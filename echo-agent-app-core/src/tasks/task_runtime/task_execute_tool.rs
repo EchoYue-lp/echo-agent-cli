@@ -1,10 +1,12 @@
-//! plan_execute 工具: L1 主 Agent 把拆好的 plan 交给框架 runtime DAG executor。
+//! `task_execute` submits one committed task-graph revision to the framework
+//! runtime DAG executor.
 //!
 //! # 设计意图 (spec §3.1.1)
 //!
-//! 主 agent 通过 plan_create 拆完 plan 后显式调用本工具, 触发 execute_run
-//! (L2 wave 调度)。这是 L1→L2 的显式衔接, 对齐 Claude Code "拆完 plan 再执行"
-//! 两阶段模型, 避免边拆边跑退化串行。
+//! The main Agent creates one or more related tasks through `task_create`, then
+//! explicitly invokes this tool to trigger `execute_run` and its L2 wave
+//! scheduling. Atomic task batches keep parallel work from degrading into
+//! create-one/run-one serialization.
 //!
 //! # 铁律 (spec §10)
 //!
@@ -33,7 +35,7 @@ use crate::agent_handle::AgentHandle;
 
 /// One active execute_run driver per run_id.
 ///
-/// Duplicate plan_execute calls can be emitted by the model or a resumed turn.
+/// Duplicate task_execute calls can be emitted by the model or a resumed turn.
 /// Serializing per run keeps one authoritative DAG driver and lets later calls
 /// re-read terminal task state instead of dispatching completed nodes again.
 ///
@@ -120,12 +122,12 @@ async fn acquire_run_execution_lock(run_id: &str) -> RunExecutionGuard {
     }
 }
 
-/// L1→L2 桥接工具: 把 plan 提交给共享 runtime DAG executor。
+/// L1→L2 bridge: submit the committed task graph to the shared DAG executor.
 ///
 /// 字段说明:
 /// - `store`: TaskRuntimeStore (用来读/写 run 状态)
 /// - `primary_agent`: AgentHandle (传给 execute_run 做 subagent 调度)
-pub struct ExecutePlanTool {
+pub struct ExecuteTaskTool {
     store: Arc<TaskRuntimeStore>,
     primary_agent: AgentHandle,
     /// D7 stage 2: unattended write mode for this tool's runs. Determines
@@ -135,7 +137,7 @@ pub struct ExecutePlanTool {
     write_mode: UnattendedWriteMode,
 }
 
-impl ExecutePlanTool {
+impl ExecuteTaskTool {
     pub fn new(store: Arc<TaskRuntimeStore>, primary_agent: AgentHandle) -> Self {
         Self::with_write_mode(store, primary_agent, UnattendedWriteMode::default())
     }
@@ -156,16 +158,16 @@ impl ExecutePlanTool {
     }
 }
 
-impl Tool for ExecutePlanTool {
+impl Tool for ExecuteTaskTool {
     fn name(&self) -> &str {
-        "plan_execute"
+        "task_execute"
     }
 
     fn description(&self) -> &str {
-        "Execute one exact committed plan revision with subagents. Create the complete DAG with one plan_create call, then pass its revision here. A stale or missing revision is rejected."
+        "Execute one exact committed task-graph revision with Subagents. The graph may contain one task or a dependency DAG; stale or missing revisions are rejected."
     }
 
-    /// plan_execute 派 subagent 跑独立 ReAct(延迟远高于普通文件/shell 工具)。
+    /// task_execute 派 subagent 跑独立 ReAct(延迟远高于普通文件/shell 工具)。
     /// 豁免并行批次总超时,避免它占满批次预算导致同批其他工具被提前取消;
     /// execute_run 内部有信号量 + subagent 600s per-dispatch 超时兜底。
     fn exempt_from_batch_timeout(&self) -> bool {
@@ -176,13 +178,13 @@ impl Tool for ExecutePlanTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "plan_revision": {
+                "revision": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Exact committed plan revision returned by plan_create, plan_patch, or task_list."
+                    "description": "Exact committed task-graph revision returned by task_create, task_update, or task_list."
                 }
             },
-            "required": ["plan_revision"]
+            "required": ["revision"]
         })
     }
 
@@ -195,40 +197,40 @@ impl Tool for ExecutePlanTool {
             tracing::info!(
                 run_id = %run_id,
                 param_keys = ?params.keys().cloned().collect::<Vec<_>>(),
-                "plan_execute: start"
+                "task_execute: start"
             );
 
             if params.contains_key("task") {
                 return Ok(ToolResult::error(
-                    "plan_execute no longer accepts an inline task; create the complete DAG with plan_create first.",
+                    "task_execute accepts only a committed revision; call task_create first.",
                 ));
             }
 
-            let Some(plan_revision) = params
-                .get("plan_revision")
+            let Some(revision) = params
+                .get("revision")
                 .and_then(serde_json::Value::as_u64)
                 .filter(|revision| *revision > 0)
             else {
                 return Ok(ToolResult::error(
-                    "plan_execute requires the committed plan_revision.",
+                    "task_execute requires the committed revision.",
                 ));
             };
             let materialized_plan = match self.store.get_plan(&run_id) {
                 Ok(Some(plan)) if !plan.tasks.is_empty() => plan,
                 Ok(_) => {
                     return Ok(ToolResult::error(
-                        "plan_execute requires a non-empty persisted plan. Submit the complete initial DAG with plan_create, then call task_list.",
+                        "task_execute requires at least one persisted task. Call task_create, then refresh with task_list.",
                     ));
                 }
                 Err(error) => {
                     return Ok(ToolResult::error(format!(
-                        "Failed to read the persisted plan before execution: {error}"
+                        "Failed to read the persisted task graph before execution: {error}"
                     )));
                 }
             };
-            if materialized_plan.revision != plan_revision {
+            if materialized_plan.revision != revision {
                 return Ok(ToolResult::error(format!(
-                    "Plan revision mismatch: requested {plan_revision}, but the latest committed revision is {}. Refresh task_list and execute the latest revision.",
+                    "Task graph revision mismatch: requested {revision}, but the latest committed revision is {}. Refresh task_list and execute the latest revision.",
                     materialized_plan.revision
                 )));
             }
@@ -292,12 +294,12 @@ impl Tool for ExecutePlanTool {
                 attended_mode = %attended_mode.as_str(),
                 has_trace_sink = trace_sink.is_some(),
                 write_mode = ?self.write_mode,
-                "plan_execute: dispatching runtime DAG executor"
+                "task_execute: dispatching runtime DAG executor"
             );
-            tracing::info!(run_id = %run_id, "plan_execute: waiting for run execution lock");
+            tracing::info!(run_id = %run_id, "task_execute: waiting for run execution lock");
             // RAII guard: 持锁 + Drop 时清理 RUN_EXECUTION_LOCKS entry (P1-1 修复)。
             let _run_guard = acquire_run_execution_lock(&run_id).await;
-            tracing::info!(run_id = %run_id, "plan_execute: acquired run execution lock");
+            tracing::info!(run_id = %run_id, "task_execute: acquired run execution lock");
             if self
                 .store
                 .get_run(&run_id)
@@ -310,9 +312,9 @@ impl Tool for ExecutePlanTool {
                 tracing::info!(
                     run_id = %run_id,
                     summary_chars = summaries.chars().count(),
-                    "plan_execute: run already completed after waiting for lock"
+                    "task_execute: run already completed after waiting for lock"
                 );
-                return Ok(ToolResult::success(plan_execute_outcome_text(
+                return Ok(ToolResult::success(task_execute_outcome_text(
                     &RunOutcome::Completed,
                     &summaries,
                 )));
@@ -321,7 +323,7 @@ impl Tool for ExecutePlanTool {
             // ── §10.1: 必须 await RunOutcome, 不得 fire-and-forget ──
             // G3 fix: read run_store from the primary agent instead of passing
             // None. execute_run uses it to persist trace Run records (token
-            // usage, status). Without it, the plan_execute path silently drops
+            // usage, status). Without it, the task_execute path silently drops
             // trace persistence (event-wiring #1残留).
             let run_store = self.primary_agent.read(|a| a.run_store.clone()).await;
             // D7 stage 2: scope the write mode into a task-local so CP B
@@ -359,7 +361,7 @@ impl Tool for ExecutePlanTool {
                         trace_sink,
                         &run_id,
                         cancel,
-                        // B5.1: plan_execute tool drives an existing run's plan;
+                        // B5.1: task_execute tool drives an existing run's plan;
                         // memory write is owned by the outer run's caller
                         // (drive_run_async / resume_task_run), not this tool.
                         super::memory_bridge::MemoryPolicy::None,
@@ -376,16 +378,16 @@ impl Tool for ExecutePlanTool {
                     tracing::info!(
                         run_id = %run_id,
                         summary_chars = summaries.chars().count(),
-                        "plan_execute: completed"
+                        "task_execute: completed"
                     );
-                    Ok(ToolResult::success(plan_execute_outcome_text(
+                    Ok(ToolResult::success(task_execute_outcome_text(
                         &RunOutcome::Completed,
                         &summaries,
                     )))
                 }
                 Ok(RunOutcome::Cancelled) => {
-                    tracing::info!(run_id = %run_id, "plan_execute: cancelled");
-                    Ok(ToolResult::success(plan_execute_outcome_text(
+                    tracing::info!(run_id = %run_id, "task_execute: cancelled");
+                    Ok(ToolResult::success(task_execute_outcome_text(
                         &RunOutcome::Cancelled,
                         "",
                     )))
@@ -398,9 +400,9 @@ impl Tool for ExecutePlanTool {
                         run_id = %run_id,
                         failed_task_id = %failed_task_id,
                         error = %error,
-                        "plan_execute: failed"
+                        "task_execute: failed"
                     );
-                    Ok(ToolResult::success(plan_execute_outcome_text(
+                    Ok(ToolResult::success(task_execute_outcome_text(
                         &RunOutcome::Failed {
                             failed_task_id,
                             error,
@@ -416,9 +418,9 @@ impl Tool for ExecutePlanTool {
                         run_id = %run_id,
                         failed_task_id = %failed_task_id,
                         error = %error,
-                        "plan_execute: paused"
+                        "task_execute: paused"
                     );
-                    Ok(ToolResult::success(plan_execute_outcome_text(
+                    Ok(ToolResult::success(task_execute_outcome_text(
                         &RunOutcome::Paused {
                             failed_task_id,
                             error,
@@ -430,9 +432,9 @@ impl Tool for ExecutePlanTool {
                     tracing::warn!(
                         run_id = %run_id,
                         error = %e,
-                        "plan_execute: executor error"
+                        "task_execute: executor error"
                     );
-                    Ok(ToolResult::error(format!("plan_execute 失败: {e}")))
+                    Ok(ToolResult::error(format!("task_execute 失败: {e}")))
                 }
             }
         })
@@ -449,7 +451,7 @@ impl Tool for ExecutePlanTool {
     }
 }
 
-fn plan_execute_outcome_text(outcome: &RunOutcome, summaries: &str) -> String {
+fn task_execute_outcome_text(outcome: &RunOutcome, summaries: &str) -> String {
     match outcome {
         RunOutcome::Completed => format!(
             "计划执行完成。各 subagent 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
@@ -592,13 +594,13 @@ mod tests {
     use echo_agent::prelude::*;
     use echo_agent::tools::ToolParameters;
 
-    fn test_tool(store: Arc<TaskRuntimeStore>) -> std::result::Result<ExecutePlanTool, String> {
+    fn test_tool(store: Arc<TaskRuntimeStore>) -> std::result::Result<ExecuteTaskTool, String> {
         let agent = ReactAgentBuilder::new()
             .model("test-model")
-            .system_prompt("test agent for plan_execute tool")
+            .system_prompt("test agent for task_execute tool")
             .build()
             .map_err(|error| error.to_string())?;
-        Ok(ExecutePlanTool::new(
+        Ok(ExecuteTaskTool::new(
             store,
             crate::agent_handle::AgentHandle::new(agent),
         ))
@@ -624,9 +626,9 @@ mod tests {
         }
     }
 
-    /// 验证无 task_local run_id 时 plan_execute 返回 error。
+    /// 验证无 task_local run_id 时 task_execute 返回 error。
     #[tokio::test]
-    async fn plan_execute_requires_run_id() -> std::result::Result<(), String> {
+    async fn task_execute_requires_run_id() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = test_tool(store)?;
         let result = tool
@@ -642,7 +644,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_execute_rejects_inline_task_in_every_mode() -> std::result::Result<(), String> {
+    async fn task_execute_rejects_inline_task_in_every_mode() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = test_tool(store)?;
         let mut params = ToolParameters::new();
@@ -653,21 +655,21 @@ mod tests {
                 "description": "分析当前项目结构"
             }),
         );
-        params.insert("plan_revision".to_string(), serde_json::json!(1));
+        params.insert("revision".to_string(), serde_json::json!(1));
         let result = task_tools::with_run_id("msg1".to_string(), tool.execute(params))
             .await
             .map_err(|error| error.to_string())?;
         assert!(!result.success);
         let error = result.error.unwrap_or_default();
         assert!(
-            error.contains("no longer accepts an inline task"),
+            error.contains("accepts only a committed revision"),
             "unexpected error: {error}"
         );
         Ok(())
     }
 
     #[test]
-    fn plan_execute_schema_requires_committed_revision() -> std::result::Result<(), String> {
+    fn task_execute_schema_requires_committed_revision() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = test_tool(store)?;
         let schema = tool.parameters();
@@ -676,29 +678,28 @@ mod tests {
                 .get("properties")
                 .and_then(|props| props.get("task"))
                 .is_none(),
-            "plan_execute schema must not expose inline task: {schema}"
+            "task_execute schema must not expose inline task: {schema}"
         );
         assert!(
             schema
                 .get("properties")
-                .and_then(|props| props.get("plan_revision"))
+                .and_then(|props| props.get("revision"))
                 .is_some(),
-            "plan_execute schema must expose plan_revision: {schema}"
+            "task_execute schema must expose revision: {schema}"
         );
         assert_eq!(
             schema.get("required"),
-            Some(&serde_json::json!(["plan_revision"]))
+            Some(&serde_json::json!(["revision"]))
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn plan_execute_requires_non_empty_materialized_plan() -> std::result::Result<(), String>
-    {
+    async fn task_execute_requires_materialized_tasks() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = test_tool(store)?;
         let mut params = ToolParameters::new();
-        params.insert("plan_revision".to_string(), serde_json::json!(1));
+        params.insert("revision".to_string(), serde_json::json!(1));
         let result = task_tools::with_run_id("run_without_plan".to_string(), tool.execute(params))
             .await
             .map_err(|error| error.to_string())?;
@@ -707,13 +708,13 @@ mod tests {
             result
                 .error
                 .unwrap_or_default()
-                .contains("non-empty persisted plan")
+                .contains("at least one persisted task")
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn plan_execute_rejects_stale_revision() -> std::result::Result<(), String> {
+    async fn task_execute_rejects_stale_revision() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let run_id = "run_count_mismatch";
         store
@@ -733,7 +734,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let tool = test_tool(store)?;
         let mut params = ToolParameters::new();
-        params.insert("plan_revision".to_string(), serde_json::json!(6));
+        params.insert("revision".to_string(), serde_json::json!(6));
         let result = task_tools::with_run_id(run_id.to_string(), tool.execute(params))
             .await
             .map_err(|error| error.to_string())?;
@@ -811,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn every_plan_execute_outcome_omits_runtime_recovery_marker() -> std::result::Result<(), String>
+    fn every_task_execute_outcome_omits_runtime_recovery_marker() -> std::result::Result<(), String>
     {
         let outcomes = [
             RunOutcome::Completed,
@@ -827,10 +828,10 @@ mod tests {
         ];
 
         for outcome in &outcomes {
-            let text = plan_execute_outcome_text(outcome, "subagent summary");
+            let text = task_execute_outcome_text(outcome, "subagent summary");
             if text.contains(super::super::compact_context::RUNTIME_RECOVERY_MARKER) {
                 return Err(format!(
-                    "plan_execute outcome must be ordinary status text: {outcome:?}"
+                    "task_execute outcome must be ordinary status text: {outcome:?}"
                 ));
             }
         }
@@ -842,7 +843,7 @@ mod tests {
     fn basic_properties() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = test_tool(store)?;
-        assert_eq!(tool.name(), "plan_execute");
+        assert_eq!(tool.name(), "task_execute");
         assert!(!tool.description().is_empty());
         assert!(tool.parameters().is_object());
         Ok(())

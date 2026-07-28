@@ -57,7 +57,7 @@ pub struct RunPayload {
 
 /// Drive an already-created TaskRuntime run to completion on an isolated pool
 /// agent. The isolated Agent first runs ReAct so it can materialize a formal
-/// plan through `plan_create` + `plan_execute`, or complete directly when the
+/// plan through `task_create` + `task_execute`, or complete directly when the
 /// Run policy allows it.
 pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> {
     let _cancel_registration = payload
@@ -72,7 +72,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         .await
         .map_err(|e| format!("pool acquire failed for run {}: {e}", payload.run_id))?;
     let execute_plan =
-        crate::tasks::task_runtime::ExecutePlanTool::new(payload.store.clone(), pool_agent.clone());
+        crate::tasks::task_runtime::ExecuteTaskTool::new(payload.store.clone(), pool_agent.clone());
     pool_agent
         .write(|agent| {
             agent.add_tool(Box::new(execute_plan));

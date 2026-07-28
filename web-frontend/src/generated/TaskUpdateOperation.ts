@@ -5,7 +5,7 @@ import type { TaskSpec } from './TaskSpec';
 /**
  * One atomic operation in a revisioned plan patch.
  */
-export type PlanPatchOperation =
+export type TaskUpdateOperation =
   | { op: 'insert'; after_task_id: string | null; task: TaskSpec }
   | { op: 'update'; task_id: string; patch: TaskPatch }
   | { op: 'skip'; task_id: string }

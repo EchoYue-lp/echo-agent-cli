@@ -47,7 +47,7 @@ model-call boundary.
    call it reads the current run ID and file-backed store, removes any previous
    recovery capsule, and inserts at most one current capsule. With no active
    plan/todos, it removes the stale capsule and inserts nothing.
-2. Stop embedding protected capsules into `task_create` and `plan_execute`
+2. Stop embedding protected capsules into `task_create` and `task_execute`
    ToolResults. Tool results remain ordinary conversational evidence.
 3. Keep `[task_context]` scoped to one fresh Fork invocation rather than
    accumulating it in reusable subagent history.

@@ -515,15 +515,15 @@ mod tool_execution_tests {
     #[test]
     fn task_tool_detail_reuses_existing_execution_panel_summary() {
         let tool = execution(
-            "plan_execute",
-            r#"{"task":{"agent_role":"explorer","description":"Inspect browser events"}}"#,
+            "task_execute",
+            r#"{"revision":3}"#,
             ToolExecutionStatus::Succeeded,
         );
         assert_eq!(
             tool_command(&tool.name, &tool.args),
-            "Execute with explorer"
+            "Execute task graph r3"
         );
-        assert_eq!(tool_detail(&tool), "Inspect browser events");
+        assert_eq!(tool_detail(&tool), "Committed revision 3");
         assert!(tool_output_tail(&tool, 6).is_empty());
     }
 

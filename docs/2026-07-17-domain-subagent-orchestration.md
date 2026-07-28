@@ -6,8 +6,8 @@ EKO 的统一产品模型是 `TaskRun -> PlanTask -> SubagentRun`。本阶段让
 
 本阶段覆盖四个结果：
 
-1. `TaskRun.domain_profile` 是领域事实源，`plan_create` 生成的每个 PlanTask 自动继承它。
-2. `plan_create` 可显式选择已注册的 `subagent`；未选择时按领域和 task kind 给出稳定默认值。
+1. `TaskRun.domain_profile` 是领域事实源，`task_create` 生成的每个 PlanTask 自动继承它。
+2. `task_create` 可显式选择已注册的 `subagent`；未选择时按领域和 task kind 给出稳定默认值。
 3. `create_complex_task` 先驱动独立主 Agent 的 ReAct 循环，由它选择“生成正式 DAG 并执行”或“直接完成”，不再对空 plan 调 `execute_run`。
 4. `echo-agent` / `echo-agent-cli` 统一使用 Subagent 术语；本阶段触及的旧称谓同步迁移。
 
@@ -24,9 +24,9 @@ EKO 的统一产品模型是 `TaskRun -> PlanTask -> SubagentRun`。本阶段让
 
 - `TaskRun`、`TaskPlan`、`PlanTask` 都已有 `domain_profile`，但 `TaskCreateTool` 构造 PlanTask 时使用 `Default`，所以所有新节点实际落成 `general`。
 - `ProfileTemplate.prompt_suffix` 和默认角色目录基本只被测试读取；review gate 是目前唯一稳定消费 task domain 的运行路径。
-- `data-shaper` 与 `analyst` 已注册，但 `plan_create` 不能指定 Subagent，默认路由也从不选择它们。
+- `data-shaper` 与 `analyst` 已注册，但 `task_create` 不能指定 Subagent，默认路由也从不选择它们。
 - `create_complex_task` 已把领域和 goal 写入 Run，却立即调用只接受“已有 plan”的 `execute_run`；没有 plan 时会返回 `NoPlan`。
-- cron/background service 已有正确范式：独立主 Agent 先执行 ReAct，可调用 `plan_create` + `plan_execute`，直接回答时则按完成门禁收敛。
+- cron/background service 已有正确范式：独立主 Agent 先执行 ReAct，可调用 `task_create` + `task_execute`，直接回答时则按完成门禁收敛。
 
 ## 框架与应用边界
 
@@ -42,11 +42,11 @@ EKO 的统一产品模型是 `TaskRun -> PlanTask -> SubagentRun`。本阶段让
 
 ### 1. Run 是领域事实源
 
-`plan_create` 在确保 Run 存在后读取 `TaskRun.domain_profile`，写入新 PlanTask。调用方不重复传 domain，避免一个 Run 内出现互相冲突的领域标签。lazy bootstrap 的 TaskPlan 继续从同一个 Run 继承领域。
+`task_create` 在确保 Run 存在后读取 `TaskRun.domain_profile`，写入新 PlanTask。调用方不重复传 domain，避免一个 Run 内出现互相冲突的领域标签。lazy bootstrap 的 TaskPlan 继续从同一个 Run 继承领域。
 
 ### 2. 参数名使用 `subagent`
 
-`plan_create` 新增可选字符串参数 `subagent`，值是 registry 中的角色名。它不使用封闭 enum，因为项目级和用户级 `.eko/subagents/**/*.md` 可以扩展角色。
+`task_create` 新增可选字符串参数 `subagent`，值是 registry 中的角色名。它不使用封闭 enum，因为项目级和用户级 `.eko/subagents/**/*.md` 可以扩展角色。
 
 默认路由保持保守：
 
@@ -67,9 +67,9 @@ EKO 的统一产品模型是 `TaskRun -> PlanTask -> SubagentRun`。本阶段让
 
 ### 4. `create_complex_task` 驱动 Agent，而不是空 DAG
 
-独立 pool agent 先注册 `plan_execute`，再在该 Run 的 context 中执行 ReAct：
+独立 pool agent 先注册 `task_execute`，再在该 Run 的 context 中执行 ReAct：
 
-- `plan_then_execute`：提示明确要求先用 `plan_create` 物化可审查 DAG，再调用 `plan_execute()`。
+- `plan_then_execute`：提示明确要求先用 `task_create` 物化可审查 DAG，再调用 `task_execute()`。
 - `direct_execute`：允许 Agent 直接使用普通工具完成；若执行中发现真实依赖或并行需求，仍可升级为正式 plan。
 
 Agent stream 结束后读取持久化 Run 状态并经过已有 completion gate 收敛。foreground 继续转发 trace，background 使用独立 cancel token；成功后沿用 blocking memory write。该路径不增加 `Planning/AwaitingApproval/Ready` 等状态。
@@ -80,7 +80,7 @@ Agent stream 结束后读取持久化 Run 状态并经过已有 completion gate 
 
 ## 验收
 
-- DataAnalysis Run 中通过 `plan_create` 新建的 PlanTask 保留 `data_analysis`，默认写任务选择 `analyst`，显式 `subagent=data-shaper` 不被覆盖。
+- DataAnalysis Run 中通过 `task_create` 新建的 PlanTask 保留 `data_analysis`，默认写任务选择 `analyst`，显式 `subagent=data-shaper` 不被覆盖。
 - AcademicResearch / MedicalResearch Run 的 PlanTask 继承对应 profile，review prompt 使用相应 checklist。
 - `create_complex_task(plan_then_execute)` 不会在空 plan 上直接调用 `execute_run`，独立 Agent 可物化并执行 DAG。
 - `create_complex_task(direct_execute)` 可在不创建 plan 时正常完成，不产生 `NoPlan`。

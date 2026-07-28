@@ -14,8 +14,8 @@
 | **Fresh inheritance** | 不继承父 system / history / memory（默认；对标 Claude Code / Cursor） |
 | **Fork inheritance** | `agent_tool` 设 `mode=fork` 时继承父 system + 最近消息 |
 | **`ExecutionMode::Fork`** | 并发调度 + worktree/workspace 物理隔离路径；**不等于**必须继承上下文 |
-| **`agent_tool`** | 主 agent 即时委派（与 `plan_execute` 并存） |
-| **`plan_execute`** | TaskRuntime DAG 编排 |
+| **`agent_tool`** | 主 agent 即时委派（与 `task_execute` 并存） |
+| **`task_execute`** | TaskRuntime DAG 编排 |
 
 产品默认：TaskRuntime / `delegate_to_agent_with_parent_context_*` 仍走 **`ExecutionMode::Fork`**（保住 implementer worktree / data workspace），但 parent_context 用 **fresh inheritance**。
 
@@ -79,7 +79,7 @@ pub struct AgentDispatchTool {
 }
 ```
 
-**主 agent** 在 `create_agent` 中调用 `.register_agent_dispatch_tool()`，与 `plan_execute` 并存，用于即时委派。
+**主 agent** 在 `create_agent` 中调用 `.register_agent_dispatch_tool()`，与 `task_execute` 并存，用于即时委派。
 
 EKO **不**把 `agent_tool` 默认发给所有 subagent。只有 `.md` 显式 `can_delegate: true` 的 role 会再注册一层嵌套委派。
 

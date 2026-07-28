@@ -1,4 +1,4 @@
-//! Agent tools for managing the task plan during execution.
+//! Agent tools for managing one revisioned task graph during execution.
 //!
 //! These let the main agent autonomously create / update / complete / skip /
 //! list tasks, mirroring Claude Code's TaskCreate / TaskUpdate model.
@@ -24,19 +24,19 @@ use super::executor::{ExecEvent, RunPlanPolicy};
 use super::profiles::{ProfileTemplate, default_subagent_for};
 use super::store::TaskRuntimeStore;
 use super::types::{
-    AttendedMode, DomainProfile, EkoTaskExecution, ExecutionMode, PlanPatchOperation,
-    PlanPatchRequest, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus, TodoStatus,
+    AttendedMode, DomainProfile, EkoTaskExecution, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan,
+    TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
 };
 
 #[derive(Debug, Clone, Default)]
-pub struct PlanCapabilityCatalog {
+pub struct TaskCapabilityCatalog {
     subagents: Arc<SubagentCatalogSnapshot>,
     tools: HashSet<String>,
 }
 
-impl PlanCapabilityCatalog {
-    const PLAN_CONTROL_TOOLS: [&'static str; 4] =
-        ["plan_create", "plan_patch", "task_list", "plan_execute"];
+impl TaskCapabilityCatalog {
+    const TASK_CONTROL_TOOLS: [&'static str; 4] =
+        ["task_create", "task_update", "task_list", "task_execute"];
 
     pub fn new(
         subagents: Arc<SubagentCatalogSnapshot>,
@@ -63,9 +63,9 @@ impl PlanCapabilityCatalog {
             ));
         }
         for tool in &task.allowed_tools {
-            if Self::PLAN_CONTROL_TOOLS.contains(&tool.as_str()) {
+            if Self::TASK_CONTROL_TOOLS.contains(&tool.as_str()) {
                 return Err(format!(
-                    "task '{}' cannot delegate plan-control tool '{}' to a Subagent",
+                    "task '{}' cannot delegate task-control tool '{}' to a Subagent",
                     task.id, tool
                 ));
             }
@@ -81,14 +81,14 @@ impl PlanCapabilityCatalog {
 
     fn validate_patch_operation(
         &self,
-        operation: &PlanPatchOperation,
+        operation: &TaskUpdateOperation,
     ) -> std::result::Result<(), String> {
         match operation {
-            PlanPatchOperation::Insert { task, .. } => self.validate_task(&PlanTask::from_parts(
+            TaskUpdateOperation::Insert { task, .. } => self.validate_task(&PlanTask::from_parts(
                 task.clone(),
                 EkoTaskExecution::pending(task.id.clone()),
             )),
-            PlanPatchOperation::Update { patch, .. } => {
+            TaskUpdateOperation::Update { patch, .. } => {
                 if let Some(role) = &patch.agent_role
                     && !self.subagents.contains(role)
                 {
@@ -96,9 +96,9 @@ impl PlanCapabilityCatalog {
                 }
                 if let Some(tools) = &patch.allowed_tools {
                     for tool in tools {
-                        if Self::PLAN_CONTROL_TOOLS.contains(&tool.as_str()) {
+                        if Self::TASK_CONTROL_TOOLS.contains(&tool.as_str()) {
                             return Err(format!(
-                                "plan-control tool '{tool}' cannot be delegated to a Subagent"
+                                "task-control tool '{tool}' cannot be delegated to a Subagent"
                             ));
                         }
                         if !self.tools.contains(tool) {
@@ -108,7 +108,7 @@ impl PlanCapabilityCatalog {
                 }
                 Ok(())
             }
-            PlanPatchOperation::Skip { .. } | PlanPatchOperation::Reorder { .. } => Ok(()),
+            TaskUpdateOperation::Skip { .. } | TaskUpdateOperation::Reorder { .. } => Ok(()),
         }
     }
 }
@@ -127,7 +127,7 @@ tokio::task_local! {
     /// [`with_run_context`] around the subagent dispatch so tools can read it.
     pub static CURRENT_RUN_ID: String;
     /// The cancel token for the currently executing task run. Set alongside
-    /// CURRENT_RUN_ID so plan_execute and other tools can read it.
+    /// CURRENT_RUN_ID so task_execute and other tools can read it.
     pub static CURRENT_CANCEL: tokio_util::sync::CancellationToken;
     /// Delegate nesting depth — incremented each time a subagent is delegated
     /// during tool execution. Used by Task 6 (L3 nesting) to prevent runaway
@@ -138,7 +138,7 @@ tokio::task_local! {
     /// alongside `CURRENT_RUN_ID` by [`with_run_context`].
     pub static CURRENT_TRACE_SINK: Option<TraceSink>;
     /// The unattended write mode for the currently executing run (D7 stage 2).
-    /// Set by `ExecutePlanTool::execute` so CP B preflight in `execute_task`
+    /// Set by `ExecuteTaskTool::execute` so CP B preflight in `execute_task`
     /// can read it without threading the mode through `execute_run` →
     /// runtime executor → EKO controller → `execute_task`. Defaults to `Disabled` when no scope is
     /// active (e.g. tests, attended runs).
@@ -485,13 +485,13 @@ fn plan_task_input_schema() -> serde_json::Value {
     })
 }
 
-fn plan_patch_operations_from(
+fn task_update_operations_from(
     value: &serde_json::Value,
     domain_profile: DomainProfile,
-) -> std::result::Result<Vec<PlanPatchOperation>, String> {
+) -> std::result::Result<Vec<TaskUpdateOperation>, String> {
     let operations = value
         .as_array()
-        .ok_or_else(|| "plan_patch operations must be an array".to_string())?;
+        .ok_or_else(|| "task_update operations must be an array".to_string())?;
     let mut parsed = Vec::with_capacity(operations.len());
     for (index, operation) in operations.iter().enumerate() {
         let op = operation
@@ -503,7 +503,7 @@ fn plan_patch_operations_from(
                 let task = operation
                     .get("task")
                     .ok_or_else(|| format!("operations[{index}].task is required"))?;
-                PlanPatchOperation::Insert {
+                TaskUpdateOperation::Insert {
                     after_task_id: operation
                         .get("after_task_id")
                         .and_then(serde_json::Value::as_str)
@@ -511,7 +511,7 @@ fn plan_patch_operations_from(
                     task: parse_plan_task(task, index, domain_profile)?.spec(),
                 }
             }
-            "update" => PlanPatchOperation::Update {
+            "update" => TaskUpdateOperation::Update {
                 task_id: operation
                     .get("task_id")
                     .and_then(serde_json::Value::as_str)
@@ -528,7 +528,7 @@ fn plan_patch_operations_from(
                             .map_err(|error| format!("operations[{index}].patch: {error}"))
                     })?,
             },
-            "skip" => PlanPatchOperation::Skip {
+            "skip" => TaskUpdateOperation::Skip {
                 task_id: operation
                     .get("task_id")
                     .and_then(serde_json::Value::as_str)
@@ -537,7 +537,7 @@ fn plan_patch_operations_from(
                     .map(str::to_string)
                     .ok_or_else(|| format!("operations[{index}].task_id is required"))?,
             },
-            "reorder" => PlanPatchOperation::Reorder {
+            "reorder" => TaskUpdateOperation::Reorder {
                 task_ids: string_array_in(operation, "task_ids"),
             },
             other => return Err(format!("operations[{index}] has unknown op '{other}'")),
@@ -547,38 +547,49 @@ fn plan_patch_operations_from(
     Ok(parsed)
 }
 
-// ── plan_create ───────────────────────────────────────────────────────────
+// ── task_create ───────────────────────────────────────────────────────────
 
 pub struct TaskCreateTool {
     pub store: Arc<TaskRuntimeStore>,
-    pub capabilities: Arc<PlanCapabilityCatalog>,
+    pub capabilities: Arc<TaskCapabilityCatalog>,
 }
 
 impl Tool for TaskCreateTool {
     fn name(&self) -> &str {
-        "plan_create"
+        "task_create"
     }
 
     fn description(&self) -> &str {
-        "Atomically create the complete formal PlanTask DAG as revision 1. Submit every intended task in one call with stable ids and explicit dependencies. The TaskRun already represents the user goal, so do not create a wrapper task."
+        "Create one task or atomically create a related task graph in the current TaskRun. Dependencies are optional; use base_revision when adding tasks to an existing graph."
     }
 
     fn parameters(&self) -> serde_json::Value {
         let task_schema = plan_task_input_schema();
+        let single_task_schema = task_schema.clone();
         serde_json::json!({
             "type": "object",
             "properties": {
+                "task": single_task_schema,
                 "tasks": {
                     "type": "array",
                     "minItems": 1,
-                    "description": "The complete DAG. All dependency ids must refer to tasks in this array.",
+                    "description": "One atomic task batch. Dependency ids may refer to this batch or existing tasks.",
                     "items": task_schema
                 },
+                "base_revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Required when the current TaskRun already has tasks."
+                },
+                "reason": { "type": "string", "description": "Why these tasks are being added" },
                 "assumptions": { "type": "array", "items": { "type": "string" } },
                 "risks": { "type": "array", "items": { "type": "string" } },
                 "execution_mode": { "type": "string", "enum": ["parallel", "sequential"] }
             },
-            "required": ["tasks"]
+            "oneOf": [
+                { "required": ["task"] },
+                { "required": ["tasks"] }
+            ]
         })
     }
 
@@ -617,13 +628,23 @@ impl TaskCreateTool {
         params: ToolParameters,
         bootstrap_ctx: Option<&echo_core::tools::ToolContext>,
     ) -> echo_agent::error::Result<ToolResult> {
-        let Some(raw_tasks) = params.get("tasks").and_then(|value| value.as_array()) else {
+        let single_task = params.get("task");
+        let task_batch = params.get("tasks").and_then(serde_json::Value::as_array);
+        if single_task.is_some() == task_batch.is_some() {
             return Ok(ToolResult::error(
-                "plan_create requires a non-empty tasks array",
+                "task_create requires exactly one of task or tasks",
             ));
+        }
+        let raw_tasks = match (single_task, task_batch) {
+            (Some(task), None) if task.is_object() => vec![task],
+            (None, Some(tasks)) => tasks.iter().collect::<Vec<_>>(),
+            (Some(_), None) => {
+                return Ok(ToolResult::error("task_create task must be an object"));
+            }
+            _ => Vec::new(),
         };
         let Some(first) = raw_tasks.first() else {
-            return Ok(ToolResult::error("plan_create requires at least one task"));
+            return Ok(ToolResult::error("task_create requires at least one task"));
         };
         let bootstrap_title = first
             .get("title")
@@ -645,7 +666,7 @@ impl TaskCreateTool {
             Ok(Some(run)) => run,
             Ok(None) => {
                 return Ok(ToolResult::error(
-                    "Task run disappeared after plan_create bootstrap",
+                    "Task run disappeared after task_create bootstrap",
                 ));
             }
             Err(error) => {
@@ -666,6 +687,57 @@ impl TaskCreateTool {
             }
             tasks.push(task);
         }
+
+        let existing_graph = match self.store.get_plan(&run_id) {
+            Ok(plan) => plan,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Failed to inspect current task graph: {error}"
+                )));
+            }
+        };
+        if let Some(graph) = existing_graph {
+            let Some(base_revision) = params
+                .get("base_revision")
+                .and_then(serde_json::Value::as_u64)
+                .filter(|revision| *revision > 0)
+            else {
+                return Ok(ToolResult::error(
+                    "task_create requires base_revision when tasks already exist",
+                ));
+            };
+            let reason = params
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("add tasks")
+                .to_string();
+            let operations = tasks
+                .into_iter()
+                .map(|task| TaskUpdateOperation::Insert {
+                    after_task_id: None,
+                    task: task.spec(),
+                })
+                .collect();
+            let request = TaskUpdateRequest {
+                base_revision,
+                reason,
+                operations,
+            };
+            return match self.store.update_tasks(&run_id, &request) {
+                Ok(updated) => Ok(ToolResult::success(format!(
+                    "Created task graph revision {} with {} total task(s)",
+                    updated.revision,
+                    updated.tasks.len()
+                ))),
+                Err(error) => Ok(ToolResult::error(format!(
+                    "Failed to add tasks to revision {}: {error}",
+                    graph.revision
+                ))),
+            };
+        }
+
         let execution_mode = params
             .get("execution_mode")
             .and_then(|value| value.as_str())
@@ -684,10 +756,12 @@ impl TaskCreateTool {
         };
         match self.store.attach_plan(&plan) {
             Ok(()) => Ok(ToolResult::success(format!(
-                "Created plan revision 1 with {} task(s). Call plan_execute with plan_revision=1.",
+                "Created task graph revision 1 with {} task(s). Call task_execute with revision=1.",
                 plan.tasks.len()
             ))),
-            Err(error) => Ok(ToolResult::error(format!("Failed to create plan: {error}"))),
+            Err(error) => Ok(ToolResult::error(format!(
+                "Failed to create task graph: {error}"
+            ))),
         }
     }
 
@@ -768,7 +842,7 @@ impl TaskCreateTool {
                 serde_json::json!({
                     "goal": goal,
                     "route": "agent_task_plan",
-                    "source": "plan_create",
+                    "source": "task_create",
                 }),
             ));
         }
@@ -776,20 +850,20 @@ impl TaskCreateTool {
     }
 }
 
-// ── plan_patch ────────────────────────────────────────────────────────────
+// ── task_update ────────────────────────────────────────────────────────────
 
-pub struct PlanPatchTool {
+pub struct TaskUpdateTool {
     pub store: Arc<TaskRuntimeStore>,
-    pub capabilities: Arc<PlanCapabilityCatalog>,
+    pub capabilities: Arc<TaskCapabilityCatalog>,
 }
 
-impl Tool for PlanPatchTool {
+impl Tool for TaskUpdateTool {
     fn name(&self) -> &str {
-        "plan_patch"
+        "task_update"
     }
 
     fn description(&self) -> &str {
-        "Atomically revise the current formal plan using optimistic concurrency. Only pending or blocked task specifications may change while a run is active."
+        "Atomically update task specifications, dependency relations, ordering, or skip state using optimistic concurrency. Only pending or blocked task specifications may change while a run is active."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -877,7 +951,7 @@ impl Tool for PlanPatchTool {
             };
             let Some(base_revision) = params.get("base_revision").and_then(|value| value.as_u64())
             else {
-                return Ok(ToolResult::error("plan_patch requires base_revision"));
+                return Ok(ToolResult::error("task_update requires base_revision"));
             };
             let reason = params
                 .get("reason")
@@ -887,18 +961,22 @@ impl Tool for PlanPatchTool {
                 .to_string();
             let current_plan = match self.store.get_plan(&run_id) {
                 Ok(Some(plan)) => plan,
-                Ok(None) => return Ok(ToolResult::error("plan_patch requires an existing plan")),
+                Ok(None) => {
+                    return Ok(ToolResult::error(
+                        "task_update requires existing tasks; call task_create first",
+                    ));
+                }
                 Err(error) => {
                     return Ok(ToolResult::error(format!(
-                        "Failed to read current plan: {error}"
+                        "Failed to read current task graph: {error}"
                     )));
                 }
             };
             let Some(raw_operations) = params.get("operations") else {
-                return Ok(ToolResult::error("plan_patch requires operations"));
+                return Ok(ToolResult::error("task_update requires operations"));
             };
             let operations =
-                match plan_patch_operations_from(raw_operations, current_plan.domain_profile) {
+                match task_update_operations_from(raw_operations, current_plan.domain_profile) {
                     Ok(operations) => operations,
                     Err(error) => return Ok(ToolResult::error(error)),
                 };
@@ -907,18 +985,20 @@ impl Tool for PlanPatchTool {
                     return Ok(ToolResult::error(error));
                 }
             }
-            let request = PlanPatchRequest {
+            let request = TaskUpdateRequest {
                 base_revision,
                 reason,
                 operations,
             };
-            match self.store.patch_plan(&run_id, &request) {
+            match self.store.update_tasks(&run_id, &request) {
                 Ok(plan) => Ok(ToolResult::success(format!(
-                    "Committed plan revision {} with {} task(s)",
+                    "Committed task graph revision {} with {} task(s)",
                     plan.revision,
                     plan.tasks.len()
                 ))),
-                Err(error) => Ok(ToolResult::error(format!("Failed to patch plan: {error}"))),
+                Err(error) => Ok(ToolResult::error(format!(
+                    "Failed to update tasks: {error}"
+                ))),
             }
         })
     }
@@ -958,9 +1038,9 @@ fn complex_run_prompt(
 ) -> String {
     let template = ProfileTemplate::for_profile(domain);
     let plan_contract = if plan_mode == "direct_execute" {
-        "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade by submitting the complete DAG in one plan_create call and execute its returned revision."
+        "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade by submitting the complete DAG in one task_create call and execute its returned revision."
     } else {
-        "This run requires a formal, reviewable DAG. The TaskRun already represents the overall goal, so do not create a wrapper, placeholder, or prose-only summary PlanTask for it. Submit every executable node together in one plan_create call with stable ids and explicit dependencies. Assign an appropriate Subagent to every node and declare artifacts, files, executable checks, and semantic acceptance criteria. A Subagent completing is not the PlanTask completing — tasks blocked on acceptance pause the run and wait for explicit retry. Execute exactly the committed revision returned by plan_create or plan_patch."
+        "This run requires a formal, reviewable DAG. The TaskRun already represents the overall goal, so do not create a wrapper, placeholder, or prose-only summary PlanTask for it. Submit every executable node together in one task_create call with stable ids and explicit dependencies. Assign an appropriate Subagent to every node and declare artifacts, files, executable checks, and semantic acceptance criteria. A Subagent completing is not the PlanTask completing — tasks blocked on acceptance pause the run and wait for explicit retry. Execute exactly the committed revision returned by task_create or task_update."
     };
     let initial = if initial_plan.is_empty() {
         "None supplied; derive the smallest complete decomposition from evidence.".to_string()
@@ -985,7 +1065,7 @@ fn complex_run_prompt(
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)] // complex-task tool impls below are production code; moving them is churn
-mod plan_create_tests {
+mod task_create_tests {
     use super::super::types::RuntimeEventKind;
     use super::*;
 
@@ -994,8 +1074,8 @@ mod plan_create_tests {
         Arc::new(SubagentCatalogSnapshot::from_definitions(&definitions))
     }
 
-    fn test_capabilities() -> Arc<PlanCapabilityCatalog> {
-        Arc::new(PlanCapabilityCatalog::new(
+    fn test_capabilities() -> Arc<TaskCapabilityCatalog> {
+        Arc::new(TaskCapabilityCatalog::new(
             test_subagent_catalog(),
             Vec::<String>::new(),
         ))
@@ -1003,7 +1083,7 @@ mod plan_create_tests {
 
     fn one_task_params(task: serde_json::Value) -> ToolParameters {
         let mut params = ToolParameters::new();
-        params.insert("tasks".to_string(), serde_json::json!([task]));
+        params.insert("task".to_string(), task);
         params
     }
 
@@ -1023,7 +1103,7 @@ mod plan_create_tests {
     }
 
     #[tokio::test]
-    async fn plan_create_bootstraps_run_before_plan_events() -> std::result::Result<(), String> {
+    async fn task_create_bootstraps_run_before_plan_events() -> std::result::Result<(), String> {
         let shadow_root = tempfile::tempdir().map_err(|e| e.to_string())?;
         let store = Arc::new(
             TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
@@ -1033,7 +1113,7 @@ mod plan_create_tests {
             store: store.clone(),
             capabilities: test_capabilities(),
         };
-        let run_id = "run_plan_create_bootstrap";
+        let run_id = "run_task_create_bootstrap";
         let params = one_task_params(serde_json::json!({
             "id": "architecture-review",
             "title": "分析当前项目架构",
@@ -1045,22 +1125,22 @@ mod plan_create_tests {
             .await
             .map_err(|e| e.to_string())?;
         if !result.success {
-            return Err(format!("plan_create failed: {:?}", result.error));
+            return Err(format!("task_create failed: {:?}", result.error));
         }
         if result
             .output
             .contains(super::super::compact_context::RUNTIME_RECOVERY_MARKER)
         {
             return Err(
-                "plan_create result must not embed the runtime recovery capsule".to_string(),
+                "task_create result must not embed the runtime recovery capsule".to_string(),
             );
         }
         if !result
             .output
-            .contains("Created plan revision 1 with 1 task(s)")
+            .contains("Created task graph revision 1 with 1 task(s)")
         {
             return Err(format!(
-                "plan_create must report the materialized task count: {}",
+                "task_create must report the materialized task count: {}",
                 result.output
             ));
         }
@@ -1083,7 +1163,59 @@ mod plan_create_tests {
     }
 
     #[tokio::test]
-    async fn plan_create_bootstrap_preserves_chat_identity_from_tool_context()
+    async fn task_create_appends_to_the_same_revisioned_graph() -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = TaskCreateTool {
+            store: store.clone(),
+            capabilities: test_capabilities(),
+        };
+        let run_id = "run_incremental_task_create";
+        let first = one_task_params(serde_json::json!({
+            "id": "inspect",
+            "title": "Inspect",
+            "description": "Inspect the task runtime",
+            "kind": "investigation",
+            "subagent": "explorer"
+        }));
+        let first_result = with_run_id(run_id.to_string(), tool.execute(first))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(first_result.success);
+
+        let mut second = one_task_params(serde_json::json!({
+            "id": "verify",
+            "title": "Verify",
+            "description": "Verify the inspected runtime",
+            "kind": "verification",
+            "subagent": "explorer",
+            "depends_on": ["inspect"]
+        }));
+        second.insert("base_revision".to_string(), serde_json::json!(1));
+        let second_result = with_run_id(run_id.to_string(), tool.execute(second))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(second_result.success);
+        assert!(
+            second_result
+                .output
+                .contains("Created task graph revision 2 with 2 total task(s)")
+        );
+
+        let graph = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "task graph missing".to_string())?;
+        assert_eq!(graph.revision, 2);
+        assert_eq!(graph.tasks.len(), 2);
+        assert_eq!(
+            graph.tasks.get(1).map(|task| task.depends_on.as_slice()),
+            Some(["inspect".to_string()].as_slice())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_create_bootstrap_preserves_chat_identity_from_tool_context()
     -> std::result::Result<(), String> {
         let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let store = Arc::new(
@@ -1114,7 +1246,7 @@ mod plan_create_tests {
             .await
             .map_err(|error| error.to_string())?;
         if !result.success {
-            return Err(format!("plan_create failed: {:?}", result.error));
+            return Err(format!("task_create failed: {:?}", result.error));
         }
 
         let run = store
@@ -1127,7 +1259,7 @@ mod plan_create_tests {
     }
 
     #[tokio::test]
-    async fn plan_create_inherits_domain_and_routes_data_subagents()
+    async fn task_create_inherits_domain_and_routes_data_subagents()
     -> std::result::Result<(), String> {
         let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let store = Arc::new(
@@ -1178,16 +1310,16 @@ mod plan_create_tests {
             .map_err(|error| error.to_string())?;
         if !result.success {
             return Err(format!(
-                "atomic data plan_create failed: {:?}",
+                "atomic data task_create failed: {:?}",
                 result.error
             ));
         }
         if !result
             .output
-            .contains("Created plan revision 1 with 2 task(s)")
+            .contains("Created task graph revision 1 with 2 task(s)")
         {
             return Err(format!(
-                "second plan_create must report two materialized tasks: {}",
+                "second task_create must report two materialized tasks: {}",
                 result.output
             ));
         }
@@ -1214,7 +1346,8 @@ mod plan_create_tests {
     }
 
     #[tokio::test]
-    async fn plan_patch_insert_accepts_plan_create_task_shape() -> std::result::Result<(), String> {
+    async fn task_update_insert_accepts_task_create_task_shape() -> std::result::Result<(), String>
+    {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let capabilities = test_capabilities();
         let create = TaskCreateTool {
@@ -1235,10 +1368,10 @@ mod plan_create_tests {
         .await
         .map_err(|error| error.to_string())?;
         if !created.success {
-            return Err(format!("plan_create failed: {:?}", created.error));
+            return Err(format!("task_create failed: {:?}", created.error));
         }
 
-        let patch = PlanPatchTool {
+        let patch = TaskUpdateTool {
             store: store.clone(),
             capabilities,
         };
@@ -1267,7 +1400,7 @@ mod plan_create_tests {
             .await
             .map_err(|error| error.to_string())?;
         if !result.success {
-            return Err(format!("plan_patch failed: {:?}", result.error));
+            return Err(format!("task_update failed: {:?}", result.error));
         }
         let plan = store
             .get_plan(run_id)
@@ -1280,7 +1413,7 @@ mod plan_create_tests {
     }
 
     #[tokio::test]
-    async fn plan_create_rejects_plan_control_tools_in_subagent_allowlist()
+    async fn task_create_rejects_task_control_tools_in_subagent_allowlist()
     -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = TaskCreateTool {
@@ -1292,10 +1425,10 @@ mod plan_create_tests {
             tool.execute(one_task_params(serde_json::json!({
                 "id": "bad-tools",
                 "title": "Bad tools",
-                "description": "Attempt to delegate plan control",
+                "description": "Attempt to delegate task control",
                 "kind": "investigation",
                 "subagent": "explorer",
-                "allowed_tools": ["plan_patch"]
+                "allowed_tools": ["task_update"]
             }))),
         )
         .await
@@ -1305,7 +1438,7 @@ mod plan_create_tests {
             result
                 .error
                 .unwrap_or_default()
-                .contains("cannot delegate plan-control tool")
+                .contains("cannot delegate task-control tool")
         );
         Ok(())
     }
@@ -1389,7 +1522,7 @@ impl Tool for CreateComplexTaskTool {
                 "reason": { "type": "string", "description": "Why an independent Run is warranted. Name the material signals: dependent multi_step work, multi_file/architectural change, long_running/cross_turn state, or multi_source synthesis." },
                 "domain_profile": { "type": "string", "enum": ["general","ai_coding","data_analysis","academic_research","medical_research"], "description": "Best-fit evidence and review profile. Cross-domain tasks should choose the profile that governs the final claim or artifact." },
                 "plan_mode": { "type": "string", "enum": ["plan_then_execute","direct_execute"], "description": "Use plan_then_execute when the work benefits from an explicit reviewable DAG; use direct_execute only when autonomous ReAct is sufficient and a formal plan adds no value." },
-                "initial_plan": { "type": "array", "items": { "type": "object", "properties": { "step_name": {"type":"string"}, "expected_outcome": {"type":"string"} }, "required": ["step_name"] }, "description": "Optional coarse decomposition (>=2 steps) as a brief. Not the PlanTask DAG — the Run's agent refines via plan_create." },
+                "initial_plan": { "type": "array", "items": { "type": "object", "properties": { "step_name": {"type":"string"}, "expected_outcome": {"type":"string"} }, "required": ["step_name"] }, "description": "Optional coarse decomposition (>=2 steps) as a brief. Not the PlanTask DAG — the Run's agent refines via task_create." },
                 "priority": { "type": "string", "enum": ["foreground","background"], "default": "background", "description": "Default background (returns run_id immediately, non-blocking). foreground only for <1min tasks where you need the result in this turn (blocks the UI until done)." }
             }
         })
@@ -1737,7 +1870,7 @@ impl Tool for TaskListTool {
         "task_list"
     }
     fn description(&self) -> &str {
-        "List all tasks in the current plan with their status."
+        "List the current TaskRun's tasks, dependency-aware graph revision, and runtime status."
     }
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({ "type": "object", "properties": {} })
@@ -1758,13 +1891,13 @@ impl Tool for TaskListTool {
                         .map(|t| format!("[{}] {} — {}", t.status.as_str(), t.task_id, t.title))
                         .collect();
                     Ok(ToolResult::success(format!(
-                        "Plan revision {} — Tasks ({}):\n{}",
+                        "Task graph revision {} — Tasks ({}):\n{}",
                         plan.revision,
                         todos.len(),
                         lines.join("\n")
                     )))
                 }
-                (Ok(None), _) => Ok(ToolResult::error("No committed plan")),
+                (Ok(None), _) => Ok(ToolResult::error("No tasks; call task_create first")),
                 (Err(error), _) | (_, Err(error)) => {
                     Ok(ToolResult::error(format!("Failed: {error}")))
                 }

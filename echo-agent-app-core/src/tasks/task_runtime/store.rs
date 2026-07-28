@@ -73,7 +73,7 @@ pub struct TaskRuntimeStore {
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     /// Per-run plan/state 写互斥锁 (F2-1 / F3-3 / F3-4)。
     ///
-    /// attach_plan / patch_plan / transition_run 都是
+    /// attach_plan / update_tasks / transition_run 都是
     /// "读事件 → 校验 → 追加 → 重建投影"事务, 必须按 run 串行化。
     /// Different runs keep independent locks.
     plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
@@ -81,7 +81,7 @@ pub struct TaskRuntimeStore {
 
 /// RAII registration for one active TaskRun driver. Nested drivers for the
 /// same run restore the previous token when they finish (for example an
-/// unattended ReAct driver invoking `plan_execute`).
+/// unattended ReAct driver invoking `task_execute`).
 pub struct RunCancellationRegistration {
     store: std::sync::Arc<TaskRuntimeStore>,
     run_id: String,
@@ -223,7 +223,7 @@ impl TaskRuntimeStore {
     /// 用 closure 模式而非返回 Guard: std::sync::MutexGuard 借自 &Mutex, 而
     /// Mutex 在 Arc 内, Arc 作为局部变量时 Guard 跨函数返回即悬垂 (自引用
     /// struct 在 Rust 里无法直接表达)。closure 把锁的获取与释放封装在内部,
-    /// 闭包体内是临界区。attach_plan / patch_plan / transition_run 用它包裹
+    /// 闭包体内是临界区。attach_plan / update_tasks / transition_run 用它包裹
     /// "读事件 → 校验 → 追加 → 重建投影"全程。
     fn with_run_lock<R, E>(&self, run_id: &str, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
         let arc = self
@@ -585,7 +585,7 @@ impl TaskRuntimeStore {
             }
             if self.get_plan(&plan.run_id)?.is_some() {
                 return Err(StoreError::InvalidPlan(
-                    "plan already exists; submit a revisioned plan_patch".to_string(),
+                    "plan already exists; submit a revisioned task_update".to_string(),
                 ));
             }
             if plan.tasks.iter().any(|task| {
@@ -617,10 +617,10 @@ impl TaskRuntimeStore {
     }
 
     /// Atomically apply a dynamic plan patch against an expected revision.
-    pub fn patch_plan(
+    pub fn update_tasks(
         &self,
         run_id: &str,
-        request: &PlanPatchRequest,
+        request: &TaskUpdateRequest,
     ) -> Result<TaskPlan, StoreError> {
         self.with_run_lock(run_id, || {
             let run = self
@@ -647,12 +647,12 @@ impl TaskRuntimeStore {
             }
             if request.operations.is_empty() {
                 return Err(StoreError::InvalidPlan(
-                    "plan_patch requires at least one operation".to_string(),
+                    "task_update requires at least one operation".to_string(),
                 ));
             }
             if request.reason.trim().is_empty() {
                 return Err(StoreError::InvalidPlan(
-                    "plan_patch requires a non-empty reason".to_string(),
+                    "task_update requires a non-empty reason".to_string(),
                 ));
             }
 
@@ -661,7 +661,7 @@ impl TaskRuntimeStore {
             let mut reset_task_ids = Vec::new();
             for operation in &request.operations {
                 match operation {
-                    PlanPatchOperation::Insert {
+                    TaskUpdateOperation::Insert {
                         after_task_id,
                         task,
                     } => {
@@ -692,7 +692,7 @@ impl TaskRuntimeStore {
                             ),
                         );
                     }
-                    PlanPatchOperation::Update { task_id, patch } => {
+                    TaskUpdateOperation::Update { task_id, patch } => {
                         let task = candidate
                             .tasks
                             .iter_mut()
@@ -712,7 +712,7 @@ impl TaskRuntimeStore {
                         task.status_detail = None;
                         task.claim = None;
                     }
-                    PlanPatchOperation::Skip { task_id } => {
+                    TaskUpdateOperation::Skip { task_id } => {
                         let task = candidate
                             .tasks
                             .iter_mut()
@@ -729,7 +729,7 @@ impl TaskRuntimeStore {
                         task.claim = None;
                         skipped_task_ids.push(task_id.clone());
                     }
-                    PlanPatchOperation::Reorder { task_ids } => {
+                    TaskUpdateOperation::Reorder { task_ids } => {
                         let expected = candidate
                             .tasks
                             .iter()
@@ -2518,12 +2518,12 @@ mod tests {
     fn mutating_in_doubt_subagent_blocks_resume_until_user_decides() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.patch_plan(
+        store.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "exercise mutating recovery".to_string(),
-                operations: vec![PlanPatchOperation::Update {
+                operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
                     patch: TaskPatch {
                         kind: Some(PlanTaskKind::Implementation),
@@ -2610,12 +2610,12 @@ mod tests {
     -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.patch_plan(
+        store.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "exercise recovery barrier".to_string(),
-                operations: vec![PlanPatchOperation::Update {
+                operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
                     patch: TaskPatch {
                         kind: Some(PlanTaskKind::Implementation),
@@ -2680,7 +2680,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_patch_inserts_task_and_commits_one_revision() {
+    fn task_update_inserts_task_and_commits_one_revision() {
         let s = fresh();
         seed_plan(&s);
         let t2 = PlanTask {
@@ -2694,12 +2694,12 @@ mod tests {
         };
         let before = s.list_events("r1", 0).unwrap().len();
         let plan = s
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "new implementation dependency".to_string(),
-                    operations: vec![PlanPatchOperation::Insert {
+                    operations: vec![TaskUpdateOperation::Insert {
                         after_task_id: Some("t1".to_string()),
                         task: t2.spec(),
                     }],
@@ -2720,37 +2720,37 @@ mod tests {
     }
 
     #[test]
-    fn plan_patch_rejects_missing_run() -> std::result::Result<(), String> {
+    fn task_update_rejects_missing_run() -> std::result::Result<(), String> {
         let s = TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?;
         let err = s
-            .patch_plan(
+            .update_tasks(
                 "missing-run",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "invalid".to_string(),
-                    operations: vec![PlanPatchOperation::Reorder {
+                    operations: vec![TaskUpdateOperation::Reorder {
                         task_ids: Vec::new(),
                     }],
                 },
             )
             .err()
-            .ok_or_else(|| "plan_patch unexpectedly succeeded without a run".to_string())?;
+            .ok_or_else(|| "task_update unexpectedly succeeded without a run".to_string())?;
         assert!(matches!(err, StoreError::RunNotFound(run_id) if run_id == "missing-run"));
         Ok(())
     }
 
     #[test]
-    fn plan_patch_rejects_stale_revision_without_appending_event() {
+    fn task_update_rejects_stale_revision_without_appending_event() {
         let s = fresh();
         seed_plan(&s);
         let before = s.list_events("r1", 0).unwrap().len();
         let error = s
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 0,
                     reason: "stale edit".to_string(),
-                    operations: vec![PlanPatchOperation::Skip {
+                    operations: vec![TaskUpdateOperation::Skip {
                         task_id: "t1".to_string(),
                     }],
                 },
@@ -2761,7 +2761,7 @@ mod tests {
     }
 
     #[test]
-    fn claim_reloads_when_plan_patch_wins_revision_race() -> Result<(), StoreError> {
+    fn claim_reloads_when_task_update_wins_revision_race() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
         let expected = store
@@ -2771,12 +2771,12 @@ mod tests {
             .first()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
             .to_task();
-        store.patch_plan(
+        store.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "skip before stale dispatch claims task".to_string(),
-                operations: vec![PlanPatchOperation::Skip {
+                operations: vec![TaskUpdateOperation::Skip {
                     task_id: "t1".to_string(),
                 }],
             },
@@ -2890,12 +2890,12 @@ mod tests {
             Some("code_reviewer"),
             Some("requires a revised contract"),
         )?;
-        let patched = store.patch_plan(
+        let patched = store.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "change blocked task contract".to_string(),
-                operations: vec![PlanPatchOperation::Update {
+                operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
                     patch: TaskPatch {
                         description: Some("review the revised runtime contract".to_string()),
@@ -2936,16 +2936,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_patch_skip_preserves_spec_and_updates_execution() {
+    fn task_update_skip_preserves_spec_and_updates_execution() {
         let s = fresh();
         seed_plan(&s);
         let plan = s
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "task no longer required".to_string(),
-                    operations: vec![PlanPatchOperation::Skip {
+                    operations: vec![TaskUpdateOperation::Skip {
                         task_id: "t1".to_string(),
                     }],
                 },
@@ -2957,7 +2957,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_patch_update_requeues_blocked_task() {
+    fn task_update_update_requeues_blocked_task() {
         let s = fresh();
         seed_plan(&s);
         s.set_task_status(
@@ -2969,12 +2969,12 @@ mod tests {
         )
         .unwrap();
         let plan = s
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "clarify the blocked task".to_string(),
-                    operations: vec![PlanPatchOperation::Update {
+                    operations: vec![TaskUpdateOperation::Update {
                         task_id: "t1".to_string(),
                         patch: TaskPatch {
                             description: Some("Review the clarified runtime boundary".to_string()),
@@ -3006,12 +3006,12 @@ mod tests {
             depends_on: vec!["t1".to_string()],
             ..Default::default()
         };
-        s.patch_plan(
+        s.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "new evidence requires verification".to_string(),
-                operations: vec![PlanPatchOperation::Insert {
+                operations: vec![TaskUpdateOperation::Insert {
                     after_task_id: Some("t1".to_string()),
                     task: follow_up.spec(),
                 }],
@@ -3030,16 +3030,16 @@ mod tests {
     }
 
     #[test]
-    fn plan_patch_rejects_running_task_contract_change() -> Result<(), StoreError> {
+    fn task_update_rejects_running_task_contract_change() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
-        let result = store.patch_plan(
+        let result = store.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "change active ownership".to_string(),
-                operations: vec![PlanPatchOperation::Update {
+                operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
                     patch: TaskPatch {
                         files: Some(vec!["src/new-owner.rs".to_string()]),
@@ -3082,7 +3082,7 @@ mod tests {
         assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
     }
 
-    /// `plan_patch` rejects a dependency cycle and appends no revision event.
+    /// `task_update` rejects a dependency cycle and appends no revision event.
     #[test]
     fn file_path_rejects_dependency_cycle_and_appends_no_event() {
         let s = fresh();
@@ -3123,12 +3123,12 @@ mod tests {
         let before = s.list_events("r1", 0).unwrap().len();
         // Now make t1 depend on t2 → cycle.
         let err = s
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "introduce invalid cycle".to_string(),
-                    operations: vec![PlanPatchOperation::Update {
+                    operations: vec![TaskUpdateOperation::Update {
                         task_id: "t1".to_string(),
                         patch: TaskPatch {
                             depends_on: Some(vec!["t2".into()]),

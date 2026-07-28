@@ -143,7 +143,7 @@ pub fn build_tauri_app(
             // TaskRuntime dynamic plan and recovery controls
             commands::task_runtime::resume_task_run,
             commands::task_runtime::retry_blocked_task,
-            commands::task_runtime::patch_task_plan,
+            commands::task_runtime::update_tasks,
             commands::task_runtime::pause_task_run,
             commands::task_runtime::cancel_task_run,
             // TaskRuntime progress ledger (PR 4)

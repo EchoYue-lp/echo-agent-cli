@@ -475,7 +475,7 @@ mod tests {
             domain_profile: DomainProfile::AiCoding,
             goal: "修复上下文压缩继承".to_string(),
             assumptions: vec!["运行态来自文件 store".to_string()],
-            risks: vec!["自动压缩发生在 plan_execute 之前".to_string()],
+            risks: vec!["自动压缩发生在 task_execute 之前".to_string()],
             execution_mode: ExecutionMode::Parallel,
             tasks: vec![
                 PlanTask {

@@ -163,13 +163,42 @@ DAG loop, dependency validator, or generic retry state machine.
 - Removed EKO write/shell/LLM limits from the framework API. The generic kernel
   exposes only `max_concurrent_subagents`; EKO owns `EkoExecutionLimits` and
   consumes its remaining semaphores in the application adapter.
+- Moved `TaskManager::detect_circular_dependencies` onto the canonical
+  `PlanValidator` dependency analysis and deleted the old manager-local DFS and
+  `VisitState`. Framework cycle queries and structural validation can no longer
+  drift into different graph semantics.
 - Removed panic-prone `unwrap`, `expect`, direct indexing, and explicit panic
   branches from the touched EKO executor tests.
 
+## Phase 5 Completed: Unified Task Relation API
+
+- Replaced the product tool surface `plan_create/plan_patch/plan_execute` with
+  `task_create/task_update/task_execute`; `task_list` remains the shared query.
+  There are no compatibility aliases or two simultaneously registered APIs.
+- `task_create` accepts one task or an atomic task batch. A later call appends
+  to the same TaskRun graph through the existing revision/CAS transaction, so a
+  one-row todo and a dependency DAG are the same runtime model.
+- `task_update` and the GUI/Tauri `updateTasks/update_tasks` endpoint use the
+  same `TaskUpdateRequest` and store transaction. The former plan patch types
+  and endpoint names were removed.
+- `task_execute` consumes an exact committed `revision`; runtime claims,
+  Subagent dispatch, completion, retry, cancellation, and acceptance remain
+  executor-owned and cannot be forged by task CRUD.
+- Chat, Auto, and Task modes expose the same task relation API. Mode prompts
+  choose when to use it; they no longer create different capability surfaces.
+- EKO removes the framework process-global `todo_write` when TaskRuntime tools
+  are registered. The reusable framework tool remains available to other
+  framework consumers, while EKO has only one task id, state, event, and UI
+  authority.
+- `TaskPlan` remains only the versioned graph artifact persisted by EKO, and
+  `TodoItem` remains only a GUI/TUI projection. Neither owns scheduling or an
+  independent task lifecycle.
+
 ## Remaining Work
 
-No duplicate DAG executor, structural validator, runtime status model,
-canonical task-spec name, or unclaimed dispatch path remains. Operational
+No duplicate task CRUD surface, todo authority, DAG executor, structural
+validator, runtime status model, canonical task-spec name, or unclaimed
+dispatch path remains. Operational
 follow-up is limited to observing real long-running GUI/TUI/CLI/channel runs for
 claim conflicts, safe-point reload, cancellation, durable Subagent reuse, and
 worktree finalization.
@@ -182,6 +211,8 @@ worktree finalization.
 - Framework `PlanValidator` tests cover acyclic runtime specs, dangling
   dependencies (including non-blocking authoring edges), cycles,
   spec/execution identity mismatch, and authoring-field preservation.
+- Framework `TaskManager` cycle and topological-query tests exercise the same
+  canonical dependency analysis used by `PlanValidator`.
 - Framework `TaskExecutor` tests cover full-kernel dependency order, failure
   propagation, cancellation, disabled timeout, UTF-8-safe context projection,
   and the retained per-task execution capabilities.

@@ -4,7 +4,7 @@ const mocks = vi.hoisted(() => ({
   pauseRun: vi.fn(),
   resumeRun: vi.fn(),
   resolveRecoveryTask: vi.fn(),
-  patchPlan: vi.fn(),
+  updateTasks: vi.fn(),
   latestRunForConversation: vi.fn(),
   getPlan: vi.fn(),
   listTodos: vi.fn(),
@@ -46,7 +46,7 @@ describe('taskRuntimeStore recovery controls', () => {
     mocks.pauseRun.mockResolvedValue({ success: true, run_id: 'run-1' });
     mocks.resumeRun.mockResolvedValue({ kind: 'resumed', run_id: 'run-1' });
     mocks.resolveRecoveryTask.mockResolvedValue(undefined);
-    mocks.patchPlan.mockResolvedValue({ run_id: 'run-1', revision: 4 });
+    mocks.updateTasks.mockResolvedValue({ run_id: 'run-1', revision: 4 });
     useTaskRuntimeStore.getState().reset();
     useTaskRuntimeStore.setState({
       activeRun: { run_id: 'run-1', status: 'paused' } as TaskRun,
@@ -85,7 +85,7 @@ describe('taskRuntimeStore recovery controls', () => {
 
     await useTaskRuntimeStore.getState().updateTask('task-1', { title: 'Refined title' });
 
-    expect(mocks.patchPlan).toHaveBeenCalledWith('run-1', {
+    expect(mocks.updateTasks).toHaveBeenCalledWith('run-1', {
       base_revision: 3,
       reason: '更新任务：task-1',
       operations: [

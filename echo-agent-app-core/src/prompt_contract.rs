@@ -114,7 +114,7 @@ mod tests {
                 max_tokens: 900,
                 required_phrases: &[
                     "## Task And Delegation Tools",
-                    "### Formal Plan Contract",
+                    "### Task Graph Contract",
                     "### Complex Run Contract",
                     "verification",
                 ],

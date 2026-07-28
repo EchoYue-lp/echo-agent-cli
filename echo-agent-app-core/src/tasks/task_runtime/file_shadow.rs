@@ -393,9 +393,9 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest,
-        PlanRevision, PlanTask, PlanTaskKind, RuntimeEventKind, TaskPatch, TaskPlan, TaskRunStatus,
-        TodoStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, PlanTaskKind,
+        RuntimeEventKind, TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation,
+        TaskUpdateRequest, TodoStatus,
     };
     use std::sync::Arc;
 
@@ -462,12 +462,12 @@ mod tests {
         };
         store.attach_plan(&plan).unwrap();
         store
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "rename task".to_string(),
-                    operations: vec![PlanPatchOperation::Update {
+                    operations: vec![TaskUpdateOperation::Update {
                         task_id: "t1".to_string(),
                         patch: TaskPatch {
                             title: Some("renamed t1".to_string()),
@@ -631,12 +631,12 @@ mod tests {
         store.attach_plan(&plan).unwrap();
         // Reorder: move t3 to front.
         store
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "prioritize t3".to_string(),
-                    operations: vec![PlanPatchOperation::Reorder {
+                    operations: vec![TaskUpdateOperation::Reorder {
                         task_ids: vec!["t3".to_string(), "t1".to_string(), "t2".to_string()],
                     }],
                 },
@@ -644,12 +644,12 @@ mod tests {
             .unwrap();
         assert_parity(&store, &shadow, "r1");
         store
-            .patch_plan(
+            .update_tasks(
                 "r1",
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 2,
                     reason: "t2 is no longer required".to_string(),
-                    operations: vec![PlanPatchOperation::Skip {
+                    operations: vec![TaskUpdateOperation::Skip {
                         task_id: "t2".to_string(),
                     }],
                 },

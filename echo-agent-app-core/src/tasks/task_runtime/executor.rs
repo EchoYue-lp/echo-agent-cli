@@ -829,7 +829,7 @@ impl TaskDispatcher for RealTaskDispatcher {
             let cancel = context.cancel;
             let delegation_policy = context.delegation_policy;
             // Scope run_id + cancel + trace_sink into task-local so Subagent-internal
-            // tools (task_*/plan_execute, and their execute_with_context
+            // tools (task_*/task_execute, and their execute_with_context
             // fallback path) and L3 nested Subagents can read them.
             // NOTE: trace_sink/cancel are also passed as explicit params to
             // execute_task (which uses them directly, not via task_local) — but
@@ -2206,7 +2206,7 @@ async fn execute_task(
             // (see put_summary above). They are NOT auto-inserted into the plan —
             // doing so caused unbounded plan expansion + dependent tasks to wait
             // forever on looping parents. The primary agent / user can promote a
-            // suggestion via plan_patch when desired. Record a Note so the
+            // suggestion via task_update when desired. Record a Note so the
             // suggestions are visible in the event stream regardless.
             if !suggested_tasks.is_empty() {
                 let titles: Vec<&str> = suggested_tasks.iter().map(|s| s.title.as_str()).collect();
@@ -2215,7 +2215,7 @@ async fn execute_task(
                     Some(&task_id),
                     &format!(
                         "subagent suggested {} follow-up task(s): [{}]. \
-                         Not auto-inserted into plan; promote via plan_patch if desired.",
+                         Not auto-inserted into plan; promote via task_update if desired.",
                         suggested_tasks.len(),
                         titles.join("; "),
                     ),
@@ -2685,11 +2685,11 @@ fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_core::to
     // `ExternalRunContext.trace_sink`. The app's `scoped_with_ctx_run_id`
     // (task_tools.rs) reads `ctx.trace_sink` back and re-scopes it into
     // `CURRENT_TRACE_SINK` so tools running inside a spawned task (e.g.
-    // `plan_execute`) can emit execution-flow events.
+    // `task_execute`) can emit execution-flow events.
     //
     // Subagent dispatch itself does NOT use this path — it goes through
     // `SubagentEventBus`. This conversion is only for the main-agent tool path
-    // (plan_execute / plan_create) that runs inside the framework's spawned
+    // (task_execute / task_create) that runs inside the framework's spawned
     // tool executor and needs to reach the trace_sink.
     trace_sink.map(|sink| {
         Arc::new(move |value: serde_json::Value| {
@@ -3364,18 +3364,18 @@ fn save_trace(
 /// background AgentChat) and route.
 ///
 /// Creates a run, then drives the agent's ReAct loop in the run's context so
-/// the agent itself calls `plan_create` (to materialise the plan) and
-/// `plan_execute` (which internally calls `execute_run`). Simple prompts that
-/// the agent answers directly (without `plan_execute`) auto-Complete.
+/// the agent itself calls `task_create` (to materialise the plan) and
+/// `task_execute` (which internally calls `execute_run`). Simple prompts that
+/// the agent answers directly (without `task_execute`) auto-Complete.
 ///
 /// **Why not call `execute_run` directly?** `execute_run` requires a plan to
 /// already exist (`store.get_plan → NoPlan` if absent). The plan is created
-/// by the agent during its ReAct loop via the `plan_create` tool. Skipping
+/// by the agent during its ReAct loop via the `task_create` tool. Skipping
 /// the agent loop would leave the plan empty and the run would fail
 /// immediately. This mirrors how `launch_unified_run` (chat path) works.
 ///
 /// The run is created with `attended_mode = Unattended` so the configured
-/// write preflight applies inside `plan_execute` / `execute_task`.
+/// write preflight applies inside `task_execute` / `execute_task`.
 #[allow(clippy::too_many_arguments)] // run identity + Agent + cancellation + write policy form the driver boundary
 pub async fn launch_unattended_run(
     store: Arc<TaskRuntimeStore>,
@@ -3448,8 +3448,8 @@ pub async fn drive_unattended_run(
 }
 
 /// Drive an already-created Run through an independent primary Agent's ReAct
-/// loop. The Agent may materialize a plan through `plan_create` +
-/// `plan_execute`; direct completion is controlled by [`RunPlanPolicy`].
+/// loop. The Agent may materialize a plan through `task_create` +
+/// `task_execute`; direct completion is controlled by [`RunPlanPolicy`].
 ///
 /// Unattended direct read-only work stays in the original checkout. Workspace
 /// mutation is routed through formal writer PlanTasks, whose existing Subagent
@@ -3485,7 +3485,7 @@ pub async fn drive_agent_run(
         .unwrap_or_default();
 
     // Drive the Agent's ReAct loop in the run's context. It may call
-    // plan_create + plan_execute; attended_mode on the persisted run controls
+    // task_create + task_execute; attended_mode on the persisted run controls
     // whether unattended preflight applies.
     let run_id_for_scope = run_id.to_string();
     let cancel_for_scope = child_cancel.clone();
@@ -3522,7 +3522,7 @@ pub async fn drive_agent_run(
             let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
 
             // Execute the prompt. The agent's ReAct loop will call
-            // plan_create + plan_execute, which runs the plan through
+            // task_create + task_execute, which runs the plan through
             // execute_run with all safety gates (preflight, approval skip).
             match agent
                 .execute_stream_with_invocation_context(
@@ -3597,7 +3597,7 @@ pub async fn drive_agent_run(
         }
     }
 
-    // Determine final outcome from the store (plan_execute/execute_run
+    // Determine final outcome from the store (task_execute/execute_run
     // may have already transitioned the run to a terminal state).
     let final_status = store.get_run(run_id).ok().flatten().map(|r| r.status);
 
@@ -3748,7 +3748,7 @@ const UNATTENDED_READONLY_TOOLS: &[&str] = &[
     "glob",
     "code_search",
     "task_list",
-    "plan_execute", // plan materialisation trigger
+    "task_execute", // plan materialisation trigger
     // Read-only network (§A = A2)
     "web_search",
     "web_fetch",
@@ -3866,8 +3866,8 @@ mod tests {
         assert!(disabled.contains("write_file"));
         assert!(disabled.contains("git_commit"));
         assert!(!disabled.contains("read_file"));
-        assert!(!disabled.contains("plan_create"));
-        assert!(!disabled.contains("plan_execute"));
+        assert!(!disabled.contains("task_create"));
+        assert!(!disabled.contains("task_execute"));
 
         let prompt = unattended_run_prompt(
             "update the implementation",
@@ -4269,7 +4269,7 @@ Read the runtime path and found one missing branch.
     async fn launch_unattended_run_returns_run_id() -> Result<(), String> {
         // Phase 3.4-1: launch_unattended_run must return the run_id so callers
         // (submit) can hand it to the Tauri layer. A simple prompt (mock returns
-        // "ok", agent never calls plan_execute) auto-Completes (Q5).
+        // "ok", agent never calls task_execute) auto-Completes (Q5).
         use echo_agent::testing::MockLlmClient;
         use std::sync::Arc;
         let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -4303,7 +4303,7 @@ Read the runtime path and found one missing branch.
         .await
         .map_err(|error| error.to_string())?;
         // The returned id must key a real run that auto-Completed (the mock
-        // returns a direct answer, so plan_execute never runs and the finalize
+        // returns a direct answer, so task_execute never runs and the finalize
         // branch auto-Completes — this verifies the contract survived the
         // extraction: a non-empty id that maps to a Completed run).
         let run = store
@@ -5266,12 +5266,12 @@ Read the runtime path and found one missing branch.
         }
 
         store
-            .patch_plan(
+            .update_tasks(
                 &run_id,
-                &PlanPatchRequest {
+                &TaskUpdateRequest {
                     base_revision: 1,
                     reason: "runtime evidence discovered a required follow-up".to_string(),
-                    operations: vec![PlanPatchOperation::Insert {
+                    operations: vec![TaskUpdateOperation::Insert {
                         after_task_id: Some("first".to_string()),
                         task: second.spec(),
                     }],

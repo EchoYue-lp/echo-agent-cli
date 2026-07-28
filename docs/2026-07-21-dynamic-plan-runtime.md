@@ -27,10 +27,10 @@ revision model.
 
 ## Runtime Contract
 
-1. `plan_create` submits the complete DAG in one call.
-2. `plan_patch(base_revision, operations, reason)` performs optimistic
+1. `task_create` submits the complete DAG in one call.
+2. `task_update(base_revision, operations, reason)` performs optimistic
    concurrency control and commits one new revision.
-3. `plan_execute(plan_revision)` executes exactly that committed revision.
+3. `task_execute(revision)` executes exactly that committed revision.
 4. Running and completed task specifications are immutable. Pending and
    blocked nodes may be revised at scheduler safe points.
 5. Completed attempts are never restarted by a plan revision. Only explicit
@@ -58,7 +58,7 @@ after each wave, after a review result, and before a paused run resumes. An
 active wave is never implicitly restarted. Run completion is committed only
 after a locked recheck confirms that the latest revision has no running or
 runnable tasks. Subagent suggestions remain advisory evidence in the execution
-summary; the main Agent or user may promote them through `plan_patch`, but they
+summary; the main Agent or user may promote them through `task_update`, but they
 do not silently expand or block the plan.
 
 ## Industry Basis
@@ -78,8 +78,8 @@ References:
 ## Delivered
 
 1. Add revisioned plan specification and independent run-state projection.
-2. Replace repeated single-node materialization with atomic `plan_create` and
-   add `plan_patch`.
+2. Replace repeated single-node materialization with atomic `task_create` and
+   add `task_update`.
 3. Enforce revision, terminal-state, capability, and transition validation.
 4. Reload revisions at scheduler safe points and prevent duplicate attempts.
 5. Migrate GUI, TUI, CLI, and channel projections to the same service.

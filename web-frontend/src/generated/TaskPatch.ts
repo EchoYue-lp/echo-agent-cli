@@ -2,7 +2,7 @@
 import type { PlanTaskKind } from './PlanTaskKind';
 
 /**
- * Partial specification update used by a revisioned [`PlanPatchOperation`].
+ * Partial specification update used by a revisioned [`TaskUpdateOperation`].
  */
 export type TaskPatch = {
   title: string | null;

@@ -131,7 +131,7 @@ echo-agent-cli / echo-agent-app-core
   tasks/task_runtime/
     types.rs          # EKO-specific run/plan/todo envelopes, or adapters
     store.rs          # file-backed authority
-    execute_plan_tool.rs
+    task_execute_tool.rs
     executor_adapter.rs
     event_rebuild.rs
     file_shadow.rs
@@ -257,8 +257,9 @@ Findings:
 
 - `spawn_background_task` / `check_task_status` remain generic framework
   background-task tools.
-- `todo_write` remains a generic scratch planning artifact, separate from EKO
-  `task_*` tools and TaskRuntime UI state.
+- `todo_write` remains a generic framework scratch planning artifact for other
+  consumers. EKO removes it when registering its unified `task_*` relation API,
+  so TaskRuntime and its UI never expose a second task authority.
 - `agent_tool` remains the generic framework delegate tool. EKO decides whether
   a role receives it via capability / registration policy.
 - EKO-specific concrete tools (`task_create/update/complete/skip/list`,

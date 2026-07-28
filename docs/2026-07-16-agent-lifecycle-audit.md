@@ -172,7 +172,7 @@ Research/Data/Writing pipeline 使用 framework `TaskManager/TaskExecutor`；Age
 
 ### P1-1 plan approval 借用 Paused
 
-`execute_plan_tool` 对 `ComplexRuntime` 执行 `Running -> Paused`，注册进程内 `Notify` 并等待最多 300 秒：`execute_plan_tool.rs:466-521`。`resume_task_run` 先尝试把“resume”解释为“approve”，找不到 signal 才执行真正 resume：`src/tauri/commands/task_runtime.rs:242-268`。
+`task_execute_tool` 对 `ComplexRuntime` 执行 `Running -> Paused`，注册进程内 `Notify` 并等待最多 300 秒：`task_execute_tool.rs:466-521`。`resume_task_run` 先尝试把“resume”解释为“approve”，找不到 signal 才执行真正 resume：`src/tauri/commands/task_runtime.rs:242-268`。
 
 影响：暂停原因不可从六态判断；进程重启后 approval signal 丢失；用户 resume 与批准 plan 的命令语义混合。
 

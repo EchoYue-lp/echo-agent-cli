@@ -300,8 +300,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest, PlanTask, PlanTaskKind,
-        TaskPatch, TaskPlan, TodoStatus,
+        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan,
+        TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
     };
 
     fn fresh() -> TaskRuntimeStore {
@@ -452,12 +452,12 @@ mod tests {
             tasks: vec![sample_task("t1", PlanTaskKind::Investigation)],
         })
         .unwrap();
-        s.patch_plan(
+        s.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "refine investigation".to_string(),
-                operations: vec![PlanPatchOperation::Update {
+                operations: vec![TaskUpdateOperation::Update {
                     task_id: "t1".to_string(),
                     patch: TaskPatch {
                         title: Some("renamed".to_string()),

@@ -22,7 +22,7 @@ import { SubagentStreamBlock } from './SubagentStreamBlock';
  * messageId (non-chat path), it falls back to the latest assistant message.
  *
  * `parent` means parent **subagent_run_id** (nested subagent), NOT the parent
- * agent name. Top-level agent_tool / plan_execute subagents omit parent.
+ * agent name. Top-level agent_tool / task_execute subagents omit parent.
  */
 interface ParallelExecutionBlockProps {
   messageId: string;

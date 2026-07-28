@@ -54,7 +54,7 @@ pub fn tool_output_artifact_config(
 }
 
 /// Guide appended to the system prompt when task management tools are
-/// available. Instructs the agent to actively manage its task plan and
+/// available. Instructs the agent to actively manage its task graph and
 /// proactively dispatch readonly subagents for investigation-heavy work
 /// (对齐 Claude Code 的 subagent:轻量派发是工具,正式并行是 runtime).
 pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
@@ -63,19 +63,19 @@ pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 Choose the lightest reliable mechanism:
 - Direct work: simple questions, narrow edits, short tool sequences.
-- `agent_tool`: one bounded Chat subtask. Fresh, no TaskRuntime entry; fork only for required history.
-- `plan_create` + `task_list` + `plan_execute({plan_revision: N})`: the required path for any delegated work in Auto or Task mode, and for dependencies, parallel work, writers, or verification.
+- `agent_tool`: one bounded Chat subtask with no TaskRuntime entry.
+- `task_create` + `task_list` + `task_execute({revision: N})`: one visible task or a dependency DAG. Use it for delegation, parallel work, writers, or verification.
 - `create_complex_task`: a long-lived Run for cross-turn or substantial orchestration.
 
-### Formal Plan Contract
-- Use the user's language for task titles, descriptions, and Subagent briefs; preserve technical identifiers. Give each task a concrete outcome, kind, role, targets, dependencies, and verification.
-- Verification splits into `execution_checks` (shell commands requiring observed pass, e.g. `cargo test`) and `acceptance_criteria` (semantic statements a reviewer judges against the output). Never declare acceptance passed yourself.
-- A completed Subagent is not a completed PlanTask. Tasks Blocked on acceptance pause the run for an explicit retry, never auto-redispatch.
-- The TaskRun already represents the user goal. Do not create a wrapper, placeholder, or prose-only summary task for that goal; materialize only work a Subagent will actually execute.
-- One `plan_create` atomically creates the complete initial DAG. Give every task a stable ID, submit all dependencies in that call, then pass the returned revision to `plan_execute`.
+### Task Graph Contract
+- Use the user's language for task titles and Subagent briefs; preserve technical identifiers. Give each task a concrete outcome, role, targets, dependencies, and verification.
+- `execution_checks` require an observed command pass; `acceptance_criteria` are semantic reviewer judgments. Never declare acceptance passed yourself.
+- A completed Subagent is not a completed Task. Acceptance failure blocks for an explicit retry.
+- TaskRun already represents the goal. Do not create a wrapper or prose-only summary task; materialize only executable work.
+- `task_create` accepts one task or an atomic batch. Give every task a stable ID, declare dependencies when they exist, and pass the returned revision to `task_execute`.
 - Read-only tasks may run in parallel. Writers must declare owned files or artifacts.
-- Keep plans truthful with `plan_patch` and `task_list`. A patch must include the latest `base_revision`; only the runtime marks completion.
-- Do not claim dispatch before `plan_execute` accepts the full plan.
+- Keep the graph truthful with `task_update` and `task_list`. Existing graphs require the latest `base_revision`; only the runtime marks completion.
+- Do not claim dispatch before `task_execute` accepts the committed revision.
 - Background `agent_tool` finishes through events. Never poll its `execution_id` with task-status tools.
 - After execution, synthesize evidence and answer the original goal.
 
@@ -115,7 +115,7 @@ pub struct AgentCreateParams {
     /// isolated checkout. None = use process cwd (backward compatible).
     pub working_dir: Option<std::path::PathBuf>,
     /// TaskRuntime store handle. When supplied, `create_agent` registers the
-    /// task-management tools (plan_create/update/complete/skip/list) so the
+    /// task-management tools (task_create/task_update/task_list) so the
     /// main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     /// Shared application-owned managed browser runtime. The same instance is
@@ -260,10 +260,10 @@ pub async fn create_agent_with_diagnostics(
         .enable_memory()
         // EKO owns planning through TaskRuntime. The framework's optional
         // background-task tools use a separate store and must not be exposed
-        // alongside plan_create/plan_execute.
+        // alongside task_create/task_execute.
         .enable_subagent()
         .subagent_prompt_compiler(subagent_prompt_compiler.clone())
-        .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside plan_execute
+        .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside task_execute
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
@@ -476,15 +476,19 @@ pub async fn create_agent_with_diagnostics(
     register_default_hooks(&mut agent);
 
     // Register task-management tools when a TaskRuntimeStore is available.
-    // These let the main Agent atomically create, revise, and inspect plans.
+    // These let the main Agent atomically create, revise, and inspect one
+    // task graph shared by the todo and DAG projections.
     // The store handle is threaded from AppState → SharedResources → params.
     if let Some(store) = &params.task_runtime_store {
         use crate::tasks::task_runtime::task_tools::{
-            PlanCapabilityCatalog, PlanPatchTool, TaskCreateTool, TaskListTool,
+            TaskCapabilityCatalog, TaskCreateTool, TaskListTool, TaskUpdateTool,
         };
         let store = Arc::clone(store);
+        // EKO uses TaskRuntime as its only task authority. The framework's
+        // standalone todo scratchpad remains available to other consumers.
+        agent.remove_tool("todo_write");
         let tool_names = agent.tool_names();
-        let capabilities = Arc::new(PlanCapabilityCatalog::new(
+        let capabilities = Arc::new(TaskCapabilityCatalog::new(
             subagent_catalog_snapshot.clone(),
             tool_names,
         ));
@@ -492,7 +496,7 @@ pub async fn create_agent_with_diagnostics(
             store: Arc::clone(&store),
             capabilities: capabilities.clone(),
         }));
-        agent.add_tool(Box::new(PlanPatchTool {
+        agent.add_tool(Box::new(TaskUpdateTool {
             store: Arc::clone(&store),
             capabilities,
         }));
@@ -500,7 +504,7 @@ pub async fn create_agent_with_diagnostics(
             store: Arc::clone(&store),
         }));
         tracing::info!(
-            "Registered revisioned task-management tools (plan_create/plan_patch/task_list)"
+            "Registered revisioned task-management tools (task_create/task_update/task_list)"
         );
     }
 
@@ -1493,7 +1497,7 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
         {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
             // Include echo_agent_app_core so the task_runtime module's traces
-            // (plan_execute/execute_run/drain loop) are visible by default.
+            // (task_execute/execute_run/drain loop) are visible by default.
             // Previously this crate was omitted, silently hiding all B1-B7
             // instrumentation unless RUST_LOG was set explicitly.
             let default_filter = format!(

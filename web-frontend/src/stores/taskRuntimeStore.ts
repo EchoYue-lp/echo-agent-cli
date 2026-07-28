@@ -27,7 +27,7 @@ import type {
   RecoveryBlocker,
   TaskSpec,
   TaskPatch,
-  PlanPatchOperation,
+  TaskUpdateOperation,
 } from '../generated';
 
 type RunSnapshot = {
@@ -97,7 +97,7 @@ export interface TaskRuntimeState {
   pause: (runId: string) => Promise<void>;
   openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
   dismissInterruptPrompt: () => void;
-  patchPlan: (reason: string, operations: PlanPatchOperation[]) => Promise<void>;
+  updateTasks: (reason: string, operations: TaskUpdateOperation[]) => Promise<void>;
   insertTask: (afterTaskId: string | null, task: TaskSpec) => Promise<void>;
   skipTask: (taskId: string) => Promise<void>;
   updateTask: (taskId: string, patch: Partial<TaskPatch>) => Promise<void>;
@@ -256,15 +256,15 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   openInterruptPrompt: (data) => set({ interruptPrompt: data }),
   dismissInterruptPrompt: () => set({ interruptPrompt: null }),
 
-  patchPlan: async (reason, operations) => {
+  updateTasks: async (reason, operations) => {
     const runId = get().activeRun?.run_id;
     const baseRevision = get().plan?.revision;
     if (!runId || baseRevision === undefined) {
-      set({ error: '当前任务计划尚未就绪，无法修改' });
+      set({ error: '当前任务图尚未就绪，无法修改' });
       return;
     }
     try {
-      const plan = await taskRuntimeApi.patchPlan(runId, {
+      const plan = await taskRuntimeApi.updateTasks(runId, {
         base_revision: baseRevision,
         reason,
         operations,
@@ -277,20 +277,20 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     }
   },
   insertTask: async (afterTaskId, task) => {
-    await get().patchPlan(`新增任务：${task.title}`, [
+    await get().updateTasks(`新增任务：${task.title}`, [
       { op: 'insert', after_task_id: afterTaskId, task },
     ]);
   },
   skipTask: async (taskId) => {
-    await get().patchPlan(`跳过任务：${taskId}`, [{ op: 'skip', task_id: taskId }]);
+    await get().updateTasks(`跳过任务：${taskId}`, [{ op: 'skip', task_id: taskId }]);
   },
   updateTask: async (taskId, patch) => {
-    await get().patchPlan(`更新任务：${taskId}`, [
+    await get().updateTasks(`更新任务：${taskId}`, [
       { op: 'update', task_id: taskId, patch: completeTaskPatch(patch) },
     ]);
   },
   reorderTasks: async (newOrder) => {
-    await get().patchPlan('调整任务顺序', [{ op: 'reorder', task_ids: newOrder }]);
+    await get().updateTasks('调整任务顺序', [{ op: 'reorder', task_ids: newOrder }]);
   },
   resumeTaskRun: async () => {
     const runId = get().activeRun?.run_id;

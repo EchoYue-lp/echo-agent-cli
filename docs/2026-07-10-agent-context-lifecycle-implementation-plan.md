@@ -51,7 +51,7 @@
 - Modify: `echo-agent-app-core/src/chat_driver.rs`
 - Modify: `echo-agent-app-core/src/infra.rs`
 - Modify: `echo-agent-app-core/src/tasks/task_runtime/task_tools.rs`
-- Modify: `echo-agent-app-core/src/tasks/task_runtime/execute_plan_tool.rs`
+- Modify: `echo-agent-app-core/src/tasks/task_runtime/task_execute_tool.rs`
 - Modify: `echo-agent-app-core/src/tasks/task_runtime/executor.rs`
 - Modify: `src/tauri/commands/panels.rs`
 
@@ -61,14 +61,14 @@
 - Runtime contract uses `isolation_requested`; observed fallback emits `isolation_observed = "primary-fallback"`.
 
 - [x] Add failing capsule tests: replacing an existing run with a no-plan run removes the old capsule; repeated refresh leaves exactly one current capsule.
-- [x] Add failing tool tests asserting `task_create` and every `plan_execute` outcome omit `RUNTIME_RECOVERY_MARKER`.
+- [x] Add failing tool tests asserting `task_create` and every `task_execute` outcome omit `RUNTIME_RECOVERY_MARKER`.
 - [x] Register/replace the per-turn projector in `drive_chat_inner`; remove one-shot upsert and remove `append_runtime_recovery_capsule`.
 - [x] Keep `[task_context]` protection for the current Fork invocation. Add a framework regression test confirming two sequential `execute_stream` calls reset prior task messages; make no production reset change if the test passes.
 - [x] Add failing evidence tests for Markdown links, `path:start-end`, URL rejection, and slash prose such as `and/or`.
 - [x] Tighten extraction to explicit Markdown destinations and credible file references with a filename extension or recognized relative/absolute path prefix.
 - [x] Add requested/observed isolation fields to execution events and emit the observed primary fallback when writer dispatch falls back.
 - [x] Replace hardcoded protected marker checks in `get_compression_stats` with `ContextManager::protected_message_count()`.
-- [x] Run focused app-core tests for `compact_context`, `task_tools`, `plan_execute`, and `evidence_path`.
+- [x] Run focused app-core tests for `compact_context`, `task_tools`, `task_execute`, and `evidence_path`.
 
 ### Task 3: Pure frontend context/usage helpers with red-green tests
 

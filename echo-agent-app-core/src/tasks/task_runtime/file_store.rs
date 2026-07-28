@@ -414,8 +414,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest, PlanTask,
-        PlanTaskKind, TaskPlan, TaskRunStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan,
+        TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest,
     };
     use std::sync::Arc;
 
@@ -534,7 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn plan_patch_status_overrides_earlier_task_events() -> Result<(), Box<dyn std::error::Error>> {
+    fn task_update_status_overrides_earlier_task_events() -> Result<(), Box<dyn std::error::Error>>
+    {
         let tmp = tempfile::tempdir()?;
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
@@ -566,12 +567,12 @@ mod tests {
             Some("reviewer"),
             Some("review needs fix"),
         )?;
-        store.patch_plan(
+        store.update_tasks(
             "r1",
-            &PlanPatchRequest {
+            &TaskUpdateRequest {
                 base_revision: 1,
                 reason: "result already incorporated".to_string(),
-                operations: vec![PlanPatchOperation::Skip {
+                operations: vec![TaskUpdateOperation::Skip {
                     task_id: "t1".to_string(),
                 }],
             },

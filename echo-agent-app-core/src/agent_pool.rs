@@ -106,7 +106,7 @@ pub struct SharedResources {
         Option<Arc<echo_agent::agent::react::run::pipeline::ToolExecutionPipeline>>,
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     /// TaskRuntime store handle. When present, pool agents get the task
-    /// management tools (plan_create/update/complete/skip/list) registered so
+    /// management tools (task_create/task_update/task_list) registered so
     /// the main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
@@ -213,7 +213,7 @@ pub struct AgentPool {
 
 impl AgentPool {
     /// Inject the TaskRuntimeStore so subsequently-created pool agents get
-    /// the task-management tools (plan_create/update/complete/skip/list)
+    /// the task-management tools (task_create/task_update/task_list)
     /// registered. Must be called before any pool agent is created (i.e. right
     /// after AppState builds the store). Existing pool agents are unaffected.
     pub fn set_task_runtime_store(
@@ -840,7 +840,7 @@ impl AgentPool {
             // Thread the TaskRuntimeStore so pooled agents get task-management
             // tools registered (matches the primary agent wiring).
             // route is intentionally None for pooled agents (subagents never get
-            // plan_execute per §10.2).
+            // task_execute per §10.2).
             task_runtime_store: self.shared.task_runtime_store.clone(),
             browser_runtime: self.shared.browser_runtime.clone(),
         };
@@ -943,7 +943,7 @@ impl AgentPool {
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 
-        // subagent 不注册 agent_tool 或 plan_execute——§10.2 防止递归派发;
+        // subagent 不注册 agent_tool 或 task_execute——§10.2 防止递归派发;
         // 因此 subagent 本身没有继续派发工具,
         // 需要子任务时自己用文件工具完成。)
 

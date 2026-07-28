@@ -119,7 +119,7 @@ impl AgentRuntime {
 
         let agent_handle = AgentHandle::new(agent);
 
-        // ── NOTE: ExecutePlanTool + the task-management tools are NOT registered
+        // ── NOTE: ExecuteTaskTool + the task-management tools are NOT registered
         // here. The TaskRuntimeStore doesn't exist yet at primary-agent build
         // time (GUI: AppState creates it later; TUI: built in main.rs after
         // bootstrap), so BOTH entry points call `register_task_tools_on_agent`

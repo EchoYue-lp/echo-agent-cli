@@ -13,7 +13,7 @@ use echo_agent::tasks::progress::TaskProgress;
 
 use super::background::BackgroundTaskKind;
 use super::task_runtime::{
-    AttendedMode, DomainProfile, ExecutePlanTool, ExecutionMode, MemoryPolicy, PlanTask,
+    AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanTask,
     RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRun, TaskRunStatus, TaskRuntimeStore,
     TodoStatus, UnattendedWriteMode,
 };
@@ -425,7 +425,7 @@ impl BackgroundTaskService {
                 .await
                 .map(|_| run_id.clone()),
                 Ok(None) => {
-                    register_plan_execute(&agent, store.clone()).await;
+                    register_task_execute(&agent, store.clone()).await;
                     super::task_runtime::drive_unattended_run(
                         store.clone(),
                         agent,
@@ -843,8 +843,8 @@ fn finish_running_failure(store: &TaskRuntimeStore, run_id: &str, error: &str) {
     }
 }
 
-async fn register_plan_execute(agent: &AgentHandle, store: Arc<TaskRuntimeStore>) {
-    let tool = ExecutePlanTool::new(store, agent.clone());
+async fn register_task_execute(agent: &AgentHandle, store: Arc<TaskRuntimeStore>) {
+    let tool = ExecuteTaskTool::new(store, agent.clone());
     agent
         .write(|agent| {
             agent.add_tool(Box::new(tool));

@@ -222,7 +222,7 @@ impl SubagentCatalogSnapshot {
     pub fn prompt(&self) -> String {
         let mut output = String::from(
             "\n## Available Subagents (agent_tool)\n\
-             Use agent_tool for bounded side work and plan_execute for formal DAG execution.\n\
+             Use agent_tool for bounded side work and task_execute for formal DAG execution.\n\
              Default context is fresh; use mode=fork only when recent conversation turns are required.\n",
         );
         for entry in &self.entries {

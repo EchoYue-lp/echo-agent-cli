@@ -7,8 +7,8 @@
 //! store is ready. Pooled agents instead get the tools via
 //! `SharedResources.task_runtime_store`.
 //!
-//! Registers the revisioned PlanCreate/PlanPatch/TaskList contract plus
-//! CreateComplexTask / CheckRunStatus / CancelRun and `plan_execute`.
+//! Registers the revisioned TaskCreate/TaskUpdate/TaskList contract plus
+//! CreateComplexTask / CheckRunStatus / CancelRun and `task_execute`.
 //!
 //! TUI/GUI functional parity (AGENTS.md): both entry points call this so the
 //! primary agent can drive complex tasks (plan / subagent / run lifecycle) via
@@ -17,20 +17,28 @@
 use std::sync::Arc;
 
 use crate::agent_handle::AgentHandle;
-use crate::tasks::task_runtime::execute_plan_tool::ExecutePlanTool;
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
+use crate::tasks::task_runtime::task_execute_tool::ExecuteTaskTool;
 use crate::tasks::task_runtime::task_tools::{
-    CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, PlanCapabilityCatalog, PlanPatchTool,
-    TaskCreateTool, TaskListTool,
+    CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, TaskCapabilityCatalog,
+    TaskCreateTool, TaskListTool, TaskUpdateTool,
 };
 
-/// Register the task-management tools + `plan_execute` (with store) on
+/// Register the task-management tools + `task_execute` (with store) on
 /// `agent_handle`. See module docs for why this is post-hoc.
 pub async fn register_task_tools_on_agent(
     agent_handle: &AgentHandle,
     store: Arc<TaskRuntimeStore>,
 ) {
-    let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
+    let tool_names = agent_handle
+        .write(|agent| {
+            // EKO projects todos and executable DAG nodes from one TaskRuntime
+            // authority. The framework scratchpad is process-global and would
+            // introduce a second task id/status space if left visible here.
+            agent.remove_tool("todo_write");
+            agent.tool_names()
+        })
+        .await;
     let registry = agent_handle
         .read(|agent| agent.subagent_registry().clone())
         .await;
@@ -38,7 +46,7 @@ pub async fn register_task_tools_on_agent(
     let subagent_catalog = Arc::new(
         crate::subagent_loader::SubagentCatalogSnapshot::from_registered(&registered_subagents),
     );
-    let capabilities = Arc::new(PlanCapabilityCatalog::new(
+    let capabilities = Arc::new(TaskCapabilityCatalog::new(
         subagent_catalog.clone(),
         tool_names,
     ));
@@ -48,7 +56,7 @@ pub async fn register_task_tools_on_agent(
                 store: store.clone(),
                 capabilities: capabilities.clone(),
             }));
-            agent.add_tool(Box::new(PlanPatchTool {
+            agent.add_tool(Box::new(TaskUpdateTool {
                 store: store.clone(),
                 capabilities: capabilities.clone(),
             }));
@@ -74,10 +82,10 @@ pub async fn register_task_tools_on_agent(
         );
     }
 
-    // Also register plan_execute tool (only on main agent per §10.2).
+    // Also register task_execute tool (only on main agent per §10.2).
     // Use ParallelReadonlyDelegation as the default route; the route is
     // resolved per-run by the router at the orchestration layer.
-    let tool = ExecutePlanTool::new(store.clone(), agent_handle.clone());
+    let tool = ExecuteTaskTool::new(store.clone(), agent_handle.clone());
     let ep_added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(tool));
@@ -85,12 +93,41 @@ pub async fn register_task_tools_on_agent(
         })
         .await;
     if ep_added {
-        tracing::info!("Registered plan_execute tool on primary agent");
+        tracing::info!("Registered task_execute tool on primary agent");
     } else {
         tracing::warn!(
-            "Failed to register plan_execute tool on primary agent (write lock poisoned)"
+            "Failed to register task_execute tool on primary agent (write lock poisoned)"
         );
     }
 
-    // 单个临时子任务由 agent_tool 负责;plan_execute 只执行已物化的正式 DAG。
+    // A one-node task graph and a dependency DAG share this execution path.
+    // `agent_tool` remains only for ephemeral side work with no TaskRun.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn registration_replaces_framework_todo_with_one_task_api()
+    -> std::result::Result<(), String> {
+        let agent = echo_agent::agent::ReactAgentBuilder::new()
+            .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+            .system_prompt("unified task api test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let handle = AgentHandle::new(agent);
+        let before = handle.read(|agent| agent.tool_names()).await;
+        assert!(before.iter().any(|name| name == "todo_write"));
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        register_task_tools_on_agent(&handle, store).await;
+
+        let after = handle.read(|agent| agent.tool_names()).await;
+        assert!(!after.iter().any(|name| name == "todo_write"));
+        for expected in ["task_create", "task_update", "task_list", "task_execute"] {
+            assert!(after.iter().any(|name| name == expected));
+        }
+        Ok(())
+    }
 }

@@ -149,7 +149,7 @@ pub(crate) fn has_planning_tools(&self) -> bool {
 
 ### §3.2 `TodoWriteTool` —— 不依赖 `enable_task` 的内置 todo
 
-`TodoWriteTool`（`src/tools/builtin/todo.rs:26`，`name()="todo_write"`）在 `react/mod.rs:306` **无条件注册**，与 `enable_task` 无关。它内部用一个 `static LazyLock<Mutex<Vec<TodoEntry>>>`（最多 100 条）作为内存中的 to-do 列表，这套是**进程内**的轻量任务记忆，不写入 `RuntimeStateStore`，也不参与 DAG。
+`TodoWriteTool`（`src/tools/builtin/todo.rs:26`，`name()="todo_write"`）在通用框架 `ReactAgent` 构造时注册。它内部用一个 `static LazyLock<Mutex<Vec<TodoEntry>>>`（最多 100 条）作为进程内 scratchpad，不写入 TaskRuntime，也不参与 DAG。EKO 在注册统一 `task_create/task_update/task_list/task_execute` API 时必须移除该工具，因此 GUI/TUI/CLI/channel 不会同时暴露两个 task id/status 空间；其它框架复用方仍可选择该通用 scratchpad。
 
 ---
 

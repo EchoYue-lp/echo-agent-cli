@@ -49,7 +49,7 @@ import type {
 import type {
   TaskRun,
   TaskPlan,
-  PlanPatchRequest,
+  TaskUpdateRequest,
   TodoItem,
   RuntimeTaskEvent,
   RuntimeArtifact,
@@ -596,10 +596,10 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<void>('resolve_recovery_task', { runId, taskId, decision })
       : post(`/task_runtime/runs/${runId}/tasks/${taskId}/resolve_recovery`, { decision }),
-  patchPlan: (runId: string, request: PlanPatchRequest) =>
+  updateTasks: (runId: string, request: TaskUpdateRequest) =>
     isTauri()
-      ? apiInvoke<TaskPlan>('patch_task_plan', { runId, request })
-      : post<TaskPlan>(`/task_runtime/runs/${runId}/plan/patch`, request),
+      ? apiInvoke<TaskPlan>('update_tasks', { runId, request })
+      : post<TaskPlan>(`/task_runtime/runs/${runId}/tasks/update`, request),
 
   // ── Interaction mode ─────────────────────────────────────────────────
   setInteractionMode: (mode: number) =>

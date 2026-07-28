@@ -405,16 +405,16 @@ pub async fn retry_blocked_task(
     }))
 }
 
-/// Atomically revise the plan against an expected revision.
+/// Atomically update tasks and their relations against an expected revision.
 #[tauri::command]
-pub async fn patch_task_plan(
+pub async fn update_tasks(
     state: tauri::State<'_, TauriState>,
     run_id: String,
-    request: PlanPatchRequest,
+    request: TaskUpdateRequest,
 ) -> Result<TaskPlan, IpcError> {
     let store = store(&state)?;
     store
-        .patch_plan(&run_id, &request)
+        .update_tasks(&run_id, &request)
         .map_err(|error| match error {
             echo_agent_app_core::tasks::task_runtime::StoreError::PlanConflict { .. }
             | echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(_) => {

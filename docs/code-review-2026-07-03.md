@@ -185,7 +185,7 @@ useEffect(() => {
 
 #### P1-1. `RUN_EXECUTION_LOCKS` 永不清理
 
-- **文件**：`echo-agent-cli/echo-agent-app-core/src/tasks/task_runtime/execute_plan_tool.rs:43-44`
+- **文件**：`echo-agent-cli/echo-agent-app-core/src/tasks/task_runtime/task_execute_tool.rs:43-44`
 - **类型**：内存泄漏（长期运行影响）
 
 `static RUN_EXECUTION_LOCKS: LazyLock<DashMap<String, Arc<TokioMutex<()>>>>` — 每个 `run_id` 首次执行 `execute_plan` 时插入一个 entry，run 完成后**永不删除**。这是一个进程级静态变量，在 Tauri 长期运行场景下，每个唯一 `run_id` 永久占用内存。预计数月运行后可达数千个无用 entry。应在 run 完成/失败时从 map 中移除对应 key。

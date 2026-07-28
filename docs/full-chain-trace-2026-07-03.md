@@ -1,7 +1,7 @@
 # EKO 全链路任务生命周期追踪报告
 
 > Historical trace. The task-plan mutation path was replaced on 2026-07-21 by
-> atomic `plan_create`, revisioned `plan_patch`, and separate `plan.json` /
+> atomic `task_create`, revisioned `task_update`, and separate `plan.json` /
 > `run-state.json` projections. See `docs/2026-07-21-dynamic-plan-runtime.md`.
 
 **审查日期**：2026-07-03
@@ -36,10 +36,10 @@
   │                                                      │
   ├─ [Agent ReAct Loop] ─────────────────────────────────┘
   │   │
-  │   ├─ Agent 调用 plan_create / plan_patch
+  │   ├─ Agent 调用 task_create / task_update
   │   │   └─ PlanRevisionCommitted → plan.json + run-state.json
   │   │
-  │   ├─ Agent 调用 execute_plan 工具                   [execute_plan_tool.rs:147]
+  │   ├─ Agent 调用 execute_plan 工具                   [task_execute_tool.rs:147]
   │   │   ├─ [Unattended] → CP A 预检 (拒绝写操作)
   │   │   ├─ [ComplexRuntime + Attended] → Paused → 等待审批 → Running
   │   │   ├─ [ParallelReadonlyDelegation] → 直接执行
@@ -168,14 +168,14 @@ for iteration in 0..max_iterations:
 
 当前路径一次提交完整 DAG：
 1. `ensure_run_exists()` → bootstrap `TaskRun` → transition `Running`
-2. `plan_create(tasks=[...])` 校验完整 DAG 并提交 revision 1
-3. 后续修改通过 `plan_patch(base_revision, operations, reason)` 原子提交
+2. `task_create(tasks=[...])` 校验完整 DAG 并提交 revision 1
+3. 后续修改通过 `task_update(base_revision, operations, reason)` 原子提交
 
 **发现的问题：**
 
 | # | 严重度 | 位置 | 问题 |
 |---|--------|------|------|
-| F2-1 | 🟡 | `task_tools.rs` vs `execute_plan_tool.rs` | `task_create` 不经过 `RUN_EXECUTION_LOCKS` 保护。若 LLM 并行发出多个 `task_create` + `execute_plan`，plan 可能被并发覆写 |
+| F2-1 | 🟡 | `task_tools.rs` vs `task_execute_tool.rs` | `task_create` 不经过 `RUN_EXECUTION_LOCKS` 保护。若 LLM 并行发出多个 `task_create` + `execute_plan`，plan 可能被并发覆写 |
 | F2-2 | 🟢 | `planner.rs` | `planner.rs` 不负责创建 plan——仅含 `validate_plan_deps`（循环依赖检测 + DAG 完整性）和 `analyze_file_ownership`（文件重叠分析） |
 
 ---
@@ -184,7 +184,7 @@ for iteration in 0..max_iterations:
 
 ### 4.1 execute_plan 工具
 
-**文件**：`execute_plan_tool.rs:147-530`
+**文件**：`task_execute_tool.rs:147-530`
 
 ```
 execute_plan 被调用
@@ -230,11 +230,11 @@ DAG 调度核心循环：
 
 | # | 严重度 | 位置 | 问题 |
 |---|--------|------|------|
-| F3-1 | 🔴 | `execute_plan_tool.rs:387` | **审批等待无超时**：`approval_signal.notified().await` 阻塞无限。用户永不审批时 run 永久 `Paused`，无法恢复 |
+| F3-1 | 🔴 | `task_execute_tool.rs:387` | **审批等待无超时**：`approval_signal.notified().await` 阻塞无限。用户永不审批时 run 永久 `Paused`，无法恢复 |
 | F3-2 | 🔴 | `store.rs:854-856` | **Paused 不被启动恢复**：`recover_incomplete` 只扫描 `Running` 状态。若进程在 `Paused` 时死亡，run 永久僵尸（除非被重新 drive） |
 | F3-3 | 🟡 | `store.rs:207-244` | **非原子 transition_run**：读→验证→写，无 CAS。两个并发合法 transition 可能都通过验证，最后一个写覆盖前一个 |
 | F3-4 | 🟡 | `store.rs:339, 601` | **并发 plan 修改**：`insert_task` 和 `attach_plan` 读→改→写，无锁保护。并行的 `task_create` 调用互相覆盖 |
-| F3-5 | 🟡 | `execute_plan_tool.rs:342` | CP A 预检仅对 Unattended 执行。Attended 模式下的写任务无预检——审批门控是唯一安全网（且只是"用户点了同意"） |
+| F3-5 | 🟡 | `task_execute_tool.rs:342` | CP A 预检仅对 Unattended 执行。Attended 模式下的写任务无预检——审批门控是唯一安全网（且只是"用户点了同意"） |
 | F3-6 | 🟢 | `types.rs` | `TodoStatus::Blocked` 无自动解封逻辑——仅手动/GUI 操作可解除 |
 | F3-7 | 🟢 | `types.rs` | `Cancelling` 中间状态缺失——cancel 直接从 `Running` → `Cancelled`，运行中任务可能未收到取消信号 |
 
@@ -367,7 +367,7 @@ HitlDispatcher::request()
 
 ### 6.2 run 级审批门控
 
-**`execute_plan_tool.rs:360-394`**：
+**`task_execute_tool.rs:360-394`**：
 ```
 若 route == ComplexRuntime 且 Attended：
   → transition_run(Paused)
@@ -403,7 +403,7 @@ check_tool_approval()
 
 | # | 严重度 | 位置 | 问题 |
 |---|--------|------|------|
-| F5-1 | 🔴 | `execute_plan_tool.rs:387` | **审批等待无超时**（同 F3-1）——最严重的 HITL 缺陷 |
+| F5-1 | 🔴 | `task_execute_tool.rs:387` | **审批等待无超时**（同 F3-1）——最严重的 HITL 缺陷 |
 | F5-2 | 🟡 | `dispatcher.rs:80` | 多 provider 场景下超时叠加——2+ provider 全部超时时总等待 `N×5min` |
 | F5-3 | 🟡 | `executor.rs:1287-1330` | Hitrisk 安全暂停无去重——用户不改 plan 直接 resume 会再次命中同一检查 |
 | F5-4 | 🟢 | `ApprovalCard.tsx` | `isSubmitting` 仅客户端防重——无请求级去重 ID。若快速连续收到同一工具的审批请求，可能展示过期状态 |
@@ -445,7 +445,7 @@ check_tool_approval()
 
 | # | 问题 | 改动 | 文件 |
 |---|------|------|------|
-| F3-1/F5-1 | 审批等待加超时 | `tokio::time::timeout(Duration::from_secs(300), signal.notified()).await` | `execute_plan_tool.rs:387` |
+| F3-1/F5-1 | 审批等待加超时 | `tokio::time::timeout(Duration::from_secs(300), signal.notified()).await` | `task_execute_tool.rs:387` |
 | F3-2/G1 | Paused 启动恢复 | `recover_incomplete` 加 `&[Running, Paused]` | `store.rs:854` |
 | F2-1/G2 | Plan 并发保护 | `task_create` 也获取 `RUN_EXECUTION_LOCKS` 或改 store 为 CAS | `task_tools.rs` / `store.rs` |
 

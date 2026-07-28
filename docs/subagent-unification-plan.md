@@ -330,7 +330,7 @@ subagent: {
 
 | 层 | 文件数 | 需改处数(估) | 性质 |
 |---|---|---|---|
-| Rust app-core | 5(executor.rs, types.rs, task_tools.rs, execute_plan_tool.rs, mod.rs 导出) | ~40 | 见下 |
+| Rust app-core | 5(executor.rs, types.rs, task_tools.rs, task_execute_tool.rs, mod.rs 导出) | ~40 | 见下 |
 | Rust tauri 桥接 | 3(mod.rs, commands/chat.rs, commands/task_runtime.rs) | ~30 | 大部分可删 |
 | 前端 store | 3(subagentTraceStore, subagentDetailStore, subagentStore) | ~15 | 合并 |
 | 前端组件 | 5(SubagentStreamBlock, ParallelExecutionBlock, SubagentDetailView, SubagentCard, RightRail) + 2 hook | ~12 | 重构 |

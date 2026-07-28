@@ -150,13 +150,13 @@ impl InteractionMode {
     pub fn prompt_hint(&self) -> &'static str {
         match self {
             InteractionMode::Chat => {
-                "Chat mode. TaskRuntime tools are unavailable for this turn. Resolve the request directly with ordinary conversation and available non-task tools. Do not claim to create, execute, or update a formal plan."
+                "Chat mode. Resolve simple requests directly. When a visible task list or delegated execution is useful, use the same task_create/task_update/task_list/task_execute API as every other mode; a single task does not require an artificial wrapper or DAG."
             }
             InteractionMode::Task => {
-                "Task mode. Use a formal, reviewable DAG. The TaskRun already represents the overall goal, so never create a wrapper or placeholder PlanTask for it. Submit the complete initial DAG in one plan_create call, inspect the returned revision with task_list, and pass it as plan_revision to plan_execute. Use plan_patch with the current base_revision for later changes. Keep task status and verification current. Do not claim dispatch before plan_execute starts."
+                "Task mode. Materialize a formal, reviewable task graph. The TaskRun already represents the overall goal, so never create a wrapper or placeholder task for it. Submit one task or the complete initial DAG with task_create, inspect the returned revision with task_list, and pass it as revision to task_execute. Use task_update with the current base_revision for later changes. Keep task status and verification current. Do not claim dispatch before task_execute starts."
             }
             InteractionMode::Auto => {
-                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. If any Subagent delegation is needed, or the work is multi-step, multi-file, dependent, or parallel, submit the complete DAG in one plan_create call, inspect the revision with task_list, and pass it as plan_revision to plan_execute. Use plan_patch for later changes. Do not dispatch ad-hoc Subagents in Auto mode."
+                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. When a visible task list, Subagent delegation, multi-step work, dependencies, or parallelism is useful, create one task or an atomic task batch with task_create, inspect the revision with task_list, and pass it as revision to task_execute. Use task_update for later changes. Do not dispatch ad-hoc Subagents in Auto mode."
             }
         }
     }
@@ -706,7 +706,7 @@ pub struct TaskRun {
     pub plan_id: Option<String>,
     pub route: String,
     /// Whether a human is present (Attended) or this is a cron/IM trigger
-    /// (Unattended). Drives safety-gate behaviour in plan_execute /
+    /// (Unattended). Drives safety-gate behaviour in task_execute /
     /// executor.  Default: Attended (chat behaviours unchanged).
     pub attended_mode: AttendedMode,
     /// User-uploaded attachments shared across all subagents in this run (so
@@ -1079,7 +1079,7 @@ fn task_status_detail(status: &echo_agent::tasks::TaskStatus) -> Option<String> 
     }
 }
 
-/// Partial specification update used by a revisioned [`PlanPatchOperation`].
+/// Partial specification update used by a revisioned [`TaskUpdateOperation`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export, rename = "TaskPatch")]
 pub struct TaskPatch {
@@ -1099,8 +1099,8 @@ pub struct TaskPatch {
 /// One atomic operation in a revisioned plan patch.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "op", rename_all = "snake_case")]
-#[ts(export, rename = "PlanPatchOperation")]
-pub enum PlanPatchOperation {
+#[ts(export, rename = "TaskUpdateOperation")]
+pub enum TaskUpdateOperation {
     Insert {
         after_task_id: Option<String>,
         task: EkoTaskSpec,
@@ -1118,12 +1118,12 @@ pub enum PlanPatchOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "PlanPatchRequest")]
-pub struct PlanPatchRequest {
+#[ts(export, rename = "TaskUpdateRequest")]
+pub struct TaskUpdateRequest {
     #[ts(type = "number")]
     pub base_revision: u64,
     pub reason: String,
-    pub operations: Vec<PlanPatchOperation>,
+    pub operations: Vec<TaskUpdateOperation>,
 }
 
 /// A todo row — the GUI-facing projection of a plan task's progress.
@@ -1677,10 +1677,10 @@ mod tests {
         let task = InteractionMode::Task.prompt_hint();
         let auto = InteractionMode::Auto.prompt_hint();
 
-        assert!(chat.contains("TaskRuntime tools are unavailable"));
-        assert!(task.contains("plan_create"));
-        assert!(task.contains("plan_revision"));
-        assert!(task.contains("plan_patch"));
+        assert!(chat.contains("same task_create/task_update/task_list/task_execute API"));
+        assert!(task.contains("task_create"));
+        assert!(task.contains("pass it as revision"));
+        assert!(task.contains("task_update"));
         assert!(task.contains("never create a wrapper"));
         assert!(auto.contains("Choose between direct work"));
         assert!(auto.contains("formal TaskRuntime execution"));

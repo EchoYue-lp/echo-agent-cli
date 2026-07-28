@@ -41,7 +41,7 @@ M5 第二批完成 (2026-07-11):
 
 - GUI/TUI 新增 browser 紧凑摘要:动作、URL/域名与 target；成功态折叠文本输出,截图与实时页面继续由既有 Browser Panel/BrowserEvent 承载。
 - MCP renderer 只在事件提供显式 `mcp__server__tool` identity、`mcp_server` metadata 或 server 参数时启用,显示 server/tool 与 text/JSON result type；缺少来源时不猜 server,继续 Generic fallback。
-- `agent_tool`、`plan_execute`、`create_complex_task` 显示 subagent/plan/run 摘要并折叠成功输出；完整生命周期继续复用既有 execution panel/SubagentStreamBlock,不重复造卡片。
+- `agent_tool`、`task_execute`、`create_complex_task` 显示 subagent/plan/run 摘要并折叠成功输出；完整生命周期继续复用既有 execution panel/SubagentStreamBlock,不重复造卡片。
 
 验证结果:
 

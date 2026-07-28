@@ -19,7 +19,7 @@ export type TaskRun = {
   route: string;
   /**
    * Whether a human is present (Attended) or this is a cron/IM trigger
-   * (Unattended). Drives safety-gate behaviour in plan_execute /
+   * (Unattended). Drives safety-gate behaviour in task_execute /
    * executor.  Default: Attended (chat behaviours unchanged).
    */
   attended_mode: AttendedMode;

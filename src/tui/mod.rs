@@ -424,12 +424,11 @@ pub(crate) fn tool_command(name: &str, args: &str) -> String {
         }
         "agent_tool" => format!("Subagent {}", text(&["agent_name"]).unwrap_or("dispatch")),
         "create_complex_task" => "Start task run".to_string(),
-        "plan_execute" => value
-            .get("task")
-            .and_then(|task| task.get("agent_role"))
-            .and_then(serde_json::Value::as_str)
-            .map(|role| format!("Execute with {role}"))
-            .unwrap_or_else(|| "Execute plan".to_string()),
+        "task_execute" => value
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .map(|revision| format!("Execute task graph r{revision}"))
+            .unwrap_or_else(|| "Execute task graph".to_string()),
         name if name.starts_with("mcp__") => {
             let mut parts = name.splitn(3, "__");
             let _prefix = parts.next();
@@ -537,12 +536,11 @@ pub(crate) fn tool_detail(tool: &ToolExecutionMessage) -> String {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        "plan_execute" => value
-            .get("task")
-            .and_then(|task| task.get("description"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_string(),
+        "task_execute" => value
+            .get("revision")
+            .and_then(serde_json::Value::as_u64)
+            .map(|revision| format!("Committed revision {revision}"))
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -583,7 +581,7 @@ pub(crate) fn tool_shows_success_tail(tool: &ToolExecutionMessage) -> bool {
             | "code_search"
             | "search_text"
             | "agent_tool"
-            | "plan_execute"
+            | "task_execute"
             | "create_complex_task"
             | "browser_backend"
             | "browser_navigate"

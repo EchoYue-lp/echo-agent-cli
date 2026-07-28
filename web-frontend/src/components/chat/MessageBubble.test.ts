@@ -3,7 +3,7 @@ import type { ChatMessage } from '../../types/api';
 import { flattenSteps } from './MessageBubble';
 
 describe('MessageBubble execution projection', () => {
-  it('keeps a final plan_create step visible when executionRounds is incomplete', () => {
+  it('keeps a final task_create step visible when executionRounds is incomplete', () => {
     const message: ChatMessage = {
       id: 'assistant-1',
       role: 'assistant',

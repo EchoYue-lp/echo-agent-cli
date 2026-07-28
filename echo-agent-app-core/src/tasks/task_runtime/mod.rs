@@ -30,7 +30,6 @@
 //! and its event-kind enum is `RuntimeEventKind`.
 pub mod compact_context;
 pub mod event_rebuild;
-pub mod execute_plan_tool;
 pub mod executor;
 pub mod file_shadow;
 pub mod file_store;
@@ -41,11 +40,11 @@ pub mod profiles;
 pub mod register;
 pub mod review;
 pub mod store;
+pub mod task_execute_tool;
 pub mod task_tools;
 pub mod types;
 pub mod worktree;
 
-pub use execute_plan_tool::ExecutePlanTool;
 pub use executor::{
     EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, RunOutcome, drive_unattended_run,
     execute_run, launch_cron_run, launch_unattended_run, preflight_unattended_plan,
@@ -66,4 +65,5 @@ pub use review::{
     review_task,
 };
 pub use store::{StoreError, TaskRuntimeStore};
+pub use task_execute_tool::ExecuteTaskTool;
 pub use types::*;

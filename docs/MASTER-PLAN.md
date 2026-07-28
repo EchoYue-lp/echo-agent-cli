@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-27
+Last updated: 2026-07-28
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -52,8 +52,8 @@ evidence, and the next bounded step.
 | PDF/DOCX systematic-review rendering | Complete | Pandoc/Quarto discovery with selectable PDF engine and portable-format fallback |
 | Real-provider and LSP smoke fixtures | Complete | Explicit ignored tests gated by credentials/environment variables |
 | Legacy history placeholder IPC removal | Complete | Duplicate history commands/types removed; conversation export remains canonical |
-| Formal plan materialization count contract | Complete | `docs/2026-07-19-formal-plan-materialization.md`; `plan_execute` rejects inline/empty/partial plans and executes only the persisted PlanTask DAG |
-| Formal plan execution identity and timeout reliability | Complete | Long-running dispatch tools own their deadline; `plan_create` preserves the originating conversation/message identity so GUI Subagent cards and TaskRuntime use the same run |
+| Formal plan materialization count contract | Complete | `docs/2026-07-19-formal-plan-materialization.md`; `task_execute` rejects inline/empty/partial plans and executes only the persisted PlanTask DAG |
+| Formal plan execution identity and timeout reliability | Complete | Long-running dispatch tools own their deadline; `task_create` preserves the originating conversation/message identity so GUI Subagent cards and TaskRuntime use the same run |
 | Parallel Subagent instance and TaskRuntime routing | Complete | Sync/Fork/Teammate dispatches use fresh factory instances; Auto/Task delegation is forced through the formal plan so the right panel cannot be bypassed |
 | Revisioned dynamic plan runtime | Complete | `docs/2026-07-21-dynamic-plan-runtime.md`; atomic DAG creation, optimistic patches, split projections, safe-point reloads, and capability-scoped Subagents |
 | Unattended worktree lifecycle and review parity | Complete | `docs/2026-07-22-unattended-worktree-lifecycle.md`; application commit `61c8350` |
@@ -122,9 +122,9 @@ app-core review path surfaced in both GUI and TUI. See
 
 ### Formal Plan Execution
 
-The canonical parallel path is one atomic `plan_create(tasks=[...])`, followed
-by `task_list` and `plan_execute(plan_revision=N)`. Later changes use one
-optimistically locked `plan_patch(base_revision=N, operations=[...])`. The
+The canonical parallel path is one atomic `task_create(tasks=[...])`, followed
+by `task_list` and `task_execute(revision=N)`. Later changes use one
+optimistically locked `task_update(base_revision=N, operations=[...])`. The
 runtime rejects inline tasks, empty plans, stale revisions, invalid DAGs, and
 unknown Subagent/tool capabilities before dispatch. `agent_tool` remains the
 single ad-hoc Subagent mechanism in Chat mode. Auto and Task mode physically
@@ -163,8 +163,8 @@ default route against it.
 
 ### Dynamic Plan Runtime
 
-The runtime accepts one atomic full-DAG `plan_create` and revisioned
-`plan_patch` operations. `events.jsonl` is the recovery authority, `plan.json`
+The runtime accepts one atomic full-DAG `task_create` and revisioned
+`task_update` operations. `events.jsonl` is the recovery authority, `plan.json`
 is the latest immutable plan specification, and `run-state.json` is the
 execution projection. The scheduler reloads revisions at safe points, completed
 attempts are never restarted implicitly, and Subagents report suggestions but
@@ -172,12 +172,12 @@ never mutate the plan directly. See
 `docs/2026-07-21-dynamic-plan-runtime.md`.
 
 Long-running formal execution is not governed by the ordinary 120-second tool
-deadline. `plan_execute` and other timeout-exempt tools use their own bounded
+deadline. `task_execute` and other timeout-exempt tools use their own bounded
 execution policy, including the Subagent dispatch deadline, in both streaming
 and non-streaming ReAct paths. The framework also carries the originating
 conversation and `message_id` through
 `ExternalRunContext -> AgentRunSnapshot -> ToolContext/SubagentEvent`.
-When `plan_create` lazily materializes a TaskRun in Auto mode, it persists that
+When `task_create` lazily materializes a TaskRun in Auto mode, it persists that
 conversation/message identity instead of substituting the internal
 `taskrun:<turn>` id. The right task panel and the inline main-chat Subagent
 stream therefore resolve the same formal run and remain visible while the plan
@@ -271,8 +271,16 @@ the same fact is not persisted twice. See
 Runtime DAG convergence is complete: the framework owns canonical
 `TaskSpec`/`TaskExecution`/`TaskStatus`, validation, traversal, and the generic
 claim protocol; EKO owns checked file/UI projections, claim persistence, and
-product policy. Do not reintroduce another loop, validator, status model,
-canonical task-spec name, or unclaimed dispatch path. Next, observe real
+product policy. `TaskManager` cycle queries now delegate to the same canonical
+dependency analysis as `PlanValidator`; the old manager-local DFS is gone. Do
+not reintroduce another loop, validator, status model,
+canonical task-spec name, or unclaimed dispatch path. Task relations are also
+unified: all modes expose
+`task_create/task_update/task_list/task_execute`; one Task and a dependency DAG
+share the same revisioned TaskRun graph. EKO removes `todo_write` at the
+TaskRuntime registration boundary, while `TaskPlan` and `TodoItem` remain only
+artifact/UI projections. Do not reintroduce `plan_*` CRUD tools or an
+independent todo store. Next, observe real
 long-running GUI/TUI/CLI task runs for claim-conflict and revision-conflict,
 safe-point, logical-task worktree reuse, and clean-finalize telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly

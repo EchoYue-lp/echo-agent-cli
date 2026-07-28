@@ -88,7 +88,7 @@ pub fn framework_trace_sink_for(sink: &std::sync::Arc<dyn ChatSink>) -> TraceSin
 /// 普通 chat 轮次使用 `res.root_message_id` 作 turn_id。Task mode 和 task tools
 /// 从该 turn_id 派生独立的 `taskrun:<turn_id>`，并创建正式 TaskRun。这样
 /// 主 agent 在 ReAct 循环里调
-/// `plan_create` / `plan_execute` / `create_complex_task` 等依赖
+/// `task_create` / `task_execute` / `create_complex_task` 等依赖
 /// `require_run_id()` 的工具时,能从 task_local 读到 run_id,不再被
 /// `"no active run — run_id not set in context"` 提前拒绝(对齐 Claude Code
 /// 的无门槛只读 dispatch)。
@@ -101,8 +101,8 @@ pub async fn drive_chat(
     multimodal: Option<&Message>,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
 ) -> Result<(), String> {
-    // Scope a per-turn run_id so task tools (plan_create /
-    // plan_execute / create_complex_task) can read it via require_run_id().
+    // Scope a per-turn run_id so task tools (task_create /
+    // task_execute / create_complex_task) can read it via require_run_id().
     // Use root_message_id (unique per turn, set by all 3 callers); fall back to
     // a fresh uuid if a caller forgot to set it (defensive, never panics).
     let turn_id = if res.root_message_id.trim().is_empty() {
@@ -260,7 +260,7 @@ fn finalize_task_mode_run(
         return;
     }
     let reason = match store.get_plan(run_id) {
-        Ok(Some(_)) => "Task mode turn ended before plan_execute reached a terminal result",
+        Ok(Some(_)) => "Task mode turn ended before task_execute reached a terminal result",
         _ => "Task mode turn ended without creating a formal plan",
     };
     let _ = store.note(run_id, None, reason);
@@ -360,7 +360,7 @@ async fn drive_chat_inner(
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
         // channel that keeps Subagent tools and run_id on this same run. The
         // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
-        // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. plan_execute)
+        // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. task_execute)
         // running inside the framework's spawned tool executor.
         let event_identity = EventIdentity {
             conversation_id: conversation_id.clone(),
@@ -451,17 +451,9 @@ fn disabled_tools_for_mode(
 
     match interaction_mode {
         InteractionMode::Chat => disabled.extend(
-            [
-                "plan_create",
-                "plan_patch",
-                "task_list",
-                "plan_execute",
-                "create_complex_task",
-                "check_run_status",
-                "cancel_run",
-            ]
-            .into_iter()
-            .map(str::to_string),
+            ["create_complex_task", "check_run_status", "cancel_run"]
+                .into_iter()
+                .map(str::to_string),
         ),
         InteractionMode::Task => disabled.extend(
             [
@@ -513,8 +505,8 @@ mod tests {
         assert!(disabled.contains("agent_tool"));
         assert!(disabled.contains("create_complex_task"));
         assert!(disabled.contains("check_task_status"));
-        assert!(!disabled.contains("plan_create"));
-        assert!(!disabled.contains("plan_execute"));
+        assert!(!disabled.contains("task_create"));
+        assert!(!disabled.contains("task_execute"));
     }
 
     #[test]
@@ -524,8 +516,18 @@ mod tests {
         assert!(disabled.contains("check_task_status"));
         assert!(disabled.contains("list_background_tasks"));
         assert!(disabled.contains("agent_tool"));
-        assert!(!disabled.contains("plan_execute"));
+        assert!(!disabled.contains("task_execute"));
         assert!(!disabled.contains("create_complex_task"));
+    }
+
+    #[test]
+    fn chat_mode_exposes_the_same_task_graph_api() {
+        let disabled = disabled_tools_for_mode(crate::tasks::task_runtime::InteractionMode::Chat);
+        assert!(!disabled.contains("task_create"));
+        assert!(!disabled.contains("task_update"));
+        assert!(!disabled.contains("task_list"));
+        assert!(!disabled.contains("task_execute"));
+        assert!(disabled.contains("create_complex_task"));
     }
 
     struct CountingTool {
