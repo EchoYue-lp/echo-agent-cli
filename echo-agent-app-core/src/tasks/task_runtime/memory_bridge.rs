@@ -320,7 +320,7 @@ mod tests {
                 ..Default::default()
             }],
         };
-        store.attach_plan(&plan).unwrap();
+        store.attach_plan_for_test(&plan).unwrap();
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         store
             .set_task_status(

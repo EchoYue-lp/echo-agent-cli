@@ -1,10 +1,12 @@
-//! Agent tools for managing one revisioned task graph during execution.
+//! EKO product tools and task-tool policy helpers.
 //!
-//! These let the main agent autonomously create / update / complete / skip /
-//! list tasks, mirroring Claude Code's TaskCreate / TaskUpdate model.
+//! The framework owns `task_create`, `task_update`, and `task_list`. This
+//! module keeps EKO's run-level tools, task-local execution context, and
+//! Subagent/tool capability catalog.
 //!
 //! Each tool reads `run_id` from a `tokio::task_local!` scoped by the executor
-//! around task execution, and operates on the [`TaskRuntimeStore`] injected at
+//! around task execution, and operates on the
+//! [`TaskRuntimeStore`](super::store::TaskRuntimeStore) injected at
 //! construction time.
 //!
 //! Why task_local (not thread_local): tokio uses a work-stealing scheduler that
@@ -21,12 +23,8 @@ use std::sync::Arc;
 use crate::subagent_loader::SubagentCatalogSnapshot;
 
 use super::executor::{ExecEvent, RunPlanPolicy};
-use super::profiles::{ProfileTemplate, default_subagent_for};
-use super::store::TaskRuntimeStore;
-use super::types::{
-    AttendedMode, DomainProfile, EkoTaskExecution, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan,
-    TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
-};
+use super::profiles::ProfileTemplate;
+use super::types::DomainProfile;
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskCapabilityCatalog {
@@ -48,7 +46,10 @@ impl TaskCapabilityCatalog {
         }
     }
 
-    fn validate_task(&self, task: &PlanTask) -> std::result::Result<(), String> {
+    pub(crate) fn validate_task_spec(
+        &self,
+        task: &echo_agent::tasks::TaskSpec,
+    ) -> std::result::Result<(), String> {
         if !self.subagents.contains(&task.agent_role) {
             let mut available = self
                 .subagents
@@ -77,39 +78,6 @@ impl TaskCapabilityCatalog {
             }
         }
         Ok(())
-    }
-
-    fn validate_patch_operation(
-        &self,
-        operation: &TaskUpdateOperation,
-    ) -> std::result::Result<(), String> {
-        match operation {
-            TaskUpdateOperation::Insert { task, .. } => self.validate_task(&PlanTask::from_parts(
-                task.clone(),
-                EkoTaskExecution::pending(task.id.clone()),
-            )),
-            TaskUpdateOperation::Update { patch, .. } => {
-                if let Some(role) = &patch.agent_role
-                    && !self.subagents.contains(role)
-                {
-                    return Err(format!("unknown Subagent '{role}'"));
-                }
-                if let Some(tools) = &patch.allowed_tools {
-                    for tool in tools {
-                        if Self::TASK_CONTROL_TOOLS.contains(&tool.as_str()) {
-                            return Err(format!(
-                                "task-control tool '{tool}' cannot be delegated to a Subagent"
-                            ));
-                        }
-                        if !self.tools.contains(tool) {
-                            return Err(format!("unknown tool '{tool}'"));
-                        }
-                    }
-                }
-                Ok(())
-            }
-            TaskUpdateOperation::Skip { .. } | TaskUpdateOperation::Reorder { .. } => Ok(()),
-        }
     }
 }
 
@@ -211,24 +179,9 @@ pub(crate) fn formal_run_id_for_turn(turn_id: &str) -> String {
     format!("taskrun:{turn_id}")
 }
 
-/// 从 ToolContext 优先读 run_id(跨 spawn 安全),回退 task_local(主 agent scope)。
-///
-/// 这是根治 task_local 跨 tokio::spawn 断裂的关键:subagent 在框架层 dispatch_fork
-/// 的 spawn 里执行,task_local 全部丢失;但 ToolContext 是值传递(经 dispatch_fork
-/// → set_external_context → pipeline 填入),跨 spawn 安全。工具 override
-/// `execute_with_context` 后用此 helper 读 run_id,主 agent 和 subagent 都能拿到。
-#[allow(clippy::result_large_err)] // ToolResult is the framework error type; boxing would touch every caller
-pub(crate) fn run_id_from_ctx_or_local(
+pub(crate) fn trace_sink_from_tool_context(
     ctx: &echo_core::tools::ToolContext,
-) -> std::result::Result<String, ToolResult> {
-    ctx.run_id
-        .clone()
-        .or_else(|| ctx.turn_id.as_deref().map(formal_run_id_for_turn))
-        .or_else(current_run_id)
-        .ok_or_else(|| ToolResult::error("no active run — run_id not in ToolContext or task_local"))
-}
-
-fn trace_sink_from_tool_context(ctx: &echo_core::tools::ToolContext) -> Option<TraceSink> {
+) -> Option<TraceSink> {
     ctx.trace_sink.as_ref().map(|sink| {
         let sink = sink.clone();
         Arc::new(move |event: ExecEvent| {
@@ -365,669 +318,6 @@ mod tests {
     }
 }
 
-fn parse_kind(s: &str) -> std::result::Result<PlanTaskKind, String> {
-    PlanTaskKind::from_str(s).ok_or_else(|| format!("unknown task kind '{s}'"))
-}
-
-fn string_array_from(params: &ToolParameters, key: &str) -> Vec<String> {
-    params
-        .get(key)
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn string_array_in(value: &serde_json::Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(|item| item.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| item.as_str())
-                .map(str::trim)
-                .filter(|item| !item.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn parse_plan_task(
-    value: &serde_json::Value,
-    index: usize,
-    domain_profile: DomainProfile,
-) -> std::result::Result<PlanTask, String> {
-    let field = |key: &str| {
-        value
-            .get(key)
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .ok_or_else(|| format!("tasks[{index}].{key} is required"))
-    };
-    let id = field("id")?;
-    let title = field("title")?;
-    let description = field("description")?;
-    let kind_name = field("kind")?;
-    let kind = parse_kind(&kind_name)?;
-    let agent_role = value
-        .get("subagent")
-        .and_then(|item| item.as_str())
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| default_subagent_for(domain_profile, kind).to_string());
-    let max_retries = value
-        .get("max_retries")
-        .and_then(|item| item.as_u64())
-        .and_then(|count| u32::try_from(count).ok())
-        .unwrap_or(3);
-    let sort_order = i64::try_from(index).unwrap_or(i64::MAX);
-    Ok(PlanTask {
-        id,
-        title,
-        description,
-        kind,
-        agent_role,
-        domain_profile,
-        depends_on: string_array_in(value, "depends_on"),
-        parallel_group: value
-            .get("parallel_group")
-            .and_then(|item| item.as_str())
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string),
-        files: string_array_in(value, "files"),
-        allowed_tools: string_array_in(value, "allowed_tools"),
-        required_artifacts: string_array_in(value, "required_artifacts"),
-        execution_checks: string_array_in(value, "execution_checks"),
-        acceptance_criteria: string_array_in(value, "acceptance_criteria"),
-        retry_count: 0,
-        max_retries,
-        failure_fingerprint: None,
-        status: TodoStatus::Pending,
-        status_detail: None,
-        claim: None,
-        sort_order,
-    })
-}
-
-fn plan_task_input_schema() -> serde_json::Value {
-    serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "id": { "type": "string", "description": "Stable task id unique within this run" },
-            "title": { "type": "string", "description": "User-visible task title in the user's current language; keep technical identifiers unchanged" },
-            "description": { "type": "string", "description": "Subagent brief in the user's current language; keep code, paths, commands, and technical identifiers unchanged" },
-            "kind": { "type": "string", "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"] },
-            "subagent": { "type": "string", "description": "Registered Subagent role; omit for the domain default" },
-            "depends_on": { "type": "array", "items": { "type": "string" } },
-            "parallel_group": { "type": "string" },
-            "files": { "type": "array", "items": { "type": "string" } },
-            "allowed_tools": { "type": "array", "items": { "type": "string" } },
-            "required_artifacts": { "type": "array", "items": { "type": "string" } },
-            "execution_checks": { "type": "array", "items": { "type": "string" } },
-            "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
-            "max_retries": { "type": "integer", "minimum": 0, "maximum": 10 }
-        },
-        "required": ["id", "title", "description", "kind"]
-    })
-}
-
-fn task_update_operations_from(
-    value: &serde_json::Value,
-    domain_profile: DomainProfile,
-) -> std::result::Result<Vec<TaskUpdateOperation>, String> {
-    let operations = value
-        .as_array()
-        .ok_or_else(|| "task_update operations must be an array".to_string())?;
-    let mut parsed = Vec::with_capacity(operations.len());
-    for (index, operation) in operations.iter().enumerate() {
-        let op = operation
-            .get("op")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("operations[{index}].op is required"))?;
-        let parsed_operation = match op {
-            "insert" => {
-                let task = operation
-                    .get("task")
-                    .ok_or_else(|| format!("operations[{index}].task is required"))?;
-                TaskUpdateOperation::Insert {
-                    after_task_id: operation
-                        .get("after_task_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
-                    task: parse_plan_task(task, index, domain_profile)?.spec(),
-                }
-            }
-            "update" => TaskUpdateOperation::Update {
-                task_id: operation
-                    .get("task_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|task_id| !task_id.is_empty())
-                    .map(str::to_string)
-                    .ok_or_else(|| format!("operations[{index}].task_id is required"))?,
-                patch: operation
-                    .get("patch")
-                    .cloned()
-                    .ok_or_else(|| format!("operations[{index}].patch is required"))
-                    .and_then(|patch| {
-                        serde_json::from_value(patch)
-                            .map_err(|error| format!("operations[{index}].patch: {error}"))
-                    })?,
-            },
-            "skip" => TaskUpdateOperation::Skip {
-                task_id: operation
-                    .get("task_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|task_id| !task_id.is_empty())
-                    .map(str::to_string)
-                    .ok_or_else(|| format!("operations[{index}].task_id is required"))?,
-            },
-            "reorder" => TaskUpdateOperation::Reorder {
-                task_ids: string_array_in(operation, "task_ids"),
-            },
-            other => return Err(format!("operations[{index}] has unknown op '{other}'")),
-        };
-        parsed.push(parsed_operation);
-    }
-    Ok(parsed)
-}
-
-// ── task_create ───────────────────────────────────────────────────────────
-
-pub struct TaskCreateTool {
-    pub store: Arc<TaskRuntimeStore>,
-    pub capabilities: Arc<TaskCapabilityCatalog>,
-}
-
-impl Tool for TaskCreateTool {
-    fn name(&self) -> &str {
-        "task_create"
-    }
-
-    fn description(&self) -> &str {
-        "Create one task or atomically create a related task graph in the current TaskRun. Dependencies are optional; use base_revision when adding tasks to an existing graph."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        let task_schema = plan_task_input_schema();
-        let single_task_schema = task_schema.clone();
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task": single_task_schema,
-                "tasks": {
-                    "type": "array",
-                    "minItems": 1,
-                    "description": "One atomic task batch. Dependency ids may refer to this batch or existing tasks.",
-                    "items": task_schema
-                },
-                "base_revision": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Required when the current TaskRun already has tasks."
-                },
-                "reason": { "type": "string", "description": "Why these tasks are being added" },
-                "assumptions": { "type": "array", "items": { "type": "string" } },
-                "risks": { "type": "array", "items": { "type": "string" } },
-                "execution_mode": { "type": "string", "enum": ["parallel", "sequential"] }
-            },
-            "oneOf": [
-                { "required": ["task"] },
-                { "required": ["tasks"] }
-            ]
-        })
-    }
-
-    fn execute<'a>(
-        &'a self,
-        params: ToolParameters,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match require_run_id() {
-                Ok(id) => id,
-                Err(e) => return Ok(e),
-            };
-            self.create_task(run_id, params, None).await
-        })
-    }
-
-    fn execute_with_context<'a>(
-        &'a self,
-        params: ToolParameters,
-        ctx: &'a echo_core::tools::ToolContext,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match run_id_from_ctx_or_local(ctx) {
-                Ok(id) => id,
-                Err(e) => return Ok(e),
-            };
-            self.create_task(run_id, params, Some(ctx)).await
-        })
-    }
-}
-
-impl TaskCreateTool {
-    async fn create_task(
-        &self,
-        run_id: String,
-        params: ToolParameters,
-        bootstrap_ctx: Option<&echo_core::tools::ToolContext>,
-    ) -> echo_agent::error::Result<ToolResult> {
-        let single_task = params.get("task");
-        let task_batch = params.get("tasks").and_then(serde_json::Value::as_array);
-        if single_task.is_some() == task_batch.is_some() {
-            return Ok(ToolResult::error(
-                "task_create requires exactly one of task or tasks",
-            ));
-        }
-        let raw_tasks = match (single_task, task_batch) {
-            (Some(task), None) if task.is_object() => vec![task],
-            (None, Some(tasks)) => tasks.iter().collect::<Vec<_>>(),
-            (Some(_), None) => {
-                return Ok(ToolResult::error("task_create task must be an object"));
-            }
-            _ => Vec::new(),
-        };
-        let Some(first) = raw_tasks.first() else {
-            return Ok(ToolResult::error("task_create requires at least one task"));
-        };
-        let bootstrap_title = first
-            .get("title")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Complex task");
-        let bootstrap_description = first
-            .get("description")
-            .and_then(|value| value.as_str())
-            .unwrap_or(bootstrap_title);
-        if let Err(e) = self.ensure_run_exists(
-            &run_id,
-            bootstrap_title,
-            bootstrap_description,
-            bootstrap_ctx,
-        ) {
-            return Ok(e);
-        }
-        let run = match self.store.get_run(&run_id) {
-            Ok(Some(run)) => run,
-            Ok(None) => {
-                return Ok(ToolResult::error(
-                    "Task run disappeared after task_create bootstrap",
-                ));
-            }
-            Err(error) => {
-                return Ok(ToolResult::error(format!(
-                    "Failed to read task run domain: {error}"
-                )));
-            }
-        };
-
-        let mut tasks = Vec::with_capacity(raw_tasks.len());
-        for (index, value) in raw_tasks.iter().enumerate() {
-            let task = match parse_plan_task(value, index, run.domain_profile) {
-                Ok(task) => task,
-                Err(error) => return Ok(ToolResult::error(error)),
-            };
-            if let Err(error) = self.capabilities.validate_task(&task) {
-                return Ok(ToolResult::error(error));
-            }
-            tasks.push(task);
-        }
-
-        let existing_graph = match self.store.get_plan(&run_id) {
-            Ok(plan) => plan,
-            Err(error) => {
-                return Ok(ToolResult::error(format!(
-                    "Failed to inspect current task graph: {error}"
-                )));
-            }
-        };
-        if let Some(graph) = existing_graph {
-            let Some(base_revision) = params
-                .get("base_revision")
-                .and_then(serde_json::Value::as_u64)
-                .filter(|revision| *revision > 0)
-            else {
-                return Ok(ToolResult::error(
-                    "task_create requires base_revision when tasks already exist",
-                ));
-            };
-            let reason = params
-                .get("reason")
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|reason| !reason.is_empty())
-                .unwrap_or("add tasks")
-                .to_string();
-            let operations = tasks
-                .into_iter()
-                .map(|task| TaskUpdateOperation::Insert {
-                    after_task_id: None,
-                    task: task.spec(),
-                })
-                .collect();
-            let request = TaskUpdateRequest {
-                base_revision,
-                reason,
-                operations,
-            };
-            return match self.store.update_tasks(&run_id, &request) {
-                Ok(updated) => Ok(ToolResult::success(format!(
-                    "Created task graph revision {} with {} total task(s)",
-                    updated.revision,
-                    updated.tasks.len()
-                ))),
-                Err(error) => Ok(ToolResult::error(format!(
-                    "Failed to add tasks to revision {}: {error}",
-                    graph.revision
-                ))),
-            };
-        }
-
-        let execution_mode = params
-            .get("execution_mode")
-            .and_then(|value| value.as_str())
-            .and_then(ExecutionMode::from_str)
-            .unwrap_or(ExecutionMode::Parallel);
-        let plan = TaskPlan {
-            plan_id: format!("plan_{}", uuid::Uuid::new_v4().as_simple()),
-            run_id: run_id.clone(),
-            revision: 1,
-            domain_profile: run.domain_profile,
-            goal: run.goal,
-            assumptions: string_array_from(&params, "assumptions"),
-            risks: string_array_from(&params, "risks"),
-            execution_mode,
-            tasks,
-        };
-        match self.store.attach_plan(&plan) {
-            Ok(()) => Ok(ToolResult::success(format!(
-                "Created task graph revision 1 with {} task(s). Call task_execute with revision=1.",
-                plan.tasks.len()
-            ))),
-            Err(error) => Ok(ToolResult::error(format!(
-                "Failed to create task graph: {error}"
-            ))),
-        }
-    }
-
-    #[allow(clippy::result_large_err)] // ToolResult is the framework error type used by Tool::execute
-    fn ensure_run_exists(
-        &self,
-        run_id: &str,
-        title: &str,
-        description: &str,
-        bootstrap_ctx: Option<&echo_core::tools::ToolContext>,
-    ) -> std::result::Result<(), ToolResult> {
-        match self.store.get_run(run_id) {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            Err(e) => {
-                return Err(ToolResult::error(format!(
-                    "Failed to inspect task run before creating task: {e}"
-                )));
-            }
-        }
-
-        let chat_resources = crate::chat_resources::current_chat_resources();
-        let conversation_id = bootstrap_ctx
-            .and_then(|ctx| ctx.conversation_id.clone())
-            .or_else(|| chat_resources.as_ref().and_then(|res| res.conv_id.clone()));
-        let root_message_id = bootstrap_ctx
-            .and_then(|ctx| ctx.message_id.clone().or_else(|| ctx.turn_id.clone()))
-            .or_else(|| {
-                chat_resources
-                    .as_ref()
-                    .map(|res| res.root_message_id.clone())
-            })
-            .unwrap_or_else(|| run_id.to_string());
-        let attachments = chat_resources
-            .as_ref()
-            .map(|res| res.attachments.clone())
-            .unwrap_or_default();
-        let trace_sink = bootstrap_ctx
-            .and_then(trace_sink_from_tool_context)
-            .or_else(|| {
-                chat_resources
-                    .as_ref()
-                    .map(|res| crate::chat_driver::subagent_trace_sink_for(&res.sink))
-            });
-        let conversation_id = conversation_id.unwrap_or_else(|| format!("message:{run_id}"));
-        let goal = task_goal(title, description);
-
-        if let Err(e) = self.store.create_run(
-            run_id,
-            "default",
-            &conversation_id,
-            &root_message_id,
-            DomainProfile::General,
-            &goal,
-            "agent_task_plan",
-            AttendedMode::Attended,
-        ) {
-            return Err(ToolResult::error(format!(
-                "Failed to create task run before creating task: {e}"
-            )));
-        }
-        #[allow(clippy::collapsible_if)]
-        // outer guard + inner if-let-Err reads clearer than a let-chain
-        if !attachments.is_empty() {
-            if let Err(e) = self.store.set_run_attachments(run_id, &attachments) {
-                tracing::warn!(run_id, error = %e, "failed to bind attachments to task run");
-            }
-        }
-        if let Err(e) = self.store.transition_run(run_id, TaskRunStatus::Running) {
-            return Err(ToolResult::error(format!(
-                "Failed to start task run before creating task: {e}"
-            )));
-        }
-        if let Some(sink) = trace_sink {
-            sink(ExecEvent::run(
-                run_id.to_string(),
-                "run_started",
-                serde_json::json!({
-                    "goal": goal,
-                    "route": "agent_task_plan",
-                    "source": "task_create",
-                }),
-            ));
-        }
-        Ok(())
-    }
-}
-
-// ── task_update ────────────────────────────────────────────────────────────
-
-pub struct TaskUpdateTool {
-    pub store: Arc<TaskRuntimeStore>,
-    pub capabilities: Arc<TaskCapabilityCatalog>,
-}
-
-impl Tool for TaskUpdateTool {
-    fn name(&self) -> &str {
-        "task_update"
-    }
-
-    fn description(&self) -> &str {
-        "Atomically update task specifications, dependency relations, ordering, or skip state using optimistic concurrency. Only pending or blocked task specifications may change while a run is active."
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        let task_schema = plan_task_input_schema();
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "base_revision": { "type": "integer", "minimum": 1 },
-                "reason": { "type": "string", "description": "Why runtime evidence requires this revision" },
-                "operations": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "oneOf": [
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "op": { "const": "insert" },
-                                    "after_task_id": { "type": ["string", "null"] },
-                                    "task": task_schema
-                                },
-                                "required": ["op", "task"]
-                            },
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "op": { "const": "update" },
-                                    "task_id": { "type": "string" },
-                                    "patch": {
-                                        "type": "object",
-                                        "additionalProperties": false,
-                                        "properties": {
-                                            "title": { "type": "string", "description": "User-visible task title in the user's current language" },
-                                            "description": { "type": "string", "description": "Subagent brief in the user's current language" },
-                                            "kind": { "type": "string", "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"] },
-                                            "agent_role": { "type": "string" },
-                                            "depends_on": { "type": "array", "items": { "type": "string" } },
-                                            "files": { "type": "array", "items": { "type": "string" } },
-                                            "allowed_tools": { "type": "array", "items": { "type": "string" } },
-                                            "required_artifacts": { "type": "array", "items": { "type": "string" } },
-                                            "execution_checks": { "type": "array", "items": { "type": "string" } },
-                                            "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
-                                            "max_retries": { "type": "integer", "minimum": 0, "maximum": 10 }
-                                        }
-                                    }
-                                },
-                                "required": ["op", "task_id", "patch"]
-                            },
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "op": { "const": "skip" },
-                                    "task_id": { "type": "string" }
-                                },
-                                "required": ["op", "task_id"]
-                            },
-                            {
-                                "type": "object",
-                                "additionalProperties": false,
-                                "properties": {
-                                    "op": { "const": "reorder" },
-                                    "task_ids": { "type": "array", "items": { "type": "string" } }
-                                },
-                                "required": ["op", "task_ids"]
-                            }
-                        ]
-                    }
-                }
-            },
-            "required": ["base_revision", "reason", "operations"]
-        })
-    }
-
-    fn execute<'a>(
-        &'a self,
-        params: ToolParameters,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match require_run_id() {
-                Ok(id) => id,
-                Err(error) => return Ok(error),
-            };
-            let Some(base_revision) = params.get("base_revision").and_then(|value| value.as_u64())
-            else {
-                return Ok(ToolResult::error("task_update requires base_revision"));
-            };
-            let reason = params
-                .get("reason")
-                .and_then(|value| value.as_str())
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            let current_plan = match self.store.get_plan(&run_id) {
-                Ok(Some(plan)) => plan,
-                Ok(None) => {
-                    return Ok(ToolResult::error(
-                        "task_update requires existing tasks; call task_create first",
-                    ));
-                }
-                Err(error) => {
-                    return Ok(ToolResult::error(format!(
-                        "Failed to read current task graph: {error}"
-                    )));
-                }
-            };
-            let Some(raw_operations) = params.get("operations") else {
-                return Ok(ToolResult::error("task_update requires operations"));
-            };
-            let operations =
-                match task_update_operations_from(raw_operations, current_plan.domain_profile) {
-                    Ok(operations) => operations,
-                    Err(error) => return Ok(ToolResult::error(error)),
-                };
-            for operation in &operations {
-                if let Err(error) = self.capabilities.validate_patch_operation(operation) {
-                    return Ok(ToolResult::error(error));
-                }
-            }
-            let request = TaskUpdateRequest {
-                base_revision,
-                reason,
-                operations,
-            };
-            match self.store.update_tasks(&run_id, &request) {
-                Ok(plan) => Ok(ToolResult::success(format!(
-                    "Committed task graph revision {} with {} task(s)",
-                    plan.revision,
-                    plan.tasks.len()
-                ))),
-                Err(error) => Ok(ToolResult::error(format!(
-                    "Failed to update tasks: {error}"
-                ))),
-            }
-        })
-    }
-
-    fn execute_with_context<'a>(
-        &'a self,
-        params: ToolParameters,
-        ctx: &'a echo_core::tools::ToolContext,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match run_id_from_ctx_or_local(ctx) {
-                Ok(id) => id,
-                Err(error) => return Ok(error),
-            };
-            with_run_id(run_id, self.execute(params)).await
-        })
-    }
-}
-
-fn task_goal(title: &str, description: &str) -> String {
-    if !description.trim().is_empty() {
-        description.to_string()
-    } else if !title.trim().is_empty() {
-        title.to_string()
-    } else {
-        "Agent task plan".to_string()
-    }
-}
-
 fn complex_run_prompt(
     user_goal: &str,
     reason: &str,
@@ -1066,8 +356,13 @@ fn complex_run_prompt(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)] // complex-task tool impls below are production code; moving them is churn
 mod task_create_tests {
+    use super::super::store::TaskRuntimeStore;
     use super::super::types::RuntimeEventKind;
+    use super::super::types::{AttendedMode, TaskRunStatus};
     use super::*;
+    use echo_agent::tasks::{
+        TaskCreateTool as FrameworkTaskCreateTool, TaskUpdateTool as FrameworkTaskUpdateTool,
+    };
 
     fn test_subagent_catalog() -> Arc<SubagentCatalogSnapshot> {
         let definitions = crate::subagent_loader::discover_subagents(None, None);
@@ -1081,6 +376,13 @@ mod task_create_tests {
         ))
     }
 
+    fn task_service(store: Arc<TaskRuntimeStore>) -> Arc<echo_agent::tasks::TaskRevisionService> {
+        super::super::revisioned_adapter::build_eko_task_revision_service(
+            store,
+            test_capabilities(),
+        )
+    }
+
     fn one_task_params(task: serde_json::Value) -> ToolParameters {
         let mut params = ToolParameters::new();
         params.insert("task".to_string(), task);
@@ -1088,18 +390,26 @@ mod task_create_tests {
     }
 
     #[test]
-    fn plan_task_schema_keeps_generated_briefs_in_user_language() {
-        let schema = plan_task_input_schema();
+    fn plan_task_schema_keeps_generated_briefs_in_user_language() -> std::result::Result<(), String>
+    {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let schema = FrameworkTaskCreateTool::new(task_service(store)).parameters();
+        let task_prefix = if schema.pointer("/properties/task").is_some() {
+            "/properties/task"
+        } else {
+            return Err("task_create schema is missing task input".to_string());
+        };
         let title = schema
-            .pointer("/properties/title/description")
+            .pointer(&format!("{task_prefix}/properties/title/description"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let description = schema
-            .pointer("/properties/description/description")
+            .pointer(&format!("{task_prefix}/properties/description/description"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         assert!(title.contains("user's current language"));
         assert!(description.contains("user's current language"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -1109,10 +419,7 @@ mod task_create_tests {
             TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
                 .map_err(|e| e.to_string())?,
         );
-        let tool = TaskCreateTool {
-            store: store.clone(),
-            capabilities: test_capabilities(),
-        };
+        let tool = FrameworkTaskCreateTool::new(task_service(store.clone()));
         let run_id = "run_task_create_bootstrap";
         let params = one_task_params(serde_json::json!({
             "id": "architecture-review",
@@ -1158,17 +465,17 @@ mod task_create_tests {
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "expected bootstrapped plan".to_string())?;
         assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].agent_role, "explorer");
+        assert_eq!(
+            plan.tasks.first().map(|task| task.agent_role.as_str()),
+            Some("explorer")
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn task_create_appends_to_the_same_revisioned_graph() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let tool = TaskCreateTool {
-            store: store.clone(),
-            capabilities: test_capabilities(),
-        };
+        let tool = FrameworkTaskCreateTool::new(task_service(store.clone()));
         let run_id = "run_incremental_task_create";
         let first = one_task_params(serde_json::json!({
             "id": "inspect",
@@ -1222,10 +529,7 @@ mod task_create_tests {
             TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
                 .map_err(|error| error.to_string())?,
         );
-        let tool = TaskCreateTool {
-            store: store.clone(),
-            capabilities: test_capabilities(),
-        };
+        let tool = FrameworkTaskCreateTool::new(task_service(store.clone()));
         let run_id = "taskrun:message-identity";
         let params = one_task_params(serde_json::json!({
             "id": "parallel-review",
@@ -1282,10 +586,7 @@ mod task_create_tests {
         store
             .transition_run(run_id, TaskRunStatus::Running)
             .map_err(|error| error.to_string())?;
-        let tool = TaskCreateTool {
-            store: store.clone(),
-            capabilities: test_capabilities(),
-        };
+        let tool = FrameworkTaskCreateTool::new(task_service(store.clone()));
         let mut params = ToolParameters::new();
         params.insert(
             "tasks".to_string(),
@@ -1349,11 +650,7 @@ mod task_create_tests {
     async fn task_update_insert_accepts_task_create_task_shape() -> std::result::Result<(), String>
     {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let capabilities = test_capabilities();
-        let create = TaskCreateTool {
-            store: store.clone(),
-            capabilities: capabilities.clone(),
-        };
+        let create = FrameworkTaskCreateTool::new(task_service(store.clone()));
         let run_id = "run_patch_shape";
         let created = with_run_id(
             run_id.to_string(),
@@ -1371,10 +668,7 @@ mod task_create_tests {
             return Err(format!("task_create failed: {:?}", created.error));
         }
 
-        let patch = TaskUpdateTool {
-            store: store.clone(),
-            capabilities,
-        };
+        let patch = FrameworkTaskUpdateTool::new(task_service(store.clone()));
         let mut params = ToolParameters::new();
         params.insert("base_revision".to_string(), serde_json::json!(1));
         params.insert(
@@ -1408,7 +702,10 @@ mod task_create_tests {
             .ok_or_else(|| "patched plan missing".to_string())?;
         assert_eq!(plan.revision, 2);
         assert_eq!(plan.tasks.len(), 2);
-        assert_eq!(plan.tasks[1].agent_role, "explorer");
+        assert_eq!(
+            plan.tasks.get(1).map(|task| task.agent_role.as_str()),
+            Some("explorer")
+        );
         Ok(())
     }
 
@@ -1416,10 +713,7 @@ mod task_create_tests {
     async fn task_create_rejects_task_control_tools_in_subagent_allowlist()
     -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let tool = TaskCreateTool {
-            store,
-            capabilities: test_capabilities(),
-        };
+        let tool = FrameworkTaskCreateTool::new(task_service(store));
         let result = with_run_id(
             "run_forbidden_tool".to_string(),
             tool.execute(one_task_params(serde_json::json!({
@@ -1856,60 +1150,5 @@ impl CancelRunTool {
                 "Failed to cancel run {run_id}: {error}"
             ))),
         }
-    }
-}
-
-// ── task_list ─────────────────────────────────────────────────────────────
-
-pub struct TaskListTool {
-    pub store: Arc<TaskRuntimeStore>,
-}
-
-impl Tool for TaskListTool {
-    fn name(&self) -> &str {
-        "task_list"
-    }
-    fn description(&self) -> &str {
-        "List the current TaskRun's tasks, dependency-aware graph revision, and runtime status."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({ "type": "object", "properties": {} })
-    }
-    fn execute<'a>(
-        &'a self,
-        _params: ToolParameters,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match require_run_id() {
-                Ok(id) => id,
-                Err(e) => return Ok(e),
-            };
-            match (self.store.get_plan(&run_id), self.store.list_todos(&run_id)) {
-                (Ok(Some(plan)), Ok(todos)) => {
-                    let lines: Vec<String> = todos
-                        .iter()
-                        .map(|t| format!("[{}] {} — {}", t.status.as_str(), t.task_id, t.title))
-                        .collect();
-                    Ok(ToolResult::success(format!(
-                        "Task graph revision {} — Tasks ({}):\n{}",
-                        plan.revision,
-                        todos.len(),
-                        lines.join("\n")
-                    )))
-                }
-                (Ok(None), _) => Ok(ToolResult::error("No tasks; call task_create first")),
-                (Err(error), _) | (_, Err(error)) => {
-                    Ok(ToolResult::error(format!("Failed: {error}")))
-                }
-            }
-        })
-    }
-
-    fn execute_with_context<'a>(
-        &'a self,
-        params: ToolParameters,
-        ctx: &'a echo_core::tools::ToolContext,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
     }
 }

@@ -4513,7 +4513,7 @@ Read the runtime path and found one missing branch.
             }],
         };
         store
-            .attach_plan(&plan)
+            .attach_plan_for_test(&plan)
             .map_err(|error| error.to_string())?;
 
         // Simulate the executor: Running, mark task running then
@@ -4979,7 +4979,7 @@ Read the runtime path and found one missing branch.
             tasks,
         };
         store
-            .attach_plan(&plan)
+            .attach_plan_for_test(&plan)
             .map_err(|error| error.to_string())?;
         store
             .transition_run(&run_id, TaskRunStatus::Running)
@@ -5266,7 +5266,7 @@ Read the runtime path and found one missing branch.
         }
 
         store
-            .update_tasks(
+            .apply_task_patch_for_test(
                 &run_id,
                 &TaskUpdateRequest {
                     base_revision: 1,
@@ -5466,7 +5466,7 @@ Read the runtime path and found one missing branch.
                 AttendedMode::Attended,
             )
             .map_err(|error| error.to_string())?;
-        let attach_result = store.attach_plan(&TaskPlan {
+        let attach_result = store.attach_plan_for_test(&TaskPlan {
             plan_id: format!("plan_{run_id}"),
             run_id,
             revision: 1,

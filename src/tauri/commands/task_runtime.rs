@@ -413,15 +413,28 @@ pub async fn update_tasks(
     request: TaskUpdateRequest,
 ) -> Result<TaskPlan, IpcError> {
     let store = store(&state)?;
-    store
-        .update_tasks(&run_id, &request)
-        .map_err(|error| match error {
-            echo_agent_app_core::tasks::task_runtime::StoreError::PlanConflict { .. }
-            | echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(_) => {
-                IpcError::Validation(error.to_string())
-            }
-            other => internal(other),
-        })
+    let agent = state.app_state.connection.primary_agent();
+    let service = echo_agent_app_core::tasks::task_runtime::task_revision_service_for_agent(
+        &agent,
+        store.clone(),
+    )
+    .await;
+    echo_agent_app_core::tasks::task_runtime::apply_eko_task_update(
+        &service, &store, &run_id, request,
+    )
+    .await
+    .map_err(|error| match error {
+        echo_agent::tasks::TaskRevisionError::RevisionConflict { .. }
+        | echo_agent::tasks::TaskRevisionError::InvalidInput { .. }
+        | echo_agent::tasks::TaskRevisionError::TaskNotFound { .. }
+        | echo_agent::tasks::TaskRevisionError::InvalidPatch { .. }
+        | echo_agent::tasks::TaskRevisionError::PolicyRejected { .. }
+        | echo_agent::tasks::TaskRevisionError::StoreRejected { .. } => {
+            IpcError::Validation(error.to_string())
+        }
+        echo_agent::tasks::TaskRevisionError::GraphNotFound { .. }
+        | echo_agent::tasks::TaskRevisionError::Backend { .. } => internal(error),
+    })
 }
 
 /// Cancel an executing run. Cancels every in-flight subagent via the run's

@@ -109,9 +109,10 @@ not use them.
   If they model a generic framework background-task API, keep the traits in the
   framework. If they encode a specific app UX or task store, move the concrete
   tools to CLI.
-- `TodoWriteTool`:
-  Keep in framework if it remains a scratch planning artifact. Move or replace
-  in CLI if it is meant to drive the EKO task panel / TaskRuntime.
+- Task relation tools:
+  The framework owns `task_create/task_update/task_list`, revision/patch
+  semantics, validation, and the default in-memory store. EKO supplies only
+  its file store and product-policy adapters.
 - `AgentDispatchTool`:
   Keep the generic delegate tool in framework. CLI decides whether a given
   subagent role receives it.
@@ -257,14 +258,13 @@ Findings:
 
 - `spawn_background_task` / `check_task_status` remain generic framework
   background-task tools.
-- `todo_write` remains a generic framework scratch planning artifact for other
-  consumers. EKO removes it when registering its unified `task_*` relation API,
-  so TaskRuntime and its UI never expose a second task authority.
+- Process-global `todo_write` was removed and replaced by the framework's
+  instance-local revisioned `task_create/task_update/task_list` tools.
 - `agent_tool` remains the generic framework delegate tool. EKO decides whether
   a role receives it via capability / registration policy.
-- EKO-specific concrete tools (`task_create/update/complete/skip/list`,
-  `create_complex_task`, `execute_plan`, `cancel_run`, `check_run_status`) stay
-  in `echo-agent-cli`.
+- EKO-specific run tools (`create_complex_task`, `task_execute`, `cancel_run`,
+  `check_run_status`) stay in `echo-agent-cli`; task CRUD tools live in the
+  framework.
 - EKO subagent `.md` frontmatter supports `can_delegate: true`. Default
   subagents do not receive `agent_tool`; only explicitly marked roles get it.
   Delegate-capable roles receive every non-self child subagent, including other

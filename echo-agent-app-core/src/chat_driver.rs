@@ -805,7 +805,7 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         store
-            .attach_plan(&TaskPlan {
+            .attach_plan_for_test(&TaskPlan {
                 plan_id: "boundary-plan".to_string(),
                 run_id: run_id.clone(),
                 revision: 1,

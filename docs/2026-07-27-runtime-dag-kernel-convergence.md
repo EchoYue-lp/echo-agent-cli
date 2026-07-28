@@ -186,10 +186,10 @@ DAG loop, dependency validator, or generic retry state machine.
   executor-owned and cannot be forged by task CRUD.
 - Chat, Auto, and Task modes expose the same task relation API. Mode prompts
   choose when to use it; they no longer create different capability surfaces.
-- EKO removes the framework process-global `todo_write` when TaskRuntime tools
-  are registered. The reusable framework tool remains available to other
-  framework consumers, while EKO has only one task id, state, event, and UI
-  authority.
+- The framework removed process-global `todo_write` and replaced it with
+  per-Agent `task_create/task_update/task_list` backed by the canonical task
+  model. EKO replaces only the store/policy adapter and therefore has one task
+  id, state, event, and UI authority.
 - `TaskPlan` remains only the versioned graph artifact persisted by EKO, and
   `TodoItem` remains only a GUI/TUI projection. Neither owns scheduling or an
   independent task lifecycle.

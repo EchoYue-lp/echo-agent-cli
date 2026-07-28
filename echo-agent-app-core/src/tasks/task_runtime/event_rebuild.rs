@@ -370,7 +370,7 @@ mod tests {
                 sample_task("t2", PlanTaskKind::Investigation),
             ],
         };
-        s.attach_plan(&plan).unwrap();
+        s.attach_plan_for_test(&plan).unwrap();
 
         // 4. mutate a task status
         s.set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
@@ -403,8 +403,8 @@ mod tests {
         assert_eq!(rebuilt.plan.risks, sql_plan.risks);
         assert_eq!(rebuilt.plan.execution_mode, sql_plan.execution_mode);
 
-        // 9. Assert task parity. attach_plan replaced tasks, so SQL has 1 task (t1);
-        // rebuild should also converge to the post-attach state (t1 only).
+        // 9. Assert task parity. The revision commit replaced tasks, so the
+        // projection has 1 task (t1) and rebuild must converge to that state.
         let rebuilt_t1 = rebuilt
             .tasks
             .iter()
@@ -440,7 +440,7 @@ mod tests {
             AttendedMode::Attended,
         )
         .unwrap();
-        s.attach_plan(&TaskPlan {
+        s.attach_plan_for_test(&TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -452,7 +452,7 @@ mod tests {
             tasks: vec![sample_task("t1", PlanTaskKind::Investigation)],
         })
         .unwrap();
-        s.update_tasks(
+        s.apply_task_patch_for_test(
             "r1",
             &TaskUpdateRequest {
                 base_revision: 1,

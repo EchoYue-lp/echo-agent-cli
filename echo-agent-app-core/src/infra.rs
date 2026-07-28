@@ -480,29 +480,16 @@ pub async fn create_agent_with_diagnostics(
     // task graph shared by the todo and DAG projections.
     // The store handle is threaded from AppState → SharedResources → params.
     if let Some(store) = &params.task_runtime_store {
-        use crate::tasks::task_runtime::task_tools::{
-            TaskCapabilityCatalog, TaskCreateTool, TaskListTool, TaskUpdateTool,
-        };
+        use crate::tasks::task_runtime::task_tools::TaskCapabilityCatalog;
         let store = Arc::clone(store);
-        // EKO uses TaskRuntime as its only task authority. The framework's
-        // standalone todo scratchpad remains available to other consumers.
-        agent.remove_tool("todo_write");
         let tool_names = agent.tool_names();
         let capabilities = Arc::new(TaskCapabilityCatalog::new(
             subagent_catalog_snapshot.clone(),
             tool_names,
         ));
-        agent.add_tool(Box::new(TaskCreateTool {
-            store: Arc::clone(&store),
-            capabilities: capabilities.clone(),
-        }));
-        agent.add_tool(Box::new(TaskUpdateTool {
-            store: Arc::clone(&store),
-            capabilities,
-        }));
-        agent.add_tool(Box::new(TaskListTool {
-            store: Arc::clone(&store),
-        }));
+        let revision_service =
+            crate::tasks::task_runtime::build_eko_task_revision_service(store, capabilities);
+        echo_agent::tasks::register_task_tools(&mut agent, revision_service);
         tracing::info!(
             "Registered revisioned task-management tools (task_create/task_update/task_list)"
         );

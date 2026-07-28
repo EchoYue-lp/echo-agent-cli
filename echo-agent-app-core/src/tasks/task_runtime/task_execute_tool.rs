@@ -730,7 +730,7 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         store
-            .attach_plan(&one_task_plan(run_id))
+            .attach_plan_for_test(&one_task_plan(run_id))
             .map_err(|error| error.to_string())?;
         let tool = test_tool(store)?;
         let mut params = ToolParameters::new();
@@ -768,7 +768,7 @@ mod tests {
             ..Default::default()
         };
         store
-            .attach_plan(&TaskPlan {
+            .attach_plan_for_test(&TaskPlan {
                 plan_id: "p1".to_string(),
                 run_id: "r1".to_string(),
                 revision: 1,

@@ -475,7 +475,7 @@ mod tests {
             execution_mode: ExecutionMode::Parallel,
             tasks: vec![task("t1", PlanTaskKind::ReadOnlyReview)],
         };
-        store.attach_plan(&plan).unwrap();
+        store.attach_plan_for_test(&plan).unwrap();
         store
             .set_task_status(
                 "r1",
@@ -549,7 +549,7 @@ mod tests {
             "complex",
             AttendedMode::Attended,
         )?;
-        store.attach_plan(&TaskPlan {
+        store.attach_plan_for_test(&TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
             revision: 1,
@@ -567,7 +567,7 @@ mod tests {
             Some("reviewer"),
             Some("review needs fix"),
         )?;
-        store.update_tasks(
+        store.apply_task_patch_for_test(
             "r1",
             &TaskUpdateRequest {
                 base_revision: 1,

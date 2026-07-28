@@ -785,6 +785,32 @@ pub struct EkoTaskSpec {
     pub sort_order: i64,
 }
 
+impl EkoTaskSpec {
+    pub(crate) fn to_task_spec(&self) -> Result<echo_agent::tasks::TaskSpec, String> {
+        let metadata = serde_json::to_value(EkoTaskMetadata {
+            domain_profile: self.domain_profile,
+            parallel_group: self.parallel_group.clone(),
+            sort_order: self.sort_order,
+        })
+        .map_err(|error| format!("task '{}' has invalid EKO metadata: {error}", self.id))?;
+        Ok(echo_agent::tasks::TaskSpec {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            kind: self.kind.to_task_kind(),
+            agent_role: self.agent_role.clone(),
+            depends_on: self.depends_on.clone(),
+            files: self.files.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            required_artifacts: self.required_artifacts.clone(),
+            execution_checks: self.execution_checks.clone(),
+            acceptance_criteria: self.acceptance_criteria.clone(),
+            max_retries: self.max_retries,
+            metadata,
+        })
+    }
+}
+
 /// EKO file projection of framework task execution state.
 ///
 /// The shared `TaskStatus` remains authoritative and lossless. `TodoStatus` is
@@ -805,6 +831,13 @@ pub struct EkoTaskMetadata {
     pub domain_profile: DomainProfile,
     pub parallel_group: Option<String>,
     pub sort_order: i64,
+}
+
+/// EKO-only plan metadata carried through the framework graph context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EkoPlanMetadata {
+    pub plan_id: String,
+    pub domain_profile: DomainProfile,
 }
 
 impl EkoTaskExecution {
@@ -1096,6 +1129,24 @@ pub struct TaskPatch {
     pub max_retries: Option<u32>,
 }
 
+impl TaskPatch {
+    pub(crate) fn to_task_spec_patch(&self) -> echo_agent::tasks::TaskSpecPatch {
+        echo_agent::tasks::TaskSpecPatch {
+            title: self.title.clone(),
+            description: self.description.clone(),
+            kind: self.kind.map(PlanTaskKind::to_task_kind),
+            agent_role: self.agent_role.clone(),
+            depends_on: self.depends_on.clone(),
+            files: self.files.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            required_artifacts: self.required_artifacts.clone(),
+            execution_checks: self.execution_checks.clone(),
+            acceptance_criteria: self.acceptance_criteria.clone(),
+            max_retries: self.max_retries,
+        }
+    }
+}
+
 /// One atomic operation in a revisioned plan patch.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -1124,6 +1175,42 @@ pub struct TaskUpdateRequest {
     pub base_revision: u64,
     pub reason: String,
     pub operations: Vec<TaskUpdateOperation>,
+}
+
+impl TaskUpdateRequest {
+    pub(crate) fn to_task_plan_patch(&self) -> Result<echo_agent::tasks::TaskPlanPatch, String> {
+        let mut operations = Vec::with_capacity(self.operations.len());
+        for operation in &self.operations {
+            operations.push(match operation {
+                TaskUpdateOperation::Insert {
+                    after_task_id,
+                    task,
+                } => echo_agent::tasks::TaskPlanPatchOp::Insert {
+                    after_task_id: after_task_id.clone(),
+                    task: task.to_task_spec()?,
+                },
+                TaskUpdateOperation::Update { task_id, patch } => {
+                    echo_agent::tasks::TaskPlanPatchOp::Update {
+                        task_id: task_id.clone(),
+                        patch: patch.to_task_spec_patch(),
+                    }
+                }
+                TaskUpdateOperation::Skip { task_id } => echo_agent::tasks::TaskPlanPatchOp::Skip {
+                    task_id: task_id.clone(),
+                },
+                TaskUpdateOperation::Reorder { task_ids } => {
+                    echo_agent::tasks::TaskPlanPatchOp::Reorder {
+                        task_ids: task_ids.clone(),
+                    }
+                }
+            });
+        }
+        Ok(echo_agent::tasks::TaskPlanPatch {
+            base_revision: self.base_revision,
+            reason: self.reason.clone(),
+            operations,
+        })
+    }
 }
 
 /// A todo row — the GUI-facing projection of a plan task's progress.

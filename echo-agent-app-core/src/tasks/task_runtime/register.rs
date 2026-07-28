@@ -21,8 +21,24 @@ use crate::tasks::task_runtime::store::TaskRuntimeStore;
 use crate::tasks::task_runtime::task_execute_tool::ExecuteTaskTool;
 use crate::tasks::task_runtime::task_tools::{
     CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, TaskCapabilityCatalog,
-    TaskCreateTool, TaskListTool, TaskUpdateTool,
 };
+
+/// Build EKO's revision service from the live Agent capability catalog.
+pub async fn task_revision_service_for_agent(
+    agent_handle: &AgentHandle,
+    store: Arc<TaskRuntimeStore>,
+) -> Arc<echo_agent::tasks::TaskRevisionService> {
+    let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
+    let registry = agent_handle
+        .read(|agent| agent.subagent_registry().clone())
+        .await;
+    let registered_subagents = registry.list_available().await;
+    let subagent_catalog = Arc::new(
+        crate::subagent_loader::SubagentCatalogSnapshot::from_registered(&registered_subagents),
+    );
+    let capabilities = Arc::new(TaskCapabilityCatalog::new(subagent_catalog, tool_names));
+    super::revisioned_adapter::build_eko_task_revision_service(store, capabilities)
+}
 
 /// Register the task-management tools + `task_execute` (with store) on
 /// `agent_handle`. See module docs for why this is post-hoc.
@@ -30,15 +46,7 @@ pub async fn register_task_tools_on_agent(
     agent_handle: &AgentHandle,
     store: Arc<TaskRuntimeStore>,
 ) {
-    let tool_names = agent_handle
-        .write(|agent| {
-            // EKO projects todos and executable DAG nodes from one TaskRuntime
-            // authority. The framework scratchpad is process-global and would
-            // introduce a second task id/status space if left visible here.
-            agent.remove_tool("todo_write");
-            agent.tool_names()
-        })
-        .await;
+    let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
     let registry = agent_handle
         .read(|agent| agent.subagent_registry().clone())
         .await;
@@ -50,19 +58,11 @@ pub async fn register_task_tools_on_agent(
         subagent_catalog.clone(),
         tool_names,
     ));
+    let revision_service =
+        super::revisioned_adapter::build_eko_task_revision_service(store.clone(), capabilities);
     let added = agent_handle
         .write(|agent| {
-            agent.add_tool(Box::new(TaskCreateTool {
-                store: store.clone(),
-                capabilities: capabilities.clone(),
-            }));
-            agent.add_tool(Box::new(TaskUpdateTool {
-                store: store.clone(),
-                capabilities: capabilities.clone(),
-            }));
-            agent.add_tool(Box::new(TaskListTool {
-                store: store.clone(),
-            }));
+            echo_agent::tasks::register_task_tools(agent, revision_service);
             // Phase B3: agent-autonomous complex-task tools. These read
             // pool/store/sink from the chat turn's task_local
             // (current_chat_resources), so no store injection is needed.
@@ -109,7 +109,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn registration_replaces_framework_todo_with_one_task_api()
+    async fn registration_replaces_default_task_store_with_eko_task_store()
     -> std::result::Result<(), String> {
         let agent = echo_agent::agent::ReactAgentBuilder::new()
             .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
@@ -118,13 +118,14 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let before = handle.read(|agent| agent.tool_names()).await;
-        assert!(before.iter().any(|name| name == "todo_write"));
+        for expected in ["task_create", "task_update", "task_list"] {
+            assert!(before.iter().any(|name| name == expected));
+        }
 
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         register_task_tools_on_agent(&handle, store).await;
 
         let after = handle.read(|agent| agent.tool_names()).await;
-        assert!(!after.iter().any(|name| name == "todo_write"));
         for expected in ["task_create", "task_update", "task_list", "task_execute"] {
             assert!(after.iter().any(|name| name == expected));
         }

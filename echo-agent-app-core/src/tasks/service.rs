@@ -329,17 +329,21 @@ impl BackgroundTaskService {
             &task_kind,
             AttendedMode::Unattended,
         )?;
-        self.task_runtime_store.attach_plan(&TaskPlan {
-            plan_id: uuid::Uuid::new_v4().to_string(),
-            run_id: run_id.clone(),
-            revision: 1,
-            domain_profile: DomainProfile::General,
-            goal: goal.to_string(),
-            assumptions: Vec::new(),
-            risks: Vec::new(),
-            execution_mode: ExecutionMode::default(),
-            tasks: plan_tasks,
-        })?;
+        super::task_runtime::commit_eko_task_plan(
+            self.task_runtime_store.clone(),
+            TaskPlan {
+                plan_id: uuid::Uuid::new_v4().to_string(),
+                run_id: run_id.clone(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal: goal.to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::default(),
+                tasks: plan_tasks,
+            },
+        )
+        .await?;
         self.task_runtime_store.record_trigger_metadata(
             &run_id,
             source_id,
@@ -991,7 +995,7 @@ mod tests {
             ..PlanTask::default()
         };
         store
-            .attach_plan(&TaskPlan {
+            .attach_plan_for_test(&TaskPlan {
                 plan_id: "retry-plan".to_string(),
                 run_id: "retry-run".to_string(),
                 revision: 1,

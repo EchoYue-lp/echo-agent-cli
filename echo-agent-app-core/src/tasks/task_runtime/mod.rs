@@ -39,6 +39,7 @@ pub mod planner;
 pub mod profiles;
 pub mod register;
 pub mod review;
+pub mod revisioned_adapter;
 pub mod store;
 pub mod task_execute_tool;
 pub mod task_tools;
@@ -59,10 +60,13 @@ pub use planner::{
     FileOverlapPair, OwnershipReport, analyze_file_ownership, has_writer_file_overlap,
 };
 pub use profiles::ProfileTemplate;
-pub use register::register_task_tools_on_agent;
+pub use register::{register_task_tools_on_agent, task_revision_service_for_agent};
 pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
     review_task,
+};
+pub use revisioned_adapter::{
+    apply_eko_task_update, build_eko_task_revision_service, commit_eko_task_plan,
 };
 pub use store::{StoreError, TaskRuntimeStore};
 pub use task_execute_tool::ExecuteTaskTool;

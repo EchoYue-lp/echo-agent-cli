@@ -266,6 +266,27 @@ the same fact is not persisted twice. See
   were not executed because `ZOTERO_API_KEY` and `ZOTERO_LIBRARY_ID` were not
   present in the environment; no credentials are stored by EKO.
 
+### 2026-07-28 Task Tools Framework Migration
+
+- The framework now publishes `task_create`, `task_update`, and `task_list` as
+  first-class tools backed by one `TaskRevisionService`, `TaskPatchEngine`,
+  `PlanValidator`, and optimistic CAS protocol.
+- Every ReAct Agent gets an instance-local in-memory task graph by default.
+  The process-global `todo_write` implementation was deleted in the same
+  framework change, so zero-configuration task tracking remains available
+  without a second id/status model.
+- EKO injects `EkoRevisionedTaskStore` and `EkoTaskToolPolicy`. These adapters
+  own file/event persistence, run bootstrap, `DomainProfile`, Subagent/tool
+  capability policy, attachments, and metadata round trips; they do not own
+  patch semantics or DAG validation.
+- Primary, pooled, GUI, TUI, CLI, and channel Agents replace the default
+  in-memory store through the shared framework registration function. The
+  Tauri `update_tasks` IPC command also calls `TaskRevisionService`.
+- The old app-core `TaskCreateTool`, `TaskUpdateTool`, and `TaskListTool`, their
+  schema/parsers, and the production `TaskRuntimeStore::update_tasks` API are
+  gone. `TaskUpdateRequest` remains only as an EKO frontend wire DTO and is
+  converted losslessly to the framework patch protocol.
+
 ## Next Step
 
 Runtime DAG convergence is complete: the framework owns canonical
@@ -277,8 +298,8 @@ not reintroduce another loop, validator, status model,
 canonical task-spec name, or unclaimed dispatch path. Task relations are also
 unified: all modes expose
 `task_create/task_update/task_list/task_execute`; one Task and a dependency DAG
-share the same revisioned TaskRun graph. EKO removes `todo_write` at the
-TaskRuntime registration boundary, while `TaskPlan` and `TodoItem` remain only
+share the same revisioned TaskRun graph. The framework has replaced
+`todo_write` with per-Agent revisioned task tools, while `TaskPlan` and `TodoItem` remain only
 artifact/UI projections. Do not reintroduce `plan_*` CRUD tools or an
 independent todo store. Next, observe real
 long-running GUI/TUI/CLI task runs for claim-conflict and revision-conflict,

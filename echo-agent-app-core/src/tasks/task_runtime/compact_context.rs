@@ -502,8 +502,8 @@ mod tests {
             ],
         };
         store
-            .attach_plan(&plan)
-            .map_err(|err| format!("seed attach_plan failed: {err}"))?;
+            .attach_plan_for_test(&plan)
+            .map_err(|err| format!("seed plan commit failed: {err}"))?;
         store
             .set_task_status("r1", "t1", TodoStatus::Completed, Some("explorer"), None)
             .map_err(|err| format!("seed t1 status failed: {err}"))?;
@@ -609,7 +609,7 @@ mod tests {
             )
             .map_err(|err| format!("seed projection run failed: {err}"))?;
         store
-            .attach_plan(&TaskPlan {
+            .attach_plan_for_test(&TaskPlan {
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
                 revision: 1,

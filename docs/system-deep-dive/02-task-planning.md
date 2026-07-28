@@ -147,9 +147,14 @@ pub(crate) fn has_planning_tools(&self) -> bool {
 
 实际后果：`has_planning_tools()` 即便在 `enable_task=true` 时也**总是返回 false**。这是 wiring 残留 / 无害悬挂代码，记录在 [07-cross-cutting.md §3](./07-cross-cutting.md#3-已知陷阱清单) 第 1 项，待跟进确认是补 register 还是删常量。
 
-### §3.2 `TodoWriteTool` —— 不依赖 `enable_task` 的内置 todo
+### §3.2 统一任务关系工具
 
-`TodoWriteTool`（`src/tools/builtin/todo.rs:26`，`name()="todo_write"`）在通用框架 `ReactAgent` 构造时注册。它内部用一个 `static LazyLock<Mutex<Vec<TodoEntry>>>`（最多 100 条）作为进程内 scratchpad，不写入 TaskRuntime，也不参与 DAG。EKO 在注册统一 `task_create/task_update/task_list/task_execute` API 时必须移除该工具，因此 GUI/TUI/CLI/channel 不会同时暴露两个 task id/status 空间；其它框架复用方仍可选择该通用 scratchpad。
+旧的进程全局 `TodoWriteTool` 已删除。框架现在为每个 `ReactAgent` 注册
+`task_create/task_update/task_list`,默认使用实例级
+`InMemoryRevisionedTaskStore`;应用可通过 `register_task_tools` 注入自己的
+`RevisionedTaskStore` 与 `TaskToolPolicy`。因此轻量进度列表和可执行 DAG
+使用同一组 `TaskSpec/TaskExecution/TaskStatus`、revision 和 patch 语义,
+不会再暴露第二个 todo id/status 空间。
 
 ---
 

@@ -231,7 +231,7 @@ mod tests {
                 },
             ],
         };
-        store.attach_plan(&plan).unwrap();
+        store.attach_plan_for_test(&plan).unwrap();
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         store
             .set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)

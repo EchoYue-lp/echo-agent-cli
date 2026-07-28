@@ -460,9 +460,9 @@ mod tests {
                 task("t2", PlanTaskKind::Investigation),
             ],
         };
-        store.attach_plan(&plan).unwrap();
+        store.attach_plan_for_test(&plan).unwrap();
         store
-            .update_tasks(
+            .apply_task_patch_for_test(
                 "r1",
                 &TaskUpdateRequest {
                     base_revision: 1,
@@ -628,10 +628,10 @@ mod tests {
                 task("t3", PlanTaskKind::Investigation),
             ],
         };
-        store.attach_plan(&plan).unwrap();
+        store.attach_plan_for_test(&plan).unwrap();
         // Reorder: move t3 to front.
         store
-            .update_tasks(
+            .apply_task_patch_for_test(
                 "r1",
                 &TaskUpdateRequest {
                     base_revision: 1,
@@ -644,7 +644,7 @@ mod tests {
             .unwrap();
         assert_parity(&store, &shadow, "r1");
         store
-            .update_tasks(
+            .apply_task_patch_for_test(
                 "r1",
                 &TaskUpdateRequest {
                     base_revision: 2,
@@ -703,7 +703,7 @@ mod tests {
                 execution_mode: ExecutionMode::Parallel,
                 tasks: vec![task(&format!("{rid}_t1"), PlanTaskKind::Summary)],
             };
-            store.attach_plan(&plan).unwrap();
+            store.attach_plan_for_test(&plan).unwrap();
         }
         assert_parity(&store, &shadow, "r1");
         assert_parity(&store, &shadow, "r2");

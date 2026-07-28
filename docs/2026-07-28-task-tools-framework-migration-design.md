@@ -1,667 +1,1195 @@
-# Task Tools Framework Migration — Design
+# Task Tools Framework Migration: Revised Comprehensive Design
 
-> Status: **Proposed** (awaiting user review)
-> Date: 2026-07-28
-> Author: agent session
-> Related: `docs/framework-app-boundary-plan.md` (Phase 1–4 complete, 2026-07-27);
-> `docs/MASTER-PLAN.md` "Runtime DAG kernel convergence"
-> Scope: `echo-agent` (framework) + `echo-agent-cli/echo-agent-app-core` (EKO app)
+Date: 2026-07-28
 
----
+Status: implemented and fully verified locally
 
-## 1. Background and Why This Is Narrow
+Repositories:
 
-### 1.1 The prior boundary migration is done
+- Framework: `echo-agent/`
+- Product application: `echo-agent-cli/`
 
-A full framework/app boundary migration was already executed
-(`docs/framework-app-boundary-plan.md`, Phase 1–4). As of 2026-07-27 the
-**Runtime DAG kernel** lives in the framework:
+Implementation result (2026-07-28): the framework service, patch engine,
+default in-memory tools, public registration function, EKO store/policy
+adapters, LLM tool cutover, Tauri cutover, background initial-plan cutover, and
+legacy tool/store API deletion are complete in the working tree. The framework,
+application, no-default-feature, isolated framework feature, and GUI-only
+submission matrices all pass with zero warning or failure.
 
-- `echo-orchestration/src/tasks/runtime.rs` — `Task`/`TaskSpec`/`TaskExecution`/
-  `TaskStatus`/`TaskClaim`/`TaskKind`/`TaskSubagent` trait
-- `echo-orchestration/src/tasks/runtime_executor.rs` — `RuntimeDagExecutor` +
-  `RuntimeDagController` trait (the application adapter seam)
-- `echo-orchestration/src/planning/` — `PlanSpec`/`PlanValidator`
-- `echo-agent/src/agent/subagent/` — registry, executor, prompt compiler trait
+## 1. Executive Decision
 
-EKO's `echo-agent-app-core/src/tasks/task_runtime/` is now a **correct adapter**:
-`EkoRuntimeDagController` implements `RuntimeDagController`; `TaskRuntimeStore`
-holds file-backed persistence + product recovery/audit; `EkoRuntimeDagController`
-owns review/worktree/write-mode policy.
+Move `task_create`, `task_update`, and `task_list` into the `echo-agent`
+framework, but do not make persistence adapters implement task mutation
+semantics.
 
-**That work is not in scope here.** The DAG kernel, validator, claim protocol,
-and dispatch loop are settled. Do not reopen.
+The framework must own one authoritative task-revision service:
 
-### 1.2 The one real gap
+- parse the stable tool wire format;
+- construct canonical `TaskSpec` / `TaskExecution` values;
+- apply `Insert`, `Update`, `Skip`, and `Reorder` exactly once;
+- enforce mutable-state restrictions;
+- call the existing `PlanValidator`;
+- calculate the next revision and generic patch effects;
+- coordinate optimistic compare-and-swap commits;
+- format tool results and errors.
 
-The framework still ships the **deprecated `todo_write`** scratchpad
-(`echo-agent/src/tools/builtin/todo.rs`), while Claude Code (the design
-reference cited throughout this codebase) **deprecated `TodoWrite` in favor of
-`TaskCreate`/`TaskUpdate`/`TaskList`/`TaskGet`**. EKO already implements the
-modern form in the app layer (`task_tools.rs`), then removes `todo_write` at
-registration time (`register.rs:38`).
+Applications supply two thin adapters:
 
-This is a genuine inversion: the modern, industry-recognized task-tool surface
-is trapped in the product layer, and the framework is stuck on a form the
-reference product has abandoned. **This design closes that gap** by migrating
-`task_create` / `task_update` / `task_list` into the framework behind a
-product-neutral trait, and removing the deprecated `todo_write`.
+- `RevisionedTaskStore`: load one coherent graph and atomically commit an
+  already-computed next revision;
+- `TaskToolPolicy`: resolve the product scope, bootstrap a run, inject product
+  metadata/defaults, and validate product capabilities.
 
-### 1.3 What stays in the app
+EKO supplies file/event persistence, `DomainProfile`, Subagent/tool capability
+validation, attachment bootstrap, and product projections through those
+adapters. It must not retain a second patch engine or task validator.
 
-Per the deep-dive decomposition (see Appendix A), the four other tools are
-genuinely product-bound and **do not migrate**:
+`todo_write` is removed only in the same framework commit that installs a
+per-Agent in-memory implementation of `task_create/update/list` by default.
+The replacement therefore covers the framework's current zero-configuration
+task-tracking use case instead of deleting a public API merely because EKO does
+not use it.
 
-| Tool | Why it stays |
-|---|---|
-| `task_execute` | Calls `execute_run` (EKO DAG executor), unattended preflight, `AgentHandle`/reviewer LLM wiring, `register_run_cancellation` (Arc-receiver, in-memory). ~70% product logic. |
-| `create_complex_task` | Spin up formal TaskRun + dispatch via `run_driver::drive_run_async`; reads `current_chat_resources()`; binds `DomainProfile`/`RunPlanPolicy`. Pure EKO orchestration launch. |
-| `check_run_status` | Reads `current_chat_resources()` task_local; thin enough to neutralize later if a use case appears, but no value today. |
-| `cancel_run` | Calls `request_cancel`, which mixes in-memory driver tokens with persisted run-state transitions (product concern). |
+This migration does not change the DAG executor, task dispatch, review,
+worktree, cancellation, or acceptance paths.
 
-These stay in `echo-agent-app-core/src/tasks/task_runtime/`.
+## 2. Why The Previous Draft Was Not Implementable
 
----
+The previous draft had the right ownership direction but five blocking flaws:
 
-## 2. Reference Implementations (per AGENTS.md "调研业界")
+1. `RevisionedTaskStore::apply_patch` made every store reimplement revision,
+   patch, and validation behavior. `InMemoryRevisionedTaskStore` and EKO would
+   immediately become two mutation engines.
+2. `apply_patch -> Result<_, PlanRevisionConflict>` could not represent missing
+   runs/plans/tasks, invalid state, invalid patches, policy rejection, or
+   backend failures.
+3. A direct implementation on `TaskRuntimeStore` could not access the live
+   `TaskCapabilityCatalog`, because that catalog is built from the Agent's
+   current Subagent registry and registered tool names.
+4. The proposed snapshot omitted `goal`, `assumptions`, `risks`, and
+   `execution_mode`, so initial `task_create` could not round-trip the current
+   EKO plan artifact.
+5. `list_tasks -> Vec<Task>` discarded the revision that `task_list` must print.
 
-- **Claude Code** ([Todo Lists — Agent SDK docs](https://code.claude.com/docs/en/agent-sdk/todo-tracking)):
-  `TodoWrite` deprecated; replaced by `TaskCreate` (per item), `TaskUpdate`
-  (per status change), `TaskList`, `TaskGet`. Includes dependency/blocker
-  tracking. **Strong signal**: the migrated surface mirrors this exactly.
-- **Codex** ([openai/codex#24547](https://github.com/openai/codex/issues/24547)):
-  proposal for task/plan lifecycle hooks + external plan-update API. Same
-  direction — revisioned plan edits exposed to the agent as discrete tools.
-- **EKO's existing implementation** is itself prior art: it already follows the
-  Claude Code model. Migration is "lift the neutral core, leave the product
-  adapter" — not greenfield design.
+The revised design fixes the boundary before any public API is added.
 
-**Takeaway**: the tool *shape* (per-item create, revisioned patch update, list)
-is industry-consensus. The *persistence* (file vs sqlite vs in-memory) and the
-*run bootstrap policy* are product choices and stay behind a trait.
+## 3. Implementation Gate: Existing Authorities
 
----
+No new type or service may be implemented until it is checked against these
+existing authorities.
 
-## 3. Target Architecture
+### 3.1 Existing framework authorities to reuse
 
+| Existing authority | Location | Decision |
+|---|---|---|
+| `TaskSpec` | `echo-orchestration/src/tasks/runtime.rs` | Reuse as the immutable executable specification |
+| `TaskExecution` | same module | Reuse as mutable execution state |
+| `TaskStatus` | same module | Reuse; do not add a CRUD status enum |
+| `Task` | same module | Reuse as `TaskSpec + TaskExecution` |
+| `TaskKind` | same module | Reuse its existing eight values in the v1 wire schema |
+| `RuntimePlanSnapshot` | `runtime_executor.rs` | Reuse as the canonical `{revision, tasks}` runtime snapshot |
+| `PlanValidator` | `planning/validator.rs` | Reuse for identity, dependency, cycle, depth, and retry validation |
+| `RuntimeDagExecutor` | `tasks/runtime_executor.rs` | Do not modify |
+| `RuntimeDagController` | same module | Do not replace or extend for CRUD |
+
+`PlanSpec` remains the rich LLM authoring artifact. It is not reused as the
+revisioned runtime graph because it contains `PlanTaskSpec`, authoring edges,
+milestones, and authoring policy rather than canonical runtime `Task` values.
+
+### 3.2 Existing EKO behavior to preserve
+
+| Behavior | Current authority | Migration requirement |
+|---|---|---|
+| `task_create` one-or-batch schema | `task_tools.rs` | Preserve the exact v1 JSON schema |
+| Existing graph append requires `base_revision` | `TaskCreateTool` | Preserve |
+| Initial assumptions/risks/execution mode | `TaskPlan` | Preserve losslessly |
+| Product run bootstrap | `TaskCreateTool::ensure_run_exists` | Move behind policy adapter |
+| Default Subagent by domain/kind | `parse_plan_task` | Move behind policy adapter |
+| Subagent/tool capability checks | `TaskCapabilityCatalog` | Move behind policy adapter |
+| Atomic event/file commit | `TaskRuntimeStore` | Keep in EKO store adapter |
+| GUI/Tauri `update_tasks` | Tauri command + store | Route through the same framework service |
+| Todo/UI projections | `TaskPlan` / `TodoItem` | Keep as EKO projections |
+
+### 3.3 Existing code that must not survive as a second authority
+
+After all production callers have switched, remove:
+
+- EKO `TaskCreateTool`, `TaskUpdateTool`, and `TaskListTool`;
+- EKO's patch-application body in `TaskRuntimeStore::update_tasks`;
+- EKO-local task tool schema/parser implementations that the framework now
+  owns;
+- production calls that directly mutate a revision through `attach_plan` or
+  `update_tasks` instead of the framework service;
+- framework `TodoWriteTool` and its process-global static task vector.
+
+EKO projection DTOs may remain. A projection is not a second semantic
+authority as long as it round-trips through the canonical framework task and
+does not validate, schedule, or mutate independently.
+
+## 4. Reference Implementations And Evidence Limits
+
+### 4.1 Claude Code
+
+Claude's Agent SDK documentation describes `TaskCreate`, `TaskUpdate`,
+`TaskList`, and `TaskGet` as the replacement for `TodoWrite`, including task
+dependencies/blockers:
+
+<https://code.claude.com/docs/en/agent-sdk/todo-tracking>
+
+This is strong evidence for:
+
+- separate task tools instead of one action-switched `todo_write` tool;
+- stable task identifiers;
+- dependency-aware task relationships;
+- queryable task state.
+
+It is not evidence for EKO's revision/CAS patch protocol. Claude's documented
+surface is item-oriented; EKO's atomic graph creation and revisioned patching
+remain EKO requirements generalized into framework primitives.
+
+### 4.2 Codex
+
+`openai/codex#24547` proposes task/plan lifecycle hooks and an external plan
+update API:
+
+<https://github.com/openai/codex/issues/24547>
+
+It is a public proposal, not an adopted Codex contract. It is retained only as
+a directionally related reference and must not be cited as industry consensus.
+The official Codex manual endpoint was unavailable during this revision, so no
+additional Codex product behavior is asserted.
+
+### 4.3 Other mature implementations already audited locally
+
+The workspace contains previously audited implementations that support a
+narrower architectural conclusion:
+
+- OpenCode keeps Subagent invocation mechanics behind a task tool/service and
+  product permissions outside the reusable core.
+- DeepAgents separates stable task identity from individual asynchronous
+  Subagent run identity.
+- Hermes Kanban centralizes readiness, claims, completion, and dependencies in
+  one task authority while UI/gateway layers consume projections.
+
+These implementations support one lifecycle authority plus thin adapters.
+They do not establish EKO's exact wire schema.
+
+### 4.4 Resulting evidence statement
+
+The defensible conclusion is:
+
+> Separate task tools and stable task relationships are established patterns;
+> EKO's revisioned graph protocol is a project requirement whose correctness
+> must come from one framework implementation and repository tests.
+
+The revised report does not use the phrase "industry consensus" for the full
+EKO API.
+
+## 5. Scope
+
+### 5.1 In scope
+
+- framework `task_create`, `task_update`, and `task_list` tools;
+- their exact v1 JSON schemas and response formatting;
+- raw wire DTOs and canonical patch DTOs;
+- a pure task patch engine;
+- a single `TaskRevisionService`;
+- typed mutation/store/policy errors;
+- a thin, object-safe `RevisionedTaskStore`;
+- a thin, object-safe `TaskToolPolicy`;
+- a per-Agent `InMemoryRevisionedTaskStore` and default policy;
+- policy-gated manual progress transitions for the default lightweight task
+  use case;
+- framework default registration and `todo_write` deletion;
+- EKO file/event store adapter and EKO policy adapter;
+- switching LLM tools, GUI/Tauri update, and other production create/patch
+  callers to the same service;
+- schema, error, summary, CAS, round-trip, and surface-parity tests.
+
+### 5.2 Out of scope
+
+- changing `RuntimeDagExecutor`, `RuntimeDagController`, ready-frontier logic,
+  claim semantics, revision safe points, retries, or deadlock handling;
+- migrating `task_execute`, `create_complex_task`, `check_run_status`, or
+  `cancel_run` into the framework;
+- allowing EKO's formal PlanTask tools to write `Running`, `Completed`,
+  `Failed`, `TimedOut`, or retry state; those transitions remain
+  executor-owned. The default in-memory framework policy is allowed to expose
+  restricted manual Pending/Running/Completed/Cancelled progress transitions
+  for lightweight non-executed task tracking;
+- moving EKO review, worktree, file ownership, memory bridge, DomainProfile
+  routing, attachment storage, or UI projections into the framework;
+- adding SQLite to EKO;
+- collapsing `PlanTaskKind`, `SuggestedTask`, or execution-summary projections;
+- adding `task_get` in this migration. It can be added later as a read-only
+  service call, but this report no longer claims exact Claude tool parity.
+
+## 6. Layering Decision
+
+### 6.1 Framework: reusable mechanism
+
+The framework owns:
+
+- tool names, descriptions, base wire schemas, policy-gated schema
+  composition, and input parsing;
+- canonical task patch types;
+- patch application and state restrictions;
+- structural validation through the existing `PlanValidator`;
+- optimistic revision coordination;
+- generic patch effects;
+- stable error categories and tool result formatting;
+- default in-memory persistence and default task scope;
+- the generic manual-progress transition mechanism used only when policy
+  enables it;
+- registration factories for `ReactAgent` consumers.
+
+### 6.2 EKO: product policy and persistence
+
+EKO owns:
+
+- `events.jsonl`, `plan.json`, and `run-state.json`;
+- TaskRun creation, transition, conversation/message binding, and attachments;
+- `DomainProfile` and default Subagent routing;
+- validation against live registered Subagents and tools;
+- the `parallel_group` task-input schema extension and its decoding;
+- plan id and EKO graph metadata;
+- `parallel_group`/`sort_order` projection rules;
+- product event emission;
+- Tauri/GUI/TUI/CLI/channel projection;
+- all execution triggers and execution policy.
+
+### 6.3 Adapter boundary
+
+EKO provides two concrete adapters:
+
+```text
+EkoRevisionedTaskStore
+  owns Arc<TaskRuntimeStore>
+  implements load + compare_and_commit only
+
+EkoTaskToolPolicy
+  owns Arc<TaskRuntimeStore> + Arc<TaskCapabilityCatalog>
+  resolves/bootstrap scope, defaults Subagent, injects EkoTaskMetadata,
+  validates product capabilities
 ```
-echo-agent  (framework)
-  echo-orchestration/src/tasks/
-    runtime.rs            # existing: Task, TaskSpec, TaskStatus, TaskKind, TaskClaim
-    revisioned_store.rs   # NEW: RevisionedTaskStore trait + neutral DTOs
-    task_tools/           # NEW module
-      mod.rs              #   TaskCreateTool, TaskUpdateTool, TaskListTool
-      schema.rs           #   JSON schemas (product-neutral task shape)
-  src/tools/builtin/
-    todo.rs               # REMOVED (deprecated scratchpad)
 
-echo-agent-cli / echo-agent-app-core  (EKO app)
-  tasks/task_runtime/
-    types.rs              # EKO DTOs (EkoTaskSpec, EkoTaskExecution, PlanTask...)
-                          #   REMAIN — they are file/UI projections, not authority
-    store.rs              # TaskRuntimeStore: impl RevisionedTaskStore (NEW impl block)
-    task_tools.rs         # SLIMMED — only CreateComplexTask/CheckRunStatus/
-                          #   CancelRun stay; TaskCapabilityCatalog stays (product)
-    task_execute_tool.rs  # UNCHANGED
-    register.rs           # UPDATED — no longer removes todo_write (framework
-                          #   doesn't ship it); still adds EKO-specific tools
+Do not implement `RevisionedTaskStore` directly on `TaskRuntimeStore`. The
+separate wrapper makes the boundary explicit and prevents persistence from
+acquiring Agent registry/policy dependencies.
+
+## 7. Target Architecture
+
+```text
+LLM / GUI / Tauri / CLI
+          |
+          v
+framework TaskRevisionService  <--- single mutation authority
+  - wire validation
+  - TaskPatchEngine
+  - PlanValidator
+  - revision calculation
+  - error/summary contract
+          |
+          +-------------------+
+          |                   |
+          v                   v
+RevisionedTaskStore      TaskToolPolicy
+load + CAS commit        scope/bootstrap/defaults/capabilities
+          |                   |
+          +---------+---------+
+                    v
+              EKO adapters
+                    |
+                    v
+      events.jsonl / plan.json / run-state.json
+                    |
+                    v
+        RuntimeDagController adapter
+                    |
+                    v
+        existing RuntimeDagExecutor
 ```
 
-### 3.1 Layering rule (enforced)
+The mutation service and DAG executor share canonical `Task` values and
+`PlanValidator`, but neither calls or owns the other.
 
-- **Framework owns**: tool name, parameter schema, revisioned-patch wire
-  protocol, neutral DTOs, optimistic-concurrency validation, summary formatting,
-  and the trait that persistence must implement.
-- **App owns**: persistence backend (file/sqlite/in-memory), run bootstrap
-  policy, capability catalog validation (subagent roles, tool allowlist),
-  domain-profile defaulting, all execution triggering (`task_execute` and below).
+## 8. Canonical Data Model
 
-The framework tool calls **only** the trait; the trait is implemented in the
-app. No `TaskRuntimeStore` symbol crosses into `echo-agent`.
+### 8.1 Reused types
 
----
-
-## 4. The `RevisionedTaskStore` Trait
-
-New trait in `echo-orchestration/src/tasks/revisioned_store.rs`. It sits
-**between** the existing flat `TaskStore` (too thin — no claim/revision/run) and
-the heavy `RuntimeDagController` (has `type DispatchOutput`, not dyn-safe, and
-owns dispatch which task_create/update/list do not need).
-
-### 4.1 Required surface (derived from actual tool call sites — see Appendix B)
+No new task/status/runtime model is introduced:
 
 ```rust
-// echo-orchestration/src/tasks/revisioned_store.rs
+TaskSpec       // immutable specification
+TaskExecution  // mutable execution state
+TaskStatus     // shared lifecycle
+Task           // spec + execution
+TaskKind       // existing closed framework enum
+RuntimePlanSnapshot { revision, tasks }
+```
 
-use echo_core::error::Result;
-use super::runtime::{Task, TaskId, TaskSpec};
+### 8.2 Revision envelope
 
-/// A coherent revisioned snapshot of one task graph (one TaskRun).
-#[derive(Debug, Clone)]
-pub struct RevisionedPlan {
-    pub revision: u64,
-    pub tasks: Vec<Task>,
+`RuntimePlanSnapshot` intentionally contains only execution-relevant data. The
+task tools also need generic graph context and lossless product extensions, so
+the service wraps rather than replaces it:
+
+```rust
+pub struct RevisionedTaskGraph {
+    pub snapshot: RuntimePlanSnapshot,
+    pub context: TaskGraphContext,
 }
 
-/// Optimistic-concurrency patch applied atomically to one revision.
-#[derive(Debug, Clone)]
-pub struct PlanPatch {
+pub struct TaskGraphContext {
+    pub goal: String,
+    pub assumptions: Vec<String>,
+    pub risks: Vec<String>,
+    pub execution_mode: TaskGraphExecutionMode,
+    pub metadata: serde_json::Value,
+}
+
+pub enum TaskGraphExecutionMode {
+    Parallel,
+    Sequential,
+}
+```
+
+This is a revision envelope, not a third scheduler model. EKO maps it losslessly
+to and from `TaskPlan`:
+
+- `context.metadata.plan_id` -> `TaskPlan.plan_id`;
+- `context.metadata.domain_profile` -> `TaskPlan.domain_profile`;
+- `context` typed fields -> goal/assumptions/risks/execution mode;
+- `snapshot.tasks` -> checked `Task <-> PlanTask` conversion.
+
+### 8.3 Stable v1 wire DTOs
+
+The first migration preserves EKO's current external contract:
+
+- create-task field remains `subagent`;
+- update-patch field remains `agent_role`;
+- `kind` remains the current eight-value enum;
+- create retains `assumptions`, `risks`, and `execution_mode`;
+- EKO's composed task input retains `parallel_group`;
+- exactly one of `task` or `tasks` is required;
+- existing-graph create still requires `base_revision`;
+- update still requires `base_revision`, non-empty `reason`, and operations.
+
+The wire DTO is intentionally separate from canonical `TaskSpec` because an
+omitted `subagent` requires product defaulting before `agent_role` exists.
+Product-specific task fields are collected in an opaque extension value rather
+than becoming framework fields.
+
+```rust
+pub struct TaskDraft {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub kind: TaskKind,
+    pub subagent: Option<String>,
+    pub depends_on: Vec<TaskId>,
+    pub files: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub required_artifacts: Vec<String>,
+    pub execution_checks: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub max_retries: u32,
+    pub extensions: serde_json::Value,
+}
+```
+
+The framework owns the base task schema. `TaskToolPolicy` may contribute a
+declarative set of additional task properties, and the framework composes them
+into the final `additionalProperties: false` schema. EKO contributes only:
+
+```json
+{
+  "parallel_group": { "type": "string" }
+}
+```
+
+The framework parser collects configured extension fields into
+`TaskDraft.extensions`; it never names or interprets `parallel_group`. This
+preserves EKO's exact current schema without promoting an EKO scheduling hint
+into the reusable task model. The default framework policy contributes no task
+schema extensions.
+
+The framework also owns an optional core `set_status` update-operation schema.
+It is included only when policy enables manual progress updates. The default
+in-memory policy enables it so the new API covers lightweight progress
+tracking; EKO disables it so the existing formal PlanTask schema and executor
+authority remain unchanged.
+
+Do not expose an arbitrary string `kind` while canonical `TaskSpec.kind` is a
+closed `TaskKind`; that would create a schema the service cannot represent.
+
+### 8.4 Canonical patch DTOs
+
+```rust
+pub struct TaskPlanPatch {
     pub base_revision: u64,
     pub reason: String,
-    pub operations: Vec<PlanPatchOp>,
+    pub operations: Vec<TaskPlanPatchOp>,
 }
 
-#[derive(Debug, Clone)]
-pub enum PlanPatchOp {
-    Insert { after_task_id: Option<TaskId>, spec: TaskSpec },
-    Update { task_id: TaskId, patch: TaskSpecPatch },
-    Skip   { task_id: TaskId },
-    Reorder{ task_ids: Vec<TaskId> },
+pub enum TaskPlanPatchOp {
+    Insert {
+        after_task_id: Option<TaskId>,
+        task: TaskSpec,
+    },
+    Update {
+        task_id: TaskId,
+        patch: TaskSpecPatch,
+    },
+    Skip {
+        task_id: TaskId,
+    },
+    Reorder {
+        task_ids: Vec<TaskId>,
+    },
+    SetStatus {
+        task_id: TaskId,
+        status: TaskStatus,
+    },
 }
 
-/// Partial update of one TaskSpec. Mirrors EKO's `TaskPatch`
-/// (types.rs:1085) but with framework-neutral field types (no DomainProfile).
-#[derive(Debug, Clone, Default)]
 pub struct TaskSpecPatch {
-    pub title:               Option<String>,
-    pub description:         Option<String>,
-    pub kind:                Option<TaskKind>,
-    pub agent_role:          Option<String>,
-    pub depends_on:          Option<Vec<TaskId>>,
-    pub files:               Option<Vec<String>>,
-    pub allowed_tools:       Option<Vec<String>>,
-    pub required_artifacts:  Option<Vec<String>>,
-    pub execution_checks:    Option<Vec<String>>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub kind: Option<TaskKind>,
+    pub agent_role: Option<String>,
+    pub depends_on: Option<Vec<TaskId>>,
+    pub files: Option<Vec<String>>,
+    pub allowed_tools: Option<Vec<String>>,
+    pub required_artifacts: Option<Vec<String>>,
+    pub execution_checks: Option<Vec<String>>,
     pub acceptance_criteria: Option<Vec<String>>,
-    pub max_retries:         Option<u32>,
-    pub metadata:            Option<serde_json::Value>, // product extension bag
+    pub max_retries: Option<u32>,
 }
+```
 
-/// Conflict returned when `base_revision` is stale.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("plan revision conflict: expected {expected}, current {current}")]
-pub struct PlanRevisionConflict {
-    pub expected: u64,
-    pub current: u64,
-}
+Product metadata is not accepted as a free-form LLM patch. EKO metadata is
+derived by policy from typed inputs and the current run, preventing arbitrary
+metadata from bypassing product invariants.
 
-/// Persistence + run-bootstrap seam for the migrated task tools.
-///
-/// Implementations are product-supplied. The framework tools call ONLY this
-/// trait; no concrete store type crosses the boundary.
-///
-/// All methods are `Send + Sync` and object-safe (no `Self` types, no
-/// `&Arc<Self>` receivers, no generic methods).
+## 9. Store And Policy Contracts
+
+### 9.1 Thin `RevisionedTaskStore`
+
+```rust
 #[async_trait::async_trait]
 pub trait RevisionedTaskStore: Send + Sync {
-    /// Read the current revisioned plan for `run_id`.
-    /// Returns `Ok(None)` when no plan exists yet (caller may bootstrap).
-    async fn load_plan(&self, run_id: &str) -> Result<Option<RevisionedPlan>>;
-
-    /// Atomically apply `patch` to the plan for `run_id`.
-    /// MUST reject with `PlanRevisionConflict` when `base_revision` is stale.
-    /// MUST validate dependencies / cycles via the framework `PlanValidator`
-    /// before commit (or delegate to an injected validator).
-    async fn apply_patch(
+    async fn load(
         &self,
-        run_id: &str,
-        patch: PlanPatch,
-    ) -> std::result::Result<RevisionedPlan, PlanRevisionConflict>;
+        scope_id: &str,
+    ) -> Result<Option<RevisionedTaskGraph>, RevisionedTaskStoreError>;
 
-    /// Ensure a task graph (TaskRun) exists for `run_id`.
-    ///
-    /// If one already exists, return `Ok(())` unchanged.
-    /// If not, the implementation creates one using product policy
-    /// (EKO: derive conversation/message/attachments from `ToolContext`,
-    /// pick a default DomainProfile, transition to Running, emit ExecEvent).
-    ///
-    /// `bootstrap_ctx` carries the framework `ToolContext` so the app can read
-    /// `conversation_id`, `message_id`, `attachments` without a task_local.
-    async fn ensure_run_exists(
+    async fn compare_and_commit(
         &self,
-        run_id: &str,
-        goal: &str,
-        bootstrap_ctx: Option<&echo_core::tools::ToolContext>,
-    ) -> Result<()>;
+        scope_id: &str,
+        commit: TaskGraphCommit,
+    ) -> Result<RevisionedTaskGraph, RevisionedTaskStoreError>;
+}
 
-    /// List tasks for `run_id` as neutral `Task` views (UI/list tool).
-    async fn list_tasks(&self, run_id: &str) -> Result<Vec<Task>>;
+pub struct TaskGraphCommit {
+    /// None means "create only if absent". Some(N) means "commit only if the
+    /// current revision is exactly N".
+    pub expected_revision: Option<u64>,
+    pub next: RevisionedTaskGraph,
+    pub reason: String,
+    pub effects: TaskPatchEffects,
+}
+
+pub struct TaskPatchEffects {
+    pub inserted_task_ids: Vec<TaskId>,
+    pub updated_task_ids: Vec<TaskId>,
+    pub skipped_task_ids: Vec<TaskId>,
+    pub reset_task_ids: Vec<TaskId>,
+    pub progressed_task_ids: Vec<TaskId>,
+    pub reordered: bool,
 }
 ```
 
-### 4.2 Why this shape
+Store obligations are deliberately narrow:
 
-- **Object-safe** (`dyn RevisionedTaskStore` works): no `Self` types, no
-  `&Arc<Self>`, no generic methods, no `impl Trait` returns. The current
-  `RuntimeDagController` fails this (`type DispatchOutput`), `TaskStore` is
-  object-safe but too flat.
-- **Carries revision semantics**: `apply_patch` is the optimistic-concurrency
-  primitive Claude Code and EKO both use; `PlanRevisionConflict` is the typed
-  error tools translate into a user-facing message.
-- **Run bootstrap is a hook, not a behavior**: `ensure_run_exists` lets the app
-  inject its product policy (EKO's "every task_create in Auto mode materializes
-  a formal run") without the framework knowing about DomainProfile / route /
-  AttendedMode. The framework passes the `ToolContext`; the app reads what it
-  needs.
-- **Neutral DTOs**: `TaskSpec` / `TaskKind` already live in the framework
-  (`runtime.rs`). `TaskSpecPatch` mirrors EKO's `TaskPatch` minus
-  DomainProfile-specific fields, plus a `metadata: serde_json::Value` extension
-  bag so the app can round-trip product fields (parallel_group, sort_order,
-  domain_profile) without polluting the framework type.
+1. load a coherent snapshot;
+2. serialize compare-and-commit for one scope;
+3. reject absent/present or revision races as `Conflict`;
+4. persist the already-computed candidate and effects atomically;
+5. return the committed projection.
 
-### 4.3 Where it lives
+The Store must not parse patch operations, choose defaults, perform capability
+validation, or implement DAG validation.
 
-`echo-orchestration/src/tasks/revisioned_store.rs`, gated behind the existing
-`tasks` feature (already on for EKO). Re-exported via the `echo_agent::tasks`
-facade (`src/tasks.rs`).
-
----
-
-## 5. The Migrated Tools
-
-Three new tools in `echo-orchestration/src/tasks/task_tools/` (new module).
-Each mirrors the `AgentDispatchTool` pattern (`agent_dispatch.rs:57-98`):
-constructed with `Arc<dyn RevisionedTaskStore>`, override
-`execute_with_context`, read `ctx.run_id` for run-scoping.
-
-### 5.1 `TaskCreateTool` (framework)
+### 9.2 Typed store errors
 
 ```rust
-pub struct TaskCreateTool {
-    store: Arc<dyn RevisionedTaskStore>,
+pub enum RevisionedTaskStoreError {
+    NotFound { scope_id: String },
+    Conflict {
+        expected: Option<u64>,
+        current: Option<u64>,
+    },
+    Rejected { message: String },
+    Backend { message: String },
 }
 ```
 
-**Behavior** (neutral core from EKO `task_tools.rs:624-766`):
+`Rejected` is reserved for persistence-side invariants that must be checked in
+the same lock/transaction, such as EKO refusing to mutate a terminal TaskRun.
+It is not a general policy escape hatch.
 
-1. Resolve `run_id` from `ctx.run_id` (fallback: error — no task_local).
-2. Parse `task` / `tasks` (exactly one required).
-3. Parse each task into a framework `TaskSpec` (id/title/description/kind/
-   depends_on/agent_role/files/allowed_tools/required_artifacts/
-   execution_checks/acceptance_criteria/max_retries; product fields go in
-   `metadata`).
-4. `store.ensure_run_exists(run_id, goal, Some(ctx))` — product hook.
-5. `store.load_plan(run_id)`:
-   - existing plan → build `PlanPatch { base_revision, ops: [Insert...] }`,
-     `store.apply_patch(run_id, patch)`.
-   - no plan → build patch with `base_revision = 0` semantics (app treats
-     `base_revision == 0 && no existing plan` as "create initial"; the app's
-     `attach_plan` becomes an impl detail of `apply_patch`).
-6. Return summary: `"Created task graph revision N with M task(s)"`.
-
-**What is NOT in the framework tool**: `TaskCapabilityCatalog` validation
-(subagent roles, tool allowlist) — that's product policy. It stays in the app
-and is invoked from the app's `apply_patch` implementation (the store trait
-implementation can call into the catalog before committing).
-
-### 5.2 `TaskUpdateTool` (framework)
-
-```rust
-pub struct TaskUpdateTool {
-    store: Arc<dyn RevisionedTaskStore>,
-}
-```
-
-**Behavior** (neutral core from EKO `task_tools.rs:943-1004`):
-
-1. Resolve `run_id` from `ctx.run_id`.
-2. Parse `base_revision` (required, ≥ 1), `reason` (required), `operations[]`.
-3. Parse each op into `PlanPatchOp` (Insert/Update/Skip/Reorder) using neutral
-   `TaskSpec` / `TaskSpecPatch`.
-4. `store.apply_patch(run_id, PlanPatch { base_revision, reason, operations })`.
-   - `PlanRevisionConflict` → return error `"plan revision conflict: reload
-     with task_list and retry"`.
-5. Return summary.
-
-### 5.3 `TaskListTool` (framework)
-
-```rust
-pub struct TaskListTool {
-    store: Arc<dyn RevisionedTaskStore>,
-}
-```
-
-**Behavior** (from EKO `task_tools.rs:1878-1906`):
-
-1. Resolve `run_id` from `ctx.run_id`.
-2. `store.list_tasks(run_id)` → `Vec<Task>`.
-3. Format: `"Task graph revision N — Tasks (M):\n[{status}] {id} — {title}"`.
-4. Empty → `"No tasks; call task_create first"`.
-
-### 5.4 JSON schemas (product-neutral)
-
-The `plan_task_input_schema()` currently in EKO
-(`task_tools.rs:465-486`) bakes in EKO's 8-value `kind` enum and EKO field
-names. The migrated schema lives in `task_tools/schema.rs` and uses:
-
-- `kind`: **string** (not enum) — the framework accepts any string; the app's
-  `apply_patch` impl validates against its known kinds. (Forward-compatible:
-  new domains don't need a framework change.)
-- Standard fields: `id`, `title`, `description`, `depends_on`, `agent_role`,
-  `files`, `allowed_tools`, `required_artifacts`, `execution_checks`,
-  `acceptance_criteria`, `max_retries`.
-- `metadata`: open object for product extension (EKO uses it for
-  `parallel_group`, `sort_order`, `domain_profile`).
-
-### 5.5 Registration — two supported paths
-
-The framework supports **both** registration styles so different consumers can
-adopt whichever fits their bootstrap order:
-
-**Path A — inline at agent build** (for consumers whose store exists before the
-agent): mirror the `SpawnBackgroundTaskTool` pattern (`react/mod.rs:421-423`).
-Add a `RevisionedTaskStore` slot to the agent builder/config; when present,
-`react/mod.rs` constructs and registers the three tools inline. This is the
-default path for non-EKO consumers and for the framework's own integration tests.
-
-**Path B — post-hoc registration** (for consumers like EKO whose store is built
-*after* the agent): the framework exposes a free function
-`echo_agent::tasks::task_tools::register_task_tools(
-    agent: &mut ToolRegistrar,
-    store: Arc<dyn RevisionedTaskStore>,
-)` that adds the three tools to an already-built agent. EKO's
-`register_task_tools_on_agent` (`register.rs:29`) calls this in place of its
-current inline construction, dropping only `remove_tool("todo_write")`.
-
-The tools themselves are identical in both paths — only the registration call
-site differs.
-
-For consumers that supply no `RevisionedTaskStore` at all, the tools are simply
-absent (same as `SpawnBackgroundTaskTool` being feature-gated). The deprecated
-`todo_write` is **removed** — it's been superseded industry-wide and EKO
-already removes it at registration.
-
-A minimal **in-memory default impl** (`InMemoryRevisionedTaskStore`) ships in
-the framework for tests and simple consumers — same spirit as `InMemoryStore`.
-
----
-
-## 6. App-Side Changes (echo-agent-app-core)
-
-### 6.1 `TaskRuntimeStore` implements `RevisionedTaskStore`
-
-New `#[async_trait]` impl block in
-`echo-agent-app-core/src/tasks/task_runtime/store.rs`:
+### 9.3 Product policy adapter
 
 ```rust
 #[async_trait::async_trait]
-impl echo_agent::tasks::RevisionedTaskStore for TaskRuntimeStore {
-    async fn load_plan(&self, run_id: &str) -> Result<Option<RevisionedPlan>> {
-        // existing get_plan() → map TaskPlan → RevisionedPlan (drop EKO fields)
-    }
-    async fn apply_patch(&self, run_id: &str, patch: PlanPatch)
-        -> std::result::Result<RevisionedPlan, PlanRevisionConflict>
-    {
-        // 1. Validate via existing TaskCapabilityCatalog (product policy)
-        // 2. Map PlanPatch → existing TaskUpdateRequest (already 1:1 shape)
-        // 3. Call existing update_tasks() / attach_plan()
-        // 4. Map PlanConflict → PlanRevisionConflict
-        // 5. Return RevisionedPlan
-    }
-    async fn ensure_run_exists(&self, run_id, goal, bootstrap_ctx) -> Result<()> {
-        // existing ensure_run_exists() body — reads chat_resources,
-        // create_run, set_run_attachments, transition_run, ExecEvent
-    }
-    async fn list_tasks(&self, run_id) -> Result<Vec<Task>> {
-        // existing list_todos() → map TodoItem → framework Task
-    }
+pub trait TaskToolPolicy: Send + Sync {
+    fn task_input_schema_extensions(&self) -> serde_json::Map<String, serde_json::Value>;
+
+    fn allow_manual_progress_updates(&self) -> bool;
+
+    async fn resolve_scope(
+        &self,
+        context: &ToolContext,
+    ) -> Result<String, TaskPolicyError>;
+
+    async fn ensure_scope(
+        &self,
+        scope_id: &str,
+        input: &TaskCreateInput,
+        context: &ToolContext,
+    ) -> Result<(), TaskPolicyError>;
+
+    async fn prepare_task(
+        &self,
+        scope_id: &str,
+        draft: &TaskDraft,
+        position: usize,
+    ) -> Result<PreparedTaskPolicy, TaskPolicyError>;
+
+    async fn prepare_initial_context(
+        &self,
+        scope_id: &str,
+        input: &TaskCreateInput,
+    ) -> Result<TaskGraphContext, TaskPolicyError>;
+
+    async fn finalize_task_metadata(
+        &self,
+        scope_id: &str,
+        task_id: &str,
+        position: usize,
+        metadata: serde_json::Value,
+    ) -> Result<serde_json::Value, TaskPolicyError>;
+
+    async fn validate_candidate(
+        &self,
+        scope_id: &str,
+        tasks: &[Task],
+    ) -> Result<(), TaskPolicyError>;
+}
+
+pub struct PreparedTaskPolicy {
+    pub agent_role: String,
+    pub metadata: serde_json::Value,
 }
 ```
 
-The mapping is **lossless in both directions**: `TaskSpec.metadata` carries
-`parallel_group`/`sort_order`/`domain_profile`, and the app round-trips them.
+Policy failures use a separate typed boundary:
 
-### 6.2 Slim down `task_tools.rs`
+```rust
+pub enum TaskPolicyError {
+    ScopeUnavailable { message: String },
+    Rejected { message: String },
+    Backend { message: String },
+}
+```
 
-After migration, EKO's `task_tools.rs` keeps only:
-- `TaskCapabilityCatalog` (product validation — called from `apply_patch` impl)
-- `CreateComplexTaskTool`, `CheckRunStatusTool`, `CancelRunTool` (product tools)
-- The `parse_plan_task` helper (used by `CreateComplexTaskTool`)
+EKO uses these hooks as follows:
 
-The migrated `TaskCreateTool`/`TaskUpdateTool`/`TaskListTool` structs and their
-~600 lines move to the framework. App's `task_tools.rs` shrinks substantially.
+- schema extensions: add the existing `parallel_group` property;
+- manual progress updates: disabled;
+- scope: `ToolContext.run_id`, then formal id from `turn_id`, then current EKO
+  task-local run id;
+- bootstrap: current conversation/message/resources, attachments, run creation,
+  transition, and product event;
+- task preparation: choose default Subagent from DomainProfile + TaskKind and
+  inject `EkoTaskMetadata`;
+- metadata finalization: update `sort_order` metadata from vector order;
+- candidate validation: read-only validation of every Subagent/tool
+  capability.
 
-### 6.3 Update `register.rs` (EKO uses Path B)
+The framework, not policy, constructs `TaskSpec` from `TaskDraft` plus the
+returned `agent_role` and metadata. Policy can normalize only metadata and can
+inspect a candidate only through `&[Task]`; its interface cannot rewrite
+generic dependencies or statuses. It may not apply operations, increment
+revisions, detect cycles, or commit persistence.
 
-- Remove `agent.remove_tool("todo_write")` (framework no longer ships it).
-- Remove construction of `TaskCreateTool`/`TaskUpdateTool`/`TaskListTool` from
-  app code — replace with a single call to
-  `echo_agent::tasks::task_tools::register_task_tools(agent,
-   store.clone() as Arc<dyn RevisionedTaskStore>)` (framework's free function,
-  Path B from §5.5). EKO's bootstrap builds the agent before the store exists,
-  which is why post-hoc registration is the right path here.
-- Keep registration of `CreateComplexTaskTool`/`CheckRunStatusTool`/`CancelRun`/
-  `task_execute` (these are product tools that stay in the app).
-- Update the test `registration_replaces_framework_todo_with_one_task_api`
-  (`register.rs:112`): rename and adjust assertions — `todo_write` is no longer
-  in the "before" set (framework doesn't ship it), and the three migrated tools
-  are now added via the framework function rather than inline `add_tool`.
+The schema-extension hook is declarative. It cannot replace the core schema,
+change required core fields, or enable arbitrary additional properties.
 
-### 6.4 Type cleanup (the 5 residual mirrors — optional, low-risk)
+When manual progress is enabled, the framework exposes only these wire values:
 
-While we're touching this code, collapse the 1:1 mirror types identified in
-the audit:
+```text
+pending -> TaskStatus::Pending
+in_progress -> TaskStatus::Running
+completed -> TaskStatus::Completed
+cancelled -> TaskStatus::Cancelled
+```
 
-| App type | Action |
-|---|---|
-| `PlanTaskKind` (`types.rs:260`) | Delete; use framework `TaskKind` |
-| `SuggestedTask` (`types.rs:1631`) | Delete; use framework `SuggestedTask` |
-| `TaskExecutionSummary` (`types.rs:1573`) | Collapse onto framework type + `metadata` extension |
-| `TodoStatus` (`types.rs:367`) | Keep as UI-rendering helper ONLY; ensure no scheduling code reads it |
-| `EkoTaskSpec`/`EkoTaskExecution` | Keep — file DTOs, correctly stay |
+`TaskPatchEngine` treats a same-state update as idempotent and otherwise calls
+the existing `TaskStatus::transition_to`; it does not introduce a second status
+transition table. A normal lightweight flow is Pending -> Running -> Completed,
+with cancellation where the shared state machine permits it. The tool does not
+expose Failed, Blocked, TimedOut, Retrying, Paused, claims, retry counters, or
+result details. EKO never enables this path.
 
-This is type hygiene; can be a follow-up commit if it bloats the PR.
+### 9.4 Unified service errors
 
----
+```rust
+pub enum TaskRevisionError {
+    InvalidInput { message: String },
+    GraphNotFound { scope_id: String },
+    TaskNotFound { task_id: TaskId },
+    RevisionConflict {
+        expected: Option<u64>,
+        current: Option<u64>,
+    },
+    InvalidPatch { message: String },
+    PolicyRejected { message: String },
+    StoreRejected { message: String },
+    Backend { message: String },
+}
+```
 
-## 7. Phased Migration Plan
+Framework tools convert these categories to the existing EKO-facing strings.
+Golden tests lock exact messages. Store adapters never fabricate a conflict for
+an unrelated failure.
 
-Each phase is independently committable and verifiable. **No phase leaves the
-build broken.** Cross-repo ordering: echo-agent first (framework adds API),
-then echo-agent-cli (app adopts).
+### 9.5 `TaskRevisionService`
 
-### Phase 1 — Framework: add the trait + neutral DTOs (echo-agent)
+The service is the only component that combines Store, policy, patch engine,
+and validator:
 
-**Goal**: add `RevisionedTaskStore` trait + `RevisionedPlan`/`PlanPatch`/
-`PlanPatchOp`/`TaskSpecPatch`/`PlanRevisionConflict` types + an
-`InMemoryRevisionedTaskStore` default impl. **No tools yet, no behavior
-change.**
+```rust
+pub struct TaskRevisionService {
+    store: Arc<dyn RevisionedTaskStore>,
+    policy: Arc<dyn TaskToolPolicy>,
+    validator: PlanValidator,
+}
+```
 
-Files:
-- `echo-orchestration/src/tasks/revisioned_store.rs` (new)
-- `echo-orchestration/src/tasks/mod.rs` — `pub mod revisioned_store;`
-- `src/tasks.rs` facade — re-export
+Its public operations are intentionally split by input level:
 
-Verify:
+```rust
+load(scope_id)
+create_from_tool(input, tool_context)
+update_from_tool(input, tool_context)
+create_prepared(scope_id, context, tasks, reason)
+apply_patch(scope_id, canonical_patch)
+```
+
+The two tool methods own wire parsing/scope resolution. The prepared methods
+let GUI/Tauri and EKO planning services reuse the same revision/validation/CAS
+path after converting their product DTOs. Neither path bypasses
+metadata finalization, read-only product validation, `PlanValidator`, or
+compare-and-commit.
+
+## 10. The Single Patch Engine
+
+`TaskPatchEngine` is a pure framework component. Both the in-memory service and
+EKO service call this same implementation.
+
+For `apply(current, patch)` it performs, in order:
+
+1. require `base_revision >= 1`;
+2. require a non-empty reason and operation list;
+3. reject a stale base revision before mutation;
+4. apply operations in request order;
+5. reject duplicate inserts and missing `after_task_id`/`task_id` targets;
+6. allow specification updates only for Pending or Blocked tasks;
+7. reset an updated Blocked task to Pending and clear its claim/detail;
+8. allow Skip only for Pending or Blocked tasks;
+9. apply SetStatus only when manual progress is policy-enabled and the existing
+   `TaskStatus` transition is valid;
+10. require Reorder to contain every task id exactly once;
+11. let policy refresh only per-task metadata from canonical vector order;
+12. run read-only product candidate validation;
+13. call the existing `PlanValidator` on canonical tasks;
+14. produce revision `current + 1` with checked/saturating arithmetic;
+15. return the candidate plus `TaskPatchEffects`.
+
+The service then calls `compare_and_commit(expected=current.revision)`. A race
+between load and commit returns a typed conflict; the service does not retry a
+model-authored patch against a different revision.
+
+Initial creation is separate from patching:
+
+```text
+load -> absent
+ensure_scope
+prepare tasks and full graph context
+PlanValidator
+build revision 1
+compare_and_commit(expected_revision=None)
+```
+
+There is no hidden `base_revision == 0` overload. Creation and update therefore
+have distinct, testable contracts.
+
+## 11. Tool Behavior
+
+### 11.1 `task_create`
+
+1. Parse exactly one of `task` or non-empty `tasks`.
+2. Resolve and bootstrap the product scope through policy.
+3. Load the current graph.
+4. Convert every `TaskDraft` through `prepare_task`.
+5. If absent, build the complete initial context and commit revision 1.
+6. If present, require `base_revision`, convert tasks into Insert operations,
+   and call the normal patch path.
+7. Return the current EKO summary text unchanged.
+
+For an existing graph, create-level assumptions/risks/execution mode remain
+ignored exactly as they are today; only inserted tasks and reason participate.
+
+### 11.2 `task_update`
+
+1. Parse `base_revision`, `reason`, and operations.
+2. Resolve scope and load the graph.
+3. Convert Insert drafts through policy; convert Update fields into typed
+   `TaskSpecPatch`.
+4. Call `TaskRevisionService::apply_patch`.
+5. On conflict, preserve the current `Failed to update tasks: ... expected ...
+   current ...` error shape; callers can reload through `task_list` before
+   submitting a new patch.
+6. Return the current committed-revision summary unchanged.
+
+Under EKO policy the tool cannot mark execution success/failure. `Skip` remains
+a planning decision, while formal execution outcomes remain
+`RuntimeDagController` writes. Under the default in-memory policy, the same
+tool name additionally exposes restricted `set_status` for lightweight manual
+progress tracking.
+
+### 11.3 `task_list`
+
+`task_list` calls only `TaskRevisionService::load` and formats both revision and
+tasks from the same coherent `RevisionedTaskGraph`. There is no separate
+`list_tasks` Store method and no chance to join a revision from one read with
+tasks from another.
+
+Existing empty/error/success text remains unchanged.
+
+## 12. Replacing `todo_write` Correctly
+
+The existing `todo_write` is always registered and uses one process-global
+`LazyLock<Mutex<Vec<_>>>`. The replacement must therefore work even when a
+consumer supplies no custom Store or run id.
+
+### 12.1 Default framework behavior
+
+Every `ReactAgent` receives, by default:
+
+- its own `Arc<InMemoryRevisionedTaskStore>`;
+- `DefaultTaskToolPolicy`;
+- `task_create`, `task_update`, and `task_list`.
+
+The default scope resolver uses:
+
+1. `ToolContext.run_id` when provided;
+2. `ToolContext.conversation_id` when provided;
+3. an Agent-instance scope id created by the builder.
+
+It does not require task-local state, so direct `Tool::execute` with an empty
+context remains usable. Per-Agent storage also removes the current accidental
+cross-Agent global task list.
+
+The default policy uses explicit `subagent` when supplied and otherwise the
+framework role `default`. It performs structural validation but no EKO
+capability validation.
+
+It also enables the framework-owned `set_status` operation so a lightweight
+task can move through Pending -> Running -> Completed or be Cancelled without
+invoking the DAG executor. These tasks still use canonical `TaskStatus` and the
+same revision/CAS service; there is no separate Todo model or Store.
+
+### 12.2 Public feature surface
+
+The task relation API must be available in a default framework build because
+it replaces an always-on tool. The root facade must therefore expose the
+canonical task relation types without requiring the optional background-task
+tools.
+
+The existing `tasks` feature may continue to control background spawn/check
+tools, but it cannot gate the replacement CRUD tools. This feature-topology
+change requires the repository's full feature matrix.
+
+### 12.3 Deletion criterion
+
+Delete `todo_write` only when one framework commit proves all of the following:
+
+- the three new tools are registered in the default Agent configuration;
+- create/update/list work without an injected Store or ToolContext run id;
+- the default update schema supports restricted manual progress transitions;
+- state is isolated per Agent instance;
+- a custom Store/policy can replace the defaults;
+- no `todo_write` symbol remains in framework registration, prompts, tests, or
+  docs.
+
+The removal is an intentional framework breaking change. It is justified by
+behavioral coverage and a better authority model, not by counting current EKO
+callers. The changelog must note that ids, revision semantics, and isolation
+differ from the old process-global scratchpad.
+
+## 13. Registration
+
+The split crate must not depend upward on `ReactAgent`, and `ReactAgent` does
+not currently implement `ToolRegistrar`. Avoid a free function that accepts
+`&mut ToolRegistrar`.
+
+`echo-orchestration` exposes tool factories:
+
+```rust
+pub fn build_task_tools(
+    service: Arc<TaskRevisionService>,
+) -> Vec<Box<dyn Tool>>;
+
+pub fn build_task_create_tool(...) -> Box<dyn Tool>;
+pub fn build_task_update_tool(...) -> Box<dyn Tool>;
+pub fn build_task_list_tool(...) -> Box<dyn Tool>;
+```
+
+The root `echo-agent` crate owns `ReactAgent` integration:
+
+- builder path: create the default in-memory service or use a supplied custom
+  service, then call `ReactAgent::add_tools`;
+- post-hoc path: EKO builds an EKO service and replaces the same three tool
+  names before the Agent serves a turn.
+
+Using `ReactAgent::add_tools` preserves `enable_tool` and `allowed_tools`
+behavior. Registration tests must prove that replacement does not leave two
+definitions or bypass allowed-tool filtering.
+
+## 14. EKO Adapter Details
+
+### 14.1 `EkoRevisionedTaskStore`
+
+`load`:
+
+- call the existing file/event read projection;
+- combine plan specification and execution projection into canonical `Task`;
+- build `RuntimePlanSnapshot`;
+- map plan-level fields into `TaskGraphContext`;
+- fail on lossy or inconsistent conversion.
+
+`compare_and_commit`:
+
+- acquire the existing per-run lock;
+- load the authoritative current revision inside the lock;
+- enforce terminal-run persistence invariant;
+- compare absent/present/revision with `expected_revision`;
+- convert the already-validated candidate to EKO projections;
+- append the existing revision event with reason and effects;
+- rebuild `plan.json` and execution projections atomically;
+- return the committed graph.
+
+It must not call EKO's old `update_tasks` patch body.
+
+### 14.2 `EkoTaskToolPolicy`
+
+The policy owns the live `TaskCapabilityCatalog`, which is constructed at Agent
+registration from:
+
+- the registered Subagent snapshot;
+- current Agent tool names.
+
+It also owns the `TaskRuntimeStore` reference needed to read DomainProfile and
+bootstrap the TaskRun. This is product policy, not persistence abstraction.
+
+`validate_candidate` validates every candidate task after all operations so
+updates cannot introduce an unknown Subagent/tool indirectly.
+`finalize_task_metadata` can update only EKO extension metadata; neither hook
+can rewrite generic dependency or status semantics.
+
+### 14.3 Attachments and task-local context
+
+Do not add EKO attachment types to framework `ToolContext`. EKO's policy may
+read current chat resources/task-local state when bootstrapping, while the
+framework passes the ordinary `ToolContext` it already owns.
+
+This preserves GUI/TUI/CLI/channel behavior without polluting the reusable
+framework context type with an EKO storage DTO.
+
+### 14.4 GUI/Tauri and non-tool callers
+
+Before this migration, the Tauri `update_tasks` command called
+`TaskRuntimeStore::update_tasks` directly and product planning paths attached
+initial plans directly. Migrating only the LLM tools would therefore have been
+incomplete.
+
+All production mutation entry points must call `TaskRevisionService`:
+
+- framework LLM task tools;
+- Tauri/GUI `update_tasks`;
+- chat/task service initial plan materialization;
+- any executor-side dynamic revision insertion.
+
+Tauri may keep EKO-generated TypeScript request/response DTOs as wire
+projections, but the command converts them once and delegates to the framework
+service. It may not apply or validate operations itself.
+
+## 15. Migration Plan
+
+Each phase must compile, switch a real path or delete replaced logic, and be
+committed in its own repository. Framework commits land before application
+commits.
+
+### Phase 1: atomic framework replacement (`echo-agent`) - completed
+
+Implement in one framework commit:
+
+- revision envelope, wire DTOs, patch DTOs, effects, and typed errors;
+- pure `TaskPatchEngine`;
+- thin `RevisionedTaskStore` and `TaskToolPolicy`;
+- `TaskRevisionService`;
+- `InMemoryRevisionedTaskStore` and default policy;
+- framework `task_create/update/list` tools;
+- default ReactAgent registration and custom-service builder path;
+- always-available public task relation facade;
+- deletion of `TodoWriteTool` and all `todo_write` registration/docs/tests.
+
+This phase switches the framework's real default task path. It does not leave
+an unused framework service beside `todo_write`.
+
+Required tests include default/no-context operation, Agent isolation, custom
+Store replacement, complete patch semantics, CAS races, schema goldens, and
+exact summaries/errors.
+
+### Phase 2: EKO read adapter and `task_list` cutover (`echo-agent-cli`) - completed
+
+- add `EkoRevisionedTaskStore` and checked graph conversions;
+- add `EkoTaskToolPolicy` with scope/bootstrap hooks;
+- construct one shared `TaskRevisionService` for the Agent/runtime;
+- replace only `task_list` with the framework implementation;
+- delete EKO `TaskListTool` and its duplicate formatting logic;
+- remove now-obsolete `remove_tool("todo_write")` calls.
+
+This phase proves coherent revision/task reads and switches one production path
+without changing mutation behavior yet.
+
+### Phase 3: EKO LLM mutation cutover (`echo-agent-cli`) - completed
+
+- register framework `task_create` and `task_update` using the EKO service;
+- delete EKO `TaskCreateTool` and `TaskUpdateTool`;
+- delete duplicate tool schemas, parsers, summaries, and error mapping;
+- keep `TaskCapabilityCatalog` only in `EkoTaskToolPolicy`;
+- port existing tool tests as framework/service integration tests.
+
+At this point all LLM task relation calls use the framework authority. The four
+product execution/control tools remain unchanged.
+
+### Phase 4: all remaining mutation callers and store cleanup (`echo-agent-cli`) - completed
+
+- route Tauri/GUI `update_tasks` through `TaskRevisionService`;
+- route production initial-plan materialization through the service's prepared
+  create path;
+- route executor-side dynamic insertion through the service;
+- replace the old Store patch body with the low-level CAS commit primitive;
+- delete public `TaskRuntimeStore::update_tasks` and obsolete app patch types
+  once every caller is converted;
+- keep `attach_plan` only if it is a private persistence helper with no
+  validation/mutation semantics; otherwise delete it too.
+
+This phase removes the final second patch authority.
+
+### Phase 5: convergence audit and archive (`echo-agent-cli`) - complete
+
+- run whole-repository grep gates;
+- update `docs/MASTER-PLAN.md` with the authoritative paths and completed
+  deletion targets;
+- update boundary/deep-dive docs that still describe framework `todo_write`;
+- run all framework/application/GUI/frontend verification gates;
+- inspect disk usage and clean only if AGENTS.md thresholds require it.
+
+No optional type cleanup is mixed into this migration.
+
+## 16. Verification
+
+### 16.1 Framework behavioral tests
+
+- exact create/update/list JSON schema snapshots;
+- one task and atomic batch creation;
+- invalid `task` + `tasks` combinations;
+- initial context preservation;
+- existing graph requires base revision;
+- duplicate/missing insert target;
+- pending/blocked update restrictions;
+- blocked update resets Pending and clears claim/detail;
+- skip restrictions;
+- default-policy manual Pending/Running/Completed/Cancelled transitions;
+- EKO policy omits and rejects manual status operations;
+- reorder exact-set validation;
+- dangling dependency/cycle/identity validation through `PlanValidator`;
+- stale load and commit-time CAS conflict;
+- backend, policy, not-found, invalid-patch, and conflict error formatting;
+- UTF-8 task titles/descriptions in summaries and errors;
+- task_list reads revision and tasks from one snapshot;
+- default ToolContext-free scope;
+- per-Agent state isolation;
+- custom service replacement;
+- `todo_write` absent and new tools present in default Agent.
+
+### 16.2 EKO adapter tests
+
+- every `TaskPlan` plan-level field round-trips;
+- every `TaskSpec` and `TaskExecution` field round-trips;
+- `EkoTaskMetadata` domain/parallel group/sort order round-trips;
+- malformed metadata returns an error instead of defaulting;
+- default Subagent follows DomainProfile + TaskKind;
+- explicit Subagent is preserved;
+- unknown Subagent/tool is rejected;
+- task-control tools cannot be delegated to a Subagent;
+- attachment/conversation/message bootstrap is unchanged;
+- terminal TaskRun mutation is rejected inside the commit lock;
+- event payload and file projections remain unchanged;
+- Tauri and LLM updates produce identical committed revisions;
+- concurrent callers produce exactly one winner and one typed conflict.
+
+### 16.3 Grep gates
+
+Framework:
+
+```bash
+rg -n "todo_write|TodoWriteTool" src echo-* docs
+rg -n "TaskRuntimeStore|DomainProfile|EkoTask" echo-orchestration src
+```
+
+Expected: zero semantic leaks; historical migration docs may be explicitly
+excluded or updated.
+
+Application production code:
+
+```bash
+rg -n "struct Task(Create|Update|List)Tool" echo-agent-app-core/src
+rg -n "\.update_tasks\(|fn update_tasks\(" echo-agent-app-core/src src/tauri
+rg -n "remove_tool\(\"todo_write\"\)" echo-agent-app-core/src src/tauri
+```
+
+Expected: no duplicate tool structs, patch engine, or obsolete removal call.
+The Tauri command name `update_tasks` may remain as an external IPC name, but
+its body must delegate directly to `TaskRevisionService`.
+
+### 16.4 Framework submission gate
+
 ```bash
 cd echo-agent
-cargo fmt --all && cargo fmt --all -- --check
+cargo fmt --all
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo clippy --workspace --lib --bins --all-features --locked -- \
+  -D clippy::unwrap_used \
+  -D clippy::expect_used \
+  -D clippy::panic \
+  -D clippy::unreachable
 cargo test --workspace --all-targets --all-features --locked
+cargo check --workspace --lib --no-default-features --locked
+./scripts/verify-all-crates.sh --feature-matrix
 ```
 
-Commit: `echo-agent: add RevisionedTaskStore trait + neutral plan-patch DTOs`
+The feature matrix is mandatory because the migration changes public API,
+feature visibility, and default tool registration.
 
-### Phase 2 — Framework: add the three tools, remove `todo_write` (echo-agent)
+### 16.5 Application submission gate
 
-**Goal**: `TaskCreateTool`/`TaskUpdateTool`/`TaskListTool` in
-`echo-orchestration/src/tasks/task_tools/`; JSON schemas in `schema.rs`;
-register them inline in `react/mod.rs` when a `RevisionedTaskStore` is present;
-**delete** `src/tools/builtin/todo.rs` and its registration at `react/mod.rs:372`.
-
-Files:
-- `echo-orchestration/src/tasks/task_tools/{mod.rs,schema.rs}` (new)
-- `echo-orchestration/src/tasks/mod.rs` — `pub mod task_tools;`
-- `src/agent/react/mod.rs` — replace `todo_write` registration with the new
-  tools, conditional on store presence
-- `src/tools/builtin/mod.rs` — remove `todo` module
-- `src/tools/builtin/todo.rs` — **delete**
-- Tests: port EKO's `task_tools` unit tests to the framework (they test
-  schema parsing, optimistic-conflict error messages, summary formatting).
-
-Verify: same matrix as Phase 1.
-
-Commit: `echo-agent: migrate task_create/update/list tools, remove deprecated todo_write`
-
-### Phase 3 — App: implement `RevisionedTaskStore` for `TaskRuntimeStore` (echo-agent-cli)
-
-**Goal**: app's `TaskRuntimeStore` gains an `impl RevisionedTaskStore` block;
-the mapping is round-trip-tested.
-
-Files:
-- `echo-agent-app-core/src/tasks/task_runtime/store.rs` — add impl block
-- `echo-agent-app-core/src/tasks/task_runtime/types.rs` — add
-  `From<TaskSpec> for PlanTask` / `TryFrom<&PlanTask> for TaskSpec` if not
-  already present (most exist — `to_task()`/`TryFrom<Task>` at types.rs:981-1065)
-- Tests: round-trip tests for every field; conflict-mapping test
-  (`PlanConflict` → `PlanRevisionConflict`).
-
-Verify:
 ```bash
 cd echo-agent-cli
-cargo fmt --all && cargo fmt --all -- --check
+cargo fmt --all
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
+cargo check -p echo-agent-app-core --no-default-features --locked
+cargo check --no-default-features --features gui --bin echo-agent-tauri
+cargo test --no-default-features --features gui
+
+cd web-frontend
+npx prettier --check "src/**/*.{ts,tsx}"
+npm test
+npm run build
 ```
 
-Commit: `echo-agent-cli: impl RevisionedTaskStore on TaskRuntimeStore`
+Before commit, also verify no Cargo manifest contains a worktree or absolute
+user path.
 
-### Phase 4 — App: slim `task_tools.rs`, update `register.rs` (echo-agent-cli)
+## 17. Acceptance Criteria
 
-**Goal**: remove the three migrated tool structs from app code; remove
-`remove_tool("todo_write")` from `register.rs`; ensure the framework tools
-receive the store via the agent builder.
+- [x] One framework `TaskRevisionService` owns all create/patch/list semantics.
+- [x] `RevisionedTaskStore` performs only coherent load and atomic CAS commit.
+- [x] `TaskToolPolicy` performs only scope/bootstrap/defaulting/product checks.
+- [x] Framework and EKO do not contain parallel production patch engines.
+- [x] Existing `TaskSpec`, `TaskExecution`, `TaskStatus`, `TaskKind`,
+      `RuntimePlanSnapshot`, and `PlanValidator` remain canonical.
+- [x] Initial goal/assumptions/risks/execution mode round-trip losslessly.
+- [x] EKO v1 tool names and schemas are preserved by the policy-composed tools.
+- [x] `task_list` formats one coherent revision snapshot.
+- [x] Default framework Agents expose task_create/update/list without custom
+      configuration or a run id.
+- [x] Default framework task_update covers lightweight manual progress, while
+      EKO formal task_update cannot forge executor outcomes.
+- [x] `todo_write` is deleted only after that default replacement is active.
+- [x] EKO task tools, Tauri/GUI updates, and production initial-plan callers use the
+      same service.
+- [x] Task execution statuses remain executor-owned.
+- [x] TUI, GUI, CLI, and channels receive the same task capability surface.
+- [x] No EKO persistence, DomainProfile, attachment, worktree, reviewer, or UI
+      type leaks into `echo-agent`.
+- [x] No SQLite dependency/feature is added to EKO.
+- [x] All applicable verification and feature matrices pass with zero warning
+      or failure.
+- [x] `MASTER-PLAN.md` records the final authoritative path and deleted legacy
+      path after implementation completes.
 
-Files:
-- `echo-agent-app-core/src/tasks/task_runtime/task_tools.rs` — remove
-  `TaskCreateTool`/`TaskUpdateTool`/`TaskListTool` structs + their impls +
-  `plan_task_input_schema` (now in framework). Keep `TaskCapabilityCatalog`,
-  `CreateComplexTaskTool`, `CheckRunStatusTool`, `CancelRunTool`,
-  `parse_plan_task` (used by CreateComplexTaskTool).
-- `echo-agent-app-core/src/tasks/task_runtime/register.rs` — drop
-  `remove_tool("todo_write")`; drop construction of the three migrated tools;
-  pass `store.clone() as Arc<dyn RevisionedTaskStore>` into the agent builder
-  path (likely `crate::runtime` / `agent_pool::from_runtime`).
-- `echo-agent-app-core/src/infra.rs:489` — drop the other `remove_tool(
-  "todo_write")` call.
-- Update `register.rs` test (`registration_replaces_framework_todo...`) —
-  renamed/assertions adjusted (framework no longer ships `todo_write`, so the
-  "before" assertion changes).
+## 18. Risk Register
 
-Verify: full app matrix incl. GUI feature + web-frontend.
-
-Commit: `echo-agent-cli: adopt framework task tools, slim app task_tools.rs`
-
-### Phase 5 — (Optional) type cleanup
-
-Collapse `PlanTaskKind`/`SuggestedTask`/`TaskExecutionSummary` mirror types.
-Separate PR. Low risk, type hygiene only.
-
----
-
-## 8. Risks and Mitigations
-
-| Risk | Mitigation |
+| Risk | Required mitigation |
 |---|---|
-| `RevisionedTaskStore` not object-safe due to oversight | Audit against `echo-core/src/tools/mod.rs` `Tool` pattern; no `Self`/`&Arc<Self>`/generic methods. Add `dyn RevisionedTaskStore` test in Phase 1. |
-| `TaskSpec.metadata` round-trip loses EKO fields | Round-trip test in Phase 3 covers every field; `metadata` is `serde_json::Value` so structurally lossless. |
-| Removing `todo_write` breaks non-EKO consumers | Grep confirms only EKO consumes `echo-agent` today; the migration plan in `framework-app-boundary-plan.md` explicitly allows removing superseded framework APIs (Phase 4 finding: "todo_write remains a generic scratchpad for other consumers" — but there are no other consumers, and the industry has moved on). If a future consumer needs a scratchpad, they get the better `task_*` surface. |
-| `ensure_run_exists` product hook needs `ToolContext` fields the framework doesn't expose | `ToolContext` already carries `conversation_id`/`message_id`/`run_id`/`turn_id`/`cancel`/`trace_sink` (`echo-core/src/tools/mod.rs:990-1018`). EKO's current `ensure_run_exists` reads exactly these. The `attachments` field is the only gap — add it to `ToolContext` if needed (small framework addition). |
-| Regression in task_create/update/list behavior | Port EKO's existing unit tests verbatim to the framework in Phase 2; run EKO's integration tests in Phase 4. Behavior must be identical (same schema, same error messages, same revision semantics). |
-| Two `RevisionedTaskStore` impls diverge | Only one impl exists today (`TaskRuntimeStore`). The framework `InMemoryRevisionedTaskStore` is for tests only. If a future sqlite impl appears, it implements the same trait — divergence is a property of the impl, not the design. |
+| Store adapter starts applying operations | Keep `compare_and_commit` input as an already-built candidate; unit-test that both stores use the same engine |
+| Product policy becomes a second validator | Permit capability/metadata checks only; structural checks remain `PlanValidator` |
+| Initial plan data is lost | Typed `TaskGraphContext` plus extension metadata and field-level round-trip tests |
+| Race between load and commit | Mandatory Store CAS under the existing per-run lock; no model-authored auto-retry |
+| Default framework build loses task tracking | Register per-Agent in-memory task tools and manual progress updates before deleting `todo_write` |
+| New framework tools collide with EKO tools | Replace identical names before the first served turn; assert one definition per name |
+| GUI bypasses the framework service | Route Tauri and every production mutation call through the same service; grep direct Store mutation |
+| Metadata bag becomes an untyped escape hatch | LLM wire does not accept arbitrary metadata; policy alone constructs EKO metadata |
+| Error behavior regresses | Typed error taxonomy plus exact golden message tests |
+| Feature combinations break | Mandatory no-default and feature-matrix verification |
 
----
+## 19. Final Ownership Matrix
 
-## 9. Acceptance Criteria
-
-- [ ] `echo-agent` ships `task_create`/`task_update`/`task_list` as first-class
-      tools, gated on a supplied `RevisionedTaskStore`.
-- [ ] `todo_write` is **deleted** from the framework.
-- [ ] `echo-agent-app-core`'s `TaskRuntimeStore` implements
-      `RevisionedTaskStore`; the three migrated tool structs are removed from
-      app code.
-- [ ] `register.rs` no longer calls `remove_tool("todo_write")`.
-- [ ] EKO behavior unchanged: same tool names, same schemas, same revision
-      semantics, same error messages, same summaries. Verified by ported unit
-      tests + existing integration tests.
-- [ ] TUI/GUI/CLI parity preserved (all three use the same framework tools).
-- [ ] `echo-agent` verification matrix green (fmt check, clippy `-D warnings`,
-      test workspace, no-default-features check).
-- [ ] `echo-agent-cli` verification matrix green (fmt, clippy, test, GUI
-      feature check, web-frontend build).
-- [ ] No `TaskRuntimeStore` symbol leaks into `echo-agent` (grep-enforced).
-- [ ] `MASTER-PLAN.md` updated with the new milestone.
-
----
-
-## 10. Non-Goals
-
-- Migrating `task_execute`, `create_complex_task`, `check_run_status`,
-  `cancel_run` — they carry too much product logic; revisit only if a concrete
-  reuse need appears.
-- Changing the DAG kernel, `RuntimeDagController`, `PlanValidator`, or
-  `TaskSpec`/`TaskExecution`/`TaskStatus` — settled by the 2026-07-27
-  convergence.
-- Adding `TaskGet` (Claude Code's fourth tool) — not currently used by EKO;
-  can be added later as a trivial read tool on the same trait.
-- Migrating any of the other ~45 app-core modules — audited, all correctly
-  placed (adapter or product). See Appendix C summary.
-- Introducing SQLite to EKO — out of scope (and forbidden by AGENTS.md).
-
----
-
-## Appendix A — Decomposition evidence (summary)
-
-Full per-tool decomposition with file:line evidence was produced by the
-deep-dive. Headline verdicts:
-
-| Tool | Verdict | Neutral core | Product adapter supplies |
+| Capability | Framework | EKO | Notes |
 |---|---|---|---|
-| `task_create` | **SPLIT → migrate** | param validation, optimistic-concurrency assembly, summary | `ensure_run_exists` (hook), capability validation (in store impl), all persistence |
-| `task_update` | **SPLIT → migrate** | op-discriminated patch parser, `PlanPatch` assembly, summary | capability validation, persistence |
-| `task_list` | **SPLIT → migrate (near-trivial)** | run_id resolution, formatting | `list_tasks` read |
-| `task_execute` | **STAY** | revision-match, lock, outcome formatting | unattended preflight, AgentHandle, reviewer LLM, execute_run DAG, register_run_cancellation |
-| `create_complex_task` | **STAY** | (parsing only) | chat_resources, run_driver, DomainProfile, Subagent catalog |
-| `check_run_status` | **STAY** | param parse, format | current_chat_resources + get_run |
-| `cancel_run` | **STAY** | param parse, format | current_chat_resources + request_cancel |
+| Tool schemas/parsing | Base authority | Declarative extension only | Composed EKO schema preserves the exact v1 contract |
+| Task/status/kind model | Authority | Checked projection | No third runtime model |
+| Patch operation semantics | Authority | None | One pure engine |
+| Manual progress transitions | Policy-gated mechanism | Disabled | Default in-memory policy only |
+| DAG structural validation | Authority | None | Existing `PlanValidator` |
+| Revision calculation | Authority | None | Store only compares/commits |
+| Atomic file/event commit | Interface | Authority | `EkoRevisionedTaskStore` |
+| Run bootstrap | Hook | Authority | `EkoTaskToolPolicy` |
+| Domain/Subagent/tool validation | Hook | Authority | Product catalog |
+| Default framework persistence | Authority | None | Per-Agent in-memory Store |
+| DAG execution | Existing authority | Controller adapter | Unchanged |
+| Review/worktree/file ownership | None | Authority | Unchanged |
+| GUI/TUI/CLI/channel projection | None | Authority | Same service underneath |
 
-The migrated three are the "clean切口" — their product coupling is entirely in
-persistence + capability validation, both of which fit cleanly behind a trait.
+## 20. Final Decision
 
-## Appendix B — Store call surface (what the trait must expose)
+Proceed with the migration only after adopting this corrected boundary:
 
-Derived from grep of every `self.store.*` call in the three migrating tools:
+> The framework owns one task-revision service and one patch engine. Stores
+> persist an already-computed candidate through CAS. EKO supplies persistence
+> and product policy through separate thin adapters. All task mutation callers,
+> including GUI/Tauri, use the same service. `todo_write` is deleted only when
+> the new API is the default zero-configuration framework path.
 
-| Method | Used by | Trait mapping |
-|---|---|---|
-| `get_plan(run_id) -> Option<TaskPlan>` | create, update, list, execute | `load_plan(run_id) -> Option<RevisionedPlan>` |
-| `update_tasks(run_id, &TaskUpdateRequest) -> TaskPlan` | create, update | `apply_patch(run_id, PlanPatch) -> RevisionedPlan \| Conflict` |
-| `attach_plan(&TaskPlan)` | create (initial) | Subsumed by `apply_patch` with `base_revision=0` semantics |
-| `list_todos(run_id) -> Vec<TodoItem>` | list | `list_tasks(run_id) -> Vec<Task>` |
-| `create_run(...)` + `set_run_attachments` + `transition_run(Running)` | create (bootstrap) | `ensure_run_exists(run_id, goal, ctx)` (single hook) |
-
-Five store methods collapse to **four trait methods**. The product's richer
-surface (`create_run`/`transition_run`/`note`/`get_summary`/`request_cancel`/
-`register_run_cancellation`) is not needed by the migrating tools and stays
-un-exposed by the trait.
-
-## Appendix C — Other modules audited (all correctly placed)
-
-For completeness, the broader audit (user's "not just tasks/") confirmed every
-other app-core module is correctly layered:
-
-- **ADAPTER** (correct trait seam): `subagent_prompt` (`SubagentPromptCompiler`),
-  `chat_driver`/`run_driver` (call `execute_stream_*`), `FileConversationStore`
-  (`ConversationStore`), `FileRuntimeStateStore` (`RuntimeStateStore`),
-  `HitlDispatcher` (`HumanLoopProvider`), `TaskRuntimeContextProjector`
-  (`PreModelContextProjector`), `scheduler` (re-exports framework `CronTask`).
-- **PRODUCT** (genuinely EKO, stays): `subagent_loader` (`.eko/` convention +
-  EKO frontmatter), `agent_pool` (multi-conversation desktop host),
-  `tool_execution` (durable paged projection), `persistence` (CLI session DTOs),
-  `SessionSearchEngine`, `DomainProfile`/`ProfileTemplate`/`AttendedMode`/
-  `UnattendedWriteMode`, review gate, worktree policy, file-ownership policy,
-  all product features (research/analysis/browser/coding-loop/skills-hub/etc.).
-
-**No other DUPLICATE verdicts.** The layering discipline established by the
-prior boundary plan is sound; this design closes the one remaining gap
-(`todo_write` → modern `task_*`).
+This produces the intended final model: lightweight progress tasks and
+executable PlanTask DAG nodes are one formal task-relationship API, while
+execution authority and EKO product policy remain correctly separated.
