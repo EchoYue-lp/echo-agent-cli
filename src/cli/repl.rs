@@ -62,6 +62,9 @@ pub struct ReplConfig {
     pub task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     /// Persisted conversation identity for the shared chat driver.
     pub conversation_id: String,
+    /// Shared webhook emitter (built from `AppConfig.webhooks` at bootstrap).
+    /// `None` means no endpoints configured — emit calls are skipped cheaply.
+    pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
 }
 
 impl Default for ReplConfig {
@@ -80,6 +83,7 @@ impl Default for ReplConfig {
             pool: None,
             task_runtime_store: None,
             conversation_id: uuid::Uuid::new_v4().to_string(),
+            webhook_emitter: None,
         }
     }
 }
@@ -223,8 +227,16 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
                             let mut staged = staged_attachments.lock().await;
                             std::mem::take(&mut *staged)
                         };
-                        chat_with_agent(&agent, &message, &output, &config, mode, attachments)
-                            .await;
+                        chat_with_agent(
+                            &agent,
+                            &message,
+                            &output,
+                            &config,
+                            mode,
+                            attachments,
+                            config.webhook_emitter.as_deref(),
+                        )
+                        .await;
                     }
                 }
             }
@@ -473,6 +485,7 @@ async fn chat_with_agent(
     config: &ReplConfig,
     interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
     attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    webhook_emitter: Option<&echo_agent_app_core::webhook::WebhookEmitter>,
 ) {
     output.print_user_message(message);
 
@@ -787,10 +800,12 @@ async fn chat_with_agent(
                 );
                 let styled = nu_ansi_term::Color::Red.paint(&err_text);
                 println!("  {}", styled);
-                crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::ToolFailed {
-                    name: name.clone(),
-                    error: error.clone(),
-                });
+                if let Some(emitter) = webhook_emitter {
+                    emitter.emit(echo_agent_app_core::webhook::WebhookEvent::ToolFailed {
+                        name: name.clone(),
+                        error: error.clone(),
+                    });
+                }
                 first_chunk = true;
             }
             AgentEvent::FinalAnswer(_answer) => {
@@ -842,15 +857,17 @@ async fn chat_with_agent(
     // Ensure spinner is cleared even if stream produced no meaningful events
     clear_spinner!();
 
-    // Emit ChatCompleted webhook
+    // Emit ChatCompleted webhook (only when an emitter with endpoints exists).
     {
         let (input_tokens, output_tokens, _) = get_usage_stats();
-        crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::ChatCompleted {
-            model: String::new(), // model not easily available here
-            input_tokens,
-            output_tokens,
-            elapsed_ms: elapsed.as_millis() as u64,
-        });
+        if let Some(emitter) = webhook_emitter {
+            emitter.emit(echo_agent_app_core::webhook::WebhookEvent::ChatCompleted {
+                model: String::new(), // model not easily available here
+                input_tokens,
+                output_tokens,
+                elapsed_ms: elapsed.as_millis() as u64,
+            });
+        }
     }
 
     let config = output.config();

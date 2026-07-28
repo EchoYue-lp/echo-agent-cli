@@ -1,39 +1,20 @@
 //! Webhook 事件发射器
 //!
 //! 非阻塞 HTTP POST，失败仅 warn，1 次重试，支持 HMAC-SHA256 签名。
+//!
+//! ## 单例策略
+//!
+//! 没有 global singleton。`WebhookEmitter` 通过 `AppState.webhook.emitter`
+//! (GUI/TUI/channel) 或 `ReplConfig.webhook_emitter` (CLI) 注入。一个进程
+//! 内可以有多个独立 emitter，但通常只有一个，从 `AppConfig.webhooks` 构建。
+//! 之前的 `init_global` / `emit_global` / `global_emitter` 被移除，因为
+//! `init_global` 从未被调用 → 全局 emitter 永远没有 endpoints → 之前的
+//! `emit_global(...)` 调用全是 no-op，掩盖了"webhook 实际上没生效"的真实状态。
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::events::{WebhookEvent, WebhookPayload};
-
-// ── 全局单例 ──────────────────────────────────────────────────────
-
-static GLOBAL_EMITTER: std::sync::LazyLock<WebhookEmitter> =
-    std::sync::LazyLock::new(WebhookEmitter::new);
-
-/// 初始化全局 WebhookEmitter（应在启动时调用一次）
-///
-/// Non-blocking: spawns endpoint registration on the runtime instead of
-/// using `block_on`, which would panic if called from an async context.
-pub fn init_global(endpoints: Vec<WebhookEndpoint>) {
-    let emitter = GLOBAL_EMITTER.clone();
-    tokio::spawn(async move {
-        for ep in endpoints {
-            emitter.add_endpoint(ep).await;
-        }
-    });
-}
-
-/// 通过全局单例发射事件
-pub fn emit_global(event: WebhookEvent) {
-    GLOBAL_EMITTER.emit(event);
-}
-
-/// 获取全局 emitter 引用（用于高级操作）
-pub fn global_emitter() -> &'static WebhookEmitter {
-    &GLOBAL_EMITTER
-}
 
 /// 单个 Webhook 端点配置
 #[derive(Debug, Clone)]
@@ -82,6 +63,11 @@ impl WebhookEmitter {
         }
     }
 
+    /// True when at least one endpoint is registered.
+    pub async fn has_endpoints(&self) -> bool {
+        !self.endpoints.read().await.is_empty()
+    }
+
     /// 添加端点（运行时动态添加）
     pub async fn add_endpoint(&self, endpoint: WebhookEndpoint) {
         self.endpoints.write().await.push(endpoint);
@@ -100,7 +86,9 @@ impl WebhookEmitter {
         self.endpoints.read().await.clone()
     }
 
-    /// 发射事件（非阻塞 fire-and-forget）
+    /// 发射事件（非阻塞 fire-and-forget）。
+    ///
+    /// 没有注册端点时立即返回，避免无谓的 spawn。
     pub fn emit(&self, event: WebhookEvent) {
         let endpoints = self.endpoints.clone();
         let client = self.client.clone();
@@ -108,6 +96,9 @@ impl WebhookEmitter {
 
         tokio::spawn(async move {
             let guard = endpoints.read().await;
+            if guard.is_empty() {
+                return;
+            }
             let payload = WebhookPayload {
                 event: event_name,
                 timestamp: chrono::Utc::now(),

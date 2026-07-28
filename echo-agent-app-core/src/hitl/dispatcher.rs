@@ -66,7 +66,18 @@ impl HumanLoopProvider for HitlDispatcher {
         req: HumanLoopRequest,
     ) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
         Box::pin(async move {
-            let providers = self.providers.read().await;
+            // Snapshot providers and drop the read guard immediately so that
+            // provider registration/unregistration is not blocked for the entire
+            // (up to 5-minute) request duration. The previous implementation
+            // held `self.providers.read().await` across the whole `while` loop,
+            // deadlocking any concurrent `register`/`unregister` call.
+            let providers: Vec<(String, Arc<dyn HumanLoopProvider>)> = {
+                let guard = self.providers.read().await;
+                guard
+                    .iter()
+                    .map(|named| (named.name.clone(), named.provider.clone()))
+                    .collect()
+            };
 
             if providers.is_empty() {
                 tracing::warn!("HITL request with no providers registered, auto-rejecting");
@@ -75,26 +86,40 @@ impl HumanLoopProvider for HitlDispatcher {
                 });
             }
 
-            // F5-2: 此前是串行 for 循环 + 每 provider 独立 5min 超时 → N 个 provider
-            // 最坏 N×5min。文件头注释本就写"First responder wins", 现在补齐实现。
+            // Parallel broadcast + first-response-wins. All providers receive
+            // the request concurrently; the first Ok (approve/reject/modify)
+            // wins and the remaining futures are cancelled by dropping
+            // `pending`. A single Err (connection drop) does not reject
+            // immediately — we keep waiting on the others. Only when all have
+            // failed/timed out does the dispatcher fail-closed (default deny).
             //
-            // 改为并行广播 + first-response-wins(对标 GitHub "any approve"、HITL
-            // 多渠道冗余、Temporal first-input-wins):所有 provider 同时收到请求,
-            // 第一个**实质性响应**(Ok, 含 approve/reject/modify)即采纳并取消其余;
-            // 单个 provider 报 Err(连接断开等)不立即 reject, 继续等其余;
-            // 全部 Err/超时才 reject(default deny)。总超时上限 = 1×5min 而非 N×5min。
+            // Single shared deadline: every provider's individual timeout is
+            // computed against ONE start instant, so the total wall-clock wait
+            // is bounded by `TIMEOUT_DURATION` regardless of how many providers
+            // are registered (the previous per-provider timeout was roughly
+            // equivalent but not strict — this version is).
             const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+            let deadline = tokio::time::Instant::now() + TIMEOUT_DURATION;
+
+            // Give each provider its own clone of the request so the dispatch
+            // futures can each be `'static` and driven independently inside a
+            // `FuturesUnordered` (the per-iteration `FnMut` cannot move `req`
+            // once, so we pre-clone here).
+            let prepared: Vec<(String, Arc<dyn HumanLoopProvider>, HumanLoopRequest)> = providers
+                .into_iter()
+                .map(|(name, provider)| (name, provider, req.clone()))
+                .collect();
 
             use futures::stream::{FuturesUnordered, StreamExt};
-            let mut pending: FuturesUnordered<_> = providers
-                .iter()
-                .map(|named| {
-                    let fut = named.provider.request(req.clone());
-                    let name = named.name.clone();
-                    async move {
-                        let result = tokio::time::timeout(TIMEOUT_DURATION, fut).await;
-                        (name, result)
-                    }
+            let mut pending: FuturesUnordered<_> = prepared
+                .into_iter()
+                .map(|(name, provider, req_for_provider)| async move {
+                    let fut = provider.request(req_for_provider);
+                    // `timeout_at` returns `Err(Elapsed)` immediately if the
+                    // deadline is already in the past — consistent timeout
+                    // reporting without a separate per-future branch.
+                    let result = tokio::time::timeout_at(deadline, fut).await;
+                    (name, result)
                 })
                 .collect();
 
@@ -106,6 +131,9 @@ impl HumanLoopProvider for HitlDispatcher {
                             provider = %name,
                             "HITL request resolved by first responder"
                         );
+                        // Returning drops `pending`, which cancels the remaining
+                        // provider futures (their `JoinHandle`-like semantics
+                        // come from the `Future` being polled inside the stream).
                         return Ok(response);
                     }
                     Ok(Err(e)) => {
@@ -119,7 +147,7 @@ impl HumanLoopProvider for HitlDispatcher {
                     Err(_) => {
                         tracing::warn!(
                             provider = %name,
-                            "HITL provider timed out after 5 minutes, waiting on others"
+                            "HITL provider hit the shared deadline, waiting on others"
                         );
                         failures.push(format!("{name}: timeout"));
                     }

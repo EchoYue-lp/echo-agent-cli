@@ -48,11 +48,13 @@ pub fn build_fire_fn(
     agent: AgentHandle,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
+    webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
 ) -> FireFn {
     Arc::new(move |task: CronTask| {
         let fallback_agent = agent.clone();
         let runtime_store = task_runtime_store.clone();
         let pool = pool.clone();
+        let webhook_emitter = webhook_emitter.clone();
         Box::pin(async move {
             let store = runtime_store.ok_or_else(|| {
                 echo_agent::error::ReactError::Other(
@@ -107,7 +109,18 @@ pub fn build_fire_fn(
             }
 
             match result {
-                Ok(run_id) => Ok(format!("cron run {run_id} finished for task {}", task.id)),
+                Ok(run_id) => {
+                    // Best-effort webhook: fire CronTaskCompleted when an emitter
+                    // with endpoints exists. Failure to emit never blocks the run.
+                    if let Some(emitter) = webhook_emitter.as_ref() {
+                        emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
+                            task_id: task.id.clone(),
+                            task_name: task.name.clone(),
+                            result_summary: format!("cron run {run_id} finished"),
+                        });
+                    }
+                    Ok(format!("cron run {run_id} finished for task {}", task.id))
+                }
                 Err(e) => Err(echo_agent::error::ReactError::Other(format!(
                     "cron run failed: {e}"
                 ))),
@@ -149,8 +162,9 @@ pub fn new_scheduler_runner(
     agent: AgentHandle,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
+    webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
 ) -> SchedulerRunner {
-    let fire_fn = build_fire_fn(agent, task_runtime_store, pool);
+    let fire_fn = build_fire_fn(agent, task_runtime_store, pool, webhook_emitter);
     SchedulerRunner::new(store, cancel, fire_fn)
 }
 
@@ -178,7 +192,7 @@ mod tests {
 
         // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
         // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → launch_cron_run。
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None);
 
         let task = CronTask::new("plain", "*/5 * * * *", "hello world");
         let result = fire_fn(task).await;
@@ -206,7 +220,7 @@ mod tests {
         let handle = AgentHandle::new(agent);
         let store =
             Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store should init"));
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
         let result = fire_fn(task).await;
@@ -234,7 +248,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None);
 
         let task = CronTask::new("failing", "*/5 * * * *", "run this");
         let result = fire_fn(task).await;

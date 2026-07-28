@@ -1,11 +1,30 @@
-//! Configuration file watcher — monitors echo-agent.yaml for changes
-//! and fires ConfigChange hooks + reloads user hooks.
+//! Hooks-config file watcher — monitors `echo-agent.yaml` for changes and
+//! hot-reloads user **hooks** (and fires the `ConfigChange` lifecycle hook).
 //!
-//! Uses the `notify` crate for filesystem event monitoring with 500ms
-//! debouncing to avoid firing multiple events for a single save operation
-//! (many editors write files in multiple steps: write + rename).
+//! ## Scope (intentional)
+//!
+//! Only hooks are reloaded live. Other config domains (model selection, MCP
+//! server topology, runtime limits) require a restart because they are wired
+//! into long-lived subsystems at agent construction. The watcher's name and
+//! this doc reflect that scope; do not widen it without a parallel story for
+//! safely tearing down and rebuilding those subsystems.
+//!
+//! ## Robustness features
+//!
+//! - **Parent-directory watch with path filter.** Watching the file directly
+//!   breaks on editors that save atomically (write-temp + rename): on macOS and
+//!   Linux the inode under the original path is replaced and the watch dies.
+//!   Watching the parent directory and filtering events to the target file
+//!   survives rename-save.
+//! - **Resettable debounce.** Events arrive in bursts (one save = many modify
+//!   events). The debounce timer is reset on every qualifying event during the
+//!   quiet window, so a burst collapses into exactly one reload rather than N
+//!   serial reloads (the previous fixed 500ms-sleep-per-event approach).
+//! - **Channel draining.** While waiting for the quiet window, additional
+//!   events are drained and only used to extend the window — never to trigger
+//!   additional reloads.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use notify::{Config, EventKind, RecursiveMode, Watcher};
@@ -14,6 +33,10 @@ use tracing::{debug, info, warn};
 
 use crate::agent_handle::AgentHandle;
 use crate::infra;
+
+/// Quiet window for the resettable debounce. A save is considered "settled"
+/// when no qualifying event has arrived for this long.
+const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 
 /// Resolve the config file path that was actually loaded.
 ///
@@ -31,9 +54,10 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
-/// Spawn a background task that watches the config file for changes.
+/// Spawn a background task that watches the config file for changes and
+/// hot-reloads user hooks.
 ///
-/// When the file changes, it:
+/// When the file settles after a burst of edits, it:
 /// 1. Fires `ConfigChange` hook with the file path as matcher context
 /// 2. Reloads the config and re-registers user hooks
 ///
@@ -44,7 +68,15 @@ pub fn spawn_config_watcher(
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        // Use a bounded async channel to receive filesystem events
+        let Some(parent) = config_path.parent() else {
+            warn!(
+                "Config path {} has no parent directory; cannot watch",
+                config_path.display()
+            );
+            return;
+        };
+
+        // Use a bounded async channel to receive filesystem events.
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
 
         let mut watcher = match notify::RecommendedWatcher::new(
@@ -60,16 +92,23 @@ pub fn spawn_config_watcher(
             }
         };
 
-        if let Err(e) = watcher.watch(&config_path, RecursiveMode::NonRecursive) {
+        // Watch the PARENT directory (recursive=false). This survives the
+        // atomic-write-temp-then-rename pattern used by most editors, which
+        // would invalidate a direct file watch. We filter to our target below.
+        if let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive) {
             warn!(
-                "Failed to watch config file {}: {}",
-                config_path.display(),
+                "Failed to watch config parent directory {}: {}",
+                parent.display(),
                 e
             );
             return;
         }
 
-        info!("Config watcher started for {}", config_path.display());
+        info!(
+            "Config watcher started: watching {} for changes to {}",
+            parent.display(),
+            config_path.display()
+        );
 
         loop {
             tokio::select! {
@@ -78,41 +117,80 @@ pub fn spawn_config_watcher(
                     break;
                 }
                 result = rx.recv() => {
-                    match result {
-                        Some(event) => {
-                            match event {
-                                Ok(notify_event) => {
-                                    // Only react to data modification events
-                                    if !matches!(notify_event.kind, EventKind::Modify(_)) {
-                                        continue;
-                                    }
+                    let Some(event) = result else {
+                        debug!("Config watcher channel closed");
+                        break;
+                    };
+                    let notify_event = match event {
+                        Ok(ev) => ev,
+                        Err(e) => {
+                            warn!("Config watch error: {}", e);
+                            continue;
+                        }
+                    };
+                    // Filter: only react to data-modify events that touch our
+                    // target config file specifically.
+                    if !matches!(notify_event.kind, EventKind::Modify(_)) {
+                        continue;
+                    }
+                    if !event_touches_target(&notify_event, &config_path) {
+                        continue;
+                    }
 
-                                    // Debounce: wait 500ms to avoid multiple events from a single save
-                                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                                    // Check if cancellation happened during debounce
-                                    if cancel.is_cancelled() {
-                                        break;
-                                    }
-
-                                    info!("Config file changed: {}", config_path.display());
-                                    handle_config_change(&config_path, &agent).await;
-                                }
-                                Err(e) => {
-                                    warn!("Config watch error: {}", e);
+                    // Resettable debounce: keep resetting the quiet window while
+                    // events keep arriving. Drain the channel non-blockingly so
+                    // a burst collapses into one reload, not N serial reloads.
+                    let settled = tokio::time::sleep(DEBOUNCE_WINDOW);
+                    tokio::pin!(settled);
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            _ = &mut settled => break,
+                            extra = rx.recv() => {
+                                let Some(Ok(ev)) = extra else { continue };
+                                if matches!(ev.kind, EventKind::Modify(_))
+                                    && event_touches_target(&ev, &config_path)
+                                {
+                                    // Qualifying event during quiet window:
+                                    // reset the debounce timer.
+                                    settled.as_mut().reset(tokio::time::Instant::now() + DEBOUNCE_WINDOW);
                                 }
                             }
                         }
-                        None => {
-                            // Channel closed — exit watcher
-                            debug!("Config watcher channel closed");
-                            break;
-                        }
                     }
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+
+                    info!("Config file changed: {}", config_path.display());
+                    handle_config_change(&config_path, &agent).await;
                 }
             }
         }
     })
+}
+
+/// True when `event` modifies the file at `target` (compared by canonical path
+/// when possible, falling back to a suffix/contains match on the event paths).
+///
+/// Path comparison is character-safe (uses `Path` API only).
+fn event_touches_target(event: &notify::Event, target: &Path) -> bool {
+    // Canonicalize both sides when possible to normalize symlinks/relative paths.
+    let target_canon = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    for p in &event.paths {
+        let p_canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if p_canon == target_canon {
+            return true;
+        }
+        // Fallback: compare by final component (covers the case where the file
+        // was just created and not yet canonicalizable).
+        if p.file_name() == target.file_name() {
+            return true;
+        }
+    }
+    false
 }
 
 async fn handle_config_change(config_path: &std::path::Path, agent: &AgentHandle) {
@@ -132,7 +210,12 @@ async fn handle_config_change(config_path: &std::path::Path, agent: &AgentHandle
         })
         .await;
 
-    // 2. Reload config and re-register user hooks
+    // 2. Reload config and re-register user hooks.
+    //
+    // Hot-reload scope is intentionally limited to hooks. Model selection, MCP
+    // topology, and runtime limits are wired into long-lived subsystems at
+    // agent build time and are NOT reloaded here — a restart is required for
+    // those to take effect (see module docs).
     let new_config = echo_agent::config::load_config(Some(&path_str));
 
     infra::load_user_hooks(agent, &new_config).await;

@@ -24,6 +24,7 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         pool: None,
         task_runtime_store: None,
         conversation_id: String::new(),
+        webhook_emitter: None,
     }
 }
 
@@ -91,6 +92,26 @@ pub async fn run_cli_mode(
     repl_config.pool = Some(pool);
     repl_config.task_runtime_store = task_runtime_store;
     repl_config.conversation_id = conversation_id;
+    // Build a CLI-side webhook emitter from the same config AppState uses.
+    // One Arc-shared instance feeds ChatCompleted/ToolFailed/etc. emit sites
+    // in chat_with_agent. Empty endpoint list → emit calls cheaply no-op.
+    repl_config.webhook_emitter = if app_config.webhooks.endpoints.is_empty() {
+        None
+    } else {
+        let endpoints: Vec<echo_agent_app_core::webhook::emitter::WebhookEndpoint> = app_config
+            .webhooks
+            .endpoints
+            .iter()
+            .map(|e| echo_agent_app_core::webhook::emitter::WebhookEndpoint {
+                url: e.url.clone(),
+                events: e.events.clone(),
+                secret: e.secret.clone(),
+            })
+            .collect();
+        Some(std::sync::Arc::new(
+            echo_agent_app_core::webhook::WebhookEmitter::with_endpoints(endpoints),
+        ))
+    };
 
     crate::cli::run_repl(agent, repl_config).await
 }

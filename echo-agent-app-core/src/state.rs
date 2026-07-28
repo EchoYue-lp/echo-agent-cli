@@ -655,6 +655,10 @@ impl AppState {
             self.connection.agent.clone(),
             self.tasks.runtime.clone(),
             self.connection.pool.clone(),
+            // Share the AppState's webhook emitter so cron runs emit
+            // CronTaskCompleted on the same endpoint set as chat. `emit`
+            // cheaply no-ops when no endpoints are registered.
+            Some(Arc::new(self.webhook.emitter.clone())),
         );
         let runner = Arc::new(runner);
         runner.clone().spawn();
