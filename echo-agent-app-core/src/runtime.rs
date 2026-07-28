@@ -15,11 +15,11 @@
 use std::sync::Arc;
 
 use crate::agent_handle::AgentHandle;
-use crate::config::AppConfig;
 use crate::evolution::ReviewIntegration;
 use crate::hitl::HitlDispatcher;
 use crate::infra::{self, AgentCreateParams};
 use crate::state::AppState;
+use echo_agent::config::AppConfig;
 use echo_agent::evolution::ReviewConfig;
 use echo_agent::intent::{
     KeywordClassifier, LlmIntentClassifier, SkillDescription, TriggerSupervisor,

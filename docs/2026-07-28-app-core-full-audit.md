@@ -1,6 +1,6 @@
 # echo-agent-app-core Full Migration Audit
 
-> Status: **Audit complete** (informs migration priorities, no code changed)
+> Status: **Audit complete; verdicts revised 2026-07-28 after user review**
 > Date: 2026-07-28
 > Scope: every module in `echo-agent-cli/echo-agent-app-core/src/` (~50 modules)
 > Method: 4 parallel deep-verification passes reading actual code (not docstrings),
@@ -10,7 +10,36 @@
 
 ---
 
-## Executive Summary
+## Revised Verdicts (supersedes the original findings below)
+
+The user reviewed this audit and pushed back on the original 8 findings. Re-verification
+confirmed **3 of the original 8 were wrong** (misread or over-eager). The corrected
+conclusion: **only 3 storage migrations are real** (S1/S2/S3). Everything else stays in
+the app — some with bug fixes, some deleted as dead code.
+
+| Item | Original verdict | **Corrected verdict** | Action |
+|---|---|---|---|
+| D1 `instruction_provider` | DUPLICATE (collapses onto framework `InstructionResolver`) | **FALSE ALARM — not a duplicate** | Stays in app. Framework's `project-rules` feature is NOT enabled in EKO (`echo-agent-app-core/Cargo.toml` confirmed), so there is no double-scan. App's tier set (`user.md`/`project.md`/`AGENTS.md`/`local.md`/`MEMORY.md`) is EKO's instruction+memory protocol, not a strict subset of the framework's project-rules resolver. |
+| D2 `sensitive.rs` | DUPLICATE (framework `ProtectedPathChecker` wins) | **APP DEAD CODE** (not a duplicate of anything live) | **Delete entirely** — zero callers (`rg` confirmed). Done in Iteration 0. |
+| D3 `utils.rs::strip_yaml_frontmatter` | Near-duplicate of framework `parse_frontmatter` | **Different semantics, not a duplicate** | Stays in app. Skill frontmatter parser vs MEMORY.md body-stripper serve different purposes; tighten the app parser's robustness locally instead of migrating. |
+| **S1** `runtime_state_file.rs` | SPLIT (file impl of framework trait) | **CONFIRMED — real framework gap** | Migrate `FileRuntimeStateStore` down to `echo-agent/src/state/file.rs`. Fix bugs first (corrupt-JSON errors, path-safe IDs, unique temp names, parent-dir sync). |
+| **S2** `conversation_restore.rs` | SPLIT (inverse of `project_message`) | **CONFIRMED — real framework gap** | Migrate `restore_messages` down to `echo-state`. Return `Result`, don't silently demote unknown roles. |
+| **S3** `conversation_file.rs::FileConversationStore` | SPLIT (file impl of framework trait) | **CONFIRMED — real framework gap** | Migrate store down to `echo-state`. Fix corrupt-JSON errors + path-safe IDs. `SessionSearchEngine` stays in app. |
+| A1 `webhook/emitter.rs` | SPLIT (framework owns config, no impl) | **CONFIRMED STAYS — but app has real bugs** | Stays in app (product delivery policy). Fix: delete global singleton, unify `AppState.webhook.emitter` with real emit calls for ChatCompleted/ToolFailed/AgentError/CronTaskCompleted. |
+| A2 `hitl/dispatcher.rs` | SPLIT (generic fan-out composite missing) | **CONFIRMED STAYS — EKO multi-surface arbitration policy** | Stays in app. Fix: shared deadline (not per-provider timeout), cancel remaining futures after first response, clone provider snapshot before await. |
+| A3 `config_watcher.rs` | SPLIT (framework has no hot-reload) | **CONFIRMED STAYS — EKO lifecycle capability** | Stays in app. Fix: resettable debounce, parent-dir watch + file filter, explicit reload scope (hooks/webhook live; model/MCP/runtime = "restart required"). Possibly rename to `hooks_config_watcher` if only hooks reload. |
+
+**Final migration scope: only 3 storage migrations (S1/S2/S3).** Plus Iteration 0
+dead-code cleanup (`sensitive.rs`, `embedded_server.rs`, `server_pid.rs`, `config.rs`
+shim — all deleted) and the bug-fix iterations on app-side instruction/webhook/HITL/
+watcher code (no framework changes).
+
+The original "8 findings" section below is retained as history; the table above is
+the operative conclusion.
+
+---
+
+## Original Findings (retained for traceability; see revised table above for corrections)
 
 This audit was triggered by the user correctly pointing out that my first pass
 gave one-line verdicts for the non-`tasks/` modules. The deep re-verification

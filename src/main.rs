@@ -13,9 +13,9 @@
 //! ```
 
 #[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
-use echo_agent_cli::cli;
+use echo_agent::config;
 #[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
-use echo_agent_cli::config;
+use echo_agent_cli::cli;
 #[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
 use echo_agent_cli::infra;
 
@@ -404,8 +404,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
+    use echo_agent::config;
     use echo_agent::prelude::*;
-    use echo_agent_cli::config;
 
     #[test]
     fn test_create_agent_config() {

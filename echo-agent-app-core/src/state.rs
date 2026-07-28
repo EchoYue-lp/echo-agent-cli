@@ -336,7 +336,7 @@ impl ConnectionState {
 
 /// 配置状态：应用 / Web / 沙箱 / 权限
 pub struct ConfigState {
-    pub app_config: RwLock<crate::config::AppConfig>,
+    pub app_config: RwLock<echo_agent::config::AppConfig>,
     pub web_config: RwLock<WebConfig>,
     pub sandbox_config: RwLock<SandboxConfigData>,
     pub permission_mode: RwLock<String>,
@@ -451,7 +451,7 @@ impl AppState {
         agent: AgentHandle,
         hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
         conversation_store: Option<Arc<dyn ConversationStore>>,
-        app_config: crate::config::AppConfig,
+        app_config: echo_agent::config::AppConfig,
     ) -> Self {
         let config = agent
             .try_write(|guard| WebConfig {

@@ -63,6 +63,8 @@ evidence, and the next bounded step.
 | Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and formal-plan `subagent_run_id` is `{task_id}:{plan_revision}:{attempt}` |
 | GUI tool execution lazy loading | Complete | `docs/2026-07-25-gui-tool-execution-lazy-loading.md`; framework commit `27bb5a4`; application commit `d8b2211`; selector stability hotfix `b8c9077`; one main/Subagent summary path, opaque `detail_ref`, 64 KiB cursor pages, file/JSONL recovery, and complete Subagent prompt/result views |
 | Runtime DAG kernel convergence and dispatch correctness | Complete | `docs/2026-07-27-runtime-dag-kernel-convergence.md`; one framework DAG loop/validator, atomic revision-safe claims, superseded-attempt rejection, revision-scoped durable results, lossless persisted status detail, and EKO-owned product resource limits |
+| Task tools framework migration (task_create/update/list) | Complete | framework commit `38da658`; application commit `64da422`; `docs/2026-07-28-task-tools-framework-migration-design.md`; deprecated `todo_write` removed; modern revisioned TaskCreate/Update/List model migrated to framework behind `RevisionedTaskStore` trait; EKO's `TaskRuntimeStore` implements the trait and owns product persistence/bootstrap |
+| App-core full migration audit + Iteration 0 dead-code cleanup | Complete | `docs/2026-07-28-app-core-full-audit.md`; deleted `sensitive.rs` (zero callers), `embedded_server.rs` + `server_pid.rs` (self-referential dead pair), and `config.rs` (5-line re-export shim, callers expanded to `echo_agent::config::...`); full audit of ~50 app-core modules confirmed only 3 real framework gaps remain (storage file impls S1/S2/S3); webhook/HITL/config_watcher confirmed as app-layer product policy with local bug-fix iterations, not migrations |
 
 ## Current Decisions
 
@@ -301,7 +303,20 @@ unified: all modes expose
 share the same revisioned TaskRun graph. The framework has replaced
 `todo_write` with per-Agent revisioned task tools, while `TaskPlan` and `TodoItem` remain only
 artifact/UI projections. Do not reintroduce `plan_*` CRUD tools or an
-independent todo store. Next, observe real
+independent todo store.
+
+The app-core full audit (`docs/2026-07-28-app-core-full-audit.md`) reviewed all
+~50 app-core modules against the framework. Verdict: **only 3 real framework
+gaps remain** — the file-backend impls of `RuntimeStateStore` (S1),
+`ConversationStore` restore direction (S2), and `ConversationStore` file impl
+(S3). These will migrate down with bug fixes (corrupt-JSON errors, path-safe
+IDs, unique temp names, parent-dir sync, `Result`-returning restore). Everything
+else stays in the app layer: webhook emitter, HITL dispatcher, and config
+watcher are EKO product policy (delivery semantics, multi-surface arbitration,
+reload scope) with no cross-product unified answer — they get local bug-fix
+iterations, not framework migrations. Iteration 0 dead-code cleanup is complete
+(`sensitive.rs`, `embedded_server.rs`+`server_pid.rs`, `config.rs` shim all
+deleted). Next, observe real
 long-running GUI/TUI/CLI task runs for claim-conflict and revision-conflict,
 safe-point, logical-task worktree reuse, and clean-finalize telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly

@@ -3,8 +3,9 @@
 //! Shared by the dedicated `echo-agent-tauri` binary and by the package-name
 //! binary when Tauri CLI builds the app with `--no-default-features --features gui`.
 
-use crate::{cli, config, config_watcher, infra, state::AppState};
+use crate::{cli, config_watcher, infra, state::AppState};
 use clap::Parser;
+use echo_agent::config;
 use std::sync::Arc;
 
 /// Crash log path — written to when the app panics before Tauri starts.

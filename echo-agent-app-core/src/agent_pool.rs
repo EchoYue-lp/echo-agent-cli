@@ -39,10 +39,10 @@ use echo_agent::agent::CancellationToken;
 use echo_agent::llm::LlmClient;
 use tokio::sync::RwLock;
 
-use crate::config::AppConfig;
 use crate::infra;
 use crate::model_config::ModelRuntimeConfig;
 use crate::workspace::WorkspaceKind;
+use echo_agent::config::AppConfig;
 
 /// Configuration for the agent pool.
 #[derive(Debug, Clone)]

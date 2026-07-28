@@ -15,9 +15,9 @@ use echo_agent::state::RuntimeStateStore;
 use futures::future::BoxFuture;
 
 use crate::agent_handle::AgentHandle;
-use crate::config::AppConfig;
 use crate::model_config;
 use crate::project::prompt::PromptAssembler;
+use echo_agent::config::AppConfig;
 
 /// Default context window size in tokens (396K).
 const DEFAULT_CONTEXT_WINDOW: usize = 396_000;
@@ -1674,8 +1674,8 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
 
 /// 执行基础环境诊断（API Key、配置文件、数据目录等）
 pub fn run_base_doctor() -> DoctorResult {
-    let mut config = crate::config::load_config(None);
-    crate::config::apply_env_overrides(&mut config);
+    let mut config = echo_agent::config::load_config(None);
+    echo_agent::config::apply_env_overrides(&mut config);
     run_base_doctor_for_model(&config.model.get_model_name())
 }
 

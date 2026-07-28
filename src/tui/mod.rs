@@ -1781,7 +1781,7 @@ impl Drop for TerminalGuard {
 #[allow(clippy::too_many_arguments)] // startup entry: agent + services + config + pool + store + review_integration all wired here
 pub async fn run_tui(
     agent: AgentHandle,
-    tui_config: &echo_agent_app_core::config::TuiConfig,
+    tui_config: &echo_agent::config::TuiConfig,
     mode_display: &str,
     tui_pending: std::sync::Arc<
         tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>,
