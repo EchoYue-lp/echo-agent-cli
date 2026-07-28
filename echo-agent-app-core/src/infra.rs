@@ -1128,7 +1128,7 @@ async fn run_dreaming_pass(
 pub fn create_conversation_store() -> Option<Arc<dyn ConversationStore>> {
     let base = echo_agent::paths::user_data_dir();
 
-    match crate::conversation_file::FileConversationStore::new(&base) {
+    match echo_agent::memory::FileConversationStore::new(&base) {
         Ok(store) => {
             tracing::info!(
                 "ConversationStore (file) 初始化: {}/conversations",
@@ -1164,7 +1164,7 @@ pub fn create_runtime_state_store() -> Option<Arc<dyn RuntimeStateStore>> {
 pub fn create_runtime_state_store_in(
     base_dir: impl AsRef<std::path::Path>,
 ) -> Option<Arc<dyn RuntimeStateStore>> {
-    match crate::runtime_state_file::FileRuntimeStateStore::new(&base_dir) {
+    match echo_agent::state::FileRuntimeStateStore::new(&base_dir) {
         Ok(store) => {
             tracing::info!(
                 "RuntimeStateStore (file) 初始化: {}/runtime_state",

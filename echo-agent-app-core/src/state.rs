@@ -894,7 +894,7 @@ impl AppState {
         // 重新初始化 conversation_store 到工作区的存储目录（U1c：文件后端）
         let conv_dir = crate::workspace::layout::WorkspaceLayout::conversations(&workspace.root);
         std::fs::create_dir_all(&conv_dir).ok();
-        match crate::conversation_file::FileConversationStore::new(&conv_dir) {
+        match echo_agent::memory::FileConversationStore::new(&conv_dir) {
             Ok(store) => {
                 let new_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(store);
                 {
@@ -1061,7 +1061,7 @@ impl AppState {
 
         // 重置 conversation_store 到全局默认路径（U1c：文件后端）
         let global_base = crate::persistence::Persistence::base_dir();
-        match crate::conversation_file::FileConversationStore::new(&global_base) {
+        match echo_agent::memory::FileConversationStore::new(&global_base) {
             Ok(store) => {
                 let mut guard = self.storage.conversation_store.write().await;
                 *guard = Some(Arc::new(store));

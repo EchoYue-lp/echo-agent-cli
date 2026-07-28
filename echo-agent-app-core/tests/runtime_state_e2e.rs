@@ -16,9 +16,8 @@ use std::sync::Arc;
 
 use echo_agent::agent::Agent;
 use echo_agent::config::AppConfig;
-use echo_agent::state::RuntimeStateStore;
+use echo_agent::state::{FileRuntimeStateStore, RuntimeStateStore};
 use echo_agent_app_core::infra::{self, AgentCreateParams};
-use echo_agent_app_core::runtime_state_file::FileRuntimeStateStore;
 
 fn make_app_config() -> AppConfig {
     let mut c = AppConfig::default();

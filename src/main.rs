@@ -196,7 +196,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Conversation '{conversation_id}' was not found"))?;
         let stored = store.get_messages(&conversation_id).await?;
-        let messages = echo_agent_app_core::conversation_restore::restore_messages(&stored);
+        let messages = echo_agent::memory::restore_messages(&stored)?;
         let message_count = messages.len();
         agent_handle
             .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))

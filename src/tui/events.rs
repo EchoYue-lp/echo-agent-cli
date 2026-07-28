@@ -1917,7 +1917,13 @@ async fn rewind_last_turn(app: &mut TuiApp, agent: &AgentHandle) -> anyhow::Resu
         .unwrap_or_default();
     stored.truncate(user_index);
     store.save_messages(conversation_id, &stored).await?;
-    let runtime_messages = echo_agent_app_core::conversation_restore::restore_messages(&stored);
+    let runtime_messages = match echo_agent::memory::restore_messages(&stored) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to restore messages; continuing with empty history");
+            Vec::new()
+        }
+    };
     agent
         .read_async(|value| Box::pin(async move { value.load_messages(runtime_messages).await }))
         .await;
@@ -4702,7 +4708,13 @@ async fn resume_conversation(
         .await?
         .ok_or_else(|| anyhow::anyhow!("conversation '{conversation_id}' was not found"))?;
     let stored = store.get_messages(conversation_id).await?;
-    let runtime_messages = echo_agent_app_core::conversation_restore::restore_messages(&stored);
+    let runtime_messages = match echo_agent::memory::restore_messages(&stored) {
+        Ok(msgs) => msgs,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to restore messages; continuing with empty history");
+            Vec::new()
+        }
+    };
     agent
         .write(|value| value.set_conversation_id(conversation_id.to_string()))
         .await;
