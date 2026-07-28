@@ -39,7 +39,7 @@ export function EvolutionPanel() {
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
 
-  // ── Rule proposals state(规则候选:用户审阅 → 采纳才写 AGENTS.md)
+  // ── Rule proposals state(规则候选:用户审阅 → 采纳才写 learned-rules.md)
   const [proposals, setProposals] = useState<RuleProposal[]>([]);
   const [loadingProposals, setLoadingProposals] = useState(false);
   const [promotingKey, setPromotingKey] = useState<string | null>(null);
@@ -104,13 +104,13 @@ export function EvolutionPanel() {
     setLoadingProposals(false);
   };
 
-  // review gate:用户点「采纳」才写 AGENTS.md。采纳后 toast 提示 + 刷新候选 +
+  // review gate:用户点「采纳」才写 learned-rules.md。采纳后 toast 提示 + 刷新候选 +
   // 刷新 dashboard(晋升会改 memory 状态 + 写变更日志)。
   const handlePromote = async (memoryKey: string) => {
     setPromotingKey(memoryKey);
     try {
       await evolutionApi.promoteRule(memoryKey);
-      addToast('success', `已采纳规则并写入 AGENTS.md`);
+      addToast('success', `已采纳规则并写入 learned-rules.md`);
       await Promise.all([loadProposals(), loadDashboard()]);
     } catch (e) {
       addToast('error', `采纳失败: ${e instanceof Error ? e.message : '未知错误'}`);
@@ -666,7 +666,7 @@ export function EvolutionPanel() {
         </div>
 
         <p className="text-xs mb-3" style={{ color: 'var(--text-secondary)' }}>
-          高置信记忆可晋升为 AGENTS.md 永久规则。采纳才会写入,agent 不会自动改规则。
+          高置信记忆可晋升为 learned-rules.md 永久规则。采纳才会写入,agent 不会自动改规则。
         </p>
 
         {proposals.length > 0 ? (

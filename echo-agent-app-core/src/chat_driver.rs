@@ -344,6 +344,11 @@ async fn drive_chat_inner(
     // the agent read guard.
     let interaction_mode = res.interaction_mode;
     let conversation_id = res.conv_id.clone();
+    // Recompute the formal run_id (deterministic function of turn_id) so it can
+    // be propagated into ToolContext.run_id below — making ToolContext the
+    // authoritative, cross-spawn-safe source for task tools instead of forcing
+    // them to fall back to the task_local scoped by `drive_chat`.
+    let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
     // Scope the chat resources into a task_local so tools the agent calls
     // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
     // can reach pool/store/sink via `current_chat_resources()`.
@@ -364,7 +369,7 @@ async fn drive_chat_inner(
         // running inside the framework's spawned tool executor.
         let event_identity = EventIdentity {
             conversation_id: conversation_id.clone(),
-            run_id: None,
+            run_id: Some(formal_run_id.clone()),
             turn_id: turn_id.clone(),
             execution_id: None,
             parent_event_id: None,
@@ -373,7 +378,11 @@ async fn drive_chat_inner(
             history: None,
             runtime: Some(echo_core::tools::ExternalRunContext {
                 conversation_id,
-                run_id: None,
+                // Propagate the formal run_id so tools read it from ToolContext
+                // (cross-spawn-safe) instead of falling back to the task_local
+                // scoped at drive_chat:151. Background runs still re-scope via
+                // executor.rs with the value-carried TaskExecutionContext.run_id.
+                run_id: Some(formal_run_id.clone()),
                 turn_id: Some(turn_id.clone()),
                 execution_id: None,
                 isolation_id: None,
@@ -615,12 +624,19 @@ mod tests {
                 .iter()
                 .filter(|event| event.payload.is_terminal())
                 .count();
+            // The chat path now propagates the formal run_id (derived from the
+            // turn id) into every event so task tools can read it from
+            // `ToolContext` instead of relying on a task_local fallback. The
+            // run_id is a stable identifier; it does NOT imply a TaskRun record
+            // was created — see the caller's `store.get_run(...).is_none()` check.
+            let expected_run_id =
+                crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
             events.iter().enumerate().all(|(index, event)| {
                 event.schema_version == echo_agent::agent::AGENT_EVENT_SCHEMA_VERSION
                     && event.sequence == (index as u64).saturating_add(1)
                     && event.conversation_id.as_deref() == Some(conversation_id)
                     && event.turn_id == turn_id
-                    && event.run_id.is_none()
+                    && event.run_id.as_deref() == Some(expected_run_id.as_str())
                     && !event.event_id.is_empty()
             }) && terminal_count == 1
         }

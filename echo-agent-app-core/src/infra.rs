@@ -1791,17 +1791,29 @@ pub fn run_base_doctor_for_model_with_connectivity(
     }
 
     if let Some(root) = crate::project::context::discover_project_root(None) {
-        let ctx = crate::project::context::load_project_context(&root);
-        if ctx.instructions.is_empty() {
-            checks.push("ℹ️  项目目录已检测到, 但未找到指令文件 (AGENTS.md 等)".to_string());
+        // Instruction files are loaded by InstructionProvider (the single
+        // authority); ProjectContext now carries only structural context.
+        let provider = crate::instruction_provider::InstructionProvider::load_for(Some(&root));
+        let count = [
+            provider.user_level.as_ref(),
+            provider.project_level.as_ref(),
+            provider.agents_level.as_ref(),
+            provider.local_level.as_ref(),
+            provider.hot_memory.as_ref(),
+        ]
+        .iter()
+        .filter(|opt| opt.is_some())
+        .count();
+        if count == 0 {
+            checks.push(
+                "ℹ️  项目目录已检测到, 但未找到指令文件 (user.md / project.md / learned-rules.md 等)"
+                    .to_string(),
+            );
         } else {
-            checks.push(format!(
-                "✅ 项目指令: {} 个文件已加载",
-                ctx.instructions.len()
-            ));
+            checks.push(format!("✅ 项目指令: {count} 个文件已加载"));
         }
     } else {
-        checks.push("ℹ️  未检测到项目目录 (可在项目根目录创建 AGENTS.md)".to_string());
+        checks.push("ℹ️  未检测到项目目录 (可在项目根目录创建 .eko/project.md)".to_string());
     }
 
     DoctorResult { issues, checks }

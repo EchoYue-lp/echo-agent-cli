@@ -1,15 +1,6 @@
 use std::path::{Path, PathBuf};
-use tracing;
 
 use super::gitignore::GitIgnore;
-
-const PROJECT_CONTEXT_FILES: &[&str] = &[
-    // Cross-tool community standard (Codex / Aider / Cursor partial).
-    "AGENTS.md",
-    // echo-agent's own private namespace, for users who want instructions
-    // that apply only to this product and not to other AI tools.
-    "ECHO_AGENT.md",
-];
 
 const PROJECT_DIR_MARKERS: &[&str] = &[
     ".git",
@@ -23,20 +14,22 @@ const PROJECT_DIR_MARKERS: &[&str] = &[
     "Makefile",
 ];
 
+/// Structural project context: directory tree + git state + ignore rules.
+///
+/// Instruction/rules content is NOT loaded here — that responsibility belongs
+/// solely to [`crate::instruction_provider::InstructionProvider`] (which
+/// produces the `eko:instruction-context` projection). Earlier versions read
+/// `AGENTS.md` / `ECHO_AGENT.md` / `~/.eko/instructions.md` here too, which
+/// duplicated `InstructionProvider` and split one logical instruction stream
+/// across two projections. Those reads and the `instructions` field were
+/// removed; the legacy file names are no longer consulted anywhere.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
     pub root: PathBuf,
     pub name: String,
-    pub instructions: Vec<LoadedInstruction>,
     pub file_tree_summary: String,
     /// Parsed .gitignore rules (empty if no .gitignore exists).
     pub gitignore: GitIgnore,
-}
-
-#[derive(Debug, Clone)]
-pub struct LoadedInstruction {
-    pub source: String,
-    pub content: String,
 }
 
 pub fn discover_project_root(start: Option<&Path>) -> Option<PathBuf> {
@@ -65,67 +58,12 @@ pub fn load_project_context(project_root: &Path) -> ProjectContext {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let mut instructions = Vec::new();
-
-    for filename in PROJECT_CONTEXT_FILES {
-        let path = project_root.join(filename);
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    if !content.trim().is_empty() {
-                        tracing::info!("加载项目指令: {}", path.display());
-                        instructions.push(LoadedInstruction {
-                            source: filename.to_string(),
-                            content,
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!("无法读取 {}: {}", path.display(), e);
-                }
-            }
-        }
-    }
-
-    let data_root = echo_agent::paths::user_data_dir();
-    let home_instructions = [
-        data_root.join("AGENTS.md"),
-        data_root.join("instructions.md"),
-    ];
-    for path in &home_instructions {
-        if path.exists() {
-            match std::fs::read_to_string(path) {
-                Ok(content) => {
-                    if !content.trim().is_empty() {
-                        tracing::info!("加载全局指令: {}", path.display());
-                        let source_name = path
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| path.display().to_string());
-                        instructions.push(LoadedInstruction {
-                            source: format!("~/.eko/{source_name}"),
-                            content,
-                        });
-                    }
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to read global instruction file"
-                    );
-                }
-            }
-        }
-    }
-
     let file_tree_summary = generate_file_tree_summary(project_root);
     let gitignore = GitIgnore::load(project_root);
 
     ProjectContext {
         root: project_root.to_path_buf(),
         name,
-        instructions,
         file_tree_summary,
         gitignore,
     }
@@ -148,18 +86,12 @@ impl ProjectContext {
     }
 }
 
+/// Build a system prompt from a base prompt plus structural project context.
+///
+/// Instruction/rules content is injected separately via the
+/// `eko:instruction-context` projection (see [`crate::unified_memory`]).
 pub fn build_system_prompt_with_context(base_prompt: &str, context: &ProjectContext) -> String {
     let mut prompt = base_prompt.to_string();
-
-    if !context.instructions.is_empty() {
-        prompt.push_str("\n\n## Project Instructions\n\n");
-        for inst in &context.instructions {
-            prompt.push_str(&format!(
-                "### From: {}\n\n{}\n\n",
-                inst.source, inst.content
-            ));
-        }
-    }
 
     if !context.file_tree_summary.is_empty() {
         prompt.push_str(&format!(

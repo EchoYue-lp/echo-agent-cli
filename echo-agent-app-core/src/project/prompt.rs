@@ -273,21 +273,9 @@ impl PromptAssembler {
     }
 
     fn add_project_context(&mut self, ctx: &ProjectContext) {
-        // P5: Project rules (high priority but can be truncated)
-        if !ctx.instructions.is_empty() {
-            let rules: String = ctx
-                .instructions
-                .iter()
-                .map(|i| format!("### From: {}\n\n{}\n", i.source, i.content))
-                .collect();
-            self.add_module(PromptModule {
-                name: "project_rules".into(),
-                content: format!("## Project Instructions\n\n{rules}"),
-                priority: 5,
-                token_budget: (self.total_budget / 10).min(6_000),
-                required: false,
-            });
-        }
+        // Note: instruction/rules content is injected separately via the
+        // `eko:instruction-context` projection (see `unified_memory`).
+        // ProjectContext now carries only structural context (tree + git).
 
         // P6: Project structure
         if !ctx.file_tree_summary.is_empty() {

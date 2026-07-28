@@ -119,9 +119,24 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         };
         root.map(|r| crate::project::context::load_project_context(&r))
     };
+    // Instruction files are owned by InstructionProvider (single authority).
     let instructions_count = project_ctx
         .as_ref()
-        .map(|c| c.instructions.len())
+        .map(|c| {
+            let provider = echo_agent_app_core::instruction_provider::InstructionProvider::load_for(
+                Some(&c.root),
+            );
+            [
+                provider.user_level.as_ref(),
+                provider.project_level.as_ref(),
+                provider.agents_level.as_ref(),
+                provider.local_level.as_ref(),
+                provider.hot_memory.as_ref(),
+            ]
+            .iter()
+            .filter(|opt| opt.is_some())
+            .count()
+        })
         .unwrap_or(0);
     let project_display = project_ctx
         .as_ref()

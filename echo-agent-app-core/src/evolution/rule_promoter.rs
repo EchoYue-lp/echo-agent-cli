@@ -1,7 +1,7 @@
 //! Rule promotion — promotes high-confidence memories to agent rules.
 //!
 //! RulePromoter scans typed memories for high-confidence entries that meet
-//! promotion criteria and writes them to AGENTS.md as permanent rules.
+//! promotion criteria and writes them to learned-rules.md as permanent rules.
 
 use crate::instruction_provider::InstructionProvider;
 use chrono::{DateTime, Utc};
@@ -46,7 +46,7 @@ pub struct RuleProposal {
     pub memory_key: String,
     /// Namespace where the memory is stored.
     pub namespace: Vec<String>,
-    /// The rule text to add to AGENTS.md.
+    /// The rule text to add to learned-rules.md.
     pub rule_text: String,
     /// Confidence score of the source memory.
     pub confidence: f32,
@@ -59,7 +59,7 @@ pub struct RuleProposal {
     pub reason: String,
 }
 
-/// Promotes high-confidence memories to agent rules in AGENTS.md.
+/// Promotes high-confidence memories to agent rules in learned-rules.md.
 pub struct RulePromoter {
     store: Arc<dyn Store>,
     security_guard: EvolutionSecurityGuard,
@@ -159,7 +159,7 @@ impl RulePromoter {
         proposals
     }
 
-    /// Format a memory entry as a rule text for AGENTS.md.
+    /// Format a memory entry as a rule text for learned-rules.md.
     fn format_rule_text(&self, entry: &TypedMemoryEntry) -> String {
         let prefix = match entry.meta.memory_type {
             MemoryType::ProjectFact => "Project fact",
@@ -172,7 +172,7 @@ impl RulePromoter {
         format!("- **{}**: {}", prefix, entry.content)
     }
 
-    /// Promote a rule by appending it to AGENTS.md.
+    /// Promote a rule by appending it to learned-rules.md.
     ///
     /// Returns Ok(()) if successful, Err if security check fails or file write fails.
     pub async fn promote_rule(
@@ -192,7 +192,8 @@ impl RulePromoter {
             ));
         }
 
-        // Load existing AGENTS.md content
+        // Load existing learned-rules content (formerly AGENTS.md; renamed by
+        // InstructionProvider::load_for on first load after upgrade).
         let existing_content =
             std::fs::read_to_string(InstructionProvider::agents_instructions_path())
                 .unwrap_or_else(|_| String::new());
@@ -216,9 +217,9 @@ impl RulePromoter {
             }
         };
 
-        // Write to AGENTS.md
+        // Write to learned-rules.md (auto-promoted rules; user-editable).
         InstructionProvider::save_agents_instructions(&new_content)
-            .map_err(|e| format!("Failed to write AGENTS.md: {}", e))?;
+            .map_err(|e| format!("Failed to write learned-rules.md: {}", e))?;
 
         // Mark memory as promoted by updating its content
         let typed_store = TypedMemoryStore::new(self.store.clone());
@@ -252,7 +253,7 @@ impl RulePromoter {
         let change_entry =
             ChangeEntryBuilder::new(EntityType::Memory, &proposal.memory_key, ChangeType::Update)
                 .reason(format!(
-                    "Promoted memory {} to rule in AGENTS.md",
+                    "Promoted memory {} to rule in learned-rules.md",
                     proposal.memory_key
                 ))
                 .before(serde_json::json!({"status": "active"}))
@@ -277,7 +278,7 @@ mod tests {
     //! 回归测试:RulePromoter 必须扫描 WARM_NAMESPACE(`["agent","memories"]`),
     //! 与 MemoryLayerManager::write_memory / MemoryRecaller / Dreaming 同源。
     /// 此前 scan_for_proposals 硬编码 ["agent","typed_memories"](无生产写入的死
-    /// namespace),导致晋升永远命中空集——"记忆 → AGENTS.md 规则"链路完全断开。
+    /// namespace),导致晋升永远命中空集——"记忆 → learned-rules.md 规则"链路完全断开。
     use super::*;
     use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource};
 
