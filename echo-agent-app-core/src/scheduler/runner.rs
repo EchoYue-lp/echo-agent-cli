@@ -79,10 +79,10 @@ pub fn build_fire_fn(
             // run-scoped key means each cron run gets its OWN agent (never
             // reused), so the worktree working_dir binding in
             // drive_unattended_run is per-run and can't be clobbered by an
-            // overlapping run. Pooled agents don't get ExecuteTaskTool at
-            // construction (built for subagents, §10.2), so register it here —
-            // a cron run's agent plays the primary role (drives task_create +
-            // task_execute), not a subagent role.
+            // overlapping run. A cron run's pool agent plays the primary role
+            // (drives task_create + task_execute), not a formal Subagent role.
+            // The fallback registration only covers standalone pools that do
+            // not already expose the shared conversation-aware tool.
             let run_agent: AgentHandle = match &pool {
                 Some(pool) => {
                     let run_key = format!("__cron__:{}:{fire_id}", task.id);
@@ -130,11 +130,16 @@ pub fn build_fire_fn(
 }
 
 /// Register the `task_execute` tool on a cron run's pool-acquired agent
-/// (Phase C). Mirrors `desktop.rs`'s primary-agent registration. Pooled agents
-/// are built without it (subagent stance, §10.2), but a cron run's agent drives
-/// task_create + task_execute and needs it.
+/// (Phase C). The normal shared pool registry already contains a
+/// conversation-aware tool; this fills the gap for standalone runners.
 async fn register_task_execute_on_agent(agent_handle: &AgentHandle, store: Arc<TaskRuntimeStore>) {
     use crate::tasks::task_runtime::ExecuteTaskTool;
+    if agent_handle
+        .read(|agent| agent.tool_names().iter().any(|name| name == "task_execute"))
+        .await
+    {
+        return;
+    }
     let tool = ExecuteTaskTool::new(store, agent_handle.clone());
     let added = agent_handle
         .write(|agent| {

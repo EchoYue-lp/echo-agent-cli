@@ -459,10 +459,10 @@ export function todoStatusDescription(
     return `${executionLabel} · 任务失败`;
   }
   if (execution.status === 'completed' && status === 'completed') {
-    return '执行与验收已完成';
+    return '执行与任务提交已完成';
   }
   if (execution.status === 'completed' && status === 'running') {
-    return `${executionLabel} · 验收中`;
+    return `${executionLabel} · 等待状态落盘`;
   }
   if (execution.status === 'running' && status === 'running') {
     return executionLabel;
@@ -646,7 +646,7 @@ export function TaskRuntimePanel() {
               任务列表{plan ? ` · r${plan.revision}` : ''}
             </span>
             <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-              执行 {executionCompletedCount}/{todos.length} · 验收 {completedCount}/{todos.length}
+              执行 {executionCompletedCount}/{todos.length} · 完成 {completedCount}/{todos.length}
             </span>
           </div>
           <div className="space-y-0.5">

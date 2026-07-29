@@ -60,7 +60,9 @@ pub use planner::{
     FileOverlapPair, OwnershipReport, analyze_file_ownership, has_writer_file_overlap,
 };
 pub use profiles::ProfileTemplate;
-pub use register::{register_task_tools_on_agent, task_revision_service_for_agent};
+pub use register::{
+    bind_task_execute_to_pool, register_task_tools_on_agent, task_revision_service_for_agent,
+};
 pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
     review_task,

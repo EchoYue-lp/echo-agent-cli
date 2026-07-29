@@ -23,7 +23,7 @@
 //!
 //! ```rust,ignore
 //! // After bootstrap:
-//! let pool = AgentPool::from_runtime(&runtime, PoolConfig::default()).await;
+//! let pool = AgentPool::from_runtime(&runtime, PoolConfig::default(), None).await;
 //!
 //! // Acquire an agent for a conversation:
 //! let agent = pool.acquire("conv-001").await?;
@@ -212,22 +212,15 @@ pub struct AgentPool {
 }
 
 impl AgentPool {
-    /// Inject the TaskRuntimeStore so subsequently-created pool agents get
-    /// the task-management tools (task_create/task_update/task_list)
-    /// registered. Must be called before any pool agent is created (i.e. right
-    /// after AppState builds the store). Existing pool agents are unaffected.
-    pub fn set_task_runtime_store(
-        &mut self,
-        store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
-    ) {
-        self.shared.task_runtime_store = Some(store);
-    }
-
     /// Create a pool from an already-bootstrapped `AgentRuntime`.
     ///
     /// Extracts shared resources from the runtime's primary agent and
     /// optionally pre-creates a background task agent.
-    pub async fn from_runtime(runtime: &crate::runtime::AgentRuntime, config: PoolConfig) -> Self {
+    pub async fn from_runtime(
+        runtime: &crate::runtime::AgentRuntime,
+        config: PoolConfig,
+        task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    ) -> Self {
         let shared = SharedResources::extract_from(
             &runtime.agent_handle,
             runtime.review_integration.clone(),
@@ -235,6 +228,7 @@ impl AgentPool {
         .await;
         let mut shared = shared;
         shared.browser_runtime = Some(runtime.browser_runtime.clone());
+        shared.task_runtime_store = task_runtime_store;
 
         // Extract skill descriptors from primary agent (avoids re-reading from disk)
         let skill_descriptors = runtime.agent_handle.read(|a| a.skill_descriptors()).await;
@@ -839,8 +833,8 @@ impl AgentPool {
             working_dir,
             // Thread the TaskRuntimeStore so pooled agents get task-management
             // tools registered (matches the primary agent wiring).
-            // route is intentionally None for pooled agents (subagents never get
-            // task_execute per §10.2).
+            // Formal Subagents created by TaskRuntime still have task_execute
+            // disabled by invocation policy; pool conversation agents may drive it.
             task_runtime_store: self.shared.task_runtime_store.clone(),
             browser_runtime: self.shared.browser_runtime.clone(),
         };
@@ -943,9 +937,9 @@ impl AgentPool {
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 
-        // subagent 不注册 agent_tool 或 task_execute——§10.2 防止递归派发;
-        // 因此 subagent 本身没有继续派发工具,
-        // 需要子任务时自己用文件工具完成。)
+        // TaskRuntime's formal Subagents are created by the framework registry,
+        // not by this conversation pool. Their invocation policy continues to
+        // disable task_execute so nested dispatch cannot recurse into L2.
 
         // 5. Configure HITL for this agent.
         // Use an empty HitlDispatcher (no REPL provider!) so that if the caller
@@ -1112,6 +1106,33 @@ mod tests {
         let pool = create_test_pool(5, false).await?;
         let _h = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
         assert!(pool.get("conv-1").await.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_execute_resolves_the_current_conversation_agent() -> TestResult {
+        let pool = Arc::new(create_test_pool(5, false).await?);
+        let pooled = pool
+            .acquire("conv-1")
+            .await
+            .map_err(|error| error.to_string())?;
+        let fallback = create_test_agent_handle()?;
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let tool = crate::tasks::task_runtime::ExecuteTaskTool::new(store, fallback.clone())
+            .with_agent_pool(Arc::downgrade(&pool));
+
+        let resolved = tool
+            .execution_agent_for_test(Some("conv-1".to_string()))
+            .await;
+        assert!(Arc::ptr_eq(resolved.inner(), pooled.inner()));
+
+        let unresolved = tool
+            .execution_agent_for_test(Some("missing".to_string()))
+            .await;
+        assert!(Arc::ptr_eq(unresolved.inner(), fallback.inner()));
         Ok(())
     }
 

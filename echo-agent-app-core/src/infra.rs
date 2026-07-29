@@ -40,14 +40,17 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
 
 /// Product-owned storage policy for complete oversized tool output.
 ///
-/// Artifacts use one stable global root so worktree/workspace removal cannot
-/// invalidate a running session's complete logs. Conversation deletion removes
-/// its scope immediately, while the 30-day max age prevents abandoned scopes
-/// from growing without bound.
+/// Workspace conversations keep their logs beside the rest of the workspace
+/// state so file tools can recover the complete output within their normal
+/// readable scope. Global conversations fall back to EKO's user-data root.
+/// Conversation deletion removes its scope, while the 30-day max age prevents
+/// abandoned scopes from growing without bound.
 pub fn tool_output_artifact_config(
-    _working_dir: Option<&std::path::Path>,
+    working_dir: Option<&std::path::Path>,
 ) -> echo_agent::tools::artifact::ToolOutputArtifactConfig {
-    let root_dir = echo_agent::paths::user_data_path("artifacts").join("tool-logs");
+    let root_dir = working_dir
+        .map(|root| crate::workspace::layout::WorkspaceLayout::artifacts(root).join("tool-logs"))
+        .unwrap_or_else(|| echo_agent::paths::user_data_path("artifacts").join("tool-logs"));
     echo_agent::tools::artifact::ToolOutputArtifactConfig::new(root_dir, "conversation_or_30d")
         .threshold_bytes(TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES)
         .max_age_secs(Some(TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS))
@@ -1938,6 +1941,7 @@ mod resolve_subagent_model_tests {
     use super::{
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, build_writer_subagent_agent,
         configure_run_code_capability, resolve_subagent_model, resolved_max_tool_output_tokens,
+        tool_output_artifact_config,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::sandbox::SandboxManager;
@@ -1955,6 +1959,21 @@ mod resolve_subagent_model_tests {
             DEFAULT_MAX_TOOL_OUTPUT_TOKENS
         );
         assert_eq!(resolved_max_tool_output_tokens(4_000), 4_000);
+    }
+
+    #[test]
+    fn workspace_tool_output_artifacts_stay_inside_workspace_state() -> anyhow::Result<()> {
+        let workspace = tempfile::tempdir()?;
+        let config = tool_output_artifact_config(Some(workspace.path()));
+
+        assert_eq!(
+            config.root_dir,
+            workspace.path().join(".eko/artifacts/tool-logs")
+        );
+        assert!(config.root_dir.starts_with(workspace.path()));
+        assert_eq!(config.threshold_bytes, 32 * 1024);
+        assert_eq!(config.max_age_secs, Some(30 * 24 * 60 * 60));
+        Ok(())
     }
 
     #[test]

@@ -177,15 +177,21 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         .await;
     }
     let pool = {
-        let mut pool = echo_agent_app_core::agent_pool::AgentPool::from_runtime(
+        let pool = echo_agent_app_core::agent_pool::AgentPool::from_runtime(
             &runtime,
             echo_agent_app_core::agent_pool::PoolConfig::default(),
+            task_runtime_store.clone(),
         )
         .await;
-        if let Some(store) = task_runtime_store.clone() {
-            pool.set_task_runtime_store(store);
-        }
         let pool = std::sync::Arc::new(pool);
+        if let Some(store) = task_runtime_store.clone() {
+            echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
+                &agent_handle,
+                store,
+                &pool,
+            )
+            .await;
+        }
         pool.spawn_cleanup_monitor().await;
         pool
     };

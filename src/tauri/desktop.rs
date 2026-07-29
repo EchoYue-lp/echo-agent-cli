@@ -183,18 +183,6 @@ async fn run_desktop() -> anyhow::Result<()> {
     let conversation_store = infra::create_conversation_store();
     infra::inject_conversation_store(&agent_handle, &conversation_store);
 
-    // ── Initialize agent pool for multi-conversation parallel execution ──
-    // init_pool() also starts the cleanup monitor automatically.
-    // `mut`: we may inject the TaskRuntimeStore via Arc::get_mut before handing
-    // the pool to AppState.
-    let mut pool = runtime
-        .init_pool(echo_agent_app_core::agent_pool::PoolConfig::default())
-        .await;
-    tracing::info!(
-        pool_size = pool.pool_size().await,
-        "AgentPool initialized for GUI (cleanup monitor started)"
-    );
-
     let mut state_inner = AppState::from_shared(
         agent_handle.clone(),
         runtime.hitl_dispatcher.clone(),
@@ -205,24 +193,36 @@ async fn run_desktop() -> anyhow::Result<()> {
     .with_prompt_assembly(runtime.prompt_assembly.clone());
     state_inner.webhook.emitter = webhook_emitter;
 
-    // Inject the TaskRuntimeStore into the pool so pooled agents get the
-    // task-management tools, and register those tools on the primary agent
-    // too (the primary agent also runs tasks). Done here because the store is
-    // created inside AppState::from_shared above, after the pool was built.
+    // Build task tools before the pool extracts the shared ToolManager, and
+    // pass the store into pool construction before its background agent exists.
     if let Some(task_store) = state_inner.tasks.runtime.clone() {
-        // pool is still a unique Arc here (not yet handed to set_pool), so
-        // get_mut succeeds and lets us inject the store into SharedResources.
-        if let Some(pool_mut) = std::sync::Arc::get_mut(&mut pool) {
-            pool_mut.set_task_runtime_store(task_store.clone());
-        } else {
-            tracing::warn!("Could not inject TaskRuntimeStore into pool (Arc not unique)");
-        }
         echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
             &agent_handle,
             task_store,
         )
         .await;
     }
+
+    // ── Initialize agent pool for multi-conversation parallel execution ──
+    // init_pool() also starts the cleanup monitor automatically.
+    let pool = runtime
+        .init_pool(
+            echo_agent_app_core::agent_pool::PoolConfig::default(),
+            state_inner.tasks.runtime.clone(),
+        )
+        .await;
+    if let Some(task_store) = state_inner.tasks.runtime.clone() {
+        echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
+            &agent_handle,
+            task_store,
+            &pool,
+        )
+        .await;
+    }
+    tracing::info!(
+        pool_size = pool.pool_size().await,
+        "AgentPool initialized for GUI (cleanup monitor started)"
+    );
 
     state_inner.set_pool(pool);
 

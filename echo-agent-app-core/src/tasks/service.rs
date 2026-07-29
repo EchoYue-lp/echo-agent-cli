@@ -848,6 +848,12 @@ fn finish_running_failure(store: &TaskRuntimeStore, run_id: &str, error: &str) {
 }
 
 async fn register_task_execute(agent: &AgentHandle, store: Arc<TaskRuntimeStore>) {
+    if agent
+        .read(|inner| inner.tool_names().iter().any(|name| name == "task_execute"))
+        .await
+    {
+        return;
+    }
     let tool = ExecuteTaskTool::new(store, agent.clone());
     agent
         .write(|agent| {

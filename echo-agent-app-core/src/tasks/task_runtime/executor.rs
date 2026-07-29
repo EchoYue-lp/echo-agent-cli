@@ -483,21 +483,7 @@ pub async fn execute_run(
                     serde_json::json!({ "status": "cancelled" }),
                 ),
             );
-            if let Ok(todos) = store.list_todos(run_id) {
-                for todo in todos
-                    .into_iter()
-                    .filter(|todo| todo.status == TodoStatus::Running)
-                {
-                    let _ = store.set_task_status(
-                        run_id,
-                        &todo.task_id,
-                        TodoStatus::Skipped,
-                        None,
-                        Some("cancelled with parent run"),
-                    );
-                }
-            }
-            let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
+            finalize_cancelled_run_state(&store, run_id);
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -630,6 +616,26 @@ fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String
         _ => {}
     }
     blockers
+}
+
+fn finalize_cancelled_run_state(store: &TaskRuntimeStore, run_id: &str) {
+    if let Ok(todos) = store.list_todos(run_id) {
+        for todo in todos.into_iter().filter(|todo| {
+            matches!(
+                todo.status,
+                TodoStatus::Pending | TodoStatus::Running | TodoStatus::Blocked
+            )
+        }) {
+            let _ = store.set_task_status(
+                run_id,
+                &todo.task_id,
+                TodoStatus::Skipped,
+                None,
+                Some("cancelled with parent run"),
+            );
+        }
+    }
+    let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
 }
 
 /// Structured completion assessment. Separates "real execution failure"
@@ -1236,6 +1242,18 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             Ok(dispatched) => dispatched,
             Err(error) => {
                 let message = error.to_string();
+                if self.cancel.is_cancelled() {
+                    if !self.set_claimed_status(
+                        run_id,
+                        &task,
+                        &claim,
+                        TodoStatus::Skipped,
+                        Some("cancelled with parent run"),
+                    )? {
+                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                    }
+                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Cancelled);
+                }
                 if !self.set_claimed_status(
                     run_id,
                     &task,
@@ -2283,7 +2301,7 @@ async fn execute_task(
                 suggested_tasks: Vec::new(),
                 created_at: chrono::Utc::now(),
             }) {
-                tracing::warn!(task_id = %task_id, %error, "failed to persist failed TaskExecutionSummary");
+                tracing::warn!(task_id = %task_id, %error, "failed to persist terminal TaskExecutionSummary");
             }
             if let Err(error) = store.record_subagent_released(
                 &run_id,
@@ -2300,13 +2318,22 @@ async fn execute_task(
                     "failed to persist Subagent terminal boundary"
                 );
             }
-            tracing::warn!(
-                run_id = %run_id,
-                task_id = %task_id,
-                agent_role = %task.agent_role,
-                error = %e,
-                "task_runtime: task failed"
-            );
+            if cancelled {
+                tracing::info!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    agent_role = %task.agent_role,
+                    "task_runtime: task cancelled"
+                );
+            } else {
+                tracing::warn!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    agent_role = %task.agent_role,
+                    error = %e,
+                    "task_runtime: task failed"
+                );
+            }
             let terminal_payload = serde_json::json!({
                 "execution_id": &execution_id,
                 "error": &e,
@@ -2318,12 +2345,17 @@ async fn execute_task(
                 "remaining_work": &task_result.remaining_work,
                 "touched_files": &task_result.touched_files,
             });
+            let task_terminal_event = if cancelled {
+                "task_cancelled"
+            } else {
+                "task_failed"
+            };
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::task(
                     run_id.clone(),
                     task_id.clone(),
-                    "task_failed",
+                    task_terminal_event,
                     terminal_payload.clone(),
                 )
                 .with_agent(task.agent_role.clone()),
@@ -4672,7 +4704,12 @@ Read the runtime path and found one missing branch.
             let task_id = task.id.clone();
             Box::pin(async move {
                 if delay_ms > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    tokio::select! {
+                        _ = context.cancel.cancelled() => {
+                            return Err((task_id, "cancelled".into()));
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                    }
                 }
                 // Honor cancellation even in the mock.
                 if context.cancel.is_cancelled() {
@@ -5133,6 +5170,90 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?;
         let todo = todos.first().ok_or_else(|| "todo a missing".to_string())?;
         assert_eq!(todo.status, TodoStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_preserves_completed_tasks_and_finalizes_the_run() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tasks = (0..8)
+            .map(|index| solo_readonly_task(&format!("task-{index}")))
+            .collect::<Vec<_>>();
+        let run_id = seed_run(&store, tasks.clone())?;
+        let dispatcher = ScriptedDispatcher::new();
+        for task in tasks.iter().take(4) {
+            dispatcher.succeed(&task.id, "completed before cancellation");
+            dispatcher.delay(&task.id, 10);
+        }
+        for task in tasks.iter().skip(4) {
+            dispatcher.succeed(&task.id, "should be cancelled");
+            dispatcher.delay(&task.id, 5_000);
+        }
+        let cancel = CancellationToken::new();
+        let run_cancel = cancel.clone();
+        let run_store = store.clone();
+        let run_dispatcher = dispatcher.clone();
+        let run_id_for_task = run_id.clone();
+        let execution = tokio::spawn(async move {
+            execute_runtime_plan(
+                run_store,
+                run_dispatcher,
+                None,
+                &run_id_for_task,
+                EkoExecutionLimits {
+                    max_concurrent_subagents: 8,
+                    ..EkoExecutionLimits::default()
+                },
+                run_cancel,
+                None,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if dispatcher.order().len() == 8 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "all tasks were not dispatched".to_string())?;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        cancel.cancel();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+            .await
+            .map_err(|_| "runtime cancellation timed out".to_string())?
+            .map_err(|error| format!("runtime task failed to join: {error}"))?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(outcome, RunOutcome::Cancelled));
+
+        finalize_cancelled_run_state(&store, &run_id);
+        let todos = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            todos
+                .iter()
+                .filter(|todo| todo.status == TodoStatus::Completed)
+                .count(),
+            4
+        );
+        assert_eq!(
+            todos
+                .iter()
+                .filter(|todo| todo.status == TodoStatus::Skipped)
+                .count(),
+            4
+        );
+        assert!(todos.iter().all(|todo| todo.status != TodoStatus::Running));
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "cancelled run missing".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Cancelled);
         Ok(())
     }
 

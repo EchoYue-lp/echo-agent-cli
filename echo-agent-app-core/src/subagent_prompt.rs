@@ -7,6 +7,7 @@ use echo_agent::agent::subagent::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::project::prompt::TOOL_DISCOVERY_POLICY;
 use crate::tasks::task_runtime::planner::{FileOwnership, file_ownership};
 use crate::tasks::task_runtime::profiles::ProfileTemplate;
 use crate::tasks::task_runtime::types::PlanTask;
@@ -171,6 +172,7 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
         let mut diagnostics = PromptDiagnostics::default();
         diagnostics.record("role", "subagent_definition.markdown");
         diagnostics.record("common-rules", "eko.common_policy");
+        diagnostics.record("tool-discovery", "eko.tool_discovery_policy");
         diagnostics.record("capability", "subagent_definition.frontmatter");
         diagnostics.record("suggested-tasks", "eko.optional_follow_up_policy");
         diagnostics.record("language", "eko.language_policy");
@@ -196,6 +198,7 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
             system_prompt: [
                 input.role_prompt.trim().to_string(),
                 COMMON_ORCHESTRATION_POLICY.to_string(),
+                TOOL_DISCOVERY_POLICY.to_string(),
                 capabilities,
                 SUGGESTED_TASKS_POLICY.to_string(),
                 SUBAGENT_LANGUAGE_POLICY.to_string(),
@@ -429,9 +432,17 @@ mod tests {
                 isolation,
             });
             assert_eq!(compiled.diagnostics.count("role"), 1);
+            assert_eq!(compiled.diagnostics.count("tool-discovery"), 1);
             assert_eq!(compiled.diagnostics.count("language"), 1);
             assert_eq!(compiled.diagnostics.count("result-quality"), 1);
             assert_eq!(compiled.diagnostics.count("contract"), 1);
+            assert_eq!(
+                compiled
+                    .system_prompt
+                    .matches("## Efficient Code Discovery")
+                    .count(),
+                1
+            );
         }
     }
 

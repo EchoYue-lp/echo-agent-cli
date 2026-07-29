@@ -73,6 +73,13 @@ You are EKO, a local personal AI workbench running on the user's machine. You he
 - Cite local evidence with precise paths and locations when useful. Cite external claims with the source format supported by the active tools.
 - Report failures and partial verification plainly. Accuracy is more important than sounding complete."#;
 
+/// Stable product policy for keeping repository exploration precise and
+/// model-visible file context bounded.
+pub const TOOL_DISCOVERY_POLICY: &str = r#"## Efficient Code Discovery
+- When the target is a known symbol, error message, string, filename, or pattern, use `grep`, `glob`, or another precise search tool first.
+- After locating relevant matches, use `read_file` with the narrowest useful `offset` and `limit`. Expand the range only when the local context is insufficient.
+- Do not read whole files merely to locate known text. Read a file directly only when it is already the necessary context or precise search cannot answer the question."#;
+
 /// A single module of the system prompt.
 #[derive(Debug, Clone)]
 pub struct PromptModule {
@@ -246,8 +253,17 @@ impl PromptAssembler {
             required: true,
         });
 
-        // P2: Stable runtime/tool contract. This must stay ahead of project,
-        // git, memory, and catalog content so provider KV caches can reuse it.
+        // P2: Stable tool discovery policy and runtime contract. These must
+        // stay ahead of project, git, memory, and catalog content so provider
+        // KV caches can reuse them.
+        assembler.add_module(PromptModule {
+            name: "tool_discovery".into(),
+            content: TOOL_DISCOVERY_POLICY.into(),
+            priority: 2,
+            token_budget: 0,
+            required: true,
+        });
+
         if let Some(runtime_prompt) = stable_runtime_prompt.filter(|value| !value.is_empty()) {
             assembler.add_module(PromptModule {
                 name: "runtime".into(),
@@ -411,6 +427,9 @@ mod tests {
 
         assert!(base_index < contract_index);
         assert!(contract_index < runtime_index);
+        assert_eq!(prompt.matches("## Efficient Code Discovery").count(), 1);
+        assert!(prompt.contains("use `grep`, `glob`, or another precise search tool first"));
+        assert!(prompt.contains("the narrowest useful `offset` and `limit`"));
         assert!(!prompt.contains("[Task state:"));
     }
 

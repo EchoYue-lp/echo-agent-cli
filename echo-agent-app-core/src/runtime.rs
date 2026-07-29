@@ -402,8 +402,10 @@ impl AgentRuntime {
     pub async fn init_pool(
         &self,
         config: crate::agent_pool::PoolConfig,
+        task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     ) -> Arc<crate::agent_pool::AgentPool> {
-        let pool = crate::agent_pool::AgentPool::from_runtime(self, config).await;
+        let pool =
+            crate::agent_pool::AgentPool::from_runtime(self, config, task_runtime_store).await;
         let pool = Arc::new(pool);
         pool.spawn_cleanup_monitor().await;
         pool

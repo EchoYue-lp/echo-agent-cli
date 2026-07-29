@@ -33,6 +33,10 @@ use super::types::{
 };
 use crate::agent_handle::AgentHandle;
 
+tokio::task_local! {
+    static CURRENT_EXECUTION_CONVERSATION_ID: Option<String>;
+}
+
 /// One active execute_run driver per run_id.
 ///
 /// Duplicate task_execute calls can be emitted by the model or a resumed turn.
@@ -130,6 +134,7 @@ async fn acquire_run_execution_lock(run_id: &str) -> RunExecutionGuard {
 pub struct ExecuteTaskTool {
     store: Arc<TaskRuntimeStore>,
     primary_agent: AgentHandle,
+    agent_pool: Option<std::sync::Weak<crate::agent_pool::AgentPool>>,
     /// D7 stage 2: unattended write mode for this tool's runs. Determines
     /// whether the CP A preflight loosens its write ban (Worktree/InPlace)
     /// or keeps stage-1 rejection (Disabled). Also scoped into a task-local
@@ -153,8 +158,44 @@ impl ExecuteTaskTool {
         Self {
             store,
             primary_agent,
+            agent_pool: None,
             write_mode,
         }
+    }
+
+    /// Resolve shared task execution against the AgentHandle that owns the
+    /// current conversation. The Weak avoids a ToolManager ↔ AgentPool cycle.
+    pub fn with_agent_pool(
+        mut self,
+        agent_pool: std::sync::Weak<crate::agent_pool::AgentPool>,
+    ) -> Self {
+        self.agent_pool = Some(agent_pool);
+        self
+    }
+
+    async fn execution_agent(&self) -> AgentHandle {
+        let conversation_id = CURRENT_EXECUTION_CONVERSATION_ID
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        if let (Some(pool), Some(conversation_id)) = (
+            self.agent_pool.as_ref().and_then(std::sync::Weak::upgrade),
+            conversation_id,
+        ) && let Some(agent) = pool.get(&conversation_id).await
+        {
+            return agent;
+        }
+        self.primary_agent.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn execution_agent_for_test(
+        &self,
+        conversation_id: Option<String>,
+    ) -> AgentHandle {
+        CURRENT_EXECUTION_CONVERSATION_ID
+            .scope(conversation_id, self.execution_agent())
+            .await
     }
 }
 
@@ -199,6 +240,7 @@ impl Tool for ExecuteTaskTool {
                 param_keys = ?params.keys().cloned().collect::<Vec<_>>(),
                 "task_execute: start"
             );
+            let execution_agent = self.execution_agent().await;
 
             if params.contains_key("task") {
                 return Ok(ToolResult::error(
@@ -325,7 +367,7 @@ impl Tool for ExecuteTaskTool {
             // None. execute_run uses it to persist trace Run records (token
             // usage, status). Without it, the task_execute path silently drops
             // trace persistence (event-wiring #1残留).
-            let run_store = self.primary_agent.read(|a| a.run_store.clone()).await;
+            let run_store = execution_agent.read(|a| a.run_store.clone()).await;
             // D7 stage 2: scope the write mode into a task-local so CP B
             // preflight in `execute_task` (inside execute_run's EKO controller)
             // can read it without threading the mode through every signature.
@@ -341,20 +383,20 @@ impl Tool for ExecuteTaskTool {
                     )));
                 }
             };
-            // Wire the reviewer LLM from the primary agent. Without this the
+            // Wire the reviewer LLM from the conversation's execution agent.
+            // Without this the
             // review gate falls through to Skipped, which (per M7) must NOT
             // auto-pass — tasks with acceptance_criteria would block forever.
-            // Sharing the primary agent's client is fine: review calls are
-            // sequential per task and bounded by max_parallel_llm_calls.
-            let reviewer_llm = self
-                .primary_agent
+            // Review calls are sequential per task and bounded by
+            // max_parallel_llm_calls.
+            let reviewer_llm = execution_agent
                 .read(|agent| agent.llm_client().cloned())
                 .await;
             let outcome = super::task_tools::CURRENT_UNATTENDED_WRITE_MODE
                 .scope(write_mode, async {
                     execute_run(
                         self.store.clone(),
-                        Some(self.primary_agent.clone()),
+                        Some(execution_agent),
                         reviewer_llm,
                         None, // layer_manager — 暂时 None
                         run_store,
@@ -446,7 +488,11 @@ impl Tool for ExecuteTaskTool {
         ctx: &'a echo_core::tools::ToolContext,
     ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
-            super::task_tools::scoped_with_ctx_run_id(ctx, || self.execute(params)).await
+            let conversation_id = ctx.conversation_id.clone();
+            super::task_tools::scoped_with_ctx_run_id(ctx, || {
+                CURRENT_EXECUTION_CONVERSATION_ID.scope(conversation_id, self.execute(params))
+            })
+            .await
         })
     }
 }

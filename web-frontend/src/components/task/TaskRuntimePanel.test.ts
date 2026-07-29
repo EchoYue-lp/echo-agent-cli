@@ -55,6 +55,14 @@ describe('displayedTodoStatus', () => {
     ).toBe('running');
   });
 
+  it('describes a completed execution with stale running persistence as pending commit', () => {
+    expect(
+      todoStatusDescription({ task_id: 'task-1', status: 'running' as TodoStatus }, [
+        run('completed'),
+      ])
+    ).toBe('执行已完成 · 等待状态落盘');
+  });
+
   it('does NOT overwrite a persisted Blocked status with Subagent completed', () => {
     // M7: acceptance failure marks the task Blocked even though the
     // Subagent trace says completed. Overwriting Blocked → completed hid

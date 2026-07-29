@@ -104,6 +104,30 @@ pub async fn register_task_tools_on_agent(
     // `agent_tool` remains only for ephemeral side work with no TaskRun.
 }
 
+/// Rebind the shared `task_execute` entry after the AgentPool is wrapped in an
+/// Arc. The tool resolves the current conversation's existing pooled agent at
+/// invocation time, so one shared ToolManager never captures a cron or another
+/// conversation's AgentHandle.
+pub async fn bind_task_execute_to_pool(
+    agent_handle: &AgentHandle,
+    store: Arc<TaskRuntimeStore>,
+    pool: &Arc<crate::agent_pool::AgentPool>,
+) {
+    let tool =
+        ExecuteTaskTool::new(store, agent_handle.clone()).with_agent_pool(Arc::downgrade(pool));
+    let added = agent_handle
+        .write(|agent| {
+            agent.add_tool(Box::new(tool));
+            true
+        })
+        .await;
+    if added {
+        tracing::info!("Bound shared task_execute tool to AgentPool conversation resolution");
+    } else {
+        tracing::warn!("Failed to bind task_execute tool to AgentPool");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
