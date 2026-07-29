@@ -462,7 +462,13 @@ async fn drive_chat_inner(
             WebhookTurnObserver::new(webhook_emitter, guard.model_name().to_string());
         // Tool visibility is invocation-scoped, so pooled agents keep one
         // registry while each interaction mode gets its own product surface.
-        let disabled_tools = Some(disabled_tools_for_mode(interaction_mode));
+        let disabled_tools = Some(crate::tool_exposure::disabled_tools_for_mode(
+            interaction_mode,
+        ));
+        let visible_tools = Some(crate::tool_exposure::initial_visible_tools(
+            interaction_mode,
+            &guard.tool_names(),
+        ));
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
@@ -496,6 +502,7 @@ async fn drive_chat_inner(
             working_dir: None,
             cancel: None,
             disabled_tools,
+            visible_tools,
             run_budget: None,
         };
         let stream_result = guard
@@ -557,46 +564,6 @@ async fn drive_chat_inner(
     .await
 }
 
-fn disabled_tools_for_mode(
-    interaction_mode: crate::tasks::task_runtime::InteractionMode,
-) -> std::collections::HashSet<String> {
-    use crate::tasks::task_runtime::InteractionMode;
-
-    // These belong to the framework's independent background-task store.
-    // EKO uses TaskRuntime and must not expose two incompatible task ID spaces.
-    let mut disabled = [
-        "spawn_background_task",
-        "check_task_status",
-        "list_background_tasks",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<std::collections::HashSet<_>>();
-
-    match interaction_mode {
-        InteractionMode::Chat => disabled.extend(
-            ["create_complex_task", "check_run_status", "cancel_run"]
-                .into_iter()
-                .map(str::to_string),
-        ),
-        InteractionMode::Task => disabled.extend(
-            [
-                "agent_tool",
-                "create_complex_task",
-                "check_run_status",
-                "cancel_run",
-            ]
-            .into_iter()
-            .map(str::to_string),
-        ),
-        InteractionMode::Auto => {
-            disabled.insert("agent_tool".to_string());
-        }
-    }
-
-    disabled
-}
-
 /// A `ChatSink` that forwards every product event to an mpsc channel.
 ///
 /// Used by modes whose renderer consumes a channel and applies a
@@ -625,7 +592,9 @@ mod tests {
 
     #[test]
     fn task_mode_uses_only_task_runtime_dispatch_tools() {
-        let disabled = disabled_tools_for_mode(crate::tasks::task_runtime::InteractionMode::Task);
+        let disabled = crate::tool_exposure::disabled_tools_for_mode(
+            crate::tasks::task_runtime::InteractionMode::Task,
+        );
         assert!(disabled.contains("agent_tool"));
         assert!(disabled.contains("create_complex_task"));
         assert!(disabled.contains("check_task_status"));
@@ -635,7 +604,9 @@ mod tests {
 
     #[test]
     fn auto_mode_requires_task_runtime_for_delegation() {
-        let disabled = disabled_tools_for_mode(crate::tasks::task_runtime::InteractionMode::Auto);
+        let disabled = crate::tool_exposure::disabled_tools_for_mode(
+            crate::tasks::task_runtime::InteractionMode::Auto,
+        );
         assert!(disabled.contains("spawn_background_task"));
         assert!(disabled.contains("check_task_status"));
         assert!(disabled.contains("list_background_tasks"));
@@ -646,7 +617,9 @@ mod tests {
 
     #[test]
     fn chat_mode_exposes_the_same_task_graph_api() {
-        let disabled = disabled_tools_for_mode(crate::tasks::task_runtime::InteractionMode::Chat);
+        let disabled = crate::tool_exposure::disabled_tools_for_mode(
+            crate::tasks::task_runtime::InteractionMode::Chat,
+        );
         assert!(!disabled.contains("task_create"));
         assert!(!disabled.contains("task_update"));
         assert!(!disabled.contains("task_list"));
@@ -660,7 +633,7 @@ mod tests {
 
     impl echo_core::tools::Tool for CountingTool {
         fn name(&self) -> &str {
-            "create_complex_task"
+            "web_fetch"
         }
 
         fn description(&self) -> &str {
@@ -1075,9 +1048,9 @@ mod tests {
         let mock = Arc::new(
             echo_agent::testing::MockLlmClient::new()
                 .with_model_name("t")
-                .then_tool_call("chat-call", "create_complex_task", "{}")
+                .then_tool_call("chat-call", "web_fetch", "{}")
                 .with_response("chat done")
-                .then_tool_call("auto-call", "create_complex_task", "{}")
+                .then_tool_call("auto-call", "web_fetch", "{}")
                 .with_response("auto done"),
         );
         let agent = AgentHandle::new(

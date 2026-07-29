@@ -19,13 +19,16 @@ triggers:
   - 骨科护理
   - 药物治疗证据
 allowed-tools:
-  - "Read"
-  - "Write"
-  - "Edit"
-  - "WebSearch"
-  - "WebFetch"
-  - "PubMedSearch"
-  - "ClinicalTrialsSearch"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
+  - "web_search"
+  - "web_fetch"
+  - "pubmed_search"
+  - "clinical_trials_search"
+  - "pdf_fetch"
+  - "bibtex_generate"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

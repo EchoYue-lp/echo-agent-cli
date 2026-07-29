@@ -719,6 +719,7 @@ async fn register_lsp_tools(agent_handle: &AgentHandle) {
 mod tests {
     use super::*;
     use echo_agent::intent::IntentClassifier;
+    use echo_agent::skills::external::{SkillLoader, tool_matcher};
 
     fn make_test_classifier() -> KeywordClassifier {
         let mut c = KeywordClassifier::new();
@@ -809,6 +810,43 @@ mod tests {
             "Standalone 'bug' should trigger coding, got {:?}",
             intent
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bundled_skill_allowlists_match_registered_tool_names() -> anyhow::Result<()> {
+        let agent = echo_agent::agent::ReactAgent::new(echo_agent::agent::AgentConfig::standard(
+            "test-model",
+            "skill-audit",
+            "test",
+        ));
+        let mut tool_names = agent.tool_names();
+        tool_names.extend(
+            ["task_create", "task_update", "task_list", "task_execute"]
+                .into_iter()
+                .map(str::to_string),
+        );
+
+        let skill_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../skills");
+        let mut loader = SkillLoader::new();
+        let descriptors = loader.discover_from_dir(skill_root).await?;
+        assert!(
+            !descriptors.is_empty(),
+            "bundled skills were not discovered"
+        );
+
+        for descriptor in descriptors {
+            for matcher in descriptor.allowed_tools {
+                assert!(
+                    tool_names
+                        .iter()
+                        .any(|tool_name| tool_matcher(&matcher, tool_name)),
+                    "Skill '{}' allowed-tools entry '{}' matches no registered tool",
+                    descriptor.name,
+                    matcher
+                );
+            }
+        }
         Ok(())
     }
 }

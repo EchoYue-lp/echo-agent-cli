@@ -18,10 +18,14 @@ triggers:
   - 置信区间
   - 效应量
 allowed-tools:
-  - "Bash(*)"
-  - "Read"
-  - "Write"
-  - "Edit"
+  - "shell"
+  - "run_code"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
+  - "read_data"
+  - "exploratory_statistics"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

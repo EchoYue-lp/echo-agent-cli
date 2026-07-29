@@ -16,10 +16,12 @@ triggers:
   - 起草
   - 写总结
 allowed-tools:
-  - "Read"
-  - "Write"
-  - "Edit"
-  - "WebSearch"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
+  - "web_search"
+  - "web_fetch"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

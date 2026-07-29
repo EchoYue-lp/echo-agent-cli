@@ -13,7 +13,7 @@ triggers:
   - Playwright
   - 浏览器测试
   - e2e
-allowed-tools: [bash]
+allowed-tools: [shell, read_artifact]
 ---
 # Webapp Testing
 

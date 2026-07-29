@@ -12,7 +12,7 @@ triggers:
   - git worktree
   - 工作区隔离
   - 独立分支
-allowed-tools: [bash, git]
+allowed-tools: [shell, read_file, read_artifact, git_*]
 ---
 
 # Using Git Worktrees

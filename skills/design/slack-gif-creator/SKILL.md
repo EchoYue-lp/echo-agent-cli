@@ -14,7 +14,7 @@ triggers:
   - 动画
   - slack
   - 表情
-allowed-tools: [bash]
+allowed-tools: [shell, read_artifact]
 ---
 # Slack GIF Creator
 

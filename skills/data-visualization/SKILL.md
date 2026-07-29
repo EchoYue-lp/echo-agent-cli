@@ -16,10 +16,14 @@ triggers:
   - 画图
   - 画个图
 allowed-tools:
-  - "Bash(*)"
-  - "Read"
-  - "Write"
-  - "Edit"
+  - "shell"
+  - "run_code"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
+  - "read_data"
+  - "generate_chart"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

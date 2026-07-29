@@ -24,12 +24,23 @@ triggers:
   - 写类
   - 实现
 allowed-tools:
-  - "Bash(*)"
-  - "Read"
-  - "Write"
-  - "Edit"
-  - "Glob"
-  - "Grep"
+  - "shell"
+  - "run_code"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
+  - "glob"
+  - "grep"
+  - "list_dir"
+  - "diff"
+  - "repo_map"
+  - "code_search"
+  - "git_*"
+  - "task_create"
+  - "task_update"
+  - "task_list"
+  - "task_execute"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

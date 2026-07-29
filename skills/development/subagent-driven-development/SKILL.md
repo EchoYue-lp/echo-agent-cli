@@ -11,7 +11,7 @@ triggers:
   - 子代理
   - subagent
   - 逐任务
-allowed-tools: [bash]
+allowed-tools: [shell, read_artifact, task_create, task_update, task_list, task_execute]
 ---
 
 # Subagent-Driven Development

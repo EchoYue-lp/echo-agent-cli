@@ -27,7 +27,8 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// EKO product default for one tool result returned to the model. The generic
 /// framework keeps 0 as opt-out so other consumers choose their own budget.
-const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize = 8_000;
+const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize =
+    crate::tool_exposure::MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS;
 const TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 32 * 1024;
 const TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 fn resolved_max_tool_output_tokens(configured: usize) -> usize {

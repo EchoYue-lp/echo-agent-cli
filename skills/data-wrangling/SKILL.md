@@ -17,10 +17,28 @@ triggers:
   - dataframe
   - 数据质量
 allowed-tools:
-  - "Bash(*)"
-  - "Read"
-  - "Write"
-  - "Edit"
+  - "shell"
+  - "run_code"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
+  - "read_data"
+  - "filter_data"
+  - "aggregate_data"
+  - "data_stats"
+  - "transform_data"
+  - "profile_data"
+  - "topn_data"
+  - "contribution_data"
+  - "bin_data"
+  - "ratio_data"
+  - "join_data"
+  - "correlate_data"
+  - "pivot_data"
+  - "missing_value_analysis"
+  - "outlier_detection"
+  - "consistency_check"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

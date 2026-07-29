@@ -15,7 +15,7 @@ triggers:
   - 演示文稿
   - 幻灯片
   - PPT
-allowed-tools: [bash, read, write]
+allowed-tools: [shell, read_file, read_artifact, write_file]
 hooks:
   UserPromptSubmit:
     - matcher: "\\.pptx"

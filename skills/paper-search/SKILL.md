@@ -17,12 +17,15 @@ triggers:
   - 找论文
   - 文献综述
 allowed-tools:
-  - "Read"
-  - "Write"
-  - "WebSearch"
-  - "WebFetch"
-  - "ArxivSearch"
-  - "SemanticScholarSearch"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "web_search"
+  - "web_fetch"
+  - "arxiv_search"
+  - "semantic_scholar_search"
+  - "pdf_fetch"
+  - "bibtex_generate"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

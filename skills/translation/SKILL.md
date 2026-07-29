@@ -15,9 +15,10 @@ triggers:
   - i18n
   - 多语言
 allowed-tools:
-  - "Read"
-  - "Write"
-  - "Edit"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

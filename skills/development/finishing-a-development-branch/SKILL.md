@@ -13,7 +13,7 @@ triggers:
   - finish branch
   - PR
   - 清理分支
-allowed-tools: [bash, git]
+allowed-tools: [shell, read_file, read_artifact, git_*]
 ---
 
 # Finishing a Development Branch

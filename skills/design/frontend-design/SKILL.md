@@ -14,7 +14,7 @@ triggers:
   - 网页
   - 仪表板
   - landing page
-allowed-tools: [bash, read, write]
+allowed-tools: [shell, read_file, read_artifact, write_file]
 ---
 # Frontend Design
 

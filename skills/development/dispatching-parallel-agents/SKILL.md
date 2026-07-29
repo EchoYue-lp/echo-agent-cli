@@ -13,7 +13,7 @@ triggers:
   - 同时
   - 多个任务
   - 并发
-allowed-tools: [bash]
+allowed-tools: [shell, read_artifact, task_create, task_update, task_list, task_execute]
 ---
 
 # Dispatching Parallel Agents

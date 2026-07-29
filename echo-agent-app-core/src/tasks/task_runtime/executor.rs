@@ -2941,6 +2941,10 @@ async fn run_main_agent_task(
             let execution_id = execution_id.clone();
             Box::pin(async move {
                 let event_cancel = cancel.clone();
+                let visible_tools = Some(crate::tool_exposure::initial_visible_tools(
+                    InteractionMode::Task,
+                    &agent.tool_names(),
+                ));
                 let invocation = echo_core::agent::AgentInvocationContext {
                     history: None,
                     runtime: Some(echo_core::tools::ExternalRunContext {
@@ -2956,7 +2960,10 @@ async fn run_main_agent_task(
                     }),
                     working_dir: None,
                     cancel: None,
-                    disabled_tools: None,
+                    disabled_tools: Some(crate::tool_exposure::disabled_tools_for_mode(
+                        InteractionMode::Task,
+                    )),
+                    visible_tools,
                     run_budget: None,
                 };
                 let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
@@ -3522,7 +3529,11 @@ pub async fn drive_agent_run(
     let run_id_for_scope = run_id.to_string();
     let cancel_for_scope = child_cancel.clone();
     let prompt_owned = unattended_run_prompt(prompt, attended_mode, write_mode);
-    let disabled_tools = unattended_direct_disabled_tools(attended_mode, write_mode);
+    let mut disabled_tools =
+        unattended_direct_disabled_tools(attended_mode, write_mode).unwrap_or_default();
+    disabled_tools.extend(crate::tool_exposure::disabled_tools_for_mode(
+        InteractionMode::Auto,
+    ));
     let trace_sink_for_scope = trace_sink.clone();
     let core_trace_sink = exec_trace_sink_to_core(trace_sink);
 
@@ -3533,6 +3544,10 @@ pub async fn drive_agent_run(
         async {
             let agent_inner = primary_agent.inner().clone();
             let agent = agent_inner.read().await;
+            let visible_tools = Some(crate::tool_exposure::initial_visible_tools(
+                InteractionMode::Auto,
+                &agent.tool_names(),
+            ));
             let invocation = echo_core::agent::AgentInvocationContext {
                 history: None,
                 runtime: Some(echo_core::tools::ExternalRunContext {
@@ -3548,7 +3563,8 @@ pub async fn drive_agent_run(
                 }),
                 working_dir: None,
                 cancel: None,
-                disabled_tools,
+                disabled_tools: Some(disabled_tools),
+                visible_tools,
                 run_budget: None,
             };
             let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
@@ -5698,12 +5714,12 @@ Read the runtime path and found one missing branch.
         use std::sync::Mutex;
 
         let llm = MockLlmClient::new()
-            .then_tool_call("call_1", "mock_calc", r#"{"x":6,"y":7}"#)
+            .then_tool_call("call_1", "run_code", r#"{"x":6,"y":7}"#)
             .with_response("The result is 42.");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
             .system_prompt("You are a test assistant.")
-            .tool(Box::new(MockTool::new("mock_calc").with_response("42")))
+            .tool(Box::new(MockTool::new("run_code").with_response("42")))
             .build()
             .map_err(|error| format!("test agent should build: {error}"))?;
         let handle = AgentHandle::new(agent);
@@ -5752,9 +5768,9 @@ Read the runtime path and found one missing branch.
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
                     && event.subagent_run_id.as_deref() == Some("implementation-a:1:1")
-                    && event.payload.get("name").and_then(|v| v.as_str()) == Some("mock_calc")
+                    && event.payload.get("name").and_then(|v| v.as_str()) == Some("run_code")
             }),
-            "expected tool_started for mock_calc, got {events:?}"
+            "expected tool_started for run_code, got {events:?}"
         );
         assert!(
             events.iter().any(|event| {

@@ -14,10 +14,12 @@ triggers:
   - 事实核查
   - 网络调研
 allowed-tools:
-  - "WebSearch"
-  - "WebFetch"
-  - "Read"
-  - "Write"
+  - "web_search"
+  - "web_fetch"
+  - "web_extract"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

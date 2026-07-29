@@ -18,10 +18,12 @@ triggers:
   - rebase
   - 版本控制
 allowed-tools:
-  - "Bash(git:*)"
-  - "Read"
-  - "Glob"
-  - "Grep"
+  - "shell"
+  - "read_file"
+  - "read_artifact"
+  - "glob"
+  - "grep"
+  - "git_*"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

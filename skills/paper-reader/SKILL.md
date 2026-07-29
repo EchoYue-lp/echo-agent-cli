@@ -13,10 +13,13 @@ triggers:
   - 方法论
   - 实验结果
 allowed-tools:
-  - "Read"
-  - "Write"
-  - "Edit"
-  - "WebFetch"
+  - "read_file"
+  - "read_artifact"
+  - "write_file"
+  - "edit_file"
+  - "web_fetch"
+  - "pdf_fetch"
+  - "extract_pdf"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"
