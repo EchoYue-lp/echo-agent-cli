@@ -9,7 +9,7 @@
 //! framework's conversation JSON files.
 //!
 //! The framework's `FileConversationStore` is the authority for storage; the
-//! app constructs it from `AppConfig.webhooks`-derived paths and shares the
+//! app constructs it from EKO's canonical user-data directory and shares the
 //! instance via `AppState`.
 
 use std::collections::HashMap;

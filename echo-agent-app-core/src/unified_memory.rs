@@ -26,6 +26,7 @@ use crate::instruction_provider::InstructionProvider;
 use echo_agent::llm::types::Message;
 
 const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
+const HOT_MEMORY_CONTEXT_PROJECTION: &str = "eko:hot-memory-context";
 
 // ── Instruction tiers ───────────────────────────────────────────────
 
@@ -123,20 +124,65 @@ impl UnifiedMemory {
     pub fn system_prompt_suffix(&self) -> String {
         self.instructions.get_system_prompt_suffix()
     }
+
+    pub fn instruction_prompt_suffix(&self) -> Option<String> {
+        self.instructions.get_instruction_suffix()
+    }
+
+    pub fn memory_prompt_suffix(&self) -> Option<String> {
+        self.instructions.get_memory_suffix()
+    }
 }
 
-/// Replace the instruction/hot-memory projection for one agent.
+/// Replace the compression-stable instruction projection for one agent.
 pub async fn refresh_instruction_projection(
     agent: &mut echo_agent::agent::ReactAgent,
     root: Option<&std::path::Path>,
 ) {
-    let suffix = UnifiedMemory::load_for(root).system_prompt_suffix();
-    let message = (!suffix.trim().is_empty()).then(|| Message::system(suffix.trim().to_string()));
+    let suffix = UnifiedMemory::load_for(root).instruction_prompt_suffix();
+    let message = suffix
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Message::system(value.trim().to_string()));
     agent
         .context()
         .lock()
         .await
         .replace_projection(INSTRUCTION_CONTEXT_PROJECTION, message);
+}
+
+/// Replace the independently-owned hot-memory projection for one agent.
+pub async fn refresh_hot_memory_projection(
+    agent: &mut echo_agent::agent::ReactAgent,
+    root: Option<&std::path::Path>,
+) {
+    let suffix = UnifiedMemory::load_for(root).memory_prompt_suffix();
+    let message = suffix
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Message::system(value.trim().to_string()));
+    agent
+        .context()
+        .lock()
+        .await
+        .replace_projection(HOT_MEMORY_CONTEXT_PROJECTION, message);
+}
+
+/// Refresh both file-backed context domains from one filesystem snapshot.
+pub async fn refresh_memory_projections(
+    agent: &mut echo_agent::agent::ReactAgent,
+    root: Option<&std::path::Path>,
+) {
+    let memory = UnifiedMemory::load_for(root);
+    let instruction = memory
+        .instruction_prompt_suffix()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Message::system(value.trim().to_string()));
+    let hot_memory = memory
+        .memory_prompt_suffix()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| Message::system(value.trim().to_string()));
+    let mut context = agent.context().lock().await;
+    context.replace_projection(INSTRUCTION_CONTEXT_PROJECTION, instruction);
+    context.replace_projection(HOT_MEMORY_CONTEXT_PROJECTION, hot_memory);
 }
 
 #[cfg(test)]
@@ -157,6 +203,7 @@ mod tests {
             instructions: InstructionProvider {
                 project_level: Some("Use Rust".to_string()),
                 user_level: None,
+                repository_level: None,
                 local_level: None,
                 agents_level: None,
                 hot_memory: None,
@@ -195,6 +242,27 @@ mod tests {
         assert!(projected.contains("SECOND_WORKSPACE_RULE"));
         assert!(!projected.contains("FIRST_WORKSPACE_RULE"));
         assert_eq!(projected.matches(INSTRUCTION_CONTEXT_PROJECTION).count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn instruction_and_hot_memory_use_distinct_projections() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        std::fs::create_dir_all(root.join(".eko"))?;
+        std::fs::write(root.join(".eko/project.md"), "PROJECT_RULE")?;
+        std::fs::write(root.join(".eko/MEMORY.md"), "HOT_MEMORY")?;
+
+        let mut agent = echo_agent::agent::ReactAgentBuilder::new()
+            .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+            .system_prompt("test")
+            .build()?;
+        refresh_instruction_projection(&mut agent, Some(root)).await;
+        refresh_hot_memory_projection(&mut agent, Some(root)).await;
+
+        let context = agent.context().lock().await;
+        assert!(context.has_projection(INSTRUCTION_CONTEXT_PROJECTION));
+        assert!(context.has_projection(HOT_MEMORY_CONTEXT_PROJECTION));
         Ok(())
     }
 }

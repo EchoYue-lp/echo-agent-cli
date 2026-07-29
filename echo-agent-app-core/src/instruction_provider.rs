@@ -1,8 +1,9 @@
 //! Layered instruction-file loader.
 //!
-//! Loads four tiers of instruction Markdown files and
+//! Loads five tiers of instruction Markdown files and
 //! concatenates them as a system-prompt suffix:
 //! - `~/.eko/user.md`              — user-level (cross-project)
+//! - `<root..cwd>/AGENTS[.override].md` — repository-standard chain
 //! - `<project-root>/.eko/project.md` — project-level
 //! - `<project-root>/.eko/learned-rules.md` — auto-promoted rules (evolution)
 //! - `<cwd>/.eko/local.md`         — local directory
@@ -28,10 +29,12 @@ const LEARNED_RULES_FILE: &str = "learned-rules.md";
 /// Legacy file name; renamed to `LEARNED_RULES_FILE` on first load.
 const LEGACY_AGENTS_FILE: &str = "AGENTS.md";
 
-/// Layered instruction-file loader (user / project / agents / local `.md`).
+/// Layered instruction-file loader (user / repository / project / learned / local).
 pub struct InstructionProvider {
     pub project_level: Option<String>,
     pub user_level: Option<String>,
+    /// Standard `AGENTS.override.md` / `AGENTS.md` chain, root to working dir.
+    pub repository_level: Option<String>,
     pub local_level: Option<String>,
     /// Auto-promoted rules and learned constraints (learned-rules.md body, frontmatter stripped).
     pub agents_level: Option<String>,
@@ -42,13 +45,11 @@ pub struct InstructionProvider {
 impl InstructionProvider {
     /// Load every tier from disk.
     pub fn load() -> Self {
-        let root = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| crate::utils::find_project_root(&cwd));
-        Self::load_for(root.as_deref())
+        let working_dir = std::env::current_dir().ok();
+        Self::load_for(working_dir.as_deref())
     }
 
-    /// Load every tier for one explicit workspace/project root.
+    /// Load every tier for one explicit working directory.
     ///
     /// `None` means global context only: user instructions plus user-level
     /// `MEMORY.md`. It intentionally does not consult process cwd, so exiting a
@@ -57,20 +58,23 @@ impl InstructionProvider {
     /// Performs a one-time migration of any legacy `.eko/AGENTS.md` to
     /// `.eko/learned-rules.md` (only renames if the new file does not already
     /// exist; never overwrites user-authored content under the new name).
-    pub fn load_for(root: Option<&Path>) -> Self {
-        let project_root = root.map(|path| {
+    pub fn load_for(working_dir: Option<&Path>) -> Self {
+        let project_root = working_dir.map(|path| {
             crate::utils::find_project_root(path).unwrap_or_else(|| path.to_path_buf())
         });
         Self::migrate_legacy_agents_file(project_root.as_deref());
         let project_level = Self::load_project_instructions(project_root.as_deref());
         let user_level = Self::load_user_instructions();
-        let local_level = Self::load_local_instructions(root);
+        let repository_level =
+            Self::load_repository_instructions(working_dir, project_root.as_deref());
+        let local_level = Self::load_local_instructions(working_dir);
         let agents_level = Self::load_agents_instructions(project_root.as_deref());
         let hot_memory = Self::load_hot_memory(project_root.as_deref());
 
         Self {
             project_level,
             user_level,
+            repository_level,
             local_level,
             agents_level,
             hot_memory,
@@ -111,11 +115,9 @@ impl InstructionProvider {
     /// Concatenate the instruction tiers and hot-layer memory into a single
     /// system-prompt suffix.
     ///
-    /// This is the current combined projection. The instruction tiers and the
-    /// memory tier are also available separately via [`get_instruction_suffix`]
-    /// and [`get_memory_suffix`] so a future change can split them into two
-    /// projections (instructions stable across compression; memory evictable)
-    /// without touching the loader.
+    /// Compatibility aggregation for callers that need one string. Runtime
+    /// context injection uses [`get_instruction_suffix`] and
+    /// [`get_memory_suffix`] as two independently replaceable projections.
     pub fn get_system_prompt_suffix(&self) -> String {
         let mut parts = Vec::new();
         if let Some(suffix) = self.get_instruction_suffix() {
@@ -131,7 +133,8 @@ impl InstructionProvider {
         }
     }
 
-    /// Concatenate only the instruction tiers (user / project / learned-rules / local).
+    /// Concatenate only the instruction tiers
+    /// (user / repository / project / learned-rules / local).
     ///
     /// Excludes hot-layer memory. Returns `None` when no instruction tier has
     /// content.
@@ -139,6 +142,9 @@ impl InstructionProvider {
         let mut parts = Vec::new();
         if let Some(ref user) = self.user_level {
             parts.push(format!("## User-level instructions\n{}", user));
+        }
+        if let Some(ref repository) = self.repository_level {
+            parts.push(format!("## Repository instructions\n{}", repository));
         }
         if let Some(ref project) = self.project_level {
             parts.push(format!("## Project-level instructions\n{}", project));
@@ -159,9 +165,8 @@ impl InstructionProvider {
     /// Format only the hot-layer memory (MEMORY.md body).
     ///
     /// Returns `None` when no memory content is loaded. Separated from
-    /// [`get_instruction_suffix`] so memory can be projected independently if
-    /// the product later wants instructions to be compression-stable while
-    /// memory is allowed to evict.
+    /// [`get_instruction_suffix`] because runtime context owns instruction and
+    /// hot-memory projections independently.
     pub fn get_memory_suffix(&self) -> Option<String> {
         self.hot_memory
             .as_ref()
@@ -181,6 +186,24 @@ impl InstructionProvider {
         Some(echo_agent::paths::user_data_path("user.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
+    }
+
+    /// Load the standard root-to-working-directory AGENTS chain.
+    ///
+    /// EKO deliberately requests the framework resolver's AGENTS-only mode:
+    /// `.echo-agent/*` and `CLAUDE.md` are not part of EKO's file protocol.
+    fn load_repository_instructions(
+        working_dir: Option<&Path>,
+        project_root: Option<&Path>,
+    ) -> Option<String> {
+        let working_dir = working_dir?;
+        let resolver =
+            echo_core::project_rules::InstructionResolver::new(working_dir).agents_files_only();
+        let resolved = match project_root {
+            Some(root) => resolver.project_root(root).resolve(),
+            None => resolver.resolve(),
+        };
+        resolved.annotated()
     }
 
     /// Load local-directory instructions from `<cwd>/.eko/local.md`.
@@ -210,8 +233,9 @@ impl InstructionProvider {
 
     /// Path to the project-level instructions file.
     fn project_instructions_path() -> PathBuf {
-        std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        let working_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        crate::utils::find_project_root(&working_dir)
+            .unwrap_or(working_dir)
             .join(".eko")
             .join("project.md")
     }
@@ -298,6 +322,7 @@ mod tests {
         let instructions = InstructionProvider {
             project_level: None,
             user_level: None,
+            repository_level: None,
             local_level: None,
             agents_level: None,
             hot_memory: None,
@@ -377,5 +402,37 @@ mod tests {
         std::fs::write(eko.join(LEGACY_AGENTS_FILE), "LEGACY").unwrap();
         let provider = InstructionProvider::load_for(Some(root));
         assert_eq!(provider.agents_level.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn loads_agents_chain_without_echo_agent_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let child = root.join("src");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".echo-agent")).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(root.join("AGENTS.md"), "ROOT_RULE").unwrap();
+        std::fs::write(child.join("AGENTS.override.md"), "CHILD_RULE").unwrap();
+        std::fs::write(root.join(".echo-agent/AGENT.md"), "NOT_EKO_PROTOCOL").unwrap();
+
+        let provider = InstructionProvider::load_for(Some(&child));
+        let repository = provider.repository_level.unwrap_or_default();
+        assert!(repository.contains("ROOT_RULE"));
+        assert!(repository.contains("CHILD_RULE"));
+        assert!(!repository.contains("NOT_EKO_PROTOCOL"));
+    }
+
+    #[test]
+    fn local_instructions_are_relative_to_working_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let child = root.join("src");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(child.join(".eko")).unwrap();
+        std::fs::write(child.join(".eko/local.md"), "LOCAL_CHILD_RULE").unwrap();
+
+        let provider = InstructionProvider::load_for(Some(&child));
+        assert_eq!(provider.local_level.as_deref(), Some("LOCAL_CHILD_RULE"));
     }
 }

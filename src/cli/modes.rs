@@ -36,6 +36,7 @@ pub async fn start_headless_services(
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
+    webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
 ) -> (
     Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
@@ -53,6 +54,7 @@ pub async fn start_headless_services(
     };
     use crate::state::AppState;
     let mut state = AppState::from_shared(agent, hitl_dispatcher, None, app_config.clone());
+    state.webhook.emitter = webhook_emitter;
     state.connection.pool = Some(pool);
     state.tasks.runtime = task_runtime_store;
     state.start_task_service().await;
@@ -74,6 +76,7 @@ pub async fn run_cli_mode(
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
     conversation_id: String,
+    webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
 ) -> Result<()> {
     let (task_service, scheduler_runner) = start_headless_services(
         agent.clone(),
@@ -81,6 +84,7 @@ pub async fn run_cli_mode(
         app_config,
         pool.clone(),
         task_runtime_store.clone(),
+        webhook_emitter.clone(),
     )
     .await;
 
@@ -92,26 +96,7 @@ pub async fn run_cli_mode(
     repl_config.pool = Some(pool);
     repl_config.task_runtime_store = task_runtime_store;
     repl_config.conversation_id = conversation_id;
-    // Build a CLI-side webhook emitter from the same config AppState uses.
-    // One Arc-shared instance feeds ChatCompleted/ToolFailed/etc. emit sites
-    // in chat_with_agent. Empty endpoint list → emit calls cheaply no-op.
-    repl_config.webhook_emitter = if app_config.webhooks.endpoints.is_empty() {
-        None
-    } else {
-        let endpoints: Vec<echo_agent_app_core::webhook::emitter::WebhookEndpoint> = app_config
-            .webhooks
-            .endpoints
-            .iter()
-            .map(|e| echo_agent_app_core::webhook::emitter::WebhookEndpoint {
-                url: e.url.clone(),
-                events: e.events.clone(),
-                secret: e.secret.clone(),
-            })
-            .collect();
-        Some(std::sync::Arc::new(
-            echo_agent_app_core::webhook::WebhookEmitter::with_endpoints(endpoints),
-        ))
-    };
+    repl_config.webhook_emitter = Some(webhook_emitter);
 
     crate::cli::run_repl(agent, repl_config).await
 }
@@ -129,6 +114,7 @@ pub async fn run_channels_mode(
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
     review_integration: Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
 ) -> Result<()> {
     use std::sync::Arc;
 
@@ -205,6 +191,7 @@ pub async fn run_channels_mode(
         let pool = pool.clone();
         let store = task_runtime_store.clone();
         let review_integration = review_integration.clone();
+        let webhook_emitter = webhook_emitter.clone();
         Arc::new(SessionHandler::new(
             session_config,
             move || -> Box<dyn MessageHandler> {
@@ -212,6 +199,7 @@ pub async fn run_channels_mode(
                     pool.clone(),
                     store.clone(),
                     review_integration.clone(),
+                    webhook_emitter.clone(),
                 ))
             },
         ))

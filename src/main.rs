@@ -100,6 +100,9 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     if args.verbose {
         app_config.logging.level = "debug".to_string();
     }
+    let webhook_emitter = std::sync::Arc::new(
+        echo_agent_app_core::webhook::WebhookEmitter::from_config(&app_config),
+    );
 
     let is_tui_entry = args.tui || (!args.web && !args.cli && !args.channels);
 
@@ -213,7 +216,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         }
     }
 
-    // Spawn config file watcher (fires ConfigChange hooks + reloads hooks on change)
+    // Spawn config watcher (reloads hooks + webhook endpoints on change).
     let cancel_token = tokio_util::sync::CancellationToken::new();
     if let Some(config_path) =
         echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref())
@@ -221,6 +224,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         echo_agent_cli::config_watcher::spawn_config_watcher(
             config_path,
             agent_handle.clone(),
+            Some(webhook_emitter.clone()),
             cancel_token.clone(),
         );
     }
@@ -250,6 +254,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &app_config,
             pool.clone(),
             task_runtime_store.clone(),
+            webhook_emitter.clone(),
         )
         .await;
 
@@ -260,6 +265,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tui_pending,
             pool.clone(),
             task_runtime_store.clone(),
+            webhook_emitter.clone(),
             tui_scheduler,
             runtime.review_integration.clone(),
             conversation_store.clone(),
@@ -338,6 +344,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 app_config.clone(),
                 task_runtime_store.clone(),
                 runtime.review_integration.clone(),
+                webhook_emitter.clone(),
             ));
 
             if run_cli {
@@ -351,6 +358,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     pool.clone(),
                     task_runtime_store.clone(),
                     conversation_id.clone(),
+                    webhook_emitter.clone(),
                 )
                 .await?;
             } else {
@@ -379,6 +387,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             pool,
             task_runtime_store,
             conversation_id,
+            webhook_emitter,
         )
         .await?;
     } else {

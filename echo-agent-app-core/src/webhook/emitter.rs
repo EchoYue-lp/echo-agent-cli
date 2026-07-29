@@ -63,6 +63,42 @@ impl WebhookEmitter {
         }
     }
 
+    /// Build the product emitter from the canonical application config.
+    pub fn from_config(config: &echo_agent::config::AppConfig) -> Self {
+        Self::with_endpoints(
+            config
+                .webhooks
+                .endpoints
+                .iter()
+                .map(|endpoint| WebhookEndpoint {
+                    url: endpoint.url.clone(),
+                    events: endpoint.events.clone(),
+                    secret: endpoint.secret.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    /// Atomically replace the configured endpoint set after config reload.
+    pub async fn replace_endpoints(&self, endpoints: Vec<WebhookEndpoint>) {
+        *self.endpoints.write().await = endpoints;
+    }
+
+    /// Reload endpoint configuration from the canonical application config.
+    pub async fn reload_from_config(&self, config: &echo_agent::config::AppConfig) {
+        let replacement = config
+            .webhooks
+            .endpoints
+            .iter()
+            .map(|endpoint| WebhookEndpoint {
+                url: endpoint.url.clone(),
+                events: endpoint.events.clone(),
+                secret: endpoint.secret.clone(),
+            })
+            .collect();
+        self.replace_endpoints(replacement).await;
+    }
+
     /// True when at least one endpoint is registered.
     pub async fn has_endpoints(&self) -> bool {
         !self.endpoints.read().await.is_empty()
@@ -88,7 +124,7 @@ impl WebhookEmitter {
 
     /// 发射事件（非阻塞 fire-and-forget）。
     ///
-    /// 没有注册端点时立即返回，避免无谓的 spawn。
+    /// 投递任务会在没有注册端点时、序列化和网络请求前立即返回。
     pub fn emit(&self, event: WebhookEvent) {
         let endpoints = self.endpoints.clone();
         let client = self.client.clone();

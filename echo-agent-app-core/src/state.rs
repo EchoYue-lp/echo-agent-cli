@@ -396,7 +396,7 @@ pub struct TaskState {
 
 /// Webhook 状态
 pub struct WebhookState {
-    pub emitter: crate::webhook::WebhookEmitter,
+    pub emitter: Arc<crate::webhook::WebhookEmitter>,
 }
 
 /// Product-level observability inputs not owned by the framework run store.
@@ -462,17 +462,7 @@ impl AppState {
             })
             .unwrap_or_default();
 
-        // Extract webhook endpoints before moving app_config
-        let webhook_endpoints: Vec<crate::webhook::emitter::WebhookEndpoint> = app_config
-            .webhooks
-            .endpoints
-            .iter()
-            .map(|e| crate::webhook::emitter::WebhookEndpoint {
-                url: e.url.clone(),
-                events: e.events.clone(),
-                secret: e.secret.clone(),
-            })
-            .collect();
+        let webhook_emitter = Arc::new(crate::webhook::WebhookEmitter::from_config(&app_config));
 
         Self {
             connection: ConnectionState {
@@ -573,7 +563,7 @@ impl AppState {
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
             },
             webhook: WebhookState {
-                emitter: crate::webhook::WebhookEmitter::with_endpoints(webhook_endpoints),
+                emitter: webhook_emitter,
             },
             observability: ObservabilityState {
                 prompt_assembly: RwLock::new(None),
@@ -658,7 +648,7 @@ impl AppState {
             // Share the AppState's webhook emitter so cron runs emit
             // CronTaskCompleted on the same endpoint set as chat. `emit`
             // cheaply no-ops when no endpoints are registered.
-            Some(Arc::new(self.webhook.emitter.clone())),
+            Some(self.webhook.emitter.clone()),
         );
         let runner = Arc::new(runner);
         runner.clone().spawn();

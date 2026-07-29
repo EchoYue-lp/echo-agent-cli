@@ -1,11 +1,12 @@
 //! Hooks-config file watcher — monitors `echo-agent.yaml` for changes and
-//! hot-reloads user **hooks** (and fires the `ConfigChange` lifecycle hook).
+//! hot-reloads user **hooks and webhook endpoints** (and fires the
+//! `ConfigChange` lifecycle hook).
 //!
 //! ## Scope (intentional)
 //!
-//! Only hooks are reloaded live. Other config domains (model selection, MCP
-//! server topology, runtime limits) require a restart because they are wired
-//! into long-lived subsystems at agent construction. The watcher's name and
+//! Hooks and webhook endpoints are reloaded live. Other config domains (model
+//! selection, MCP server topology, runtime limits) require a restart because
+//! they are wired into long-lived subsystems at agent construction. The watcher's name and
 //! this doc reflect that scope; do not widen it without a parallel story for
 //! safely tearing down and rebuilding those subsystems.
 //!
@@ -55,16 +56,17 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 }
 
 /// Spawn a background task that watches the config file for changes and
-/// hot-reloads user hooks.
+/// hot-reloads user hooks and webhook endpoints.
 ///
 /// When the file settles after a burst of edits, it:
 /// 1. Fires `ConfigChange` hook with the file path as matcher context
-/// 2. Reloads the config and re-registers user hooks
+/// 2. Reloads the config, user hooks, and webhook endpoints
 ///
 /// The watcher stops when the cancellation token is triggered.
 pub fn spawn_config_watcher(
     config_path: PathBuf,
     agent: AgentHandle,
+    webhook_emitter: Option<std::sync::Arc<crate::webhook::WebhookEmitter>>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -130,7 +132,7 @@ pub fn spawn_config_watcher(
                     };
                     // Filter: only react to data-modify events that touch our
                     // target config file specifically.
-                    if !matches!(notify_event.kind, EventKind::Modify(_)) {
+                    if !is_config_write_event(&notify_event.kind) {
                         continue;
                     }
                     if !event_touches_target(&notify_event, &config_path) {
@@ -148,7 +150,7 @@ pub fn spawn_config_watcher(
                             _ = &mut settled => break,
                             extra = rx.recv() => {
                                 let Some(Ok(ev)) = extra else { continue };
-                                if matches!(ev.kind, EventKind::Modify(_))
+                                if is_config_write_event(&ev.kind)
                                     && event_touches_target(&ev, &config_path)
                                 {
                                     // Qualifying event during quiet window:
@@ -163,11 +165,15 @@ pub fn spawn_config_watcher(
                     }
 
                     info!("Config file changed: {}", config_path.display());
-                    handle_config_change(&config_path, &agent).await;
+                    handle_config_change(&config_path, &agent, webhook_emitter.as_deref()).await;
                 }
             }
         }
     })
+}
+
+fn is_config_write_event(kind: &EventKind) -> bool {
+    matches!(kind, EventKind::Create(_) | EventKind::Modify(_))
 }
 
 /// True when `event` modifies the file at `target` (compared by canonical path
@@ -193,7 +199,11 @@ fn event_touches_target(event: &notify::Event, target: &Path) -> bool {
     false
 }
 
-async fn handle_config_change(config_path: &std::path::Path, agent: &AgentHandle) {
+async fn handle_config_change(
+    config_path: &std::path::Path,
+    agent: &AgentHandle,
+    webhook_emitter: Option<&crate::webhook::WebhookEmitter>,
+) {
     let path_str = config_path.to_str().unwrap_or("").to_string();
 
     // 1. Fire ConfigChange hook
@@ -210,13 +220,15 @@ async fn handle_config_change(config_path: &std::path::Path, agent: &AgentHandle
         })
         .await;
 
-    // 2. Reload config and re-register user hooks.
+    // 2. Reload config and re-register the live-reloadable domains.
     //
-    // Hot-reload scope is intentionally limited to hooks. Model selection, MCP
-    // topology, and runtime limits are wired into long-lived subsystems at
-    // agent build time and are NOT reloaded here — a restart is required for
-    // those to take effect (see module docs).
+    // Model selection, MCP topology, and runtime limits are wired into
+    // long-lived subsystems at agent build time and are NOT reloaded here — a
+    // restart is required for those to take effect (see module docs).
     let new_config = echo_agent::config::load_config(Some(&path_str));
 
     infra::load_user_hooks(agent, &new_config).await;
+    if let Some(emitter) = webhook_emitter {
+        emitter.reload_from_config(&new_config).await;
+    }
 }

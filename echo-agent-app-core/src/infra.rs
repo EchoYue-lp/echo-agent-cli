@@ -503,7 +503,7 @@ pub async fn create_agent_with_diagnostics(
 
 /// Refresh every workspace-dependent context projection on an agent.
 pub async fn refresh_dynamic_context(agent: &mut ReactAgent, root: Option<&std::path::Path>) {
-    crate::unified_memory::refresh_instruction_projection(agent, root).await;
+    crate::unified_memory::refresh_memory_projections(agent, root).await;
     crate::project::prompt::refresh_project_context_projection(agent, root).await;
 }
 
@@ -1796,6 +1796,7 @@ pub fn run_base_doctor_for_model_with_connectivity(
         let provider = crate::instruction_provider::InstructionProvider::load_for(Some(&root));
         let count = [
             provider.user_level.as_ref(),
+            provider.repository_level.as_ref(),
             provider.project_level.as_ref(),
             provider.agents_level.as_ref(),
             provider.local_level.as_ref(),
@@ -1806,7 +1807,7 @@ pub fn run_base_doctor_for_model_with_connectivity(
         .count();
         if count == 0 {
             checks.push(
-                "ℹ️  项目目录已检测到, 但未找到指令文件 (user.md / project.md / learned-rules.md 等)"
+                "ℹ️  项目目录已检测到, 但未找到指令文件 (AGENTS.md / user.md / project.md / learned-rules.md 等)"
                     .to_string(),
             );
         } else {

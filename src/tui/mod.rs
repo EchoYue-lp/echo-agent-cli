@@ -303,6 +303,8 @@ pub struct TuiApp {
     /// TaskRuntimeStore for create_run / cancel_run (Phase B3). Set by `run_tui`.
     pub task_runtime_store:
         Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Shared webhook emitter for chat/tool lifecycle events.
+    pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
     /// Shared scheduler used by direct `/cron` commands.
     pub scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     /// Latest TaskRuntime projection for the current conversation.
@@ -771,6 +773,7 @@ impl TuiApp {
             pending_approval: None,
             pool: None,
             task_runtime_store: None,
+            webhook_emitter: None,
             scheduler: None,
             task_runtime_view: None,
             subagent_runs: Vec::new(),
@@ -1790,6 +1793,7 @@ pub async fn run_tui(
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
+    webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     review_integration: Option<std::sync::Arc<ReviewIntegration>>,
     conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
@@ -1840,6 +1844,7 @@ pub async fn run_tui(
     app.pending_approval = Some(tui_pending);
     app.pool = Some(pool);
     app.task_runtime_store = task_runtime_store;
+    app.webhook_emitter = Some(webhook_emitter);
     app.scheduler = scheduler;
     app.review_integration = review_integration;
     // One conversation id per TUI session (parity with GUI's per-conversation id):

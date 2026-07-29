@@ -75,6 +75,105 @@ pub fn framework_trace_sink_for(sink: &std::sync::Arc<dyn ChatSink>) -> TraceSin
     )
 }
 
+struct WebhookTurnObserver {
+    emitter: Option<std::sync::Arc<crate::webhook::WebhookEmitter>>,
+    model: String,
+    started: std::time::Instant,
+    input_tokens: usize,
+    output_tokens: usize,
+    completed: bool,
+    tools: std::collections::HashMap<String, (String, String, std::time::Instant)>,
+}
+
+impl WebhookTurnObserver {
+    fn new(emitter: Option<std::sync::Arc<crate::webhook::WebhookEmitter>>, model: String) -> Self {
+        Self {
+            emitter,
+            model,
+            started: std::time::Instant::now(),
+            input_tokens: 0,
+            output_tokens: 0,
+            completed: false,
+            tools: std::collections::HashMap::new(),
+        }
+    }
+
+    fn observe(&mut self, event: &AgentEvent) {
+        let Some(emitter) = self.emitter.as_ref() else {
+            return;
+        };
+        match event {
+            AgentEvent::LlmUsage {
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                self.input_tokens = self.input_tokens.saturating_add(*prompt_tokens);
+                self.output_tokens = self.output_tokens.saturating_add(*completion_tokens);
+            }
+            AgentEvent::ToolCall {
+                call_id,
+                name,
+                args,
+            } => {
+                let args_summary = args.to_string().chars().take(240).collect::<String>();
+                self.tools.insert(
+                    call_id.clone(),
+                    (name.clone(), args_summary, std::time::Instant::now()),
+                );
+            }
+            AgentEvent::ToolResult { call_id, name, .. } => {
+                let (tool_name, args_summary, started) = self
+                    .tools
+                    .remove(call_id)
+                    .unwrap_or_else(|| (name.clone(), String::new(), std::time::Instant::now()));
+                emitter.emit(crate::webhook::WebhookEvent::ToolCalled {
+                    name: tool_name,
+                    args_summary,
+                    elapsed_ms: duration_millis(started.elapsed()),
+                });
+            }
+            AgentEvent::ToolError {
+                call_id,
+                name,
+                error,
+                ..
+            } => {
+                self.tools.remove(call_id);
+                emitter.emit(crate::webhook::WebhookEvent::ToolFailed {
+                    name: name.clone(),
+                    error: error.clone(),
+                });
+            }
+            AgentEvent::Error { message, .. } => {
+                emitter.emit(crate::webhook::WebhookEvent::AgentError {
+                    error: message.clone(),
+                });
+            }
+            AgentEvent::FinalAnswer(_) => self.completed = true,
+            _ => {}
+        }
+    }
+
+    fn finish(self) {
+        if !self.completed {
+            return;
+        }
+        if let Some(emitter) = self.emitter {
+            emitter.emit(crate::webhook::WebhookEvent::ChatCompleted {
+                model: self.model,
+                input_tokens: self.input_tokens,
+                output_tokens: self.output_tokens,
+                elapsed_ms: duration_millis(self.started.elapsed()),
+            });
+        }
+    }
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Drive a chat turn through the single shared path (极简入口).
 ///
 /// Wraps `message` (plus optional `multimodal`) into one `Message`, streams the
@@ -344,11 +443,13 @@ async fn drive_chat_inner(
     // the agent read guard.
     let interaction_mode = res.interaction_mode;
     let conversation_id = res.conv_id.clone();
-    // Recompute the formal run_id (deterministic function of turn_id) so it can
-    // be propagated into ToolContext.run_id below — making ToolContext the
-    // authoritative, cross-spawn-safe source for task tools instead of forcing
-    // them to fall back to the task_local scoped by `drive_chat`.
-    let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+    let webhook_emitter = res.webhook_emitter.clone();
+    // Task mode creates its run before the model call, so its product events
+    // carry that real run identity. Chat/Auto turns remain run-less until a
+    // task tool actually bootstraps a run; ToolContext can derive the same
+    // deterministic scope from turn_id without falsely labelling ordinary chat.
+    let active_run_id = (interaction_mode == crate::tasks::task_runtime::InteractionMode::Task)
+        .then(|| crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id));
     // Scope the chat resources into a task_local so tools the agent calls
     // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
     // can reach pool/store/sink via `current_chat_resources()`.
@@ -357,6 +458,8 @@ async fn drive_chat_inner(
         // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
         let guard = inner.read().await;
+        let mut webhook_observer =
+            WebhookTurnObserver::new(webhook_emitter, guard.model_name().to_string());
         // Tool visibility is invocation-scoped, so pooled agents keep one
         // registry while each interaction mode gets its own product surface.
         let disabled_tools = Some(disabled_tools_for_mode(interaction_mode));
@@ -369,7 +472,7 @@ async fn drive_chat_inner(
         // running inside the framework's spawned tool executor.
         let event_identity = EventIdentity {
             conversation_id: conversation_id.clone(),
-            run_id: Some(formal_run_id.clone()),
+            run_id: active_run_id.clone(),
             turn_id: turn_id.clone(),
             execution_id: None,
             parent_event_id: None,
@@ -378,11 +481,10 @@ async fn drive_chat_inner(
             history: None,
             runtime: Some(echo_core::tools::ExternalRunContext {
                 conversation_id,
-                // Propagate the formal run_id so tools read it from ToolContext
-                // (cross-spawn-safe) instead of falling back to the task_local
-                // scoped at drive_chat:151. Background runs still re-scope via
-                // executor.rs with the value-carried TaskExecutionContext.run_id.
-                run_id: Some(formal_run_id.clone()),
+                // A real pre-created Task-mode run is value-carried across
+                // framework spawns. Chat/Auto task tools derive their prospective
+                // scope from turn_id and create it only when invoked.
+                run_id: active_run_id,
                 turn_id: Some(turn_id.clone()),
                 execution_id: None,
                 isolation_id: None,
@@ -405,6 +507,11 @@ async fn drive_chat_inner(
                 // F1-5: 此前只 return Err 字符串, 不经 sink 发 Error 事件 →
                 // 前端 assistant 消息卡在 streaming。发 Error 让前端终止流式状态。
                 tracing::warn!(error = %e, "agent stream setup failed during chat");
+                if let Some(emitter) = webhook_observer.emitter.as_ref() {
+                    emitter.emit(crate::webhook::WebhookEvent::AgentError {
+                        error: e.to_string(),
+                    });
+                }
                 let _ = sink.on_event(ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
                     &event_identity,
                     1,
@@ -422,6 +529,7 @@ async fn drive_chat_inner(
             while let Some(event_result) = stream.next().await {
                 match event_result {
                     Ok(event) => {
+                        webhook_observer.observe(&event.payload);
                         if !sink.on_event(ChatDriverEvent::Agent(Box::new(event))) {
                             break;
                         }
@@ -431,10 +539,17 @@ async fn drive_chat_inner(
                         // terminal payloads. This branch remains for future
                         // transport adapters that can fail independently.
                         tracing::warn!(error = %e, "agent stream error during chat");
-                        break;
+                        let error = e.to_string();
+                        if let Some(emitter) = webhook_observer.emitter.as_ref() {
+                            emitter.emit(crate::webhook::WebhookEvent::AgentError {
+                                error: error.clone(),
+                            });
+                        }
+                        return Err(error);
                     }
                 }
             }
+            webhook_observer.finish();
             Ok::<(), String>(())
         }
         .await
@@ -618,25 +733,25 @@ mod tests {
         fn event_count(&self) -> usize {
             self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
         }
+        fn has_run_identity(&self) -> bool {
+            self.events
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .iter()
+                .any(|event| event.run_id.is_some())
+        }
         fn has_valid_contract(&self, conversation_id: &str, turn_id: &str) -> bool {
             let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
             let terminal_count = events
                 .iter()
                 .filter(|event| event.payload.is_terminal())
                 .count();
-            // The chat path now propagates the formal run_id (derived from the
-            // turn id) into every event so task tools can read it from
-            // `ToolContext` instead of relying on a task_local fallback. The
-            // run_id is a stable identifier; it does NOT imply a TaskRun record
-            // was created — see the caller's `store.get_run(...).is_none()` check.
-            let expected_run_id =
-                crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
             events.iter().enumerate().all(|(index, event)| {
                 event.schema_version == echo_agent::agent::AGENT_EVENT_SCHEMA_VERSION
                     && event.sequence == (index as u64).saturating_add(1)
                     && event.conversation_id.as_deref() == Some(conversation_id)
                     && event.turn_id == turn_id
-                    && event.run_id.as_deref() == Some(expected_run_id.as_str())
+                    && event.run_id.is_none()
                     && !event.event_id.is_empty()
             }) && terminal_count == 1
         }
@@ -675,6 +790,7 @@ mod tests {
             pool: None,
             store: Some(store.clone()),
             sink: chat_sink.clone(),
+            webhook_emitter: None,
             conv_id: Some("task-conversation".to_string()),
             root_message_id: "task-turn".to_string(),
             attachments: Vec::new(),
@@ -747,6 +863,7 @@ mod tests {
             pool: None,
             store: Some(Arc::clone(&store)),
             sink,
+            webhook_emitter: None,
             conv_id: Some("c1".to_string()),
             root_message_id: "m1".to_string(),
             attachments: vec![],
@@ -774,6 +891,10 @@ mod tests {
                 .expect("read task run")
                 .is_none(),
             "ordinary chat must not create a TaskRun"
+        );
+        assert!(
+            !chat_sink.has_run_identity(),
+            "ordinary Auto chat events must not claim a nonexistent TaskRun"
         );
     }
 
@@ -845,6 +966,7 @@ mod tests {
             pool: None,
             store: Some(Arc::clone(&store)),
             sink,
+            webhook_emitter: None,
             conv_id: Some("c1".to_string()),
             root_message_id: turn_id.to_string(),
             attachments: Vec::new(),
@@ -907,6 +1029,7 @@ mod tests {
             pool: None,
             store: Some(store),
             sink,
+            webhook_emitter: None,
             conv_id: None,
             root_message_id: "m1".to_string(),
             attachments: vec![],
@@ -983,6 +1106,7 @@ mod tests {
                 pool: None,
                 store: None,
                 sink,
+                webhook_emitter: None,
                 conv_id: None,
                 root_message_id: root_message_id.to_string(),
                 attachments: Vec::new(),

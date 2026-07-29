@@ -7,16 +7,36 @@ use std::path::{Path, PathBuf};
 
 /// Find the project root by walking up from the given directory.
 ///
-/// Looks for `.eko` or `.git` markers — the same logic used by
-/// by `InstructionProvider` and project-context discovery.
+/// Uses the shared marker set for both instruction loading and structural
+/// project context. The first matching ancestor is authoritative.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = start;
-    loop {
-        if dir.join(".eko").exists() || dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        dir = dir.parent()?;
+    const VCS_MARKERS: &[&str] = &[".git", ".hg", ".svn"];
+    const FALLBACK_MARKERS: &[&str] = &[
+        ".eko",
+        "Cargo.toml",
+        "package.json",
+        "go.mod",
+        "pyproject.toml",
+        "pom.xml",
+        "Makefile",
+    ];
+    // A repository boundary outranks nested package manifests. Otherwise a
+    // workspace such as `repo/crate/Cargo.toml` would hide `repo/AGENTS.md`.
+    if let Some(root) = start.ancestors().find(|directory| {
+        VCS_MARKERS
+            .iter()
+            .any(|marker| directory.join(marker).exists())
+    }) {
+        return Some(root.to_path_buf());
     }
+    start
+        .ancestors()
+        .find(|directory| {
+            FALLBACK_MARKERS
+                .iter()
+                .any(|marker| directory.join(marker).exists())
+        })
+        .map(Path::to_path_buf)
 }
 
 /// Strip a leading YAML frontmatter block (delimited by `---` fences on their
@@ -52,27 +72,54 @@ pub fn strip_yaml_frontmatter(raw: &str) -> String {
         return raw.to_string();
     }
     // Find the closing fence: a line equal to `---` after the opening fence.
-    for idx in (first_content + 1)..lines.len() {
-        if lines[idx].trim_end() == "---" {
-            // Body = everything after the closing fence.
-            let body_lines = &lines[idx + 1..];
-            let mut body: String = body_lines.join("\n");
-            // Trim leading blank lines but preserve a trailing newline if the
-            // original input had one and the body is non-empty.
-            body = body.chars().skip_while(|c| *c == '\n').collect();
-            if has_trailing_newline && !body.is_empty() && !body.ends_with('\n') {
-                body.push('\n');
-            }
-            return body;
-        }
+    let closing_fence = lines
+        .iter()
+        .enumerate()
+        .skip(first_content.saturating_add(1))
+        .find_map(|(index, line)| (line.trim_end() == "---").then_some(index));
+    let Some(closing_fence) = closing_fence else {
+        // No closing fence — return input unchanged rather than stripping a partial block.
+        return raw.to_string();
+    };
+    let body_lines = lines
+        .get(closing_fence.saturating_add(1)..)
+        .unwrap_or_default();
+    let mut body: String = body_lines.join("\n");
+    // Trim leading blank lines but preserve a trailing newline if the
+    // original input had one and the body is non-empty.
+    body = body.chars().skip_while(|c| *c == '\n').collect();
+    if has_trailing_newline && !body.is_empty() && !body.ends_with('\n') {
+        body.push('\n');
     }
-    // No closing fence — return input unchanged rather than stripping a partial block.
-    raw.to_string()
+    body
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_root_outranks_nested_package_marker() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("repo");
+        let nested = root.join("crates/member/src");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("crates/member/Cargo.toml"), "[package]").unwrap();
+
+        assert_eq!(find_project_root(&nested).as_deref(), Some(root.as_path()));
+    }
+
+    #[test]
+    fn package_marker_is_used_without_repository_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        let nested = root.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+
+        assert_eq!(find_project_root(&nested).as_deref(), Some(root.as_path()));
+    }
 
     #[test]
     fn strip_frontmatter_basic() {

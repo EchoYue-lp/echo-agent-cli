@@ -629,6 +629,7 @@ pub async fn send_chat_message(
         pool: state.app_state.connection.pool.clone(),
         store: state.app_state.tasks.runtime.clone(),
         sink: sink.clone(),
+        webhook_emitter: Some(state.app_state.webhook.emitter.clone()),
         conv_id: conversation_id.clone(),
         root_message_id: message_key.clone(),
         attachments: attachment_refs.clone(),

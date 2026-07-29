@@ -27,6 +27,9 @@ pub struct ChatResources {
     /// TaskRuntimeStore for create_run / cancel_run. `None` when unavailable.
     pub store: Option<Arc<TaskRuntimeStore>>,
     pub sink: Arc<dyn ChatSink>,
+    /// Shared product webhook emitter. Event delivery is observed in
+    /// `drive_chat`, so GUI/TUI/CLI/channel use identical lifecycle semantics.
+    pub webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
     pub conv_id: Option<String>,
     pub root_message_id: String,
     pub attachments: Vec<AttachmentRef>,

@@ -2,27 +2,14 @@ use std::path::{Path, PathBuf};
 
 use super::gitignore::GitIgnore;
 
-const PROJECT_DIR_MARKERS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    "Cargo.toml",
-    "package.json",
-    "go.mod",
-    "pyproject.toml",
-    "pom.xml",
-    "Makefile",
-];
-
 /// Structural project context: directory tree + git state + ignore rules.
 ///
 /// Instruction/rules content is NOT loaded here — that responsibility belongs
 /// solely to [`crate::instruction_provider::InstructionProvider`] (which
 /// produces the `eko:instruction-context` projection). Earlier versions read
-/// `AGENTS.md` / `ECHO_AGENT.md` / `~/.eko/instructions.md` here too, which
-/// duplicated `InstructionProvider` and split one logical instruction stream
-/// across two projections. Those reads and the `instructions` field were
-/// removed; the legacy file names are no longer consulted anywhere.
+/// the same files here too, which split one logical instruction stream across
+/// two projections. `AGENTS.md` remains supported through that single owner;
+/// `ECHO_AGENT.md` and the old global aliases are no longer consulted.
 #[derive(Debug, Clone)]
 pub struct ProjectContext {
     pub root: PathBuf,
@@ -34,22 +21,12 @@ pub struct ProjectContext {
 
 pub fn discover_project_root(start: Option<&Path>) -> Option<PathBuf> {
     let start = start.unwrap_or_else(|| Path::new("."));
-    let mut dir = if start.is_absolute() {
+    let dir = if start.is_absolute() {
         start.to_path_buf()
     } else {
         std::env::current_dir().ok()?.join(start)
     };
-
-    loop {
-        for marker in PROJECT_DIR_MARKERS {
-            if dir.join(marker).exists() {
-                return Some(dir);
-            }
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
+    crate::utils::find_project_root(&dir)
 }
 
 pub fn load_project_context(project_root: &Path) -> ProjectContext {

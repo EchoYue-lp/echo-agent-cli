@@ -1388,6 +1388,7 @@ async fn dispatch_turn(
         pool: app.pool.clone(),
         store: app.task_runtime_store.clone(),
         sink,
+        webhook_emitter: app.webhook_emitter.clone(),
         // TUI/GUI parity (AGENTS.md): bind this turn to the session's
         // conversation id so TaskRuntime runs + transcript projection work.
         conv_id: app.conversation_id.clone(),

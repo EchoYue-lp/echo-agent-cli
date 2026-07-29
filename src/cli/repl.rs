@@ -227,16 +227,8 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
                             let mut staged = staged_attachments.lock().await;
                             std::mem::take(&mut *staged)
                         };
-                        chat_with_agent(
-                            &agent,
-                            &message,
-                            &output,
-                            &config,
-                            mode,
-                            attachments,
-                            config.webhook_emitter.as_deref(),
-                        )
-                        .await;
+                        chat_with_agent(&agent, &message, &output, &config, mode, attachments)
+                            .await;
                     }
                 }
             }
@@ -485,7 +477,6 @@ async fn chat_with_agent(
     config: &ReplConfig,
     interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
     attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    webhook_emitter: Option<&echo_agent_app_core::webhook::WebhookEmitter>,
 ) {
     output.print_user_message(message);
 
@@ -518,6 +509,7 @@ async fn chat_with_agent(
         pool: config.pool.clone(),
         store: config.task_runtime_store.clone(),
         sink,
+        webhook_emitter: config.webhook_emitter.clone(),
         conv_id: Some(conversation_id),
         root_message_id: turn_id,
         attachments,
@@ -800,12 +792,6 @@ async fn chat_with_agent(
                 );
                 let styled = nu_ansi_term::Color::Red.paint(&err_text);
                 println!("  {}", styled);
-                if let Some(emitter) = webhook_emitter {
-                    emitter.emit(echo_agent_app_core::webhook::WebhookEvent::ToolFailed {
-                        name: name.clone(),
-                        error: error.clone(),
-                    });
-                }
                 first_chunk = true;
             }
             AgentEvent::FinalAnswer(_answer) => {
@@ -856,19 +842,6 @@ async fn chat_with_agent(
 
     // Ensure spinner is cleared even if stream produced no meaningful events
     clear_spinner!();
-
-    // Emit ChatCompleted webhook (only when an emitter with endpoints exists).
-    {
-        let (input_tokens, output_tokens, _) = get_usage_stats();
-        if let Some(emitter) = webhook_emitter {
-            emitter.emit(echo_agent_app_core::webhook::WebhookEvent::ChatCompleted {
-                model: String::new(), // model not easily available here
-                input_tokens,
-                output_tokens,
-                elapsed_ms: elapsed.as_millis() as u64,
-            });
-        }
-    }
 
     let config = output.config();
 

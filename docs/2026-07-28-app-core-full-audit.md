@@ -19,7 +19,7 @@ the app — some with bug fixes, some deleted as dead code.
 
 | Item | Original verdict | **Corrected verdict** | Action |
 |---|---|---|---|
-| D1 `instruction_provider` | DUPLICATE (collapses onto framework `InstructionResolver`) | **FALSE ALARM — not a duplicate** | Stays in app. Framework's `project-rules` feature is NOT enabled in EKO (`echo-agent-app-core/Cargo.toml` confirmed), so there is no double-scan. App's tier set (`user.md`/`project.md`/`AGENTS.md`/`local.md`/`MEMORY.md`) is EKO's instruction+memory protocol, not a strict subset of the framework's project-rules resolver. |
+| D1 `instruction_provider` | DUPLICATE (collapses onto framework `InstructionResolver`) | **FALSE ALARM — not a duplicate** | Stays in app as the EKO protocol owner. It composes the framework resolver's `agents_files_only()` mechanism for the root-to-cwd `AGENTS.md` chain, while retaining EKO's `user.md`/`project.md`/`learned-rules.md`/`local.md`/`MEMORY.md` tiers. EKO does not scan `.echo-agent/*` or `CLAUDE.md`. |
 | D2 `sensitive.rs` | DUPLICATE (framework `ProtectedPathChecker` wins) | **APP DEAD CODE** (not a duplicate of anything live) | **Delete entirely** — zero callers (`rg` confirmed). Done in Iteration 0. |
 | D3 `utils.rs::strip_yaml_frontmatter` | Near-duplicate of framework `parse_frontmatter` | **Different semantics, not a duplicate** | Stays in app. Skill frontmatter parser vs MEMORY.md body-stripper serve different purposes; tighten the app parser's robustness locally instead of migrating. |
 | **S1** `runtime_state_file.rs` | SPLIT (file impl of framework trait) | **CONFIRMED — real framework gap** | Migrate `FileRuntimeStateStore` down to `echo-agent/src/state/file.rs`. Fix bugs first (corrupt-JSON errors, path-safe IDs, unique temp names, parent-dir sync). |
@@ -32,7 +32,8 @@ the app — some with bug fixes, some deleted as dead code.
 **Final migration scope: only 3 storage migrations (S1/S2/S3).** Plus Iteration 0
 dead-code cleanup (`sensitive.rs`, `embedded_server.rs`, `server_pid.rs`, `config.rs`
 shim — all deleted) and the bug-fix iterations on app-side instruction/webhook/HITL/
-watcher code (no framework changes).
+watcher code. The only additional framework change is a narrow reusable
+`InstructionResolver::agents_files_only()` selection mode; EKO's protocol remains in the app.
 
 The original "8 findings" section below is retained as history; the table above is
 the operative conclusion.

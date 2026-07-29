@@ -36,6 +36,7 @@ pub struct AppChannelMessageHandler {
     pool: Arc<AgentPool>,
     store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     hitl: Arc<ChannelHumanLoopProvider>,
     interaction_mode:
         tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
@@ -47,11 +48,13 @@ impl AppChannelMessageHandler {
         pool: Arc<AgentPool>,
         store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
         review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+        webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     ) -> Self {
         Self {
             pool,
             store,
             review_integration,
+            webhook_emitter,
             hitl: Arc::new(ChannelHumanLoopProvider::new()),
             interaction_mode: tokio::sync::RwLock::new(
                 echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
@@ -212,6 +215,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let pool = self.pool.clone();
         let store = self.store.clone();
         let review_integration = self.review_integration.clone();
+        let webhook_emitter = self.webhook_emitter.clone();
         let interaction_mode = *self.interaction_mode.read().await;
         let mut prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
@@ -229,6 +233,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 pool: Some(pool),
                 store,
                 sink,
+                webhook_emitter: Some(webhook_emitter),
                 conv_id: Some(conv_owned.clone()),
                 root_message_id: uuid::Uuid::new_v4().to_string(),
                 attachments: attachment_refs,

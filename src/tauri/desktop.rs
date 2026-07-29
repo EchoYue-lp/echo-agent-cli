@@ -130,6 +130,9 @@ async fn run_desktop() -> anyhow::Result<()> {
     let args = cli::Args::parse_from(["echo-agent-tauri"]);
     let mut app_config = config::load_config(args.config.as_deref());
     config::apply_env_overrides(&mut app_config);
+    let webhook_emitter = Arc::new(echo_agent_app_core::webhook::WebhookEmitter::from_config(
+        &app_config,
+    ));
 
     infra::init_logging(&app_config.logging.level);
 
@@ -161,6 +164,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         config_watcher::spawn_config_watcher(
             config_path,
             agent_handle.clone(),
+            Some(webhook_emitter.clone()),
             cancel_token.clone(),
         );
     }
@@ -199,6 +203,7 @@ async fn run_desktop() -> anyhow::Result<()> {
     )
     .with_review_integration(runtime.review_integration.clone())
     .with_prompt_assembly(runtime.prompt_assembly.clone());
+    state_inner.webhook.emitter = webhook_emitter;
 
     // Inject the TaskRuntimeStore into the pool so pooled agents get the
     // task-management tools, and register those tools on the primary agent
