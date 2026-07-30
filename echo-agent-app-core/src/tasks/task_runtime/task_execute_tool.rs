@@ -489,12 +489,72 @@ impl Tool for ExecuteTaskTool {
     ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
             let conversation_id = ctx.conversation_id.clone();
-            super::task_tools::scoped_with_ctx_run_id(ctx, || {
+            let result = super::task_tools::scoped_with_ctx_run_id(ctx, || {
                 CURRENT_EXECUTION_CONVERSATION_ID.scope(conversation_id, self.execute(params))
             })
-            .await
+            .await?;
+            compact_completed_task_result(ctx, result)
         })
     }
+}
+
+fn compact_completed_task_result(
+    ctx: &echo_core::tools::ToolContext,
+    mut result: ToolResult,
+) -> echo_agent::error::Result<ToolResult> {
+    if !result.success || !result.output.contains("各 subagent 的产出如下") {
+        return Ok(result);
+    }
+    let Some(mut config) = ctx.output_artifacts.clone() else {
+        return Ok(result);
+    };
+    config.threshold_bytes = 1;
+    let full_output = result.output.clone();
+    let artifact = match echo_core::tools::artifact::persist_tool_output(
+        config,
+        echo_core::tools::artifact::ToolOutputArtifactIdentity::from_context(ctx, "task_execute"),
+        &full_output,
+    ) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            tracing::warn!(%error, "task_execute output artifact write failed");
+            result
+                .metadata
+                .insert("artifact_status".to_string(), "write_failed".to_string());
+            result
+                .metadata
+                .insert("artifact_error".to_string(), error.to_string());
+            return Ok(result);
+        }
+    };
+    let Some(artifact) = artifact else {
+        return Ok(result);
+    };
+    let subagent_count = full_output
+        .lines()
+        .filter(|line| line.starts_with("## "))
+        .count();
+    result.output = format!(
+        "计划执行完成。已汇总 {subagent_count} 个 Subagent 的结果。完整汇总已保存到 artifact: {} (sha256 {})。请用 read_artifact 分页读取后撰写最终答案。",
+        artifact.path.display(),
+        artifact.sha256
+    );
+    result.data = None;
+    artifact.extend_metadata(&mut result.metadata);
+    result
+        .metadata
+        .insert("output_handling".to_string(), "spilled".to_string());
+    result
+        .metadata
+        .insert("original_bytes".to_string(), full_output.len().to_string());
+    result.metadata.insert(
+        "returned_bytes".to_string(),
+        result.output.len().to_string(),
+    );
+    result
+        .metadata
+        .insert("subagent_count".to_string(), subagent_count.to_string());
+    Ok(result)
 }
 
 fn task_execute_outcome_text(outcome: &RunOutcome, summaries: &str) -> String {

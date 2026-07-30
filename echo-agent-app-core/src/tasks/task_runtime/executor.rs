@@ -2941,10 +2941,16 @@ async fn run_main_agent_task(
             let execution_id = execution_id.clone();
             Box::pin(async move {
                 let event_cancel = cancel.clone();
-                let visible_tools = Some(crate::tool_exposure::initial_visible_tools(
+                let visible_tools = crate::tool_exposure::initial_visible_tools(
                     InteractionMode::Task,
                     &agent.tool_names(),
-                ));
+                );
+                crate::tool_exposure::record_mode_schema_budget(
+                    InteractionMode::Task,
+                    &agent.tool_definitions(),
+                    &visible_tools,
+                );
+                let visible_tools = Some(visible_tools);
                 let invocation = echo_core::agent::AgentInvocationContext {
                     history: None,
                     runtime: Some(echo_core::tools::ExternalRunContext {
@@ -3544,10 +3550,16 @@ pub async fn drive_agent_run(
         async {
             let agent_inner = primary_agent.inner().clone();
             let agent = agent_inner.read().await;
-            let visible_tools = Some(crate::tool_exposure::initial_visible_tools(
+            let visible_tools = crate::tool_exposure::initial_visible_tools(
                 InteractionMode::Auto,
                 &agent.tool_names(),
-            ));
+            );
+            crate::tool_exposure::record_mode_schema_budget(
+                InteractionMode::Auto,
+                &agent.tool_definitions(),
+                &visible_tools,
+            );
+            let visible_tools = Some(visible_tools);
             let invocation = echo_core::agent::AgentInvocationContext {
                 history: None,
                 runtime: Some(echo_core::tools::ExternalRunContext {

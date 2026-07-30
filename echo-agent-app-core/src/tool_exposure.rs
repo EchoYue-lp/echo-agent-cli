@@ -4,6 +4,56 @@ use crate::tasks::task_runtime::InteractionMode;
 
 pub(crate) const MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS: usize = 4_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ToolOptimizationRollout {
+    pub deferred_schemas: bool,
+    pub cursor_pagination: bool,
+    pub bounded_results: bool,
+    pub content_free_telemetry: bool,
+}
+
+pub(crate) fn rollout_for_mode(_interaction_mode: InteractionMode) -> ToolOptimizationRollout {
+    ToolOptimizationRollout {
+        deferred_schemas: true,
+        cursor_pagination: true,
+        bounded_results: true,
+        content_free_telemetry: true,
+    }
+}
+
+pub(crate) fn record_mode_schema_budget(
+    interaction_mode: InteractionMode,
+    definitions: &[echo_core::llm::types::ToolDefinition],
+    visible: &HashSet<String>,
+) {
+    let rollout = rollout_for_mode(interaction_mode);
+    let selected = definitions
+        .iter()
+        .filter(|definition| visible.contains(&definition.function.name))
+        .cloned()
+        .collect::<Vec<_>>();
+    match echo_agent::tools::ToolManager::schema_stats_for(&selected) {
+        Ok(stats) => tracing::info!(
+            target: "eko::tool_budget",
+            mode = interaction_mode.as_str(),
+            tool_count = stats.tool_count,
+            schema_bytes = stats.schema_bytes,
+            schema_estimated_tokens = stats.estimated_tokens,
+            deferred_schemas = rollout.deferred_schemas,
+            cursor_pagination = rollout.cursor_pagination,
+            bounded_results = rollout.bounded_results,
+            content_free_telemetry = rollout.content_free_telemetry,
+            "interaction tool budget"
+        ),
+        Err(error) => tracing::warn!(
+            target: "eko::tool_budget",
+            mode = interaction_mode.as_str(),
+            %error,
+            "failed to measure interaction tool budget"
+        ),
+    }
+}
+
 const CONTROL_TOOLS: &[&str] = &["final_answer", "tool_search"];
 const FILE_TOOLS: &[&str] = &[
     "read_file",
@@ -69,6 +119,9 @@ pub(crate) fn initial_visible_tools(
     interaction_mode: InteractionMode,
     registered: &[String],
 ) -> HashSet<String> {
+    if !rollout_for_mode(interaction_mode).deferred_schemas {
+        return registered.iter().cloned().collect();
+    }
     let registered = registered
         .iter()
         .map(String::as_str)
@@ -218,6 +271,21 @@ mod tests {
                 "write_file",
             ]
         );
+    }
+
+    #[test]
+    fn optimizations_are_enabled_after_chat_task_auto_rollout() {
+        for mode in [
+            InteractionMode::Chat,
+            InteractionMode::Task,
+            InteractionMode::Auto,
+        ] {
+            let rollout = rollout_for_mode(mode);
+            assert!(rollout.deferred_schemas);
+            assert!(rollout.cursor_pagination);
+            assert!(rollout.bounded_results);
+            assert!(rollout.content_free_telemetry);
+        }
     }
 
     #[tokio::test]

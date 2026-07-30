@@ -68,7 +68,7 @@ evidence, and the next bounded step.
 | Iteration 1: instruction system + turn/run identity | Complete | `.eko/AGENTS.md` is migrated to the unambiguous `.eko/learned-rules.md`; `InstructionProvider` is the sole EKO protocol owner and composes `echo_core::InstructionResolver::agents_files_only()` for the standard root-to-cwd `AGENTS.md` / `AGENTS.override.md` chain without scanning `.echo-agent/*` or `CLAUDE.md`; project-root discovery is shared and VCS-root-first, while `.eko/local.md` is resolved from the actual working directory; instruction and hot-memory content use distinct replaceable projections; Chat/Auto events keep `run_id=None` until a real TaskRun exists, while Task mode value-carries its pre-created run id. |
 | Iteration 2: webhook + HITL + config_watcher fixes | Complete | The dead webhook singleton was removed. One `Arc<WebhookEmitter>` is shared by chat, scheduler, and the active surface; lifecycle emission now lives in the common `drive_chat` path, giving GUI/TUI/CLI/channel the same `ToolCalled`/`ToolFailed`/`AgentError`/`ChatCompleted` behavior, while cron emits `CronTaskCompleted`. Config reload watches the parent directory, accepts create/modify atomic-save events, uses resettable debounce, and hot-reloads both hooks and webhook endpoints; model/MCP/runtime topology still requires restart. HITL snapshots providers before await, broadcasts concurrently under one shared deadline, and drops remaining futures after the first response. |
 | Iteration 3: migrate 3 file-backed storage impls down to framework | Complete | `FileRuntimeStateStore`, `FileConversationStore`, and `restore_message(s)` are framework capabilities; EKO uses them without enabling SQLite. File writes use unique temp names, file fsync, atomic rename, Unix parent-directory fsync, cleanup on failure, path-safe ids, and explicit corrupt-JSON errors. `FileConversationStore` serializes complete single-process read/modify/write operations, atomically implements `ensure_conversation`, reconciles stale counters from records on reopen, and normalizes stored message ownership. Message projection/restore now round-trips canonical roles, tool identity, multimodal content, and reasoning metadata. App-only `SessionSearchEngine`, path ownership, and UI persistence projections remain in EKO. |
-| Tool Schema budget and recoverable output Phase 0-3 | Complete | Framework commit `9fad29f`; `docs/2026-07-29-tool-schema-budget-and-artifacts.md`; one framework registry with invocation-local Tool Search, real Skill allowlists, bounded SHA-verified artifact pages, and production-mode Schema gates at Chat 3,561 / Task 3,820 / Auto 3,905 estimated tokens |
+| Tool Schema budget and recoverable output Phase 0-6 | Complete | Framework commits `9fad29f`, `bbca516`; `docs/2026-07-29-tool-schema-budget-and-artifacts.md`; one framework registry, invocation-local Tool Search, query-and-result-bound cursor pagination, recoverable SQL/Web/task artifacts, and content-free metrics; current Schema gates are Chat 3,647 / Task 3,906 / Auto 3,929 estimated tokens |
 
 ## Current Decisions
 
@@ -295,15 +295,11 @@ the same fact is not persisted twice. See
 
 ## Next Step
 
-Tool context optimization continues at Phase 4 in
-`docs/2026-07-29-tool-schema-budget-and-artifacts.md`: define the one framework
-`PageRequest` / `PageInfo` contract with query-fingerprinted cursors, then
-migrate collection tools one at a time while deleting each replaced paging
-protocol. Phase 5 applies the 4K visible-result contract to SQL, diff,
-directory/repo map, Web, memory, and `task_execute`; Phase 6 adds content-free
-local telemetry and fixed-task rollout gates. Do not add another tool registry,
-placeholder schemas, application-owned cursor engine, or eager Browser/MCP
-schema surface.
+Tool context optimization Phase 0-6 is closed in
+`docs/2026-07-29-tool-schema-budget-and-artifacts.md`. Operational follow-up is
+limited to live-model success-rate measurement using the content-free counters.
+Do not add another tool registry, placeholder schemas, application-owned cursor
+engine, eager Browser/MCP schema surface, or EKO telemetry database.
 
 Runtime DAG convergence is complete: the framework owns canonical
 `TaskSpec`/`TaskExecution`/`TaskStatus`, validation, traversal, and the generic

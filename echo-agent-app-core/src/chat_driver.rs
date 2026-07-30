@@ -465,10 +465,14 @@ async fn drive_chat_inner(
         let disabled_tools = Some(crate::tool_exposure::disabled_tools_for_mode(
             interaction_mode,
         ));
-        let visible_tools = Some(crate::tool_exposure::initial_visible_tools(
+        let visible_tools =
+            crate::tool_exposure::initial_visible_tools(interaction_mode, &guard.tool_names());
+        crate::tool_exposure::record_mode_schema_budget(
             interaction_mode,
-            &guard.tool_names(),
-        ));
+            &guard.tool_definitions(),
+            &visible_tools,
+        );
+        let visible_tools = Some(visible_tools);
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
