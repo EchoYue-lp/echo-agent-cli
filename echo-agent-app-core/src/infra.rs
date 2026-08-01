@@ -39,6 +39,21 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     }
 }
 
+/// Registration-time static environment for subagent system prompts.
+///
+/// OS/arch/date are stable for the agent's lifetime, so they are compiled into
+/// the system prompt once. Per-dispatch state (working dir, workspace root)
+/// must NOT be added here — worktree/workspace isolation changes the cwd per
+/// dispatch, and the invocation compiler renders those dynamically.
+fn static_subagent_environment() -> String {
+    format!(
+        "- OS: {} ({})\n- Date: {}\n- Runtime: local personal assistant on the user's machine",
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        chrono::Local::now().format("%Y-%m-%d")
+    )
+}
+
 /// Product-owned storage policy for complete oversized tool output.
 ///
 /// Workspace conversations keep their logs beside the rest of the workspace
@@ -608,8 +623,12 @@ async fn register_default_subagents(
             description: &subagent_def.description,
             role_prompt: &subagent_def.system_prompt,
             readonly: subagent_def.readonly,
-            can_delegate: false,
+            // Wire the frontmatter declaration through so the system-prompt
+            // delegation wording matches the `.md` claim and the parent-facing
+            // catalog (previously hardcoded false — a display inconsistency).
+            can_delegate: subagent_def.can_delegate,
             isolation,
+            environment: Some(static_subagent_environment()),
         });
         let build_result = if subagent_def.readonly {
             build_readonly_subagent_agent(

@@ -19,7 +19,17 @@ const COMMON_ORCHESTRATION_POLICY: &str = r#"## Assignment Policy
 - Complete the assigned outcome using the smallest evidence-backed approach.
 - Inspect relevant evidence before concluding and distinguish observed facts from inference.
 - Do not create, modify, approve, or execute the parent TaskRuntime plan.
-- Preserve unrelated user work and report incomplete or blocked work plainly."#;
+- Preserve unrelated user work and report incomplete or blocked work plainly.
+- Complete the assignment fully — do not gold-plate, but do not leave it half-done."#;
+
+/// Identity + communication protocol shared by every subagent (mirrors the
+/// parent-relay and autonomy contracts Claude Code / Codex bake into their
+/// subagent prompts). Completion standards stay in `COMMON_ORCHESTRATION_POLICY`;
+/// this section only covers who the subagent is and how it communicates.
+const SUBAGENT_COMMUNICATION_PROTOCOL: &str = r#"## Subagent Protocol
+- You are a Subagent dispatched by EKO's primary agent on the user's own machine to complete one bounded assignment; the parent relays your result to the user.
+- The user cannot see your intermediate process. Do not ask the user questions or request approvals — complete the assignment autonomously within its boundary.
+- Validate material outputs when tools allow; if validation cannot run, state the reason and remaining risk in the result contract."#;
 
 const SUBAGENT_RESULT_QUALITY_POLICY: &str = r#"## Result Quality
 Put the complete user-facing deliverable in the final answer before `## Result`. The JSON `summary` must also be self-contained because the parent may consume it without the reasoning trace. Never use referential placeholders such as "see above", "as described above", "见上方", or "如上" as the final answer or summary."#;
@@ -172,6 +182,7 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
         let mut diagnostics = PromptDiagnostics::default();
         diagnostics.record("role", "subagent_definition.markdown");
         diagnostics.record("common-rules", "eko.common_policy");
+        diagnostics.record("protocol", "eko.subagent_protocol");
         diagnostics.record("tool-discovery", "eko.tool_discovery_policy");
         diagnostics.record("capability", "subagent_definition.frontmatter");
         diagnostics.record("suggested-tasks", "eko.optional_follow_up_policy");
@@ -194,18 +205,33 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
             input.isolation
         );
 
+        let mut sections = vec![
+            input.role_prompt.trim().to_string(),
+            COMMON_ORCHESTRATION_POLICY.to_string(),
+            SUBAGENT_COMMUNICATION_PROTOCOL.to_string(),
+            TOOL_DISCOVERY_POLICY.to_string(),
+            capabilities,
+            SUGGESTED_TASKS_POLICY.to_string(),
+            SUBAGENT_LANGUAGE_POLICY.to_string(),
+            SUBAGENT_RESULT_QUALITY_POLICY.to_string(),
+            render_result_contract(),
+        ];
+        // Static environment grounding (OS/arch/date) is registration-time
+        // stable, so it belongs in the system prompt. Per-dispatch state
+        // (working dir, workspace root) must NOT be compiled here — it changes
+        // with worktree/workspace isolation and is rendered per invocation.
+        if let Some(env) = input
+            .environment
+            .as_deref()
+            .map(str::trim)
+            .filter(|env| !env.is_empty())
+        {
+            diagnostics.record("environment", "eko.static_environment");
+            sections.push(format!("## Environment\n{env}"));
+        }
+
         CompiledSubagentSystemPrompt {
-            system_prompt: [
-                input.role_prompt.trim().to_string(),
-                COMMON_ORCHESTRATION_POLICY.to_string(),
-                TOOL_DISCOVERY_POLICY.to_string(),
-                capabilities,
-                SUGGESTED_TASKS_POLICY.to_string(),
-                SUBAGENT_LANGUAGE_POLICY.to_string(),
-                SUBAGENT_RESULT_QUALITY_POLICY.to_string(),
-                render_result_contract(),
-            ]
-            .join("\n\n"),
+            system_prompt: sections.join("\n\n"),
             diagnostics,
         }
     }
@@ -260,6 +286,18 @@ fn compile_direct_invocation(
         input.agent_name,
         input.task.trim()
     ));
+    // Defensive rendering: the direct-dispatch path currently inherits an empty
+    // constraints list, but a parent context that carries constraints must not
+    // drop them silently (planned invocations render their own boundary block).
+    if let Some(constraints) = input.parent_context.and_then(|context| {
+        (!context.constraints.is_empty()).then_some(context.constraints.as_slice())
+    }) {
+        diagnostics.record("constraints", "parent_context.constraints");
+        sections.push(format!(
+            "[constraints]\n{}\n[/constraints]",
+            constraints.join("\n")
+        ));
+    }
     CompiledSubagentInvocation {
         task_input: sections.join("\n\n"),
         history,
@@ -430,8 +468,10 @@ mod tests {
                 readonly: definition.readonly,
                 can_delegate: definition.can_delegate,
                 isolation,
+                environment: None,
             });
             assert_eq!(compiled.diagnostics.count("role"), 1);
+            assert_eq!(compiled.diagnostics.count("protocol"), 1);
             assert_eq!(compiled.diagnostics.count("tool-discovery"), 1);
             assert_eq!(compiled.diagnostics.count("language"), 1);
             assert_eq!(compiled.diagnostics.count("result-quality"), 1);
@@ -443,7 +483,83 @@ mod tests {
                     .count(),
                 1
             );
+            assert_eq!(
+                compiled
+                    .system_prompt
+                    .matches("## Subagent Protocol")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                compiled.system_prompt.matches("## Environment").count(),
+                0,
+                "environment section must be absent when no environment is provided"
+            );
         }
+    }
+
+    #[test]
+    fn environment_section_rendered_once_when_provided() {
+        let compiler = EkoSubagentPromptCompiler;
+        let isolation = "context";
+        let with_env = compiler.compile_system(&SubagentSystemPromptInput {
+            name: "env-test",
+            description: "d",
+            role_prompt: "# Role\nbody",
+            readonly: true,
+            can_delegate: false,
+            isolation,
+            environment: Some("- OS: macos (aarch64)\n- Date: 2026-08-01".to_string()),
+        });
+        assert_eq!(with_env.diagnostics.count("environment"), 1);
+        assert_eq!(with_env.system_prompt.matches("## Environment").count(), 1);
+        assert!(with_env.system_prompt.contains("- OS: macos (aarch64)"));
+
+        let without_env = compiler.compile_system(&SubagentSystemPromptInput {
+            name: "env-test",
+            description: "d",
+            role_prompt: "# Role\nbody",
+            readonly: true,
+            can_delegate: false,
+            isolation,
+            environment: None,
+        });
+        assert_eq!(without_env.diagnostics.count("environment"), 0);
+        assert_eq!(
+            without_env.system_prompt.matches("## Environment").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn can_delegate_declaration_reaches_system_prompt_wording() {
+        let compiler = EkoSubagentPromptCompiler;
+        let isolation = "context";
+        let enabled = compiler.compile_system(&SubagentSystemPromptInput {
+            name: "delegate-test",
+            description: "d",
+            role_prompt: "# Role\nbody",
+            readonly: false,
+            can_delegate: true,
+            isolation,
+            environment: None,
+        });
+        assert!(
+            enabled.system_prompt.contains("delegation is allowed"),
+            "can_delegate=true must render the allowed wording, got: {}",
+            enabled.system_prompt
+        );
+
+        let disabled = compiler.compile_system(&SubagentSystemPromptInput {
+            name: "delegate-test",
+            description: "d",
+            role_prompt: "# Role\nbody",
+            readonly: false,
+            can_delegate: false,
+            isolation,
+            environment: None,
+        });
+        assert!(disabled.system_prompt.contains("delegation is disabled"));
     }
 
     #[test]
