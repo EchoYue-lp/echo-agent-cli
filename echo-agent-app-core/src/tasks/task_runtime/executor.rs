@@ -2150,6 +2150,7 @@ async fn execute_task(
             parent_context: None,
             inherit_history: None,
             payload: Some(&prompt_payload),
+            constraints: &[],
         });
         emit_primary_subagent_started(
             trace_sink.as_ref(),
@@ -3910,6 +3911,7 @@ mod tests {
                 parent_context: None,
                 inherit_history: None,
                 payload: Some(&payload),
+                constraints: &[],
             })
             .task_input)
     }
