@@ -287,15 +287,14 @@ fn compile_direct_invocation(
         input.task.trim()
     ));
     // Defensive rendering: the direct-dispatch path currently inherits an empty
-    // constraints list, but a parent context that carries constraints must not
-    // drop them silently (planned invocations render their own boundary block).
-    if let Some(constraints) = input.parent_context.and_then(|context| {
-        (!context.constraints.is_empty()).then_some(context.constraints.as_slice())
-    }) {
-        diagnostics.record("constraints", "parent_context.constraints");
+    // Explicit dispatch constraints (the `agent_tool` `constraints` parameter)
+    // render for fresh-context dispatches too — they are the caller's task
+    // boundary, not inherited conversation state.
+    if !input.constraints.is_empty() {
+        diagnostics.record("constraints", "dispatch_request.constraints");
         sections.push(format!(
             "[constraints]\n{}\n[/constraints]",
-            constraints.join("\n")
+            input.constraints.join("\n")
         ));
     }
     CompiledSubagentInvocation {
@@ -563,6 +562,42 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_constraints_render_in_direct_invocation() {
+        let compiler = EkoSubagentPromptCompiler;
+        let context = parent_context();
+        let compiled = compiler.compile_invocation(&SubagentPromptInput {
+            agent_name: "explorer",
+            task: "检查约束",
+            mode: ExecutionMode::Sync,
+            transfer_policy: ContextTransferPolicy::Fresh,
+            parent_context: Some(&context),
+            inherit_history: None,
+            payload: None,
+            constraints: &[
+                "只读，不修改文件".to_string(),
+                "不要碰 src/legacy".to_string(),
+            ],
+        });
+        assert_eq!(compiled.diagnostics.count("constraints"), 1);
+        assert!(compiled.task_input.contains("[constraints]"));
+        assert!(compiled.task_input.contains("只读，不修改文件"));
+        assert!(compiled.task_input.contains("src/legacy"));
+
+        let empty = compiler.compile_invocation(&SubagentPromptInput {
+            agent_name: "explorer",
+            task: "检查约束",
+            mode: ExecutionMode::Sync,
+            transfer_policy: ContextTransferPolicy::Fresh,
+            parent_context: None,
+            inherit_history: None,
+            payload: None,
+            constraints: &[],
+        });
+        assert_eq!(empty.diagnostics.count("constraints"), 0);
+        assert!(!empty.task_input.contains("[constraints]"));
+    }
+
+    #[test]
     fn direct_planned_and_fork_invocations_have_structured_cardinality() -> Result<(), String> {
         let compiler = EkoSubagentPromptCompiler;
         let context = parent_context();
@@ -593,6 +628,7 @@ mod tests {
                 parent_context: Some(&context),
                 inherit_history: None,
                 payload: None,
+                constraints: &[],
             });
             assert_eq!(direct.diagnostics.count("user-goal"), 1);
             assert_eq!(direct.diagnostics.count("task"), 1);
@@ -606,6 +642,7 @@ mod tests {
                 parent_context: Some(&context),
                 inherit_history: None,
                 payload: Some(&payload),
+                constraints: &[],
             });
             assert_eq!(planned.diagnostics.count("user-goal"), 1);
             assert_eq!(planned.diagnostics.count("task"), 1);
@@ -620,6 +657,7 @@ mod tests {
                 parent_context: Some(&context),
                 inherit_history: Some(2),
                 payload: None,
+                constraints: &[],
             });
             assert_eq!(fork.history.len(), 2);
             assert!(
@@ -636,6 +674,7 @@ mod tests {
                 parent_context: Some(&context),
                 inherit_history: Some(2),
                 payload: None,
+                constraints: &[],
             });
             assert!(teammate.history.is_empty());
         }
@@ -660,6 +699,7 @@ mod tests {
             parent_context: None,
             inherit_history: None,
             payload: Some(&payload),
+            constraints: &[],
         });
 
         assert_eq!(compiled.diagnostics.count("user-goal"), 1);
