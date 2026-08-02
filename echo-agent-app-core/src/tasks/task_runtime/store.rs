@@ -1529,7 +1529,7 @@ impl TaskRuntimeStore {
                             let execution_id = task.and_then(|task| {
                                 task.claim
                                     .as_ref()
-                                    .map(|claim| claim.execution_id(&task.id))
+                                    .map(|claim| claim.execution_id(&run.run_id, &task.id))
                             });
                             let completed_subagent = execution_id.as_deref().and_then(|id| {
                                 self.recoverable_subagent_result(&run.run_id, &todo.task_id, id)
@@ -2537,7 +2537,7 @@ mod tests {
                 ));
             }
         };
-        let execution_id = claim.execution_id("t1");
+        let execution_id = claim.execution_id("r1", "t1");
         store.record_subagent_assigned("r1", "t1", &execution_id, "subagent", 1, true)?;
         let result = SubagentTaskResult::terminal(
             SubagentRunStatus::Completed,
@@ -2929,7 +2929,7 @@ mod tests {
                 .stable_hash()
                 .map_err(StoreError::InvalidPlan)?,
         };
-        let old_execution_id = old_claim.execution_id(&original.id);
+        let old_execution_id = old_claim.execution_id("r1", &original.id);
         let durable_result = SubagentTaskResult::terminal(
             SubagentRunStatus::Completed,
             "old spec result",
@@ -2979,7 +2979,7 @@ mod tests {
                 ));
             }
         };
-        let new_execution_id = new_claim.execution_id(&patched_task.id);
+        let new_execution_id = new_claim.execution_id("r1", &patched_task.id);
 
         assert_ne!(old_execution_id, new_execution_id);
         assert_ne!(old_claim.spec_hash, new_claim.spec_hash);

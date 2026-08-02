@@ -15,9 +15,18 @@ const MAX_EVENTS = 500;
 
 /// P1-7: 防止 polling 的 refresh 重叠。模块级而非 state 字段, 避免触发渲染。
 let refreshInFlight = false;
+let loadGeneration = 0;
+let refreshRequestGeneration = 0;
 
 import { create } from 'zustand';
-import { taskRuntimeApi } from '../api/endpoints';
+import { taskRuntimeApi, toolExecutionApi } from '../api/endpoints';
+import { ingestTaskRuntimeSubagentEvents } from './subagentRunStore';
+import {
+  ingestTaskRuntimeToolExecutions,
+  mergeTaskRuntimeToolExecutions,
+  taskRuntimeToolExecutions,
+  useToolExecutionStore,
+} from './toolExecutionStore';
 import type {
   TaskRun,
   TaskPlan,
@@ -154,6 +163,9 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   refresh: async (runId: string) => {
+    const generation = loadGeneration;
+    const requestGeneration = refreshRequestGeneration + 1;
+    refreshRequestGeneration = requestGeneration;
     // P1-7: refreshInFlight 防止 polling 重叠; finally 确保异常时也清除。
     refreshInFlight = true;
     try {
@@ -161,6 +173,9 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         taskRuntimeApi.getRun(runId),
         taskRuntimeApi.listEvents(runId, get().lastSeq),
       ]);
+      if (generation !== loadGeneration || requestGeneration !== refreshRequestGeneration) {
+        return;
+      }
       const lastSeq = events.length ? events[events.length - 1].seq : get().lastSeq;
       if (!run) {
         set({
@@ -175,6 +190,11 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         return;
       }
       const { plan, todos, artifacts, recoveryBlockers } = await loadRunSnapshot(run);
+      if (generation !== loadGeneration || requestGeneration !== refreshRequestGeneration) {
+        return;
+      }
+      ingestTaskRuntimeSubagentEvents(run, plan, events);
+      ingestTaskRuntimeToolExecutions(run, events);
       set({
         activeRun: run,
         plan,
@@ -188,13 +208,19 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         error: null,
       });
     } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
+      if (generation === loadGeneration && requestGeneration === refreshRequestGeneration) {
+        set({ error: e instanceof Error ? e.message : String(e) });
+      }
     } finally {
-      refreshInFlight = false;
+      if (requestGeneration === refreshRequestGeneration) refreshInFlight = false;
     }
   },
 
   loadByConversation: async (conversationId: string) => {
+    const generation = loadGeneration + 1;
+    loadGeneration = generation;
+    refreshRequestGeneration += 1;
+    refreshInFlight = false;
     // Loading a conversation is also the lifecycle boundary for polling. The
     // run_started event and app restoration both enter through this method, so
     // leaving polling to the chat command response can strand the panel on its
@@ -202,18 +228,36 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     get().stopPolling();
     try {
       const run = await taskRuntimeApi.latestRunForConversation(conversationId);
+      if (generation !== loadGeneration) return;
       if (run) {
         // Reset event cursor when switching runs so we don't cross streams.
         set({ events: [], lastSeq: '0' });
-        const { plan, todos, artifacts, recoveryBlockers } = await loadRunSnapshot(run);
+        const [{ plan, todos, artifacts, recoveryBlockers }, events, persistedTools] =
+          await Promise.all([
+            loadRunSnapshot(run),
+            taskRuntimeApi.listEvents(run.run_id, '0'),
+            toolExecutionApi.list(run.conversation_id).catch((error) => {
+              console.warn('[TaskRuntime] Failed to restore persisted tool executions:', error);
+              return [];
+            }),
+          ]);
+        if (generation !== loadGeneration) return;
+        const lastSeq = events.length ? events[events.length - 1].seq : '0';
+        ingestTaskRuntimeSubagentEvents(run, plan, events);
+        useToolExecutionStore
+          .getState()
+          .hydrateConversation(
+            run.conversation_id,
+            mergeTaskRuntimeToolExecutions(persistedTools, taskRuntimeToolExecutions(run, events))
+          );
         set({
           activeRun: run,
           plan,
           todos,
-          events: [],
+          events: events.slice(-MAX_EVENTS),
           artifacts,
           recoveryBlockers,
-          lastSeq: '0',
+          lastSeq,
           error: null,
         });
         if (run.status === 'pending' || run.status === 'running' || run.status === 'paused') {
@@ -228,10 +272,13 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           artifacts: [],
           recoveryBlockers: [],
           lastSeq: '0',
+          error: null,
         });
       }
     } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
+      if (generation === loadGeneration) {
+        set({ error: e instanceof Error ? e.message : String(e) });
+      }
     }
   },
 
@@ -326,6 +373,9 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   reset: () => {
+    loadGeneration += 1;
+    refreshRequestGeneration += 1;
+    refreshInFlight = false;
     get().stopPolling();
     set({
       activeRun: null,

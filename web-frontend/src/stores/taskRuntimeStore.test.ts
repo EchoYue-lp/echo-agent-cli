@@ -12,14 +12,20 @@ const mocks = vi.hoisted(() => ({
   listRecoveryBlockers: vi.fn(),
   getRun: vi.fn(),
   listEvents: vi.fn(),
+  listToolExecutions: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
   taskRuntimeApi: mocks,
+  toolExecutionApi: { list: mocks.listToolExecutions },
 }));
 
 import type { TaskPlan, TaskRun } from '../generated';
+import { subagentRunStoreKey, useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
+import { useToolExecutionStore } from './toolExecutionStore';
+
+const originalRefresh = useTaskRuntimeStore.getState().refresh;
 
 function run(status: TaskRun['status']): TaskRun {
   return {
@@ -38,6 +44,14 @@ function run(status: TaskRun['status']): TaskRun {
   };
 }
 
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
+
 describe('taskRuntimeStore recovery controls', () => {
   const refresh = vi.fn().mockResolvedValue(undefined);
 
@@ -53,6 +67,10 @@ describe('taskRuntimeStore recovery controls', () => {
       error: null,
       refresh,
     });
+  });
+
+  afterEach(() => {
+    useTaskRuntimeStore.setState({ refresh: originalRefresh });
   });
 
   it('pauses through the shared runtime API and refreshes the canonical run', async () => {
@@ -114,12 +132,17 @@ describe('taskRuntimeStore recovery controls', () => {
 
 describe('taskRuntimeStore conversation loading', () => {
   beforeEach(() => {
+    useTaskRuntimeStore.setState({ refresh: originalRefresh });
     useTaskRuntimeStore.getState().reset();
     vi.clearAllMocks();
     mocks.getPlan.mockResolvedValue(null);
     mocks.listTodos.mockResolvedValue([]);
     mocks.listArtifacts.mockResolvedValue([]);
     mocks.listRecoveryBlockers.mockResolvedValue([]);
+    mocks.listEvents.mockResolvedValue([]);
+    mocks.listToolExecutions.mockResolvedValue([]);
+    useSubagentRunStore.getState().clear();
+    useToolExecutionStore.getState().clear();
   });
 
   afterEach(() => {
@@ -139,5 +162,107 @@ describe('taskRuntimeStore conversation loading', () => {
 
     expect(useTaskRuntimeStore.getState().activeRun?.status).toBe('completed');
     expect(useTaskRuntimeStore.getState().pollingInterval).toBeNull();
+  });
+
+  it('hydrates the prior Subagent GUI from the run event history', async () => {
+    mocks.latestRunForConversation.mockResolvedValueOnce(run('running'));
+    mocks.getPlan.mockResolvedValueOnce({
+      tasks: [
+        {
+          id: 'task-1',
+          title: 'CLI 层架构分析',
+          description: '分析 CLI 层',
+          agent_role: 'explorer',
+        },
+      ],
+    } as TaskPlan);
+    mocks.listEvents.mockResolvedValueOnce([
+      {
+        seq: '5',
+        run_id: 'run-1',
+        task_id: 'task-1',
+        step_id: 'run-1:task-1:1:1',
+        event_type: 'subagent_assigned',
+        payload: { execution_id: 'run-1:task-1:1:1', agent_name: 'explorer' },
+        timestamp: '2026-07-30T01:02:03Z',
+      },
+    ]);
+
+    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+
+    expect(mocks.listEvents).toHaveBeenCalledWith('run-1', '0');
+    expect(useTaskRuntimeStore.getState().lastSeq).toBe('5');
+    expect(
+      useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'run-1:task-1:1:1')]
+    ).toMatchObject({
+      status: 'running',
+      agent: 'explorer',
+      messageId: 'message-1',
+      conversationId: 'conversation-1',
+    });
+  });
+
+  it('restores persisted Subagent tool execution summaries with the run', async () => {
+    mocks.latestRunForConversation.mockResolvedValueOnce(run('completed'));
+    mocks.listToolExecutions.mockResolvedValueOnce([
+      {
+        id: 'tool-detail-1',
+        call_id: 'call-1',
+        owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
+        conversation_id: 'conversation-1',
+        run_id: 'run-1',
+        name: 'read_file',
+        args_preview: '{"path":"src/main.rs"}',
+        status: 'succeeded',
+        started_at: 100,
+        finished_at: 120,
+        duration_ms: 20,
+        detail_ref: 'tool-detail-1',
+      },
+    ]);
+
+    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+
+    expect(mocks.listToolExecutions).toHaveBeenCalledWith('conversation-1');
+    expect(useToolExecutionStore.getState().tools['tool-detail-1']).toMatchObject({
+      name: 'read_file',
+      status: 'succeeded',
+      owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
+    });
+  });
+
+  it('ignores a stale conversation load that resolves after the active conversation', async () => {
+    const first = deferred<TaskRun | null>();
+    const secondRun = {
+      ...run('completed'),
+      run_id: 'run-2',
+      conversation_id: 'conversation-2',
+      root_message_id: 'message-2',
+    };
+    mocks.latestRunForConversation
+      .mockReturnValueOnce(first.promise)
+      .mockResolvedValueOnce(secondRun);
+
+    const firstLoad = useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+    const secondLoad = useTaskRuntimeStore.getState().loadByConversation('conversation-2');
+    await secondLoad;
+    first.resolve(run('completed'));
+    await firstLoad;
+
+    expect(useTaskRuntimeStore.getState().activeRun?.run_id).toBe('run-2');
+  });
+
+  it('ignores an older refresh that resolves after a newer terminal refresh', async () => {
+    const staleRun = deferred<TaskRun | null>();
+    mocks.getRun.mockReturnValueOnce(staleRun.promise).mockResolvedValueOnce(run('completed'));
+    mocks.listEvents.mockResolvedValue([]);
+
+    const staleRefresh = useTaskRuntimeStore.getState().refresh('run-1');
+    const terminalRefresh = useTaskRuntimeStore.getState().refresh('run-1');
+    await terminalRefresh;
+    staleRun.resolve(run('running'));
+    await staleRefresh;
+
+    expect(useTaskRuntimeStore.getState().activeRun?.status).toBe('completed');
   });
 });

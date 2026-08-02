@@ -213,13 +213,9 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
             capabilities,
             SUGGESTED_TASKS_POLICY.to_string(),
             SUBAGENT_LANGUAGE_POLICY.to_string(),
-            SUBAGENT_RESULT_QUALITY_POLICY.to_string(),
-            render_result_contract(),
         ];
-        // Static environment grounding (OS/arch/date) is registration-time
-        // stable, so it belongs in the system prompt. Per-dispatch state
-        // (working dir, workspace root) must NOT be compiled here — it changes
-        // with worktree/workspace isolation and is rendered per invocation.
+        // Only facts that remain stable for the Agent lifetime belong here.
+        // Date and working directory are rendered per invocation.
         if let Some(env) = input
             .environment
             .as_deref()
@@ -229,6 +225,8 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
             diagnostics.record("environment", "eko.static_environment");
             sections.push(format!("## Environment\n{env}"));
         }
+        sections.push(SUBAGENT_RESULT_QUALITY_POLICY.to_string());
+        sections.push(render_result_contract());
 
         CompiledSubagentSystemPrompt {
             system_prompt: sections.join("\n\n"),
@@ -271,6 +269,7 @@ fn compile_direct_invocation(
 ) -> CompiledSubagentInvocation {
     let mut diagnostics = PromptDiagnostics::default();
     let mut sections = Vec::new();
+    append_dynamic_environment(&mut sections, &mut diagnostics);
     if let Some(goal) = input
         .parent_context
         .and_then(|context| context.parent_goal.as_deref())
@@ -314,6 +313,7 @@ fn compile_planned_invocation(
         diagnostics.record("workspace", "task_runtime.working_dir");
         sections.push(format!("[workspace]\n- root: {root}\n[/workspace]"));
     }
+    append_dynamic_environment(&mut sections, &mut diagnostics);
 
     let mut context = String::from("[task_context]\n");
     diagnostics.record("domain", "task.domain_profile");
@@ -387,6 +387,14 @@ fn compile_planned_invocation(
         history,
         diagnostics,
     }
+}
+
+fn append_dynamic_environment(sections: &mut Vec<String>, diagnostics: &mut PromptDiagnostics) {
+    diagnostics.record("date", "runtime.local_date");
+    sections.push(format!(
+        "[environment]\n- Date: {}\n[/environment]",
+        chrono::Local::now().format("%Y-%m-%d")
+    ));
 }
 
 fn append_dependencies(
@@ -494,6 +502,7 @@ mod tests {
                 0,
                 "environment section must be absent when no environment is provided"
             );
+            assert!(compiled.system_prompt.ends_with(&render_result_contract()));
         }
     }
 
@@ -508,11 +517,12 @@ mod tests {
             readonly: true,
             can_delegate: false,
             isolation,
-            environment: Some("- OS: macos (aarch64)\n- Date: 2026-08-01".to_string()),
+            environment: Some("- OS: macos (aarch64)".to_string()),
         });
         assert_eq!(with_env.diagnostics.count("environment"), 1);
         assert_eq!(with_env.system_prompt.matches("## Environment").count(), 1);
         assert!(with_env.system_prompt.contains("- OS: macos (aarch64)"));
+        assert!(with_env.system_prompt.ends_with(&render_result_contract()));
 
         let without_env = compiler.compile_system(&SubagentSystemPromptInput {
             name: "env-test",
@@ -579,7 +589,9 @@ mod tests {
             ],
         });
         assert_eq!(compiled.diagnostics.count("constraints"), 1);
+        assert_eq!(compiled.diagnostics.count("date"), 1);
         assert!(compiled.task_input.contains("[constraints]"));
+        assert_eq!(compiled.task_input.matches("- Date:").count(), 1);
         assert!(compiled.task_input.contains("只读，不修改文件"));
         assert!(compiled.task_input.contains("src/legacy"));
 
@@ -632,6 +644,7 @@ mod tests {
             });
             assert_eq!(direct.diagnostics.count("user-goal"), 1);
             assert_eq!(direct.diagnostics.count("task"), 1);
+            assert_eq!(direct.diagnostics.count("date"), 1);
             assert!(direct.history.is_empty());
 
             let planned = compiler.compile_invocation(&SubagentPromptInput {
@@ -647,6 +660,9 @@ mod tests {
             assert_eq!(planned.diagnostics.count("user-goal"), 1);
             assert_eq!(planned.diagnostics.count("task"), 1);
             assert_eq!(planned.diagnostics.count("dependencies"), 1);
+            assert_eq!(planned.diagnostics.count("workspace"), 1);
+            assert_eq!(planned.diagnostics.count("date"), 1);
+            assert_eq!(planned.task_input.matches("[workspace]").count(), 1);
             assert!(planned.history.is_empty());
 
             let fork = compiler.compile_invocation(&SubagentPromptInput {

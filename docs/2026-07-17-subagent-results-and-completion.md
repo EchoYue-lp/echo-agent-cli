@@ -57,7 +57,7 @@ M7 将 Subagent 的“执行已经结束”和父任务的“需求已经满足�
       "kind": "report",
       "bytes": 1234,
       "sha256": "64-hex",
-      "producer_execution_id": "task_id:plan_revision:attempt",
+      "producer_execution_id": "run_id:task_id:plan_revision:attempt",
       "available": true
     }
   ],
@@ -105,7 +105,7 @@ Skipped 是显式放弃的任务事实，不伪装成成功；存在 Skipped 时
 ## 2026-07-24 展示与 identity 修正
 
 本轮修复锁定两个不同 identity：`task_id` 是稳定的 PlanTask 节点，
-`subagent_run_id = execution_id = {task_id}:{plan_revision}:{attempt}` 是一次
+`subagent_run_id = execution_id = {run_id}:{task_id}:{plan_revision}:{attempt}` 是一次
 真实执行。2026-07-27 增加 revision 维度，防止 TaskSpec 更新后复用旧 durable
 result。
 前端可以按 `task_id` 选择最新 attempt 展示，但 store、事件、usage、artifact

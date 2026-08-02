@@ -3,12 +3,12 @@
 //! Read-only query commands, mutations for creating/managing task runs,
 //! subagent execution, and route feedback learning.
 
+use crate::tauri::commands::chat::TauriExecutionProjector;
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 
 use echo_agent_app_core::tasks::task_runtime::types::*;
 use std::sync::Arc;
-use tauri::Emitter;
 
 // ── Helper: borrow the store or error ────────────────────────────────────
 
@@ -247,20 +247,13 @@ pub async fn resume_task_run(
         .map_err(internal)?;
     store.resume_task_run(&run_id).map_err(internal)?;
     tracing::info!(run_id = %run_id, "task run resumed -> Running");
+    let execution_projector = Arc::new(TauriExecutionProjector::new(
+        app,
+        state.app_state.storage.tool_executions.clone(),
+        Some(store.clone()),
+    ));
     let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
-        // Forward run-level lifecycle events to the unified
-        // `execution://event` channel (kind="run"). The frontend reads
-        // these to track run start/complete/fail/cancel transitions.
-        let mut payload = serde_json::Map::new();
-        payload.insert("kind".into(), "run".into());
-        payload.insert("run_id".into(), ev.run_id.into());
-        payload.insert("event".into(), ev.event.into());
-        if let serde_json::Value::Object(fields) = ev.payload {
-            for (k, v) in fields {
-                payload.insert(k, v);
-            }
-        }
-        let _ = app.emit("execution://event", serde_json::Value::Object(payload));
+        execution_projector.emit(ev);
     });
     let run_id_for_task = run_id.clone();
 
@@ -305,7 +298,7 @@ pub async fn resume_task_run(
 /// auto-redispatches on acceptance failure (M7). Bumps `retry_count`,
 /// resets the task to Pending, transitions the run to Running, and spawns
 /// the executor. Title and description are preserved; the next attempt
-/// gets a fresh `execution_id = "{task_id}:{retry_count+1}"`.
+/// gets a fresh `execution_id = "{run_id}:{task_id}:{plan_revision}:{attempt}"`.
 ///
 /// Honors the `max_retries` budget: returns a validation error when
 /// `retry_count >= max_retries`.
@@ -356,17 +349,13 @@ pub async fn retry_blocked_task(
     // Run was already transitioned to Running inside retry_blocked_task's
     // atomic section. Skip resume_task_run here — it would re-attempt the
     // Paused → Running transition and fail with IllegalTransition.
+    let execution_projector = Arc::new(TauriExecutionProjector::new(
+        app,
+        state.app_state.storage.tool_executions.clone(),
+        Some(store.clone()),
+    ));
     let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
-        let mut payload = serde_json::Map::new();
-        payload.insert("kind".into(), "run".into());
-        payload.insert("run_id".into(), ev.run_id.into());
-        payload.insert("event".into(), ev.event.into());
-        if let serde_json::Value::Object(fields) = ev.payload {
-            for (k, v) in fields {
-                payload.insert(k, v);
-            }
-        }
-        let _ = app.emit("execution://event", serde_json::Value::Object(payload));
+        execution_projector.emit(ev);
     });
     let run_id_for_task = run_id.clone();
 

@@ -5,6 +5,9 @@ import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
 import type { ChatMessage, ExecutionStep, SavedMessage } from '../types/api';
 
+let loadGeneration = 0;
+let loadingConversationId: string | null = null;
+
 // ── Types ──
 
 export interface ConversationMeta {
@@ -91,12 +94,13 @@ function generateId(): string {
   return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
+export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
   const saved: SavedMessage[] = [];
 
   for (const m of messages) {
     // Save the main message
     const entry: SavedMessage = {
+      message_id: m.id,
       role: m.role,
       content: m.content,
     };
@@ -137,6 +141,14 @@ function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
   }
 
   return saved;
+}
+
+export function restoredMessageId(
+  conversationId: string,
+  index: number,
+  message: SavedMessage
+): string {
+  return message.message_id ?? `loaded-${conversationId}-${index}`;
 }
 
 // ── Store ──
@@ -225,6 +237,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   loadConversation: async (id: string) => {
+    const generation = loadGeneration + 1;
+    loadGeneration = generation;
+    loadingConversationId = id;
     set({ isLoading: true });
 
     try {
@@ -232,7 +247,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         conversationApi.get(id),
         toolExecutionApi.list(id),
       ]);
-      useToolExecutionStore.getState().replaceAll(tools);
+      if (generation !== loadGeneration) return;
 
       // Restore agent context on the backend so conversation can continue
       try {
@@ -240,6 +255,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       } catch (e) {
         console.error('Failed to restore agent context:', e);
       }
+      if (generation !== loadGeneration) return;
+      useToolExecutionStore.getState().hydrateConversation(id, tools);
 
       // Convert user/assistant messages for display. Tool-role payloads stay in
       // the agent context; the GUI renders tools from lightweight summaries.
@@ -250,7 +267,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             // P2-7: 此前用 `loaded-${Date.now()}-${idx}`, 每次加载产生不同 id,
             // React key 变化导致消息列表全量重渲染。改用会话 id + 索引, 同一会话
             // 每次加载产生确定性 id, key 稳定。timestamp 仍用 now (无服务端时间)。
-            id: `loaded-${id}-${idx}`,
+            id: restoredMessageId(id, idx, m),
             role: m.role as 'user' | 'assistant',
             content: m.content || '',
             isStreaming: false,
@@ -302,15 +319,24 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       chatStore.setHistoryView(false); // Agent has context, can continue chatting
 
       set({ activeId: id, isLoading: false });
+      loadingConversationId = null;
     } catch (e) {
       console.error('Failed to load conversation:', e);
-      set({ isLoading: false });
+      if (generation === loadGeneration) {
+        loadingConversationId = null;
+        set({ isLoading: false });
+      }
     }
   },
 
   deleteConversation: async (id: string) => {
     // P1-12: 此前 catch 吞错后仍执行本地删除 → 后端还在但前端已移除,
     // 刷新后数据"恢复"又"丢失", 体验混乱。改为 API 失败则不更新本地 + 报错。
+    if (get().activeId === id || loadingConversationId === id) {
+      loadGeneration += 1;
+      loadingConversationId = null;
+      set({ isLoading: false });
+    }
     try {
       await conversationApi.delete(id);
     } catch (e) {
@@ -349,6 +375,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   startNew: async () => {
+    loadGeneration += 1;
+    loadingConversationId = null;
+    set({ isLoading: false });
     // Save current conversation first — must not block clearing even if save fails
     const currentMessages = useChatStore.getState().messages;
     if (currentMessages.length > 0) {
@@ -369,10 +398,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     // Always clear — this is the user's expected outcome
     useChatStore.getState().clearMessages();
     useToolExecutionStore.getState().clear();
-    set({ activeId: null });
+    set({ activeId: null, isLoading: false });
   },
 
   clearCurrent: async () => {
+    loadGeneration += 1;
+    loadingConversationId = null;
+    set({ isLoading: false });
     try {
       await sessionApi.reset();
     } catch (e) {
@@ -381,7 +413,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
     useChatStore.getState().clearMessages();
     useToolExecutionStore.getState().clear();
-    set({ activeId: null });
+    set({ activeId: null, isLoading: false });
   },
 
   getGroupedConversations: () => {

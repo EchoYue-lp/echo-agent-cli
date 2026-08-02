@@ -154,7 +154,7 @@ DAG loop, dependency validator, or generic retry state machine.
   applies it only while the same claim is still Running; late results return
   `Superseded` and cannot overwrite cancellation, retry, or a changed plan.
 - Subagent execution identity is now
-  `{task_id}:{plan_revision}:{attempt}`. Durable result lookup therefore cannot
+  `{run_id}:{task_id}:{plan_revision}:{attempt}`. Durable result lookup therefore cannot
   reuse output produced for an older TaskSpec when a plan patch changes the
   specification without increasing `retry_count`.
 - `run-state.json` persists the shared `TaskStatus` separately from

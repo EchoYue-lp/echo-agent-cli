@@ -1,5 +1,11 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { useSubagentRunStore, type ExecutionEvent } from './subagentRunStore';
+import type { RuntimeTaskEvent, TaskPlan, TaskRun } from '../generated';
+import {
+  ingestTaskRuntimeSubagentEvents,
+  subagentRunStoreKey,
+  useSubagentRunStore,
+  type ExecutionEvent,
+} from './subagentRunStore';
 
 describe('subagentRunStore terminal result', () => {
   beforeEach(() => {
@@ -45,7 +51,7 @@ describe('subagentRunStore terminal result', () => {
 
     useSubagentRunStore.getState().ingest(event);
 
-    const run = useSubagentRunStore.getState().runs['task-1:1'];
+    const run = useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'task-1:1')];
     expect(run?.status).toBe('timed_out');
     expect(run?.finalOutput).toBe('partial report body');
     expect(run?.result?.summary).toBe(event.summary);
@@ -77,7 +83,8 @@ describe('subagentRunStore terminal result', () => {
     });
     useSubagentRunStore.getState().ingest({ ...base, event: 'started' });
 
-    const completed = useSubagentRunStore.getState().runs['task-merge:1'];
+    const completed =
+      useSubagentRunStore.getState().runs[subagentRunStoreKey('run-merge', 'task-merge:1')];
     expect(completed?.status).toBe('completed');
     expect(completed?.result?.summary).toBe('implementation finished');
   });
@@ -95,8 +102,110 @@ describe('subagentRunStore terminal result', () => {
     useSubagentRunStore.getState().ingest({ ...base, subagent_run_id: 'task-retry:2' });
 
     expect(Object.keys(useSubagentRunStore.getState().runs).sort()).toEqual([
-      'task-retry:1',
-      'task-retry:2',
+      subagentRunStoreKey('run-retry', 'task-retry:1'),
+      subagentRunStoreKey('run-retry', 'task-retry:2'),
     ]);
+  });
+
+  it('isolates the same legacy execution id across separate TaskRuns', () => {
+    const base = {
+      kind: 'subagent' as const,
+      subagent_run_id: 'task-shared:1:1',
+      task_id: 'task-shared',
+      agent: 'explorer',
+    };
+    useSubagentRunStore.getState().ingest({
+      ...base,
+      run_id: 'run-old',
+      event: 'completed',
+      summary: 'old result',
+    });
+    useSubagentRunStore.getState().ingest({
+      ...base,
+      run_id: 'run-new',
+      event: 'started',
+    });
+
+    expect(
+      useSubagentRunStore.getState().runs[subagentRunStoreKey('run-old', 'task-shared:1:1')]?.status
+    ).toBe('completed');
+    expect(
+      useSubagentRunStore.getState().runs[subagentRunStoreKey('run-new', 'task-shared:1:1')]?.status
+    ).toBe('running');
+  });
+
+  it('restores the existing Subagent card state from durable TaskRuntime events', () => {
+    const taskRun = {
+      run_id: 'run-restored',
+      conversation_id: 'conversation-restored',
+      root_message_id: 'message-restored',
+    } as TaskRun;
+    const plan = {
+      tasks: [
+        {
+          id: 'task-analysis',
+          title: 'CLI 层架构分析',
+          description: '分析 CLI 目录与入口',
+          agent_role: 'explorer',
+        },
+      ],
+    } as TaskPlan;
+    const events = [
+      {
+        seq: '12',
+        run_id: 'run-restored',
+        task_id: 'task-analysis',
+        step_id: 'run-restored:task-analysis:4:1',
+        event_type: 'subagent_assigned',
+        payload: {
+          execution_id: 'run-restored:task-analysis:4:1',
+          agent_name: 'explorer',
+          attempt: 1,
+        },
+        timestamp: '2026-07-30T01:02:03Z',
+      },
+      {
+        seq: '13',
+        run_id: 'run-restored',
+        task_id: 'task-analysis',
+        step_id: 'run-restored:task-analysis:4:1',
+        event_type: 'subagent_released',
+        payload: {
+          execution_id: 'run-restored:task-analysis:4:1',
+          status: 'completed',
+          full_output: 'CLI analysis complete',
+          result: {
+            contract_version: 1,
+            status: 'completed',
+            summary: 'CLI analysis complete',
+            artifacts: [],
+            verification: [],
+            remaining_work: [],
+            touched_files: { read: ['src/cli'], written: [] },
+          },
+        },
+        timestamp: '2026-07-30T01:03:03Z',
+      },
+    ] as unknown as RuntimeTaskEvent[];
+
+    ingestTaskRuntimeSubagentEvents(taskRun, plan, events);
+
+    const restored =
+      useSubagentRunStore.getState().runs[
+        subagentRunStoreKey('run-restored', 'run-restored:task-analysis:4:1')
+      ];
+    expect(restored).toMatchObject({
+      runId: 'run-restored',
+      taskId: 'task-analysis',
+      agent: 'explorer',
+      task: '分析 CLI 目录与入口',
+      conversationId: 'conversation-restored',
+      messageId: 'message-restored',
+      status: 'completed',
+      startedAt: Date.parse('2026-07-30T01:02:03Z'),
+      finalOutput: 'CLI analysis complete',
+    });
+    expect(restored?.result?.summary).toBe('CLI analysis complete');
+    expect(restored?.result?.touched_files.read).toEqual(['src/cli']);
   });
 });

@@ -36,10 +36,13 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   );
   const previousStatus = useRef(run.status);
   const userControlledExpansion = useRef(false);
-  const ownerKey = toolExecutionOwnerKey({
-    kind: 'subagent',
-    subagent_run_id: run.subagentRunId,
-  });
+  const ownerKey = toolExecutionOwnerKey(
+    {
+      kind: 'subagent',
+      subagent_run_id: run.subagentRunId,
+    },
+    run.runId
+  );
   const toolIds = useToolExecutionStore((state) =>
     toolExecutionIdsForOwner(state.idsByOwner, ownerKey)
   );

@@ -127,7 +127,7 @@ EKO 首层 PlanTask subagent 使用 depth 0,默认 max depth 2。普通 role 即
 - `subagentTraceStore` / `subagentDetailStore`
 
 `SubagentRun.subagentRunId` 是一次执行 attempt 的稳定 execution id。正式
-PlanTask 使用 `{task_id}:{plan_revision}:{attempt}`；`task_id` 是 PlanTask 节点
+PlanTask 使用 `{run_id}:{task_id}:{plan_revision}:{attempt}`；`task_id` 是 PlanTask 节点
 identity。revision 维度阻止修改后的 TaskSpec 复用旧 durable result。前端 store
 保留每个 attempt 的独立记录，面向 task 的默认视图选择最新 attempt，不在事件层
 截断或合并 identity。

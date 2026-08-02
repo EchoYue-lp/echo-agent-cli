@@ -7,7 +7,7 @@ import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
-import { useSubagentRunStore } from '../../stores/subagentRunStore';
+import { subagentRunStoreKey, useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { SubagentDetailView } from '../task/SubagentDetailView';
@@ -39,7 +39,9 @@ export function ChatPanel() {
   const selectedSubagentRef = useSubagentDetailStore((s) => s.selected);
   const closeSubagentDetail = useSubagentDetailStore((s) => s.close);
   const selectedSubagent = selectedSubagentRef
-    ? subagentRuns[selectedSubagentRef.subagentRunId]
+    ? subagentRuns[
+        subagentRunStoreKey(selectedSubagentRef.runId, selectedSubagentRef.subagentRunId)
+      ]
     : undefined;
 
   // ── 按需卡片状态 ──

@@ -49,7 +49,7 @@ describe('InlineToolCall', () => {
         duration_ms: null,
       })
     );
-    const ownerIds = useToolExecutionStore.getState().idsByOwner['subagent:task-1:1'];
+    const ownerIds = useToolExecutionStore.getState().idsByOwner['subagent:run-1:task-1:1'];
 
     expect(ownerIds).toEqual(['detail-subagent']);
     expect(useToolExecutionStore.getState().tools['detail-subagent']?.status).toBe('running');

@@ -153,10 +153,10 @@ impl InteractionMode {
                 "Chat mode. Resolve simple requests directly. When a visible task list or delegated execution is useful, use the same task_create/task_update/task_list/task_execute API as every other mode; a single task does not require an artificial wrapper or DAG."
             }
             InteractionMode::Task => {
-                "Task mode. Materialize a formal, reviewable task graph. The TaskRun already represents the overall goal, so never create a wrapper or placeholder task for it. Submit one task or the complete initial DAG with task_create, inspect the returned revision with task_list, and pass it as revision to task_execute. Use task_update with the current base_revision for later changes. Keep task status and verification current. Do not claim dispatch before task_execute starts."
+                "Task mode. Materialize a formal, reviewable task graph. The TaskRun already represents the overall goal, so never create a wrapper or placeholder task for it. Submit the complete initial graph in one task_create call using its tasks array, including when the graph has only one task. Inspect the returned revision with task_list, and pass it as revision to task_execute. Use task_update with the current base_revision for later changes. Keep task status and verification current. Do not claim dispatch before task_execute starts."
             }
             InteractionMode::Auto => {
-                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. When a visible task list, Subagent delegation, multi-step work, dependencies, or parallelism is useful, create one task or an atomic task batch with task_create, inspect the revision with task_list, and pass it as revision to task_execute. Use task_update for later changes. Do not dispatch ad-hoc Subagents in Auto mode."
+                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. When a visible task list, Subagent delegation, multi-step work, dependencies, or parallelism is useful, submit the complete graph in one task_create call using its tasks array, including for a single task. Inspect the revision with task_list, and pass it as revision to task_execute. Use task_update for later changes. Do not dispatch ad-hoc Subagents in Auto mode."
             }
         }
     }
@@ -1329,7 +1329,7 @@ pub struct Artifact {
 // 不持有 executions 字段(避免污染 plan artifact)。
 //
 // `subagent_run_id` 与框架 SubagentEvent.execution_id 对齐(正式 PlanTask 格式
-// "{task_id}:{plan_revision}:{attempt}"),由 TaskRuntime 派发时生成并经
+// "{run_id}:{task_id}:{plan_revision}:{attempt}"),由 TaskRuntime 派发时生成并经
 // ExternalRunContext 透传,不再由 tauri bridge 临时分配(消除双账本)。
 
 /// Lifecycle status of a [`SubagentRun`]. Mirrors the coarse states the
@@ -1552,7 +1552,7 @@ pub struct SubagentRunUsage {
 #[ts(export, rename = "SubagentRun")]
 pub struct SubagentRun {
     /// Stable execution id. Formal PlanTasks use
-    /// "{task_id}:{plan_revision}:{attempt}". Aligns with
+    /// "{run_id}:{task_id}:{plan_revision}:{attempt}". Aligns with
     /// `SubagentEvent::execution_id`.
     pub subagent_run_id: String,
     /// Parent [`TaskRun`] id.

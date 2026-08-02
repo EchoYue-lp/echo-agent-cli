@@ -1,4 +1,4 @@
-import { useState, memo } from 'react';
+import { memo, useState } from 'react';
 import { Brain, ChevronDown, ChevronRight } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 
@@ -14,7 +14,8 @@ interface ThinkingSegmentProps {
 
 /**
  * One "thinking" segment in the inline one-stream layout.
- * Collapsible; expanded by default while streaming, collapsed after streaming ends.
+ * Expanded while the task is live. Completed history is collapsed, while each
+ * segment remains individually expandable inside the execution-process group.
  */
 export const ThinkingSegment = memo(function ThinkingSegment({
   index,
@@ -29,8 +30,11 @@ export const ThinkingSegment = memo(function ThinkingSegment({
   return (
     <div className="my-1 border-l border-[var(--border-primary)] pl-3">
       <button
+        type="button"
         onClick={() => setExpanded((e) => !e)}
         className="flex w-full items-center gap-1.5 py-0.5 text-left"
+        aria-expanded={expanded}
+        aria-label={expanded ? `折叠${label}` : `展开${label}`}
       >
         {expanded ? (
           <ChevronDown size={11} className="text-[var(--text-tertiary)]" />

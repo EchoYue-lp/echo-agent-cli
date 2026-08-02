@@ -16,8 +16,9 @@ use state::TauriState;
 use std::sync::Arc;
 use tauri::Emitter;
 
-fn task_id_from_subagent_execution_id(execution_id: &str) -> Option<String> {
-    let mut parts = execution_id.rsplitn(3, ':');
+fn task_id_from_subagent_execution_id(execution_id: &str, run_id: &str) -> Option<String> {
+    let scoped = execution_id.strip_prefix(run_id)?.strip_prefix(':')?;
+    let mut parts = scoped.rsplitn(3, ':');
     let attempt = parts.next()?;
     let revision = parts.next()?;
     let task_id = parts.next()?;
@@ -692,12 +693,15 @@ pub fn build_tauri_app(
                                 payload.insert("kind".into(), "subagent".into());
                                 // `task_id` identifies the stable plan node, while
                                 // `subagent_run_id` identifies this concrete attempt.
-                                // Keeping `{task_id}:{plan_revision}:{attempt}` intact
+                                // Keeping `{run_id}:{task_id}:{plan_revision}:{attempt}` intact
                                 // prevents late events from an older spec or retry
                                 // overwriting newer lifecycle, usage, or terminal data.
-                                let task_id_owned: Option<String> = execution_id
-                                    .as_deref()
-                                    .and_then(task_id_from_subagent_execution_id);
+                                let task_id_owned: Option<String> =
+                                    execution_id.as_deref().and_then(|execution_id| {
+                                        run_id.as_deref().and_then(|run_id| {
+                                            task_id_from_subagent_execution_id(execution_id, run_id)
+                                        })
+                                    });
                                 let subagent_run_id_owned: String = execution_id
                                     .clone()
                                     .unwrap_or_else(|| format!("{agent_name}:unknown"));
@@ -763,13 +767,13 @@ mod tests {
 
     #[test]
     fn execution_attempt_keeps_full_identity_and_extracts_only_the_task_join_key() {
-        let execution_id = "phase:task-1:7:2";
+        let execution_id = "run-1:phase:task-1:7:2";
         assert_eq!(
-            task_id_from_subagent_execution_id(execution_id).as_deref(),
+            task_id_from_subagent_execution_id(execution_id, "run-1").as_deref(),
             Some("phase:task-1")
         );
-        assert_eq!(execution_id, "phase:task-1:7:2");
-        assert!(task_id_from_subagent_execution_id("phase:task-1").is_none());
-        assert!(task_id_from_subagent_execution_id("phase:task-1:2").is_none());
+        assert_eq!(execution_id, "run-1:phase:task-1:7:2");
+        assert!(task_id_from_subagent_execution_id("phase:task-1", "run-1").is_none());
+        assert!(task_id_from_subagent_execution_id("run-2:phase:task-1:7:2", "run-1").is_none());
     }
 }

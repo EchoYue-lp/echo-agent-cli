@@ -88,7 +88,7 @@ pub struct ExecEvent {
     /// Plan node identity. Present on task and Subagent events.
     pub task_id: Option<String>,
     /// One concrete Subagent execution identity
-    /// (`{task_id}:{plan_revision}:{attempt}`).
+    /// (`{run_id}:{task_id}:{plan_revision}:{attempt}`).
     /// Present only when `scope == Subagent`.
     pub subagent_run_id: Option<String>,
     pub event: String,
@@ -167,8 +167,12 @@ fn emit_exec(sink: Option<&ExecSink>, ev: ExecEvent) {
     }
 }
 
-fn subagent_execution_id(task_id: &str, claim: &echo_agent::tasks::TaskClaim) -> String {
-    claim.execution_id(task_id)
+fn subagent_execution_id(
+    run_id: &str,
+    task_id: &str,
+    claim: &echo_agent::tasks::TaskClaim,
+) -> String {
+    claim.execution_id(run_id, task_id)
 }
 
 fn task_isolation_id(run_id: &str, task_id: &str) -> String {
@@ -1182,7 +1186,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         runtime_task: echo_agent::tasks::Task,
     ) -> echo_agent::error::Result<Self::DispatchOutput> {
         let task = self.plan_task(&runtime_task.spec.id)?;
-        let execution_id = subagent_execution_id(&task.id, &claim);
+        let execution_id = subagent_execution_id(&context.run_id, &task.id, &claim);
         match self
             .store
             .recoverable_subagent_result(&context.run_id, &task.id, &execution_id)
@@ -1404,7 +1408,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 if !self.claim_is_current(run_id, &task.id, &claim)? {
                     return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
                 }
-                let execution_id = subagent_execution_id(&task.id, &claim);
+                let execution_id = subagent_execution_id(run_id, &task.id, &claim);
                 match integrate_reviewed_task(
                     self.dispatcher.clone(),
                     self.store.clone(),
@@ -1795,7 +1799,7 @@ async fn execute_task(
     // A PlanTask is a stable plan node; each dispatch attempt is a distinct
     // SubagentRun. Never collapse retries back to the bare task id.
     let attempt = claim.attempt;
-    let execution_id = subagent_execution_id(&task_id, &claim);
+    let execution_id = subagent_execution_id(&run_id, &task_id, &claim);
     let contract = subagent_runtime_contract(&primary_agent, &task.agent_role, &task.kind).await;
     tracing::info!(
         run_id = %run_id,
@@ -1962,7 +1966,10 @@ async fn execute_task(
     let dep_summaries = collect_dependency_summaries(&store, &run_id, &task);
     let parent_goal = store.get_run(&run_id).ok().flatten().map(|run| run.goal);
 
-    let workspace_root = primary_agent.read(|agent| agent.working_dir()).await;
+    let workspace_root = primary_workspace_root_for_prompt(
+        &contract.isolation_requested,
+        primary_agent.read(|agent| agent.working_dir()).await,
+    );
     let prompt_payload = crate::subagent_prompt::EkoPromptPayload::planned_task(
         &task,
         &dep_summaries,
@@ -2522,6 +2529,13 @@ struct SubagentRuntimeContract {
     isolation_requested: String,
     context_in: String,
     returns: String,
+}
+
+fn primary_workspace_root_for_prompt(
+    isolation_requested: &str,
+    workspace_root: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    workspace_root.filter(|_| !matches!(isolation_requested, "worktree" | "workspace"))
 }
 
 fn runtime_contract_started_payload(
@@ -4056,7 +4070,7 @@ mod tests {
             agent_role: "implementer".to_string(),
             ..PlanTask::default()
         };
-        let started = runtime_contract_started_payload(&contract, &task, "task-1:7:2");
+        let started = runtime_contract_started_payload(&contract, &task, "run-1:task-1:7:2");
         if started.get("isolation").is_some() {
             return Err(
                 "legacy isolation field must not claim configured isolation happened".into(),
@@ -4072,7 +4086,8 @@ mod tests {
         if started.get("isolation_observed").is_some() {
             return Err("started event must not invent observed isolation".into());
         }
-        if started.get("execution_id").and_then(|value| value.as_str()) != Some("task-1:7:2") {
+        if started.get("execution_id").and_then(|value| value.as_str()) != Some("run-1:task-1:7:2")
+        {
             return Err("started event must preserve the revision-scoped execution id".into());
         }
 
@@ -4085,6 +4100,28 @@ mod tests {
             return Err("writer fallback must report primary-fallback observation".into());
         }
         Ok(())
+    }
+
+    #[test]
+    fn isolated_subagent_prompt_uses_only_dispatch_time_workspace() {
+        let root = std::path::PathBuf::from("/workspace/main");
+
+        assert_eq!(
+            primary_workspace_root_for_prompt("context", Some(root.clone())),
+            Some(root.clone())
+        );
+        assert_eq!(
+            primary_workspace_root_for_prompt("primary", Some(root.clone())),
+            Some(root.clone())
+        );
+        assert_eq!(
+            primary_workspace_root_for_prompt("worktree", Some(root.clone())),
+            None
+        );
+        assert_eq!(
+            primary_workspace_root_for_prompt("workspace", Some(root)),
+            None
+        );
     }
 
     #[tokio::test]
@@ -5292,15 +5329,16 @@ Read the runtime path and found one missing branch.
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = solo_readonly_task("a");
         let run_id = seed_run(&store, vec![task.clone()])?;
+        let execution_id = format!("{run_id}:a:1:1");
         store
-            .record_subagent_assigned(&run_id, "a", "a:1:1", "reviewer", 1, true)
+            .record_subagent_assigned(&run_id, "a", &execution_id, "reviewer", 1, true)
             .map_err(|error| error.to_string())?;
         let recovered_result = successful_task_result("recovered summary");
         store
             .record_subagent_released(
                 &run_id,
                 "a",
-                "a:1:1",
+                &execution_id,
                 "completed",
                 Some(&recovered_result),
                 Some("recovered full output"),
@@ -5763,7 +5801,7 @@ Read the runtime path and found one missing branch.
             store,
             "run-trace",
             &task,
-            "implementation-a:1:1",
+            "run-trace:implementation-a:1:1",
             "What is 6 times 7?",
             CancellationToken::new(),
             Some(sink),
@@ -5781,7 +5819,7 @@ Read the runtime path and found one missing branch.
                 event.event == "tool_started"
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
-                    && event.subagent_run_id.as_deref() == Some("implementation-a:1:1")
+                    && event.subagent_run_id.as_deref() == Some("run-trace:implementation-a:1:1")
                     && event.payload.get("name").and_then(|v| v.as_str()) == Some("run_code")
             }),
             "expected tool_started for run_code, got {events:?}"
@@ -5791,7 +5829,7 @@ Read the runtime path and found one missing branch.
                 event.event == "tool_completed"
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
-                    && event.subagent_run_id.as_deref() == Some("implementation-a:1:1")
+                    && event.subagent_run_id.as_deref() == Some("run-trace:implementation-a:1:1")
                     && event.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
                     && event
                         .payload

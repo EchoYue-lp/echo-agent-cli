@@ -419,6 +419,7 @@ export interface ExtractExample {
 // ── Conversation persistence types ──
 
 export interface SavedMessage {
+  message_id?: string;
   role: string;
   content: string | null;
   tool_calls?: { id: string; name: string; arguments: string }[];

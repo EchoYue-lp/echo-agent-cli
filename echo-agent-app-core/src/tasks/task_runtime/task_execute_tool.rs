@@ -215,6 +215,10 @@ impl Tool for ExecuteTaskTool {
         true
     }
 
+    fn allows_parallel_batch_execution(&self) -> bool {
+        false
+    }
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -952,6 +956,7 @@ mod tests {
         assert_eq!(tool.name(), "task_execute");
         assert!(!tool.description().is_empty());
         assert!(tool.parameters().is_object());
+        assert!(!tool.allows_parallel_batch_execution());
         Ok(())
     }
 }

@@ -60,7 +60,7 @@ evidence, and the next bounded step.
 | Logical-task worktree reuse and content-aware cleanup | Complete | `docs/2026-07-25-logical-task-worktree-reuse.md`; stable `{run_id}:{task_id}` isolation identity with attempt-scoped Subagent events |
 | Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
 | Memory and self-evolution seam closure | Complete | `docs/2026-07-23-memory-self-evolution-closure.md`; replaceable workspace/hot-memory projections, one layered EKO write path, workspace-bound Curator, shared review integration, and stable compression dedup keys |
-| Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and formal-plan `subagent_run_id` is `{task_id}:{plan_revision}:{attempt}` |
+| Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and formal-plan `subagent_run_id` is `{run_id}:{task_id}:{plan_revision}:{attempt}` |
 | GUI tool execution lazy loading | Complete | `docs/2026-07-25-gui-tool-execution-lazy-loading.md`; framework commit `27bb5a4`; application commit `d8b2211`; selector stability hotfix `b8c9077`; one main/Subagent summary path, opaque `detail_ref`, 64 KiB cursor pages, file/JSONL recovery, and complete Subagent prompt/result views |
 | Runtime DAG kernel convergence and dispatch correctness | Complete | `docs/2026-07-27-runtime-dag-kernel-convergence.md`; one framework DAG loop/validator, atomic revision-safe claims, superseded-attempt rejection, revision-scoped durable results, lossless persisted status detail, and EKO-owned product resource limits |
 | Task tools framework migration (task_create/update/list) | Complete | framework commit `38da658`; application commit `64da422`; `docs/2026-07-28-task-tools-framework-migration-design.md`; deprecated `todo_write` removed; modern revisioned TaskCreate/Update/List model migrated to framework behind `RevisionedTaskStore` trait; EKO's `TaskRuntimeStore` implements the trait and owns product persistence/bootstrap |
@@ -117,7 +117,7 @@ Unattended execution no longer creates a duplicate run-level
 authoritative checkout; mutation is forced through a formal writer PlanTask,
 whose `eko-fork-*` worktree is keyed by `{run_id}:{task_id}` and reused across
 attempts. Formal-plan attempt identity is
-`{task_id}:{plan_revision}:{attempt}` for events and audit, while the worktree
+`{run_id}:{task_id}:{plan_revision}:{attempt}` for events and audit, while the worktree
 isolation key remains `{run_id}:{task_id}`.
 Finalization removes a checkout immediately when Git proves it has no
 uncommitted files or unique commits; changed checkouts are unlocked and retained
@@ -191,7 +191,7 @@ executes.
 
 Subagent execution identity is attempt-scoped and specification-aware. `task_id`
 identifies the stable PlanTask node;
-`subagent_run_id = execution_id = {task_id}:{plan_revision}:{attempt}` identifies
+`subagent_run_id = execution_id = {run_id}:{task_id}:{plan_revision}:{attempt}` identifies
 one concrete formal-plan dispatch. Framework-dispatched Subagents use framework lifecycle
 events, direct primary execution uses application Subagent events, and
 TaskRuntime integration events use a separate task scope. The frontend stores

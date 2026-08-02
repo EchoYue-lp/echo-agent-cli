@@ -33,6 +33,8 @@ pub struct SavedSession {
 /// 消息的序列化表示
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SavedMessage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     pub role: String,
     pub content: Option<String>,
     pub tool_calls: Option<Vec<SavedToolCall>>,
@@ -98,6 +100,9 @@ pub struct SavedRoundThinking {
 /// New format: `{"thinking_segments": [...], "execution_steps": [...], "attachments": [...]}`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttachmentsPayload {
+    /// Stable GUI message identity used to attach TaskRun/Subagent history after reload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     #[serde(default)]
     pub thinking_segments: Vec<String>,
     #[serde(default)]
@@ -121,6 +126,7 @@ impl AttachmentsPayload {
         // Fall back to old array format: ["segment1", "segment2"]
         if let Ok(segments) = serde_json::from_str::<Vec<String>>(s) {
             return Some(Self {
+                message_id: None,
                 thinking_segments: segments,
                 execution_steps: Vec::new(),
                 execution_rounds: None,
@@ -349,6 +355,7 @@ impl Persistence {
 
     fn convert_message(msg: &Message) -> SavedMessage {
         SavedMessage {
+            message_id: None,
             role: msg.role.as_str().to_string(),
             content: msg.content.as_deref().map(|s| s.to_string()),
             tool_calls: msg.tool_calls.as_ref().map(|calls| {
@@ -377,6 +384,7 @@ mod tests {
     #[test]
     fn test_saved_message_serialize() {
         let msg = SavedMessage {
+            message_id: Some("message-1".to_string()),
             role: "user".to_string(),
             content: Some("hello".to_string()),
             tool_calls: None,
@@ -420,6 +428,7 @@ mod tests {
             tool_call_ids: vec!["detail-1".to_string()],
         }];
         let payload = AttachmentsPayload {
+            message_id: Some("message-1".to_string()),
             thinking_segments: Vec::new(),
             execution_steps: Vec::new(),
             execution_rounds: Some(rounds.clone()),

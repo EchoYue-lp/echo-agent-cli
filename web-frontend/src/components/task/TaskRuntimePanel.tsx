@@ -26,6 +26,7 @@ import {
   Edit3,
   X,
   AlertTriangle,
+  Clock3,
 } from 'lucide-react';
 import { Card } from '../common/Card';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -34,7 +35,7 @@ import {
   type ExecutionEvent,
   type SubagentRunState,
 } from '../../stores/subagentRunStore';
-import type { TodoStatus } from '../../generated';
+import type { TaskRunStatus, TodoStatus } from '../../generated';
 import { isCanonicalUsageEvent } from '../compress/subagentUsage';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -71,7 +72,21 @@ function statusColor(status: string): string {
   return 'var(--text-tertiary)';
 }
 
-function TodoIcon({ status }: { status: string }) {
+function TodoIcon({
+  status,
+  executionStatus,
+  taskRunStatus,
+}: {
+  status: string;
+  executionStatus?: SubagentRunState['status'];
+  taskRunStatus: TaskRunStatus;
+}) {
+  if (!todoShouldSpin(status, executionStatus, taskRunStatus) && status === 'running') {
+    if (executionStatus === 'failed' || executionStatus === 'timed_out') {
+      return <AlertCircle size={14} style={{ color: 'var(--color-error)' }} />;
+    }
+    return <Clock3 size={14} style={{ color: 'var(--text-tertiary)' }} />;
+  }
   switch (status) {
     case 'completed':
       return <CheckCircle2 size={14} style={{ color: 'var(--color-success)' }} />;
@@ -86,6 +101,18 @@ function TodoIcon({ status }: { status: string }) {
     default:
       return <Circle size={14} style={{ color: 'var(--text-tertiary)' }} />;
   }
+}
+
+export function todoShouldSpin(
+  status: string,
+  executionStatus: SubagentRunState['status'] | undefined,
+  taskRunStatus: TaskRunStatus
+): boolean {
+  return (
+    status === 'running' &&
+    taskRunStatus === 'running' &&
+    (!executionStatus || executionStatus === 'running')
+  );
 }
 
 function kindLabel(kind: string): string {
@@ -400,6 +427,15 @@ function traceRunForTodo(todo: { task_id: string }, runs: SubagentRunState[]) {
     .sort((a, b) => b.startedAt - a.startedAt)[0];
 }
 
+export function traceRunsForTaskRun(
+  runId: string | null,
+  runs: readonly SubagentRunState[]
+): SubagentRunState[] {
+  return runId
+    ? runs.filter((run) => run.runId === runId).sort((a, b) => a.startedAt - b.startedAt)
+    : [];
+}
+
 export function displayedTodoStatus(
   todo: { status: TodoStatus; task_id: string },
   runs: SubagentRunState[]
@@ -462,7 +498,7 @@ export function todoStatusDescription(
     return '执行与任务提交已完成';
   }
   if (execution.status === 'completed' && status === 'running') {
-    return `${executionLabel} · 等待状态落盘`;
+    return `${executionLabel} · 评审/收尾中`;
   }
   if (execution.status === 'running' && status === 'running') {
     return executionLabel;
@@ -502,6 +538,10 @@ export function TaskRuntimePanel() {
         : [],
     [activeRun, traceRuns]
   );
+  const activeTaskTraceRuns = useMemo(
+    () => traceRunsForTaskRun(activeRun?.run_id ?? null, Object.values(traceRuns)),
+    [activeRun, traceRuns]
+  );
 
   if (!activeRun) return null;
 
@@ -511,10 +551,10 @@ export function TaskRuntimePanel() {
   const usageSummary = cacheUsageForRuns(visibleTraceRuns);
   const completedCount = todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length;
   const executionCompletedCount = todos.filter((todo) => {
-    const trace = traceRunForTodo(todo, visibleTraceRuns);
+    const trace = traceRunForTodo(todo, activeTaskTraceRuns);
     return (
       trace?.status === 'completed' ||
-      displayedTodoStatus(todo, visibleTraceRuns) === ('completed' as TodoStatus)
+      displayedTodoStatus(todo, activeTaskTraceRuns) === ('completed' as TodoStatus)
     );
   }).length;
 
@@ -652,8 +692,9 @@ export function TaskRuntimePanel() {
           <div className="space-y-0.5">
             {todos.map((todo) => {
               const task = plan?.tasks.find((t) => t.id === todo.task_id);
-              const status = displayedTodoStatus(todo, visibleTraceRuns);
-              const statusDescription = todoStatusDescription(todo, visibleTraceRuns);
+              const execution = traceRunForTodo(todo, activeTaskTraceRuns);
+              const status = displayedTodoStatus(todo, activeTaskTraceRuns);
+              const statusDescription = todoStatusDescription(todo, activeTaskTraceRuns);
               const canPatch = status === 'pending' || status === 'blocked';
               const canRetry =
                 (status === 'blocked' || status === 'failed') &&
@@ -666,7 +707,11 @@ export function TaskRuntimePanel() {
                   style={{ background: 'var(--bg-secondary)' }}
                 >
                   <div className="mt-0.5">
-                    <TodoIcon status={status} />
+                    <TodoIcon
+                      status={status}
+                      executionStatus={execution?.status}
+                      taskRunStatus={activeRun.status}
+                    />
                   </div>
                   <div className="min-w-0 flex-1">
                     <div

@@ -8,12 +8,12 @@ use crate::tauri::state::TauriState;
 use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
-use echo_agent::tools::{ToolOutputChannel, ToolStreamEvent};
+use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
 use echo_agent_app_core::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
 use echo_agent_app_core::tool_execution::{
-    ToolExecutionDetailChannel, ToolExecutionOwner, ToolExecutionSummary,
+    ToolExecutionDetailChannel, ToolExecutionOwner, ToolExecutionRepository, ToolExecutionSummary,
 };
 use futures::future::BoxFuture;
 use serde::Serialize;
@@ -146,7 +146,7 @@ fn emit_chat_event(
 ///
 /// `subagent_run_id` is the aggregation key the frontend store uses to group a
 /// Subagent's events into one card. It is the concrete execution id
-/// (for formal PlanTasks, `{task_id}:{plan_revision}:{attempt}`), never the
+/// (for formal PlanTasks, `{run_id}:{task_id}:{plan_revision}:{attempt}`), never the
 /// stable PlanTask id. For non-Subagent events pass `""`; this function only
 /// attaches the field for `kind == "subagent"`.
 pub(crate) fn emit_execution_event(
@@ -611,6 +611,11 @@ pub async fn send_chat_message(
     // (normal reply AND any complex runs the agent autonomously spins up via
     // create_complex_task) through the single shared `drive_chat` entry. The
     // agent decides complexity itself (Phase B3) — no code route pre-judgment.
+    let execution_projector = Arc::new(TauriExecutionProjector::new(
+        app.clone(),
+        state.app_state.storage.tool_executions.clone(),
+        state.app_state.tasks.runtime.clone(),
+    ));
     let sink = std::sync::Arc::new(TauriChatSink {
         app: app.clone(),
         message_key: message_key.clone(),
@@ -618,6 +623,7 @@ pub async fn send_chat_message(
         tool_executions: state.app_state.storage.tool_executions.clone(),
         tool_completions: StdMutex::new(HashMap::new()),
         active_tool_ids: StdMutex::new(HashSet::new()),
+        execution_projector,
     });
     // Signal the chat-turn lifecycle so the GUI shows the spinner / terminal
     // badge. Ordinary chat turns are not TaskRuntime runs.
@@ -857,6 +863,251 @@ pub async fn send_selection_response(
     }
 }
 
+/// Projects app-owned TaskRuntime tool events into the same durable repository
+/// and `kind=tool` channel used by ordinary chat and framework Subagents.
+pub(crate) struct TauriExecutionProjector {
+    app: Option<tauri::AppHandle>,
+    tool_executions: Arc<ToolExecutionRepository>,
+    task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    pending_tool_completions: StdMutex<HashMap<String, PendingToolCompletion>>,
+    active_tool_ids_by_execution: StdMutex<HashMap<String, HashSet<String>>>,
+}
+
+impl TauriExecutionProjector {
+    pub(crate) fn new(
+        app: tauri::AppHandle,
+        tool_executions: Arc<ToolExecutionRepository>,
+        task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    ) -> Self {
+        Self {
+            app: Some(app),
+            tool_executions,
+            task_runtime_store,
+            pending_tool_completions: StdMutex::new(HashMap::new()),
+            active_tool_ids_by_execution: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    pub(crate) fn emit(&self, event: ExecEvent) {
+        self.project_tool_event(&event);
+        if let Some(app) = self.app.as_ref() {
+            emit_tauri_execution_event(app, event);
+        }
+    }
+
+    #[cfg(test)]
+    fn without_app(
+        tool_executions: Arc<ToolExecutionRepository>,
+        task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    ) -> Self {
+        Self {
+            app: None,
+            tool_executions,
+            task_runtime_store,
+            pending_tool_completions: StdMutex::new(HashMap::new()),
+            active_tool_ids_by_execution: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn emit_summary(&self, event: &str, agent: &str, summary: &ToolExecutionSummary) {
+        if let Some(app) = self.app.as_ref() {
+            let _ = emit_tool_execution_summary(app, event, agent, summary);
+        }
+    }
+
+    fn conversation_id(&self, run_id: &str) -> Option<String> {
+        self.task_runtime_store
+            .as_ref()
+            .and_then(|store| store.get_run(run_id).ok())
+            .flatten()
+            .map(|run| run.conversation_id)
+    }
+
+    fn completion_key(subagent_run_id: &str, call_id: &str) -> String {
+        format!("{subagent_run_id}\0{call_id}")
+    }
+
+    fn project_tool_event(&self, event: &ExecEvent) {
+        if event.scope != ExecEventScope::Subagent {
+            return;
+        }
+        let Some(subagent_run_id) = event.subagent_run_id.as_deref() else {
+            return;
+        };
+        let owner = ToolExecutionOwner::Subagent {
+            subagent_run_id: subagent_run_id.to_string(),
+        };
+        let payload = match event.payload.as_object() {
+            Some(payload) => payload,
+            None => return,
+        };
+        let agent = event.agent.as_deref().unwrap_or("echo-assistant");
+
+        match event.event.as_str() {
+            "tool_started" => {
+                let Some(call_id) = payload.get("call_id").and_then(serde_json::Value::as_str)
+                else {
+                    return;
+                };
+                let Some(name) = payload.get("name").and_then(serde_json::Value::as_str) else {
+                    return;
+                };
+                let args = payload
+                    .get("args")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let conversation_id = self.conversation_id(&event.run_id);
+                match self.tool_executions.start(
+                    owner,
+                    conversation_id.as_deref(),
+                    Some(&event.run_id),
+                    call_id,
+                    name,
+                    &args,
+                ) {
+                    Ok(summary) => {
+                        lock_std(
+                            &self.active_tool_ids_by_execution,
+                            "active TaskRuntime Subagent tools",
+                        )
+                        .entry(subagent_run_id.to_string())
+                        .or_default()
+                        .insert(call_id.to_string());
+                        self.emit_summary("started", agent, &summary);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %call_id, %name, "failed to persist TaskRuntime Subagent tool start");
+                    }
+                }
+            }
+            "tool_output" => {
+                let Some(call_id) = payload.get("call_id").and_then(serde_json::Value::as_str)
+                else {
+                    return;
+                };
+                let output = payload
+                    .get("chunk")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| payload.get("message").and_then(serde_json::Value::as_str));
+                let Some(output) = output else {
+                    return;
+                };
+                let channel = match payload.get("channel").and_then(serde_json::Value::as_str) {
+                    Some("stdout") => ToolExecutionDetailChannel::Stdout,
+                    Some("stderr") => ToolExecutionDetailChannel::Stderr,
+                    _ => ToolExecutionDetailChannel::Log,
+                };
+                if let Err(error) = self
+                    .tool_executions
+                    .append_output(&owner, call_id, channel, output)
+                {
+                    tracing::warn!(%error, %call_id, "failed to persist TaskRuntime Subagent tool output");
+                }
+            }
+            "tool_completed" => {
+                let Some(call_id) = payload.get("call_id").and_then(serde_json::Value::as_str)
+                else {
+                    return;
+                };
+                let completion_key = Self::completion_key(subagent_run_id, call_id);
+                let metadata = payload
+                    .get("metadata")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<HashMap<String, String>>(value).ok())
+                    .unwrap_or_default();
+                let truncated = payload
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                let Some(result) = payload.get("result").and_then(serde_json::Value::as_str) else {
+                    lock_std(
+                        &self.pending_tool_completions,
+                        "pending TaskRuntime tool completions",
+                    )
+                    .insert(
+                        completion_key,
+                        PendingToolCompletion {
+                            metadata,
+                            truncated,
+                        },
+                    );
+                    return;
+                };
+                let pending = lock_std(
+                    &self.pending_tool_completions,
+                    "pending TaskRuntime tool completions",
+                )
+                .remove(&completion_key)
+                .unwrap_or_default();
+                let mut combined_metadata = pending.metadata;
+                combined_metadata.extend(metadata);
+                let success = payload
+                    .get("success")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true);
+                let failure = payload
+                    .get("failure")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<ToolFailure>(value).ok());
+                match self.tool_executions.finish(
+                    &owner,
+                    call_id,
+                    success,
+                    result,
+                    failure,
+                    combined_metadata,
+                    truncated || pending.truncated,
+                ) {
+                    Ok(summary) => {
+                        let mut active_tools = lock_std(
+                            &self.active_tool_ids_by_execution,
+                            "active TaskRuntime Subagent tools",
+                        );
+                        if let Some(call_ids) = active_tools.get_mut(subagent_run_id) {
+                            call_ids.remove(call_id);
+                            if call_ids.is_empty() {
+                                active_tools.remove(subagent_run_id);
+                            }
+                        }
+                        self.emit_summary("finished", agent, &summary);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, %call_id, "failed to persist TaskRuntime Subagent tool completion");
+                    }
+                }
+            }
+            "completed" | "failed" | "cancelled" | "timed_out" => {
+                self.cancel_active_tools(subagent_run_id, agent, &owner);
+            }
+            _ => {}
+        }
+    }
+
+    fn cancel_active_tools(&self, subagent_run_id: &str, agent: &str, owner: &ToolExecutionOwner) {
+        let call_ids = lock_std(
+            &self.active_tool_ids_by_execution,
+            "active TaskRuntime Subagent tools",
+        )
+        .remove(subagent_run_id)
+        .unwrap_or_default();
+        for call_id in call_ids {
+            lock_std(
+                &self.pending_tool_completions,
+                "pending TaskRuntime tool completions",
+            )
+            .remove(&Self::completion_key(subagent_run_id, &call_id));
+            match self.tool_executions.cancel(owner, &call_id) {
+                Ok(summary) => {
+                    self.emit_summary("cancelled", agent, &summary);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %call_id, "failed to cancel TaskRuntime Subagent tool");
+                }
+            }
+        }
+    }
+}
+
 /// GUI `ChatSink`: bridges the shared `drive_chat` stream to the Tauri frontend
 /// by emitting `ChatEvent`s + subagent trace events.
 ///
@@ -871,6 +1122,7 @@ struct TauriChatSink {
     tool_executions: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
     tool_completions: StdMutex<HashMap<String, PendingToolCompletion>>,
     active_tool_ids: StdMutex<HashSet<String>>,
+    execution_projector: Arc<TauriExecutionProjector>,
 }
 
 #[derive(Default)]
@@ -891,6 +1143,7 @@ impl TauriChatSink {
             .drain()
             .collect::<Vec<_>>();
         for call_id in call_ids {
+            lock_std(&self.tool_completions, "GUI tool completions").remove(&call_id);
             match self.tool_executions.cancel(owner, &call_id) {
                 Ok(summary) => {
                     let _ = emit_tool_execution_summary(
@@ -1076,10 +1329,13 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
                 )
             }
             ChatDriverEvent::Execution(event) => {
-                emit_tauri_execution_event(&self.app, event);
+                self.execution_projector.emit(event);
                 true
             }
             ChatDriverEvent::TurnStatus { status } => {
+                if status != "running" {
+                    self.cancel_active_tools(&self.tool_owner());
+                }
                 let emitted = emit_chat_event(
                     &self.app,
                     &ChatEvent::RunStatus {
@@ -1282,5 +1538,156 @@ fn agent_event_to_chat_event(
             code: "unknown_agent_event".to_string(),
             message: format!("{other:?}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod execution_projector_tests {
+    use super::*;
+    use echo_agent_app_core::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRuntimeStore};
+    use echo_agent_app_core::tool_execution::ToolExecutionStatus;
+    use std::path::{Path, PathBuf};
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> std::io::Result<Self> {
+            let path = std::env::temp_dir().join(format!(
+                "eko-task-runtime-tool-projector-{}",
+                Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("failed to clean projector test directory: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn task_runtime_tools_are_persisted_with_output_and_terminal_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDir::new()?;
+        let repository = Arc::new(ToolExecutionRepository::open(temp.path())?);
+        let runtime = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        runtime.create_run(
+            "run-1",
+            "workspace-1",
+            "conversation-1",
+            "message-1",
+            DomainProfile::AiCoding,
+            "analyze project",
+            "formal_plan",
+            AttendedMode::Attended,
+        )?;
+        let projector =
+            TauriExecutionProjector::without_app(repository.clone(), Some(runtime.clone()));
+        let execution_id = "run-1:task-1:1:1";
+
+        projector.emit(
+            ExecEvent::subagent(
+                "run-1",
+                "task-1",
+                execution_id,
+                "tool_started",
+                serde_json::json!({
+                    "call_id": "call-1",
+                    "name": "read_file",
+                    "args": {"path": "src/main.rs"},
+                }),
+            )
+            .with_agent("explorer"),
+        );
+        projector.emit(ExecEvent::subagent(
+            "run-1",
+            "task-1",
+            execution_id,
+            "tool_output",
+            serde_json::json!({
+                "call_id": "call-1",
+                "name": "read_file",
+                "channel": "stdout",
+                "chunk": "main output",
+            }),
+        ));
+        projector.emit(ExecEvent::subagent(
+            "run-1",
+            "task-1",
+            execution_id,
+            "tool_completed",
+            serde_json::json!({
+                "call_id": "call-1",
+                "name": "read_file",
+                "success": true,
+                "metadata": {"source": "stream"},
+                "truncated": false,
+            }),
+        ));
+        projector.emit(ExecEvent::subagent(
+            "run-1",
+            "task-1",
+            execution_id,
+            "tool_completed",
+            serde_json::json!({
+                "call_id": "call-1",
+                "name": "read_file",
+                "result": "main output",
+                "success": true,
+            }),
+        ));
+
+        let summaries = repository.summaries_for_conversation("conversation-1");
+        let completed = summaries
+            .iter()
+            .find(|summary| summary.call_id == "call-1")
+            .ok_or_else(|| "missing completed tool summary".to_string())?;
+        assert_eq!(completed.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(completed.run_id.as_deref(), Some("run-1"));
+        let detail = repository.detail_manifest(&completed.detail_ref)?;
+        assert_eq!(
+            detail.metadata.get("source").map(String::as_str),
+            Some("stream")
+        );
+        let output = repository.read_output(&completed.detail_ref, None, 1024)?;
+        assert_eq!(
+            output.chunks.first().map(|chunk| chunk.text.as_str()),
+            Some("main output")
+        );
+
+        projector.emit(ExecEvent::subagent(
+            "run-1",
+            "task-1",
+            execution_id,
+            "tool_started",
+            serde_json::json!({
+                "call_id": "call-2",
+                "name": "shell",
+                "args": {"command": "sleep 1"},
+            }),
+        ));
+        projector.emit(ExecEvent::subagent(
+            "run-1",
+            "task-1",
+            execution_id,
+            "completed",
+            serde_json::json!({}),
+        ));
+
+        let summaries = repository.summaries_for_conversation("conversation-1");
+        let cancelled = summaries
+            .iter()
+            .find(|summary| summary.call_id == "call-2")
+            .ok_or_else(|| "missing cancelled tool summary".to_string())?;
+        assert_eq!(cancelled.status, ToolExecutionStatus::Cancelled);
+        Ok(())
     }
 }

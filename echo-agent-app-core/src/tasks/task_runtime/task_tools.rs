@@ -385,7 +385,7 @@ mod task_create_tests {
 
     fn one_task_params(task: serde_json::Value) -> ToolParameters {
         let mut params = ToolParameters::new();
-        params.insert("task".to_string(), task);
+        params.insert("tasks".to_string(), serde_json::json!([task]));
         params
     }
 
@@ -394,8 +394,8 @@ mod task_create_tests {
     {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let schema = FrameworkTaskCreateTool::new(task_service(store)).parameters();
-        let task_prefix = if schema.pointer("/properties/task").is_some() {
-            "/properties/task"
+        let task_prefix = if schema.pointer("/properties/tasks/items").is_some() {
+            "/properties/tasks/items"
         } else {
             return Err("task_create schema is missing task input".to_string());
         };

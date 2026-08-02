@@ -65,7 +65,7 @@ export function SubagentCard({ subagent: s }: Props) {
         <button
           type="button"
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
-          onClick={() => selectSubagent(s.subagentRunId)}
+          onClick={() => selectSubagent(s.runId, s.subagentRunId)}
         >
           <span className="font-medium text-[var(--text-primary)] truncate flex-1">{s.agent}</span>
           {s.tokensUsed != null && (
@@ -162,7 +162,7 @@ export function SubagentPanel({ subagents }: { subagents: Record<string, Subagen
 
       {/* Running subagents (always visible) */}
       {running.map((s) => (
-        <SubagentCard key={s.subagentRunId} subagent={s} />
+        <SubagentCard key={`${s.runId}:${s.subagentRunId}`} subagent={s} />
       ))}
 
       {/* Completed/failed subagents (collapsible) */}
@@ -178,10 +178,10 @@ export function SubagentPanel({ subagents }: { subagents: Record<string, Subagen
           {showDone && (
             <div className="space-y-1 opacity-60">
               {completed.map((s) => (
-                <SubagentCard key={s.subagentRunId} subagent={s} />
+                <SubagentCard key={`${s.runId}:${s.subagentRunId}`} subagent={s} />
               ))}
               {failed.map((s) => (
-                <SubagentCard key={s.subagentRunId} subagent={s} />
+                <SubagentCard key={`${s.runId}:${s.subagentRunId}`} subagent={s} />
               ))}
             </div>
           )}

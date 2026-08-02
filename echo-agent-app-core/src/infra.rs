@@ -39,18 +39,15 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     }
 }
 
-/// Registration-time static environment for subagent system prompts.
+/// Registration-time static environment for Subagent system prompts.
 ///
-/// OS/arch/date are stable for the agent's lifetime, so they are compiled into
-/// the system prompt once. Per-dispatch state (working dir, workspace root)
-/// must NOT be added here — worktree/workspace isolation changes the cwd per
-/// dispatch, and the invocation compiler renders those dynamically.
+/// OS/arch are stable for the Agent's lifetime. Date and working directory are
+/// dispatch-time facts and are rendered by the invocation compiler.
 fn static_subagent_environment() -> String {
     format!(
-        "- OS: {} ({})\n- Date: {}\n- Runtime: local personal assistant on the user's machine",
+        "- OS: {} ({})\n- Runtime: local personal assistant on the user's machine",
         std::env::consts::OS,
-        std::env::consts::ARCH,
-        chrono::Local::now().format("%Y-%m-%d")
+        std::env::consts::ARCH
     )
 }
 
@@ -91,7 +88,7 @@ Choose the lightest reliable mechanism:
 - `execution_checks` require an observed command pass; `acceptance_criteria` are semantic reviewer judgments. Never declare acceptance passed yourself.
 - A completed Subagent is not a completed Task. Acceptance failure blocks for an explicit retry.
 - TaskRun already represents the goal. Do not create a wrapper or prose-only summary task; materialize only executable work.
-- `task_create` accepts one task or an atomic batch. Give every task a stable ID, declare dependencies when they exist, and pass the returned revision to `task_execute`.
+- `task_create` always accepts one atomic `tasks` array, including for a single task. Give every task a stable ID, declare dependencies when they exist, and pass the returned revision to `task_execute`.
 - Read-only tasks may run in parallel. Writers must declare owned files or artifacts.
 - Keep the graph truthful with `task_update` and `task_list`. Existing graphs require the latest `base_revision`; only the runtime marks completion.
 - Do not claim dispatch before `task_execute` accepts the committed revision.
@@ -264,6 +261,7 @@ pub async fn create_agent_with_diagnostics(
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
+    let subagent_registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
     let run_code_available = sandbox_manager.has_local_os_sandbox().await;
     if !run_code_available {
         tracing::warn!("OS sandbox unavailable; run_code will be disabled for this EKO runtime");
@@ -281,6 +279,7 @@ pub async fn create_agent_with_diagnostics(
         // background-task tools use a separate store and must not be exposed
         // alongside task_create/task_execute.
         .enable_subagent()
+        .subagent_registry(subagent_registry.clone())
         .subagent_prompt_compiler(subagent_prompt_compiler.clone())
         .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside task_execute
         .enable_human_in_loop()
@@ -485,6 +484,7 @@ pub async fn create_agent_with_diagnostics(
         &cache_user_id,
         &discovered_subagents,
         subagent_prompt_compiler.clone(),
+        subagent_registry,
         params.browser_runtime.clone(),
         sandbox_manager,
         run_code_available,
@@ -581,6 +581,7 @@ async fn register_default_subagents(
     cache_user_id: &str,
     subagents: &[crate::subagent_loader::SubagentDefinition],
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
+    subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
@@ -600,6 +601,7 @@ async fn register_default_subagents(
         isolate_worktree: bool,
         isolate_workspace: bool,
         has_team: bool,
+        can_delegate: bool,
         tags: Vec<String>,
     }
 
@@ -643,6 +645,9 @@ async fn register_default_subagents(
                 max_tool_output_tokens,
                 cache_user_id,
                 max_iterations,
+                subagent_def.can_delegate,
+                prompt_compiler.clone(),
+                subagent_registry.clone(),
                 browser_runtime.clone(),
             )
         } else {
@@ -658,6 +663,9 @@ async fn register_default_subagents(
                 max_tool_output_tokens,
                 cache_user_id,
                 max_iterations,
+                subagent_def.can_delegate,
+                prompt_compiler.clone(),
+                subagent_registry.clone(),
                 browser_runtime.clone(),
                 sandbox_manager.clone(),
                 run_code_available,
@@ -712,6 +720,9 @@ async fn register_default_subagents(
                 if subagent_def.is_background {
                     builder = builder.background().tag("background");
                 }
+                if subagent_def.can_delegate {
+                    builder = builder.can_delegate();
+                }
                 builder = builder.tag(format!("prompt_source:{}", subagent_def.source));
                 builder = builder.tag(if subagent_def.readonly {
                     "capability:readonly"
@@ -737,6 +748,8 @@ async fn register_default_subagents(
                 let factory_sandbox_manager = sandbox_manager.clone();
                 let factory_tool_output_artifacts = tool_output_artifacts.clone();
                 let factory_system_prompt = compiled_system.system_prompt.clone();
+                let factory_prompt_compiler = prompt_compiler.clone();
+                let factory_subagent_registry = subagent_registry.clone();
                 let fork_factory = Arc::new(FnAgentFactory::new(
                     move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
                         let subagent_def = factory_def.clone();
@@ -747,8 +760,11 @@ async fn register_default_subagents(
                         let sandbox_manager = factory_sandbox_manager.clone();
                         let tool_output_artifacts = factory_tool_output_artifacts.clone();
                         let system_prompt = factory_system_prompt.clone();
+                        let prompt_compiler = factory_prompt_compiler.clone();
+                        let subagent_registry = factory_subagent_registry.clone();
                         Box::pin(async move {
                             let max_iterations = subagent_def.max_turns.unwrap_or(0);
+                            let catalog_registry = subagent_registry.clone();
                             let subagent = if subagent_def.readonly {
                                 build_readonly_subagent_agent(
                                     &subagent_def.name,
@@ -762,6 +778,9 @@ async fn register_default_subagents(
                                     max_tool_output_tokens,
                                     &cache_user_id,
                                     max_iterations,
+                                    subagent_def.can_delegate,
+                                    prompt_compiler,
+                                    subagent_registry,
                                     browser_runtime,
                                 )?
                             } else {
@@ -777,12 +796,19 @@ async fn register_default_subagents(
                                     max_tool_output_tokens,
                                     &cache_user_id,
                                     max_iterations,
+                                    subagent_def.can_delegate,
+                                    prompt_compiler,
+                                    subagent_registry,
                                     browser_runtime,
                                     sandbox_manager,
                                     run_code_available,
                                 )?
                             };
                             subagent.set_tool_output_artifacts(tool_output_artifacts);
+                            if subagent_def.can_delegate {
+                                let definitions = catalog_registry.list_available().await;
+                                subagent.sync_subagent_dispatch_catalog(&definitions);
+                            }
                             crate::tasks::task_runtime::compact_context::install_task_context_protection(
                                 &subagent,
                             )
@@ -799,6 +825,7 @@ async fn register_default_subagents(
                     isolate_worktree: subagent_def.isolate_worktree,
                     isolate_workspace: subagent_def.isolate_workspace,
                     has_team: subagent_def.team.is_some(),
+                    can_delegate: subagent_def.can_delegate,
                     tags: subagent_def.tags.clone(),
                 });
             }
@@ -828,6 +855,17 @@ async fn register_default_subagents(
             "registered default subagent"
         );
     }
+    let registered_definitions = subagent_registry.list_available().await;
+    for built in &built_subagents {
+        if built.can_delegate {
+            built
+                .handle
+                .write(|subagent| {
+                    subagent.sync_subagent_dispatch_catalog(&registered_definitions);
+                })
+                .await;
+        }
+    }
 }
 
 /// Build a **writer** subagent (Sprint 9): same as the readonly subagent
@@ -848,6 +886,9 @@ fn build_writer_subagent_agent(
     max_tool_output_tokens: usize,
     cache_user_id: &str,
     max_iterations: usize,
+    can_delegate: bool,
+    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
+    subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
@@ -876,6 +917,14 @@ fn build_writer_subagent_agent(
             ..Default::default()
         })
         .sandbox_manager(sandbox_manager);
+
+    if can_delegate {
+        builder = builder
+            .enable_subagent()
+            .subagent_registry(subagent_registry)
+            .subagent_prompt_compiler(prompt_compiler)
+            .register_agent_dispatch_tool();
+    }
 
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
@@ -924,6 +973,9 @@ fn build_readonly_subagent_agent(
     max_tool_output_tokens: usize,
     cache_user_id: &str,
     max_iterations: usize,
+    can_delegate: bool,
+    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
+    subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
@@ -943,6 +995,14 @@ fn build_readonly_subagent_agent(
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         });
+
+    if can_delegate {
+        builder = builder
+            .enable_subagent()
+            .subagent_registry(subagent_registry)
+            .subagent_prompt_compiler(prompt_compiler)
+            .register_agent_dispatch_tool();
+    }
 
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
@@ -1964,6 +2024,7 @@ mod resolve_subagent_model_tests {
         tool_output_artifact_config,
     };
     use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
     use echo_agent::sandbox::SandboxManager;
     use std::sync::Arc;
 
@@ -2052,6 +2113,10 @@ mod resolve_subagent_model_tests {
             1_024,
             "test-cache-user",
             1,
+            false,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler)
+                as Arc<dyn SubagentPromptCompiler>,
+            Arc::new(SubagentRegistry::new()),
             None,
             sandbox,
             true,
@@ -2061,6 +2126,37 @@ mod resolve_subagent_model_tests {
         assert!(subagent.list_tools().iter().any(|name| name == "run_code"));
         assert!(
             !subagent
+                .list_tools()
+                .iter()
+                .any(|name| name == "agent_tool")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delegation_capability_registers_agent_tool() -> echo_agent::error::Result<()> {
+        let subagent = build_writer_subagent_agent(
+            "delegator",
+            "delegate bounded work",
+            "test-model",
+            None,
+            None,
+            None,
+            8_192,
+            30_000,
+            1_024,
+            "test-cache-user",
+            1,
+            true,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
+            Arc::new(SubagentRegistry::new()),
+            None,
+            Arc::new(SandboxManager::local_sandbox()),
+            true,
+        )?;
+
+        assert!(
+            subagent
                 .list_tools()
                 .iter()
                 .any(|name| name == "agent_tool")

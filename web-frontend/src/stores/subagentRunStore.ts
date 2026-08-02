@@ -8,7 +8,7 @@
  * the single source of truth for subagent execution-flow events.
  *
  * Aggregation key is the concrete execution id in `subagent_run_id` (normally
- * `{task_id}:{plan_revision}:{attempt}`). `task_id` remains the stable PlanTask join key. This
+ * `{run_id}:{task_id}:{plan_revision}:{attempt}`). `task_id` remains the stable PlanTask join key. This
  * separation keeps retries independent while still allowing task-oriented UI
  * to select the latest attempt.
  */
@@ -16,11 +16,14 @@
 import { create } from 'zustand';
 import { isCanonicalUsageEvent } from '../components/compress/subagentUsage';
 import type {
+  RuntimeTaskEvent,
   SubagentArtifactResult,
   SubagentRunStatus,
   SubagentTaskResult,
   SubagentTouchedFiles,
   SubagentVerificationResult,
+  TaskPlan,
+  TaskRun,
 } from '../generated';
 
 export type { SubagentRunStatus } from '../generated';
@@ -79,6 +82,8 @@ export interface ExecutionEvent {
   usage_event_id?: string;
   /** Background dispatch flag (from DispatchStarted). */
   background?: boolean;
+  /** Millisecond timestamp supplied by durable TaskRuntime event replay. */
+  started_at?: number;
   /** Parent-facing summary on completed events. */
   summary?: string;
   contract_version?: number;
@@ -138,6 +143,20 @@ interface SubagentRunStore {
 }
 
 const MAX_EVENTS_PER_RUN = 300;
+const STORED_SUBAGENT_EVENTS = new Set<string>([
+  'started',
+  'usage',
+  'isolation_observed',
+  'artifact',
+  'completed',
+  'failed',
+  'timed_out',
+  'cancelled',
+]);
+
+export function subagentRunStoreKey(runId: string, subagentRunId: string): string {
+  return `${runId}\u0000${subagentRunId}`;
+}
 
 function statusFromEvent(event: SubagentRunEventKind): SubagentRunStatus | null {
   switch (event) {
@@ -206,6 +225,185 @@ function terminalResult(
   };
 }
 
+type JsonRecord = Record<string, unknown>;
+
+function jsonRecord(value: unknown): JsonRecord | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as JsonRecord)
+    : null;
+}
+
+function jsonString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
+}
+
+function jsonNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function jsonStringArray(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
+}
+
+type TerminalSubagentRunEventKind = 'completed' | 'failed' | 'timed_out' | 'cancelled';
+
+function runtimeTerminalEvent(value: unknown): TerminalSubagentRunEventKind | null {
+  switch (value) {
+    case 'completed':
+    case 'failed':
+    case 'timed_out':
+    case 'cancelled':
+      return value;
+    default:
+      return null;
+  }
+}
+
+function runtimeArtifacts(value: unknown): WireSubagentArtifactResult[] {
+  if (!Array.isArray(value)) return [];
+  const artifacts: WireSubagentArtifactResult[] = [];
+  for (const item of value) {
+    const artifact = jsonRecord(item);
+    const path = jsonString(artifact?.path);
+    const kind = jsonString(artifact?.kind);
+    if (!artifact || !path || !kind) continue;
+    artifacts.push({
+      path,
+      kind,
+      bytes:
+        typeof artifact.bytes === 'number' ||
+        typeof artifact.bytes === 'string' ||
+        typeof artifact.bytes === 'bigint'
+          ? artifact.bytes
+          : null,
+      sha256: jsonString(artifact.sha256) ?? null,
+      producer_execution_id: jsonString(artifact.producer_execution_id) ?? null,
+      available: typeof artifact.available === 'boolean' ? artifact.available : false,
+    });
+  }
+  return artifacts;
+}
+
+function runtimeVerification(value: unknown): SubagentVerificationResult[] {
+  if (!Array.isArray(value)) return [];
+  const verification: SubagentVerificationResult[] = [];
+  for (const item of value) {
+    const candidate = jsonRecord(item);
+    const check = jsonString(candidate?.check);
+    const details = jsonString(candidate?.details);
+    const status = candidate?.status;
+    const source = candidate?.source;
+    if (
+      !check ||
+      details === undefined ||
+      (status !== 'passed' && status !== 'failed' && status !== 'not_run') ||
+      (source !== 'observed' && source !== 'reported')
+    ) {
+      continue;
+    }
+    verification.push({ check, details, status, source });
+  }
+  return verification;
+}
+
+function runtimeTouchedFiles(value: unknown): SubagentTouchedFiles | undefined {
+  const touchedFiles = jsonRecord(value);
+  if (!touchedFiles) return undefined;
+  return {
+    read: jsonStringArray(touchedFiles.read),
+    written: jsonStringArray(touchedFiles.written),
+  };
+}
+
+function runtimeEventTimestamp(timestamp: string): number | undefined {
+  const value = Date.parse(timestamp);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+/**
+ * Thin application adapter from durable TaskRuntime boundaries to the existing
+ * realtime Subagent lifecycle stream. It restores the same GUI cards after a
+ * page reload without introducing a second Subagent state machine.
+ */
+export function taskRuntimeSubagentExecutionEvents(
+  run: TaskRun,
+  plan: TaskPlan | null,
+  events: readonly RuntimeTaskEvent[]
+): ExecutionEvent[] {
+  const projected: ExecutionEvent[] = [];
+  const agentsByExecution = new Map<string, string>();
+
+  for (const runtimeEvent of events) {
+    if (
+      runtimeEvent.run_id !== run.run_id ||
+      (runtimeEvent.event_type !== 'subagent_assigned' &&
+        runtimeEvent.event_type !== 'subagent_released')
+    ) {
+      continue;
+    }
+
+    const payload = jsonRecord(runtimeEvent.payload);
+    const executionId = jsonString(payload?.execution_id) ?? runtimeEvent.step_id ?? undefined;
+    if (!executionId) continue;
+
+    const taskId = runtimeEvent.task_id ?? undefined;
+    const planTask = taskId ? plan?.tasks.find((task) => task.id === taskId) : undefined;
+    const task = planTask
+      ? planTask.description.trim() || planTask.title.trim() || undefined
+      : undefined;
+    const startedAt = runtimeEventTimestamp(runtimeEvent.timestamp);
+
+    if (runtimeEvent.event_type === 'subagent_assigned') {
+      const agent = jsonString(payload?.agent_name) ?? planTask?.agent_role ?? 'subagent';
+      agentsByExecution.set(executionId, agent);
+      projected.push({
+        kind: 'subagent',
+        subagent_run_id: executionId,
+        run_id: run.run_id,
+        task_id: taskId,
+        agent,
+        event: 'started',
+        task,
+        message_id: run.root_message_id,
+        conversation_id: run.conversation_id,
+        started_at: startedAt,
+      });
+      continue;
+    }
+
+    const result = jsonRecord(payload?.result);
+    const terminalEvent = runtimeTerminalEvent(payload?.status ?? result?.status);
+    if (!terminalEvent) continue;
+    const summary = jsonString(result?.summary) ?? jsonString(payload?.summary);
+    const output = jsonString(payload?.full_output);
+    projected.push({
+      kind: 'subagent',
+      subagent_run_id: executionId,
+      run_id: run.run_id,
+      task_id: taskId,
+      agent: agentsByExecution.get(executionId) ?? planTask?.agent_role ?? 'subagent',
+      event: terminalEvent,
+      task,
+      message_id: run.root_message_id,
+      conversation_id: run.conversation_id,
+      started_at: startedAt,
+      output,
+      error: terminalEvent === 'failed' ? (summary ?? output) : undefined,
+      summary,
+      contract_version: jsonNumber(result?.contract_version),
+      terminal_status: terminalEvent,
+      artifacts: runtimeArtifacts(result?.artifacts),
+      verification: runtimeVerification(result?.verification),
+      remaining_work: jsonStringArray(result?.remaining_work),
+      touched_files: runtimeTouchedFiles(result?.touched_files),
+    });
+  }
+
+  return projected;
+}
+
 function executionAttempt(run: SubagentRunState): number | null {
   const separator = run.subagentRunId.lastIndexOf(':');
   if (separator <= 0) return null;
@@ -247,11 +445,15 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
 
   ingest: (ev) => {
     set((s) => {
+      // TaskRuntime tool/thinking events share kind="subagent" on the wire but
+      // belong to their dedicated stores. Keep this lifecycle log type-safe.
+      if (!STORED_SUBAGENT_EVENTS.has(ev.event)) return s;
       const id = ev.subagent_run_id;
-      const prev = s.runs[id];
+      const storeKey = subagentRunStoreKey(ev.run_id, id);
+      const prev = s.runs[storeKey];
       const newStatus = statusFromEvent(ev.event);
       // One execution id has one monotonic lifecycle. Retries use a new
-      // `{task_id}:{plan_revision}:{attempt}` id, so late/duplicate events must not reopen a
+      // `{run_id}:{task_id}:{plan_revision}:{attempt}` id, so late/duplicate events must not reopen a
       // terminal execution or overwrite its result.
       if (prev && prev.status !== 'running') {
         return s;
@@ -272,7 +474,10 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         mode: ev.mode,
         conversationId: evConvId,
         status: 'running',
-        startedAt: Date.now(),
+        startedAt:
+          typeof ev.started_at === 'number' && Number.isFinite(ev.started_at)
+            ? ev.started_at
+            : Date.now(),
         events: [],
         usageEvents: [],
       };
@@ -312,9 +517,19 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         usageEvents,
         events,
       };
-      return { runs: { ...s.runs, [id]: next } };
+      return { runs: { ...s.runs, [storeKey]: next } };
     });
   },
 
   clear: () => set({ runs: {} }),
 }));
+
+export function ingestTaskRuntimeSubagentEvents(
+  run: TaskRun,
+  plan: TaskPlan | null,
+  events: readonly RuntimeTaskEvent[]
+): void {
+  for (const event of taskRuntimeSubagentExecutionEvents(run, plan, events)) {
+    useSubagentRunStore.getState().ingest(event);
+  }
+}

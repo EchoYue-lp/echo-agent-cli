@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import type { TodoStatus } from '../../generated';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { displayedTodoStatus, todoStatusDescription } from './TaskRuntimePanel';
+import {
+  displayedTodoStatus,
+  todoShouldSpin,
+  todoStatusDescription,
+  traceRunsForTaskRun,
+} from './TaskRuntimePanel';
 
 function run(status: SubagentRunState['status']): SubagentRunState {
   return {
@@ -16,6 +21,20 @@ function run(status: SubagentRunState['status']): SubagentRunState {
 }
 
 describe('displayedTodoStatus', () => {
+  it('does not animate a stale running row after the TaskRun is terminal', () => {
+    expect(todoShouldSpin('running', 'running', 'completed')).toBe(false);
+    expect(todoShouldSpin('running', 'running', 'paused')).toBe(false);
+    expect(todoShouldSpin('running', 'running', 'pending')).toBe(false);
+    expect(todoShouldSpin('running', 'running', 'running')).toBe(true);
+  });
+
+  it('scopes todo execution state to the active TaskRun', () => {
+    const oldRun = { ...run('completed'), runId: 'run-old', startedAt: 20 };
+    const activeRun = { ...run('running'), runId: 'run-active', startedAt: 10 };
+
+    expect(traceRunsForTaskRun('run-active', [oldRun, activeRun])).toEqual([activeRun]);
+  });
+
   it('projects a running Subagent onto a pending todo', () => {
     expect(
       displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [run('running')])
@@ -55,12 +74,12 @@ describe('displayedTodoStatus', () => {
     ).toBe('running');
   });
 
-  it('describes a completed execution with stale running persistence as pending commit', () => {
+  it('describes a completed execution with a running task as review or integration', () => {
     expect(
       todoStatusDescription({ task_id: 'task-1', status: 'running' as TodoStatus }, [
         run('completed'),
       ])
-    ).toBe('执行已完成 · 等待状态落盘');
+    ).toBe('执行已完成 · 评审/收尾中');
   });
 
   it('does NOT overwrite a persisted Blocked status with Subagent completed', () => {

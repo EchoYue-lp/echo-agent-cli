@@ -60,7 +60,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
 
   const loadPage = useCallback(
     async (initial: boolean) => {
-      if (!tool || loading || complete) return;
+      if (!tool || !tool.detail_ref || loading || complete) return;
       setLoading(true);
       setLoadError(null);
       try {
@@ -84,7 +84,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
   );
 
   useEffect(() => {
-    if (!expanded || manifest || !tool) return;
+    if (!expanded || manifest || !tool?.detail_ref) return;
     void loadPage(true);
   }, [expanded, loadPage, manifest, tool]);
 
@@ -93,6 +93,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
     if (
       !expanded ||
       !tool ||
+      !tool.detail_ref ||
       tool.status !== 'running' ||
       loadError ||
       loadedCharacters >= LIVE_DETAIL_AUTOLOAD_CHARS
@@ -104,7 +105,14 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
   }, [chunks, expanded, loadError, loadPage, tool]);
 
   useEffect(() => {
-    if (!expanded || !tool || tool.status === 'running' || manifest?.status !== 'running') return;
+    if (
+      !expanded ||
+      !tool?.detail_ref ||
+      tool.status === 'running' ||
+      manifest?.status !== 'running'
+    ) {
+      return;
+    }
     void loadPage(false);
   }, [expanded, loadPage, manifest?.status, tool]);
 
@@ -168,6 +176,9 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
 
       {expanded && (
         <div className="ml-5 mt-1 min-w-0 border-l border-[var(--border-primary)] pl-3">
+          {!tool.detail_ref && (
+            <div className="text-[10px] text-[var(--text-tertiary)]">仅保留工具执行摘要</div>
+          )}
           {loadError && (
             <div className="mb-2 flex items-center gap-1.5 text-[var(--color-error)]">
               <AlertTriangle size={11} />

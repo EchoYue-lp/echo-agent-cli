@@ -1,7 +1,11 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
-import { useSubagentRunStore, type ExecutionEvent } from '../stores/subagentRunStore';
+import {
+  subagentRunStoreKey,
+  useSubagentRunStore,
+  type ExecutionEvent,
+} from '../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
@@ -105,16 +109,22 @@ export function useTauriChat() {
         const payload = event.payload;
         const kind = payload.kind as string | undefined;
         if (kind === 'subagent') {
-          const runId = String(payload.subagent_run_id ?? '');
-          const prevStatus = runId ? useSubagentRunStore.getState().runs[runId]?.status : undefined;
+          const subagentRunId = String(payload.subagent_run_id ?? '');
+          const taskRunId = String(payload.run_id ?? '');
+          const storeKey = subagentRunId ? subagentRunStoreKey(taskRunId, subagentRunId) : null;
+          const prevStatus = storeKey
+            ? useSubagentRunStore.getState().runs[storeKey]?.status
+            : undefined;
           useSubagentRunStore.getState().ingest(payload as unknown as ExecutionEvent);
           // Background Subagent completion is already represented by its
           // message-bound execution card. Notify without appending a second
           // assistant message that duplicates the terminal summary.
-          if (runId && payload.event === 'completed') {
-            const run = useSubagentRunStore.getState().runs[runId];
+          if (storeKey && payload.event === 'completed') {
+            const run = useSubagentRunStore.getState().runs[storeKey];
             if (run?.background && prevStatus !== 'completed') {
-              useToastStore.getState().addToast('success', `Subagent ${run.agent || runId} 已完成`);
+              useToastStore
+                .getState()
+                .addToast('success', `Subagent ${run.agent || subagentRunId} 已完成`);
             }
           }
         } else if (kind === 'tool') {

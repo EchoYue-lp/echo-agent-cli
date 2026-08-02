@@ -4,7 +4,7 @@
 > 新窗口读本文件 + `docs/system-deep-dive/03-subagent.md` 即可恢复全局,不靠会话记忆。
 > **创建**:2026-07-02。**状态**:阶段 1-5 已完成;本文作为历史设计与状态归档保留。
 > **2026-07-27 后续合同**:本文中的 `{task_id}:{attempt}` 是当时实现记录。正式
-> PlanTask 当前使用 `{task_id}:{plan_revision}:{attempt}`；以
+> PlanTask 当前使用 `{run_id}:{task_id}:{plan_revision}:{attempt}`；以
 > `docs/system-deep-dive/03-subagent.md` 和
 > `docs/2026-07-27-runtime-dag-kernel-convergence.md` 为准。
 

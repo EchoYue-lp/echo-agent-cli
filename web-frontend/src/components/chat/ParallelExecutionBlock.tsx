@@ -32,7 +32,8 @@ export function visibleSubagentRuns(
   runs: readonly SubagentRunState[],
   activeRun: Pick<TaskRun, 'run_id' | 'conversation_id'> | null,
   messageId: string,
-  lastAssistantMessageId: string | null
+  lastAssistantMessageId: string | null,
+  knownMessageIds: ReadonlySet<string>
 ): SubagentRunState[] {
   const isLatestAssistant = messageId === lastAssistantMessageId;
   const matchingRuns = runs.filter((run) => {
@@ -42,7 +43,14 @@ export function visibleSubagentRuns(
     if (run.messageId === messageId) {
       return true;
     }
-    if (run.messageId || !isLatestAssistant) {
+    if (run.messageId) {
+      if (knownMessageIds.has(run.messageId)) return false;
+      // Conversations saved before message IDs were persisted cannot reproduce
+      // root_message_id. Restrict the fallback to the active run and latest
+      // assistant message so history from another run cannot drift forward.
+      return Boolean(isLatestAssistant && activeRun && run.runId === activeRun.run_id);
+    }
+    if (!isLatestAssistant) {
       return false;
     }
     return (
@@ -60,16 +68,30 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
   const activeRun = useTaskRuntimeStore((s) => s.activeRun);
   const plan = useTaskRuntimeStore((s) => s.plan);
   const runs = useSubagentRunStore((s) => s.runs);
-  const lastAssistantMessageId = useChatStore((s) => {
-    for (let i = s.messages.length - 1; i >= 0; i -= 1) {
-      if (s.messages[i]?.role === 'assistant') return s.messages[i]?.id ?? null;
+  const messages = useChatStore((s) => s.messages);
+  const { lastAssistantMessageId, knownMessageIds } = useMemo(() => {
+    let lastAssistant: string | null = null;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === 'assistant') {
+        lastAssistant = messages[i]?.id ?? null;
+        break;
+      }
     }
-    return null;
-  });
+    return {
+      lastAssistantMessageId: lastAssistant,
+      knownMessageIds: new Set(messages.map((message) => message.id)),
+    };
+  }, [messages]);
 
   const visibleRuns = useMemo(() => {
-    return visibleSubagentRuns(Object.values(runs), activeRun, messageId, lastAssistantMessageId);
-  }, [activeRun, runs, messageId, lastAssistantMessageId]);
+    return visibleSubagentRuns(
+      Object.values(runs),
+      activeRun,
+      messageId,
+      lastAssistantMessageId,
+      knownMessageIds
+    );
+  }, [activeRun, runs, messageId, lastAssistantMessageId, knownMessageIds]);
 
   if (visibleRuns.length === 0) return null;
 
@@ -77,7 +99,7 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
     <>
       {visibleRuns.map((w) => (
         <SubagentStreamBlock
-          key={w.subagentRunId}
+          key={`${w.runId}:${w.subagentRunId}`}
           run={w}
           taskTitle={plan?.tasks.find((task) => task.id === w.taskId)?.title}
         />

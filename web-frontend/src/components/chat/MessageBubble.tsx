@@ -1,10 +1,14 @@
-import { useState, memo } from 'react';
-import type { ChatMessage, ExecutionRound } from '../../types/api';
+import { useMemo, useState, memo } from 'react';
+import type { ChatMessage } from '../../types/api';
 import { Bot, Copy, Check, RefreshCw, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
-import { InlineToolCall } from './InlineToolCall';
-import { ParallelExecutionBlock } from './ParallelExecutionBlock';
+import { ParallelExecutionBlock, visibleSubagentRuns } from './ParallelExecutionBlock';
+import { ToolExecutionGroup } from './ToolExecutionGroup';
+import { ExecutionProcessGroup } from './ExecutionProcessGroup';
+import { useSubagentRunStore } from '../../stores/subagentRunStore';
+import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
+import { useChatStore } from '../../stores/chatStore';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -45,7 +49,7 @@ function isImageFile(mime: string): boolean {
   return mime.startsWith('image/');
 }
 
-/** Flatten executionRounds (or legacy fields) into an ordered step list. */
+/** Project the persisted execution timeline into renderable steps. */
 interface FlatStep {
   type: 'thinking' | 'tool';
   thinkingContent?: string;
@@ -53,32 +57,40 @@ interface FlatStep {
   toolIndex: number;
 }
 
+interface ThinkingDisplayItem {
+  type: 'thinking';
+  content: string;
+}
+
+interface ToolDisplayItem {
+  type: 'tools';
+  toolIds: string[];
+}
+
+type ExecutionDisplayItem = ThinkingDisplayItem | ToolDisplayItem;
+
+export function isExecutionProcessCompleted(
+  messageIsStreaming: boolean | undefined,
+  activeRunBelongsToMessage: boolean,
+  activeRunStatus: string | null,
+  subagentStatuses: readonly string[]
+): boolean {
+  if (messageIsStreaming) return false;
+  if (activeRunBelongsToMessage) {
+    // TaskRun is the authoritative lifecycle. A missing or delayed Subagent
+    // terminal event must not leave a completed task expanded forever.
+    return Boolean(
+      activeRunStatus && ['completed', 'failed', 'cancelled'].includes(activeRunStatus)
+    );
+  }
+  return subagentStatuses.every((status) => status !== 'running');
+}
+
 export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal: number } {
   const steps: FlatStep[] = [];
   let thinkingTotal = 0;
 
-  if (!message.isStreaming && message.executionRounds && message.executionRounds.length > 0) {
-    const renderedToolIds = new Set<string>();
-    message.executionRounds.forEach((round: ExecutionRound) => {
-      if (round.thinking && round.thinking.content.trim()) {
-        steps.push({ type: 'thinking', thinkingContent: round.thinking.content, toolIndex: 0 });
-        thinkingTotal++;
-      }
-      round.toolCallIds.forEach((callId) => {
-        renderedToolIds.add(callId);
-        steps.push({ type: 'tool', toolId: callId, toolIndex: steps.length });
-      });
-    });
-
-    // A final tool batch may not have reached executionRounds when the chat
-    // stream hands off to TaskRuntime. executionSteps records the started tool
-    // summary, so append only calls that completed rounds did not already project.
-    message.executionSteps?.forEach((step) => {
-      if (step.type !== 'tool' || renderedToolIds.has(step.callId)) return;
-      renderedToolIds.add(step.callId);
-      steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
-    });
-  } else if (message.executionSteps && message.executionSteps.length > 0) {
+  if (message.executionSteps && message.executionSteps.length > 0) {
     message.executionSteps.forEach((step) => {
       if (step.type === 'thinking') {
         const seg = message.thinkingSegments?.[step.index];
@@ -89,6 +101,17 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
       } else if (step.type === 'tool') {
         steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
       }
+    });
+  } else if (message.executionRounds && message.executionRounds.length > 0) {
+    // Older persisted conversations may only have round-level execution data.
+    message.executionRounds.forEach((round) => {
+      if (round.thinking && round.thinking.content.trim()) {
+        steps.push({ type: 'thinking', thinkingContent: round.thinking.content, toolIndex: 0 });
+        thinkingTotal++;
+      }
+      round.toolCallIds.forEach((callId) => {
+        steps.push({ type: 'tool', toolId: callId, toolIndex: steps.length });
+      });
     });
   } else {
     // Fallback for messages without explicit execution order.
@@ -103,6 +126,28 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
     }
   }
   return { steps, thinkingTotal };
+}
+
+/** Collapse each uninterrupted run of tool calls into one display item. */
+export function groupExecutionSteps(steps: FlatStep[]): ExecutionDisplayItem[] {
+  const items: ExecutionDisplayItem[] = [];
+
+  for (const step of steps) {
+    if (step.type === 'thinking') {
+      items.push({ type: 'thinking', content: step.thinkingContent ?? '' });
+      continue;
+    }
+
+    if (!step.toolId) continue;
+    const previous = items.at(-1);
+    if (previous?.type === 'tools') {
+      previous.toolIds.push(step.toolId);
+    } else {
+      items.push({ type: 'tools', toolIds: [step.toolId] });
+    }
+  }
+
+  return items;
 }
 
 export const MessageBubble = memo(function MessageBubble({
@@ -136,6 +181,41 @@ export const MessageBubble = memo(function MessageBubble({
   const files = message.attachments?.filter((a) => !isImageFile(a.mime_type)) ?? [];
 
   const { steps, thinkingTotal } = flattenSteps(message);
+  const executionItems = groupExecutionSteps(steps);
+  const activeRun = useTaskRuntimeStore((state) => state.activeRun);
+  const subagentRuns = useSubagentRunStore((state) => state.runs);
+  const chatMessages = useChatStore((state) => state.messages);
+  const lastAssistantMessageId = useMemo(() => {
+    for (let index = chatMessages.length - 1; index >= 0; index -= 1) {
+      const candidate = chatMessages[index];
+      if (candidate?.role === 'assistant') return candidate.id;
+    }
+    return null;
+  }, [chatMessages]);
+  const messageIds = useMemo(() => new Set(chatMessages.map((item) => item.id)), [chatMessages]);
+  const visibleRuns = useMemo(
+    () =>
+      visibleSubagentRuns(
+        Object.values(subagentRuns),
+        activeRun,
+        message.id,
+        lastAssistantMessageId,
+        messageIds
+      ),
+    [activeRun, lastAssistantMessageId, message.id, messageIds, subagentRuns]
+  );
+  const activeRunBelongsToMessage = Boolean(
+    activeRun &&
+    (activeRun.root_message_id === message.id ||
+      (!messageIds.has(activeRun.root_message_id) && message.id === lastAssistantMessageId))
+  );
+  const executionCompleted = isExecutionProcessCompleted(
+    message.isStreaming,
+    activeRunBelongsToMessage,
+    activeRun?.status ?? null,
+    visibleRuns.map((run) => run.status)
+  );
+  const hasExecutionProcess = executionItems.length > 0 || visibleRuns.length > 0;
   let thinkingIndex = 0;
 
   return (
@@ -256,35 +336,34 @@ export const MessageBubble = memo(function MessageBubble({
             sections. This is what makes it read as one continuous flow. */}
         {!isUser && (
           <div className="w-full space-y-2">
-            {/* Thinking + tools */}
-            {steps.length > 0 && (
-              <div className="space-y-1">
-                {steps.map((step, i) => {
-                  if (step.type === 'thinking') {
-                    thinkingIndex++;
-                    return (
-                      <ThinkingSegment
-                        key={`think-${i}`}
-                        index={thinkingIndex}
-                        total={thinkingTotal}
-                        content={step.thinkingContent || ''}
-                        isStreaming={message.isStreaming}
-                      />
-                    );
-                  }
-                  return (
-                    <InlineToolCall
-                      key={`tool-${i}`}
-                      toolId={step.toolId || ''}
-                      index={step.toolIndex}
-                    />
-                  );
-                })}
-              </div>
-            )}
+            {hasExecutionProcess ? (
+              <ExecutionProcessGroup completed={executionCompleted}>
+                {/* Thinking + tools */}
+                <div className="space-y-1">
+                  {executionItems.map((item, i) => {
+                    if (item.type === 'thinking') {
+                      thinkingIndex++;
+                      return (
+                        <ThinkingSegment
+                          key={`think-${i}`}
+                          index={thinkingIndex}
+                          total={thinkingTotal}
+                          content={item.content}
+                          isStreaming={!executionCompleted}
+                        />
+                      );
+                    }
+                    return <ToolExecutionGroup key={`tools-${i}`} toolIds={item.toolIds} />;
+                  })}
+                </div>
 
-            {/* Parallel execution segment (run-level subagents) — inline, no wrapper */}
-            <ParallelExecutionBlock messageId={message.id} />
+                {/* Run-level Subagents remain independent rows inside the process. */}
+                <ParallelExecutionBlock messageId={message.id} />
+              </ExecutionProcessGroup>
+            ) : (
+              // No execution history exists for this assistant response.
+              <ParallelExecutionBlock messageId={message.id} />
+            )}
 
             {/* Final text — no left border, plain markdown flow */}
             {message.content && (

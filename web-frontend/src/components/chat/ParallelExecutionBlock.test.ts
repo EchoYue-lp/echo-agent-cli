@@ -27,7 +27,13 @@ describe('ParallelExecutionBlock visibility', () => {
     });
 
     expect(
-      visibleSubagentRuns([candidate], activeRun, 'assistant-message-2', 'assistant-message-2')
+      visibleSubagentRuns(
+        [candidate],
+        activeRun,
+        'assistant-message-2',
+        'assistant-message-2',
+        new Set(['assistant-message-2'])
+      )
     ).toEqual([candidate]);
   });
 
@@ -35,7 +41,40 @@ describe('ParallelExecutionBlock visibility', () => {
     const candidate = run({ messageId: 'assistant-message-1' });
 
     expect(
-      visibleSubagentRuns([candidate], null, 'assistant-message-2', 'assistant-message-2')
+      visibleSubagentRuns(
+        [candidate],
+        null,
+        'assistant-message-2',
+        'assistant-message-2',
+        new Set(['assistant-message-1', 'assistant-message-2'])
+      )
+    ).toEqual([]);
+  });
+
+  it('attaches an old unresolvable message id only to the active run latest response', () => {
+    const activeRun = {
+      run_id: 'formal-run',
+      conversation_id: 'conversation-1',
+    } as TaskRun;
+    const candidate = run({ runId: 'formal-run', messageId: 'legacy-message-id' });
+
+    expect(
+      visibleSubagentRuns(
+        [candidate],
+        activeRun,
+        'loaded-conversation-1-3',
+        'loaded-conversation-1-3',
+        new Set(['loaded-conversation-1-2', 'loaded-conversation-1-3'])
+      )
+    ).toEqual([candidate]);
+    expect(
+      visibleSubagentRuns(
+        [candidate],
+        activeRun,
+        'loaded-conversation-1-2',
+        'loaded-conversation-1-3',
+        new Set(['loaded-conversation-1-2', 'loaded-conversation-1-3'])
+      )
     ).toEqual([]);
   });
 
@@ -47,7 +86,13 @@ describe('ParallelExecutionBlock visibility', () => {
     const candidate = run({ runId: 'formal-run', messageId: undefined });
 
     expect(
-      visibleSubagentRuns([candidate], activeRun, 'assistant-message', 'assistant-message')
+      visibleSubagentRuns(
+        [candidate],
+        activeRun,
+        'assistant-message',
+        'assistant-message',
+        new Set(['assistant-message'])
+      )
     ).toEqual([candidate]);
   });
 
@@ -69,7 +114,41 @@ describe('ParallelExecutionBlock visibility', () => {
     });
 
     expect(
-      visibleSubagentRuns([first, retry], null, 'assistant-message', 'assistant-message')
+      visibleSubagentRuns(
+        [first, retry],
+        null,
+        'assistant-message',
+        'assistant-message',
+        new Set(['assistant-message'])
+      )
     ).toEqual([retry]);
+  });
+
+  it('does not duplicate an older stable-message run onto the latest response', () => {
+    const activeRun = {
+      run_id: 'formal-run',
+      conversation_id: 'conversation-1',
+    } as TaskRun;
+    const candidate = run({ runId: 'formal-run', messageId: 'assistant-message-1' });
+    const knownMessageIds = new Set(['assistant-message-1', 'assistant-message-2']);
+
+    expect(
+      visibleSubagentRuns(
+        [candidate],
+        activeRun,
+        'assistant-message-1',
+        'assistant-message-2',
+        knownMessageIds
+      )
+    ).toEqual([candidate]);
+    expect(
+      visibleSubagentRuns(
+        [candidate],
+        activeRun,
+        'assistant-message-2',
+        'assistant-message-2',
+        knownMessageIds
+      )
+    ).toEqual([]);
   });
 });

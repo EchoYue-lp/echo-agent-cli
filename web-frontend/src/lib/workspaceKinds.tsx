@@ -34,13 +34,6 @@ export const WORKSPACE_KINDS: WorkspaceKindMeta[] = [
     color: '#6366f1',
   },
   {
-    value: 'data',
-    label: '数据分析',
-    icon: BarChart3,
-    desc: '自动激活 data-wrangling、statistical-analysis、data-visualization 技能',
-    color: '#f59e0b',
-  },
-  {
     value: 'data_analysis',
     label: '数据分析',
     icon: BarChart3,
@@ -78,5 +71,6 @@ const DEFAULT_KIND = KIND_MAP['general'];
 
 /** Resolve a kind string (from backend) to its visual meta, falling back to general. */
 export function getWorkspaceKind(kind: string): WorkspaceKindMeta {
-  return KIND_MAP[kind] ?? DEFAULT_KIND;
+  const normalized = kind === 'data' ? 'data_analysis' : kind;
+  return KIND_MAP[normalized] ?? DEFAULT_KIND;
 }
