@@ -22,6 +22,7 @@ pub mod model_config;
 pub mod observability;
 pub mod output;
 pub mod persistence;
+pub mod prepared_turn;
 pub mod profiles;
 pub mod project;
 pub mod prompt_contract;

@@ -293,6 +293,57 @@ the same fact is not persisted twice. See
   gone. `TaskUpdateRequest` remains only as an EKO frontend wire DTO and is
   converted losslessly to the framework patch protocol.
 
+### 2026-08-03 User Input Normalization (Phase 1 of 3, in progress)
+
+Long pastes and large text uploads previously reached the model fully inlined,
+and stayed inlined across ReAct turns and session restore. The industry
+converges on reference-then-search-then-read (Claude Code spills tool output
+over ~50K chars; Codex writes long goals to `goal_files`). EKO adopts the same
+mixed strategy: short text inlines, long text spills to a user-input artifact
+and is delivered as a lightweight reference + preview, with `grep`/`read_artifact`
+recovering the content on demand.
+
+**Layering (locked):** application layer owns `PreparedUserTurn` / threshold
+policy / spill directory / five-entry-point + steer normalization / data-URL
+removal in persistence; framework only gains the ability for `grep` to resolve
+`ToolContext.output_artifacts.root_dir` (the field already exists) and reuses
+the existing artifact infrastructure (`ToolOutputArtifactWriter`, `read_artifact`).
+No second artifact mechanism, no SQLite, no new Task state.
+
+**Phase 1 done (pure additive, no main-path switch):**
+- New `echo-agent-app-core/src/prepared_turn.rs`: `PreparedUserTurn`
+  (instruction + resources + mode_hint), `InputResourceRef` (generalizes
+  `AttachmentRef` with kind/delivery/metadata), `UserTurnInput`, single
+  `to_message()` merge point, threshold gate (32 KiB or ~4k estimated tokens),
+  UTF-8-safe spill (`chars().take` preview, atomic `.partial`→rename, SHA-256).
+- `attachments.rs`: `is_image_mime` promoted to `pub(crate)`; new
+  `AttachmentRef::to_input_resource()`.
+- `workspace/layout.rs`: new `WorkspaceLayout::user_input_artifacts()`
+  (`.eko/artifacts/user-input/`, created on demand like `tool-logs`).
+- `lib.rs`: registered `prepared_turn` module.
+- 10 unit tests green (threshold/CJK/emoji/spill/`to_message`/path sanitize);
+  clippy + four panic lints + fmt pass; attachments/persistence regression clean.
+
+**Phase 2 pending (high risk — writes the authoritative main path):**
+- `drive_chat`/`drive_chat_inner` (`chat_driver.rs:197/417-438`) signature
+  takes `PreparedUserTurn`; delete the `match multimodal` merge block
+  (mode_hint folding moves into `PreparedUserTurn`).
+- Switch five entry points + steer (GUI send `chat.rs:455-668`, GUI steer
+  `chat.rs:736`, TUI send `events.rs:1366-2168`, TUI steer `events.rs:4134`,
+  CLI REPL `repl.rs:497-527`, channel `channels.rs:201-247`).
+- GUI main path moves to refs (eliminates the `build_message` /
+  `build_message_from_refs` dual implementation); delete `build_message` once
+  caller-free.
+- Attachment propagation chain unchanged: `ChatResources.attachments`,
+  `TaskRun.attachments`, `executor.rs:2790/2948` subagent rebuild keep using
+  `AttachmentRef` (TaskRun serialization-compatible). Invariant: `SubagentRun`
+  carries no attachments; subagents read parent `TaskRun` live.
+- Recommended in fresh context (re-read this section to resume).
+
+**Phase 3 pending:** persistence data-URL removal (`persistence.rs:67`
+`SavedAttachment.url` → `artifact_path`); grep artifact-root extension
+(`echo-tools/src/files/grep.rs:148-170` only); threshold eval + adapter cleanup.
+
 ## Next Step
 
 Tool context optimization Phase 0-6 is closed in

@@ -191,7 +191,7 @@ pub fn save_attachments<'a>(
 }
 
 /// Whether a MIME type is an image (routed to `ContentPart::ImageUrl`).
-fn is_image_mime(mime: &str) -> bool {
+pub(crate) fn is_image_mime(mime: &str) -> bool {
     mime.starts_with("image/")
 }
 
@@ -261,6 +261,20 @@ impl AttachmentRef {
             name: att.name.clone(),
             mime_type: att.mime_type.clone(),
         }
+    }
+
+    /// Convert this persisted upload ref into an inline
+    /// [`InputResourceRef`](crate::prepared_turn::InputResourceRef). Reads the
+    /// file from disk to record its size; delivery is `Inline` so
+    /// [`PreparedUserTurn::to_message`](crate::prepared_turn::PreparedUserTurn)
+    /// inlines it into the model message.
+    pub fn to_input_resource(
+        &self,
+    ) -> std::result::Result<
+        crate::prepared_turn::InputResourceRef,
+        crate::prepared_turn::PreparedTurnError,
+    > {
+        crate::prepared_turn::InputResourceRef::from_attachment(self)
     }
 }
 
