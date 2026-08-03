@@ -195,49 +195,6 @@ pub(crate) fn is_image_mime(mime: &str) -> bool {
     mime.starts_with("image/")
 }
 
-/// Build a multimodal user [`Message`] from text + saved attachments.
-///
-/// Images become `ContentPart::ImageUrl` with a `data:` URL (inline base64) so
-/// the LLM sees the pixels. Everything else becomes `ContentPart::File` with
-/// inline base64 content — the provider layer decides how to forward it
-/// (Anthropic maps text-class files to inline text, PDFs to document blocks).
-pub fn build_message(
-    text: &str,
-    attachments: &[(PathBuf, &AttachmentData)],
-) -> std::io::Result<Message> {
-    if attachments.is_empty() {
-        return Ok(Message::user(text.to_string()));
-    }
-
-    let mut parts = Vec::with_capacity(attachments.len() + 1);
-    parts.push(ContentPart::Text {
-        text: text.to_string(),
-    });
-
-    for (path, att) in attachments {
-        let bytes = std::fs::read(path)?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-        if is_image_mime(&att.mime_type) {
-            // Inline data URL so providers that parse `image_url.url` (Anthropic
-            // via data_url_to_image_source, OpenAI Vision) both work.
-            parts.push(ContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: format!("data:{};base64,{}", att.mime_type, b64),
-                    detail: None,
-                },
-            });
-        } else {
-            parts.push(ContentPart::File {
-                name: att.name.clone(),
-                content: b64,
-            });
-        }
-    }
-
-    Ok(Message::user_multimodal(parts))
-}
-
 /// A persisted attachment reference (no base64 body — just enough to rebuild a
 /// multimodal message by re-reading the file from disk).
 ///
@@ -280,10 +237,11 @@ impl AttachmentRef {
 
 /// Build a multimodal user [`Message`] from text + attachment refs.
 ///
-/// Unlike [`build_message`], this re-reads each file from disk (the refs carry
-/// no base64 body), so it is suitable for subagents that reconstruct the message
-/// long after the original upload. Returns a plain text `Message` when there
-/// are no refs.
+/// Re-reads each file from disk (the refs carry no base64 body), so it is
+/// suitable for subagents that reconstruct the message long after the original
+/// upload. Returns a plain text `Message` when there are no refs. The five
+/// entry points now go through [`PreparedUserTurn`](crate::prepared_turn::PreparedUserTurn)
+/// instead; this helper remains for the subagent rebuild path in `executor.rs`.
 pub fn build_message_from_refs(
     text: &str,
     attachments: &[AttachmentRef],
@@ -349,7 +307,11 @@ mod tests {
         let attachments = [att("photo.png", "image/png", &png_b64)];
         let saved = save_attachments(&attachments, tmp.path());
         assert_eq!(saved.len(), 1);
-        let msg = build_message("look", &saved).unwrap();
+        let refs: Vec<_> = saved
+            .iter()
+            .map(|(p, a)| AttachmentRef::from_saved(p.clone(), a))
+            .collect();
+        let msg = build_message_from_refs("look", &refs).unwrap();
         // Multimodal message: 1 text + 1 image part.
         match &msg.content {
             echo_core::llm::types::MessageContent::Parts(parts) => {
@@ -366,7 +328,11 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello world");
         let attachments = [att("notes.txt", "text/plain", &b64)];
         let saved = save_attachments(&attachments, tmp.path());
-        let msg = build_message("see notes", &saved).unwrap();
+        let refs: Vec<_> = saved
+            .iter()
+            .map(|(p, a)| AttachmentRef::from_saved(p.clone(), a))
+            .collect();
+        let msg = build_message_from_refs("see notes", &refs).unwrap();
         match &msg.content {
             echo_core::llm::types::MessageContent::Parts(parts) => {
                 assert_eq!(parts.len(), 2);
@@ -378,7 +344,7 @@ mod tests {
 
     #[test]
     fn build_message_no_attachments_is_text() {
-        let msg = build_message("plain", &[]).unwrap();
+        let msg = build_message_from_refs("plain", &[]).unwrap();
         assert_eq!(msg.content.as_text(), Some("plain".to_string()));
     }
 }

@@ -199,15 +199,32 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         // Persist IM attachments into the same durable reference contract as
         // GUI/TUI so TaskRuntime subagents can reconstruct the same message.
         let attachment_refs = stage_channel_attachments(&msg.attachments);
-        let multimodal = if attachment_refs.is_empty() {
-            None
-        } else {
-            match echo_agent_app_core::attachments::build_message_from_refs(&text, &attachment_refs)
-            {
-                Ok(message) => Some(message),
-                Err(error) => {
-                    tracing::warn!(%error, "failed to rebuild channel attachments");
-                    None
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        // Channels have no workspace root; long pastes spill to the global
+        // user-input artifact dir (~/.eko/artifacts/user-input/).
+        let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
+        let interaction_mode = *self.interaction_mode.read().await;
+        let mode_hint_str = interaction_mode.prompt_hint().to_string();
+        let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+            echo_agent_app_core::prepared_turn::UserTurnInput {
+                text: &text,
+                attachments: &attachment_refs,
+                mode_hint: Some(&mode_hint_str),
+                spill_dir: &spill_dir,
+                conversation_id: Some(&conv),
+                turn_id: Some(&turn_id),
+            },
+        ) {
+            Ok(turn) => turn,
+            Err(error) => {
+                // Spill failure should not silently drop the message: fall back
+                // to a plain text turn (no artifact) so the user still gets a
+                // reply, and surface the error in logs.
+                tracing::warn!(%error, conv = %conv, "channel user-turn spill failed; falling back to inline text");
+                echo_agent_app_core::prepared_turn::PreparedUserTurn {
+                    instruction: format!("[Mode: {mode_hint_str}]\n\n{text}"),
+                    resources: vec![],
+                    mode_hint: None,
                 }
             }
         };
@@ -216,7 +233,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let store = self.store.clone();
         let review_integration = self.review_integration.clone();
         let webhook_emitter = self.webhook_emitter.clone();
-        let interaction_mode = *self.interaction_mode.read().await;
         let mut prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
         tokio::spawn(async move {
@@ -235,16 +251,16 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 sink,
                 webhook_emitter: Some(webhook_emitter),
                 conv_id: Some(conv_owned.clone()),
-                root_message_id: uuid::Uuid::new_v4().to_string(),
+                root_message_id: turn_id,
                 attachments: attachment_refs,
                 cancel,
-                mode_hint: Some(interaction_mode.prompt_hint().to_string()),
+                mode_hint: Some(mode_hint_str),
                 interaction_mode,
                 layer_manager: review_integration
                     .as_ref()
                     .map(|integration| Arc::new(integration.create_layer_manager())),
             });
-            if let Err(e) = drive_chat(&agent_owned, &text, multimodal.as_ref(), res).await {
+            if let Err(e) = drive_chat(&agent_owned, &turn, res).await {
                 tracing::warn!(error = %e, conv = %conv_owned, "channel drive_chat failed");
             }
         });

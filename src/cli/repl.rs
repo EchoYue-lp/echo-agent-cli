@@ -494,15 +494,28 @@ async fn chat_with_agent(
     } else {
         config.conversation_id.clone()
     };
-    let multimodal = if attachments.is_empty() {
-        None
-    } else {
-        match echo_agent_app_core::attachments::build_message_from_refs(message, &attachments) {
-            Ok(message) => Some(message),
-            Err(error) => {
-                output.print_error(&format!("Failed to read staged attachments: {error}"));
-                None
-            }
+    let workspace_root = config
+        .project
+        .as_deref()
+        .map(std::path::Path::new)
+        .and_then(|p| p.canonicalize().ok());
+    let spill_dir =
+        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(workspace_root.as_deref());
+    let mode_hint_str = interaction_mode.prompt_hint().to_string();
+    let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::prepared_turn::UserTurnInput {
+            text: message,
+            attachments: &attachments,
+            mode_hint: Some(&mode_hint_str),
+            spill_dir: &spill_dir,
+            conversation_id: Some(&conversation_id),
+            turn_id: Some(&turn_id),
+        },
+    ) {
+        Ok(turn) => turn,
+        Err(error) => {
+            output.print_error(&format!("Failed to prepare user turn: {error}"));
+            return;
         }
     };
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
@@ -514,7 +527,7 @@ async fn chat_with_agent(
         root_message_id: turn_id,
         attachments,
         cancel: echo_agent::agent::CancellationToken::new(),
-        mode_hint: Some(interaction_mode.prompt_hint().to_string()),
+        mode_hint: Some(mode_hint_str),
         interaction_mode,
         layer_manager: config
             .review_integration
@@ -522,15 +535,8 @@ async fn chat_with_agent(
             .map(|integration| Arc::new(integration.create_layer_manager())),
     });
     let agent_owned = agent.clone();
-    let message_owned = message.to_string();
     let drive_task = tokio::spawn(async move {
-        echo_agent_app_core::chat_driver::drive_chat(
-            &agent_owned,
-            &message_owned,
-            multimodal.as_ref(),
-            resources,
-        )
-        .await
+        echo_agent_app_core::chat_driver::drive_chat(&agent_owned, &turn, resources).await
     });
 
     spinner.set_message("Waiting for response...");

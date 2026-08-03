@@ -324,21 +324,28 @@ No second artifact mechanism, no SQLite, no new Task state.
 - 10 unit tests green (threshold/CJK/emoji/spill/`to_message`/path sanitize);
   clippy + four panic lints + fmt pass; attachments/persistence regression clean.
 
-**Phase 2 pending (high risk — writes the authoritative main path):**
-- `drive_chat`/`drive_chat_inner` (`chat_driver.rs:197/417-438`) signature
-  takes `PreparedUserTurn`; delete the `match multimodal` merge block
-  (mode_hint folding moves into `PreparedUserTurn`).
-- Switch five entry points + steer (GUI send `chat.rs:455-668`, GUI steer
-  `chat.rs:736`, TUI send `events.rs:1366-2168`, TUI steer `events.rs:4134`,
-  CLI REPL `repl.rs:497-527`, channel `channels.rs:201-247`).
-- GUI main path moves to refs (eliminates the `build_message` /
-  `build_message_from_refs` dual implementation); delete `build_message` once
-  caller-free.
+**Phase 2 done (authoritative main path switched, 2026-08-03):**
+- `drive_chat`/`drive_chat_inner` (`chat_driver.rs:197`) now take
+  `&PreparedUserTurn` instead of `(&str, Option<&Message>)`; the
+  `match multimodal` merge block is gone — `to_message()` is the single
+  authoritative collapse point. Mode-hint folding moved into
+  `PreparedUserTurn::build`.
+- All six entry points switched: GUI send (`chat.rs`), GUI steer
+  (`steer_chat_message`), TUI send (`events.rs` send path + `send_to_agent`),
+  TUI steer (`/steer`), CLI REPL (`chat_with_agent`), channel. Each now builds
+  a `PreparedUserTurn` via `UserTurnInput` + `resolve_user_input_spill_dir`.
+- `ensure_task_mode_run`'s goal is now `turn.instruction` (reference block for
+  spilled text = better task goal than the raw paste); attachments still come
+  from `ChatResources.attachments` (propagation chain unchanged).
+- Dual implementation eliminated: the in-memory `build_message` is deleted;
+  its 3 tests migrated to `build_message_from_refs` (which remains for the
+  `executor.rs:2790/2948` subagent rebuild path).
 - Attachment propagation chain unchanged: `ChatResources.attachments`,
   `TaskRun.attachments`, `executor.rs:2790/2948` subagent rebuild keep using
-  `AttachmentRef` (TaskRun serialization-compatible). Invariant: `SubagentRun`
-  carries no attachments; subagents read parent `TaskRun` live.
-- Recommended in fresh context (re-read this section to resume).
+  `AttachmentRef` (TaskRun serialization-compatible). Invariant holds:
+  `SubagentRun` carries no attachments; subagents read parent `TaskRun` live.
+- Gate green: fmt + clippy (`-D warnings`) + four panic lints + workspace
+  tests (app-core 608 / cli 83+9+5, all pass, 0 failed).
 
 **Phase 3 pending:** persistence data-URL removal (`persistence.rs:67`
 `SavedAttachment.url` → `artifact_path`); grep artifact-root extension

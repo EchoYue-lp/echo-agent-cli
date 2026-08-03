@@ -86,6 +86,21 @@ pub enum PreparedTurnError {
 
 type Result<T> = std::result::Result<T, PreparedTurnError>;
 
+/// Resolve the user-input spill directory for the active workspace.
+///
+/// Prefers `{workspace_root}/.eko/artifacts/user-input/` (per-workspace
+/// isolation, cleaned with the workspace). When no workspace is active
+/// (first-turn, global chats), falls back to the global
+/// `~/.eko/artifacts/user-input/`. Mirrors
+/// [`resolve_uploads_dir`](crate::attachments::resolve_uploads_dir).
+pub fn resolve_user_input_spill_dir(workspace_root: Option<&Path>) -> PathBuf {
+    if let Some(root) = workspace_root {
+        crate::workspace::layout::WorkspaceLayout::user_input_artifacts(root)
+    } else {
+        echo_agent::paths::user_data_path("artifacts").join("user-input")
+    }
+}
+
 /// How an [`InputResourceRef`] is delivered to the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

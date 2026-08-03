@@ -450,44 +450,33 @@ pub async fn send_chat_message(
     // ── Persist attachments + build multimodal message (if any) ──────────
     // The frontend base64-encodes uploads; we write them to a per-workspace
     // uploads dir and rebuild a `Message` with the right ContentParts so the
-    // LLM sees images/files. When there are no attachments we keep the plain
-    // `&str` path unchanged for zero overhead.
+    // LLM sees images/files via the unified PreparedUserTurn (instruction + input
+    // resources). Attachments are persisted first, then converted to refs; the
+    // turn's to_message() rebuilds the multimodal Message from disk (the refs
+    // path), so the in-memory `build_message` helper is no longer used here.
     let saved_attachments = attachments.unwrap_or_default();
-    let (multimodal_message, attachment_refs): (
-        Option<echo_core::llm::types::Message>,
-        Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    ) = if saved_attachments.is_empty() {
-        (None, Vec::new())
+    let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
+    let attachment_refs: Vec<echo_agent_app_core::attachments::AttachmentRef> = if saved_attachments
+        .is_empty()
+    {
+        Vec::new()
     } else {
-        let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
         let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
         let saved =
             echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir);
         // Build refs (path + name + mime) for binding to the run so plan-level
-        // subagents can rebuild the multimodal message later.
-        let refs: Vec<_> = saved
+        // subagents can rebuild the multimodal message later, and so the
+        // PreparedUserTurn can re-read them for inline delivery.
+        saved
             .iter()
             .map(|(path, att)| {
                 echo_agent_app_core::attachments::AttachmentRef::from_saved(path.clone(), att)
             })
-            .collect();
-        let msg = if saved.is_empty() {
-            None
-        } else {
-            match echo_agent_app_core::attachments::build_message(&message, &saved) {
-                Ok(msg) => Some(msg),
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to build multimodal message, sending text only");
-                    None
-                }
-            }
-        };
-        (msg, refs)
+            .collect()
     };
-    let has_attachments = multimodal_message.is_some();
-    if has_attachments {
+    if !attachment_refs.is_empty() {
         tracing::info!(
-            count = saved_attachments.len(),
+            count = attachment_refs.len(),
             "send_chat_message: multimodal message with attachments"
         );
     }
@@ -658,20 +647,49 @@ pub async fn send_chat_message(
     let active_chat_turns = state.app_state.session.active_chat_turns.clone();
     let active_turn_key_for_cleanup = active_turn_key.clone();
     let cancel_for_status = cancel_token.clone();
+    // Build the prepared turn (instruction + input resources, mode hint folded
+    // in, long pastes spilled to user-input artifacts). Replaces the old
+    // (message, multimodal_message) pair handed to drive_chat.
+    let mode_hint_for_turn = interaction_mode.prompt_hint().to_string();
+    let spill_dir =
+        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(ws_root.as_deref());
+    let prepared_turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::prepared_turn::UserTurnInput {
+            text: &message,
+            attachments: &attachment_refs,
+            mode_hint: Some(&mode_hint_for_turn),
+            spill_dir: &spill_dir,
+            conversation_id: conversation_id.as_deref(),
+            turn_id: Some(&message_key),
+        },
+    ) {
+        Ok(turn) => turn,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to prepare user turn");
+            cleanup_tokens.remove(&cleanup_key);
+            if active_chat_turns
+                .get(&active_turn_key_for_cleanup)
+                .is_some_and(|entry| entry.value() == &cleanup_key)
+            {
+                active_chat_turns.remove(&active_turn_key_for_cleanup);
+            }
+            let _ = sink.on_event(ChatDriverEvent::TurnStatus {
+                status: "failed".to_string(),
+            });
+            return Err(IpcError::Validation(format!(
+                "failed to prepare user turn: {e}"
+            )));
+        }
+    };
     tokio::spawn(async move {
         let start = std::time::Instant::now();
-        // Multimodal: drive_chat takes Option<&Message>; pass the pre-built one
-        // (images/files) so the agent sees attachments this turn. Background
-        // runs created by create_complex_task pick up attachments via
-        // ChatResources.attachments (already bound above).
-        let multimodal_ref = multimodal_message.as_ref();
-        let outcome = echo_agent_app_core::chat_driver::drive_chat(
-            &agent_handle_clone,
-            &message,
-            multimodal_ref,
-            res,
-        )
-        .await;
+        // The prepared turn carries instruction + inline resources (images /
+        // files re-read from disk via refs). Background runs created by
+        // create_complex_task pick up attachments via ChatResources.attachments
+        // (already bound above).
+        let outcome =
+            echo_agent_app_core::chat_driver::drive_chat(&agent_handle_clone, &prepared_turn, res)
+                .await;
         let terminal_status = if cancel_for_status.is_cancelled() {
             "cancelled"
         } else if outcome.is_ok() {
@@ -734,20 +752,32 @@ pub async fn steer_chat_message(
         .map(|entry| entry.value().clone())
         .ok_or_else(|| IpcError::Validation("no active chat turn".to_string()))?;
     let saved_attachments = attachments.unwrap_or_default();
-    let steer_message = if saved_attachments.is_empty() {
-        echo_core::llm::types::Message::user(message)
-    } else {
-        let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
-        let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
-        let saved =
-            echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir);
-        if saved.is_empty() {
-            echo_core::llm::types::Message::user(message)
-        } else {
-            echo_agent_app_core::attachments::build_message(&message, &saved)
-                .map_err(|error| IpcError::Validation(error.to_string()))?
-        }
-    };
+    let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
+    let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
+    let saved =
+        echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir);
+    let attachment_refs: Vec<_> = saved
+        .iter()
+        .map(|(path, att)| {
+            echo_agent_app_core::attachments::AttachmentRef::from_saved(path.clone(), att)
+        })
+        .collect();
+    let spill_dir =
+        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(ws_root.as_deref());
+    let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::prepared_turn::UserTurnInput {
+            text: &message,
+            attachments: &attachment_refs,
+            mode_hint: None,
+            spill_dir: &spill_dir,
+            conversation_id: Some(&conversation_id),
+            turn_id: Some(&expected_turn_id),
+        },
+    )
+    .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let steer_message = prepared
+        .to_message()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent = state.app_state.connection.agent_for(&conversation_id).await;
     match agent
         .steer_input(Some(&expected_turn_id), steer_message)

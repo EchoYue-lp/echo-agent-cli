@@ -1,14 +1,18 @@
 //! Stage 2 — shared chat driver (极简入口).
 //!
 //! `drive_chat` is the single, thin entry for a chat turn across TUI / CLI
-//! channel / GUI: it wraps the user input into one `Message`, streams the
-//! agent's ReAct reply through a per-mode `ChatSink`, and stops. It does not
-//! classify Auto requests in advance. Task mode creates its required formal
-//! run before execution; Auto creates a run only when the agent invokes a
-//! formal plan or long-lived task tool; ordinary Chat/Auto turns create none.
+//! channel / GUI: it takes a [`PreparedUserTurn`] (instruction + input
+//! resources, with the mode hint already folded in and long pastes spilled to
+//! a user-input artifact), collapses it into one `Message` via
+//! [`PreparedUserTurn::to_message`], streams the agent's ReAct reply through a
+//! per-mode `ChatSink`, and stops. It does not classify Auto requests in
+//! advance. Task mode creates its required formal run before execution; Auto
+//! creates a run only when the agent invokes a formal plan or long-lived task
+//! tool; ordinary Chat/Auto turns create none.
 //!
-//! Multimodal is passed through (`Option<&Message>`) so TUI / channel can
-//! attach images/files the same way GUI already does.
+//! Multimodal (images/files) is delivered via the turn's inline resources; the
+//! old `(&str, Option<&Message>)` pair has been replaced by the single
+//! `PreparedUserTurn`.
 
 use echo_agent::agent::{
     Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity, envelope_event_stream,
@@ -196,8 +200,7 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 /// `create_complex_task` 和 inline/formal plan 各自拥有真正的 run_id。
 pub async fn drive_chat(
     agent: &AgentHandle,
-    message: &str,
-    multimodal: Option<&Message>,
+    turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
 ) -> Result<(), String> {
     // Scope a per-turn run_id so task tools (task_create /
@@ -219,12 +222,16 @@ pub async fn drive_chat(
     let interaction_mode = res.interaction_mode;
     let store = res.store.clone();
     if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
+        // The turn's instruction is the goal (mode_hint already folded in; for
+        // spilled long text it is the reference block, which is a better task
+        // goal than the full paste). Attachments still come from ChatResources
+        // so the TaskRun/subagent propagation chain is unchanged.
         ensure_task_mode_run(
             store.as_ref(),
             &formal_run_id,
             res.conv_id.as_deref(),
             &turn_id,
-            message,
+            &turn.instruction,
             &res.attachments,
             Some(&trace_sink),
         )?;
@@ -251,7 +258,7 @@ pub async fn drive_chat(
         formal_run_id.clone(),
         cancel,
         Some(trace_sink.clone()),
-        drive_chat_inner(agent, message, multimodal, res, turn_id_for_inner),
+        drive_chat_inner(agent, turn, res, turn_id_for_inner),
     )
     .await;
     if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
@@ -416,26 +423,18 @@ fn observe_execution_path(
 /// Inner ReAct-streaming body of [`drive_chat`], run inside the run_id scope.
 async fn drive_chat_inner(
     agent: &AgentHandle,
-    message: &str,
-    multimodal: Option<&Message>,
+    turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     turn_id: String,
 ) -> Result<(), String> {
-    let msg: Message = match multimodal {
-        Some(m) => m.clone(),
-        None => {
-            // B4.3 (spec §8): prepend the per-turn mode hint to the user text
-            // when set (Chat/Task modes). Pure prompt — no code route branch,
-            // no re-introduction of route pre-judgment. Auto (None) adds none.
-            let text = match &res.mode_hint {
-                Some(hint) if !hint.is_empty() => {
-                    format!("[Mode: {hint}]\n\n{message}")
-                }
-                _ => message.to_string(),
-            };
-            Message::user(text)
-        }
-    };
+    // Single authoritative merge: the turn already folded the mode hint into its
+    // instruction (and spilled long text to an artifact reference). `to_message`
+    // collapses instruction + inline resources into one framework Message,
+    // replacing the old `match multimodal` block.
+    let msg: Message = turn.to_message().map_err(|e| {
+        tracing::error!(error = %e, "failed to build user message from prepared turn");
+        format!("failed to build user message: {e}")
+    })?;
     let cancel = res.cancel.clone();
     let sink: std::sync::Arc<dyn ChatSink> = res.sink.clone();
     // P1.1: capture interaction mode before `res` is moved into the chat
@@ -593,6 +592,21 @@ impl ChatSink for ChannelChatSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal [`PreparedUserTurn`] from text (+ optional mode hint) for
+    /// tests that don't exercise spill/attachment logic. Mirrors how the real
+    /// entry points fold the mode hint into the instruction.
+    fn make_turn(text: &str, mode_hint: Option<&str>) -> crate::prepared_turn::PreparedUserTurn {
+        let instruction = match mode_hint {
+            Some(hint) if !hint.trim().is_empty() => format!("[Mode: {hint}]\n\n{text}"),
+            _ => text.to_string(),
+        };
+        crate::prepared_turn::PreparedUserTurn {
+            instruction,
+            resources: vec![],
+            mode_hint: None,
+        }
+    }
 
     #[test]
     fn task_mode_uses_only_task_runtime_dispatch_tools() {
@@ -781,7 +795,12 @@ mod tests {
             layer_manager: None,
         });
 
-        drive_chat(&agent, "build a formal plan", None, resources).await?;
+        drive_chat(
+            &agent,
+            &make_turn("build a formal plan", Some("task")),
+            resources,
+        )
+        .await?;
 
         let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("task-turn");
         let run = store
@@ -849,7 +868,7 @@ mod tests {
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
             layer_manager: None,
         });
-        drive_chat(&agent, "hi", None, res)
+        drive_chat(&agent, &make_turn("hi", None), res)
             .await
             .expect("drive_chat should succeed");
         // The agent's FinalAnswer is streamed through the sink.
@@ -953,7 +972,7 @@ mod tests {
             layer_manager: None,
         });
 
-        drive_chat(&agent, "continue", None, res).await?;
+        drive_chat(&agent, &make_turn("continue", None), res).await?;
 
         let messages = mock
             .last_messages()
@@ -1015,7 +1034,8 @@ mod tests {
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Chat,
             layer_manager: None,
         });
-        drive_chat(&agent, "hi there", None, res)
+        let turn = make_turn("hi there", Some("Chat — do not spawn tasks"));
+        drive_chat(&agent, &turn, res)
             .await
             .expect("drive_chat should succeed");
         let messages = mock
@@ -1092,7 +1112,7 @@ mod tests {
                 interaction_mode,
                 layer_manager: None,
             });
-            drive_chat(&agent, "run", None, resources).await?;
+            drive_chat(&agent, &make_turn("run", None), resources).await?;
         }
 
         if calls.load(std::sync::atomic::Ordering::SeqCst) != 1 {

@@ -1363,27 +1363,32 @@ async fn dispatch_turn(
         }
     }
     app.start_turn(&turn.text);
-    let multimodal = if turn.attachments.is_empty() {
-        None
-    } else {
-        match echo_agent_app_core::attachments::build_message_from_refs(
-            &turn.text,
-            &turn.attachments,
-        ) {
-            Ok(msg) => Some(msg),
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to build multimodal message; sending text only");
-                None
-            }
-        }
-    };
     let cancel = echo_agent::agent::CancellationToken::new();
     app.active_cancel = Some(cancel.clone());
     let turn_id = uuid::Uuid::new_v4().to_string();
     app.active_turn_id = Some(turn_id.clone());
     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx));
-    let mode_hint = Some(turn.interaction_mode.prompt_hint().to_string());
+    let mode_hint_str = turn.interaction_mode.prompt_hint().to_string();
+    // TUI has no workspace concept (same as its uploads dir at line ~2494), so
+    // long pastes spill to the global user-input artifact dir.
+    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
+    let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::prepared_turn::UserTurnInput {
+            text: &turn.text,
+            attachments: &turn.attachments,
+            mode_hint: Some(&mode_hint_str),
+            spill_dir: &spill_dir,
+            conversation_id: app.conversation_id.as_deref(),
+            turn_id: Some(&turn_id),
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(%error, "failed to prepare TUI user turn");
+            return;
+        }
+    };
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: app.pool.clone(),
         store: app.task_runtime_store.clone(),
@@ -1396,7 +1401,7 @@ async fn dispatch_turn(
         // Bind staged refs so subagents in an autonomous run see them too.
         attachments: turn.attachments,
         cancel,
-        mode_hint,
+        mode_hint: Some(mode_hint_str),
         interaction_mode: turn.interaction_mode,
         // B5.1 (TUI/GUI parity): build a layer_manager per turn from
         // review_integration so autonomous runs block-write their
@@ -1407,7 +1412,7 @@ async fn dispatch_turn(
             .as_ref()
             .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
     });
-    send_to_agent(agent, turn.text, multimodal, res).await;
+    send_to_agent(agent, prepared, res).await;
 }
 
 async fn steer_active_turn(app: &mut TuiApp, agent: &AgentHandle, text: &str) {
@@ -2152,20 +2157,19 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
 
 async fn send_to_agent(
     agent: &AgentHandle,
-    text: String,
-    multimodal: Option<echo_agent::prelude::Message>,
+    turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
 ) {
     use echo_agent_app_core::chat_driver::drive_chat;
 
     // 极简入口(Phase B1/B3):TUI 不预判 normal/complex——agent 自主决定是否
     // 建后台 Run(create_complex_task 工具,B3b)。ChatResources(pool/store/sink)
-    // 经 drive_chat scope 进 task_local 供工具读。B5.3: multimodal 透传 /attach
-    // 暂存的图片/文档(与 GUI 同路径)。
+    // 经 drive_chat scope 进 task_local 供工具读。B5.3: 用户输入(含 /attach 暂存
+    // 的图片/文档)经 PreparedUserTurn 统一构造(与 GUI 同路径)。
     let agent_owned = agent.clone();
 
     tokio::spawn(async move {
-        if let Err(e) = drive_chat(&agent_owned, &text, multimodal.as_ref(), res).await {
+        if let Err(e) = drive_chat(&agent_owned, &turn, res).await {
             tracing::warn!(error = %e, "TUI drive_chat failed");
         }
     });
@@ -4132,22 +4136,36 @@ async fn handle_slash_command(
                 return;
             }
             let attachments = std::mem::take(&mut app.pending_attachments);
-            let message = if attachments.is_empty() {
-                echo_agent::llm::types::Message::user(instruction.to_string())
-            } else {
-                match echo_agent_app_core::attachments::build_message_from_refs(
-                    instruction,
-                    &attachments,
-                ) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        app.messages.push(ChatMessage {
-                            role: MessageRole::System,
-                            content: format!("Failed to build steer attachment: {error}"),
-                        });
-                        app.pending_attachments = attachments;
-                        return;
-                    }
+            let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
+            let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+                echo_agent_app_core::prepared_turn::UserTurnInput {
+                    text: instruction,
+                    attachments: &attachments,
+                    mode_hint: None,
+                    spill_dir: &spill_dir,
+                    conversation_id: app.conversation_id.as_deref(),
+                    turn_id: app.active_turn_id.as_deref(),
+                },
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Failed to prepare steer input: {error}"),
+                    });
+                    app.pending_attachments = attachments;
+                    return;
+                }
+            };
+            let message = match prepared.to_message() {
+                Ok(message) => message,
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Failed to build steer message: {error}"),
+                    });
+                    app.pending_attachments = attachments;
+                    return;
                 }
             };
             match agent.steer_input(None, message).await {
