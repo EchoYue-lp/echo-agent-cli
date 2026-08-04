@@ -101,6 +101,25 @@ pub fn resolve_user_input_spill_dir(workspace_root: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Remove the user-input artifacts scoped to a single conversation.
+///
+/// Deletes `{spill_dir}/{conversation}/` (the per-conversation subtree). Called
+/// when a conversation is deleted so spilled long-paste artifacts do not
+/// accumulate. Best-effort: missing dir is a no-op, errors are returned for
+/// the caller to log. Mirrors the framework's
+/// `cleanup_tool_output_scope` for tool-output artifacts.
+pub fn cleanup_user_input_scope(spill_dir: &Path, conversation_id: &str) -> std::io::Result<()> {
+    let conv = path_component(conversation_id);
+    if conv.is_empty() || conv == "_" {
+        return Ok(()); // nothing to remove
+    }
+    let target = spill_dir.join(&conv);
+    if target.exists() {
+        std::fs::remove_dir_all(&target)?;
+    }
+    Ok(())
+}
+
 /// How an [`InputResourceRef`] is delivered to the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

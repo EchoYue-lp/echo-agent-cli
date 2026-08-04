@@ -347,9 +347,30 @@ No second artifact mechanism, no SQLite, no new Task state.
 - Gate green: fmt + clippy (`-D warnings`) + four panic lints + workspace
   tests (app-core 608 / cli 83+9+5, all pass, 0 failed).
 
-**Phase 3 pending:** persistence data-URL removal (`persistence.rs:67`
-`SavedAttachment.url` → `artifact_path`); grep artifact-root extension
-(`echo-tools/src/files/grep.rs:148-170` only); threshold eval + adapter cleanup.
+**Phase 3 done (grep artifact-root + conversation cleanup, 2026-08-04):**
+- **grep artifact-root extension** (framework, `echo-agent` commit `8fd9b6a`):
+  `echo-tools/src/files/grep.rs` confinement now accepts a candidate-root set
+  (`base_dir` + `working_dir` + `ctx.output_artifacts.root_dir`). The model can
+  grep spilled tool-output and user-input artifacts by the absolute paths
+  `read_artifact` / `PreparedUserTurn` already hand out. Both candidate roots
+  and the resolved path are canonicalized (mirrors `read_artifact`), so
+  symlink/`..` escapes are caught. No `ToolContext`/schema/pipeline changes.
+  3 integration tests green (artifact-root searchable / outside-all-roots
+  rejected / relative path still uses working_dir).
+- **conversation cleanup**: `delete_conversation` now also removes the
+  per-conversation user-input artifact subtree via the new
+  `prepared_turn::cleanup_user_input_scope` (mirrors the existing
+  `cleanup_tool_output_scope` for tool-output artifacts).
+- **deferred**: persistence data-URL removal (`SavedAttachment.url` →
+  `artifact_path`). This is a frontend cross-cutting change — the data URL is
+  the frontend's own persistence contract (`conversationStore.ts` writes it,
+  `MessageBubble.tsx:241` renders `img.url` directly). Removing it requires a
+  new Tauri command to read attachment files by path + async frontend render.
+  Not blocking (only affects session-file size); tracked as a separate task.
+
+**Verification gate:** both repos green — echo-agent (660+ tests, 0 failed,
+clippy + four panic lints + feature isolation) and echo-agent-cli (app-core
+608 / cli 83+9+5 / e2e 5, all pass, 0 failed).
 
 ## Next Step
 

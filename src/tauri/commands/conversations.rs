@@ -299,6 +299,14 @@ pub async fn delete_conversation(
         .await;
     if let Some(config) = artifact_config {
         let conversation_id = id.clone();
+        // The tool-output root_dir is `{scope}/.eko/artifacts/tool-logs`; the
+        // user-input spill dir is the sibling `.../artifacts/user-input`. Derive
+        // it so spilled long-paste artifacts are cleaned with the conversation
+        // too (mirrors the tool-output cleanup above).
+        let user_input_spill_dir = config
+            .root_dir
+            .parent()
+            .map(|artifacts_dir| artifacts_dir.join("user-input"));
         tokio::task::spawn_blocking(move || {
             if let Err(error) = echo_agent::tools::artifact::cleanup_tool_output_scope(
                 &config,
@@ -306,6 +314,18 @@ pub async fn delete_conversation(
                 None,
             ) {
                 tracing::warn!(conversation_id = %conversation_id, %error, "Failed to clean conversation tool artifacts");
+            }
+            if let Some(spill_dir) = user_input_spill_dir
+                && let Err(error) = echo_agent_app_core::prepared_turn::cleanup_user_input_scope(
+                    &spill_dir,
+                    &conversation_id,
+                )
+            {
+                tracing::warn!(
+                    conversation_id = %conversation_id,
+                    %error,
+                    "Failed to clean conversation user-input artifacts"
+                );
             }
         });
     }
