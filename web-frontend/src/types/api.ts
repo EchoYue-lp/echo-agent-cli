@@ -325,6 +325,7 @@ export interface Attachment {
   mime_type: string;
   data: string; // base64 encoded
   size: number;
+  source?: 'upload' | 'paste' | 'channel' | 'message';
 }
 
 // Execution round: one ReAct loop iteration (think → tools)
@@ -344,7 +345,13 @@ export interface ChatMessage {
   content: string;
   thinkingContent?: string; // deprecated, kept for history display
   thinkingSegments?: { content: string }[];
-  attachments?: { name: string; mime_type: string; url: string; size: number }[];
+  attachments?: {
+    name: string;
+    mime_type: string;
+    url: string;
+    size: number;
+    source?: Attachment['source'];
+  }[];
   chartSpecs?: unknown[];
   isStreaming?: boolean;
   timestamp: number;
@@ -430,9 +437,15 @@ export interface SavedMessage {
     tool_call_ids: string[];
   }[];
   tool_result?: string | null;
-  /** User-uploaded attachments (images/documents) as data URLs, so the
-   * message renders identically after reload. */
-  attachments?: { name: string; mime_type: string; url: string; size: number }[];
+  /** Inline attachments retain their data URL. Artifact-backed text keeps
+   * metadata only, so it can render after reload without duplicating content. */
+  attachments?: {
+    name: string;
+    mime_type: string;
+    url: string;
+    size: number;
+    source?: Attachment['source'];
+  }[];
 }
 
 export interface ConversationRecord {

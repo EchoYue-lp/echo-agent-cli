@@ -58,7 +58,8 @@ interface ChatState {
   /** 会话级缓存命中率累加器（压缩保留，clear/replace 清零）。 */
   usageAccumulator: ContextUsageAccumulator;
 
-  addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => void;
+  addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => string;
+  removeMessages: (ids: string[]) => void;
   startAssistantMessage: (idOverride?: string) => string;
   continueAfterSteer: (
     assistantId: string | null,
@@ -145,9 +146,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   usageAccumulator: { totalInput: 0, totalCached: 0 },
 
   addUserMessage: (content, attachments) => {
+    const id = nextId();
     set((s) => {
       const newMsg: ChatMessage = {
-        id: nextId(),
+        id,
         role: 'user',
         content,
         attachments,
@@ -156,6 +158,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const msgs = trimToMax([...s.messages, newMsg]);
       return { isCancelled: false, runStatus: 'running', messages: msgs };
     });
+    scheduleAutoSave();
+    return id;
+  },
+
+  removeMessages: (ids) => {
+    const removed = new Set(ids);
+    set((state) => ({
+      messages: state.messages.filter((message) => !removed.has(message.id)),
+      isStreaming: false,
+      isThinking: false,
+    }));
     scheduleAutoSave();
   },
 

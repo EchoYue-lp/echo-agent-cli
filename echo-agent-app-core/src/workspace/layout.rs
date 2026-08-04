@@ -92,15 +92,15 @@ impl WorkspaceLayout {
 
     /// 用户输入长文本落盘目录：`{root}/.eko/artifacts/user-input/`
     ///
-    /// 当用户粘贴超过 32 KiB 的文本时，`PreparedUserTurn` 将其写入此目录
-    /// 下（按 `{conversation}/{turn}/` 分层），模型只收到引用 + 预览，通过
-    /// `grep` / `read_artifact` 按需读取。与 `artifacts()` 下的 `tool-logs`
-    /// 同级，共享 30 天清理策略。
+    /// 长粘贴和超过输入预算的文本写入此目录（按
+    /// `{conversation}/{turn}/` 分层），模型只收到引用 + 预览，通过
+    /// `grep` / `read_artifact` 按需读取。它与工具输出共用 artifact 根目录和
+    /// 30 天清理策略。
     pub fn user_input_artifacts(root: &Path) -> PathBuf {
         Self::artifacts(root).join("user-input")
     }
 
-    /// 任务状态目录（SQLite DB）：`{root}/.eko/tasks/`
+    /// 任务状态目录：`{root}/.eko/tasks/`
     pub fn tasks(root: &Path) -> PathBuf {
         Self::state_dir(root).join("tasks")
     }

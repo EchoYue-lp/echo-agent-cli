@@ -1,6 +1,6 @@
 //! 请求类型定义
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use ts_rs::TS;
 
@@ -149,6 +149,17 @@ pub struct LoggingUpdate {
 // ── WebSocket 消息类型 ─────────────────────────────────────────────────
 
 /// 附件数据
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "AttachmentSource")]
+pub enum AttachmentSource {
+    #[default]
+    Upload,
+    Paste,
+    Channel,
+    Message,
+}
+
 #[derive(Debug, Clone, Deserialize, TS)]
 #[ts(export, rename = "AttachmentData")]
 pub struct AttachmentData {
@@ -157,6 +168,8 @@ pub struct AttachmentData {
     /// Base64 编码的文件内容
     pub data: String,
     pub size: u64,
+    #[serde(default)]
+    pub source: AttachmentSource,
 }
 
 /// 客户端 -> 服务端 WebSocket 消息

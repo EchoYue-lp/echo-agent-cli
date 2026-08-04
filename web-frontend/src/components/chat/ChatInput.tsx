@@ -71,16 +71,18 @@ interface PendingFile {
   name: string;
   mime_type: string;
   size: number;
+  source: NonNullable<Attachment['source']>;
 }
 
 interface ChatInputProps {
-  onSend: (text: string, attachments?: Attachment[]) => void;
+  onSend: (text: string, attachments?: Attachment[]) => Promise<boolean>;
   isStreaming?: boolean;
   onCancel?: () => void;
   queuedCount?: number;
 }
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+const PASTE_ATTACHMENT_CHAR_THRESHOLD = 1_000;
 
 function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -540,24 +542,28 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
 
   // ── File handling ──
 
-  const addFiles = useCallback((files: FileList | File[]) => {
-    const newFiles: PendingFile[] = [];
-    for (const file of Array.from(files)) {
-      if (file.size > MAX_FILE_SIZE) {
-        alert(`File "${file.name}" exceeds the 10MB limit and was skipped`);
-        continue;
+  const addFiles = useCallback(
+    (files: FileList | File[], source: NonNullable<Attachment['source']> = 'upload') => {
+      const newFiles: PendingFile[] = [];
+      for (const file of Array.from(files)) {
+        if (file.size > MAX_FILE_SIZE) {
+          alert(`File "${file.name}" exceeds the 10MB limit and was skipped`);
+          continue;
+        }
+        newFiles.push({
+          id: `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          file,
+          previewUrl: isImageFile(file.type) ? URL.createObjectURL(file) : '',
+          name: file.name,
+          mime_type: file.type || 'application/octet-stream',
+          size: file.size,
+          source,
+        });
       }
-      newFiles.push({
-        id: `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        file,
-        previewUrl: isImageFile(file.type) ? URL.createObjectURL(file) : '',
-        name: file.name,
-        mime_type: file.type || 'application/octet-stream',
-        size: file.size,
-      });
-    }
-    setPendingFiles((prev) => [...prev, ...newFiles]);
-  }, []);
+      setPendingFiles((prev) => [...prev, ...newFiles]);
+    },
+    []
+  );
 
   const removeFile = useCallback((id: string) => {
     setPendingFiles((prev) => {
@@ -583,8 +589,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       if (!items) return;
 
       const imageFiles: File[] = [];
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i];
+      for (const item of Array.from(items)) {
         if (item.type.startsWith('image/')) {
           const file = item.getAsFile();
           if (file) imageFiles.push(file);
@@ -592,10 +597,22 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       }
       if (imageFiles.length > 0) {
         e.preventDefault();
-        addFiles(imageFiles);
+        addFiles(imageFiles, 'paste');
+        return;
+      }
+
+      const pastedText = e.clipboardData.getData('text/plain');
+      if (Array.from(pastedText).length >= PASTE_ATTACHMENT_CHAR_THRESHOLD) {
+        e.preventDefault();
+        const file = new globalThis.File(
+          [pastedText],
+          `pasted-text-${pendingFiles.length + 1}.txt`,
+          { type: 'text/plain' }
+        );
+        addFiles([file], 'paste');
       }
     },
-    [addFiles]
+    [addFiles, pendingFiles.length]
   );
 
   // ── Send ──
@@ -624,6 +641,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
           mime_type: pf.mime_type,
           data: await fileToBase64(pf.file),
           size: pf.size,
+          source: pf.source,
         }))
       );
     } catch (e) {
@@ -633,12 +651,11 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       return;
     }
 
-    // Release preview URLs
+    const accepted = await onSend(trimmed, attachmentData.length > 0 ? attachmentData : undefined);
+    if (!accepted) return;
     pendingFiles.forEach((pf) => {
       if (pf.previewUrl) URL.revokeObjectURL(pf.previewUrl);
     });
-
-    onSend(trimmed, attachmentData.length > 0 ? attachmentData : undefined);
     setText('');
     setPendingFiles([]);
 

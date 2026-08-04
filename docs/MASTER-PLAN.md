@@ -293,38 +293,32 @@ the same fact is not persisted twice. See
   gone. `TaskUpdateRequest` remains only as an EKO frontend wire DTO and is
   converted losslessly to the framework patch protocol.
 
-### 2026-08-03 User Input Normalization (Phase 1 of 3, in progress)
+### 2026-08-04 User Input Normalization (complete)
 
 Long pastes and large text uploads previously reached the model fully inlined,
 and stayed inlined across ReAct turns and session restore. The industry
 converges on reference-then-search-then-read (Claude Code spills tool output
 over ~50K chars; Codex writes long goals to `goal_files`). EKO adopts the same
 mixed strategy: short text inlines, long text spills to a user-input artifact
-and is delivered as a lightweight reference + preview, with `grep`/`read_artifact`
-recovering the content on demand.
+and is delivered as a lightweight reference + preview, with
+`grep`/`read_artifact` recovering the content on demand. Direct pastes are
+tracked separately from uploaded data so a pasted request is not mislabeled as
+untrusted log content.
 
-**Layering (locked):** application layer owns `PreparedUserTurn` / threshold
-policy / spill directory / five-entry-point + steer normalization / data-URL
-removal in persistence; framework only gains the ability for `grep` to resolve
-`ToolContext.output_artifacts.root_dir` (the field already exists) and reuses
-the existing artifact infrastructure (`ToolOutputArtifactWriter`, `read_artifact`).
-No second artifact mechanism, no SQLite, no new Task state.
+**Layering:** application layer owns `PreparedUserTurn`, source classification,
+threshold policy, spill/TTL cleanup, entry-point normalization, and the UI
+persistence projection. The framework only resolves generic artifact roots in
+`grep` and reuses `read_artifact`; EKO configures one common artifact root with
+`user-input/` as an application-owned subtree. No second artifact reader, no
+SQLite, and no new Task state were introduced.
 
-**Phase 1 done (pure additive, no main-path switch):**
-- New `echo-agent-app-core/src/prepared_turn.rs`: `PreparedUserTurn`
-  (instruction + resources + mode_hint), `InputResourceRef` (generalizes
-  `AttachmentRef` with kind/delivery/metadata), `UserTurnInput`, single
-  `to_message()` merge point, threshold gate (32 KiB or ~4k estimated tokens),
-  UTF-8-safe spill (`chars().take` preview, atomic `.partial`→rename, SHA-256).
-- `attachments.rs`: `is_image_mime` promoted to `pub(crate)`; new
-  `AttachmentRef::to_input_resource()`.
-- `workspace/layout.rs`: new `WorkspaceLayout::user_input_artifacts()`
-  (`.eko/artifacts/user-input/`, created on demand like `tool-logs`).
-- `lib.rs`: registered `prepared_turn` module.
-- 10 unit tests green (threshold/CJK/emoji/spill/`to_message`/path sanitize);
-  clippy + four panic lints + fmt pass; attachments/persistence regression clean.
+**Authoritative input path:**
 
-**Phase 2 done (authoritative main path switched, 2026-08-03):**
+- `PreparedUserTurn` owns instruction + `InputResourceRef` resources and the
+  single `to_message()` merge point. Raw messages spill at 32 KiB or the token
+  budget; text resources explicitly sourced from paste always spill. Writes
+  are atomic, previews are UTF-8 safe, and SHA-256/line/byte metadata travels
+  with the reference.
 - `drive_chat`/`drive_chat_inner` (`chat_driver.rs:197`) now take
   `&PreparedUserTurn` instead of `(&str, Option<&Message>)`; the
   `match multimodal` merge block is gone — `to_message()` is the single
@@ -335,42 +329,39 @@ No second artifact mechanism, no SQLite, no new Task state.
   TUI steer (`/steer`), CLI REPL (`chat_with_agent`), channel. Each now builds
   a `PreparedUserTurn` via `UserTurnInput` + `resolve_user_input_spill_dir`.
 - `ensure_task_mode_run`'s goal is now `turn.instruction` (reference block for
-  spilled text = better task goal than the raw paste); attachments still come
-  from `ChatResources.attachments` (propagation chain unchanged).
+  spilled text = better task goal than the raw paste). Only inline resources
+  enter `ChatResources.attachments`; tool-reference text is never re-inlined by
+  TaskRun/subagent reconstruction.
 - Dual implementation eliminated: the in-memory `build_message` is deleted;
   its 3 tests migrated to `build_message_from_refs` (which remains for the
   `executor.rs:2790/2948` subagent rebuild path).
-- Attachment propagation chain unchanged: `ChatResources.attachments`,
-  `TaskRun.attachments`, `executor.rs:2790/2948` subagent rebuild keep using
-  `AttachmentRef` (TaskRun serialization-compatible). Invariant holds:
-  `SubagentRun` carries no attachments; subagents read parent `TaskRun` live.
-- Gate green: fmt + clippy (`-D warnings`) + four panic lints + workspace
-  tests (app-core 608 / cli 83+9+5, all pass, 0 failed).
+- TUI and GUI stage long clipboard text as `source=paste`; short pastes remain
+  editable text. Preparation failure restores the draft/resources and does not
+  enter a processing state. Channels return a retryable error instead of
+  falling back to full-text inline delivery.
 
-**Phase 3 done (grep artifact-root + conversation cleanup, 2026-08-04):**
-- **grep artifact-root extension** (framework, `echo-agent` commit `8fd9b6a`):
-  `echo-tools/src/files/grep.rs` confinement now accepts a candidate-root set
+**Artifact reachability and lifecycle:**
+
+- `echo-tools/src/files/grep.rs` confinement accepts a candidate-root set
   (`base_dir` + `working_dir` + `ctx.output_artifacts.root_dir`). The model can
   grep spilled tool-output and user-input artifacts by the absolute paths
   `read_artifact` / `PreparedUserTurn` already hand out. Both candidate roots
   and the resolved path are canonicalized (mirrors `read_artifact`), so
   symlink/`..` escapes are caught. No `ToolContext`/schema/pipeline changes.
-  3 integration tests green (artifact-root searchable / outside-all-roots
-  rejected / relative path still uses working_dir).
-- **conversation cleanup**: `delete_conversation` now also removes the
-  per-conversation user-input artifact subtree via the new
-  `prepared_turn::cleanup_user_input_scope` (mirrors the existing
-  `cleanup_tool_output_scope` for tool-output artifacts).
-- **deferred**: persistence data-URL removal (`SavedAttachment.url` →
-  `artifact_path`). This is a frontend cross-cutting change — the data URL is
-  the frontend's own persistence contract (`conversationStore.ts` writes it,
-  `MessageBubble.tsx:241` renders `img.url` directly). Removing it requires a
-  new Tauri command to read attachment files by path + async frontend render.
-  Not blocking (only affects session-file size); tracked as a separate task.
+  Relative paths also resolve against the artifact root when it is the only
+  configured root.
+- `read_artifact` and `grep` share the configured `.eko/artifacts/` root, so
+  both framework tool output and EKO's `user-input/` subtree are reachable.
+- Conversation deletion removes both tool-output and user-input scopes; a
+  best-effort 30-day TTL cleanup runs when new input artifacts are written.
 
-**Verification gate:** both repos green — echo-agent (660+ tests, 0 failed,
-clippy + four panic lints + feature isolation) and echo-agent-cli (app-core
-608 / cli 83+9+5 / e2e 5, all pass, 0 failed).
+**Persistence:** framework-projected `MessageContent::Parts`, tool calls, and
+tool results remain authoritative. Frontend display metadata is merged by
+user/final-assistant role order rather than raw array index, so tool messages
+cannot shift the mapping. `display_content` keeps internal artifact references
+out of history rendering, and pasted/oversized attachment data URLs are not
+duplicated. GUI restore delegates to the framework's `restore_messages`, which
+round-trips structured artifact references.
 
 ## Next Step
 

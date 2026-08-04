@@ -620,27 +620,6 @@ pub async fn send_chat_message(
         status: "running".to_string(),
     });
 
-    let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-        pool: state.app_state.connection.pool.clone(),
-        store: state.app_state.tasks.runtime.clone(),
-        sink: sink.clone(),
-        webhook_emitter: Some(state.app_state.webhook.emitter.clone()),
-        conv_id: conversation_id.clone(),
-        root_message_id: message_key.clone(),
-        attachments: attachment_refs.clone(),
-        cancel: cancel_token.clone(),
-        mode_hint,
-        interaction_mode,
-        // B5.1: wire the memory layer so create_complex_task's autonomous runs
-        // block-write their completion memory (recall closure). None when the
-        // review/memory subsystem isn't initialized (write becomes a no-op).
-        layer_manager: state
-            .app_state
-            .review_integration
-            .as_ref()
-            .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
-    });
-
     let agent_handle_clone = agent_handle.clone();
     let cleanup_tokens = state.app_state.session.cancel_token.clone();
     let cleanup_key = message_key.clone();
@@ -681,6 +660,23 @@ pub async fn send_chat_message(
             )));
         }
     };
+    let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+        pool: state.app_state.connection.pool.clone(),
+        store: state.app_state.tasks.runtime.clone(),
+        sink: sink.clone(),
+        webhook_emitter: Some(state.app_state.webhook.emitter.clone()),
+        conv_id: conversation_id.clone(),
+        root_message_id: message_key.clone(),
+        attachments: prepared_turn.inline_attachment_refs(),
+        cancel: cancel_token.clone(),
+        mode_hint,
+        interaction_mode,
+        layer_manager: state
+            .app_state
+            .review_integration
+            .as_ref()
+            .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
+    });
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         // The prepared turn carries instruction + inline resources (images /

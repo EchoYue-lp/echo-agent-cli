@@ -29,6 +29,7 @@ use echo_agent_app_core::context_window::ContextWindowSnapshot;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PASTE_ATTACHMENT_CHAR_THRESHOLD: usize = 1_000;
 
 /// Handle keyboard input when an approval request is pending.
 /// Returns `true` if the key was consumed.
@@ -918,7 +919,7 @@ pub async fn run_event_loop(
         match event::poll(POLL_INTERVAL) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => handle_key(app, key, &agent, agent_tx.clone()).await,
-                Ok(Event::Paste(text)) => insert_text(app, &text),
+                Ok(Event::Paste(text)) => handle_pasted_text(app, &text),
                 Ok(Event::Mouse(mouse)) => handle_mouse(app, &mouse),
                 Ok(Event::Resize(_, _)) => {} // ratatui handles resize automatically
                 Ok(_) => {}
@@ -1299,8 +1300,10 @@ async fn handle_enter(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    let Some(text) = app.take_input() else {
-        return;
+    let text = match app.take_input() {
+        Some(text) => text,
+        None if !app.pending_attachments.is_empty() => String::new(),
+        None => return,
     };
     if let Some(steer_text) = text.strip_prefix("/steer ") {
         steer_active_turn(app, agent, steer_text.trim()).await;
@@ -1362,11 +1365,7 @@ async fn dispatch_turn(
             tracing::warn!(error = %error, conversation_id, "failed to ensure TUI conversation metadata");
         }
     }
-    app.start_turn(&turn.text);
-    let cancel = echo_agent::agent::CancellationToken::new();
-    app.active_cancel = Some(cancel.clone());
     let turn_id = uuid::Uuid::new_v4().to_string();
-    app.active_turn_id = Some(turn_id.clone());
     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx));
     let mode_hint_str = turn.interaction_mode.prompt_hint().to_string();
@@ -1386,9 +1385,34 @@ async fn dispatch_turn(
         Ok(prepared) => prepared,
         Err(error) => {
             tracing::warn!(%error, "failed to prepare TUI user turn");
+            app.pending_attachments.extend(turn.attachments);
+            if !turn.text.is_empty() {
+                if app.history.last().is_some_and(|entry| entry == &turn.text) {
+                    app.history.pop();
+                }
+                app.input = turn.text;
+                app.cursor = app.input.len();
+                app.update_suggestions();
+            }
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: format!("Failed to prepare user turn: {error}"),
+            });
+            app.status_msg = "Ready".to_string();
+            app.rebuild_message_groups();
             return;
         }
     };
+    let task_attachments = prepared.inline_attachment_refs();
+    let display_text = if turn.text.is_empty() {
+        format!("[{} attachment(s)]", turn.attachments.len())
+    } else {
+        turn.text.clone()
+    };
+    app.start_turn(&display_text);
+    let cancel = echo_agent::agent::CancellationToken::new();
+    app.active_cancel = Some(cancel.clone());
+    app.active_turn_id = Some(turn_id.clone());
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: app.pool.clone(),
         store: app.task_runtime_store.clone(),
@@ -1399,7 +1423,7 @@ async fn dispatch_turn(
         conv_id: app.conversation_id.clone(),
         root_message_id: turn_id,
         // Bind staged refs so subagents in an autonomous run see them too.
-        attachments: turn.attachments,
+        attachments: task_attachments,
         cancel,
         mode_hint: Some(mode_hint_str),
         interaction_mode: turn.interaction_mode,
@@ -1487,6 +1511,40 @@ fn insert_text(app: &mut TuiApp, text: &str) {
     app.update_suggestions();
 }
 
+fn handle_pasted_text(app: &mut TuiApp, text: &str) {
+    if text.chars().count() < PASTE_ATTACHMENT_CHAR_THRESHOLD {
+        insert_text(app, text);
+        return;
+    }
+    use base64::Engine as _;
+    use echo_agent_app_core::types::{AttachmentData, AttachmentSource};
+
+    let data = AttachmentData {
+        name: format!(
+            "pasted-text-{}.txt",
+            app.pending_attachments.len().saturating_add(1)
+        ),
+        mime_type: "text/plain".to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(text.as_bytes()),
+        size: u64::try_from(text.len()).unwrap_or(u64::MAX),
+        source: AttachmentSource::Paste,
+    };
+    match echo_agent_app_core::attachments::stage_attachment_data(&data, None) {
+        Ok(reference) => {
+            app.pending_attachments.push(reference);
+            app.status_msg = format!(
+                "Pasted text attached · {} chars · {} resource(s) staged",
+                text.chars().count(),
+                app.pending_attachments.len()
+            );
+        }
+        Err(error) => {
+            insert_text(app, text);
+            app.status_msg = format!("Failed to stage pasted text: {error}");
+        }
+    }
+}
+
 fn paste_clipboard(app: &mut TuiApp) {
     let mut clipboard = match arboard::Clipboard::new() {
         Ok(clipboard) => clipboard,
@@ -1536,7 +1594,7 @@ fn paste_clipboard(app: &mut TuiApp) {
         return;
     }
     match clipboard.get_text() {
-        Ok(text) => insert_text(app, &text),
+        Ok(text) => handle_pasted_text(app, &text),
         Err(error) => app.status_msg = format!("Clipboard has no supported content: {error}"),
     }
 }
@@ -2498,6 +2556,7 @@ fn stage_attachment(
         path: dest,
         name: name.clone(),
         mime_type: mime.clone(),
+        source: echo_agent_app_core::types::AttachmentSource::Upload,
     });
     Ok((name, mime))
 }
@@ -3021,10 +3080,18 @@ async fn handle_slash_command(
             };
             if result.is_ok()
                 && let Some(config) = agent.read(|a| a.tool_output_artifacts()).await
-                && let Err(error) =
-                    echo_agent::tools::artifact::cleanup_tool_output_scope(&config, id, None)
             {
-                tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation tool artifacts");
+                if let Err(error) =
+                    echo_agent::tools::artifact::cleanup_tool_output_scope(&config, id, None)
+                {
+                    tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation tool artifacts");
+                }
+                let spill_dir = config.root_dir.join("user-input");
+                if let Err(error) =
+                    echo_agent_app_core::prepared_turn::cleanup_user_input_scope(&spill_dir, id)
+                {
+                    tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation user-input artifacts");
+                }
             }
             if result.is_ok() && app.conversation_id.as_deref() == Some(id) {
                 reset_conversation_state(app, agent, true).await;

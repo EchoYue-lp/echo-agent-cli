@@ -53,22 +53,24 @@ pub struct SavedMessage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_rounds: Option<Vec<SavedExecutionRound>>,
     /// User-uploaded attachments (images/documents) attached to this message.
-    /// Stored as a data URL so the message renders identically on reload.
-    /// None or empty for non-multimodal messages.
+    /// Small resources retain their data URL; artifact-backed text keeps only
+    /// display metadata so its body is not duplicated in conversation JSON.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attachments: Option<Vec<SavedAttachment>>,
 }
 
 /// A persisted attachment reference (stored inside SavedMessage).
 ///
-/// `url` is a complete data URL (`data:{mime};base64,...`) so the frontend can
-/// render it directly on reload without an extra backend round-trip.
+/// `url` is a complete data URL for small inline resources and empty for
+/// artifact-backed text resources.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SavedAttachment {
     pub name: String,
     pub mime_type: String,
     pub url: String,
     pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Execution step for tracking thinking/tool interleaving order
@@ -103,6 +105,10 @@ pub struct AttachmentsPayload {
     /// Stable GUI message identity used to attach TaskRun/Subagent history after reload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
+    /// Frontend display text. The canonical `StoredMessage.content` remains
+    /// the agent-facing projection (for example an artifact reference).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_content: Option<String>,
     #[serde(default)]
     pub thinking_segments: Vec<String>,
     #[serde(default)]
@@ -119,14 +125,15 @@ pub struct AttachmentsPayload {
 impl AttachmentsPayload {
     /// Parse from JSON string, handling both old and new formats.
     pub fn parse(s: &str) -> Option<Self> {
-        // Try new object format first
-        if let Ok(payload) = serde_json::from_str::<Self>(s) {
-            return Some(payload);
+        let value = serde_json::from_str::<serde_json::Value>(s).ok()?;
+        if value.is_object() {
+            return serde_json::from_value(value).ok();
         }
-        // Fall back to old array format: ["segment1", "segment2"]
-        if let Ok(segments) = serde_json::from_str::<Vec<String>>(s) {
+        if value.is_array() {
+            let segments = serde_json::from_value::<Vec<String>>(value).ok()?;
             return Some(Self {
                 message_id: None,
+                display_content: None,
                 thinking_segments: segments,
                 execution_steps: Vec::new(),
                 execution_rounds: None,
@@ -429,6 +436,7 @@ mod tests {
         }];
         let payload = AttachmentsPayload {
             message_id: Some("message-1".to_string()),
+            display_content: Some("visible text".to_string()),
             thinking_segments: Vec::new(),
             execution_steps: Vec::new(),
             execution_rounds: Some(rounds.clone()),

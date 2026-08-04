@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use echo_agent::llm::types::{ContentPart, ImageUrl, Message};
 
-use crate::types::AttachmentData;
+use crate::types::{AttachmentData, AttachmentSource};
 
 /// Errors from attachment handling.
 #[derive(Debug, thiserror::Error)]
@@ -86,6 +86,7 @@ pub fn stage_local_attachment(
         size: std::fs::metadata(source)
             .map(|value| value.len())
             .unwrap_or(0),
+        source: AttachmentSource::Upload,
     };
     stage_attachment_data(&attachment, workspace_root)
 }
@@ -208,6 +209,8 @@ pub struct AttachmentRef {
     pub name: String,
     /// MIME type, decides `ContentPart::ImageUrl` vs `ContentPart::File`.
     pub mime_type: String,
+    #[serde(default)]
+    pub source: AttachmentSource,
 }
 
 impl AttachmentRef {
@@ -217,21 +220,8 @@ impl AttachmentRef {
             path,
             name: att.name.clone(),
             mime_type: att.mime_type.clone(),
+            source: att.source,
         }
-    }
-
-    /// Convert this persisted upload ref into an inline
-    /// [`InputResourceRef`](crate::prepared_turn::InputResourceRef). Reads the
-    /// file from disk to record its size; delivery is `Inline` so
-    /// [`PreparedUserTurn::to_message`](crate::prepared_turn::PreparedUserTurn)
-    /// inlines it into the model message.
-    pub fn to_input_resource(
-        &self,
-    ) -> std::result::Result<
-        crate::prepared_turn::InputResourceRef,
-        crate::prepared_turn::PreparedTurnError,
-    > {
-        crate::prepared_turn::InputResourceRef::from_attachment(self)
     }
 }
 
@@ -286,6 +276,7 @@ mod tests {
             mime_type: mime.to_string(),
             data: data.to_string(),
             size: data.len() as u64,
+            source: AttachmentSource::Upload,
         }
     }
 

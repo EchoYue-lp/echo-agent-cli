@@ -11,4 +11,5 @@ export type AttachmentData = {
    */
   data: string;
   size: bigint;
+  source: 'upload' | 'paste' | 'channel' | 'message';
 };

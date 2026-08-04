@@ -252,27 +252,37 @@ export const MessageBubble = memo(function MessageBubble({
         {/* Files */}
         {files.length > 0 && (
           <div className="space-y-1.5">
-            {files.map((file, i) => (
-              <a
-                key={i}
-                href={file.url}
-                download={file.name}
-                className="flex items-center gap-3 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-3 transition-colors hover:bg-[var(--bg-hover)]"
-              >
-                <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--bg-primary)]">
-                  <File size={16} className="text-[var(--text-tertiary)]" />
-                </div>
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-xs font-medium text-[var(--text-primary)]">
-                    {file.name}
+            {files.map((file, i) => {
+              const body = (
+                <>
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--bg-primary)]">
+                    <File size={16} className="text-[var(--text-tertiary)]" />
                   </div>
-                  <div className="text-[10px] text-[var(--text-tertiary)]">
-                    {formatFileSize(file.size)}
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-xs font-medium text-[var(--text-primary)]">
+                      {file.name}
+                    </div>
+                    <div className="text-[10px] text-[var(--text-tertiary)]">
+                      {formatFileSize(file.size)}
+                    </div>
                   </div>
+                  {file.url && (
+                    <Download size={14} className="shrink-0 text-[var(--text-tertiary)]" />
+                  )}
+                </>
+              );
+              const className =
+                'flex items-center gap-3 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-3 transition-colors hover:bg-[var(--bg-hover)]';
+              return file.url ? (
+                <a key={i} href={file.url} download={file.name} className={className}>
+                  {body}
+                </a>
+              ) : (
+                <div key={i} className={className}>
+                  {body}
                 </div>
-                <Download size={14} className="shrink-0 text-[var(--text-tertiary)]" />
-              </a>
-            ))}
+              );
+            })}
           </div>
         )}
 

@@ -217,15 +217,14 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         ) {
             Ok(turn) => turn,
             Err(error) => {
-                // Spill failure should not silently drop the message: fall back
-                // to a plain text turn (no artifact) so the user still gets a
-                // reply, and surface the error in logs.
-                tracing::warn!(%error, conv = %conv, "channel user-turn spill failed; falling back to inline text");
-                echo_agent_app_core::prepared_turn::PreparedUserTurn {
-                    instruction: format!("[Mode: {mode_hint_str}]\n\n{text}"),
-                    resources: vec![],
-                    mode_hint: None,
-                }
+                tracing::warn!(%error, conv = %conv, "channel user-turn preparation failed");
+                let outbound = echo_agent::channels::OutboundMessage::new(
+                    &msg.channel_id,
+                    &msg.sender_id,
+                    msg.chat_type,
+                    format!("无法安全保存这条长消息，请检查本地磁盘后重试：{error}"),
+                );
+                return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
             }
         };
         let agent_owned = agent.clone();
@@ -252,7 +251,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 webhook_emitter: Some(webhook_emitter),
                 conv_id: Some(conv_owned.clone()),
                 root_message_id: turn_id,
-                attachments: attachment_refs,
+                attachments: turn.inline_attachment_refs(),
                 cancel,
                 mode_hint: Some(mode_hint_str),
                 interaction_mode,
@@ -465,6 +464,7 @@ fn channel_attachment_data(
         mime_type: mime_type.to_string(),
         data: base64::engine::general_purpose::STANDARD.encode(&attachment.data),
         size: u64::try_from(attachment.data.len()).unwrap_or(u64::MAX),
+        source: echo_agent_app_core::types::AttachmentSource::Channel,
     }
 }
 

@@ -111,13 +111,13 @@ export function ChatPanel() {
     sendMessage(text);
   };
 
-  const handleSend = (text: string, attachments?: Attachment[]) => {
+  const handleSend = async (text: string, attachments?: Attachment[]) => {
     const command = text.trim().toLowerCase();
     if (!attachments?.length && (command === '/clear' || command === '/cls')) {
-      void clearCurrentChat();
-      return;
+      await clearCurrentChat();
+      return true;
     }
-    sendMessage(text, attachments);
+    return sendMessage(text, attachments);
   };
 
   return (

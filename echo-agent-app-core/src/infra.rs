@@ -61,9 +61,13 @@ fn static_subagent_environment() -> String {
 pub fn tool_output_artifact_config(
     working_dir: Option<&std::path::Path>,
 ) -> echo_agent::tools::artifact::ToolOutputArtifactConfig {
+    // Use the common artifact root. Tool outputs live under the framework's
+    // conversation/run layout while application-owned user input lives under
+    // `user-input/`; `read_artifact` and `grep` can therefore recover both
+    // without teaching the generic framework an EKO-specific sibling path.
     let root_dir = working_dir
-        .map(|root| crate::workspace::layout::WorkspaceLayout::artifacts(root).join("tool-logs"))
-        .unwrap_or_else(|| echo_agent::paths::user_data_path("artifacts").join("tool-logs"));
+        .map(crate::workspace::layout::WorkspaceLayout::artifacts)
+        .unwrap_or_else(|| echo_agent::paths::user_data_path("artifacts"));
     echo_agent::tools::artifact::ToolOutputArtifactConfig::new(root_dir, "conversation_or_30d")
         .threshold_bytes(TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES)
         .max_age_secs(Some(TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS))
@@ -2047,10 +2051,7 @@ mod resolve_subagent_model_tests {
         let workspace = tempfile::tempdir()?;
         let config = tool_output_artifact_config(Some(workspace.path()));
 
-        assert_eq!(
-            config.root_dir,
-            workspace.path().join(".eko/artifacts/tool-logs")
-        );
+        assert_eq!(config.root_dir, workspace.path().join(".eko/artifacts"));
         assert!(config.root_dir.starts_with(workspace.path()));
         assert_eq!(config.threshold_bytes, 32 * 1024);
         assert_eq!(config.max_age_secs, Some(30 * 24 * 60 * 60));

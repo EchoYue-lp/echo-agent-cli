@@ -28,7 +28,7 @@ export function useTauriChat() {
   const thinkingIdRef = useRef<string | null>(null);
   const queuedInputsRef = useRef<QueuedChatInput[]>([]);
   const dispatchMessageRef = useRef<
-    ((text: string, attachments: Attachment[] | undefined) => void) | null
+    ((text: string, attachments: Attachment[] | undefined) => Promise<boolean>) | null
   >(null);
   const [queuedInputs, setQueuedInputs] = useState<QueuedChatInput[]>([]);
 
@@ -41,7 +41,9 @@ export function useTauriChat() {
     const [next, ...remaining] = queuedInputsRef.current;
     replaceQueue(remaining);
     if (next) {
-      queueMicrotask(() => dispatchMessageRef.current?.(next.text, next.attachments));
+      queueMicrotask(() => {
+        void dispatchMessageRef.current?.(next.text, next.attachments);
+      });
     }
   };
 
@@ -171,8 +173,10 @@ export function useTauriChat() {
       mime_type: a.mime_type,
       url: `data:${a.mime_type};base64,${a.data}`,
       size: a.size,
+      source: a.source,
     }));
-    store.addUserMessage(text || '(附件)', displayAttachments);
+    const userMessageId = store.addUserMessage(text || '(附件)', displayAttachments);
+    let pendingAssistantId: string | null = null;
 
     try {
       isCancelledRef.current = false;
@@ -182,7 +186,8 @@ export function useTauriChat() {
           ? crypto.randomUUID()
           : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       currentMessageKeyRef.current = message_key;
-      assistantIdRef.current = store.startAssistantMessage(message_key);
+      pendingAssistantId = store.startAssistantMessage(message_key);
+      assistantIdRef.current = pendingAssistantId;
 
       // TaskRuntime runs are keyed by conversation_id. On the first turn there
       // is no active conversation yet, so create it before routing; otherwise
@@ -226,31 +231,34 @@ export function useTauriChat() {
           .loadByConversation(conversation_id)
           .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
       }
+      return true;
     } catch (e) {
       console.error('[TauriChat] Failed to send message:', e);
-      if (assistantIdRef.current) {
-        store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${errorMessage(e)}`);
-      }
+      store.removeMessages(
+        pendingAssistantId ? [userMessageId, pendingAssistantId] : [userMessageId]
+      );
+      useToastStore.getState().addToast('error', `发送失败：${errorMessage(e)}`);
       store.setRunStatus('failed');
       assistantIdRef.current = null;
       currentMessageKeyRef.current = null;
       dispatchNextQueued();
+      return false;
     }
   }, []);
 
   dispatchMessageRef.current = dispatchMessage;
 
   const sendMessage = useCallback(
-    (text: string, attachments?: Attachment[]) => {
+    async (text: string, attachments?: Attachment[]) => {
       if (currentMessageKeyRef.current) {
         const id =
           typeof crypto !== 'undefined' && 'randomUUID' in crypto
             ? crypto.randomUUID()
             : `queued-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         replaceQueue([...queuedInputsRef.current, { id, text, attachments }]);
-        return;
+        return true;
       }
-      void dispatchMessage(text, attachments);
+      return dispatchMessage(text, attachments);
     },
     [dispatchMessage]
   );
@@ -351,6 +359,7 @@ export function useTauriChat() {
           mime_type: attachment.mime_type,
           url: `data:${attachment.mime_type};base64,${attachment.data}`,
           size: attachment.size,
+          source: attachment.source,
         }));
         assistantIdRef.current = useChatStore
           .getState()

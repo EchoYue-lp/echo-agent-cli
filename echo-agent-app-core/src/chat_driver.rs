@@ -604,7 +604,6 @@ mod tests {
         crate::prepared_turn::PreparedUserTurn {
             instruction,
             resources: vec![],
-            mode_hint: None,
         }
     }
 

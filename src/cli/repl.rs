@@ -525,7 +525,7 @@ async fn chat_with_agent(
         webhook_emitter: config.webhook_emitter.clone(),
         conv_id: Some(conversation_id),
         root_message_id: turn_id,
-        attachments,
+        attachments: turn.inline_attachment_refs(),
         cancel: echo_agent::agent::CancellationToken::new(),
         mode_hint: Some(mode_hint_str),
         interaction_mode,

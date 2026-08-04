@@ -94,6 +94,46 @@ function generateId(): string {
   return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+function isTextAttachment(name: string, mimeType: string): boolean {
+  if (
+    mimeType.startsWith('text/') ||
+    ['application/json', 'application/xml', 'application/yaml'].includes(mimeType)
+  ) {
+    return true;
+  }
+  const extension = name.split('.').pop()?.toLowerCase();
+  return Boolean(
+    extension &&
+    [
+      'txt',
+      'log',
+      'md',
+      'markdown',
+      'json',
+      'xml',
+      'yaml',
+      'yml',
+      'csv',
+      'tsv',
+      'rs',
+      'py',
+      'js',
+      'ts',
+      'tsx',
+      'jsx',
+      'go',
+      'java',
+      'c',
+      'cpp',
+      'h',
+      'sh',
+      'toml',
+      'ini',
+      'sql',
+    ].includes(extension)
+  );
+}
+
 export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
   const saved: SavedMessage[] = [];
 
@@ -132,8 +172,16 @@ export function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
       entry.attachments = m.attachments.map((a) => ({
         name: a.name,
         mime_type: a.mime_type,
-        url: a.url,
+        // Large/pasted text is durably represented by the backend's canonical
+        // message projection. Do not duplicate its body as a data URL in the
+        // UI projection.
+        url:
+          isTextAttachment(a.name, a.mime_type) &&
+          (a.source === 'paste' || a.url.length > 64 * 1024)
+            ? ''
+            : a.url,
         size: a.size,
+        source: a.source,
       }));
     }
 
@@ -181,9 +229,18 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   saveCurrent: async (messages: ChatMessage[]) => {
-    if (messages.length === 0) return;
-
     const activeId = get().activeId;
+    if (messages.length === 0) {
+      if (activeId) {
+        try {
+          await conversationApi.update(activeId, { messages: [] });
+        } catch (e) {
+          console.error('[saveCurrent] failed to clear persisted messages:', e);
+        }
+      }
+      return;
+    }
+
     const firstUserMsg = messages.find((m) => m.role === 'user');
     const title = firstUserMsg?.content?.slice(0, 50) || 'New Chat';
     const savedMessages = chatMessagesToSaved(messages);
@@ -308,6 +365,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
               mime_type: a.mime_type,
               url: a.url,
               size: a.size,
+              source: a.source,
             }));
           }
 

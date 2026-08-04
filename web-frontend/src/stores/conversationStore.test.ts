@@ -63,6 +63,62 @@ describe('conversation message identity', () => {
     expect(restoredMessageId('conversation-1', 2, legacy)).toBe('loaded-conversation-1-2');
   });
 
+  it('does not duplicate pasted or oversized attachment bodies in UI persistence', () => {
+    const largeUrl = `data:text/plain;base64,${'A'.repeat(70 * 1024)}`;
+    const messages: ChatMessage[] = [
+      {
+        id: 'user-turn-1',
+        role: 'user',
+        content: '(附件)',
+        timestamp: 1,
+        attachments: [
+          {
+            name: 'pasted-text-1.txt',
+            mime_type: 'text/plain',
+            url: 'data:text/plain;base64,cGFzdGU=',
+            size: 5,
+            source: 'paste',
+          },
+          {
+            name: 'large.log',
+            mime_type: 'text/plain',
+            url: largeUrl,
+            size: 70 * 1024,
+            source: 'upload',
+          },
+          {
+            name: 'small.txt',
+            mime_type: 'text/plain',
+            url: 'data:text/plain;base64,c21hbGw=',
+            size: 5,
+            source: 'upload',
+          },
+          {
+            name: 'screenshot.png',
+            mime_type: 'image/png',
+            url: 'data:image/png;base64,aW1hZ2U=',
+            size: 5,
+            source: 'paste',
+          },
+        ],
+      },
+    ];
+
+    const attachments = chatMessagesToSaved(messages)[0]?.attachments;
+    expect(attachments?.map((attachment) => attachment.url)).toEqual([
+      '',
+      '',
+      'data:text/plain;base64,c21hbGw=',
+      'data:image/png;base64,aW1hZ2U=',
+    ]);
+    expect(attachments?.map((attachment) => attachment.source)).toEqual([
+      'paste',
+      'upload',
+      'upload',
+      'paste',
+    ]);
+  });
+
   it('clears loading state when a pending conversation load is interrupted by a new chat', async () => {
     const pendingRecord = deferred<{ messages: SavedMessage[] }>();
     mocks.getConversation.mockReturnValueOnce(pendingRecord.promise);
