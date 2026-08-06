@@ -24,7 +24,7 @@ impl Widget for Input {
         let sep_style = if app.is_processing {
             Style::default().fg(t.yellow)
         } else if !app.suggestions.is_empty() {
-            Style::default().fg(t.cyan)
+            Style::default().fg(t.peach)
         } else {
             Style::default().fg(t.surface0)
         };
@@ -63,8 +63,8 @@ impl Widget for Input {
             )
         } else {
             Span::styled(
-                "> ",
-                Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
+                "❯ ",
+                Style::default().fg(t.peach).add_modifier(Modifier::BOLD),
             )
         };
 

@@ -148,7 +148,12 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
         PendingHumanLoopKind::Selection => format!(" {} 需要选择 ", approval.tool_name),
     };
     let block = Block::default()
-        .title(title)
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.yellow));

@@ -199,9 +199,9 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       <div className="space-y-2 px-2.5 pb-3">
         <button
           onClick={() => onNewTask()}
-          className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-[13px] font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-sidebar-hover)]"
+          className="flex w-full items-center gap-2 rounded-lg bg-[var(--accent-bg)] px-2.5 py-2 text-[13px] font-medium text-[var(--accent)] transition-all hover:shadow-[var(--shadow-sm)]"
         >
-          <Plus size={15} />
+          <Plus size={15} strokeWidth={2.5} />
           新建任务
         </button>
 

@@ -68,48 +68,59 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Create a Theme from a CLI ColorTheme, unifying both theme systems.
-    pub fn from_color_theme(ct: &echo_agent_app_core::output::theme::ColorTheme) -> Self {
+    /// Dark theme — Claude Code inspired: warm coral accent on a near-black
+    /// canvas, semantic colors for status/roles, muted grays for chrome.
+    pub fn dark() -> Self {
         use ratatui::style::Color as RatatuiColor;
-
-        if ct.name == "light" {
-            return Self {
-                is_dark: false,
-                bg: RatatuiColor::Rgb(250, 250, 249),
-                surface0: RatatuiColor::Rgb(231, 229, 228),
-                surface1: RatatuiColor::Rgb(245, 245, 244),
-                overlay0: RatatuiColor::Rgb(161, 161, 170),
-                text: RatatuiColor::Rgb(24, 24, 27),
-                subtext: RatatuiColor::Rgb(82, 82, 91),
-                blue: RatatuiColor::Rgb(82, 82, 91),
-                green: RatatuiColor::Rgb(82, 82, 91),
-                yellow: RatatuiColor::Rgb(202, 138, 4),
-                peach: RatatuiColor::Rgb(82, 82, 91),
-                mauve: RatatuiColor::Rgb(82, 82, 91),
-                teal: RatatuiColor::Rgb(82, 82, 91),
-                red: RatatuiColor::Rgb(220, 38, 38),
-                cyan: RatatuiColor::Rgb(82, 82, 91),
-                lavender: RatatuiColor::Rgb(82, 82, 91),
-            };
-        }
-
         Self {
             is_dark: true,
-            bg: RatatuiColor::Rgb(16, 16, 16),
-            surface0: RatatuiColor::Rgb(48, 48, 48),
-            surface1: RatatuiColor::Rgb(36, 36, 36),
-            overlay0: RatatuiColor::Rgb(113, 113, 122),
-            text: RatatuiColor::Rgb(231, 229, 228),
-            subtext: RatatuiColor::Rgb(161, 161, 170),
-            blue: RatatuiColor::Rgb(161, 161, 170),
-            green: RatatuiColor::Rgb(161, 161, 170),
-            yellow: RatatuiColor::Rgb(250, 204, 21),
-            peach: RatatuiColor::Rgb(161, 161, 170),
-            mauve: RatatuiColor::Rgb(161, 161, 170),
-            teal: RatatuiColor::Rgb(161, 161, 170),
-            red: RatatuiColor::Rgb(248, 113, 113),
-            cyan: RatatuiColor::Rgb(161, 161, 170),
-            lavender: RatatuiColor::Rgb(161, 161, 170),
+            bg: RatatuiColor::Rgb(18, 18, 20),
+            surface0: RatatuiColor::Rgb(44, 44, 50),
+            surface1: RatatuiColor::Rgb(30, 30, 34),
+            overlay0: RatatuiColor::Rgb(118, 118, 128),
+            text: RatatuiColor::Rgb(232, 230, 228),
+            subtext: RatatuiColor::Rgb(156, 156, 166),
+            blue: RatatuiColor::Rgb(125, 175, 255),
+            green: RatatuiColor::Rgb(88, 203, 134),
+            yellow: RatatuiColor::Rgb(229, 192, 123),
+            peach: RatatuiColor::Rgb(222, 147, 95),
+            mauve: RatatuiColor::Rgb(198, 160, 246),
+            teal: RatatuiColor::Rgb(86, 196, 180),
+            red: RatatuiColor::Rgb(240, 113, 120),
+            cyan: RatatuiColor::Rgb(104, 205, 224),
+            lavender: RatatuiColor::Rgb(164, 177, 255),
+        }
+    }
+
+    /// Light theme — same accent family tuned for a near-white canvas.
+    pub fn light() -> Self {
+        use ratatui::style::Color as RatatuiColor;
+        Self {
+            is_dark: false,
+            bg: RatatuiColor::Rgb(250, 250, 249),
+            surface0: RatatuiColor::Rgb(226, 224, 222),
+            surface1: RatatuiColor::Rgb(240, 239, 237),
+            overlay0: RatatuiColor::Rgb(148, 148, 158),
+            text: RatatuiColor::Rgb(30, 30, 34),
+            subtext: RatatuiColor::Rgb(96, 96, 106),
+            blue: RatatuiColor::Rgb(28, 99, 218),
+            green: RatatuiColor::Rgb(22, 131, 66),
+            yellow: RatatuiColor::Rgb(176, 122, 8),
+            peach: RatatuiColor::Rgb(187, 87, 36),
+            mauve: RatatuiColor::Rgb(128, 66, 200),
+            teal: RatatuiColor::Rgb(8, 133, 118),
+            red: RatatuiColor::Rgb(198, 40, 44),
+            cyan: RatatuiColor::Rgb(0, 128, 158),
+            lavender: RatatuiColor::Rgb(88, 98, 218),
+        }
+    }
+
+    /// Create a Theme from a CLI ColorTheme, unifying both theme systems.
+    pub fn from_color_theme(ct: &echo_agent_app_core::output::theme::ColorTheme) -> Self {
+        if ct.name == "light" {
+            Self::light()
+        } else {
+            Self::dark()
         }
     }
 }
@@ -1119,9 +1130,9 @@ impl TuiApp {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     ratatui::text::Span::styled(
-                        format!(" {} Agent ", "\u{2728}"),
+                        " ✻ Agent ".to_string(),
                         ratatui::style::Style::default()
-                            .fg(theme.green)
+                            .fg(theme.peach)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
                     ratatui::text::Span::styled(
@@ -1131,7 +1142,7 @@ impl TuiApp {
                             .add_modifier(ratatui::style::Modifier::ITALIC),
                     ),
                 ]));
-                let md_lines = markdown::render_markdown(streaming_text);
+                let md_lines = markdown::render_markdown(streaming_text, &theme);
                 for line in md_lines {
                     lines.push(widgets::chat::indent_line(line, theme.surface0));
                 }
@@ -1139,9 +1150,9 @@ impl TuiApp {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
                     ratatui::text::Span::styled(
-                        format!(" {} Agent ", "\u{2728}"),
+                        " ✻ Agent ".to_string(),
                         ratatui::style::Style::default()
-                            .fg(theme.green)
+                            .fg(theme.peach)
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     ),
                     ratatui::text::Span::styled(
@@ -1324,7 +1335,7 @@ impl TuiApp {
                 });
                 // Badge
                 out.push(WrappedLine {
-                    text: " \u{1f464} You ".to_string(),
+                    text: " ❯ You ".to_string(),
                     message_idx: msg_idx,
                 });
                 // Content with 4-space indent
@@ -1346,11 +1357,11 @@ impl TuiApp {
                 });
                 // Badge
                 out.push(WrappedLine {
-                    text: " \u{2728} Agent ".to_string(),
+                    text: " ✻ Agent ".to_string(),
                     message_idx: msg_idx,
                 });
                 // Markdown content with indent guide
-                let md_lines = markdown::render_markdown(content);
+                let md_lines = markdown::render_markdown(content, &self.theme);
                 for line in &md_lines {
                     let plain = format!("  \u{2502} {line}");
                     for wrapped in textwrap::wrap(&plain, wrap_opts) {
@@ -1381,7 +1392,7 @@ impl TuiApp {
                 });
                 // Header line
                 let summary = content.lines().next().unwrap_or(content);
-                let header = format!(" \u{1f4dd} {tool_name} {summary}");
+                let header = format!(" ▸ {tool_name} {summary}");
                 for wrapped in textwrap::wrap(&header, wrap_opts) {
                     out.push(WrappedLine {
                         text: wrapped.into_owned(),
@@ -1435,8 +1446,9 @@ impl TuiApp {
                         message_idx: msg_idx,
                     });
                 }
-                for raw_line in tool_output_tail(tool, 6) {
-                    let prefixed = format!("   {raw_line}");
+                for (i, raw_line) in tool_output_tail(tool, 6).into_iter().enumerate() {
+                    let prefix = if i == 0 { "  ⎿ " } else { "    " };
+                    let prefixed = format!("{prefix}{raw_line}");
                     for wrapped in textwrap::wrap(&prefixed, wrap_opts) {
                         out.push(WrappedLine {
                             text: wrapped.into_owned(),

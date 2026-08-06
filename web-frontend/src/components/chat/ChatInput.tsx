@@ -843,7 +843,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
           )}
 
           {/* Input row */}
-          <div className="flex items-end rounded-[22px] border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 shadow-[var(--shadow-sm)] transition-colors focus-within:border-[var(--border-focus)] sm:px-4">
+          <div className="flex items-end rounded-[22px] border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 shadow-[var(--shadow-sm)] transition-all focus-within:border-[var(--border-focus)] focus-within:shadow-[var(--shadow-glow)] sm:px-4">
             {/* Attachment button */}
             <button
               onClick={() => fileInputRef.current?.click()}

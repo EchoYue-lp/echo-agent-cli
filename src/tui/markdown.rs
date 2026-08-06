@@ -12,6 +12,8 @@ use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
 
+use crate::tui::Theme;
+
 use std::sync::OnceLock;
 
 // ── Lazy singletons for syntect ─────────────────────────────────────────────
@@ -48,8 +50,8 @@ fn syntect_color_to_ratatui(c: syntect::highlighting::Color) -> Color {
 ///
 /// Safe to call on partial / streaming markdown -- incomplete code blocks and
 /// unclosed tags are handled gracefully.
-pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
-    let mut renderer = MarkdownRenderer::new();
+pub fn render_markdown(text: &str, theme: &Theme) -> Vec<Line<'static>> {
+    let mut renderer = MarkdownRenderer::new(theme.clone());
     renderer.render(text);
     renderer.lines
 }
@@ -57,6 +59,7 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
 // ── Renderer state machine ──────────────────────────────────────────────────
 
 struct MarkdownRenderer {
+    theme: Theme,
     lines: Vec<Line<'static>>,
     current_spans: Vec<Span<'static>>,
     style_stack: Vec<Style>,
@@ -76,8 +79,9 @@ struct MarkdownRenderer {
 }
 
 impl MarkdownRenderer {
-    fn new() -> Self {
+    fn new(theme: Theme) -> Self {
         Self {
+            theme,
             lines: Vec::new(),
             current_spans: Vec::new(),
             style_stack: Vec::new(),
@@ -175,12 +179,12 @@ impl MarkdownRenderer {
                     let marker = if checked { "[x] " } else { "[ ] " };
                     self.push_span(Span::styled(
                         format!("{}{}", indent, marker),
-                        Style::default().fg(Color::Cyan),
+                        Style::default().fg(self.theme.peach),
                     ));
                     self.task_list_checked = None;
                 } else {
                     let bullet = format!("{}  - ", indent);
-                    self.push_span(Span::styled(bullet, Style::default().fg(Color::Cyan)));
+                    self.push_span(Span::styled(bullet, Style::default().fg(self.theme.peach)));
                 }
             }
             Event::End(TagEnd::Item) => {
@@ -244,7 +248,7 @@ impl MarkdownRenderer {
             Event::Start(Tag::Strikethrough) => {
                 self.push_style(
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(self.theme.overlay0)
                         .add_modifier(Modifier::CROSSED_OUT),
                 );
             }
@@ -256,7 +260,7 @@ impl MarkdownRenderer {
             Event::Start(Tag::Link { dest_url, .. }) => {
                 self.push_style(
                     Style::default()
-                        .fg(Color::Blue)
+                        .fg(self.theme.blue)
                         .add_modifier(Modifier::UNDERLINED),
                 );
                 // We'll append the URL after the link text in End.
@@ -280,7 +284,9 @@ impl MarkdownRenderer {
                     let style = if self.heading_level > 0 {
                         self.heading_style(style)
                     } else if self.in_blockquote {
-                        style.fg(Color::DarkGray)
+                        style
+                            .fg(self.theme.subtext)
+                            .add_modifier(Modifier::ITALIC)
                     } else {
                         style
                     };
@@ -299,7 +305,7 @@ impl MarkdownRenderer {
             Event::Code(code) => {
                 // Inline code.
                 let style = Style::default()
-                    .fg(Color::Magenta)
+                    .fg(self.theme.mauve)
                     .add_modifier(Modifier::BOLD);
                 self.push_span(Span::styled(format!(" {} ", code), style));
             }
@@ -317,7 +323,7 @@ impl MarkdownRenderer {
                 self.lines.push(Line::from(""));
                 self.lines.push(Line::from(Span::styled(
                     "─".repeat(40),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.surface0),
                 )));
                 self.lines.push(Line::from(""));
             }
@@ -350,9 +356,9 @@ impl MarkdownRenderer {
 
     fn heading_style(&self, base: Style) -> Style {
         match self.heading_level {
-            1 => base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
-            2 => base.fg(Color::Green).add_modifier(Modifier::BOLD),
-            3 => base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            1 => base.fg(self.theme.peach).add_modifier(Modifier::BOLD),
+            2 => base.fg(self.theme.blue).add_modifier(Modifier::BOLD),
+            3 => base.fg(self.theme.mauve).add_modifier(Modifier::BOLD),
             _ => base.add_modifier(Modifier::BOLD),
         }
     }
@@ -426,11 +432,20 @@ impl MarkdownRenderer {
         let bottom_parts: Vec<String> = col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
         table_lines.push(format!("└{}┘", bottom_parts.join("┴")));
 
-        for line in table_lines {
-            self.lines.push(Line::from(Span::styled(
-                line,
-                Style::default().fg(Color::DarkGray),
-            )));
+        for (i, line) in table_lines.iter().enumerate() {
+            // Border rows + header separator dimmed; header row emphasized.
+            let is_border = line.starts_with('┌') || line.starts_with('├') || line.starts_with('└');
+            let style = if is_border {
+                Style::default().fg(self.theme.surface0)
+            } else if i == 1 {
+                Style::default()
+                    .fg(self.theme.text)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(self.theme.subtext)
+            };
+            self.lines
+                .push(Line::from(Span::styled(line.clone(), style)));
         }
     }
     fn render_code_block(&mut self) {
@@ -445,7 +460,7 @@ impl MarkdownRenderer {
             self.lines.push(Line::from(Span::styled(
                 format!("  {}", lang),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(self.theme.overlay0)
                     .add_modifier(Modifier::ITALIC),
             )));
         }
@@ -472,11 +487,12 @@ impl MarkdownRenderer {
 
         let mut h = HighlightLines::new(syntax, theme);
         let mut result = Vec::new();
+        let code_bg = self.theme.surface1;
 
         for line in LinesWithEndings::from(&self.code_block_text) {
             let mut spans = Vec::new();
-            // Indent for code block
-            spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
+            // Indent for code block; subtle panel background lifts code off the canvas.
+            spans.push(Span::styled("  ", Style::default().bg(code_bg)));
 
             match h.highlight_line(line, ss) {
                 Ok(regions) => {
@@ -484,7 +500,10 @@ impl MarkdownRenderer {
                         let fg = syntect_color_to_ratatui(style.foreground);
                         let text = text.trim_end_matches('\n');
                         if !text.is_empty() {
-                            spans.push(Span::styled(text.to_string(), Style::default().fg(fg)));
+                            spans.push(Span::styled(
+                                text.to_string(),
+                                Style::default().fg(fg).bg(code_bg),
+                            ));
                         }
                     }
                 }
@@ -492,7 +511,7 @@ impl MarkdownRenderer {
                     let text = line.trim_end_matches('\n');
                     spans.push(Span::styled(
                         text.to_string(),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.theme.subtext).bg(code_bg),
                     ));
                 }
             }
@@ -507,22 +526,26 @@ impl MarkdownRenderer {
 mod tests {
     use super::*;
 
+    fn theme() -> Theme {
+        Theme::dark()
+    }
+
     #[test]
     fn render_plain_text() {
-        let lines = render_markdown("Hello world");
+        let lines = render_markdown("Hello world", &theme());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn render_heading() {
-        let lines = render_markdown("# Title\n\nSome text.");
+        let lines = render_markdown("# Title\n\nSome text.", &theme());
         assert!(lines.len() >= 2);
     }
 
     #[test]
     fn render_code_block() {
         let md = "```rust\nfn main() {}\n```";
-        let lines = render_markdown(md);
+        let lines = render_markdown(md, &theme());
         assert!(lines.len() >= 3);
     }
 
@@ -530,26 +553,26 @@ mod tests {
     fn render_partial_code_block() {
         // Streaming: incomplete fence
         let md = "```rust\nfn main() {";
-        let lines = render_markdown(md);
+        let lines = render_markdown(md, &theme());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn render_inline_code() {
-        let lines = render_markdown("Use `println!` macro.");
+        let lines = render_markdown("Use `println!` macro.", &theme());
         assert!(!lines.is_empty());
     }
 
     #[test]
     fn render_list() {
         let md = "- item 1\n- item 2\n- item 3";
-        let lines = render_markdown(md);
+        let lines = render_markdown(md, &theme());
         assert!(lines.len() >= 3);
     }
 
     #[test]
     fn render_bold_italic() {
-        let lines = render_markdown("**bold** and *italic*");
+        let lines = render_markdown("**bold** and *italic*", &theme());
         assert!(!lines.is_empty());
     }
 }

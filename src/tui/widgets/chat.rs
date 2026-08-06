@@ -179,10 +179,10 @@ pub fn build_chat_lines(
     match role {
         MessageRole::User => {
             lines.push(Line::from(""));
-            // User badge with icon
+            // User badge — Claude Code style prompt marker
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" {} You ", "\u{1f464}"),
+                    " ❯ You ".to_string(),
                     Style::default().fg(t.blue).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
@@ -197,16 +197,16 @@ pub fn build_chat_lines(
         }
         MessageRole::Assistant => {
             lines.push(Line::from(""));
-            // Agent badge with icon
+            // Agent badge — Claude Code's ✻ marker on the coral accent
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" {} Agent ", "\u{2728}"),
-                    Style::default().fg(t.green).add_modifier(Modifier::BOLD),
+                    " ✻ Agent ".to_string(),
+                    Style::default().fg(t.peach).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ]));
             // Render with markdown
-            let md_lines = render_markdown(content);
+            let md_lines = render_markdown(content, t);
             for line in md_lines {
                 lines.push(indent_line(line, t.surface0));
             }
@@ -229,8 +229,8 @@ pub fn build_chat_lines(
             let summary = content.lines().next().unwrap_or(content);
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" {} {} ", "\u{1f4dd}", tool_name),
-                    Style::default().fg(t.yellow).add_modifier(Modifier::BOLD),
+                    format!(" ▸ {} ", tool_name),
+                    Style::default().fg(t.mauve).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(summary.to_string(), Style::default().fg(t.text)),
             ]));
@@ -277,9 +277,11 @@ pub fn build_chat_lines(
                 ),
                 Span::styled(format!(" · {timing}"), Style::default().fg(t.subtext)),
             ]));
-            for output in tool_output_tail(tool, 6) {
+            for (i, output) in tool_output_tail(tool, 6).into_iter().enumerate() {
+                // Claude Code style tree marker on the first output line.
+                let prefix = if i == 0 { "  ⎿ " } else { "    " };
                 lines.push(Line::from(vec![
-                    Span::styled("   ", Style::default()),
+                    Span::styled(prefix, Style::default().fg(t.surface0)),
                     Span::styled(output, Style::default().fg(t.subtext)),
                 ]));
             }

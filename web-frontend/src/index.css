@@ -36,6 +36,7 @@
   --bg-hover: #edf3f5;
   --bg-input: #ffffff;
   --bg-user-msg: #2563eb;
+  --bg-user-bubble: #eaf1fe; /* soft accent wash for the user prompt row */
   --bg-assistant-msg: transparent;
   --bg-code: #111827;
   --bg-code-header: #1f2937;
@@ -116,6 +117,7 @@
   --bg-hover: #1a1c1f;
   --bg-input: #141517;
   --bg-user-msg: #3b82f6;
+  --bg-user-bubble: #152233; /* soft accent wash for the user prompt row */
   --bg-assistant-msg: transparent;
   --bg-code: #07080a;
   --bg-code-header: #111315;
@@ -203,10 +205,9 @@ body {
   min-height: 100dvh;
 }
 
-/* Selection */
+/* Selection — soft accent wash, keeps text readable in both themes */
 ::selection {
-  background: var(--accent);
-  color: white;
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
 }
 
 /* Scrollbar - WebKit + Firefox */
@@ -570,14 +571,18 @@ body {
   cursor: pointer;
   padding: 2px 8px;
   border-radius: var(--radius-sm);
-  border: 1px solid var(--text-secondary);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   background: transparent;
   color: var(--text-tertiary);
   font-size: 11px;
-  transition: background 0.15s;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    color 0.15s ease;
 }
 .md-pre-copy:hover {
-  background: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.24);
   color: var(--color-code-text);
 }
 .md-pre-wrap pre {
@@ -633,27 +638,36 @@ body {
   background: var(--bg-primary);
   color: var(--text-primary);
   cursor: pointer;
-  transition: all 0.15s ease;
+  box-shadow: var(--shadow-sm);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.1s ease;
 }
 
 .btn:hover {
   background: var(--bg-hover);
   border-color: var(--border-focus);
+  box-shadow: var(--shadow-md);
 }
 
 .btn:active {
   transform: scale(0.98);
+  box-shadow: var(--shadow-sm);
 }
 
 .btn-primary {
   background: var(--accent);
   border-color: transparent;
   color: white;
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .btn-primary:hover {
-  filter: brightness(1.1);
+  filter: brightness(1.08);
   border-color: transparent;
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
 .btn-sm {

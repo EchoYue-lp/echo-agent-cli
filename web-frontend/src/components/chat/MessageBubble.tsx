@@ -219,10 +219,10 @@ export const MessageBubble = memo(function MessageBubble({
   let thinkingIndex = 0;
 
   return (
-    <div className="flex gap-3 py-3.5">
+    <div className="animate-fade-up flex gap-3 py-3.5">
       {/* Avatar — assistant only; user messages are full-width rows (no bubble) */}
       {!isUser && (
-        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-xs font-semibold text-[var(--text-tertiary)]">
+        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-bg)] text-[var(--accent)] shadow-[var(--shadow-sm)]">
           <Bot size={14} />
         </div>
       )}
@@ -334,7 +334,7 @@ export const MessageBubble = memo(function MessageBubble({
                 </div>
               </div>
             ) : (
-              <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-3 text-sm leading-relaxed text-[var(--text-primary)]">
+              <div className="rounded-2xl bg-[var(--bg-user-bubble)] px-4 py-3 text-sm leading-relaxed text-[var(--text-primary)]">
                 <div className="whitespace-pre-wrap break-words">{message.content}</div>
               </div>
             )}

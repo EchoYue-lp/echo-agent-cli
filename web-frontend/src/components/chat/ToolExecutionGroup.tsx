@@ -68,7 +68,7 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
       <button
         type="button"
         onClick={() => setExpanded((value) => !value)}
-        className="flex min-h-7 w-full min-w-0 items-center gap-1.5 py-0.5 text-left text-[12px] text-[var(--text-tertiary)]"
+        className="flex min-h-7 w-full min-w-0 items-center gap-1.5 rounded-md px-1.5 py-0.5 -ml-1.5 text-left text-[12px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-secondary)]"
         aria-expanded={expanded}
         aria-label={expanded ? '折叠工具执行过程' : '展开工具执行过程'}
       >

@@ -58,14 +58,14 @@ impl Widget for StatusBar {
             let win_str =
                 echo_agent_app_core::context_window::format_token_count(ctx.context_window_size);
             match pct {
-                Some(p) => format!("  {} {}/{} {}%{}", ring, used_str, win_str, p, cache_span),
-                None => format!("  {} {}{}", ring, used_str, cache_span),
+                Some(p) => format!("{} {}/{} {}%{}", ring, used_str, win_str, p, cache_span),
+                None => format!("{} {}{}", ring, used_str, cache_span),
             }
         } else {
             // 首次响应前 / 刚压缩后：占用占位；cache 率可能仍有值（压缩不清 Accumulator）。
             let win_str =
                 echo_agent_app_core::context_window::format_token_count(ctx.context_window_size);
-            format!("  {} --/{}{}", ring, win_str, cache_span)
+            format!("{} --/{}{}", ring, win_str, cache_span)
         };
         let sidebar_hint = if app.sidebar_visible {
             "side"
@@ -73,19 +73,27 @@ impl Widget for StatusBar {
             "Ctrl+B side"
         };
 
+        // Segments separated by a dim vertical bar — Claude Code statusline style.
+        let sep = || Span::styled("  │  ", Style::default().fg(t.surface0));
+        let state_icon = if app.is_processing { "●" } else { "○" };
+
         let line = Line::from(vec![
             Span::styled(
-                " EKO",
-                Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+                " ✻ EKO",
+                Style::default().fg(t.peach).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("  {}", app.mode), Style::default().fg(t.text)),
-            Span::styled(format!("  {}", app.model), Style::default().fg(t.subtext)),
-            Span::styled(format!("  {}", state), Style::default().fg(state_color)),
-            Span::styled(context_span, Style::default().fg(ctx_color)),
+            sep(),
+            Span::styled(app.mode.clone(), Style::default().fg(mode_color)),
+            sep(),
+            Span::styled(app.model.clone(), Style::default().fg(t.subtext)),
+            sep(),
             Span::styled(
-                format!("  {}", sidebar_hint),
-                Style::default().fg(t.overlay0),
+                format!("{} {}", state_icon, state),
+                Style::default().fg(state_color),
             ),
+            Span::styled(context_span, Style::default().fg(ctx_color)),
+            sep(),
+            Span::styled(sidebar_hint.to_string(), Style::default().fg(t.overlay0)),
         ]);
 
         let paragraph = Paragraph::new(line).style(Style::default().bg(t.bg));
