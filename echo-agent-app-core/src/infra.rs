@@ -1419,13 +1419,6 @@ pub enum LogTarget {
 /// Only imports known API key variables to avoid polluting the environment
 /// with unrelated shell state.
 pub fn load_shell_env() {
-    // Only relevant on macOS where GUI apps miss shell env vars.
-    // On Linux, desktop environments generally inherit the shell env.
-    #[cfg(not(target_os = "macos"))]
-    {
-        return;
-    }
-
     #[cfg(target_os = "macos")]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
