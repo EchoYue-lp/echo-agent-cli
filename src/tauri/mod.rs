@@ -436,7 +436,6 @@ pub fn build_tauri_app(
                                         metadata,
                                         truncated,
                                         execution_id,
-                                        run_id: _,
                                         ..
                                     } => {
                                         let subagent_run_id = execution_id
