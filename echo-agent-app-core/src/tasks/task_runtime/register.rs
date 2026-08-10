@@ -85,17 +85,7 @@ pub async fn register_task_tools_on_agent(
     // Also register task_execute tool (only on main agent per §10.2).
     // Use ParallelReadonlyDelegation as the default route; the route is
     // resolved per-run by the router at the orchestration layer.
-    // Wire the task lifecycle hook bridge (P0-5) so TaskCreated/Completed/
-    // Timeout/Cancelled fire into the agent's central HookRegistry.
-    let hook_bridge = agent_handle
-        .read(|agent| agent.create_task_hook_bridge().bridge().clone())
-        .await;
-    let subagent_bridge = agent_handle
-        .read(|agent| std::sync::Arc::new(agent.create_subagent_hook_bridge()))
-        .await;
-    let tool = ExecuteTaskTool::new(store.clone(), agent_handle.clone())
-        .with_hook_bridge(hook_bridge)
-        .with_subagent_bridge(subagent_bridge);
+    let tool = ExecuteTaskTool::new(store.clone(), agent_handle.clone());
     let ep_added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(tool));
@@ -123,20 +113,8 @@ pub async fn bind_task_execute_to_pool(
     store: Arc<TaskRuntimeStore>,
     pool: &Arc<crate::agent_pool::AgentPool>,
 ) {
-    // Wire the task lifecycle hook bridge (P0-5) on the pool-shared
-    // task_execute entry so TaskCreated/Completed/Timeout/Cancelled fire into
-    // the agent's central HookRegistry regardless of which conversation's
-    // pooled agent ultimately runs the task.
-    let hook_bridge = agent_handle
-        .read(|agent| agent.create_task_hook_bridge().bridge().clone())
-        .await;
-    let subagent_bridge = agent_handle
-        .read(|agent| std::sync::Arc::new(agent.create_subagent_hook_bridge()))
-        .await;
-    let tool = ExecuteTaskTool::new(store, agent_handle.clone())
-        .with_agent_pool(Arc::downgrade(pool))
-        .with_hook_bridge(hook_bridge)
-        .with_subagent_bridge(subagent_bridge);
+    let tool =
+        ExecuteTaskTool::new(store, agent_handle.clone()).with_agent_pool(Arc::downgrade(pool));
     let added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(tool));

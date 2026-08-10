@@ -140,14 +140,6 @@ pub struct ExecuteTaskTool {
     /// or keeps stage-1 rejection (Disabled). Also scoped into a task-local
     /// so CP B preflight in `execute_task` can read it.
     write_mode: UnattendedWriteMode,
-    /// Hook bridge forwarded into `execute_run` → `execute_task` so task
-    /// lifecycle events (TaskCreated/Completed/Timeout/Cancelled) reach the
-    /// central `HookRegistry`. `None` by default; production wiring injects
-    /// the runtime-owned bridge (P0-5).
-    hook_bridge: Option<Arc<echo_agent::hooks_bridge::TaskHookBridge>>,
-    /// Hook bridge forwarded into `execute_run` → `execute_task` for the
-    /// SubagentCancelled lifecycle event (P0-5).
-    subagent_bridge: Option<Arc<echo_agent::hooks_bridge::SubagentHookBridge>>,
 }
 
 impl ExecuteTaskTool {
@@ -168,8 +160,6 @@ impl ExecuteTaskTool {
             primary_agent,
             agent_pool: None,
             write_mode,
-            hook_bridge: None,
-            subagent_bridge: None,
         }
     }
 
@@ -180,29 +170,6 @@ impl ExecuteTaskTool {
         agent_pool: std::sync::Weak<crate::agent_pool::AgentPool>,
     ) -> Self {
         self.agent_pool = Some(agent_pool);
-        self
-    }
-
-    /// Inject the task lifecycle hook bridge (P0-5). The bridge is forwarded
-    /// into `execute_run` → `execute_task` so task lifecycle events fire into
-    /// the central `HookRegistry`. The runtime owns the bridge and injects it
-    /// when constructing the tool.
-    pub fn with_hook_bridge(
-        mut self,
-        bridge: Arc<echo_agent::hooks_bridge::TaskHookBridge>,
-    ) -> Self {
-        self.hook_bridge = Some(bridge);
-        self
-    }
-
-    /// Inject the subagent lifecycle hook bridge (P0-5). Forwarded into
-    /// `execute_run` → `execute_task` so SubagentCancelled fires into the
-    /// central `HookRegistry` when a dispatched subagent is cancelled.
-    pub fn with_subagent_bridge(
-        mut self,
-        bridge: Arc<echo_agent::hooks_bridge::SubagentHookBridge>,
-    ) -> Self {
-        self.subagent_bridge = Some(bridge);
         self
     }
 
@@ -444,8 +411,6 @@ impl Tool for ExecuteTaskTool {
                         // memory write is owned by the outer run's caller
                         // (drive_run_async / resume_task_run), not this tool.
                         super::memory_bridge::MemoryPolicy::None,
-                        self.hook_bridge.clone(),
-                        self.subagent_bridge.clone(),
                     )
                     .await
                 })

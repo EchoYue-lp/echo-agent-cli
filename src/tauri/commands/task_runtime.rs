@@ -256,14 +256,6 @@ pub async fn resume_task_run(
         execution_projector.emit(ev);
     });
     let run_id_for_task = run_id.clone();
-    // Wire the task lifecycle hook bridge (P0-5) from the primary agent so the
-    // resumed GUI run also fires TaskCreated/Completed/Timeout/Cancelled.
-    let gui_hook_bridge = primary_agent
-        .read(|a| a.create_task_hook_bridge().bridge().clone())
-        .await;
-    let gui_subagent_bridge = primary_agent
-        .read(|a| std::sync::Arc::new(a.create_subagent_hook_bridge()))
-        .await;
 
     tokio::spawn(async move {
         let _cancel_registration = cancel_registration;
@@ -278,8 +270,6 @@ pub async fn resume_task_run(
             cancel,
             // GUI resume keeps the interactive asynchronous memory projection.
             echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
-            Some(gui_hook_bridge),
-            Some(gui_subagent_bridge),
         )
         .await;
         match outcome {
@@ -368,13 +358,6 @@ pub async fn retry_blocked_task(
         execution_projector.emit(ev);
     });
     let run_id_for_task = run_id.clone();
-    // Wire the task lifecycle hook bridge (P0-5) for the retried GUI run.
-    let retry_hook_bridge = primary_agent
-        .read(|a| a.create_task_hook_bridge().bridge().clone())
-        .await;
-    let retry_subagent_bridge = primary_agent
-        .read(|a| std::sync::Arc::new(a.create_subagent_hook_bridge()))
-        .await;
 
     tokio::spawn(async move {
         let _cancel_registration = cancel_registration;
@@ -388,8 +371,6 @@ pub async fn retry_blocked_task(
             &run_id_for_task,
             cancel,
             echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
-            Some(retry_hook_bridge),
-            Some(retry_subagent_bridge),
         )
         .await;
         match outcome {
