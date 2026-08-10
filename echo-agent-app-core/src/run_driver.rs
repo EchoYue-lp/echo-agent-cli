@@ -71,8 +71,18 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         .acquire(&payload.run_id)
         .await
         .map_err(|e| format!("pool acquire failed for run {}: {e}", payload.run_id))?;
+    // Wire the task lifecycle hook bridge (P0-5) from the pooled agent's own
+    // hook registry so task events fire into the same registry its hooks see.
+    let pool_hook_bridge = pool_agent
+        .read(|agent| agent.create_task_hook_bridge().bridge().clone())
+        .await;
+    let pool_subagent_bridge = pool_agent
+        .read(|agent| std::sync::Arc::new(agent.create_subagent_hook_bridge()))
+        .await;
     let execute_plan =
-        crate::tasks::task_runtime::ExecuteTaskTool::new(payload.store.clone(), pool_agent.clone());
+        crate::tasks::task_runtime::ExecuteTaskTool::new(payload.store.clone(), pool_agent.clone())
+            .with_hook_bridge(pool_hook_bridge)
+            .with_subagent_bridge(pool_subagent_bridge);
     pool_agent
         .write(|agent| {
             agent.add_tool(Box::new(execute_plan));

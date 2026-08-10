@@ -212,21 +212,14 @@ impl AgentRuntime {
         }
 
         // ── 6. User hooks ──
+        // Single merged load: echo-agent.yaml inline + ~/.eko/hooks.yaml +
+        // .eko/hooks.yaml are merged into one HooksDefinition by
+        // HookConfigLoader (P0-1), then registered once. The previous code
+        // loaded inline and file sources separately, each calling
+        // clear_user_hooks(), so the second load wiped the first — a silent
+        // bug where echo-agent.yaml inline hooks disappeared whenever any
+        // hooks.yaml file existed.
         infra::load_user_hooks(&agent_handle, app_config).await;
-        let hooks_load = crate::hooks_config::load_hooks_files();
-        if !hooks_load.definition.is_empty() {
-            let hooks_def = hooks_load.definition;
-            agent_handle
-                .write_async(|a| {
-                    Box::pin(async move {
-                        let mut registry = a.hook_registry().write().await;
-                        registry.clear_user_hooks();
-                        registry.register_user_hooks(hooks_def);
-                    })
-                })
-                .await;
-            tracing::info!("Hooks loaded from hooks.yaml files");
-        }
 
         // ── 7. Hook bridges ──
         let task_hook_bridge = agent_handle.read(|a| a.create_task_hook_bridge()).await;
@@ -502,7 +495,7 @@ impl AgentRuntime {
 }
 
 async fn load_plugins(agent_handle: &AgentHandle) {
-    use echo_agent::plugin::PluginRegistry;
+    use echo_agent::plugin::{PluginIntegrator, PluginRegistry};
 
     let mut plugin_registry = PluginRegistry::new(None);
 
@@ -520,99 +513,31 @@ async fn load_plugins(agent_handle: &AgentHandle) {
 
     tracing::info!("Discovered {plugin_count} plugins ({enabled_count} enabled)");
 
-    match plugin_registry.resolve_dependencies() {
-        Ok(ordered_ids) => {
-            let mut skills_to_load: Vec<std::path::PathBuf> = Vec::new();
-            let mut hooks_to_register: Vec<(
-                String,
-                String,
-                echo_agent::skills::hooks::HooksDefinition,
-            )> = Vec::new();
-            let mut mcp_files_to_load: Vec<std::path::PathBuf> = Vec::new();
+    // Thin adapter: delegate discovery + dependency resolution + skills/hooks/
+    // MCP wiring to the framework `PluginIntegrator` (audit P0-2b / AGENTS.md
+    // gate #3 "no parallel implementation of the same semantics"). The previous
+    // hand-written loop duplicated `wire_all` and filed plugin hooks under
+    // `HookSource::Skill("plugin:…")`; the framework path now uses
+    // `register_plugin_hooks` → `HookSource::Plugin(name)`.
+    let wiring = agent_handle
+        .write_async(|a| {
+            Box::pin(async move {
+                PluginIntegrator::new()
+                    .wire_all(a, &mut plugin_registry)
+                    .await
+            })
+        })
+        .await;
 
-            for plugin_id in &ordered_ids {
-                let entry_info = plugin_registry
-                    .get(plugin_id)
-                    .map(|entry| (entry.enabled, entry.root.display().to_string()));
-
-                let Some((enabled, source_dir)) = entry_info else {
-                    continue;
-                };
-
-                if !enabled {
-                    continue;
-                }
-
-                if let Ok(resolved) = plugin_registry.resolve_components(plugin_id) {
-                    for skill_dir in &resolved.skill_dirs {
-                        skills_to_load.push(skill_dir.clone());
-                    }
-
-                    if let Some(ref hooks_file) = resolved.hooks_file
-                        && let Ok(content) = std::fs::read_to_string(hooks_file)
-                        && let Ok(def) = serde_yaml::from_str::<
-                            echo_agent::skills::hooks::HooksDefinition,
-                        >(&content)
-                    {
-                        hooks_to_register.push((plugin_id.clone(), source_dir.clone(), def));
-                    }
-
-                    if let Some(ref mcp_file) = resolved.mcp_config_file {
-                        mcp_files_to_load.push(mcp_file.clone());
-                    }
-                }
-            }
-
-            if !skills_to_load.is_empty() {
-                let count = skills_to_load.len();
-                agent_handle
-                    .write_async(|a| {
-                        Box::pin(async move {
-                            for dir in &skills_to_load {
-                                let _ = a.load_skills_from_dir(dir).await;
-                            }
-                        })
-                    })
-                    .await;
-                tracing::info!("Wired {count} skill directories from plugins");
-            }
-
-            if !hooks_to_register.is_empty() {
-                let count = hooks_to_register.len();
-                agent_handle
-                    .write_async(|a| {
-                        Box::pin(async move {
-                            let mut registry = a.hook_registry().write().await;
-                            for (plugin_name, source_dir, def) in &hooks_to_register {
-                                registry.register(
-                                    &format!("plugin:{plugin_name}"),
-                                    source_dir,
-                                    def.clone(),
-                                );
-                            }
-                        })
-                    })
-                    .await;
-                tracing::info!("Wired {count} hook definitions from plugins");
-            }
-
-            if !mcp_files_to_load.is_empty() {
-                let count = mcp_files_to_load.len();
-                agent_handle
-                    .write_async(|a| {
-                        Box::pin(async move {
-                            for mcp_file in &mcp_files_to_load {
-                                let _ = a.load_mcp_from_file(mcp_file).await;
-                            }
-                        })
-                    })
-                    .await;
-                tracing::info!("Wired {count} MCP config files from plugins");
-            }
-        }
-        Err(e) => {
-            tracing::error!("Failed to resolve plugin dependencies: {e}");
-        }
+    tracing::info!(
+        skills = wiring.skills_loaded.len(),
+        hooks = wiring.hooks_registered.len(),
+        mcp = wiring.mcp_connected.len(),
+        errors = wiring.errors.len(),
+        "Plugin wiring complete"
+    );
+    for err in &wiring.errors {
+        tracing::warn!(error = %err, "Plugin wiring error");
     }
 }
 

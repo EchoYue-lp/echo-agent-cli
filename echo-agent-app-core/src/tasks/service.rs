@@ -414,6 +414,15 @@ impl BackgroundTaskService {
             // require a review pass; without a reviewer the Skipped branch
             // would otherwise Paused the run forever (M7 forbids auto-pass).
             let reviewer_llm = agent.read(|a| a.llm_client().cloned()).await;
+            // Build the task lifecycle hook bridge from the background agent's
+            // own hook registry (P0-5) so TaskCreated/Completed/Timeout/Cancelled
+            // fire into the same registry its skills/hooks see.
+            let hook_bridge = agent
+                .read(|a| a.create_task_hook_bridge().bridge().clone())
+                .await;
+            let subagent_bridge = agent
+                .read(|a| std::sync::Arc::new(a.create_subagent_hook_bridge()))
+                .await;
             let result = match store.get_plan(&run_id) {
                 Ok(Some(_)) => super::task_runtime::execute_run(
                     store.clone(),
@@ -425,6 +434,8 @@ impl BackgroundTaskService {
                     &run_id,
                     cancel,
                     MemoryPolicy::None,
+                    Some(hook_bridge),
+                    Some(subagent_bridge),
                 )
                 .await
                 .map(|_| run_id.clone()),
@@ -854,7 +865,17 @@ async fn register_task_execute(agent: &AgentHandle, store: Arc<TaskRuntimeStore>
     {
         return;
     }
-    let tool = ExecuteTaskTool::new(store, agent.clone());
+    // Wire the task lifecycle hook bridge (P0-5) from the agent's own hook
+    // registry so TaskCreated/Completed/Timeout/Cancelled fire into it.
+    let hook_bridge = agent
+        .read(|agent| agent.create_task_hook_bridge().bridge().clone())
+        .await;
+    let subagent_bridge = agent
+        .read(|agent| std::sync::Arc::new(agent.create_subagent_hook_bridge()))
+        .await;
+    let tool = ExecuteTaskTool::new(store, agent.clone())
+        .with_hook_bridge(hook_bridge)
+        .with_subagent_bridge(subagent_bridge);
     agent
         .write(|agent| {
             agent.add_tool(Box::new(tool));

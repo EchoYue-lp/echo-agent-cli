@@ -1900,24 +1900,47 @@ pub fn run_base_doctor_for_model_with_connectivity(
     DoctorResult { issues, checks }
 }
 
-/// Load user hooks from YAML config into the agent's hook registry.
+/// Load user hooks from **all** user-config sources into the agent's hook
+/// registry, as a single merged `HooksDefinition`.
+///
+/// 这是 P0-1 修复后的**唯一** user hook 注册入口(bootstrap 路径)。
+/// 它通过 [`crate::hook_config_loader::HookConfigLoader::load_merged`] 把
+/// 三个来源(echo-agent.yaml 内嵌 + ~/.eko/hooks.yaml + .eko/hooks.yaml)
+/// 按固定顺序合并成单个 `HooksDefinition`,然后**一次性**
+/// `clear_user_hooks()` + `register_user_hooks(merged)`。
+///
+/// **重要**:调用方在调用本函数后,**不应再** 单独调用
+/// `load_hooks_files()` + `register_user_hooks()` —— 那是旧 bug 的根源
+/// (文件来源会 clear 掉本函数刚 register 的内嵌 hooks)。文件 hooks
+/// 已包含在本函数的合并结果里。
+///
+/// 旧的实现只 register `app_config.hooks`(内嵌),把文件来源留给
+/// `runtime.rs::bootstrap` 单独 register —— 但 `register_user_hooks`
+/// 内部会覆盖 `UserConfig` 单槽位,导致文件来源 clear 掉内嵌来源。
 pub async fn load_user_hooks(agent: &AgentHandle, app_config: &AppConfig) {
-    let hooks_def = app_config.hooks.clone();
+    let load_result = crate::hook_config_loader::HookConfigLoader::load_merged(app_config);
+    let hooks_def = load_result.definition;
     if hooks_def.is_empty() {
         return;
     }
-    let rule_count = hooks_def.rules.len();
+    let rule_count: usize = hooks_def.rules.values().map(Vec::len).sum();
     agent
         .write_async(|a| {
             Box::pin(async move {
                 let mut registry = a.hook_registry().write().await;
-                // Clear existing user hooks first to avoid duplicates on config reload
+                // 一次性 clear + register 合并后的完整 user hook 集。
+                // 这里 clear 是为了支持 config reload(避免重复注册);
+                // 因为我们已把三源合并,clear 不会丢任何来源。
                 registry.clear_user_hooks();
                 registry.register_user_hooks(hooks_def);
             })
         })
         .await;
-    tracing::info!(count = rule_count, "User hooks loaded from config");
+    tracing::info!(
+        count = rule_count,
+        files = ?load_result.loaded_from,
+        "User hooks loaded (merged: inline echo-agent.yaml + hooks.yaml files)"
+    );
 }
 
 /// Fire SessionStart("startup") hook after hooks are loaded.

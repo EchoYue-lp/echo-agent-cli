@@ -64,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
     // 统一全局根目录为 ~/.eko(EKO 品牌)。必须在任何路径解析之前调用一次;
     // 框架与应用随后都通过 echo_agent::paths::user_data_dir() 取同一个根。
     let _ = echo_agent::paths::set_user_data_dir_name(".eko");
+    // 插件数据也落到 ~/.eko/plugins(默认是 ~/.echo-agent/plugins,会与非插件
+    // 数据分裂)。框架 plugin 模块自带独立的 base dir 解析(echo-core 不能依赖
+    // facade 的 paths 模块),这里同步覆盖(审计 P0-3)。
+    let _ = echo_agent::plugin::set_plugin_data_base_dir_name(".eko");
 
     // Tauri CLI builds the package-name binary (`echo-agent-cli`) and then
     // bundles/renames it. In a GUI-only build, route this binary to the

@@ -140,7 +140,17 @@ async fn register_task_execute_on_agent(agent_handle: &AgentHandle, store: Arc<T
     {
         return;
     }
-    let tool = ExecuteTaskTool::new(store, agent_handle.clone());
+    // Wire the task lifecycle hook bridge (P0-5) from the cron agent's own
+    // hook registry so task events fire into it.
+    let hook_bridge = agent_handle
+        .read(|agent| agent.create_task_hook_bridge().bridge().clone())
+        .await;
+    let subagent_bridge = agent_handle
+        .read(|agent| std::sync::Arc::new(agent.create_subagent_hook_bridge()))
+        .await;
+    let tool = ExecuteTaskTool::new(store, agent_handle.clone())
+        .with_hook_bridge(hook_bridge)
+        .with_subagent_bridge(subagent_bridge);
     let added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(tool));

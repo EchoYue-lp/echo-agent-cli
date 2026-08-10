@@ -31,15 +31,20 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 .await;
         }
         "reload" => {
-            // Load hooks from YAML files
-            let load_result = echo_agent_app_core::hooks_config::load_hooks_files();
+            // P0-1: 从磁盘重读**所有** user hook 来源(echo-agent.yaml 内嵌
+            // + ~/.eko/hooks.yaml + .eko/hooks.yaml),合并成单个 definition
+            // 后一次性 register。旧实现只 reload 文件 hooks、不重读
+            // echo-agent.yaml,导致 reload 后内嵌 hooks 永久丢失。
+            let load_result =
+                echo_agent_app_core::hook_config_loader::HookConfigLoader::load_merged_from_disk();
             if load_result.definition.is_empty() {
-                println!("No hooks found in config files.");
-                println!("  Searched: ~/.eko/hooks.yaml, .eko/hooks.yaml");
+                println!("No hooks found in config sources.");
+                println!("  Checked: echo-agent.yaml, ~/.eko/hooks.yaml, .eko/hooks.yaml");
             } else {
                 let rule_count: usize =
                     load_result.definition.rules.values().map(|v| v.len()).sum();
                 println!("Loaded {} rules from:", rule_count);
+                println!("  - echo-agent.yaml (inline)");
                 for path in &load_result.loaded_from {
                     println!("  - {}", path.display());
                 }

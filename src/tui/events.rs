@@ -3504,7 +3504,9 @@ async fn handle_slash_command(
                         .await
                 }
                 "reload" => {
-                    let loaded = echo_agent_app_core::hooks_config::load_hooks_files();
+                    // P0-1: 从磁盘重读所有 user hook 来源(含 echo-agent.yaml
+                    // 内嵌),合并成单个 definition 后一次性 register。
+                    let loaded = echo_agent_app_core::hook_config_loader::HookConfigLoader::load_merged_from_disk();
                     let count: usize = loaded.definition.rules.values().map(Vec::len).sum();
                     let definition = loaded.definition;
                     agent
@@ -4697,6 +4699,14 @@ async fn start_tui_task_run_driver(
     };
     let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
     let run_store = agent.read(|value| value.run_store().cloned()).await;
+    // Wire the task lifecycle hook bridge (P0-5) from this agent's own hook
+    // registry so TaskCreated/Completed/Timeout/Cancelled fire into it.
+    let tui_hook_bridge = agent
+        .read(|value| value.create_task_hook_bridge().bridge().clone())
+        .await;
+    let tui_subagent_bridge = agent
+        .read(|value| std::sync::Arc::new(value.create_subagent_hook_bridge()))
+        .await;
     tokio::spawn(async move {
         let _cancel_registration = cancel_registration;
         let result = echo_agent_app_core::tasks::task_runtime::execute_run(
@@ -4709,6 +4719,8 @@ async fn start_tui_task_run_driver(
             &run_id,
             cancel,
             echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
+            Some(tui_hook_bridge),
+            Some(tui_subagent_bridge),
         )
         .await;
         if let Err(error) = result {

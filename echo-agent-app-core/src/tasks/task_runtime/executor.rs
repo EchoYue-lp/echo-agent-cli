@@ -314,6 +314,15 @@ pub async fn execute_run(
     run_id: &str,
     parent_cancel: CancellationToken,
     memory_policy: super::memory_bridge::MemoryPolicy,
+    // Hook bridge forwarded into `execute_task` for task lifecycle events
+    // (TaskCreated/Completed/Timeout/Cancelled). `None` when no hook
+    // registry is wired. EKO's task_runtime does not run through the
+    // framework TaskExecutor, so this is the only path that fires these
+    // events.
+    hook_bridge: Option<Arc<echo_agent::hooks_bridge::TaskHookBridge>>,
+    // Hook bridge forwarded into `execute_task` for the SubagentCancelled
+    // subagent lifecycle event.
+    subagent_bridge: Option<Arc<echo_agent::hooks_bridge::SubagentHookBridge>>,
 ) -> Result<RunOutcome, ExecError> {
     let run = store
         .get_run(run_id)?
@@ -390,6 +399,8 @@ pub async fn execute_run(
             store.clone(),
             RealTaskDispatcher {
                 primary_agent: primary_agent.clone(),
+                hook_bridge: hook_bridge.clone(),
+                subagent_bridge: subagent_bridge.clone(),
             },
             reviewer_llm.clone(),
             run_id,
@@ -818,6 +829,13 @@ trait TaskDispatcher: Send + Sync {
 /// dispatcher only needs the Agent and product-specific concurrency primitives.
 struct RealTaskDispatcher {
     primary_agent: crate::agent_handle::AgentHandle,
+    /// Hook bridge forwarded into `execute_task` so task lifecycle events
+    /// (TaskCreated/Completed/Timeout/Cancelled) reach the central
+    /// `HookRegistry`. `None` in test/fixture paths.
+    hook_bridge: Option<Arc<echo_agent::hooks_bridge::TaskHookBridge>>,
+    /// Hook bridge forwarded into `execute_task` so SubagentCancelled reaches
+    /// the central `HookRegistry`.
+    subagent_bridge: Option<Arc<echo_agent::hooks_bridge::SubagentHookBridge>>,
 }
 
 impl TaskDispatcher for RealTaskDispatcher {
@@ -834,6 +852,8 @@ impl TaskDispatcher for RealTaskDispatcher {
         trace_sink: Option<ExecSink>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>> {
         let primary_agent = self.primary_agent.clone();
+        let hook_bridge = self.hook_bridge.clone();
+        let subagent_bridge = self.subagent_bridge.clone();
         Box::pin(async move {
             let run_id = context.run_id;
             let cancel = context.cancel;
@@ -861,6 +881,8 @@ impl TaskDispatcher for RealTaskDispatcher {
                     task,
                     cancel,
                     delegation_policy,
+                    hook_bridge,
+                    subagent_bridge,
                 )
                 .await
             })
@@ -1743,6 +1765,17 @@ async fn execute_task(
     task: PlanTask,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
+    // Hook bridge for firing task lifecycle events
+    // (TaskCreated/Completed/Timeout/Cancelled) into the central
+    // `HookRegistry`. `None` when no hook registry is wired (e.g. tests).
+    // EKO's `task_runtime` DAG scheduler does not run through the framework
+    // `TaskExecutor`, so the framework's `TaskHooks` call points never fire;
+    // this bridge is the application-side equivalent.
+    hook_bridge: Option<Arc<echo_agent::hooks_bridge::TaskHookBridge>>,
+    // Hook bridge for firing the subagent lifecycle event
+    // (SubagentCancelled) into the central `HookRegistry`. Fired when a
+    // dispatched subagent returns a `Cancelled` outcome.
+    subagent_bridge: Option<Arc<echo_agent::hooks_bridge::SubagentHookBridge>>,
 ) -> TaskDispatchResult {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
@@ -1818,6 +1851,13 @@ async fn execute_task(
         &task,
         &contract,
     );
+
+    // Fire TaskCreated lifecycle hook (P0-5). EKO's task_runtime DAG scheduler
+    // bypasses the framework TaskExecutor, so this is the application-side
+    // equivalent of the framework's TaskHooks::before_execute call point.
+    if let Some(bridge) = &hook_bridge {
+        bridge.on_before_execute(&task_id, &task.description).await;
+    }
 
     // Acquire EKO product-resource permits with cancel awareness:
     // - Read-only tasks need no additional permit; the framework executor
@@ -2060,6 +2100,10 @@ async fn execute_task(
                     agent_role = %task.agent_role,
                     "task_runtime: read-only subagent cancelled"
                 );
+                // Fire SubagentCancelled lifecycle hook (P0-5).
+                if let Some(bridge) = &subagent_bridge {
+                    bridge.on_cancelled(&task.agent_role).await;
+                }
                 Err("task cancelled".to_string())
             }
             Ok(sub_result) => {
@@ -2123,6 +2167,10 @@ async fn execute_task(
                     agent_role = %task.agent_role,
                     "task_runtime: writer subagent cancelled"
                 );
+                // Fire SubagentCancelled lifecycle hook (P0-5).
+                if let Some(bridge) = &subagent_bridge {
+                    bridge.on_cancelled(&task.agent_role).await;
+                }
                 Err("task cancelled".to_string())
             }
             Ok(sub_result) => {
@@ -2281,6 +2329,12 @@ async fn execute_task(
                     .with_agent(task.agent_role.clone()),
                 );
             }
+            // Fire TaskCompleted lifecycle hook (P0-5). Fires only on the
+            // success branch — failure/cancel/timeout each have their own
+            // hook point below.
+            if let Some(bridge) = &hook_bridge {
+                bridge.on_after_execute(&task_id, &task.description).await;
+            }
             Ok(TaskDispatchSuccess {
                 task_id,
                 result: task_result,
@@ -2299,6 +2353,18 @@ async fn execute_task(
                 SubagentRunStatus::Failed
             };
             let task_result = SubagentTaskResult::terminal(status, e.clone(), vec![e.clone()]);
+            // Fire TaskCancelled / TaskTimeout lifecycle hooks (P0-5). A task
+            // that both timed out and was cancelled prefers Cancelled (the
+            // cancel token is the more authoritative signal). Generic failures
+            // currently fire no hook here — the framework `on_failure` path
+            // carries a RetryDecision which the task_runtime DAG does not use.
+            if let Some(bridge) = &hook_bridge {
+                if cancelled {
+                    bridge.on_cancelled(&task_id, &task.description).await;
+                } else if status == SubagentRunStatus::TimedOut {
+                    bridge.on_timeout(&task_id, &task.description).await;
+                }
+            }
             if let Err(error) = store.put_summary(&TaskExecutionSummary {
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
