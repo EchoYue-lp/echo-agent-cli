@@ -93,12 +93,7 @@ pub async fn list_plugins(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let service = require_service(&state)?;
-    let plugins: Vec<PluginInfo> = service
-        .list()
-        .await
-        .iter()
-        .map(entry_to_info)
-        .collect();
+    let plugins: Vec<PluginInfo> = service.list().await.iter().map(entry_to_info).collect();
     Ok(serde_json::to_value(plugins).unwrap_or_default())
 }
 

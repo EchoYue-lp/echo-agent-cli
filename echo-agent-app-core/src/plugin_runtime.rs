@@ -183,15 +183,15 @@ impl PluginRuntimeService {
         self.reload().await.map(|_| ())
     }
 
-    /// Disable a plugin and re-wire the agent.
+    /// Disable a plugin, unload its components from the live agent, then
+    /// re-wire the still-enabled subset.
     ///
-    /// **Known limitation (P1):** the framework `wire_all` is additive — it
-    /// registers components but cannot unregister them. After disable, the
-    /// re-run `wire_all` only wires the still-enabled subset, but the disabled
-    /// plugin's previously-registered skills/hooks remain in the agent's
-    /// registries (MCP servers are idempotent — re-running `load_mcp_from_file`
-    /// with the smaller set won't disconnect the dropped ones either). True
-    /// unload requires framework support and is tracked in MASTER-PLAN.
+    /// Unload (P1-reload) removes the plugin's skills via
+    /// `SkillRegistry::unregister_by_source` and its hooks via
+    /// `HookRegistry::unregister(HookSource::Plugin)`. MCP servers are not
+    /// disconnected here (the framework MCP manager has no per-server
+    /// disconnect API); they become inert on next reload's idempotent re-wire.
+    /// After unload, `reload()` re-wires the remaining enabled plugins.
     pub async fn disable(&self, name: &str) -> anyhow::Result<()> {
         {
             let mut registry = self.registry.lock().await;
@@ -199,6 +199,28 @@ impl PluginRuntimeService {
                 .disable(name)
                 .map_err(|e| anyhow::anyhow!("Disable plugin '{name}' failed: {e}"))?;
         }
+        // Unload this plugin's skills + hooks from the live agent before
+        // reloading, so the disabled plugin's components are actually gone
+        // (wire_all is additive and cannot remove them).
+        let source_tag = format!("plugin:{name}");
+        let hook_source = echo_agent::skills::hooks::HookSource::Plugin(name.to_string());
+        let plugin_name = name.to_string();
+        self.agent_handle
+            .write_async(|agent| {
+                Box::pin(async move {
+                    let removed_skills =
+                        agent.skill_registry_mut().unregister_by_source(&source_tag);
+                    let mut hook_reg = agent.hook_registry().write().await;
+                    let removed_hooks = hook_reg.unregister(&hook_source);
+                    tracing::info!(
+                        plugin = %plugin_name,
+                        removed_skills,
+                        removed_hooks,
+                        "Unloaded plugin components from live agent (disable)"
+                    );
+                })
+            })
+            .await;
         self.reload().await.map(|_| ())
     }
 
@@ -223,11 +245,10 @@ impl PluginRuntimeService {
         Ok(plugin_id)
     }
 
-    /// Uninstall a plugin, then reload (which re-wires the remaining set).
+    /// Uninstall a plugin, unload its components from the live agent, then
+    /// reload the remaining set.
     ///
-    /// Same additive-wire limitation as `disable`: already-registered
-    /// components from the uninstalled plugin are not unloaded from the agent
-    /// (P1).
+    /// Same unload path as `disable` (skills + hooks removed; MCP inert).
     pub async fn uninstall(&self, name: &str, keep_data: bool) -> anyhow::Result<()> {
         {
             let mut registry = self.registry.lock().await;
@@ -235,6 +256,25 @@ impl PluginRuntimeService {
                 .uninstall(name, keep_data)
                 .map_err(|e| anyhow::anyhow!("Uninstall plugin '{name}' failed: {e}"))?;
         }
+        let source_tag = format!("plugin:{name}");
+        let hook_source = echo_agent::skills::hooks::HookSource::Plugin(name.to_string());
+        let plugin_name = name.to_string();
+        self.agent_handle
+            .write_async(|agent| {
+                Box::pin(async move {
+                    let removed_skills =
+                        agent.skill_registry_mut().unregister_by_source(&source_tag);
+                    let mut hook_reg = agent.hook_registry().write().await;
+                    let removed_hooks = hook_reg.unregister(&hook_source);
+                    tracing::info!(
+                        plugin = %plugin_name,
+                        removed_skills,
+                        removed_hooks,
+                        "Unloaded plugin components from live agent (uninstall)"
+                    );
+                })
+            })
+            .await;
         self.reload().await.map(|_| ())
     }
 

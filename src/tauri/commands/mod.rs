@@ -12,6 +12,7 @@ pub mod chat;
 pub mod config;
 pub mod conversations;
 pub mod files;
+pub mod hooks;
 pub mod mcp;
 pub mod memory;
 pub mod panels;

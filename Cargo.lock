@@ -1853,6 +1853,7 @@ dependencies = [
  "parking_lot",
  "rand 0.9.4",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml_ng",

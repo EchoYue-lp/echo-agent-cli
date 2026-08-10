@@ -15,6 +15,7 @@ export type SettingsTabId =
   | 'compress'
   | 'evolution'
   | 'plugins'
+  | 'hooks'
   | 'scheduler'
   | 'worktree';
 

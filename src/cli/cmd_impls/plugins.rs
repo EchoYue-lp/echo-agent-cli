@@ -255,15 +255,66 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "reload" => {
+            // TUI/CLI has no persistent PluginRuntimeService like the GUI, so we
+            // rescan the plugin manifests on disk and report the same dimensions
+            // as the GUI's ReloadSummary (total/enabled/skills/hooks/mcp). This
+            // keeps the two surfaces feature-parity per AGENTS.md. The actual
+            // wiring into the live agent's registries happens on agent restart
+            // (the CLI REPL runs without a long-lived wiring service).
             println!("Reloading plugins...");
             if let Err(e) = registry.scan_all() {
                 println!("Error reloading plugins: {e}");
                 return CommandOutcome::Continue;
             }
 
-            let count = registry.count();
-            let enabled = registry.list_enabled().len();
-            println!("Loaded {count} plugins ({enabled} enabled).");
+            let all = registry.list();
+            let total = all.len();
+            let enabled_entries = registry.list_enabled();
+            let enabled = enabled_entries.len();
+
+            // Collect the per-plugin data we need into owned values first, so
+            // the immutable borrow from `list_enabled()` ends before we call
+            // `resolve_components` (which needs `&mut self`).
+            let mut skills_loaded = 0usize;
+            let mut hooks_registered = 0usize;
+            let mut mcp_connected = 0usize;
+            for entry in &enabled_entries {
+                if entry.manifest.components.skills.is_some() {
+                    skills_loaded += 1;
+                }
+                if entry.manifest.components.hooks.is_some() {
+                    hooks_registered += 1;
+                }
+                if entry.manifest.components.mcp_servers.is_some() {
+                    mcp_connected += 1;
+                }
+            }
+            // Collect names into owned strings so the immutable borrow of the
+            // registry (via list_enabled()) ends before the mutable resolve.
+            let names_to_resolve: Vec<String> = enabled_entries
+                .iter()
+                .map(|e| e.manifest.name.clone())
+                .collect();
+
+            // Surface malformed manifests resolved during scan. Done after the
+            // borrow above ends, since resolve_components takes &mut self.
+            let mut errors: Vec<String> = Vec::new();
+            for name in &names_to_resolve {
+                if let Err(e) = registry.resolve_components(name) {
+                    errors.push(format!("{}: {}", name, e));
+                }
+            }
+
+            println!("Loaded {total} plugins ({enabled} enabled).");
+            println!("  Skills components:  {skills_loaded}");
+            println!("  Hooks components:   {hooks_registered}");
+            println!("  MCP components:     {mcp_connected}");
+            if !errors.is_empty() {
+                println!("Errors ({}):", errors.len());
+                for err in &errors {
+                    println!("  - {err}");
+                }
+            }
             println!("Note: Plugin components will be wired on next agent restart.");
         }
 

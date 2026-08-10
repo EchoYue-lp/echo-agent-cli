@@ -1711,6 +1711,10 @@ export const pluginApi = {
           success: boolean;
           total?: number;
           enabled?: number;
+          skills_loaded?: number;
+          hooks_registered?: number;
+          mcp_connected?: number;
+          errors?: string[];
           message?: string;
           error?: string;
         }>('reload_plugins')
@@ -1718,9 +1722,41 @@ export const pluginApi = {
           success: boolean;
           total?: number;
           enabled?: number;
+          skills_loaded?: number;
+          hooks_registered?: number;
+          mcp_connected?: number;
+          errors?: string[];
           message?: string;
           error?: string;
         }>('/plugins/reload'),
+};
+
+// ── Hooks API ──────────────────────────────────────────────────────────
+
+/** A registered hook source and its rule count, mirroring the backend
+ *  `HookRegistry::list_sources` result. Sources look like `user_config`,
+ *  `skill:foo`, or `plugin:bar`. */
+export interface HookSourceInfo {
+  source: string;
+  rule_count: number;
+}
+
+/** Summary returned by a hooks reload: how many rules were merged and where
+ *  they came from. */
+export interface HooksReloadSummary {
+  success: boolean;
+  rule_count: number;
+  loaded_from: string[];
+  message: string;
+}
+
+export const hooksApi = {
+  list: () =>
+    isTauri() ? apiInvoke<HookSourceInfo[]>('list_hooks') : get<HookSourceInfo[]>('/hooks'),
+  reload: () =>
+    isTauri()
+      ? apiInvoke<HooksReloadSummary>('reload_hooks')
+      : post<HooksReloadSummary>('/hooks/reload'),
 };
 
 // ── Scheduler API (定时任务) ──────────────────────────────────────

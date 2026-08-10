@@ -16,6 +16,7 @@ import {
   BrainCircuit,
   Sparkles,
   Package,
+  Webhook,
   Timer,
   GitBranch,
   LayoutDashboard,
@@ -34,6 +35,7 @@ import { MemoryPanel } from '../memory/MemoryPanel';
 import { EvolutionPanel } from '../evolution/EvolutionPanel';
 import { ProviderPanel } from '../providers/ProviderPanel';
 import { PluginPanel } from '../plugins/PluginPanel';
+import { HooksPanel } from '../hooks/HooksPanel';
 import { SchedulerPanel } from '../scheduler/SchedulerPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
 import { ObservabilityPanel } from '../observability/ObservabilityPanel';
@@ -173,6 +175,13 @@ const settingsGroups: SettingsGroup[] = [
         description: '本地插件市场',
       },
       {
+        id: 'hooks',
+        label: 'Hooks',
+        icon: Webhook,
+        maturity: 'advanced',
+        description: '事件钩子来源与规则',
+      },
+      {
         id: 'scheduler',
         label: '定时任务',
         icon: Timer,
@@ -213,6 +222,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   compress: CompressPanel,
   evolution: EvolutionPanel,
   plugins: PluginPanel,
+  hooks: HooksPanel,
   scheduler: SchedulerPanel,
   worktree: WorktreePanel,
 };

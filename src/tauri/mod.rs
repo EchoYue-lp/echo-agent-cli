@@ -181,6 +181,9 @@ pub fn build_tauri_app(
             commands::plugins::enable_plugin,
             commands::plugins::disable_plugin,
             commands::plugins::reload_plugins,
+            // Hooks
+            commands::hooks::list_hooks,
+            commands::hooks::reload_hooks,
             // Providers
             commands::providers::list_model_templates,
             commands::providers::list_configured_models,
