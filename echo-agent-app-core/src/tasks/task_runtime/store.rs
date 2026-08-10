@@ -183,6 +183,19 @@ impl TaskRuntimeStore {
         })
     }
 
+    /// Attach the application-layer HookEventDispatcher so every event written
+    /// via `append_event_line` is translated into framework HookEvents.
+    ///
+    /// Idempotent (first call wins). Intended to be called once during
+    /// bootstrap, after the agent + bridges exist (the store is built earlier).
+    /// Until attached, task/subagent events are not dispatched to hooks.
+    pub fn attach_hook_event_hook(
+        &self,
+        hook: std::sync::Arc<dyn Fn(&super::types::RuntimeTaskEvent) + Send + Sync>,
+    ) -> bool {
+        self.shadow.try_attach_event_hook(hook)
+    }
+
     /// 在持有某 run 的 plan/state 写锁期间执行闭包 (F2-1 / F3-3 / F3-4)。
     ///
     /// 用 closure 模式而非返回 Guard: std::sync::MutexGuard 借自 &Mutex, 而

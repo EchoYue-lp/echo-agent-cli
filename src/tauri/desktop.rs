@@ -192,7 +192,8 @@ async fn run_desktop() -> anyhow::Result<()> {
         app_config.clone(),
     )
     .with_review_integration(runtime.review_integration.clone())
-    .with_prompt_assembly(runtime.prompt_assembly.clone());
+    .with_prompt_assembly(runtime.prompt_assembly.clone())
+    .with_plugin_runtime(Some(runtime.plugin_runtime.clone()));
     state_inner.webhook.emitter = webhook_emitter;
 
     // Build task tools before the pool extracts the shared ToolManager, and

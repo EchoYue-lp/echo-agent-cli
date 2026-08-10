@@ -51,6 +51,11 @@ pub struct AgentRuntime {
     pub browser_runtime: Arc<crate::browser::BrowserRuntime>,
     /// Static EKO prompt-module budget report captured at agent build time.
     pub prompt_assembly: crate::project::prompt::PromptAssembly,
+    /// Process-level shared plugin runtime (P0-4). Built after plugins are
+    /// initially wired by [`load_plugins`] so the Tauri plugin commands share
+    /// one registry with the running agent instead of each spinning up their
+    /// own via `build_registry()`.
+    pub plugin_runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
 }
 
 impl AgentRuntime {
@@ -275,6 +280,14 @@ impl AgentRuntime {
         // ── 9. Plugins ──
         load_plugins(&agent_handle).await;
 
+        // ── 9b. Process-level shared plugin runtime (P0-4) ──
+        // Built AFTER `load_plugins` so the initial wiring has already landed
+        // on the agent. The service does an initial `scan_all()` but does NOT
+        // re-run `wire_all` here (that would double-register skills/hooks);
+        // subsequent user-driven enable/disable/reload IPC is what re-wires.
+        let plugin_runtime =
+            crate::plugin_runtime::PluginRuntimeService::new(agent_handle.clone()).await;
+
         // ── 10. File-backed research library ──
         agent_handle
             .write(|agent| {
@@ -364,6 +377,7 @@ impl AgentRuntime {
             review_integration,
             browser_runtime,
             prompt_assembly,
+            plugin_runtime,
         })
     }
 
@@ -381,7 +395,8 @@ impl AgentRuntime {
             self.app_config.clone(),
         )
         .with_review_integration(self.review_integration.clone())
-        .with_prompt_assembly(self.prompt_assembly.clone());
+        .with_prompt_assembly(self.prompt_assembly.clone())
+        .with_plugin_runtime(Some(self.plugin_runtime.clone()));
         // Note: task_service and scheduler are started separately by the caller
         // because they need a Store which may be created differently per entry.
         state

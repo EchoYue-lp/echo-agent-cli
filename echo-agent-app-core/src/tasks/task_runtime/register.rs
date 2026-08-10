@@ -102,6 +102,28 @@ pub async fn register_task_tools_on_agent(
 
     // A one-node task graph and a dependency DAG share this execution path.
     // `agent_tool` remains only for ephemeral side work with no TaskRun.
+
+    // Attach the HookEventDispatcher so every task/subagent event written by
+    // the store is translated into framework HookEvents (P: Task/Subagent
+    // event integration). Built from this agent's own hook registry so events
+    // fire into the same registry its hooks see. Idempotent (first call wins),
+    // so the pooled/cron paths calling this again on the same store are safe.
+    let task_bridge = agent_handle
+        .read(|agent| agent.create_task_hook_bridge().bridge().clone())
+        .await;
+    let subagent_bridge = agent_handle
+        .read(|agent| std::sync::Arc::new(agent.create_subagent_hook_bridge()))
+        .await;
+    let dispatcher = super::hook_event_dispatcher::HookEventDispatcher::new(
+        Some(task_bridge),
+        Some(subagent_bridge),
+    );
+    let dispatcher_arc = std::sync::Arc::new(dispatcher);
+    let hook_fn: std::sync::Arc<dyn Fn(&super::types::RuntimeTaskEvent) + Send + Sync> =
+        std::sync::Arc::new(move |event| dispatcher_arc.dispatch(event));
+    if store.attach_hook_event_hook(hook_fn) {
+        tracing::info!("HookEventDispatcher attached to TaskRuntimeStore");
+    }
 }
 
 /// Rebind the shared `task_execute` entry after the AgentPool is wrapped in an

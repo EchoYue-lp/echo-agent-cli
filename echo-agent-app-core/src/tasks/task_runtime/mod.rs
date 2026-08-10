@@ -33,6 +33,7 @@ pub mod event_rebuild;
 pub mod executor;
 pub mod file_shadow;
 pub mod file_store;
+pub mod hook_event_dispatcher;
 pub mod ledger;
 pub mod memory_bridge;
 pub mod planner;

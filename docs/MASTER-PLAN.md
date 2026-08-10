@@ -69,6 +69,7 @@ evidence, and the next bounded step.
 | Iteration 2: webhook + HITL + config_watcher fixes | Complete | The dead webhook singleton was removed. One `Arc<WebhookEmitter>` is shared by chat, scheduler, and the active surface; lifecycle emission now lives in the common `drive_chat` path, giving GUI/TUI/CLI/channel the same `ToolCalled`/`ToolFailed`/`AgentError`/`ChatCompleted` behavior, while cron emits `CronTaskCompleted`. Config reload watches the parent directory, accepts create/modify atomic-save events, uses resettable debounce, and hot-reloads both hooks and webhook endpoints; model/MCP/runtime topology still requires restart. HITL snapshots providers before await, broadcasts concurrently under one shared deadline, and drops remaining futures after the first response. |
 | Iteration 3: migrate 3 file-backed storage impls down to framework | Complete | `FileRuntimeStateStore`, `FileConversationStore`, and `restore_message(s)` are framework capabilities; EKO uses them without enabling SQLite. File writes use unique temp names, file fsync, atomic rename, Unix parent-directory fsync, cleanup on failure, path-safe ids, and explicit corrupt-JSON errors. `FileConversationStore` serializes complete single-process read/modify/write operations, atomically implements `ensure_conversation`, reconciles stale counters from records on reopen, and normalizes stored message ownership. Message projection/restore now round-trips canonical roles, tool identity, multimodal content, and reasoning metadata. App-only `SessionSearchEngine`, path ownership, and UI persistence projections remain in EKO. |
 | Tool Schema budget and recoverable output Phase 0-6 | Complete | Framework commits `9fad29f`, `bbca516`; `docs/2026-07-29-tool-schema-budget-and-artifacts.md`; one framework registry, invocation-local Tool Search, query-and-result-bound cursor pagination, recoverable SQL/Web/task artifacts, and content-free metrics; current Schema gates are Chat 3,647 / Task 3,906 / Auto 3,929 estimated tokens |
+| Process-level shared PluginRuntimeService (P0-4) | Complete | `echo-agent-app-core/src/plugin_runtime.rs`; one shared `PluginRegistry` on `AppState` replaces the 8 per-command `build_registry()` calls in `src/tauri/commands/plugins.rs`; enable/disable/install/uninstall/reload now run framework `PluginIntegrator::wire_all` against the live primary agent. Disable does NOT unload already-registered components (P1). |
 
 ## Current Decisions
 
@@ -362,6 +363,33 @@ cannot shift the mapping. `display_content` keeps internal artifact references
 out of history rendering, and pasted/oversized attachment data URLs are not
 duplicated. GUI restore delegates to the framework's `restore_messages`, which
 round-trips structured artifact references.
+
+### Plugins (P0-4)
+
+`PluginRuntimeService` (`echo-agent-app-core/src/plugin_runtime.rs`) is the single
+process-level owner of the `PluginRegistry`. It holds an `AgentHandle` plus a
+`tokio::sync::Mutex<PluginRegistry>`, and `project_root` is derived from the
+agent's `working_dir` so workspace switches are reflected without recreating the
+service. Built once after `runtime::load_plugins` finishes the initial wiring
+(see `AgentRuntime::bootstrap`), and surfaced on `AppState.plugin_runtime` via
+the `with_plugin_runtime` builder.
+
+All eight Tauri plugin commands delegate to it; the per-command `build_registry()`
+calls are deleted. `enable`/`disable`/`install`/`uninstall` each persist the
+state change and then call `reload()`, which re-runs `PluginIntegrator::wire_all`
+against the live primary agent inside its write lock (the rebuild model; Codex
+and Claude Code follow the same re-discovery pattern rather than live
+hot-plug). `reload()` returns a `ReloadSummary` carrying total/enabled plugin
+counts plus the wiring result's skills/hooks/mcp counts and per-plugin errors.
+
+**Known P1 limitation — disable does not unload.** The framework `wire_all` is
+additive: it registers skills/hooks/MCP servers into the agent's registries but
+cannot unregister a single component. After `disable(name)` (or `uninstall`),
+`reload()` re-wires the still-enabled subset, but the disabled plugin's already
+registered skills/hooks remain in the agent's `SkillRegistry`/`HookRegistry`.
+MCP servers are likewise idempotent on re-wire and won't be disconnected. True
+unload needs framework support for component removal and is tracked here for P1;
+until then, disable takes full effect only after an agent restart.
 
 ## Next Step
 

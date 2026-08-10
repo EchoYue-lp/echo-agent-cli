@@ -443,6 +443,10 @@ pub struct AppState {
     pub skills_hub: Arc<RwLock<crate::skills_hub::SkillsHub>>,
     /// Shared memory review integration for GUI/IPC paths that write real memory.
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    /// Process-level shared plugin runtime (P0-4). `None` until bootstrap
+    /// completes the primary agent; populated via
+    /// [`Self::with_plugin_runtime`].
+    pub plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
 }
 
 impl AppState {
@@ -587,6 +591,7 @@ impl AppState {
             },
             skills_hub: Arc::new(RwLock::new(crate::skills_hub::SkillsHub::new())),
             review_integration: None,
+            plugin_runtime: None,
         }
     }
 
@@ -605,6 +610,19 @@ impl AppState {
         prompt_assembly: crate::project::prompt::PromptAssembly,
     ) -> Self {
         *self.observability.prompt_assembly.get_mut() = Some(prompt_assembly);
+        self
+    }
+
+    /// Attach the shared plugin runtime (P0-4).
+    ///
+    /// Built once bootstrap has created the primary agent (the service derives
+    /// its `project_root` from the agent's `working_dir`). Call before wrapping
+    /// in `Arc`.
+    pub fn with_plugin_runtime(
+        mut self,
+        plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
+    ) -> Self {
+        self.plugin_runtime = plugin_runtime;
         self
     }
 

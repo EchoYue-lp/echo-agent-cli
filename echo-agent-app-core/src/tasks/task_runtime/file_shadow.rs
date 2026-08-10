@@ -32,6 +32,22 @@ pub struct FileTaskShadow {
     run_write_locks: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
     >,
+    /// Optional synchronous event hook invoked after each event is successfully
+    /// appended. The hook receives the fully-formed `RuntimeTaskEvent`. Used by
+    /// the application-layer HookEventDispatcher to translate RuntimeEventKind
+    /// into framework HookEvents (TaskCreated/Started/Completed(status),
+    /// SubagentStop(status)) without polluting the sync store with async logic.
+    /// The callback must be cheap (spawn-and-detach); it runs under the per-run
+    /// write lock, so blocking here blocks all same-run writes.
+    ///
+    /// `OnceLock` so it can be attached once, post-construction: the store is
+    /// built early in bootstrap (before bridges exist), then the dispatcher is
+    /// attached once the agent + bridges are ready. Shared via Arc across clones.
+    #[allow(clippy::type_complexity)]
+    // Arc<OnceLock<Arc<dyn Fn>>> — structural, mirrors run_write_locks above
+    event_hook: std::sync::Arc<
+        std::sync::OnceLock<std::sync::Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>>,
+    >,
 }
 
 impl FileTaskShadow {
@@ -43,7 +59,24 @@ impl FileTaskShadow {
             run_write_locks: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            event_hook: std::sync::Arc::new(std::sync::OnceLock::new()),
         }
+    }
+
+    /// Attach a synchronous event hook fired after each successful append.
+    ///
+    /// Idempotent: the first call wins; subsequent calls are ignored (returns
+    /// false). This lets bootstrap attach the dispatcher once bridges exist
+    /// without racing. The hook receives the persisted `RuntimeTaskEvent` and
+    /// MUST be cheap (spawn-and-detach) because it runs under the per-run
+    /// write lock. This is the single injection point that lets the application
+    /// translate the event-sourced RuntimeEventKind stream into framework
+    /// HookEvents without making the store async.
+    pub fn try_attach_event_hook(
+        &self,
+        hook: std::sync::Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>,
+    ) -> bool {
+        self.event_hook.set(hook).is_ok()
     }
 
     /// Default shadow root: `~/.eko/tasks/`.
@@ -128,6 +161,16 @@ impl FileTaskShadow {
         // Advance the in-memory cache so the next append doesn't re-read the file.
         if let Ok(mut cache) = self.seq_cache.lock() {
             cache.insert(run_id.to_string(), next_seq);
+        }
+        // Fire the event hook (if attached) AFTER the cache bump and OUTSIDE
+        // the seq-allocation critical section, but still under the per-run
+        // write lock (cheap spawn-and-detach only). This is the single point
+        // the HookEventDispatcher observes every RuntimeEventKind transition
+        // (plan revision commit, task status change, subagent assigned/
+        // released, run status change) and translates it into framework
+        // HookEvents. Run while `event` is still owned so the borrow is short.
+        if let Some(hook) = self.event_hook.get() {
+            hook(&event);
         }
         Ok(event)
     }
