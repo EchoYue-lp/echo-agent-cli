@@ -42,6 +42,9 @@ pub struct HooksLoadResult {
     /// 实际加载成功的文件路径列表(内嵌 echo-agent.yaml 不算文件,
     /// 不进入此列表;只含 `~/.eko/hooks.yaml` 与 `.eko/hooks.yaml`)。
     pub loaded_from: Vec<PathBuf>,
+    /// Read/parse errors. Reload callers must keep the existing live hook set
+    /// when this is non-empty rather than replacing it with partial data.
+    pub errors: Vec<String>,
 }
 
 /// hook 配置来源标识(仅用于日志/审计,不影响框架 `HookSource`)。
@@ -73,8 +76,7 @@ impl HookConfigSource {
 ///
 /// 无状态:所有方法都是关联函数,直接从磁盘/`AppConfig` 读取并合并。
 /// 提供 `load_merged`(已知 `AppConfig`)与 `load_merged_from_disk`
-/// (`/hooks reload` 无法访问 `AppConfig` 时从磁盘重读)两个统一入口,
-/// 以及向后兼容的 `load_hooks_files`(仅文件)。
+/// (`/hooks reload` 无法访问 `AppConfig` 时从磁盘重读)两个统一入口。
 pub struct HookConfigLoader;
 
 impl HookConfigLoader {
@@ -88,6 +90,7 @@ impl HookConfigLoader {
     pub fn load_merged(app_config: &AppConfig) -> HooksLoadResult {
         let mut definition = HooksDefinition::default();
         let mut loaded_from = Vec::new();
+        let mut errors = Vec::new();
 
         // 1. echo-agent.yaml 内嵌(最低优先级)
         let inline = app_config.hooks.clone();
@@ -102,11 +105,12 @@ impl HookConfigLoader {
         }
 
         // 2 & 3. 两个 hooks.yaml 文件(全局 + 项目级)
-        Self::merge_file_sources(&mut definition, &mut loaded_from);
+        Self::merge_file_sources(&mut definition, &mut loaded_from, &mut errors);
 
         HooksLoadResult {
             definition,
             loaded_from,
+            errors,
         }
     }
 
@@ -117,27 +121,27 @@ impl HookConfigLoader {
     /// 再叠加两个 hooks.yaml 文件。语义与 `load_merged` 完全一致,
     /// 只是内嵌来源从磁盘重读而非从内存取。
     pub fn load_merged_from_disk() -> HooksLoadResult {
-        let app_config = echo_agent::config::load_config(None);
-        Self::load_merged(&app_config)
-    }
-
-    /// 仅加载两个 hooks.yaml 文件(不含 echo-agent.yaml 内嵌)。
-    ///
-    /// **向后兼容入口**:保留给仍按"仅文件"语义调用旧代码。新代码
-    /// 应优先用 `load_merged` / `load_merged_from_disk`,否则会丢
-    /// 内嵌 hooks(就是 P0-1 要修的 bug)。
-    ///
-    /// 注意:仅在你**确认**该调用点不关心内嵌 hooks 时使用 —— 例如
-    /// 某些只展示"文件来源"的诊断命令。bootstrap 和 `/hooks reload`
-    /// 不应再调用此函数。
-    pub fn load_hooks_files() -> HooksLoadResult {
-        let mut definition = HooksDefinition::default();
-        let mut loaded_from = Vec::new();
-        Self::merge_file_sources(&mut definition, &mut loaded_from);
-        HooksLoadResult {
-            definition,
-            loaded_from,
+        let mut config_errors = Vec::new();
+        let mut app_config = AppConfig::default();
+        for path in echo_agent::config::config_search_paths() {
+            if !path.exists() {
+                continue;
+            }
+            match echo_agent::config::load_config_file(&path) {
+                Ok(config) => {
+                    app_config = config;
+                    break;
+                }
+                Err(error) => config_errors.push(format!(
+                    "Failed to load app config {}: {error}",
+                    path.display()
+                )),
+            }
         }
+
+        let mut result = Self::load_merged(&app_config);
+        result.errors.splice(0..0, config_errors);
+        result
     }
 
     // ── 内部 helpers ──────────────────────────────────────────────
@@ -145,33 +149,45 @@ impl HookConfigLoader {
     /// 把全局 hooks.yaml + 项目级 hooks.yaml 合并进 `definition`,
     /// 并把成功加载的路径加入 `loaded_from`。
     ///
-    /// 抽出来是因为 `load_merged` 和 `load_hooks_files` 都需要这步。
-    fn merge_file_sources(definition: &mut HooksDefinition, loaded_from: &mut Vec<PathBuf>) {
+    /// 文件来源合并的唯一实现。
+    fn merge_file_sources(
+        definition: &mut HooksDefinition,
+        loaded_from: &mut Vec<PathBuf>,
+        errors: &mut Vec<String>,
+    ) {
         // 2. 全局 hooks: ~/.eko/hooks.yaml
         let global_path = echo_agent::paths::user_data_path("hooks.yaml");
-        if let Some(def) = try_load_yaml(&global_path) {
-            let count: usize = def.rules.values().map(Vec::len).sum();
-            definition.merge(def);
-            loaded_from.push(global_path);
-            tracing::info!(
-                source = HookConfigSource::GlobalFile.label(),
-                count,
-                "Loaded user hooks from global file"
-            );
+        match try_load_yaml(&global_path) {
+            Ok(Some(def)) => {
+                let count: usize = def.rules.values().map(Vec::len).sum();
+                definition.merge(def);
+                loaded_from.push(global_path);
+                tracing::info!(
+                    source = HookConfigSource::GlobalFile.label(),
+                    count,
+                    "Loaded user hooks from global file"
+                );
+            }
+            Ok(None) => {}
+            Err(error) => errors.push(error),
         }
 
         // 3. 项目级 hooks: .eko/hooks.yaml(相对 cwd)
         if let Ok(cwd) = std::env::current_dir() {
             let project_path = cwd.join(".eko").join("hooks.yaml");
-            if let Some(def) = try_load_yaml(&project_path) {
-                let count: usize = def.rules.values().map(Vec::len).sum();
-                definition.merge(def);
-                loaded_from.push(project_path);
-                tracing::info!(
-                    source = HookConfigSource::ProjectFile.label(),
-                    count,
-                    "Loaded user hooks from project file"
-                );
+            match try_load_yaml(&project_path) {
+                Ok(Some(def)) => {
+                    let count: usize = def.rules.values().map(Vec::len).sum();
+                    definition.merge(def);
+                    loaded_from.push(project_path);
+                    tracing::info!(
+                        source = HookConfigSource::ProjectFile.label(),
+                        count,
+                        "Loaded user hooks from project file"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => errors.push(error),
             }
         }
     }
@@ -179,28 +195,18 @@ impl HookConfigLoader {
 
 /// 尝试从 YAML 文件加载 `HooksDefinition`。
 ///
-/// 文件不存在 → `None`(静默);读取或解析失败 → `None` + warn 日志
-/// (单个坏文件不应让整个 hook 加载失败)。
-fn try_load_yaml(path: &Path) -> Option<HooksDefinition> {
+/// 文件不存在 → `Ok(None)`;读取或解析失败 → `Err`, so a live reload can
+/// preserve the last known-good hook set.
+fn try_load_yaml(path: &Path) -> Result<Option<HooksDefinition>, String> {
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
 
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "Failed to read hooks file");
-            return None;
-        }
-    };
-
-    match serde_yaml::from_str::<HooksDefinition>(&content) {
-        Ok(def) => Some(def),
-        Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "Failed to parse hooks file");
-            None
-        }
-    }
+    let content = std::fs::read_to_string(path)
+        .map_err(|error| format!("Failed to read hooks file {}: {error}", path.display()))?;
+    serde_yaml::from_str::<HooksDefinition>(&content)
+        .map(Some)
+        .map_err(|error| format!("Failed to parse hooks file {}: {error}", path.display()))
 }
 
 #[cfg(test)]
@@ -298,7 +304,7 @@ mod tests {
     #[test]
     fn test_try_load_yaml_returns_none_for_missing_file() {
         let p = PathBuf::from("/tmp/__definitely_not_existing_hooks__.yaml");
-        assert!(try_load_yaml(&p).is_none());
+        assert!(matches!(try_load_yaml(&p), Ok(None)));
     }
 
     #[test]
@@ -322,18 +328,26 @@ SessionStart:
         // 清理临时文件
         let _ = std::fs::remove_file(&path);
 
-        let def = def.expect("yaml should parse");
+        let def = def.ok().flatten().unwrap_or_default();
         let rules = def.rules_for(HookEvent::SessionStart);
         assert_eq!(rules.len(), 1, "one SessionStart rule expected");
         // 不再访问 matcher/hook 内部细节,只验证数量足够(避免耦合字段)。
     }
 
-    // ── load_hooks_files 向后兼容 ────────────────────────────────
-
     #[test]
-    fn test_load_hooks_files_does_not_panic_on_missing() {
-        // 不应 panic,即使文件都不存在。
-        let _ = HookConfigLoader::load_hooks_files();
+    fn test_try_load_yaml_reports_parse_error() {
+        let path = std::env::temp_dir().join(format!(
+            "eko_hook_loader_invalid_{}.yaml",
+            std::process::id()
+        ));
+        let write_result = std::fs::write(&path, "SessionStart: [");
+        assert!(write_result.is_ok(), "failed to write invalid hook fixture");
+        if write_result.is_err() {
+            return;
+        }
+        let result = try_load_yaml(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
     }
 
     // ── 来源标识 ────────────────────────────────────────────────

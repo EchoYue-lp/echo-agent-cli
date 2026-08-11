@@ -37,29 +37,36 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             // echo-agent.yaml,导致 reload 后内嵌 hooks 永久丢失。
             let load_result =
                 echo_agent_app_core::hook_config_loader::HookConfigLoader::load_merged_from_disk();
-            if load_result.definition.is_empty() {
+            if !load_result.errors.is_empty() {
+                println!("Hook reload aborted; existing hooks are unchanged:");
+                for error in &load_result.errors {
+                    println!("  - {error}");
+                }
+                return CommandOutcome::Continue;
+            }
+            let rule_count: usize = load_result.definition.rules.values().map(Vec::len).sum();
+            let is_empty = load_result.definition.is_empty();
+            let hooks_def = load_result.definition;
+            ctx.agent
+                .write_async(|a| {
+                    Box::pin(async move {
+                        let mut registry = a.hook_registry().write().await;
+                        registry.clear_user_hooks();
+                        if !hooks_def.is_empty() {
+                            registry.register_user_hooks(hooks_def);
+                        }
+                    })
+                })
+                .await;
+            if is_empty {
                 println!("No hooks found in config sources.");
                 println!("  Checked: echo-agent.yaml, ~/.eko/hooks.yaml, .eko/hooks.yaml");
             } else {
-                let rule_count: usize =
-                    load_result.definition.rules.values().map(|v| v.len()).sum();
                 println!("Loaded {} rules from:", rule_count);
                 println!("  - echo-agent.yaml (inline)");
                 for path in &load_result.loaded_from {
                     println!("  - {}", path.display());
                 }
-
-                // Register into agent's hook registry
-                let hooks_def = load_result.definition;
-                ctx.agent
-                    .write_async(|a| {
-                        Box::pin(async move {
-                            let mut registry = a.hook_registry().write().await;
-                            registry.clear_user_hooks();
-                            registry.register_user_hooks(hooks_def);
-                        })
-                    })
-                    .await;
                 println!("Hooks registered successfully.");
             }
         }
@@ -71,20 +78,7 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 return CommandOutcome::Continue;
             }
 
-            // Try to parse the event name
-            let event = match event_name.as_str() {
-                "PreToolUse" => Some(echo_agent::skills::hooks::HookEvent::PreToolUse),
-                "PostToolUse" => Some(echo_agent::skills::hooks::HookEvent::PostToolUse),
-                "PostToolUseFailure" => {
-                    Some(echo_agent::skills::hooks::HookEvent::PostToolUseFailure)
-                }
-                "SessionStart" => Some(echo_agent::skills::hooks::HookEvent::SessionStart),
-                "SessionEnd" => Some(echo_agent::skills::hooks::HookEvent::SessionEnd),
-                "Stop" => Some(echo_agent::skills::hooks::HookEvent::Stop),
-                "UserPromptSubmit" => Some(echo_agent::skills::hooks::HookEvent::UserPromptSubmit),
-                "ConfigChange" => Some(echo_agent::skills::hooks::HookEvent::ConfigChange),
-                _ => None,
-            };
+            let event = echo_agent::skills::hooks::HookEvent::from_name(&event_name);
 
             match event {
                 Some(evt) => {
@@ -108,9 +102,7 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 }
                 None => {
                     println!("Unknown event: '{}'", event_name);
-                    println!(
-                        "  Valid events: PreToolUse, PostToolUse, PostToolUseFailure, SessionStart, SessionEnd, Stop, UserPromptSubmit, ConfigChange"
-                    );
+                    println!("  Use the canonical PascalCase hook event name.");
                 }
             }
         }

@@ -50,6 +50,8 @@ pub struct ReplConfig {
     pub project: Option<String>,
     pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     pub scheduler_runner: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    /// Shared live plugin runtime from bootstrap.
+    pub plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     /// Shared ReviewIntegration (from bootstrap) — enables Dreaming + reuse
     /// in session-end memory review. When `None`, review functions fall back
     /// to building a temporary instance (legacy behavior).
@@ -78,6 +80,7 @@ impl Default for ReplConfig {
             project: None,
             task_service: None,
             scheduler_runner: None,
+            plugin_runtime: None,
             review_integration: None,
             prompt_assembly: None,
             pool: None,
@@ -194,6 +197,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         .with_coding_loop(coding_loop)
         .with_task_service_opt(config.task_service.clone())
         .with_scheduler_opt(config.scheduler_runner.clone())
+        .with_plugin_runtime_opt(config.plugin_runtime.clone())
         .with_prompt_assembly(config.prompt_assembly.clone())
         .with_review_integration(config.review_integration.clone())
         .with_interaction_mode(interaction_mode.clone())

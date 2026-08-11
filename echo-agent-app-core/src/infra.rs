@@ -1909,16 +1909,17 @@ pub fn run_base_doctor_for_model_with_connectivity(
 /// 按固定顺序合并成单个 `HooksDefinition`,然后**一次性**
 /// `clear_user_hooks()` + `register_user_hooks(merged)`。
 ///
-/// **重要**:调用方在调用本函数后,**不应再** 单独调用
-/// `load_hooks_files()` + `register_user_hooks()` —— 那是旧 bug 的根源
-/// (文件来源会 clear 掉本函数刚 register 的内嵌 hooks)。文件 hooks
-/// 已包含在本函数的合并结果里。
+/// **重要**:调用方在调用本函数后,不应再单独加载或注册文件 hooks。
+/// 文件 hooks 已包含在本函数的合并结果里。
 ///
 /// 旧的实现只 register `app_config.hooks`(内嵌),把文件来源留给
 /// `runtime.rs::bootstrap` 单独 register —— 但 `register_user_hooks`
 /// 内部会覆盖 `UserConfig` 单槽位,导致文件来源 clear 掉内嵌来源。
 pub async fn load_user_hooks(agent: &AgentHandle, app_config: &AppConfig) {
     let load_result = crate::hook_config_loader::HookConfigLoader::load_merged(app_config);
+    for error in &load_result.errors {
+        tracing::warn!(%error, "User hook source was not loaded");
+    }
     let hooks_def = load_result.definition;
     if hooks_def.is_empty() {
         return;

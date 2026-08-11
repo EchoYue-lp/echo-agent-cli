@@ -10,11 +10,11 @@ description = "Shared state and infrastructure for EKO"
 export_dir = "../web-frontend/src/generated"
 
 [dependencies]
-echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", features = [
+echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", default-features = false, features = [
     "mcp", "lsp", "human-loop", "subagent", "git", "tasks",
     "shell", "files", "web",
     "data", "statistics", "chart", "research", "media",
-    "database", "rag",
+    "rag",
 ] }
 echo-core = { version = "0.2", package = "echo_core", path = "../../echo-agent/echo-core" }
 tokio = { version = "1", features = ["full"] }
@@ -59,4 +59,4 @@ telemetry = ["echo-agent/telemetry"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("__ts_rs"))'] }
 
 [dev-dependencies]
-echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", features = ["testing"] }
+echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", default-features = false, features = ["testing"] }

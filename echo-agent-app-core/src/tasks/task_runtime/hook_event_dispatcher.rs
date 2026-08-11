@@ -10,33 +10,27 @@
 //! maps `RuntimeEventKind` → framework `HookEvent` and fires it through the
 //! agent's `TaskHookBridge` / `SubagentHookBridge`.
 //!
-//! This keeps the store synchronous and pure (no async, no bridge threading
-//! through every chokepoint), while giving YAML-configured hooks visibility
-//! into the full task/subagent lifecycle. The dispatcher spawns each fire as
-//! a detached tokio task so the sync hook callback never blocks the store's
-//! per-run write lock.
+//! This keeps the store synchronous while giving YAML-configured hooks
+//! visibility into the lifecycle. The callback only sends to one async queue;
+//! a single consumer fires hooks in persisted event order. Independent
+//! `tokio::spawn` calls are deliberately avoided because they can deliver
+//! Completed before Started.
 //!
-//! ## Translation (P1 — TaskCreated pending)
+//! ## Translation
 //!
 //! | RuntimeEventKind | Framework HookEvent |
 //! |---|---|
+//! | `PlanRevisionCommitted` (new node ids) | `TaskCreated` |
 //! | `TaskStarted` | `TaskStarted` (PlanTask first claim) |
 //! | `TaskCompleted` | `TaskCompleted(status=Completed)` |
 //! | `TaskFailed` | `TaskCompleted(status=Failed)` |
 //! | `TaskSkipped` | `TaskCompleted(status=Skipped)` |
-//! | `TaskBlocked` | `TaskCompleted(status=Blocked)` |
-//! | `SubagentAssigned` | `SubagentStart` |
-//! | `SubagentReleased` | `SubagentStop(status)` (from payload) |
-//!
-//! `PlanRevisionCommitted` → `TaskCreated` (per new node) is deferred: it
-//! requires diffing the committed revision against the previous one to find
-//! newly-added task ids, which is a richer change than a status transition.
-//! Tracked in MASTER-PLAN as P2. For now, consumers that need "task entered
-//! the graph" can observe `PlanRevisionCommitted` directly via the event log.
+//! | `SubagentAssigned` (`dispatch_hook=true`) | `SubagentStart` |
+//! | `SubagentReleased` (`dispatch_hook=true`) | `SubagentStop(status)` |
 
 use std::sync::Arc;
 
-use echo_agent::hooks_bridge::{SubagentHookBridge, TaskHookBridge};
+use echo_agent::hooks_bridge::{HookCorrelation, SubagentHookBridge, TaskHookBridge};
 use echo_core::hooks::{SubagentStopStatus, TaskTerminalStatus};
 use serde_json::Value;
 
@@ -50,57 +44,52 @@ use super::types::{RuntimeEventKind, RuntimeTaskEvent};
 /// bridges are absent (e.g. during early bootstrap / in-memory test stores).
 #[derive(Clone)]
 pub struct HookEventDispatcher {
-    /// Task lifecycle bridge (TaskCreated/Started/Completed). None = task
-    /// events dropped (no hook registry wired, e.g. in-memory test store).
-    task_bridge: Option<Arc<TaskHookBridge>>,
-    /// Subagent lifecycle bridge (SubagentStart/Stop). None = subagent events
-    /// dropped.
-    subagent_bridge: Option<Arc<SubagentHookBridge>>,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<EventTranslation>>,
 }
 
 impl HookEventDispatcher {
     pub fn new(
         task_bridge: Option<Arc<TaskHookBridge>>,
         subagent_bridge: Option<Arc<SubagentHookBridge>>,
-    ) -> Self {
-        Self {
-            task_bridge,
-            subagent_bridge,
-        }
+    ) -> Result<Self, String> {
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|error| format!("HookEventDispatcher requires a Tokio runtime: {error}"))?;
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<EventTranslation>();
+        handle.spawn(async move {
+            while let Some(event) = receiver.recv().await {
+                event
+                    .fire(task_bridge.as_ref(), subagent_bridge.as_ref())
+                    .await;
+            }
+        });
+        Ok(Self {
+            sender: Some(sender),
+        })
     }
 
     /// A dispatcher with no bridges — all events dropped. Useful as a
     /// placeholder when constructing a store before bridges exist.
     pub fn inactive() -> Self {
-        Self {
-            task_bridge: None,
-            subagent_bridge: None,
-        }
+        Self { sender: None }
     }
 
     /// The synchronous hook entry point — attached to `FileTaskShadow`.
     ///
-    /// Translates the `RuntimeTaskEvent` into the corresponding framework
-    /// HookEvent and spawns a detached task to fire it through the bridge.
-    /// Must be cheap (spawn-and-detach) because it runs under the per-run
-    /// write lock.
+    /// Translates the event and enqueues it without blocking the store lock.
     pub fn dispatch(&self, event: &RuntimeTaskEvent) {
-        // No bridges → nothing to do. Avoid spawning work that will no-op.
-        if self.task_bridge.is_none() && self.subagent_bridge.is_none() {
-            return;
-        }
-        let Some(span) = EventTranslation::from_runtime_event(event) else {
+        let Some(sender) = &self.sender else {
             return;
         };
-        let task_bridge = self.task_bridge.clone();
-        let subagent_bridge = self.subagent_bridge.clone();
-        // Detached spawn: the store's write lock must not wait on async hook
-        // execution. A failed/slow hook is logged inside the spawned task and
-        // never blocks the event-sourcing write path.
-        tokio::spawn(async move {
-            span.fire(task_bridge.as_ref(), subagent_bridge.as_ref())
-                .await;
-        });
+        for translation in EventTranslation::from_runtime_event(event) {
+            if sender.send(translation).is_err() {
+                tracing::warn!(
+                    run_id = %event.run_id,
+                    seq = event.seq,
+                    "Task hook dispatcher stopped; lifecycle event was not delivered"
+                );
+                break;
+            }
+        }
     }
 }
 
@@ -114,9 +103,14 @@ struct EventTranslation {
     /// Correlation fields copied from the RuntimeTaskEvent / payload.
     task_id: String,
     task_subject: String,
+    run_id: String,
+    plan_revision: Option<String>,
+    subagent_run_id: Option<String>,
+    attempt: Option<u32>,
 }
 
 enum TranslatedKind {
+    TaskCreated,
     TaskStarted,
     TaskCompleted {
         result: String,
@@ -139,14 +133,18 @@ impl EventTranslation {
     /// Translate a RuntimeTaskEvent into a fireable envelope, or None if the
     /// event kind is not in the dispatch table (e.g. ToolStarted, Note,
     /// PlanRevisionCommitted — see module docs).
-    fn from_runtime_event(event: &RuntimeTaskEvent) -> Option<Self> {
+    fn from_runtime_event(event: &RuntimeTaskEvent) -> Vec<Self> {
+        if event.event_type == RuntimeEventKind::PlanRevisionCommitted {
+            return task_created_translations(event);
+        }
+
         let task_id = event.task_id.clone().unwrap_or_default();
         // `subject`/`title` is carried in the payload for task events;
         // fall back to task_id so the matcher hint is never empty.
         let task_subject = event
             .payload
-            .get("summary")
-            .or_else(|| event.payload.get("title"))
+            .get("title")
+            .or_else(|| event.payload.get("summary"))
             .and_then(Value::as_str)
             .unwrap_or(&task_id)
             .to_string();
@@ -154,22 +152,26 @@ impl EventTranslation {
         let kind = match event.event_type {
             RuntimeEventKind::TaskStarted => TranslatedKind::TaskStarted,
             RuntimeEventKind::TaskCompleted => TranslatedKind::TaskCompleted {
-                result: task_subject.clone(),
-                status: TaskTerminalStatus::Completed,
+                result: first_str_or(&event.payload, &["summary"], &task_subject),
+                status: task_terminal_status(&event.payload, TaskTerminalStatus::Completed),
             },
             RuntimeEventKind::TaskFailed => TranslatedKind::TaskCompleted {
-                result: str_or(&event.payload, "status_detail", "failed"),
-                status: TaskTerminalStatus::Failed,
+                result: first_str_or(&event.payload, &["status_detail", "summary"], "failed"),
+                status: task_terminal_status(&event.payload, TaskTerminalStatus::Failed),
             },
             RuntimeEventKind::TaskSkipped => TranslatedKind::TaskCompleted {
-                result: str_or(&event.payload, "status_detail", "skipped"),
-                status: TaskTerminalStatus::Skipped,
-            },
-            RuntimeEventKind::TaskBlocked => TranslatedKind::TaskCompleted {
-                result: str_or(&event.payload, "status_detail", "blocked"),
-                status: TaskTerminalStatus::Blocked,
+                result: first_str_or(&event.payload, &["status_detail", "summary"], "skipped"),
+                status: task_terminal_status(&event.payload, TaskTerminalStatus::Skipped),
             },
             RuntimeEventKind::SubagentAssigned => {
+                if !event
+                    .payload
+                    .get("dispatch_hook")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return Vec::new();
+                }
                 let subagent_name = event
                     .payload
                     .get("agent_name")
@@ -179,11 +181,19 @@ impl EventTranslation {
                     .to_string();
                 TranslatedKind::SubagentStart {
                     subagent_name,
-                    mode: "sync".to_string(),
+                    mode: "direct".to_string(),
                     task: task_subject.clone(),
                 }
             }
             RuntimeEventKind::SubagentReleased => {
+                if !event
+                    .payload
+                    .get("dispatch_hook")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    return Vec::new();
+                }
                 let subagent_name = event
                     .payload
                     .get("agent_name")
@@ -200,7 +210,7 @@ impl EventTranslation {
                 let result = str_or(&event.payload, "summary", &status_str);
                 TranslatedKind::SubagentStop {
                     subagent_name,
-                    mode: "sync".to_string(),
+                    mode: "direct".to_string(),
                     result,
                     status,
                 }
@@ -210,15 +220,48 @@ impl EventTranslation {
             // level; a future TaskRun hook layer could translate these, but
             // for now they are intentionally not dispatched (consumers observe
             // them via the existing RuntimeEventKind stream / ExecSink).
-            // PlanRevisionCommitted → TaskCreated is P2 (see module docs).
-            _ => return None,
+            _ => return Vec::new(),
         };
 
-        Some(Self {
+        let plan_revision = event
+            .payload
+            .get("plan_revision")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                event
+                    .payload
+                    .get("claim")
+                    .and_then(|claim| claim.get("revision"))
+                    .and_then(Value::as_u64)
+            })
+            .map(|revision| revision.to_string());
+        let subagent_run_id = event
+            .payload
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let attempt = event
+            .payload
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                event
+                    .payload
+                    .get("claim")
+                    .and_then(|claim| claim.get("attempt"))
+                    .and_then(Value::as_u64)
+            })
+            .and_then(|attempt| u32::try_from(attempt).ok());
+
+        vec![Self {
             kind,
             task_id,
             task_subject,
-        })
+            run_id: event.run_id.clone(),
+            plan_revision,
+            subagent_run_id,
+            attempt,
+        }]
     }
 
     async fn fire(
@@ -226,16 +269,44 @@ impl EventTranslation {
         task_bridge: Option<&Arc<TaskHookBridge>>,
         subagent_bridge: Option<&Arc<SubagentHookBridge>>,
     ) {
-        match self.kind {
+        let Self {
+            kind,
+            task_id,
+            task_subject,
+            run_id,
+            plan_revision,
+            subagent_run_id,
+            attempt,
+        } = self;
+        let correlation = HookCorrelation {
+            run_id: Some(&run_id),
+            plan_revision: plan_revision.as_deref(),
+            subagent_run_id: subagent_run_id.as_deref(),
+            attempt,
+        };
+        match kind {
+            TranslatedKind::TaskCreated => {
+                if let Some(b) = task_bridge {
+                    b.on_created_with_correlation(&task_id, &task_subject, correlation)
+                        .await;
+                }
+            }
             TranslatedKind::TaskStarted => {
                 if let Some(b) = task_bridge {
-                    b.on_before_execute(&self.task_id, &self.task_subject).await;
+                    b.on_before_execute_with_correlation(&task_id, &task_subject, correlation)
+                        .await;
                 }
             }
             TranslatedKind::TaskCompleted { result, status } => {
                 if let Some(b) = task_bridge {
-                    b.on_after_execute(&self.task_id, &self.task_subject, &result, status)
-                        .await;
+                    b.on_after_execute_with_correlation(
+                        &task_id,
+                        &task_subject,
+                        &result,
+                        status,
+                        correlation,
+                    )
+                    .await;
                 }
             }
             TranslatedKind::SubagentStart {
@@ -244,7 +315,13 @@ impl EventTranslation {
                 task,
             } => {
                 if let Some(b) = subagent_bridge {
-                    b.on_before_dispatch(&subagent_name, &mode, &task).await;
+                    b.on_before_dispatch_with_correlation(
+                        &subagent_name,
+                        &mode,
+                        &task,
+                        correlation,
+                    )
+                    .await;
                 }
             }
             TranslatedKind::SubagentStop {
@@ -254,12 +331,63 @@ impl EventTranslation {
                 status,
             } => {
                 if let Some(b) = subagent_bridge {
-                    b.on_after_dispatch(&subagent_name, &mode, &result, status)
-                        .await;
+                    b.on_after_dispatch_with_correlation(
+                        &subagent_name,
+                        &mode,
+                        &result,
+                        status,
+                        correlation,
+                    )
+                    .await;
                 }
             }
         }
     }
+}
+
+fn task_created_translations(event: &RuntimeTaskEvent) -> Vec<EventTranslation> {
+    let created_ids = event
+        .payload
+        .get("created_task_ids")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let tasks = event
+        .payload
+        .get("plan")
+        .and_then(|plan| plan.get("tasks"))
+        .and_then(Value::as_array);
+    let plan_revision = event
+        .payload
+        .get("plan")
+        .and_then(|plan| plan.get("revision"))
+        .and_then(Value::as_u64)
+        .map(|revision| revision.to_string());
+
+    created_ids
+        .into_iter()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .map(|task_id| {
+            let task_subject = tasks
+                .and_then(|tasks| {
+                    tasks.iter().find(|task| {
+                        task.get("id").and_then(Value::as_str) == Some(task_id.as_str())
+                    })
+                })
+                .and_then(|task| task.get("title").and_then(Value::as_str))
+                .unwrap_or(&task_id)
+                .to_string();
+            EventTranslation {
+                kind: TranslatedKind::TaskCreated,
+                task_id,
+                task_subject,
+                run_id: event.run_id.clone(),
+                plan_revision: plan_revision.clone(),
+                subagent_run_id: None,
+                attempt: None,
+            }
+        })
+        .collect()
 }
 
 /// Read a string field from a JSON payload, falling back to `default`.
@@ -269,6 +397,25 @@ fn str_or(payload: &Value, field: &str, default: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or(default)
         .to_string()
+}
+
+fn first_str_or(payload: &Value, fields: &[&str], default: &str) -> String {
+    fields
+        .iter()
+        .find_map(|field| payload.get(*field).and_then(Value::as_str))
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn task_terminal_status(payload: &Value, default: TaskTerminalStatus) -> TaskTerminalStatus {
+    match payload.get("hook_terminal_status").and_then(Value::as_str) {
+        Some("completed") => TaskTerminalStatus::Completed,
+        Some("failed") => TaskTerminalStatus::Failed,
+        Some("cancelled") => TaskTerminalStatus::Cancelled,
+        Some("timed_out") => TaskTerminalStatus::TimedOut,
+        Some("skipped") => TaskTerminalStatus::Skipped,
+        _ => default,
+    }
 }
 
 #[cfg(test)]
@@ -300,9 +447,14 @@ mod tests {
             Some("t-1"),
             json!({"summary": "build"}),
         );
-        let t = EventTranslation::from_runtime_event(&ev).expect("TaskStarted should translate");
+        let translated = EventTranslation::from_runtime_event(&ev);
+        let Some(t) = translated.first() else {
+            assert!(!translated.is_empty(), "TaskStarted should translate");
+            return;
+        };
         assert!(matches!(t.kind, TranslatedKind::TaskStarted));
         assert_eq!(t.task_id, "t-1");
+        assert_eq!(t.run_id, "run-1");
     }
 
     #[test]
@@ -312,13 +464,86 @@ mod tests {
             Some("t-1"),
             json!({"status_detail": "compile error"}),
         );
-        let t = EventTranslation::from_runtime_event(&ev).expect("TaskFailed should translate");
-        match t.kind {
-            TranslatedKind::TaskCompleted { status, .. } => {
-                assert_eq!(status, TaskTerminalStatus::Failed);
-            }
-            _ => panic!("wrong kind"),
-        }
+        let translated = EventTranslation::from_runtime_event(&ev);
+        assert!(matches!(
+            translated.first().map(|translation| &translation.kind),
+            Some(TranslatedKind::TaskCompleted {
+                status: TaskTerminalStatus::Failed,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn task_completed_preserves_summary_as_result() {
+        let ev = make_event(
+            RuntimeEventKind::TaskCompleted,
+            Some("t-1"),
+            json!({"title": "build", "summary": "built three artifacts"}),
+        );
+        let translated = EventTranslation::from_runtime_event(&ev);
+        assert!(matches!(
+            translated.first().map(|translation| &translation.kind),
+            Some(TranslatedKind::TaskCompleted { result, .. })
+                if result == "built three artifacts"
+        ));
+    }
+
+    #[test]
+    fn task_cancelled_status_is_not_collapsed_to_skipped() {
+        let ev = make_event(
+            RuntimeEventKind::TaskSkipped,
+            Some("t-1"),
+            json!({
+                "title": "build",
+                "hook_terminal_status": "cancelled",
+                "status_detail": "cancelled with parent run"
+            }),
+        );
+        let translated = EventTranslation::from_runtime_event(&ev);
+        assert!(matches!(
+            translated.first().map(|translation| &translation.kind),
+            Some(TranslatedKind::TaskCompleted {
+                status: TaskTerminalStatus::Cancelled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn plan_commit_translates_each_new_node_to_task_created() {
+        let ev = make_event(
+            RuntimeEventKind::PlanRevisionCommitted,
+            None,
+            json!({
+                "created_task_ids": ["t-2"],
+                "plan": {
+                    "revision": 3,
+                    "tasks": [
+                        {"id": "t-1", "title": "existing"},
+                        {"id": "t-2", "title": "new task"}
+                    ]
+                }
+            }),
+        );
+        let translated = EventTranslation::from_runtime_event(&ev);
+        assert_eq!(translated.len(), 1);
+        assert!(matches!(
+            translated.first().map(|translation| &translation.kind),
+            Some(TranslatedKind::TaskCreated)
+        ));
+        assert_eq!(
+            translated
+                .first()
+                .map(|translation| translation.task_id.as_str()),
+            Some("t-2")
+        );
+        assert_eq!(
+            translated
+                .first()
+                .and_then(|translation| translation.plan_revision.as_deref()),
+            Some("3")
+        );
     }
 
     #[test]
@@ -326,34 +551,54 @@ mod tests {
         let ev = make_event(
             RuntimeEventKind::SubagentReleased,
             Some("t-1"),
-            json!({"agent_name": "coder", "status": "timed_out", "summary": "deadline"}),
+            json!({
+                "agent_name": "coder",
+                "status": "timed_out",
+                "summary": "deadline",
+                "dispatch_hook": true,
+                "execution_id": "run-1:t-1:2:3",
+                "plan_revision": 2,
+                "attempt": 3
+            }),
         );
-        let t =
-            EventTranslation::from_runtime_event(&ev).expect("SubagentReleased should translate");
-        match t.kind {
+        let translated = EventTranslation::from_runtime_event(&ev);
+        let Some(t) = translated.first() else {
+            assert!(!translated.is_empty(), "SubagentReleased should translate");
+            return;
+        };
+        assert!(matches!(
+            &t.kind,
             TranslatedKind::SubagentStop {
-                status,
+                status: SubagentStopStatus::TimedOut,
                 subagent_name,
                 result,
                 ..
-            } => {
-                assert_eq!(status, SubagentStopStatus::TimedOut);
-                assert_eq!(subagent_name, "coder");
-                assert_eq!(result, "deadline");
-            }
-            _ => panic!("wrong kind"),
-        }
+            } if subagent_name == "coder" && result == "deadline"
+        ));
+        assert_eq!(t.subagent_run_id.as_deref(), Some("run-1:t-1:2:3"));
+        assert_eq!(t.plan_revision.as_deref(), Some("2"));
+        assert_eq!(t.attempt, Some(3));
+    }
+
+    #[test]
+    fn framework_owned_subagent_events_are_not_dispatched_again() {
+        let ev = make_event(
+            RuntimeEventKind::SubagentAssigned,
+            Some("t-1"),
+            json!({"agent_name": "coder", "dispatch_hook": false}),
+        );
+        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
     }
 
     #[test]
     fn unhandled_events_skip() {
-        // ToolStarted / Note / PlanRevisionCommitted are not dispatched.
+        // ToolStarted / Note and plan commits with no new nodes are skipped.
         let ev = make_event(RuntimeEventKind::ToolStarted, Some("t-1"), json!({}));
-        assert!(EventTranslation::from_runtime_event(&ev).is_none());
+        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
         let ev = make_event(RuntimeEventKind::Note, None, json!({}));
-        assert!(EventTranslation::from_runtime_event(&ev).is_none());
+        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
         let ev = make_event(RuntimeEventKind::PlanRevisionCommitted, None, json!({}));
-        assert!(EventTranslation::from_runtime_event(&ev).is_none());
+        assert!(EventTranslation::from_runtime_event(&ev).is_empty());
     }
 
     #[test]

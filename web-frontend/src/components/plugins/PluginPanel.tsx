@@ -28,6 +28,17 @@ export function PluginPanel() {
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
 
+  const mutationMessage = (
+    result: { wiring_ok?: boolean; errors?: string[]; message?: string },
+    fallback: string
+  ): { type: 'success' | 'error'; text: string } => {
+    if (result.wiring_ok === false) {
+      const details = result.errors?.join('; ') || 'Some components could not be activated';
+      return { type: 'error', text: `${result.message || fallback}: ${details}` };
+    }
+    return { type: 'success', text: result.message || fallback };
+  };
+
   useEffect(() => {
     loadPlugins();
   }, []);
@@ -55,7 +66,7 @@ export function PluginPanel() {
         scope: installScope,
       });
       if (result.success) {
-        setMessage({ type: 'success', text: `Plugin '${result.plugin_id}' installed` });
+        setMessage(mutationMessage(result, `Plugin '${result.plugin_id}' installed`));
         setInstallSource('');
         setShowInstall(false);
         await loadPlugins();
@@ -74,7 +85,7 @@ export function PluginPanel() {
     try {
       const result = await pluginApi.uninstall({ name });
       if (result.success) {
-        setMessage({ type: 'success', text: result.message || `Plugin '${name}' uninstalled` });
+        setMessage(mutationMessage(result, `Plugin '${name}' uninstalled`));
         await loadPlugins();
       } else {
         setMessage({ type: 'error', text: result.error || 'Uninstall failed' });
@@ -90,10 +101,7 @@ export function PluginPanel() {
         ? await pluginApi.disable(plugin.name)
         : await pluginApi.enable(plugin.name);
       if (result.success) {
-        setMessage({
-          type: 'success',
-          text: result.message || `Plugin ${plugin.enabled ? 'disabled' : 'enabled'}`,
-        });
+        setMessage(mutationMessage(result, `Plugin ${plugin.enabled ? 'disabled' : 'enabled'}`));
         await loadPlugins();
       } else {
         setMessage({ type: 'error', text: result.error || 'Toggle failed' });

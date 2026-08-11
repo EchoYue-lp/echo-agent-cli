@@ -119,6 +119,30 @@ struct ActiveToolBoundary {
     replay_safe: bool,
 }
 
+struct TaskStatusEvent<'a> {
+    run_id: &'a str,
+    task_id: &'a str,
+    task_subject: &'a str,
+    status: TodoStatus,
+    owner_agent: Option<&'a str>,
+    summary: Option<&'a str>,
+    claim: Option<&'a echo_agent::tasks::TaskClaim>,
+}
+
+pub(crate) struct SubagentReleaseRecord<'a> {
+    pub run_id: &'a str,
+    pub task_id: &'a str,
+    pub execution_id: &'a str,
+    pub agent_name: &'a str,
+    pub task_subject: &'a str,
+    pub plan_revision: u64,
+    pub attempt: u32,
+    pub status: &'a str,
+    pub result: Option<&'a SubagentTaskResult>,
+    pub full_output: Option<&'a str>,
+    pub dispatch_hook: bool,
+}
+
 impl Drop for RunCancellationRegistration {
     fn drop(&mut self) {
         if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
@@ -587,6 +611,7 @@ impl TaskRuntimeStore {
                 serde_json::json!({
                     "base_revision": 0,
                     "reason": "initial complete plan",
+                    "created_task_ids": committed.tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>(),
                     "plan": committed.specification(),
                 }),
             )?;
@@ -695,6 +720,17 @@ impl TaskRuntimeStore {
                 )));
             }
             let current = self.load_revisioned_task_graph(run_id)?;
+            let previous_task_ids = current
+                .as_ref()
+                .map(|graph| {
+                    graph
+                        .snapshot
+                        .tasks
+                        .iter()
+                        .map(|task| task.spec.id.as_str())
+                        .collect::<std::collections::HashSet<_>>()
+                })
+                .unwrap_or_default();
             let current_revision = current.as_ref().map(|graph| graph.snapshot.revision);
             if current_revision != commit.expected_revision {
                 return Err(StoreError::PlanConflict {
@@ -771,6 +807,12 @@ impl TaskRuntimeStore {
                 },
                 tasks: specifications,
             };
+            let created_task_ids = plan
+                .tasks
+                .iter()
+                .filter(|task| !previous_task_ids.contains(task.id.as_str()))
+                .map(|task| task.id.clone())
+                .collect::<Vec<_>>();
             self.shadow.append_event_line(
                 run_id,
                 None,
@@ -781,6 +823,7 @@ impl TaskRuntimeStore {
                     "reason": commit.reason,
                     "skipped_task_ids": commit.effects.skipped_task_ids,
                     "reset_task_ids": commit.effects.reset_task_ids,
+                    "created_task_ids": created_task_ids,
                     "plan": plan,
                 }),
             )?;
@@ -871,10 +914,20 @@ impl TaskRuntimeStore {
             let plan = self
                 .get_plan(run_id)?
                 .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            if !plan.tasks.iter().any(|t| t.id == task_id) {
-                return Err(StoreError::TaskNotFound(task_id.to_string()));
-            }
-            self.append_task_status_event(run_id, task_id, status, owner_agent, summary, None)
+            let task = plan
+                .tasks
+                .iter()
+                .find(|task| task.id == task_id)
+                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
+            self.append_task_status_event(TaskStatusEvent {
+                run_id,
+                task_id,
+                task_subject: &task.title,
+                status,
+                owner_agent,
+                summary,
+                claim: None,
+            })
         })
     }
 
@@ -911,14 +964,15 @@ impl TaskRuntimeStore {
                     .stable_hash()
                     .map_err(StoreError::InvalidPlan)?,
             };
-            self.append_task_status_event(
+            self.append_task_status_event(TaskStatusEvent {
                 run_id,
-                &task.id,
-                TodoStatus::Running,
-                Some(&task.agent_role),
-                None,
-                Some(&claim),
-            )?;
+                task_id: &task.id,
+                task_subject: &task.title,
+                status: TodoStatus::Running,
+                owner_agent: Some(&task.agent_role),
+                summary: None,
+                claim: Some(&claim),
+            })?;
             Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim))
         })
     }
@@ -943,14 +997,15 @@ impl TaskRuntimeStore {
             if task.status != TodoStatus::Running || task.claim.as_ref() != Some(claim) {
                 return Ok(ClaimWriteOutcome::Superseded);
             }
-            self.append_task_status_event(
+            self.append_task_status_event(TaskStatusEvent {
                 run_id,
                 task_id,
+                task_subject: &task.title,
                 status,
                 owner_agent,
                 summary,
-                Some(claim),
-            )?;
+                claim: Some(claim),
+            })?;
             Ok(ClaimWriteOutcome::Applied)
         })
     }
@@ -1014,15 +1069,16 @@ impl TaskRuntimeStore {
         }))
     }
 
-    fn append_task_status_event(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        status: TodoStatus,
-        owner_agent: Option<&str>,
-        summary: Option<&str>,
-        claim: Option<&echo_agent::tasks::TaskClaim>,
-    ) -> Result<(), StoreError> {
+    fn append_task_status_event(&self, event: TaskStatusEvent<'_>) -> Result<(), StoreError> {
+        let TaskStatusEvent {
+            run_id,
+            task_id,
+            task_subject,
+            status,
+            owner_agent,
+            summary,
+            claim,
+        } = event;
         let now = echo_agent::utils::time::now_local().to_rfc3339();
         let started = matches!(status, TodoStatus::Running);
         let finished = matches!(
@@ -1039,6 +1095,20 @@ impl TaskRuntimeStore {
         };
         let status_detail = matches!(status, TodoStatus::Failed | TodoStatus::Blocked)
             .then(|| summary.unwrap_or_else(|| status.as_str()));
+        let hook_terminal_status = match status {
+            TodoStatus::Completed => Some("completed"),
+            TodoStatus::Failed => Some(if summary.is_some_and(is_timeout_detail) {
+                "timed_out"
+            } else {
+                "failed"
+            }),
+            TodoStatus::Skipped => Some(if summary.is_some_and(is_cancelled_detail) {
+                "cancelled"
+            } else {
+                "skipped"
+            }),
+            TodoStatus::Pending | TodoStatus::Running | TodoStatus::Blocked => None,
+        };
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -1046,8 +1116,10 @@ impl TaskRuntimeStore {
             kind,
             serde_json::json!({
                 "status": status.as_str(),
+                "hook_terminal_status": hook_terminal_status,
                 "status_detail": status_detail,
                 "owner_agent": owner_agent,
+                "title": task_subject,
                 "summary": summary,
                 "claim": claim,
                 "started_at": if started { Some(now.as_str()) } else { None },
@@ -1779,8 +1851,11 @@ impl TaskRuntimeStore {
         task_id: &str,
         execution_id: &str,
         agent_name: &str,
+        task_subject: &str,
+        plan_revision: u64,
         attempt: u32,
         replay_safe: bool,
+        dispatch_hook: bool,
     ) -> Result<(), StoreError> {
         self.shadow.append_event_line(
             run_id,
@@ -1790,23 +1865,34 @@ impl TaskRuntimeStore {
             serde_json::json!({
                 "execution_id": execution_id,
                 "agent_name": agent_name,
+                "title": task_subject,
+                "plan_revision": plan_revision,
                 "attempt": attempt,
                 "replay_safe": replay_safe,
+                "dispatch_hook": dispatch_hook,
             }),
         )?;
         Ok(())
     }
 
     /// Persist a Subagent terminal fact with the structured result needed for resume.
-    pub fn record_subagent_released(
+    pub(crate) fn record_subagent_released(
         &self,
-        run_id: &str,
-        task_id: &str,
-        execution_id: &str,
-        status: &str,
-        result: Option<&SubagentTaskResult>,
-        full_output: Option<&str>,
+        record: SubagentReleaseRecord<'_>,
     ) -> Result<(), StoreError> {
+        let SubagentReleaseRecord {
+            run_id,
+            task_id,
+            execution_id,
+            agent_name,
+            task_subject,
+            plan_revision,
+            attempt,
+            status,
+            result,
+            full_output,
+            dispatch_hook,
+        } = record;
         let summary = result.map(|value| bounded_event_text(&value.summary, 2_000));
         self.shadow.append_event_line(
             run_id,
@@ -1815,10 +1901,15 @@ impl TaskRuntimeStore {
             RuntimeEventKind::SubagentReleased,
             serde_json::json!({
                 "execution_id": execution_id,
+                "agent_name": agent_name,
+                "title": task_subject,
+                "plan_revision": plan_revision,
+                "attempt": attempt,
                 "status": status,
                 "summary": summary,
                 "result": result,
                 "full_output": full_output,
+                "dispatch_hook": dispatch_hook,
             }),
         )?;
         Ok(())
@@ -2044,6 +2135,15 @@ fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
+}
+
+fn is_cancelled_detail(detail: &str) -> bool {
+    detail.to_ascii_lowercase().contains("cancelled")
+}
+
+fn is_timeout_detail(detail: &str) -> bool {
+    let normalized = detail.to_ascii_lowercase();
+    normalized.contains("timed out") || normalized.contains("timeout")
 }
 
 fn bounded_event_text(value: &str, max_chars: usize) -> String {
@@ -2551,20 +2651,35 @@ mod tests {
             }
         };
         let execution_id = claim.execution_id("r1", "t1");
-        store.record_subagent_assigned("r1", "t1", &execution_id, "subagent", 1, true)?;
+        store.record_subagent_assigned(
+            "r1",
+            "t1",
+            &execution_id,
+            "subagent",
+            "Task 1",
+            claim.revision,
+            claim.attempt,
+            true,
+            true,
+        )?;
         let result = SubagentTaskResult::terminal(
             SubagentRunStatus::Completed,
             "durable result",
             Vec::new(),
         );
-        store.record_subagent_released(
-            "r1",
-            "t1",
-            &execution_id,
-            "completed",
-            Some(&result),
-            Some("durable full output"),
-        )?;
+        store.record_subagent_released(SubagentReleaseRecord {
+            run_id: "r1",
+            task_id: "t1",
+            execution_id: &execution_id,
+            agent_name: "subagent",
+            task_subject: "Task 1",
+            plan_revision: claim.revision,
+            attempt: claim.attempt,
+            status: "completed",
+            result: Some(&result),
+            full_output: Some("durable full output"),
+            dispatch_hook: true,
+        })?;
 
         assert_eq!(store.recover_incomplete(), 1);
         assert_eq!(
@@ -2607,7 +2722,9 @@ mod tests {
             },
         )?;
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
-        store.record_subagent_assigned("r1", "t1", "t1:1", "subagent", 1, false)?;
+        store.record_subagent_assigned(
+            "r1", "t1", "t1:1", "subagent", "Task 1", 1, 1, false, true,
+        )?;
         store.record_tool_started("r1", "t1", "t1:1", "call-write", "write_file", false)?;
 
         assert_eq!(store.recover_incomplete(), 1);
@@ -2699,7 +2816,9 @@ mod tests {
             },
         )?;
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
-        store.record_subagent_assigned("r1", "t1", "t1:1", "subagent", 1, false)?;
+        store.record_subagent_assigned(
+            "r1", "t1", "t1:1", "subagent", "Task 1", 1, 1, false, true,
+        )?;
         assert_eq!(store.recover_incomplete(), 1);
 
         // Simulate a process stop after RecoveryResolved was appended but
@@ -2948,15 +3067,30 @@ mod tests {
             "old spec result",
             Vec::new(),
         );
-        store.record_subagent_assigned("r1", "t1", &old_execution_id, "code_reviewer", 1, true)?;
-        store.record_subagent_released(
+        store.record_subagent_assigned(
             "r1",
             "t1",
             &old_execution_id,
-            "completed",
-            Some(&durable_result),
-            Some("old spec full output"),
+            "code_reviewer",
+            &original.title,
+            old_claim.revision,
+            old_claim.attempt,
+            true,
+            true,
         )?;
+        store.record_subagent_released(SubagentReleaseRecord {
+            run_id: "r1",
+            task_id: "t1",
+            execution_id: &old_execution_id,
+            agent_name: "code_reviewer",
+            task_subject: &original.title,
+            plan_revision: old_claim.revision,
+            attempt: old_claim.attempt,
+            status: "completed",
+            result: Some(&durable_result),
+            full_output: Some("old spec full output"),
+            dispatch_hook: true,
+        })?;
         store.set_task_status(
             "r1",
             "t1",

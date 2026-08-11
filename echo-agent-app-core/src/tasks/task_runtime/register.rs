@@ -109,15 +109,21 @@ pub async fn register_task_tools_on_agent(
     // fire into the same registry its hooks see. Idempotent (first call wins),
     // so the pooled/cron paths calling this again on the same store are safe.
     let task_bridge = agent_handle
-        .read(|agent| agent.create_task_hook_bridge().bridge().clone())
+        .read(|agent| std::sync::Arc::new(agent.create_task_hook_bridge()))
         .await;
     let subagent_bridge = agent_handle
         .read(|agent| std::sync::Arc::new(agent.create_subagent_hook_bridge()))
         .await;
-    let dispatcher = super::hook_event_dispatcher::HookEventDispatcher::new(
+    let dispatcher = match super::hook_event_dispatcher::HookEventDispatcher::new(
         Some(task_bridge),
         Some(subagent_bridge),
-    );
+    ) {
+        Ok(dispatcher) => dispatcher,
+        Err(error) => {
+            tracing::warn!(%error, "HookEventDispatcher was not attached");
+            return;
+        }
+    };
     let dispatcher_arc = std::sync::Arc::new(dispatcher);
     let hook_fn: std::sync::Arc<dyn Fn(&super::types::RuntimeTaskEvent) + Send + Sync> =
         std::sync::Arc::new(move |event| dispatcher_arc.dispatch(event));

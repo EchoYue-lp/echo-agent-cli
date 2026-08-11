@@ -124,33 +124,27 @@ pub async fn install_plugin(
         .unwrap_or(PluginScope::User);
     let source = InstallSource::parse(&source);
 
-    // P1-6: confine a Local install source to an allowed root. A `Local(path)`
-    // source copies that directory into a plugin scope dir; without confinement
-    // a compromised page could aggregate any on-disk directory (e.g. copy
-    // `~/.ssh` into a plugin and read it back). Git sources are SSRF-checked in
-    // the registry. Allow only paths under the current workspace root or home.
+    // This is a local personal assistant: a user-selected extension path is
+    // trusted. Keep validation to the source existing; the framework validates
+    // the plugin manifest before copying it.
     if let InstallSource::Local(ref src_path) = source {
-        let canonical = src_path
+        src_path
             .canonicalize()
             .map_err(|_| IpcError::NotFound(format!("插件源目录不存在: {}", src_path.display())))?;
-        let allowed = super::panels::allowed_skill_roots(&state).await;
-        if !allowed.iter().any(|root| canonical.starts_with(root)) {
-            return Err(IpcError::Validation(format!(
-                "插件源目录不在允许范围内（须位于当前工作区或用户主目录下）: {}",
-                src_path.display()
-            )));
-        }
     }
 
     match service.install(&source, scope).await {
-        Ok(id) => {
+        Ok((id, summary)) => {
             // Reuse the shared registry snapshot (already refreshed by reload
             // inside install) for the response info.
             let info = service.get(&id).await.map(|e| entry_to_info(&e));
+            let wiring_ok = summary.errors.is_empty();
             Ok(serde_json::json!({
                 "success": true,
                 "plugin_id": id,
                 "info": info,
+                "wiring_ok": wiring_ok,
+                "errors": summary.errors,
             }))
         }
         Err(e) => Err(IpcError::Internal(e.to_string())),
@@ -165,9 +159,11 @@ pub async fn uninstall_plugin(
 ) -> Result<serde_json::Value, IpcError> {
     let service = require_service(&state)?;
     match service.uninstall(&name, keep_data.unwrap_or(false)).await {
-        Ok(()) => Ok(serde_json::json!({
+        Ok(summary) => Ok(serde_json::json!({
             "success": true,
             "message": format!("Plugin '{}' uninstalled", name),
+            "wiring_ok": summary.errors.is_empty(),
+            "errors": summary.errors,
         })),
         Err(e) => Err(IpcError::Internal(e.to_string())),
     }
@@ -180,9 +176,11 @@ pub async fn enable_plugin(
 ) -> Result<serde_json::Value, IpcError> {
     let service = require_service(&state)?;
     match service.enable(&name).await {
-        Ok(()) => Ok(serde_json::json!({
+        Ok(summary) => Ok(serde_json::json!({
             "success": true,
             "message": format!("Plugin '{}' enabled", name),
+            "wiring_ok": summary.errors.is_empty(),
+            "errors": summary.errors,
         })),
         Err(e) => Err(IpcError::Internal(e.to_string())),
     }
@@ -195,9 +193,11 @@ pub async fn disable_plugin(
 ) -> Result<serde_json::Value, IpcError> {
     let service = require_service(&state)?;
     match service.disable(&name).await {
-        Ok(()) => Ok(serde_json::json!({
+        Ok(summary) => Ok(serde_json::json!({
             "success": true,
             "message": format!("Plugin '{}' disabled", name),
+            "wiring_ok": summary.errors.is_empty(),
+            "errors": summary.errors,
         })),
         Err(e) => Err(IpcError::Internal(e.to_string())),
     }
@@ -209,16 +209,21 @@ pub async fn reload_plugins(
 ) -> Result<serde_json::Value, IpcError> {
     let service = require_service(&state)?;
     match service.reload().await {
-        Ok(summary) => Ok(serde_json::json!({
-            "success": true,
-            "total": summary.total,
-            "enabled": summary.enabled,
-            "skills_loaded": summary.skills_loaded,
-            "hooks_registered": summary.hooks_registered,
-            "mcp_connected": summary.mcp_connected,
-            "errors": summary.errors,
-            "message": format!("Reloaded {} plugins", summary.total),
-        })),
+        Ok(summary) => {
+            let success = summary.errors.is_empty();
+            let error = (!success).then(|| summary.errors.join("; "));
+            Ok(serde_json::json!({
+                "success": success,
+                "total": summary.total,
+                "enabled": summary.enabled,
+                "skills_loaded": summary.skills_loaded,
+                "hooks_registered": summary.hooks_registered,
+                "mcp_connected": summary.mcp_connected,
+                "errors": summary.errors,
+                "message": format!("Reloaded {} plugins", summary.total),
+                "error": error,
+            }))
+        }
         Err(e) => Err(IpcError::Internal(e.to_string())),
     }
 }

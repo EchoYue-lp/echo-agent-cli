@@ -30,6 +30,12 @@ pub struct HooksReloadSummary {
     pub message: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HookTestResult {
+    pub event: String,
+    pub registered: bool,
+}
+
 // ── IPC Commands ────────────────────────────────────────────────────────────
 
 /// List every registered hook source on the live agent, with rule counts.
@@ -56,6 +62,32 @@ pub async fn list_hooks(
     Ok(infos)
 }
 
+#[tauri::command]
+pub fn list_hook_events() -> Vec<&'static str> {
+    echo_agent::skills::hooks::HookEvent::ALL
+        .iter()
+        .map(|event| event.as_str())
+        .collect()
+}
+
+#[tauri::command]
+pub async fn test_hook(
+    state: tauri::State<'_, TauriState>,
+    event: String,
+) -> Result<HookTestResult, IpcError> {
+    let hook_event = echo_agent::skills::hooks::HookEvent::from_name(&event)
+        .ok_or_else(|| IpcError::Validation(format!("Unknown hook event: {event}")))?;
+    let registered = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read_async(|agent| {
+            Box::pin(async move { agent.hook_registry().read().await.has_hooks_for(hook_event) })
+        })
+        .await;
+    Ok(HookTestResult { event, registered })
+}
+
 /// Reload user-configured hooks from disk and re-register them on the live
 /// agent.
 ///
@@ -73,25 +105,23 @@ pub async fn reload_hooks(
     let load_result = HookConfigLoader::load_merged_from_disk();
     let rule_count: usize = load_result.definition.rules.values().map(|v| v.len()).sum();
 
-    if load_result.definition.is_empty() {
-        return Ok(HooksReloadSummary {
-            success: true,
-            rule_count: 0,
-            loaded_from: load_result
-                .loaded_from
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect(),
-            message: "No hooks found in config sources".to_string(),
-        });
-    }
-
     let hooks_def = load_result.definition;
     let loaded_from: Vec<String> = load_result
         .loaded_from
         .iter()
         .map(|p| p.display().to_string())
         .collect();
+    if !load_result.errors.is_empty() {
+        return Ok(HooksReloadSummary {
+            success: false,
+            rule_count,
+            loaded_from,
+            message: format!(
+                "Hook reload aborted; existing hooks are unchanged: {}",
+                load_result.errors.join("; ")
+            ),
+        });
+    }
 
     // Register into the agent's hook registry. clear_user_hooks +
     // register_user_hooks both need `&mut`, so this runs under write_async.
@@ -101,7 +131,9 @@ pub async fn reload_hooks(
             Box::pin(async move {
                 let mut registry = a.hook_registry().write().await;
                 registry.clear_user_hooks();
-                registry.register_user_hooks(hooks_def);
+                if !hooks_def.is_empty() {
+                    registry.register_user_hooks(hooks_def);
+                }
             })
         })
         .await;
@@ -110,6 +142,10 @@ pub async fn reload_hooks(
         success: true,
         rule_count,
         loaded_from,
-        message: format!("Reloaded {} hook rules", rule_count),
+        message: if rule_count == 0 {
+            "No hooks found; cleared previous user hooks".to_string()
+        } else {
+            format!("Reloaded {} hook rules", rule_count)
+        },
     })
 }

@@ -293,6 +293,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 .collect(),
             runtime.browser_runtime.clone(),
             runtime.prompt_assembly.clone(),
+            runtime.plugin_runtime.clone(),
             args.no_alt_screen,
         )
         .await?;
@@ -369,6 +370,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     task_runtime_store.clone(),
                     conversation_id.clone(),
                     webhook_emitter.clone(),
+                    runtime.plugin_runtime.clone(),
                 )
                 .await?;
             } else {
@@ -398,6 +400,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             task_runtime_store,
             conversation_id,
             webhook_emitter,
+            runtime.plugin_runtime.clone(),
         )
         .await?;
     } else {

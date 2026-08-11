@@ -1672,6 +1672,14 @@ export interface PluginInfo {
   config_keys: string[];
 }
 
+export interface PluginMutationResult {
+  success: boolean;
+  message?: string;
+  error?: string;
+  wiring_ok?: boolean;
+  errors?: string[];
+}
+
 export const pluginApi = {
   list: () => (isTauri() ? apiInvoke<PluginInfo[]>('list_plugins') : get<PluginInfo[]>('/plugins')),
   get: (name: string) =>
@@ -1680,31 +1688,31 @@ export const pluginApi = {
       : get<{ info: PluginInfo; resolved?: Record<string, any> }>(`/plugins/${name}`),
   install: (req: { source: string; scope?: string }) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; plugin_id?: string; info?: PluginInfo; error?: string }>(
+      ? apiInvoke<PluginMutationResult & { plugin_id?: string; info?: PluginInfo }>(
           'install_plugin',
           { source: req.source, scope: req.scope }
         )
-      : post<{ success: boolean; plugin_id?: string; info?: PluginInfo; error?: string }>(
+      : post<PluginMutationResult & { plugin_id?: string; info?: PluginInfo }>(
           '/plugins/install',
           req
         ),
   uninstall: (req: { name: string; keep_data?: boolean }) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; message?: string; error?: string }>('uninstall_plugin', {
+      ? apiInvoke<PluginMutationResult>('uninstall_plugin', {
           name: req.name,
           keep_data: req.keep_data,
         })
-      : post<{ success: boolean; message?: string; error?: string }>('/plugins/uninstall', req),
+      : post<PluginMutationResult>('/plugins/uninstall', req),
   enable: (name: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; message?: string; error?: string }>('enable_plugin', { name })
-      : post<{ success: boolean; message?: string; error?: string }>(`/plugins/${name}/enable`),
+      ? apiInvoke<PluginMutationResult>('enable_plugin', { name })
+      : post<PluginMutationResult>(`/plugins/${name}/enable`),
   disable: (name: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; message?: string; error?: string }>('disable_plugin', {
+      ? apiInvoke<PluginMutationResult>('disable_plugin', {
           name,
         })
-      : post<{ success: boolean; message?: string; error?: string }>(`/plugins/${name}/disable`),
+      : post<PluginMutationResult>(`/plugins/${name}/disable`),
   reload: () =>
     isTauri()
       ? apiInvoke<{
@@ -1750,6 +1758,11 @@ export interface HooksReloadSummary {
   message: string;
 }
 
+export interface HookTestResult {
+  event: string;
+  registered: boolean;
+}
+
 export const hooksApi = {
   list: () =>
     isTauri() ? apiInvoke<HookSourceInfo[]>('list_hooks') : get<HookSourceInfo[]>('/hooks'),
@@ -1757,6 +1770,12 @@ export const hooksApi = {
     isTauri()
       ? apiInvoke<HooksReloadSummary>('reload_hooks')
       : post<HooksReloadSummary>('/hooks/reload'),
+  events: () =>
+    isTauri() ? apiInvoke<string[]>('list_hook_events') : get<string[]>('/hooks/events'),
+  test: (event: string) =>
+    isTauri()
+      ? apiInvoke<HookTestResult>('test_hook', { event })
+      : post<HookTestResult>('/hooks/test', { event }),
 };
 
 // ── Scheduler API (定时任务) ──────────────────────────────────────

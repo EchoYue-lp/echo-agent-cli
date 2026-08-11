@@ -1,6 +1,15 @@
 import { useEffect, useState } from 'react';
 import { hooksApi, type HookSourceInfo, type HooksReloadSummary } from '../../api/endpoints';
-import { Webhook, RefreshCw, Check, AlertCircle, X, Loader2, FileCode2 } from 'lucide-react';
+import {
+  Webhook,
+  RefreshCw,
+  Check,
+  AlertCircle,
+  X,
+  Loader2,
+  FileCode2,
+  TestTube2,
+} from 'lucide-react';
 
 /** Categorize a hook source string into a stable kind for icon/color. */
 function sourceKind(source: string): 'user' | 'skill' | 'plugin' | 'other' {
@@ -20,11 +29,23 @@ const KIND_LABEL: Record<ReturnType<typeof sourceKind>, string> = {
 export function HooksPanel() {
   const [sources, setSources] = useState<HookSourceInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  const [testing, setTesting] = useState(false);
+  const [events, setEvents] = useState<string[]>([]);
+  const [selectedEvent, setSelectedEvent] = useState('PreToolUse');
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   useEffect(() => {
     loadHooks();
+    hooksApi
+      .events()
+      .then((available) => {
+        setEvents(available);
+        setSelectedEvent((current) =>
+          available.length > 0 && !available.includes(current) ? available[0] : current
+        );
+      })
+      .catch((e: any) => setError(e.message || 'Failed to load hook events'));
   }, []);
 
   const loadHooks = async () => {
@@ -63,6 +84,22 @@ export function HooksPanel() {
     }
   };
 
+  const handleTest = async () => {
+    try {
+      setTesting(true);
+      setMessage(null);
+      const result = await hooksApi.test(selectedEvent);
+      setMessage({
+        type: result.registered ? 'success' : 'error',
+        text: `${result.event}: ${result.registered ? 'registered' : 'not registered'}`,
+      });
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.message || 'Hook test failed' });
+    } finally {
+      setTesting(false);
+    }
+  };
+
   const totalRules = sources.reduce((sum, s) => sum + s.rule_count, 0);
 
   return (
@@ -78,33 +115,54 @@ export function HooksPanel() {
             {sources.length} sources, {totalRules} rules
           </span>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          <select
+            value={selectedEvent}
+            onChange={(event) => setSelectedEvent(event.target.value)}
+            disabled={events.length === 0 || testing}
+            className="h-9 max-w-48 rounded-md border bg-[var(--bg-secondary)] px-2 text-xs"
+            style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-primary)' }}
+            aria-label="Hook event"
+          >
+            {events.map((event) => (
+              <option key={event} value={event}>
+                {event}
+              </option>
+            ))}
+          </select>
+          <button
+            onClick={handleTest}
+            disabled={events.length === 0 || testing}
+            className="flex h-9 w-9 items-center justify-center rounded-md transition-colors disabled:opacity-50 hover:bg-[var(--bg-hover)]"
+            style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-primary)' }}
+            title="Test hook event"
+            aria-label="Test hook event"
+          >
+            {testing ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <TestTube2 className="h-4 w-4" />
+            )}
+          </button>
           <button
             onClick={handleReload}
             disabled={loading}
-            className="flex items-center gap-1 px-3 py-2 rounded-lg text-sm transition-colors disabled:opacity-50 hover:bg-[var(--bg-hover)]"
+            className="flex h-9 w-9 items-center justify-center rounded-md transition-colors disabled:opacity-50 hover:bg-[var(--bg-hover)]"
             style={{
               color: 'var(--text-secondary)',
               border: '1px solid var(--border-primary)',
             }}
             title="Reload hooks from config"
+            aria-label="Reload hooks from config"
           >
             {loading ? (
               <Loader2 className="w-4 h-4 animate-spin" />
             ) : (
               <RefreshCw className="w-4 h-4" />
             )}
-            Reload
           </button>
         </div>
       </div>
-
-      {/* Hint */}
-      <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-        Hooks are loaded from <code>echo-agent.yaml</code> (inline), <code>~/.eko/hooks.yaml</code>,
-        and <code>.eko/hooks.yaml</code>. Skill and plugin sources are registered automatically when
-        those components load.
-      </p>
 
       {/* Message */}
       {message && (
@@ -149,9 +207,6 @@ export function HooksPanel() {
       ) : sources.length === 0 ? (
         <div className="text-center py-8 text-sm" style={{ color: 'var(--text-tertiary)' }}>
           No hooks registered.
-          <br />
-          Configure hooks in <code>~/.eko/hooks.yaml</code> or <code>echo-agent.yaml</code>, then
-          click Reload.
         </div>
       ) : (
         <div className="space-y-2">

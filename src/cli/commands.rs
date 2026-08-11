@@ -27,6 +27,7 @@ pub struct CommandHandler {
     registry: Option<Arc<crate::cli::command::CommandRegistry>>,
     task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     interaction_mode:
@@ -44,6 +45,7 @@ impl CommandHandler {
             registry: None,
             task_service: None,
             scheduler: None,
+            plugin_runtime: None,
             prompt_assembly: None,
             review_integration: None,
             interaction_mode: Arc::new(tokio::sync::RwLock::new(
@@ -97,6 +99,22 @@ impl CommandHandler {
         scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     ) -> Self {
         self.scheduler = scheduler;
+        self
+    }
+
+    pub fn with_plugin_runtime(
+        mut self,
+        runtime: Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    ) -> Self {
+        self.plugin_runtime = Some(runtime);
+        self
+    }
+
+    pub fn with_plugin_runtime_opt(
+        mut self,
+        runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
+    ) -> Self {
+        self.plugin_runtime = runtime;
         self
     }
 
@@ -169,6 +187,7 @@ impl CommandHandler {
                 registry: Some(registry.clone()),
                 task_service: self.task_service.clone(),
                 scheduler: self.scheduler.clone(),
+                plugin_runtime: self.plugin_runtime.clone(),
                 prompt_assembly: self.prompt_assembly.clone(),
                 review_integration: self.review_integration.clone(),
                 interaction_mode: self.interaction_mode.clone(),

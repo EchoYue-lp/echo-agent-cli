@@ -3507,18 +3507,25 @@ async fn handle_slash_command(
                     // P0-1: 从磁盘重读所有 user hook 来源(含 echo-agent.yaml
                     // 内嵌),合并成单个 definition 后一次性 register。
                     let loaded = echo_agent_app_core::hook_config_loader::HookConfigLoader::load_merged_from_disk();
-                    let count: usize = loaded.definition.rules.values().map(Vec::len).sum();
-                    let definition = loaded.definition;
-                    agent
-                        .write_async(|value| {
-                            Box::pin(async move {
-                                let mut registry = value.hook_registry().write().await;
-                                registry.clear_user_hooks();
-                                registry.register_user_hooks(definition);
+                    if !loaded.errors.is_empty() {
+                        format!(
+                            "Hook reload aborted; existing hooks are unchanged:\n{}",
+                            loaded.errors.join("\n")
+                        )
+                    } else {
+                        let count: usize = loaded.definition.rules.values().map(Vec::len).sum();
+                        let definition = loaded.definition;
+                        agent
+                            .write_async(|value| {
+                                Box::pin(async move {
+                                    let mut registry = value.hook_registry().write().await;
+                                    registry.clear_user_hooks();
+                                    registry.register_user_hooks(definition);
+                                })
                             })
-                        })
-                        .await;
-                    format!("Hooks reloaded: {count} rule(s).")
+                            .await;
+                        format!("Hooks reloaded: {count} rule(s).")
+                    }
                 }
                 "test" if !target.is_empty() => match parse_hook_event(target) {
                     Some(event) => {
@@ -3534,6 +3541,16 @@ async fn handle_slash_command(
                     None => format!("Unknown hook event: {target}"),
                 },
                 _ => "Usage: /hooks [list|reload|test <event>]".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::Plugins) => {
+            let content = match app.plugin_runtime.clone() {
+                Some(runtime) => handle_tui_plugin_command(runtime, args).await,
+                None => "Plugin runtime is not initialized.".to_string(),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -4982,17 +4999,162 @@ fn append_subagent_summary(content: &mut String, runs: &[SubagentRuntimeView]) {
 }
 
 fn parse_hook_event(name: &str) -> Option<echo_agent::skills::hooks::HookEvent> {
-    use echo_agent::skills::hooks::HookEvent;
-    match name {
-        "PreToolUse" => Some(HookEvent::PreToolUse),
-        "PostToolUse" => Some(HookEvent::PostToolUse),
-        "PostToolUseFailure" => Some(HookEvent::PostToolUseFailure),
-        "SessionStart" => Some(HookEvent::SessionStart),
-        "SessionEnd" => Some(HookEvent::SessionEnd),
-        "Stop" => Some(HookEvent::Stop),
-        "UserPromptSubmit" => Some(HookEvent::UserPromptSubmit),
-        "ConfigChange" => Some(HookEvent::ConfigChange),
-        _ => None,
+    echo_agent::skills::hooks::HookEvent::from_name(name)
+}
+
+fn with_plugin_wiring_errors(
+    mut message: String,
+    summary: &echo_agent_app_core::plugin_runtime::ReloadSummary,
+) -> String {
+    if !summary.errors.is_empty() {
+        message.push_str("\nComponent wiring errors:\n");
+        message.push_str(&summary.errors.join("\n"));
+    }
+    message
+}
+
+async fn handle_tui_plugin_command(
+    runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    args: &str,
+) -> String {
+    use echo_agent::plugin::{InstallSource, PluginScope};
+
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    let sub = parts.first().copied().unwrap_or("list");
+    let rest = parts.get(1..).unwrap_or(&[]);
+    match sub {
+        "list" | "ls" | "" => {
+            let plugins = runtime.list().await;
+            if plugins.is_empty() {
+                return "No plugins installed.".to_string();
+            }
+            plugins
+                .into_iter()
+                .map(|entry| {
+                    format!(
+                        "{} v{} [{}] · {}",
+                        entry.manifest.name,
+                        entry.manifest.version,
+                        if entry.enabled { "enabled" } else { "disabled" },
+                        entry.scope
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        "install" => {
+            let Some(source_text) = rest.first() else {
+                return "Usage: /plugins install <path|git-url> [--scope user|project|local]"
+                    .to_string();
+            };
+            let scope = rest
+                .windows(2)
+                .find(|pair| pair.first() == Some(&"--scope"))
+                .and_then(|pair| pair.get(1))
+                .and_then(|value| PluginScope::from_arg(value))
+                .unwrap_or(PluginScope::User);
+            match runtime
+                .install(&InstallSource::parse(source_text), scope)
+                .await
+            {
+                Ok((plugin_id, summary)) => {
+                    let enabled = runtime
+                        .get(&plugin_id)
+                        .await
+                        .is_some_and(|entry| entry.enabled);
+                    with_plugin_wiring_errors(
+                        if !enabled {
+                            format!("Plugin '{plugin_id}' installed and disabled by default.")
+                        } else if summary.errors.is_empty() {
+                            format!("Plugin '{plugin_id}' installed and activated.")
+                        } else {
+                            format!("Plugin '{plugin_id}' installed, but activation is incomplete.")
+                        },
+                        &summary,
+                    )
+                }
+                Err(error) => format!("Plugin install failed: {error}"),
+            }
+        }
+        "uninstall" | "remove" => {
+            let Some(name) = rest.first() else {
+                return "Usage: /plugins uninstall <name> [--keep-data]".to_string();
+            };
+            let keep_data = rest.contains(&"--keep-data");
+            match runtime.uninstall(name, keep_data).await {
+                Ok(summary) => with_plugin_wiring_errors(
+                    format!("Plugin '{name}' uninstalled and unloaded."),
+                    &summary,
+                ),
+                Err(error) => format!("Plugin uninstall failed: {error}"),
+            }
+        }
+        "enable" | "disable" => {
+            let Some(name) = rest.first() else {
+                return format!("Usage: /plugins {sub} <name>");
+            };
+            let result = if sub == "enable" {
+                runtime.enable(name).await
+            } else {
+                runtime.disable(name).await
+            };
+            match result {
+                Ok(summary) => with_plugin_wiring_errors(
+                    format!("Plugin '{name}' {sub}d in the current session."),
+                    &summary,
+                ),
+                Err(error) => format!("Plugin {sub} failed: {error}"),
+            }
+        }
+        "info" | "details" => {
+            let Some(name) = rest.first() else {
+                return "Usage: /plugins info <name>".to_string();
+            };
+            match runtime.get(name).await {
+                Some(entry) => {
+                    let capabilities = entry
+                        .manifest
+                        .inferred_capabilities()
+                        .into_iter()
+                        .map(|capability| capability.display_name().to_string())
+                        .collect::<Vec<_>>();
+                    format!(
+                        "{} v{}\n{}\nScope: {}\nEnabled: {}\nPath: {}\nCapabilities: {}",
+                        entry.manifest.name,
+                        entry.manifest.version,
+                        entry.manifest.description,
+                        entry.scope,
+                        entry.enabled,
+                        entry.root.display(),
+                        if capabilities.is_empty() {
+                            "none".to_string()
+                        } else {
+                            capabilities.join(", ")
+                        }
+                    )
+                }
+                None => format!("Plugin '{name}' not found."),
+            }
+        }
+        "reload" => match runtime.reload().await {
+            Ok(summary) => {
+                let mut content = format!(
+                    "Reloaded {} plugins ({} enabled).\nSkills: {} · Hooks: {} · MCP: {}",
+                    summary.total,
+                    summary.enabled,
+                    summary.skills_loaded,
+                    summary.hooks_registered,
+                    summary.mcp_connected
+                );
+                if !summary.errors.is_empty() {
+                    content.push_str("\nErrors:\n");
+                    content.push_str(&summary.errors.join("\n"));
+                }
+                content
+            }
+            Err(error) => format!("Plugin reload failed: {error}"),
+        },
+        _ => "Usage: /plugins [list|install|uninstall|enable|disable|info|reload]".to_string(),
     }
 }
 

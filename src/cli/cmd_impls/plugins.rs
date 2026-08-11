@@ -1,38 +1,23 @@
 //! Plugin management slash commands.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
-use echo_agent::plugin::{InstallSource, PluginRegistry, PluginScope};
-use std::path::PathBuf;
+use echo_agent::plugin::{InstallSource, PluginScope};
 use std::sync::Arc;
 
 // ── PluginsCommand ───────────────────────────────────────────────────
 
-fn detect_project_root() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let mut dir = cwd.as_path();
-    loop {
-        if dir.join(".eko").exists() || dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        dir = dir.parent()?;
-    }
-}
-
-async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("list");
     let rest: &[&str] = args.get(1..).unwrap_or(&[]);
 
-    let project_root = detect_project_root();
-    let mut registry = PluginRegistry::new(project_root.clone());
-
     match sub {
         "list" | "ls" | "" => {
-            if let Err(e) = registry.scan_all() {
-                println!("Error scanning plugins: {e}");
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
-            }
+            };
 
-            let plugins = registry.list();
+            let plugins = runtime.list().await;
             if plugins.is_empty() {
                 println!("\n--- No plugins installed ---");
                 println!("Use /plugins install <path|git-url> to add plugins.");
@@ -40,7 +25,7 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
 
             println!("\n--- Installed Plugins ({}) ---", plugins.len());
-            for entry in &plugins {
+            for entry in plugins {
                 let status = if entry.enabled { "enabled" } else { "disabled" };
                 let caps = entry.manifest.inferred_capabilities();
                 let cap_str = caps
@@ -75,10 +60,16 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let source = InstallSource::parse(source_str);
             println!("Installing plugin from {source} (scope: {scope})...");
 
-            match registry.install(&source, scope) {
-                Ok(id) => {
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
+                return CommandOutcome::Continue;
+            };
+            match runtime.install(&source, scope).await {
+                Ok((id, summary)) => {
                     println!("Plugin '{id}' installed successfully.");
-                    if let Some(entry) = registry.get(&id) {
+                    let mut enabled = false;
+                    if let Some(entry) = runtime.get(&id).await {
+                        enabled = entry.enabled;
                         let caps = entry.manifest.inferred_capabilities();
                         println!("  Version: {}", entry.manifest.version);
                         println!("  Description: {}", entry.manifest.description);
@@ -92,7 +83,16 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                             );
                         }
                     }
-                    println!("\nRestart or run /plugins reload to activate.");
+                    if !enabled {
+                        println!("Plugin is disabled by its manifest default.");
+                    } else if summary.errors.is_empty() {
+                        println!("Plugin components are active in the current session.");
+                    } else {
+                        println!("Plugin installed, but some components failed to activate:");
+                        for error in summary.errors {
+                            println!("  - {error}");
+                        }
+                    }
                 }
                 Err(e) => println!("Install failed: {e}"),
             }
@@ -107,17 +107,20 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let name = rest[0];
             let keep_data = rest.contains(&"--keep-data");
 
-            if let Err(e) = registry.scan_all() {
-                println!("Error scanning plugins: {e}");
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
-            }
+            };
 
             println!("Uninstalling plugin '{name}'...");
-            match registry.uninstall(name, keep_data) {
-                Ok(()) => {
+            match runtime.uninstall(name, keep_data).await {
+                Ok(summary) => {
                     println!("Plugin '{name}' uninstalled.");
                     if keep_data {
                         println!("  (Data directory preserved)");
+                    }
+                    for error in summary.errors {
+                        println!("  Remaining plugin wiring error: {error}");
                     }
                 }
                 Err(e) => println!("Uninstall failed: {e}"),
@@ -131,15 +134,23 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
 
             let name = rest[0];
-            if let Err(e) = registry.scan_all() {
-                println!("Error scanning plugins: {e}");
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
-            }
+            };
 
-            match registry.enable(name) {
-                Ok(()) => {
-                    println!("Plugin '{name}' enabled.");
-                    println!("Run /plugins reload to activate.");
+            match runtime.enable(name).await {
+                Ok(summary) => {
+                    if summary.errors.is_empty() {
+                        println!("Plugin '{name}' enabled and activated.");
+                    } else {
+                        println!(
+                            "Plugin '{name}' enabled, but component activation is incomplete:"
+                        );
+                        for error in summary.errors {
+                            println!("  - {error}");
+                        }
+                    }
                 }
                 Err(e) => println!("Enable failed: {e}"),
             }
@@ -152,15 +163,17 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
 
             let name = rest[0];
-            if let Err(e) = registry.scan_all() {
-                println!("Error scanning plugins: {e}");
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
-            }
+            };
 
-            match registry.disable(name) {
-                Ok(()) => {
-                    println!("Plugin '{name}' disabled.");
-                    println!("Run /plugins reload to deactivate.");
+            match runtime.disable(name).await {
+                Ok(summary) => {
+                    println!("Plugin '{name}' disabled and unloaded.");
+                    for error in summary.errors {
+                        println!("  Remaining plugin wiring error: {error}");
+                    }
                 }
                 Err(e) => println!("Disable failed: {e}"),
             }
@@ -173,12 +186,12 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
 
             let name = rest[0];
-            if let Err(e) = registry.scan_all() {
-                println!("Error scanning plugins: {e}");
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
-            }
+            };
 
-            match registry.get(name) {
+            match runtime.get(name).await {
                 Some(entry) => {
                     println!("\n--- Plugin: {} ---", entry.manifest.name);
                     println!("  Version: {}", entry.manifest.version);
@@ -229,93 +242,35 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                             }
                         }
                     }
-
-                    // Resolve components
-                    if let Ok(resolved) = registry.resolve_components(name) {
-                        println!("\n  Resolved Components:");
-                        if !resolved.skill_dirs.is_empty() {
-                            println!("    Skills: {} directories", resolved.skill_dirs.len());
-                        }
-                        if !resolved.agent_files.is_empty() {
-                            println!("    Agents: {} files", resolved.agent_files.len());
-                        }
-                        if resolved.hooks_file.is_some() {
-                            println!("    Hooks: configured");
-                        }
-                        if resolved.mcp_config_file.is_some() {
-                            println!("    MCP Servers: configured");
-                        }
-                        if resolved.lsp_config_file.is_some() {
-                            println!("    LSP Servers: configured");
-                        }
-                    }
                 }
                 None => println!("Plugin '{name}' not found."),
             }
         }
 
         "reload" => {
-            // TUI/CLI has no persistent PluginRuntimeService like the GUI, so we
-            // rescan the plugin manifests on disk and report the same dimensions
-            // as the GUI's ReloadSummary (total/enabled/skills/hooks/mcp). This
-            // keeps the two surfaces feature-parity per AGENTS.md. The actual
-            // wiring into the live agent's registries happens on agent restart
-            // (the CLI REPL runs without a long-lived wiring service).
             println!("Reloading plugins...");
-            if let Err(e) = registry.scan_all() {
-                println!("Error reloading plugins: {e}");
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
+            };
+            match runtime.reload().await {
+                Ok(summary) => {
+                    println!(
+                        "Loaded {} plugins ({} enabled).",
+                        summary.total, summary.enabled
+                    );
+                    println!("  Skills loaded:    {}", summary.skills_loaded);
+                    println!("  Hooks registered: {}", summary.hooks_registered);
+                    println!("  MCP connected:    {}", summary.mcp_connected);
+                    if !summary.errors.is_empty() {
+                        println!("Errors ({}):", summary.errors.len());
+                        for error in summary.errors {
+                            println!("  - {error}");
+                        }
+                    }
+                }
+                Err(error) => println!("Plugin reload failed: {error}"),
             }
-
-            let all = registry.list();
-            let total = all.len();
-            let enabled_entries = registry.list_enabled();
-            let enabled = enabled_entries.len();
-
-            // Collect the per-plugin data we need into owned values first, so
-            // the immutable borrow from `list_enabled()` ends before we call
-            // `resolve_components` (which needs `&mut self`).
-            let mut skills_loaded = 0usize;
-            let mut hooks_registered = 0usize;
-            let mut mcp_connected = 0usize;
-            for entry in &enabled_entries {
-                if entry.manifest.components.skills.is_some() {
-                    skills_loaded += 1;
-                }
-                if entry.manifest.components.hooks.is_some() {
-                    hooks_registered += 1;
-                }
-                if entry.manifest.components.mcp_servers.is_some() {
-                    mcp_connected += 1;
-                }
-            }
-            // Collect names into owned strings so the immutable borrow of the
-            // registry (via list_enabled()) ends before the mutable resolve.
-            let names_to_resolve: Vec<String> = enabled_entries
-                .iter()
-                .map(|e| e.manifest.name.clone())
-                .collect();
-
-            // Surface malformed manifests resolved during scan. Done after the
-            // borrow above ends, since resolve_components takes &mut self.
-            let mut errors: Vec<String> = Vec::new();
-            for name in &names_to_resolve {
-                if let Err(e) = registry.resolve_components(name) {
-                    errors.push(format!("{}: {}", name, e));
-                }
-            }
-
-            println!("Loaded {total} plugins ({enabled} enabled).");
-            println!("  Skills components:  {skills_loaded}");
-            println!("  Hooks components:   {hooks_registered}");
-            println!("  MCP components:     {mcp_connected}");
-            if !errors.is_empty() {
-                println!("Errors ({}):", errors.len());
-                for err in &errors {
-                    println!("  - {err}");
-                }
-            }
-            println!("Note: Plugin components will be wired on next agent restart.");
         }
 
         "init" => {
@@ -367,14 +322,22 @@ components:
                 return CommandOutcome::Continue;
             }
 
-            // Create default directories
-            let _ = std::fs::create_dir_all(dir.join("skills"));
-            let _ = std::fs::create_dir_all(dir.join("hooks"));
-            let _ = std::fs::create_dir_all(dir.join("agents"));
+            for path in [dir.join("skills"), dir.join("hooks"), dir.join("agents")] {
+                if let Err(error) = std::fs::create_dir_all(&path) {
+                    println!("Failed to create {}: {error}", path.display());
+                    return CommandOutcome::Continue;
+                }
+            }
 
-            // Create placeholder files
-            let _ = std::fs::write(dir.join("hooks").join("hooks.yaml"), "# Hook definitions\n");
-            let _ = std::fs::write(dir.join(".mcp.json"), "{\n  \"mcpServers\": {}\n}\n");
+            for (path, content) in [
+                (dir.join("hooks").join("hooks.yaml"), "{}\n"),
+                (dir.join(".mcp.json"), "{\n  \"mcpServers\": {}\n}\n"),
+            ] {
+                if let Err(error) = std::fs::write(&path, content) {
+                    println!("Failed to write {}: {error}", path.display());
+                    return CommandOutcome::Continue;
+                }
+            }
 
             println!("Plugin scaffolded at: {}", dir.display());
             println!("  .echo-plugin/manifest.yaml");

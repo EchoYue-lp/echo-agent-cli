@@ -93,6 +93,8 @@ pub struct CommandContext {
     pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     /// Scheduler runner for managing cron tasks.
     pub scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    /// Shared live plugin runtime used by every interaction surface.
+    pub plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     /// Static prompt-module report captured during runtime bootstrap.
     pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
     /// Workspace-bound review/evolution integration shared with the runtime.
@@ -114,6 +116,7 @@ impl CommandContext {
             registry: None,
             task_service: None,
             scheduler: None,
+            plugin_runtime: None,
             prompt_assembly: None,
             review_integration: None,
             interaction_mode: Arc::new(tokio::sync::RwLock::new(
@@ -154,6 +157,14 @@ impl CommandContext {
         runner: Arc<echo_agent_app_core::scheduler::SchedulerRunner>,
     ) -> Self {
         self.scheduler = Some(runner);
+        self
+    }
+
+    pub fn with_plugin_runtime(
+        mut self,
+        runtime: Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    ) -> Self {
+        self.plugin_runtime = Some(runtime);
         self
     }
 

@@ -318,6 +318,9 @@ pub struct TuiApp {
     pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
     /// Shared scheduler used by direct `/cron` commands.
     pub scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    /// Shared live plugin runtime used by direct `/plugins` commands.
+    pub plugin_runtime:
+        Option<std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     /// Latest TaskRuntime projection for the current conversation.
     pub task_runtime_view: Option<TaskRuntimeView>,
     /// Live subagent dispatches observed from the framework event bus.
@@ -786,6 +789,7 @@ impl TuiApp {
             task_runtime_store: None,
             webhook_emitter: None,
             scheduler: None,
+            plugin_runtime: None,
             task_runtime_view: None,
             subagent_runs: Vec::new(),
             pending_attachments: Vec::new(),
@@ -1813,6 +1817,7 @@ pub async fn run_tui(
     configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
     browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
     prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
+    plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
     inline_mode: bool,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
@@ -1865,6 +1870,7 @@ pub async fn run_tui(
     app.conversation_store = conversation_store;
     app.configured_models = configured_models;
     app.prompt_assembly = Some(prompt_assembly);
+    app.plugin_runtime = Some(plugin_runtime);
     app.browser_runtime = Some(browser_runtime);
     app.inline_mode = inline_mode;
     app.project_files = collect_project_files(std::path::Path::new("."), 10_000);

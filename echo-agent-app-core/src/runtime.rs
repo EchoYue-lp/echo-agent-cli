@@ -33,10 +33,6 @@ pub struct AgentRuntime {
     pub hitl_dispatcher: Arc<HitlDispatcher>,
     pub app_config: AppConfig,
     pub keyword_classifier: KeywordClassifier,
-    /// Hook bridge for forwarding task lifecycle events to the central HookRegistry.
-    pub task_hook_bridge: Option<Arc<echo_agent::hooks_bridge::BridgedTaskHooks>>,
-    /// Hook bridge for forwarding subagent lifecycle events to the central HookRegistry.
-    pub subagent_hook_bridge: Option<echo_agent::hooks_bridge::SubagentHookBridge>,
     /// Shared `RuntimeStateStore` produced during bootstrap. Surfaced on the
     /// runtime so `init_pool` (and any future product paths) can inject the
     /// same instance into pooled agents — bypasses the previous `extract_from`
@@ -51,10 +47,7 @@ pub struct AgentRuntime {
     pub browser_runtime: Arc<crate::browser::BrowserRuntime>,
     /// Static EKO prompt-module budget report captured at agent build time.
     pub prompt_assembly: crate::project::prompt::PromptAssembly,
-    /// Process-level shared plugin runtime (P0-4). Built after plugins are
-    /// initially wired by [`load_plugins`] so the Tauri plugin commands share
-    /// one registry with the running agent instead of each spinning up their
-    /// own via `build_registry()`.
+    /// Process-level shared plugin runtime used by every interaction surface.
     pub plugin_runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
 }
 
@@ -226,11 +219,6 @@ impl AgentRuntime {
         // hooks.yaml file existed.
         infra::load_user_hooks(&agent_handle, app_config).await;
 
-        // ── 7. Hook bridges ──
-        let task_hook_bridge = agent_handle.read(|a| a.create_task_hook_bridge()).await;
-        let subagent_hook_bridge = agent_handle.read(|a| a.create_subagent_hook_bridge()).await;
-        tracing::info!("Hook bridges created");
-
         // ── 8b. Review integration — create when Store is available so
         //       /memory-review and session-end hooks can access it. ──
         // The `echo_agent_dir` MUST be the same root the memory store was
@@ -278,13 +266,8 @@ impl AgentRuntime {
         }
 
         // ── 9. Plugins ──
-        load_plugins(&agent_handle).await;
-
-        // ── 9b. Process-level shared plugin runtime (P0-4) ──
-        // Built AFTER `load_plugins` so the initial wiring has already landed
-        // on the agent. The service does an initial `scan_all()` but does NOT
-        // re-run `wire_all` here (that would double-register skills/hooks);
-        // subsequent user-driven enable/disable/reload IPC is what re-wires.
+        // Discovery, initial wiring, and later live mutations all go through
+        // one runtime owner. This avoids bootstrap/reload double registration.
         let plugin_runtime =
             crate::plugin_runtime::PluginRuntimeService::new(agent_handle.clone()).await;
 
@@ -371,8 +354,6 @@ impl AgentRuntime {
             hitl_dispatcher,
             app_config: app_config.clone(),
             keyword_classifier,
-            task_hook_bridge: Some(Arc::new(task_hook_bridge)),
-            subagent_hook_bridge: Some(subagent_hook_bridge),
             state_store,
             review_integration,
             browser_runtime,
@@ -506,53 +487,6 @@ impl AgentRuntime {
                 tracing::warn!(path = %memory_file.display(), error = %e, "Failed to open project memory for writing");
             }
         }
-    }
-}
-
-async fn load_plugins(agent_handle: &AgentHandle) {
-    use echo_agent::plugin::{PluginIntegrator, PluginRegistry};
-
-    let mut plugin_registry = PluginRegistry::new(None);
-
-    if let Err(e) = plugin_registry.scan_all() {
-        tracing::warn!("Failed to scan plugins: {e}");
-        return;
-    }
-
-    let plugin_count = plugin_registry.count();
-    let enabled_count = plugin_registry.list_enabled().len();
-
-    if plugin_count == 0 {
-        return;
-    }
-
-    tracing::info!("Discovered {plugin_count} plugins ({enabled_count} enabled)");
-
-    // Thin adapter: delegate discovery + dependency resolution + skills/hooks/
-    // MCP wiring to the framework `PluginIntegrator` (audit P0-2b / AGENTS.md
-    // gate #3 "no parallel implementation of the same semantics"). The previous
-    // hand-written loop duplicated `wire_all` and filed plugin hooks under
-    // `HookSource::Skill("plugin:…")`; the framework path now uses
-    // `register_plugin_hooks` → `HookSource::Plugin(name)`.
-    let wiring = agent_handle
-        .write_async(|a| {
-            Box::pin(async move {
-                PluginIntegrator::new()
-                    .wire_all(a, &mut plugin_registry)
-                    .await
-            })
-        })
-        .await;
-
-    tracing::info!(
-        skills = wiring.skills_loaded.len(),
-        hooks = wiring.hooks_registered.len(),
-        mcp = wiring.mcp_connected.len(),
-        errors = wiring.errors.len(),
-        "Plugin wiring complete"
-    );
-    for err in &wiring.errors {
-        tracing::warn!(error = %err, "Plugin wiring error");
     }
 }
 

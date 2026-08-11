@@ -6,32 +6,23 @@
 //! `McpManager`. `enable`/`disable` only flipped a flag on disk; `reload` only
 //! recomputed counts — none of them ever touched the live agent.
 //!
-//! This service fixes that by holding one shared `PluginRegistry` plus a
-//! reference to the running primary agent (`AgentHandle`). Enable/disable and
-//! reload now run the framework `PluginIntegrator::wire_all` against the live
-//! agent so newly enabled skills/hooks/MCP servers actually get wired in.
-//!
-//! ## Industry reference
-//!
-//! Codex and Claude Code both implement enable/disable as "re-discovery +
-//! registry rebuild" rather than live hot-plug of a running agent (the agent's
-//! subsystems don't support atomic removal of a single registered component).
-//! EKO follows the same model: every state change re-runs `wire_all`, which is
-//! additive. Disabling a plugin therefore does NOT unload the components it
-//! already registered (skills/hooks are still in the agent's registries). True
-//! unload is a P1 follow-up tracked in `docs/MASTER-PLAN.md`.
+//! This service owns discovery and live component state for every interaction
+//! surface. Each mutation is serialized and rebuilt as one operation: scan the
+//! new registry, unload the previous skills/hooks/MCP servers, then wire the
+//! enabled set. Reload therefore cannot accumulate duplicate or stale entries.
 //!
 //! ## Threading model
 //!
-//! The shared registry is guarded by a `tokio::sync::Mutex` because `wire_all`
-//! is async and we hold the registry across an `.await` (the agent write lock
-//! is also async). Using `parking_lot::Mutex` here would deadlock-prone or
-//! require holding a sync guard across an await (not `Send`).
+//! One async mutex protects registry state and serializes reload, install,
+//! uninstall, enable, and disable. This prevents a slower rebuild from
+//! publishing stale state over a newer operation.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use echo_agent::plugin::{
     InstallSource, PluginEntry, PluginIntegrator, PluginRegistry, PluginScope, PluginWiringResult,
+    WiredPluginComponents,
 };
 use serde::Serialize;
 use tokio::sync::Mutex;
@@ -75,48 +66,52 @@ impl ReloadSummary {
 /// the agent's `working_dir` so `Project`/`Local` scoped plugins resolve
 /// against the active workspace (matching the bootstrap-time `load_plugins`
 /// behavior in `runtime.rs`).
+struct PluginRuntimeState {
+    registry: PluginRegistry,
+    components_by_plugin: HashMap<String, WiredPluginComponents>,
+}
+
 pub struct PluginRuntimeService {
     agent_handle: AgentHandle,
-    registry: Mutex<PluginRegistry>,
+    state: Mutex<PluginRuntimeState>,
 }
 
 impl PluginRuntimeService {
     /// Construct the service, deriving `project_root` from the agent's current
     /// `working_dir` (falls back to process cwd).
     ///
-    /// Performs an initial `scan_all()` so that `list()`/`get()` work
-    /// immediately without requiring a separate reload call. Initial wiring
-    /// into the agent is NOT done here — bootstrap (`runtime::load_plugins`)
-    /// already wired plugins once during agent construction, and re-running
-    /// `wire_all` would double-register skills/hooks. The first `reload()`
-    /// call from a user action is what re-wires.
+    /// The initial load goes through the same rebuild path as every later
+    /// reload, so bootstrap cannot double-register components.
     pub async fn new(agent_handle: AgentHandle) -> Arc<Self> {
-        let project_root = agent_handle
-            .read(|agent| agent.working_dir())
-            .await
-            .or_else(|| std::env::current_dir().ok());
-
-        let mut registry = PluginRegistry::new(project_root);
-        if let Err(error) = registry.scan_all() {
-            tracing::warn!(%error, "PluginRuntimeService: initial scan_all failed");
-        }
-
-        Arc::new(Self {
+        let service = Arc::new(Self {
             agent_handle,
-            registry: Mutex::new(registry),
-        })
+            state: Mutex::new(PluginRuntimeState {
+                registry: PluginRegistry::new(None),
+                components_by_plugin: HashMap::new(),
+            }),
+        });
+        if let Err(error) = service.reload().await {
+            tracing::warn!(%error, "PluginRuntimeService: initial plugin load failed");
+        }
+        service
     }
 
     /// Re-scan all plugin scopes and re-run `wire_all` against the live agent.
     ///
-    /// This is the rebuild model: discovery + wiring are redone from scratch
-    /// against the running agent (not a hot-plug). See module docs for the
-    /// known limitation around disable.
     pub async fn reload(&self) -> anyhow::Result<ReloadSummary> {
+        let mut state = self.state.lock().await;
+        self.reload_locked(&mut state).await
+    }
+
+    async fn reload_locked(&self, state: &mut PluginRuntimeState) -> anyhow::Result<ReloadSummary> {
+        let previously_enabled = state
+            .registry
+            .list_enabled()
+            .into_iter()
+            .map(|entry| entry.manifest.name.clone())
+            .collect::<HashSet<_>>();
         // Re-scan with the agent's CURRENT working_dir as project root so a
-        // workspace switch is reflected without restarting the service. We
-        // reconstruct the registry in place: scan_all already clears plugins,
-        // but it doesn't re-resolve project_root, so we rebuild it.
+        // workspace switch is reflected without restarting the service.
         let project_root = self
             .agent_handle
             .read(|agent| agent.working_dir())
@@ -127,24 +122,57 @@ impl PluginRuntimeService {
         registry
             .scan_all()
             .map_err(|e| anyhow::anyhow!("Plugin scan failed: {e}"))?;
+        registry
+            .resolve_enabled_dependencies()
+            .map_err(|error| anyhow::anyhow!("Plugin dependency validation failed: {error}"))?;
 
         let total = registry.count();
         let enabled = registry.list_enabled().len();
+        let enabled_names = registry
+            .list_enabled()
+            .into_iter()
+            .map(|entry| entry.manifest.name.clone())
+            .collect::<HashSet<_>>();
+        let mut externally_disabled = previously_enabled
+            .difference(&enabled_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        externally_disabled.sort();
+        let previous_components = std::mem::take(&mut state.components_by_plugin);
 
-        // Run wire_all against the live agent inside the write lock. The
-        // registry is moved into the closure (it must be `'static` + `Send`),
-        // wired by reference, and returned back out so we can publish it to
-        // the shared slot. Returning `(PluginWiringResult, PluginRegistry)`
-        // avoids a "use of moved value" after the closure.
-        let (wiring, registry) = self
+        let (wiring, registry, hook_registry, session_id, agent_name) = self
             .agent_handle
             .write_async(|agent| {
                 Box::pin(async move {
+                    unload_components(agent, previous_components).await;
                     let wiring = PluginIntegrator::new().wire_all(agent, &mut registry).await;
-                    (wiring, registry)
+                    let hook_registry = agent.hook_registry().clone();
+                    let session_id = agent
+                        .config()
+                        .get_session_id()
+                        .unwrap_or_default()
+                        .to_string();
+                    let agent_name = agent.config().get_agent_name().to_string();
+                    (wiring, registry, hook_registry, session_id, agent_name)
                 })
             })
             .await;
+        fire_plugin_events(
+            &hook_registry,
+            echo_agent::skills::hooks::HookEvent::PluginDisabled,
+            &externally_disabled,
+            &session_id,
+            &agent_name,
+        )
+        .await;
+        fire_plugin_events(
+            &hook_registry,
+            echo_agent::skills::hooks::HookEvent::PluginLoaded,
+            &wiring.plugins_loaded,
+            &session_id,
+            &agent_name,
+        )
+        .await;
 
         tracing::info!(
             total,
@@ -160,9 +188,8 @@ impl PluginRuntimeService {
         }
 
         let summary = ReloadSummary::from_wiring(total, enabled, &wiring);
-
-        // Publish the freshly-wired registry back to the shared slot.
-        *self.registry.lock().await = registry;
+        state.components_by_plugin = wiring.components_by_plugin.clone();
+        state.registry = registry;
 
         Ok(summary)
     }
@@ -171,118 +198,61 @@ impl PluginRuntimeService {
     ///
     /// The plugin becomes eligible for `wire_all`; reload attaches its
     /// skills/hooks/MCP into the running agent.
-    pub async fn enable(&self, name: &str) -> anyhow::Result<()> {
-        {
-            let mut registry = self.registry.lock().await;
-            registry
-                .enable(name)
-                .map_err(|e| anyhow::anyhow!("Enable plugin '{name}' failed: {e}"))?;
-            // save_state is already invoked inside registry.enable; no extra
-            // persistence needed here.
-        }
-        self.reload().await.map(|_| ())
+    pub async fn enable(&self, name: &str) -> anyhow::Result<ReloadSummary> {
+        let mut state = self.state.lock().await;
+        state
+            .registry
+            .enable(name)
+            .map_err(|e| anyhow::anyhow!("Enable plugin '{name}' failed: {e}"))?;
+        self.reload_locked(&mut state).await
     }
 
-    /// Disable a plugin, unload its components from the live agent, then
-    /// re-wire the still-enabled subset.
-    ///
-    /// Unload (P1-reload) removes the plugin's skills via
-    /// `SkillRegistry::unregister_by_source` and its hooks via
-    /// `HookRegistry::unregister(HookSource::Plugin)`. MCP servers are not
-    /// disconnected here (the framework MCP manager has no per-server
-    /// disconnect API); they become inert on next reload's idempotent re-wire.
-    /// After unload, `reload()` re-wires the remaining enabled plugins.
-    pub async fn disable(&self, name: &str) -> anyhow::Result<()> {
-        {
-            let mut registry = self.registry.lock().await;
-            registry
-                .disable(name)
-                .map_err(|e| anyhow::anyhow!("Disable plugin '{name}' failed: {e}"))?;
-        }
-        // Unload this plugin's skills + hooks from the live agent before
-        // reloading, so the disabled plugin's components are actually gone
-        // (wire_all is additive and cannot remove them).
-        let source_tag = format!("plugin:{name}");
-        let hook_source = echo_agent::skills::hooks::HookSource::Plugin(name.to_string());
-        let plugin_name = name.to_string();
-        self.agent_handle
-            .write_async(|agent| {
-                Box::pin(async move {
-                    let removed_skills =
-                        agent.skill_registry_mut().unregister_by_source(&source_tag);
-                    let mut hook_reg = agent.hook_registry().write().await;
-                    let removed_hooks = hook_reg.unregister(&hook_source);
-                    tracing::info!(
-                        plugin = %plugin_name,
-                        removed_skills,
-                        removed_hooks,
-                        "Unloaded plugin components from live agent (disable)"
-                    );
-                })
-            })
-            .await;
-        self.reload().await.map(|_| ())
+    /// Disable a plugin and rebuild the live enabled set.
+    pub async fn disable(&self, name: &str) -> anyhow::Result<ReloadSummary> {
+        let mut state = self.state.lock().await;
+        state
+            .registry
+            .disable(name)
+            .map_err(|e| anyhow::anyhow!("Disable plugin '{name}' failed: {e}"))?;
+        let summary = self.reload_locked(&mut state).await?;
+        self.fire_plugin_disabled(name).await;
+        Ok(summary)
     }
 
     /// Install a plugin from a source into a scope, then reload to wire it.
     ///
-    /// `Local` source confinement to allowed roots (workspace / home) is the
-    /// caller's responsibility (preserved in the Tauri command) — this method
-    /// trusts the caller. Git-source SSRF is handled inside the framework
-    /// registry.
     pub async fn install(
         &self,
         source: &InstallSource,
         scope: PluginScope,
-    ) -> anyhow::Result<String> {
-        let plugin_id = {
-            let mut registry = self.registry.lock().await;
-            registry
-                .install(source, scope)
-                .map_err(|e| anyhow::anyhow!("Install plugin failed: {e}"))?
-        };
-        self.reload().await.map(|_| ())?;
-        Ok(plugin_id)
+    ) -> anyhow::Result<(String, ReloadSummary)> {
+        let mut state = self.state.lock().await;
+        let plugin_id = state
+            .registry
+            .install(source, scope)
+            .map_err(|e| anyhow::anyhow!("Install plugin failed: {e}"))?;
+        let summary = self.reload_locked(&mut state).await?;
+        Ok((plugin_id, summary))
     }
 
-    /// Uninstall a plugin, unload its components from the live agent, then
-    /// reload the remaining set.
-    ///
-    /// Same unload path as `disable` (skills + hooks removed; MCP inert).
-    pub async fn uninstall(&self, name: &str, keep_data: bool) -> anyhow::Result<()> {
-        {
-            let mut registry = self.registry.lock().await;
-            registry
-                .uninstall(name, keep_data)
-                .map_err(|e| anyhow::anyhow!("Uninstall plugin '{name}' failed: {e}"))?;
-        }
-        let source_tag = format!("plugin:{name}");
-        let hook_source = echo_agent::skills::hooks::HookSource::Plugin(name.to_string());
-        let plugin_name = name.to_string();
-        self.agent_handle
-            .write_async(|agent| {
-                Box::pin(async move {
-                    let removed_skills =
-                        agent.skill_registry_mut().unregister_by_source(&source_tag);
-                    let mut hook_reg = agent.hook_registry().write().await;
-                    let removed_hooks = hook_reg.unregister(&hook_source);
-                    tracing::info!(
-                        plugin = %plugin_name,
-                        removed_skills,
-                        removed_hooks,
-                        "Unloaded plugin components from live agent (uninstall)"
-                    );
-                })
-            })
-            .await;
-        self.reload().await.map(|_| ())
+    /// Uninstall a plugin and rebuild the remaining live set.
+    pub async fn uninstall(&self, name: &str, keep_data: bool) -> anyhow::Result<ReloadSummary> {
+        let mut state = self.state.lock().await;
+        state
+            .registry
+            .uninstall(name, keep_data)
+            .map_err(|e| anyhow::anyhow!("Uninstall plugin '{name}' failed: {e}"))?;
+        let summary = self.reload_locked(&mut state).await?;
+        self.fire_plugin_disabled(name).await;
+        Ok(summary)
     }
 
     /// Snapshot of all installed plugins (sorted by name by the framework).
     pub async fn list(&self) -> Vec<PluginEntry> {
-        self.registry
+        self.state
             .lock()
             .await
+            .registry
             .list()
             .into_iter()
             .cloned()
@@ -291,7 +261,83 @@ impl PluginRuntimeService {
 
     /// Lookup a single plugin by id.
     pub async fn get(&self, name: &str) -> Option<PluginEntry> {
-        self.registry.lock().await.get(name).cloned()
+        self.state.lock().await.registry.get(name).cloned()
+    }
+
+    async fn fire_plugin_disabled(&self, name: &str) {
+        let (hook_registry, session_id, agent_name) = self
+            .agent_handle
+            .read(|agent| {
+                (
+                    agent.hook_registry().clone(),
+                    agent
+                        .config()
+                        .get_session_id()
+                        .unwrap_or_default()
+                        .to_string(),
+                    agent.config().get_agent_name().to_string(),
+                )
+            })
+            .await;
+        fire_plugin_events(
+            &hook_registry,
+            echo_agent::skills::hooks::HookEvent::PluginDisabled,
+            &[name.to_string()],
+            &session_id,
+            &agent_name,
+        )
+        .await;
+    }
+}
+
+async fn fire_plugin_events(
+    hook_registry: &std::sync::Arc<tokio::sync::RwLock<echo_agent::skills::hooks::HookRegistry>>,
+    event: echo_agent::skills::hooks::HookEvent,
+    plugin_names: &[String],
+    session_id: &str,
+    agent_name: &str,
+) {
+    for plugin_name in plugin_names {
+        let context = echo_agent::skills::hooks::HookContext::for_lifecycle(
+            event,
+            plugin_name,
+            session_id,
+            agent_name,
+        );
+        let _ = hook_registry
+            .read()
+            .await
+            .run_lifecycle_hooks(&context)
+            .await;
+    }
+}
+
+async fn unload_components(
+    agent: &mut echo_agent::agent::react::ReactAgent,
+    components_by_plugin: HashMap<String, WiredPluginComponents>,
+) {
+    for (plugin_name, components) in components_by_plugin {
+        let source_tag = format!("plugin:{plugin_name}");
+        let removed_skills = agent.unregister_skills_by_source(&source_tag).await.len();
+        let removed_hooks = if components.hooks_registered {
+            let hook_source = echo_agent::skills::hooks::HookSource::Plugin(plugin_name.clone());
+            agent.hook_registry().write().await.unregister(&hook_source)
+        } else {
+            false
+        };
+        let mut removed_mcp = 0usize;
+        for server_name in components.mcp_servers {
+            if agent.disconnect_mcp(&server_name).await {
+                removed_mcp = removed_mcp.saturating_add(1);
+            }
+        }
+        tracing::info!(
+            plugin = %plugin_name,
+            removed_skills,
+            removed_hooks,
+            removed_mcp,
+            "Unloaded plugin components from live agent"
+        );
     }
 }
 

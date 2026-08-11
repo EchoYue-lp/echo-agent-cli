@@ -41,7 +41,7 @@ use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use futures::StreamExt;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
-use super::store::{ClaimWriteOutcome, StoreError, TaskRuntimeStore};
+use super::store::{ClaimWriteOutcome, StoreError, SubagentReleaseRecord, TaskRuntimeStore};
 use super::types::*;
 
 /// EKO product-resource limits. Only the Subagent cap is passed to the
@@ -2019,8 +2019,11 @@ async fn execute_task(
         &task_id,
         &execution_id,
         &task.agent_role,
+        &task.title,
+        claim.revision,
         attempt,
         task.kind.is_read_only(),
+        app_owns_subagent_events,
     ) {
         return Err((
             task_id,
@@ -2215,14 +2218,19 @@ async fn execute_task(
             }) {
                 tracing::warn!(task_id = %task_id, error = %e, "failed to persist TaskExecutionSummary");
             }
-            if let Err(error) = store.record_subagent_released(
-                &run_id,
-                &task_id,
-                &execution_id,
-                task_result.status.as_str(),
-                Some(&task_result),
-                Some(&full_output),
-            ) {
+            if let Err(error) = store.record_subagent_released(SubagentReleaseRecord {
+                run_id: &run_id,
+                task_id: &task_id,
+                execution_id: &execution_id,
+                agent_name: &task.agent_role,
+                task_subject: &task.title,
+                plan_revision: claim.revision,
+                attempt,
+                status: task_result.status.as_str(),
+                result: Some(&task_result),
+                full_output: Some(&full_output),
+                dispatch_hook: app_owns_subagent_events,
+            }) {
                 return Err((
                     task_id,
                     format!("Subagent completed but terminal boundary was not persisted: {error}"),
@@ -2311,14 +2319,19 @@ async fn execute_task(
             }) {
                 tracing::warn!(task_id = %task_id, %error, "failed to persist terminal TaskExecutionSummary");
             }
-            if let Err(error) = store.record_subagent_released(
-                &run_id,
-                &task_id,
-                &execution_id,
-                status.as_str(),
-                Some(&task_result),
-                Some(&e),
-            ) {
+            if let Err(error) = store.record_subagent_released(SubagentReleaseRecord {
+                run_id: &run_id,
+                task_id: &task_id,
+                execution_id: &execution_id,
+                agent_name: &task.agent_role,
+                task_subject: &task.title,
+                plan_revision: claim.revision,
+                attempt,
+                status: status.as_str(),
+                result: Some(&task_result),
+                full_output: Some(&e),
+                dispatch_hook: app_owns_subagent_events,
+            }) {
                 tracing::warn!(
                     run_id = %run_id,
                     task_id = %task_id,
@@ -5331,18 +5344,33 @@ Read the runtime path and found one missing branch.
         let run_id = seed_run(&store, vec![task.clone()])?;
         let execution_id = format!("{run_id}:a:1:1");
         store
-            .record_subagent_assigned(&run_id, "a", &execution_id, "reviewer", 1, true)
-            .map_err(|error| error.to_string())?;
-        let recovered_result = successful_task_result("recovered summary");
-        store
-            .record_subagent_released(
+            .record_subagent_assigned(
                 &run_id,
                 "a",
                 &execution_id,
-                "completed",
-                Some(&recovered_result),
-                Some("recovered full output"),
+                "reviewer",
+                &task.title,
+                1,
+                1,
+                true,
+                true,
             )
+            .map_err(|error| error.to_string())?;
+        let recovered_result = successful_task_result("recovered summary");
+        store
+            .record_subagent_released(SubagentReleaseRecord {
+                run_id: &run_id,
+                task_id: "a",
+                execution_id: &execution_id,
+                agent_name: "reviewer",
+                task_subject: &task.title,
+                plan_revision: 1,
+                attempt: 1,
+                status: "completed",
+                result: Some(&recovered_result),
+                full_output: Some("recovered full output"),
+                dispatch_hook: true,
+            })
             .map_err(|error| error.to_string())?;
         let dispatcher = ScriptedDispatcher::new();
 

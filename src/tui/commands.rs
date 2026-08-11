@@ -83,6 +83,7 @@ pub enum SlashCommand {
     Skills,
     Mcp,
     Hooks,
+    Plugins,
 
     // -- Coding --
     Plan,
@@ -162,6 +163,7 @@ impl SlashCommand {
             Self::Skills => "List and manage skills",
             Self::Mcp => "List, load, or disconnect MCP servers",
             Self::Hooks => "List, reload, or test hooks",
+            Self::Plugins => "Manage live plugins",
 
             Self::Plan => "Enter plan mode (read-only)",
             Self::Mode => "Switch interaction mode (auto/chat/task)",
@@ -232,7 +234,8 @@ impl SlashCommand {
             | Self::Attach
             | Self::Skills
             | Self::Mcp
-            | Self::Hooks => Category::Context,
+            | Self::Hooks
+            | Self::Plugins => Category::Context,
             Self::Plan
             | Self::Mode
             | Self::Tasks
@@ -303,6 +306,7 @@ impl SlashCommand {
             Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",
             Self::Mcp => "[list|load <config>|disconnect <name>]",
             Self::Hooks => "[list|reload|test <event>]",
+            Self::Plugins => "[list|install|uninstall|enable|disable|info|reload]",
             Self::EvidenceInbox => {
                 "[pending|expired|undoable|show|edit|accept|reject|undo] [candidate-id] [content]"
             }

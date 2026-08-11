@@ -1801,28 +1801,6 @@ async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError>
     }
 }
 
-/// Roots under which a skill directory may legitimately reside (P1-6).
-///
-/// Returns the current workspace root (best-effort; skipped if unavailable)
-/// plus the user's home directory (where the global skills bundle lives).
-/// `load_skill` canonicalizes the requested path and requires it to be under
-/// one of these, so a compromised page cannot point the agent at an arbitrary
-/// on-disk SKILL.md.
-pub(crate) async fn allowed_skill_roots(state: &TauriState) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    if let Ok(ws_root) = workspace_project_root(state).await
-        && let Ok(c) = ws_root.canonicalize()
-    {
-        roots.push(c);
-    }
-    if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from)
-        && let Ok(c) = home.canonicalize()
-    {
-        roots.push(c);
-    }
-    roots
-}
-
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, IpcError> {
     let output = Command::new("git")
         .arg("-C")

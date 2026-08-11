@@ -19,6 +19,7 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         project: args.project.clone(),
         task_service: None,
         scheduler_runner: None,
+        plugin_runtime: None,
         review_integration: None,
         prompt_assembly: None,
         pool: None,
@@ -77,6 +78,7 @@ pub async fn run_cli_mode(
     >,
     conversation_id: String,
     webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
+    plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
 ) -> Result<()> {
     let (task_service, scheduler_runner) = start_headless_services(
         agent.clone(),
@@ -97,6 +99,7 @@ pub async fn run_cli_mode(
     repl_config.task_runtime_store = task_runtime_store;
     repl_config.conversation_id = conversation_id;
     repl_config.webhook_emitter = Some(webhook_emitter);
+    repl_config.plugin_runtime = Some(plugin_runtime);
 
     crate::cli::run_repl(agent, repl_config).await
 }

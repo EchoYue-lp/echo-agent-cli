@@ -16,7 +16,6 @@ pub mod evolution;
 pub mod export;
 pub mod hitl;
 pub mod hook_config_loader;
-pub mod hooks_config;
 pub mod infra;
 pub mod instruction_provider;
 pub mod model_config;
