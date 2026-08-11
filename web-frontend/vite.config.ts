@@ -10,9 +10,9 @@ export default defineConfig(({ mode }) => {
     build: {
       // Tauri v2 frontend plugins must be bundled by Vite — they are NOT
       // available as global scripts in the webview. Do NOT externalize them.
-      // The application entry is kept below 600 kB minified (about 150 kB gzip)
-      // after large editor, terminal, markdown, and icon dependencies are split.
-      chunkSizeWarningLimit: 600,
+      // Keep a bounded warning threshold after large editor, terminal, markdown,
+      // and icon dependencies are split into independently cached chunks.
+      chunkSizeWarningLimit: 700,
       rollupOptions: {
         output: {
           manualChunks: {

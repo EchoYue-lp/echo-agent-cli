@@ -11,10 +11,10 @@
 //! agent's `TaskHookBridge` / `SubagentHookBridge`.
 //!
 //! This keeps the store synchronous while giving YAML-configured hooks
-//! visibility into the lifecycle. The callback only sends to one async queue;
-//! a single consumer fires hooks in persisted event order. Independent
-//! `tokio::spawn` calls are deliberately avoided because they can deliver
-//! Completed before Started.
+//! visibility into the lifecycle. A bounded queue applies backpressure to the
+//! synchronous producer and one dedicated consumer fires hooks in persisted
+//! event order. Independent `tokio::spawn` calls are deliberately avoided
+//! because they can deliver Completed before Started.
 //!
 //! ## Translation
 //!
@@ -24,11 +24,14 @@
 //! | `TaskStarted` | `TaskStarted` (PlanTask first claim) |
 //! | `TaskCompleted` | `TaskCompleted(status=Completed)` |
 //! | `TaskFailed` | `TaskCompleted(status=Failed)` |
+//! | `TaskCancelled` | `TaskCompleted(status=Cancelled)` |
+//! | `TaskTimedOut` | `TaskCompleted(status=TimedOut)` |
 //! | `TaskSkipped` | `TaskCompleted(status=Skipped)` |
 //! | `SubagentAssigned` (`dispatch_hook=true`) | `SubagentStart` |
 //! | `SubagentReleased` (`dispatch_hook=true`) | `SubagentStop(status)` |
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use echo_agent::hooks_bridge::{HookCorrelation, SubagentHookBridge, TaskHookBridge};
 use echo_core::hooks::{SubagentStopStatus, TaskTerminalStatus};
@@ -44,52 +47,170 @@ use super::types::{RuntimeEventKind, RuntimeTaskEvent};
 /// bridges are absent (e.g. during early bootstrap / in-memory test stores).
 #[derive(Clone)]
 pub struct HookEventDispatcher {
-    sender: Option<tokio::sync::mpsc::UnboundedSender<EventTranslation>>,
+    inner: Option<Arc<DispatcherInner>>,
+}
+
+struct DispatcherInner {
+    sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<QueueCommand>>>,
+    shutdown: AtomicBool,
+}
+
+enum QueueCommand {
+    Event(EventTranslation),
+    Flush(tokio::sync::oneshot::Sender<()>),
+    Shutdown(tokio::sync::oneshot::Sender<()>),
+    #[cfg(test)]
+    Pause {
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
 }
 
 impl HookEventDispatcher {
+    const DEFAULT_QUEUE_CAPACITY: usize = 256;
+
     pub fn new(
         task_bridge: Option<Arc<TaskHookBridge>>,
         subagent_bridge: Option<Arc<SubagentHookBridge>>,
     ) -> Result<Self, String> {
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|error| format!("HookEventDispatcher requires a Tokio runtime: {error}"))?;
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<EventTranslation>();
-        handle.spawn(async move {
-            while let Some(event) = receiver.recv().await {
-                event
-                    .fire(task_bridge.as_ref(), subagent_bridge.as_ref())
-                    .await;
-            }
-        });
+        Self::new_with_capacity(task_bridge, subagent_bridge, Self::DEFAULT_QUEUE_CAPACITY)
+    }
+
+    fn new_with_capacity(
+        task_bridge: Option<Arc<TaskHookBridge>>,
+        subagent_bridge: Option<Arc<SubagentHookBridge>>,
+        capacity: usize,
+    ) -> Result<Self, String> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| format!("Failed to build HookEventDispatcher runtime: {error}"))?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<QueueCommand>(capacity.max(1));
+        std::thread::Builder::new()
+            .name("eko-hook-dispatcher".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        QueueCommand::Event(event) => runtime
+                            .block_on(event.fire(task_bridge.as_ref(), subagent_bridge.as_ref())),
+                        QueueCommand::Flush(acknowledge) => {
+                            let _ = acknowledge.send(());
+                        }
+                        QueueCommand::Shutdown(acknowledge) => {
+                            let _ = acknowledge.send(());
+                            break;
+                        }
+                        #[cfg(test)]
+                        QueueCommand::Pause { started, release } => {
+                            let _ = started.send(());
+                            let _ = release.recv();
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("Failed to start HookEventDispatcher: {error}"))?;
         Ok(Self {
-            sender: Some(sender),
+            inner: Some(Arc::new(DispatcherInner {
+                sender: std::sync::Mutex::new(Some(sender)),
+                shutdown: AtomicBool::new(false),
+            })),
         })
     }
 
-    /// A dispatcher with no bridges — all events dropped. Useful as a
-    /// placeholder when constructing a store before bridges exist.
+    /// A dispatcher with no bridges and no queue.
     pub fn inactive() -> Self {
-        Self { sender: None }
+        Self { inner: None }
     }
 
-    /// The synchronous hook entry point — attached to `FileTaskShadow`.
+    /// Enqueue every translation in persisted order.
     ///
-    /// Translates the event and enqueues it without blocking the store lock.
-    pub fn dispatch(&self, event: &RuntimeTaskEvent) {
-        let Some(sender) = &self.sender else {
-            return;
+    /// The bounded channel blocks when full. This is deliberate backpressure:
+    /// lifecycle delivery is never silently dropped merely because hooks are
+    /// slower than the task event producer.
+    pub fn dispatch(&self, event: &RuntimeTaskEvent) -> Result<(), String> {
+        let Some(inner) = &self.inner else {
+            return Ok(());
         };
-        for translation in EventTranslation::from_runtime_event(event) {
-            if sender.send(translation).is_err() {
-                tracing::warn!(
-                    run_id = %event.run_id,
-                    seq = event.seq,
-                    "Task hook dispatcher stopped; lifecycle event was not delivered"
-                );
-                break;
-            }
+        if inner.shutdown.load(Ordering::Acquire) {
+            return Err("HookEventDispatcher is shut down".to_string());
         }
+        let sender = inner
+            .sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sender = sender
+            .as_ref()
+            .ok_or_else(|| "HookEventDispatcher is shut down".to_string())?;
+        for translation in EventTranslation::from_runtime_event(event) {
+            sender
+                .send(QueueCommand::Event(translation))
+                .map_err(|_| "HookEventDispatcher consumer stopped".to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Wait until every event enqueued before this call has finished firing.
+    pub async fn flush(&self) -> Result<(), String> {
+        let Some(inner) = &self.inner else {
+            return Ok(());
+        };
+        let (acknowledge, received) = tokio::sync::oneshot::channel();
+        let inner = inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let sender = inner
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match sender.as_ref() {
+                Some(sender) => sender
+                    .send(QueueCommand::Flush(acknowledge))
+                    .map_err(|_| "HookEventDispatcher consumer stopped before flush".to_string()),
+                None => {
+                    let _ = acknowledge.send(());
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .map_err(|error| format!("HookEventDispatcher flush join failed: {error}"))??;
+        received
+            .await
+            .map_err(|_| "HookEventDispatcher flush acknowledgement was lost".to_string())
+    }
+
+    /// Drain prior events and stop the consumer. Idempotent across clones.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let Some(inner) = &self.inner else {
+            return Ok(());
+        };
+        if inner.shutdown.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let (acknowledge, received) = tokio::sync::oneshot::channel();
+        let inner = inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let sender = inner
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            match sender {
+                Some(sender) => sender
+                    .send(QueueCommand::Shutdown(acknowledge))
+                    .map_err(|_| {
+                        "HookEventDispatcher consumer stopped before shutdown".to_string()
+                    }),
+                None => {
+                    let _ = acknowledge.send(());
+                    Ok(())
+                }
+            }
+        })
+        .await
+        .map_err(|error| format!("HookEventDispatcher shutdown join failed: {error}"))??;
+        received
+            .await
+            .map_err(|_| "HookEventDispatcher shutdown acknowledgement was lost".to_string())
     }
 }
 
@@ -153,15 +274,23 @@ impl EventTranslation {
             RuntimeEventKind::TaskStarted => TranslatedKind::TaskStarted,
             RuntimeEventKind::TaskCompleted => TranslatedKind::TaskCompleted {
                 result: first_str_or(&event.payload, &["summary"], &task_subject),
-                status: task_terminal_status(&event.payload, TaskTerminalStatus::Completed),
+                status: TaskTerminalStatus::Completed,
             },
             RuntimeEventKind::TaskFailed => TranslatedKind::TaskCompleted {
                 result: first_str_or(&event.payload, &["status_detail", "summary"], "failed"),
-                status: task_terminal_status(&event.payload, TaskTerminalStatus::Failed),
+                status: TaskTerminalStatus::Failed,
+            },
+            RuntimeEventKind::TaskCancelled => TranslatedKind::TaskCompleted {
+                result: first_str_or(&event.payload, &["status_detail", "summary"], "cancelled"),
+                status: TaskTerminalStatus::Cancelled,
+            },
+            RuntimeEventKind::TaskTimedOut => TranslatedKind::TaskCompleted {
+                result: first_str_or(&event.payload, &["status_detail", "summary"], "timed out"),
+                status: TaskTerminalStatus::TimedOut,
             },
             RuntimeEventKind::TaskSkipped => TranslatedKind::TaskCompleted {
                 result: first_str_or(&event.payload, &["status_detail", "summary"], "skipped"),
-                status: task_terminal_status(&event.payload, TaskTerminalStatus::Skipped),
+                status: TaskTerminalStatus::Skipped,
             },
             RuntimeEventKind::SubagentAssigned => {
                 if !event
@@ -407,17 +536,6 @@ fn first_str_or(payload: &Value, fields: &[&str], default: &str) -> String {
         .to_string()
 }
 
-fn task_terminal_status(payload: &Value, default: TaskTerminalStatus) -> TaskTerminalStatus {
-    match payload.get("hook_terminal_status").and_then(Value::as_str) {
-        Some("completed") => TaskTerminalStatus::Completed,
-        Some("failed") => TaskTerminalStatus::Failed,
-        Some("cancelled") => TaskTerminalStatus::Cancelled,
-        Some("timed_out") => TaskTerminalStatus::TimedOut,
-        Some("skipped") => TaskTerminalStatus::Skipped,
-        _ => default,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -492,11 +610,10 @@ mod tests {
     #[test]
     fn task_cancelled_status_is_not_collapsed_to_skipped() {
         let ev = make_event(
-            RuntimeEventKind::TaskSkipped,
+            RuntimeEventKind::TaskCancelled,
             Some("t-1"),
             json!({
                 "title": "build",
-                "hook_terminal_status": "cancelled",
                 "status_detail": "cancelled with parent run"
             }),
         );
@@ -505,6 +622,23 @@ mod tests {
             translated.first().map(|translation| &translation.kind),
             Some(TranslatedKind::TaskCompleted {
                 status: TaskTerminalStatus::Cancelled,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn task_timed_out_status_is_not_collapsed_to_failed() {
+        let event = make_event(
+            RuntimeEventKind::TaskTimedOut,
+            Some("t-1"),
+            json!({"status_detail": "provider deadline elapsed"}),
+        );
+        let translated = EventTranslation::from_runtime_event(&event);
+        assert!(matches!(
+            translated.first().map(|translation| &translation.kind),
+            Some(TranslatedKind::TaskCompleted {
+                status: TaskTerminalStatus::TimedOut,
                 ..
             })
         ));
@@ -606,6 +740,71 @@ mod tests {
         // No bridges → dispatch returns without spawning; just verify no panic.
         let d = HookEventDispatcher::inactive();
         let ev = make_event(RuntimeEventKind::TaskStarted, Some("t-1"), json!({}));
-        d.dispatch(&ev);
+        assert!(d.dispatch(&ev).is_ok());
+    }
+
+    #[tokio::test]
+    async fn flush_and_shutdown_are_explicit_and_idempotent() -> Result<(), String> {
+        let dispatcher = HookEventDispatcher::new_with_capacity(None, None, 1)?;
+        let event = make_event(RuntimeEventKind::TaskStarted, Some("t-1"), json!({}));
+        dispatcher.dispatch(&event)?;
+        dispatcher.flush().await?;
+        dispatcher.shutdown().await?;
+        dispatcher.shutdown().await?;
+        assert!(dispatcher.dispatch(&event).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_applies_backpressure_without_dropping() -> Result<(), String> {
+        let dispatcher = HookEventDispatcher::new_with_capacity(None, None, 1)?;
+        let inner = dispatcher
+            .inner
+            .as_ref()
+            .ok_or_else(|| "active dispatcher has no inner state".to_string())?;
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        inner
+            .sender
+            .lock()
+            .map_err(|_| "dispatcher sender lock poisoned".to_string())?
+            .as_ref()
+            .ok_or_else(|| "dispatcher sender missing".to_string())?
+            .send(QueueCommand::Pause {
+                started: started_tx,
+                release: release_rx,
+            })
+            .map_err(|_| "failed to pause dispatcher".to_string())?;
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .map_err(|error| format!("dispatcher did not pause: {error}"))?;
+
+        let event = make_event(RuntimeEventKind::TaskStarted, Some("t-1"), json!({}));
+        dispatcher.dispatch(&event)?;
+        let blocked_dispatcher = dispatcher.clone();
+        let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+        let producer = std::thread::spawn(move || {
+            let result = blocked_dispatcher.dispatch(&event);
+            let _ = finished_tx.send(result);
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut finished_rx)
+                .await
+                .is_err(),
+            "dispatch unexpectedly bypassed a saturated queue"
+        );
+
+        release_tx
+            .send(())
+            .map_err(|_| "failed to release dispatcher".to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut finished_rx)
+            .await
+            .map_err(|_| "blocked dispatch did not resume".to_string())?
+            .map_err(|_| "blocked dispatch result was lost".to_string())??;
+        producer
+            .join()
+            .map_err(|_| "blocked dispatch thread panicked".to_string())?;
+        dispatcher.shutdown().await?;
+        Ok(())
     }
 }

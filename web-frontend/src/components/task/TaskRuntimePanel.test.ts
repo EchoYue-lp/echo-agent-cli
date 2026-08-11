@@ -41,12 +41,12 @@ describe('displayedTodoStatus', () => {
     ).toBe('running');
   });
 
-  it('projects a cancelled Subagent onto a pending todo as skipped', () => {
+  it('projects a cancelled Subagent onto a pending todo as cancelled', () => {
     expect(
       displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [
         run('cancelled'),
       ])
-    ).toBe('skipped');
+    ).toBe('cancelled');
   });
 
   it('projects a completed inline Subagent onto a pending todo', () => {
@@ -57,14 +57,19 @@ describe('displayedTodoStatus', () => {
     ).toBe('completed');
   });
 
-  it.each(['failed', 'timed_out'] as const)(
-    'projects a %s inline Subagent onto a pending todo as failed',
-    (status) => {
-      expect(
-        displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [run(status)])
-      ).toBe('failed');
-    }
-  );
+  it('projects a failed inline Subagent without changing its type', () => {
+    expect(
+      displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [run('failed')])
+    ).toBe('failed');
+  });
+
+  it('projects a timed-out inline Subagent without changing its type', () => {
+    expect(
+      displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [
+        run('timed_out'),
+      ])
+    ).toBe('timed_out');
+  });
 
   it('does NOT mark an executor-owned running todo completed before review finishes', () => {
     expect(

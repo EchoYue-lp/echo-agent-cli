@@ -53,6 +53,8 @@ const TODO_LABEL: Record<string, string> = {
   blocked: '阻塞',
   completed: '已完成',
   failed: '失败',
+  cancelled: '已取消',
+  timed_out: '已超时',
   skipped: '已跳过',
 };
 
@@ -67,7 +69,7 @@ const SUBAGENT_STATUS_LABEL: Record<SubagentRunState['status'], string> = {
 function statusColor(status: string): string {
   if (['completed'].includes(status)) return 'var(--color-success)';
   if (['running'].includes(status)) return 'var(--color-info)';
-  if (['failed', 'cancelled'].includes(status)) return 'var(--color-error)';
+  if (['failed', 'cancelled', 'timed_out'].includes(status)) return 'var(--color-error)';
   if (['paused', 'blocked'].includes(status)) return 'var(--color-warning)';
   return 'var(--text-tertiary)';
 }
@@ -93,7 +95,10 @@ function TodoIcon({
     case 'running':
       return <Loader2 size={14} className="animate-spin" style={{ color: 'var(--color-info)' }} />;
     case 'failed':
+    case 'timed_out':
       return <AlertCircle size={14} style={{ color: 'var(--color-error)' }} />;
+    case 'cancelled':
+      return <Circle size={14} style={{ color: 'var(--color-error)' }} />;
     case 'blocked':
       return <AlertCircle size={14} style={{ color: 'var(--color-warning)' }} />;
     case 'skipped':
@@ -451,6 +456,8 @@ export function displayedTodoStatus(
   if (
     todo.status === ('blocked' as TodoStatus) ||
     todo.status === ('failed' as TodoStatus) ||
+    todo.status === ('cancelled' as TodoStatus) ||
+    todo.status === ('timed_out' as TodoStatus) ||
     todo.status === ('completed' as TodoStatus) ||
     todo.status === ('skipped' as TodoStatus)
   ) {
@@ -468,10 +475,11 @@ export function displayedTodoStatus(
       case 'completed':
         return 'completed' as TodoStatus;
       case 'failed':
-      case 'timed_out':
         return 'failed' as TodoStatus;
+      case 'timed_out':
+        return 'timed_out' as TodoStatus;
       case 'cancelled':
-        return 'skipped' as TodoStatus;
+        return 'cancelled' as TodoStatus;
     }
   }
   return todo.status;
@@ -697,7 +705,7 @@ export function TaskRuntimePanel() {
               const statusDescription = todoStatusDescription(todo, activeTaskTraceRuns);
               const canPatch = status === 'pending' || status === 'blocked';
               const canRetry =
-                (status === 'blocked' || status === 'failed') &&
+                (status === 'blocked' || status === 'failed' || status === 'timed_out') &&
                 (activeRun?.status === 'paused' || activeRun?.status === 'failed') &&
                 (task?.retry_count ?? 0) < (task?.max_retries ?? 0);
               return (

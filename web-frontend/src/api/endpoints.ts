@@ -1680,6 +1680,33 @@ export interface PluginMutationResult {
   errors?: string[];
 }
 
+export interface PluginValidationReport {
+  valid: boolean;
+  name: string | null;
+  components: string[];
+  errors: string[];
+}
+
+export interface PluginThemeDefinition {
+  name: string;
+  display_name: string | null;
+  dark: boolean;
+  colors: Record<string, string>;
+  plugin: string;
+}
+
+export interface PluginOutputStyle {
+  name: string;
+  description: string;
+  instructions: string;
+  plugin: string;
+}
+
+export interface PluginOutputStylesResult {
+  styles: PluginOutputStyle[];
+  active: string | null;
+}
+
 export const pluginApi = {
   list: () => (isTauri() ? apiInvoke<PluginInfo[]>('list_plugins') : get<PluginInfo[]>('/plugins')),
   get: (name: string) =>
@@ -1722,6 +1749,11 @@ export const pluginApi = {
           skills_loaded?: number;
           hooks_registered?: number;
           mcp_connected?: number;
+          agents_loaded?: number;
+          lsp_languages_loaded?: number;
+          monitors_loaded?: number;
+          themes_loaded?: number;
+          output_styles_loaded?: number;
           errors?: string[];
           message?: string;
           error?: string;
@@ -1733,10 +1765,43 @@ export const pluginApi = {
           skills_loaded?: number;
           hooks_registered?: number;
           mcp_connected?: number;
+          agents_loaded?: number;
+          lsp_languages_loaded?: number;
+          monitors_loaded?: number;
+          themes_loaded?: number;
+          output_styles_loaded?: number;
           errors?: string[];
           message?: string;
           error?: string;
         }>('/plugins/reload'),
+  scaffold: (directory: string, name: string) =>
+    isTauri()
+      ? apiInvoke<PluginMutationResult & { path?: string; name?: string }>('scaffold_plugin', {
+          directory,
+          name,
+        })
+      : post<PluginMutationResult & { path?: string; name?: string }>('/plugins/scaffold', {
+          directory,
+          name,
+        }),
+  validate: (directory: string) =>
+    isTauri()
+      ? apiInvoke<PluginValidationReport>('validate_plugin', { directory })
+      : post<PluginValidationReport>('/plugins/validate', { directory }),
+  themes: () =>
+    isTauri()
+      ? apiInvoke<PluginThemeDefinition[]>('list_plugin_themes')
+      : get<PluginThemeDefinition[]>('/plugins/themes'),
+  outputStyles: () =>
+    isTauri()
+      ? apiInvoke<PluginOutputStylesResult>('list_plugin_output_styles')
+      : get<PluginOutputStylesResult>('/plugins/output-styles'),
+  activateOutputStyle: (name: string | null) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; active: string | null }>('activate_plugin_output_style', {
+          name,
+        })
+      : post<{ success: boolean; active: string | null }>('/plugins/output-style', { name }),
 };
 
 // ── Hooks API ──────────────────────────────────────────────────────────

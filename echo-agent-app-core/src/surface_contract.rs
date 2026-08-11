@@ -176,7 +176,7 @@ fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
             "run-1",
             "task-1",
             "execution-1",
-            "artifact_produced",
+            RuntimeEventKind::ArtifactProduced,
             serde_json::json!({
                 "execution_id": "execution-1",
                 "artifact": {

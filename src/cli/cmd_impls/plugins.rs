@@ -45,12 +45,10 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "install" => {
-            if rest.is_empty() {
+            let Some(source_str) = rest.first().copied() else {
                 println!("Usage: /plugins install <path|git-url> [--scope user|project|local]");
                 return CommandOutcome::Continue;
-            }
-
-            let source_str = rest[0];
+            };
             let scope = rest
                 .windows(2)
                 .find(|w| w[0] == "--scope")
@@ -99,12 +97,10 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "uninstall" | "remove" => {
-            if rest.is_empty() {
+            let Some(name) = rest.first().copied() else {
                 println!("Usage: /plugins uninstall <name> [--keep-data]");
                 return CommandOutcome::Continue;
-            }
-
-            let name = rest[0];
+            };
             let keep_data = rest.contains(&"--keep-data");
 
             let Some(runtime) = ctx.plugin_runtime.as_ref() else {
@@ -128,12 +124,10 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "enable" => {
-            if rest.is_empty() {
+            let Some(name) = rest.first().copied() else {
                 println!("Usage: /plugins enable <name>");
                 return CommandOutcome::Continue;
-            }
-
-            let name = rest[0];
+            };
             let Some(runtime) = ctx.plugin_runtime.as_ref() else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
@@ -157,12 +151,10 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "disable" => {
-            if rest.is_empty() {
+            let Some(name) = rest.first().copied() else {
                 println!("Usage: /plugins disable <name>");
                 return CommandOutcome::Continue;
-            }
-
-            let name = rest[0];
+            };
             let Some(runtime) = ctx.plugin_runtime.as_ref() else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
@@ -180,12 +172,10 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "info" | "details" => {
-            if rest.is_empty() {
+            let Some(name) = rest.first().copied() else {
                 println!("Usage: /plugins info <name>");
                 return CommandOutcome::Continue;
-            }
-
-            let name = rest[0];
+            };
             let Some(runtime) = ctx.plugin_runtime.as_ref() else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
@@ -262,136 +252,121 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     println!("  Skills loaded:    {}", summary.skills_loaded);
                     println!("  Hooks registered: {}", summary.hooks_registered);
                     println!("  MCP connected:    {}", summary.mcp_connected);
-                    if !summary.errors.is_empty() {
-                        println!("Errors ({}):", summary.errors.len());
-                        for error in summary.errors {
-                            println!("  - {error}");
-                        }
-                    }
+                    println!("  Agents loaded:    {}", summary.agents_loaded);
+                    println!("  LSP languages:    {}", summary.lsp_languages_loaded);
+                    println!("  Monitors loaded:  {}", summary.monitors_loaded);
+                    println!("  Themes loaded:    {}", summary.themes_loaded);
+                    println!("  Output styles:    {}", summary.output_styles_loaded);
                 }
                 Err(error) => println!("Plugin reload failed: {error}"),
             }
         }
 
+        "themes" => {
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
+                return CommandOutcome::Continue;
+            };
+            let themes = runtime.themes().await;
+            if themes.is_empty() {
+                println!("No plugin themes are loaded.");
+            } else {
+                for theme in themes {
+                    println!(
+                        "{} [{}] from {}",
+                        theme.display_name.as_deref().unwrap_or(&theme.name),
+                        if theme.dark { "dark" } else { "light" },
+                        theme.plugin
+                    );
+                }
+            }
+        }
+
+        "styles" => {
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
+                return CommandOutcome::Continue;
+            };
+            let active = runtime.active_output_style().await;
+            let styles = runtime.output_styles().await;
+            if styles.is_empty() {
+                println!("No plugin output styles are loaded.");
+            } else {
+                for style in styles {
+                    println!(
+                        "{}{} from {} - {}",
+                        if active.as_deref() == Some(style.name.as_str()) {
+                            "* "
+                        } else {
+                            "  "
+                        },
+                        style.name,
+                        style.plugin,
+                        style.description
+                    );
+                }
+            }
+        }
+
+        "style" => {
+            let Some(name) = rest.first().copied() else {
+                println!("Usage: /plugins style <name|default>");
+                return CommandOutcome::Continue;
+            };
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
+                return CommandOutcome::Continue;
+            };
+            let selected = (!matches!(name, "default" | "off" | "none")).then_some(name);
+            match runtime.activate_output_style(selected).await {
+                Ok(()) => match selected {
+                    Some(name) => println!("Output style '{name}' activated."),
+                    None => println!("Output style reset to default."),
+                },
+                Err(error) => println!("Output style activation failed: {error}"),
+            }
+        }
+
         "init" => {
-            let name = rest.first().copied().unwrap_or("my-plugin");
-            let dir = std::path::PathBuf::from(name);
-            let manifest_dir = dir.join(".echo-plugin");
-
-            if manifest_dir.exists() {
-                println!(
-                    "Plugin directory already exists: {}",
-                    manifest_dir.display()
-                );
-                return CommandOutcome::Continue;
+            let directory = rest.first().copied().unwrap_or("my-plugin");
+            let default_name = std::path::Path::new(directory)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("my-plugin");
+            let name = rest.get(1).copied().unwrap_or(default_name);
+            match echo_agent_app_core::plugin_runtime::PluginRuntimeService::scaffold(
+                directory, name,
+            ) {
+                Ok(result) => println!(
+                    "Plugin '{}' scaffolded at {}",
+                    result.name,
+                    result.path.display()
+                ),
+                Err(error) => println!("Plugin scaffold failed: {error}"),
             }
-
-            if let Err(e) = std::fs::create_dir_all(&manifest_dir) {
-                println!("Failed to create directory: {e}");
-                return CommandOutcome::Continue;
-            }
-
-            let manifest = format!(
-                r#"# EchoAgent Plugin Manifest
-name: {name}
-display_name: "{}"
-version: "0.1.0"
-description: "A new EchoAgent plugin"
-license: MIT
-keywords: []
-
-components:
-  skills: "./skills/"
-  hooks: "./hooks/hooks.yaml"
-  mcp_servers: "./.mcp.json"
-"#,
-                name.split('-')
-                    .map(|w| {
-                        let mut c = w.chars();
-                        match c.next() {
-                            None => String::new(),
-                            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            );
-
-            if let Err(e) = std::fs::write(manifest_dir.join("manifest.yaml"), &manifest) {
-                println!("Failed to write manifest: {e}");
-                return CommandOutcome::Continue;
-            }
-
-            for path in [dir.join("skills"), dir.join("hooks"), dir.join("agents")] {
-                if let Err(error) = std::fs::create_dir_all(&path) {
-                    println!("Failed to create {}: {error}", path.display());
-                    return CommandOutcome::Continue;
-                }
-            }
-
-            for (path, content) in [
-                (dir.join("hooks").join("hooks.yaml"), "{}\n"),
-                (dir.join(".mcp.json"), "{\n  \"mcpServers\": {}\n}\n"),
-            ] {
-                if let Err(error) = std::fs::write(&path, content) {
-                    println!("Failed to write {}: {error}", path.display());
-                    return CommandOutcome::Continue;
-                }
-            }
-
-            println!("Plugin scaffolded at: {}", dir.display());
-            println!("  .echo-plugin/manifest.yaml");
-            println!("  skills/");
-            println!("  hooks/hooks.yaml");
-            println!("  agents/");
-            println!("  .mcp.json");
-            println!("\nEdit manifest.yaml to configure your plugin.");
         }
 
         "validate" => {
             let path = rest.first().copied().unwrap_or(".");
-            let manifest_path = std::path::PathBuf::from(path)
-                .join(".echo-plugin")
-                .join("manifest.yaml");
-
-            if !manifest_path.exists() {
-                println!("No manifest found at: {}", manifest_path.display());
-                return CommandOutcome::Continue;
-            }
-
-            match echo_agent::plugin::PluginManifest::from_file(&manifest_path) {
-                Ok(manifest) => {
-                    let errors = manifest.validate();
-                    if errors.is_empty() {
-                        println!("Plugin manifest is valid.");
-                        println!("  Name: {}", manifest.name);
-                        println!("  Version: {}", manifest.version);
-                        println!("  Description: {}", manifest.description);
-                        let caps = manifest.inferred_capabilities();
-                        if !caps.is_empty() {
-                            println!(
-                                "  Capabilities: {}",
-                                caps.iter()
-                                    .map(|c| c.display_name())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            );
-                        }
-                    } else {
-                        println!("Manifest validation errors:");
-                        for err in &errors {
-                            println!("  - {err}");
-                        }
-                    }
+            let report = echo_agent_app_core::plugin_runtime::PluginRuntimeService::validate(path);
+            if report.valid {
+                println!(
+                    "Plugin '{}' is valid.",
+                    report.name.as_deref().unwrap_or("<unknown>")
+                );
+                println!("  Components: {}", report.components.join(", "));
+            } else {
+                println!("Plugin validation failed:");
+                for error in report.errors {
+                    println!("  - {error}");
                 }
-                Err(e) => println!("Failed to parse manifest: {e}"),
             }
         }
 
         _ => {
             println!("Unknown subcommand: {sub}");
             println!(
-                "Available: list, install, uninstall, enable, disable, info, reload, init, validate"
+                "Available: list, install, uninstall, enable, disable, info, reload, themes, styles, style, init, validate"
             );
         }
     }
@@ -404,7 +379,7 @@ cmd!(
     "plugins",
     ["plugin"],
     CommandCategory::Config,
-    "Manage plugins (install, enable, disable, info)",
+    "Manage plugins and live plugin components",
     cmd_plugins
 );
 

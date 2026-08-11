@@ -89,6 +89,11 @@ pub async fn run_cli_mode(
         webhook_emitter.clone(),
     )
     .await;
+    if let Some(scheduler) = scheduler_runner.as_ref()
+        && let Err(error) = plugin_runtime.bind_scheduler(scheduler.clone()).await
+    {
+        tracing::warn!(%error, "failed to bind plugin monitors to CLI scheduler");
+    }
 
     let mut repl_config = repl_config_for(args);
     repl_config.task_service = task_service;

@@ -124,10 +124,7 @@ pub async fn register_task_tools_on_agent(
             return;
         }
     };
-    let dispatcher_arc = std::sync::Arc::new(dispatcher);
-    let hook_fn: std::sync::Arc<dyn Fn(&super::types::RuntimeTaskEvent) + Send + Sync> =
-        std::sync::Arc::new(move |event| dispatcher_arc.dispatch(event));
-    if store.attach_hook_event_hook(hook_fn) {
+    if store.attach_hook_event_dispatcher(dispatcher) {
         tracing::info!("HookEventDispatcher attached to TaskRuntimeStore");
     }
 }

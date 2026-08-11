@@ -22,6 +22,7 @@ pub mod model_config;
 pub mod observability;
 pub mod output;
 pub mod persistence;
+mod plugin_components;
 pub mod plugin_runtime;
 pub mod prepared_turn;
 pub mod profiles;

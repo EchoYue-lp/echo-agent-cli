@@ -200,7 +200,7 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         if let Some(sink) = trace_sink {
             sink(ExecEvent::run(
                 scope_id.to_string(),
-                "run_started",
+                super::types::RuntimeEventKind::RunStarted,
                 serde_json::json!({
                     "goal": goal,
                     "route": "agent_task_plan",

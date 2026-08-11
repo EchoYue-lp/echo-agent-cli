@@ -625,11 +625,7 @@ async fn aggregate_by_sentence<'a>(
                 _ => {}
                 },
                 ChannelRenderEvent::Driver(ChatDriverEvent::Execution(event)) => {
-                    if event.event.contains("failed")
-                        || event.event.contains("cancelled")
-                        || event.event.contains("artifact")
-                        || event.event.contains("merge_")
-                    {
+                    if event.event.is_attention_event() {
                         flush_all!();
                         let detail: String = event.payload.to_string().chars().take(500).collect();
                         yield OutboundMessage::new(

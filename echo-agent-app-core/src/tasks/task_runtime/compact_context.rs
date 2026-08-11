@@ -222,7 +222,12 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
         plan.as_ref().map(|p| p.tasks.as_slice()).unwrap_or(&[]),
         store,
         run_id,
-        &[TodoStatus::Blocked, TodoStatus::Failed],
+        &[
+            TodoStatus::Blocked,
+            TodoStatus::Failed,
+            TodoStatus::Cancelled,
+            TodoStatus::TimedOut,
+        ],
         4,
     );
     push_task_group(

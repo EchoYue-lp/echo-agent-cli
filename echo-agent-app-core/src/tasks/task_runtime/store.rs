@@ -71,6 +71,9 @@ pub struct TaskRuntimeStore {
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
     /// File-backed event authority and deterministic projections.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
+    /// Owns the bounded task/subagent hook consumer so shutdown can drain it.
+    hook_event_dispatcher:
+        std::sync::Mutex<Option<super::hook_event_dispatcher::HookEventDispatcher>>,
     /// Per-run plan/state 写互斥锁 (F2-1 / F3-3 / F3-4)。
     ///
     /// revision compare-and-commit / transition_run 都是
@@ -178,6 +181,7 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
+            hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
         })
     }
@@ -203,6 +207,7 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
+            hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
         })
     }
@@ -213,11 +218,57 @@ impl TaskRuntimeStore {
     /// Idempotent (first call wins). Intended to be called once during
     /// bootstrap, after the agent + bridges exist (the store is built earlier).
     /// Until attached, task/subagent events are not dispatched to hooks.
-    pub fn attach_hook_event_hook(
+    pub fn attach_hook_event_dispatcher(
         &self,
-        hook: std::sync::Arc<dyn Fn(&super::types::RuntimeTaskEvent) + Send + Sync>,
+        dispatcher: super::hook_event_dispatcher::HookEventDispatcher,
     ) -> bool {
-        self.shadow.try_attach_event_hook(hook)
+        let Ok(mut owned_dispatcher) = self.hook_event_dispatcher.lock() else {
+            tracing::warn!("HookEventDispatcher ownership lock is poisoned");
+            return false;
+        };
+        if owned_dispatcher.is_some() {
+            return false;
+        }
+        let event_dispatcher = dispatcher.clone();
+        let hook: std::sync::Arc<dyn Fn(&super::types::RuntimeTaskEvent) + Send + Sync> =
+            std::sync::Arc::new(move |event| {
+                if let Err(error) = event_dispatcher.dispatch(event) {
+                    tracing::warn!(%error, "Failed to enqueue task hook event");
+                }
+            });
+        if !self.shadow.try_attach_event_hook(hook) {
+            return false;
+        }
+        *owned_dispatcher = Some(dispatcher);
+        true
+    }
+
+    /// Wait for every persisted task/subagent hook event to finish firing.
+    pub async fn flush_hook_events(&self) -> Result<(), String> {
+        let dispatcher = self
+            .hook_event_dispatcher
+            .lock()
+            .map_err(|_| "HookEventDispatcher ownership lock is poisoned".to_string())?
+            .clone();
+        if let Some(dispatcher) = dispatcher {
+            dispatcher.flush().await
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Drain and stop the hook consumer. Repeated calls are harmless.
+    pub async fn shutdown_hook_events(&self) -> Result<(), String> {
+        let dispatcher = self
+            .hook_event_dispatcher
+            .lock()
+            .map_err(|_| "HookEventDispatcher ownership lock is poisoned".to_string())?
+            .clone();
+        if let Some(dispatcher) = dispatcher {
+            dispatcher.shutdown().await
+        } else {
+            Ok(())
+        }
     }
 
     /// 在持有某 run 的 plan/state 写锁期间执行闭包 (F2-1 / F3-3 / F3-4)。
@@ -1083,32 +1134,27 @@ impl TaskRuntimeStore {
         let started = matches!(status, TodoStatus::Running);
         let finished = matches!(
             status,
-            TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+            TodoStatus::Completed
+                | TodoStatus::Failed
+                | TodoStatus::Cancelled
+                | TodoStatus::TimedOut
+                | TodoStatus::Skipped
         );
         let kind = match status {
             TodoStatus::Running => RuntimeEventKind::TaskStarted,
             TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
             TodoStatus::Failed => RuntimeEventKind::TaskFailed,
+            TodoStatus::Cancelled => RuntimeEventKind::TaskCancelled,
+            TodoStatus::TimedOut => RuntimeEventKind::TaskTimedOut,
             TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
             TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
             TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
         };
-        let status_detail = matches!(status, TodoStatus::Failed | TodoStatus::Blocked)
-            .then(|| summary.unwrap_or_else(|| status.as_str()));
-        let hook_terminal_status = match status {
-            TodoStatus::Completed => Some("completed"),
-            TodoStatus::Failed => Some(if summary.is_some_and(is_timeout_detail) {
-                "timed_out"
-            } else {
-                "failed"
-            }),
-            TodoStatus::Skipped => Some(if summary.is_some_and(is_cancelled_detail) {
-                "cancelled"
-            } else {
-                "skipped"
-            }),
-            TodoStatus::Pending | TodoStatus::Running | TodoStatus::Blocked => None,
-        };
+        let status_detail = matches!(
+            status,
+            TodoStatus::Failed | TodoStatus::Blocked | TodoStatus::Cancelled | TodoStatus::TimedOut
+        )
+        .then(|| summary.unwrap_or_else(|| status.as_str()));
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -1116,7 +1162,6 @@ impl TaskRuntimeStore {
             kind,
             serde_json::json!({
                 "status": status.as_str(),
-                "hook_terminal_status": hook_terminal_status,
                 "status_detail": status_detail,
                 "owner_agent": owner_agent,
                 "title": task_subject,
@@ -1185,7 +1230,8 @@ impl TaskRuntimeStore {
                     run_id, run.status
                 )));
             }
-            // 2. Task must be Blocked or Failed.
+            // 2. Task must be Blocked, Failed, or TimedOut. A cancellation is
+            // an explicit user decision and is not silently turned into retry.
             let plan = self
                 .get_plan(run_id)?
                 .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
@@ -1195,9 +1241,12 @@ impl TaskRuntimeStore {
                 .find(|t| t.id == task_id)
                 .cloned()
                 .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
-            if !matches!(task.status, TodoStatus::Blocked | TodoStatus::Failed) {
+            if !matches!(
+                task.status,
+                TodoStatus::Blocked | TodoStatus::Failed | TodoStatus::TimedOut
+            ) {
                 return Err(StoreError::InvalidPlan(format!(
-                    "task {} is {:?}; retry requires Blocked or Failed",
+                    "task {} is {:?}; retry requires Blocked, Failed, or TimedOut",
                     task_id, task.status
                 )));
             }
@@ -1264,8 +1313,13 @@ impl TaskRuntimeStore {
                             .iter()
                             .find(|dep| dep.id == *dep_id)
                             .is_some_and(|dep| {
-                                matches!(dep.status, TodoStatus::Failed | TodoStatus::Blocked)
-                                    && !recovered.contains(dep_id)
+                                matches!(
+                                    dep.status,
+                                    TodoStatus::Failed
+                                        | TodoStatus::TimedOut
+                                        | TodoStatus::Cancelled
+                                        | TodoStatus::Blocked
+                                ) && !recovered.contains(dep_id)
                             })
                     });
                     if still_blocked {
@@ -2137,15 +2191,6 @@ fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn is_cancelled_detail(detail: &str) -> bool {
-    detail.to_ascii_lowercase().contains("cancelled")
-}
-
-fn is_timeout_detail(detail: &str) -> bool {
-    let normalized = detail.to_ascii_lowercase();
-    normalized.contains("timed out") || normalized.contains("timeout")
-}
-
 fn bounded_event_text(value: &str, max_chars: usize) -> String {
     let mut text = value.chars().take(max_chars).collect::<String>();
     if value.chars().count() > max_chars {
@@ -2343,6 +2388,64 @@ mod tests {
             evs.iter()
                 .any(|e| e.event_type == RuntimeEventKind::TaskStarted)
         );
+    }
+
+    #[test]
+    fn task_terminal_events_follow_typed_status_not_detail_text() -> Result<(), StoreError> {
+        let failed = fresh();
+        seed_plan(&failed);
+        failed.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Failed,
+            Some("code_reviewer"),
+            Some("the report mentions timeout and cancelled behavior"),
+        )?;
+        let failed_events = failed.list_events("r1", 0)?;
+        assert!(
+            failed_events
+                .iter()
+                .any(|event| event.event_type == RuntimeEventKind::TaskFailed)
+        );
+        assert!(failed_events.iter().all(|event| {
+            !matches!(
+                event.event_type,
+                RuntimeEventKind::TaskTimedOut | RuntimeEventKind::TaskCancelled
+            )
+        }));
+
+        let timed_out = fresh();
+        seed_plan(&timed_out);
+        timed_out.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::TimedOut,
+            Some("code_reviewer"),
+            Some("provider deadline elapsed"),
+        )?;
+        assert!(
+            timed_out
+                .list_events("r1", 0)?
+                .iter()
+                .any(|event| event.event_type == RuntimeEventKind::TaskTimedOut)
+        );
+
+        let cancelled = fresh();
+        seed_plan(&cancelled);
+        cancelled.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Cancelled,
+            Some("code_reviewer"),
+            Some("stopped by parent run"),
+        )?;
+        assert!(
+            cancelled
+                .list_events("r1", 0)?
+                .iter()
+                .any(|event| event.event_type == RuntimeEventKind::TaskCancelled)
+        );
+        Ok(())
     }
 
     #[test]

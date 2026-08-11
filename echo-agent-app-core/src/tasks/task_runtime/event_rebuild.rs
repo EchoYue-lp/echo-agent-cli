@@ -207,6 +207,8 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
             K::TaskStarted
             | K::TaskCompleted
             | K::TaskFailed
+            | K::TaskCancelled
+            | K::TaskTimedOut
             | K::TaskSkipped
             | K::TaskBlocked
             | K::TodoUpdated => {

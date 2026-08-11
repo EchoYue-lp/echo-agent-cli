@@ -306,7 +306,9 @@ impl SlashCommand {
             Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",
             Self::Mcp => "[list|load <config>|disconnect <name>]",
             Self::Hooks => "[list|reload|test <event>]",
-            Self::Plugins => "[list|install|uninstall|enable|disable|info|reload]",
+            Self::Plugins => {
+                "[list|install|uninstall|enable|disable|info|reload|themes|styles|style|init|validate]"
+            }
             Self::EvidenceInbox => {
                 "[pending|expired|undoable|show|edit|accept|reject|undo] [candidate-id] [content]"
             }

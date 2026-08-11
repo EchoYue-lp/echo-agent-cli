@@ -356,6 +356,8 @@ fn fold_task_runtime(events: &[RuntimeTaskEvent], task_id: &str) -> TaskRuntimeM
             RuntimeEventKind::TaskStarted
                 | RuntimeEventKind::TaskCompleted
                 | RuntimeEventKind::TaskFailed
+                | RuntimeEventKind::TaskCancelled
+                | RuntimeEventKind::TaskTimedOut
                 | RuntimeEventKind::TaskSkipped
                 | RuntimeEventKind::TaskBlocked
                 | RuntimeEventKind::TodoUpdated

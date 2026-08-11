@@ -265,22 +265,26 @@ impl AgentRuntime {
             tracing::info!("Layered memory, evidence sink, and skill policy installed");
         }
 
-        // ── 9. Plugins ──
+        // ── 9. LSP runtime ──
+        // Plugins and built-in project discovery share this single manager;
+        // plugin reload atomically replaces its contents while every LSP tool
+        // keeps the same Arc handle.
+        let lsp_runtime = register_lsp_tools(&agent_handle).await;
+
+        // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
         // one runtime owner. This avoids bootstrap/reload double registration.
         let plugin_runtime =
-            crate::plugin_runtime::PluginRuntimeService::new(agent_handle.clone()).await;
+            crate::plugin_runtime::PluginRuntimeService::new(agent_handle.clone(), lsp_runtime)
+                .await;
 
-        // ── 10. File-backed research library ──
+        // ── 11. File-backed research library ──
         agent_handle
             .write(|agent| {
                 crate::research_connectors::install_auto_ingest_tools(agent);
                 agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
             })
             .await;
-
-        // ── 11. LSP tools ──
-        register_lsp_tools(&agent_handle).await;
 
         // ── 12. Startup hook ──
         infra::fire_startup_hook(&agent_handle).await;
@@ -490,7 +494,7 @@ impl AgentRuntime {
     }
 }
 
-async fn register_lsp_tools(agent_handle: &AgentHandle) {
+async fn register_lsp_tools(agent_handle: &AgentHandle) -> crate::plugin_runtime::PluginLspRuntime {
     use echo_agent::lsp::{LspConfig, LspManager};
     use std::sync::Arc;
     use tokio::sync::RwLock;
@@ -550,11 +554,6 @@ async fn register_lsp_tools(agent_handle: &AgentHandle) {
         }
     }
 
-    if config.servers.is_empty() {
-        tracing::debug!(root = %project_root.display(), "No installed LSP server matched the project");
-        return;
-    }
-
     let mut lsp_manager = LspManager::new();
     lsp_manager.load_config(&config);
     lsp_manager.set_project_root(&project_root);
@@ -587,6 +586,7 @@ async fn register_lsp_tools(agent_handle: &AgentHandle) {
         })
         .await;
     tracing::info!("LSP tools registered");
+    crate::plugin_runtime::PluginLspRuntime::new(shared_lsp, config, project_root)
 }
 
 #[cfg(test)]

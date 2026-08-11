@@ -164,7 +164,9 @@ impl FileTaskShadow {
         }
         // Fire the event hook (if attached) AFTER the cache bump and OUTSIDE
         // the seq-allocation critical section, but still under the per-run
-        // write lock (cheap spawn-and-detach only). This is the single point
+        // write lock. The bounded HookEventDispatcher normally makes this a
+        // cheap enqueue; when saturated it deliberately applies backpressure
+        // instead of dropping lifecycle events. This is the single point
         // the HookEventDispatcher observes every RuntimeEventKind transition
         // (plan revision commit, task status change, subagent assigned/
         // released, run status change) and translates it into framework
@@ -230,6 +232,8 @@ impl FileTaskShadow {
                 | RuntimeEventKind::TaskStarted
                 | RuntimeEventKind::TaskCompleted
                 | RuntimeEventKind::TaskFailed
+                | RuntimeEventKind::TaskCancelled
+                | RuntimeEventKind::TaskTimedOut
                 | RuntimeEventKind::TaskSkipped
                 | RuntimeEventKind::TaskBlocked
                 | RuntimeEventKind::TodoUpdated

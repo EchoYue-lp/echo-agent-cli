@@ -868,11 +868,7 @@ pub async fn run_event_loop(
                 }
                 AgentEvent::Execution(event) => {
                     app.status_msg = format!("{}: {}", event.run_id, event.event);
-                    if event.event.contains("failed")
-                        || event.event.contains("cancelled")
-                        || event.event.contains("artifact")
-                        || event.event.contains("merge_")
-                    {
+                    if event.event.is_attention_event() {
                         let detail: String = event.payload.to_string().chars().take(500).collect();
                         app.messages.push(ChatMessage {
                             role: MessageRole::System,
@@ -5139,12 +5135,17 @@ async fn handle_tui_plugin_command(
         "reload" => match runtime.reload().await {
             Ok(summary) => {
                 let mut content = format!(
-                    "Reloaded {} plugins ({} enabled).\nSkills: {} · Hooks: {} · MCP: {}",
+                    "Reloaded {} plugins ({} enabled).\nSkills: {} · Hooks: {} · MCP: {} · Agents: {} · LSP: {} · Monitors: {} · Themes: {} · Styles: {}",
                     summary.total,
                     summary.enabled,
                     summary.skills_loaded,
                     summary.hooks_registered,
-                    summary.mcp_connected
+                    summary.mcp_connected,
+                    summary.agents_loaded,
+                    summary.lsp_languages_loaded,
+                    summary.monitors_loaded,
+                    summary.themes_loaded,
+                    summary.output_styles_loaded
                 );
                 if !summary.errors.is_empty() {
                     content.push_str("\nErrors:\n");
@@ -5154,7 +5155,98 @@ async fn handle_tui_plugin_command(
             }
             Err(error) => format!("Plugin reload failed: {error}"),
         },
-        _ => "Usage: /plugins [list|install|uninstall|enable|disable|info|reload]".to_string(),
+        "themes" => {
+            let themes = runtime.themes().await;
+            if themes.is_empty() {
+                "No plugin themes are loaded.".to_string()
+            } else {
+                themes
+                    .into_iter()
+                    .map(|theme| {
+                        format!(
+                            "{} [{}] from {}",
+                            theme.display_name.as_deref().unwrap_or(&theme.name),
+                            if theme.dark { "dark" } else { "light" },
+                            theme.plugin
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        "styles" => {
+            let active = runtime.active_output_style().await;
+            let styles = runtime.output_styles().await;
+            if styles.is_empty() {
+                "No plugin output styles are loaded.".to_string()
+            } else {
+                styles
+                    .into_iter()
+                    .map(|style| {
+                        format!(
+                            "{}{} from {} - {}",
+                            if active.as_deref() == Some(style.name.as_str()) {
+                                "* "
+                            } else {
+                                "  "
+                            },
+                            style.name,
+                            style.plugin,
+                            style.description
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+        "style" => {
+            let Some(name) = rest.first().copied() else {
+                return "Usage: /plugins style <name|default>".to_string();
+            };
+            let selected = (!matches!(name, "default" | "off" | "none")).then_some(name);
+            match runtime.activate_output_style(selected).await {
+                Ok(()) => match selected {
+                    Some(name) => format!("Output style '{name}' activated."),
+                    None => "Output style reset to default.".to_string(),
+                },
+                Err(error) => format!("Output style activation failed: {error}"),
+            }
+        }
+        "init" => {
+            let Some(directory) = rest.first().copied() else {
+                return "Usage: /plugins init <directory> [name]".to_string();
+            };
+            let default_name = std::path::Path::new(directory)
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("my-plugin");
+            let name = rest.get(1).copied().unwrap_or(default_name);
+            match echo_agent_app_core::plugin_runtime::PluginRuntimeService::scaffold(
+                directory, name,
+            ) {
+                Ok(result) => format!(
+                    "Plugin '{}' scaffolded at {}.",
+                    result.name,
+                    result.path.display()
+                ),
+                Err(error) => format!("Plugin scaffold failed: {error}"),
+            }
+        }
+        "validate" => {
+            let directory = rest.first().copied().unwrap_or(".");
+            let report =
+                echo_agent_app_core::plugin_runtime::PluginRuntimeService::validate(directory);
+            if report.valid {
+                format!(
+                    "Plugin '{}' is valid.\nComponents: {}",
+                    report.name.as_deref().unwrap_or("<unknown>"),
+                    report.components.join(", ")
+                )
+            } else {
+                format!("Plugin validation failed:\n{}", report.errors.join("\n"))
+            }
+        }
+        _ => "Usage: /plugins [list|install|uninstall|enable|disable|info|reload|themes|styles|style|init|validate]".to_string(),
     }
 }
 

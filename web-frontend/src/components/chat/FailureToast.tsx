@@ -20,7 +20,7 @@ export function FailureToast({ onDismiss }: FailureToastProps) {
   const activeRun = useTaskRuntimeStore((s) => s.activeRun);
   const todos = useTaskRuntimeStore((s) => s.todos);
 
-  const failedTodos = todos.filter((t) => t.status === 'failed');
+  const failedTodos = todos.filter((t) => t.status === 'failed' || t.status === 'timed_out');
   const runFailed = activeRun?.status === 'failed';
   const count = failedTodos.length + (runFailed ? 1 : 0);
 

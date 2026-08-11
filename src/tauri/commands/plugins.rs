@@ -219,6 +219,11 @@ pub async fn reload_plugins(
                 "skills_loaded": summary.skills_loaded,
                 "hooks_registered": summary.hooks_registered,
                 "mcp_connected": summary.mcp_connected,
+                "agents_loaded": summary.agents_loaded,
+                "lsp_languages_loaded": summary.lsp_languages_loaded,
+                "monitors_loaded": summary.monitors_loaded,
+                "themes_loaded": summary.themes_loaded,
+                "output_styles_loaded": summary.output_styles_loaded,
                 "errors": summary.errors,
                 "message": format!("Reloaded {} plugins", summary.total),
                 "error": error,
@@ -226,4 +231,58 @@ pub async fn reload_plugins(
         }
         Err(e) => Err(IpcError::Internal(e.to_string())),
     }
+}
+
+#[tauri::command]
+pub async fn list_plugin_themes(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let service = require_service(&state)?;
+    serde_json::to_value(service.themes().await)
+        .map_err(|error| IpcError::Internal(format!("Failed to serialize themes: {error}")))
+}
+
+#[tauri::command]
+pub async fn list_plugin_output_styles(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let service = require_service(&state)?;
+    let styles = service.output_styles().await;
+    let active = service.active_output_style().await;
+    Ok(serde_json::json!({ "styles": styles, "active": active }))
+}
+
+#[tauri::command]
+pub async fn activate_plugin_output_style(
+    state: tauri::State<'_, TauriState>,
+    name: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    let service = require_service(&state)?;
+    let selected = name.filter(|value| !value.trim().is_empty());
+    service
+        .activate_output_style(selected.as_deref())
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    Ok(serde_json::json!({ "success": true, "active": selected }))
+}
+
+#[tauri::command]
+pub async fn scaffold_plugin(
+    directory: String,
+    name: String,
+) -> Result<serde_json::Value, IpcError> {
+    let result = PluginRuntimeService::scaffold(&directory, &name)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    Ok(serde_json::json!({
+        "success": true,
+        "path": result.path,
+        "name": result.name,
+        "message": format!("Plugin '{}' scaffolded", result.name),
+    }))
+}
+
+#[tauri::command]
+pub async fn validate_plugin(directory: String) -> Result<serde_json::Value, IpcError> {
+    serde_json::to_value(PluginRuntimeService::validate(directory))
+        .map_err(|error| IpcError::Internal(format!("Failed to serialize validation: {error}")))
 }

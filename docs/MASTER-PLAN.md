@@ -69,8 +69,9 @@ evidence, and the next bounded step.
 | Iteration 2: webhook + HITL + config_watcher fixes | Complete | The dead webhook singleton was removed. One `Arc<WebhookEmitter>` is shared by chat, scheduler, and the active surface; lifecycle emission now lives in the common `drive_chat` path, giving GUI/TUI/CLI/channel the same `ToolCalled`/`ToolFailed`/`AgentError`/`ChatCompleted` behavior, while cron emits `CronTaskCompleted`. Config reload watches the parent directory, accepts create/modify atomic-save events, uses resettable debounce, and hot-reloads both hooks and webhook endpoints; model/MCP/runtime topology still requires restart. HITL snapshots providers before await, broadcasts concurrently under one shared deadline, and drops remaining futures after the first response. |
 | Iteration 3: migrate 3 file-backed storage impls down to framework | Complete | `FileRuntimeStateStore`, `FileConversationStore`, and `restore_message(s)` are framework capabilities; EKO uses them without enabling SQLite. File writes use unique temp names, file fsync, atomic rename, Unix parent-directory fsync, cleanup on failure, path-safe ids, and explicit corrupt-JSON errors. `FileConversationStore` serializes complete single-process read/modify/write operations, atomically implements `ensure_conversation`, reconciles stale counters from records on reopen, and normalizes stored message ownership. Message projection/restore now round-trips canonical roles, tool identity, multimodal content, and reasoning metadata. App-only `SessionSearchEngine`, path ownership, and UI persistence projections remain in EKO. |
 | Tool Schema budget and recoverable output Phase 0-6 | Complete | Framework commits `9fad29f`, `bbca516`; `docs/2026-07-29-tool-schema-budget-and-artifacts.md`; one framework registry, invocation-local Tool Search, query-and-result-bound cursor pagination, recoverable SQL/Web/task artifacts, and content-free metrics; current Schema gates are Chat 3,647 / Task 3,906 / Auto 3,929 estimated tokens |
-| Process-level shared PluginRuntimeService (P0-4) | Complete | `echo-agent-app-core/src/plugin_runtime.rs`; GUI/TUI/CLI share one serialized runtime owner. Bootstrap and every mutation unload the previous plugin-owned skills/hooks/MCP tools before wiring the enabled set, so reload does not accumulate stale components. |
-| Plugin component runtime wiring (P1) | Partial | Skills, Hooks, and MCP servers are wired and exactly unloaded/reloaded. Agent definitions, LSP configs, monitors, themes, and output styles are discovery-only until their application-owned runtime/UI consumers can construct and unregister them atomically. Do not report discovery counts as active components. |
+| Process-level shared PluginRuntimeService (P0-4) | Complete | `echo-agent-app-core/src/plugin_runtime.rs`; GUI/TUI/CLI share one serialized runtime owner. Bootstrap and every mutation stage a complete candidate, then replace plugin-owned components; failed wiring restores the previous live set. Real-process tests cover load, disable, uninstall, LSP startup, monitor replacement, output-style projection, and failed-reload rollback. |
+| Plugin component runtime wiring (P1) | Complete | Framework Skills/Hooks/MCP plus application-owned Agent/LSP/monitor/theme/output-style adapters are loaded and exactly unloaded. GUI/TUI/CLI expose the same live catalogs and output-style selection; GUI/TUI both expose scaffold and strict validate. |
+| Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
 
 ## Current Decisions
 
@@ -374,16 +375,42 @@ agent's `working_dir` so workspace switches are reflected without recreating the
 service. It owns initial wiring during `AgentRuntime::bootstrap` and is surfaced
 on `AppState.plugin_runtime` as well as the TUI and CLI command contexts.
 
-All GUI/TUI/CLI plugin commands delegate to it. Each operation is serialized;
-reload first scans a replacement registry, then removes all previously tracked
-plugin skills, skill hooks/projections, plugin hooks, MCP tools, and MCP clients
-before `PluginIntegrator::wire_all` installs the enabled set. Agent definition
-files remain discovery-only until the application can construct and register a
-definition plus executable factory atomically. LSP configs, monitors, themes,
-and output styles are likewise discovery-only because their application-owned
-runtime/UI consumers are not wired yet. `ReloadSummary` reports only live
-skills/hooks/MCP counts and per-plugin errors; discovery is never presented as
-activation.
+All GUI/TUI/CLI plugin commands delegate to it. Each operation is serialized.
+Reload parses and validates a complete candidate before mutating the live
+runtime, starts required plugin LSP servers, replaces scheduled monitors, and
+then swaps framework Skills/Hooks/MCP plus executable Subagent factories. Any
+failure unloads partial candidate wiring, restores the previous component set,
+and leaves the published registry unchanged. Runtime mutations acquire the
+serialized plugin state before scheduler replacement, so binding and reload use
+one lock order. Candidate LSP preparation treats every currently running base
+server as required, preventing a plugin reload from stopping unrelated language
+services. Themes are an application-owned renderer catalog; output styles are
+replaceable system-context projections. Their catalogs and output-style
+activation are available in GUI/TUI/CLI.
+
+The scaffold writes unique Agent and output-style names plus valid Skills,
+Hooks, MCP, LSP, monitor, theme, and output-style files. Strict validation uses
+the framework resolver for declared paths and the application parsers for all
+EKO-owned component formats. Real integration-style tests use an executable
+stdio JSON-RPC LSP fixture and a live scheduler instead of count-only mocks.
+
+This lifecycle follows the separation between discovery and activation in the
+[VS Code extension model](https://code.visualstudio.com/api/references/activation-events).
+Candidate preparation remains in EKO because Agent construction, monitor
+policy, themes, and output-style projections are product concerns; generic
+path resolution and reversible Subagent registration remain framework APIs.
+
+### TaskRuntime hook delivery
+
+The persisted `RuntimeEventKind` is also the typed event kind transported to
+GUI/TUI/CLI/channel consumers. Cancellation and timeout are enum variants from
+the original `ReactError`/`SubagentStatus`; no consumer classifies terminal
+state by searching error or event text. The ordered Hook dispatcher uses a
+bounded synchronous producer queue and a dedicated async consumer runtime.
+Flush is a FIFO barrier; shutdown prevents new sends, drains prior events, and
+is idempotent. This matches Tokio's documented
+[bounded backpressure and clean-shutdown model](https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html)
+while accommodating the store's synchronous append hook.
 
 ## Next Step
 

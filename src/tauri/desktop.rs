@@ -231,6 +231,14 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     state_inner.start_task_service().await;
     state_inner.start_scheduler_with_store(Some(scheduler_store));
+    if let Some(scheduler) = state_inner.scheduler.runner.as_ref()
+        && let Err(error) = runtime
+            .plugin_runtime
+            .bind_scheduler(scheduler.clone())
+            .await
+    {
+        tracing::warn!(%error, "failed to bind plugin monitors to GUI scheduler");
+    }
     let state = Arc::new(state_inner);
 
     infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
@@ -252,6 +260,11 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
+    if let Some(store) = state.tasks.runtime.as_ref()
+        && let Err(error) = store.shutdown_hook_events().await
+    {
+        tracing::warn!(%error, "failed to shut down task hook dispatcher");
+    }
     runtime.browser_runtime.shutdown().await;
     tauri_result.map_err(|e| anyhow::anyhow!("error while running Tauri application: {e}"))?;
 

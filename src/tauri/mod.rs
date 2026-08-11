@@ -181,6 +181,11 @@ pub fn build_tauri_app(
             commands::plugins::enable_plugin,
             commands::plugins::disable_plugin,
             commands::plugins::reload_plugins,
+            commands::plugins::scaffold_plugin,
+            commands::plugins::validate_plugin,
+            commands::plugins::list_plugin_themes,
+            commands::plugins::list_plugin_output_styles,
+            commands::plugins::activate_plugin_output_style,
             // Hooks
             commands::hooks::list_hooks,
             commands::hooks::list_hook_events,

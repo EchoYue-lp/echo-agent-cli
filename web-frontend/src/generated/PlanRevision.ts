@@ -4,7 +4,7 @@ import type { ExecutionMode } from './ExecutionMode';
 import type { TaskSpec } from './TaskSpec';
 
 /**
- * Canonical structured plan specification persisted in `plan.json`.
+ * EKO's file-backed plan projection persisted in `plan.json`.
  */
 export type PlanRevision = {
   plan_id: string;

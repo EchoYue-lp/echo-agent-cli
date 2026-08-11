@@ -56,7 +56,7 @@ pub fn render_progress(store: &TaskRuntimeStore, run_id: &str) -> Result<String,
             TodoStatus::Completed => completed.push(t),
             TodoStatus::Running => in_progress.push(t),
             TodoStatus::Blocked => blocked.push(t),
-            TodoStatus::Failed => failed.push(t),
+            TodoStatus::Failed | TodoStatus::Cancelled | TodoStatus::TimedOut => failed.push(t),
             TodoStatus::Pending => pending.push(t),
             TodoStatus::Skipped => {} // skipped tasks omitted for brevity
         }

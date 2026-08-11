@@ -4,3 +4,10 @@ gui-run = "run --no-default-features --features gui --bin echo-agent-tauri"
 gui-build = "build --no-default-features --features gui --bin echo-agent-tauri"
 gui-dev = "tauri dev -- --no-default-features --features gui --bin echo-agent-tauri"
 gui-bundle = "tauri build -- --no-default-features --features gui --bin echo-agent-tauri"
+
+[env]
+TS_RS_EXPORT_DIR = { value = "web-frontend/src/generated", relative = true }
+
+# Large macOS debug test binaries fall back from compact unwind to DWARF.
+[target.'cfg(target_os = "macos")']
+rustflags = ["-A", "linker_messages"]

@@ -3,4 +3,12 @@
 /**
  * Status of an individual todo / plan task.
  */
-export type TodoStatus = 'pending' | 'running' | 'blocked' | 'completed' | 'failed' | 'skipped';
+export type TodoStatus =
+  | 'pending'
+  | 'running'
+  | 'blocked'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'skipped';

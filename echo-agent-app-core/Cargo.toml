@@ -6,9 +6,6 @@ rust-version = "1.95"
 license = "MIT"
 description = "Shared state and infrastructure for EKO"
 
-[package.metadata.ts-rs]
-export_dir = "../web-frontend/src/generated"
-
 [dependencies]
 echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", default-features = false, features = [
     "mcp", "lsp", "human-loop", "subagent", "git", "tasks",

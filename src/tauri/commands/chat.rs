@@ -12,6 +12,7 @@ use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
 use echo_agent_app_core::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
+use echo_agent_app_core::tasks::task_runtime::types::RuntimeEventKind;
 use echo_agent_app_core::tool_execution::{
     ToolExecutionDetailChannel, ToolExecutionOwner, ToolExecutionRepository, ToolExecutionSummary,
 };
@@ -969,8 +970,8 @@ impl TauriExecutionProjector {
         };
         let agent = event.agent.as_deref().unwrap_or("echo-assistant");
 
-        match event.event.as_str() {
-            "tool_started" => {
+        match event.event {
+            RuntimeEventKind::ToolStarted => {
                 let Some(call_id) = payload.get("call_id").and_then(serde_json::Value::as_str)
                 else {
                     return;
@@ -1006,7 +1007,7 @@ impl TauriExecutionProjector {
                     }
                 }
             }
-            "tool_output" => {
+            RuntimeEventKind::ToolOutput => {
                 let Some(call_id) = payload.get("call_id").and_then(serde_json::Value::as_str)
                 else {
                     return;
@@ -1030,7 +1031,7 @@ impl TauriExecutionProjector {
                     tracing::warn!(%error, %call_id, "failed to persist TaskRuntime Subagent tool output");
                 }
             }
-            "tool_completed" => {
+            RuntimeEventKind::ToolCompleted => {
                 let Some(call_id) = payload.get("call_id").and_then(serde_json::Value::as_str)
                 else {
                     return;
@@ -1102,7 +1103,10 @@ impl TauriExecutionProjector {
                     }
                 }
             }
-            "completed" | "failed" | "cancelled" | "timed_out" => {
+            RuntimeEventKind::Completed
+            | RuntimeEventKind::Failed
+            | RuntimeEventKind::Cancelled
+            | RuntimeEventKind::TimedOut => {
                 self.cancel_active_tools(subagent_run_id, agent, &owner);
             }
             _ => {}
@@ -1434,7 +1438,7 @@ fn emit_tauri_execution_event(app: &tauri::AppHandle, event: ExecEvent) {
         app,
         &run_id,
         kind,
-        &event,
+        event.as_str(),
         agent.as_deref().unwrap_or("echo-assistant"),
         subagent_run_id.as_deref().unwrap_or(""),
         payload,
@@ -1624,7 +1628,7 @@ mod execution_projector_tests {
                 "run-1",
                 "task-1",
                 execution_id,
-                "tool_started",
+                RuntimeEventKind::ToolStarted,
                 serde_json::json!({
                     "call_id": "call-1",
                     "name": "read_file",
@@ -1637,7 +1641,7 @@ mod execution_projector_tests {
             "run-1",
             "task-1",
             execution_id,
-            "tool_output",
+            RuntimeEventKind::ToolOutput,
             serde_json::json!({
                 "call_id": "call-1",
                 "name": "read_file",
@@ -1649,7 +1653,7 @@ mod execution_projector_tests {
             "run-1",
             "task-1",
             execution_id,
-            "tool_completed",
+            RuntimeEventKind::ToolCompleted,
             serde_json::json!({
                 "call_id": "call-1",
                 "name": "read_file",
@@ -1662,7 +1666,7 @@ mod execution_projector_tests {
             "run-1",
             "task-1",
             execution_id,
-            "tool_completed",
+            RuntimeEventKind::ToolCompleted,
             serde_json::json!({
                 "call_id": "call-1",
                 "name": "read_file",
@@ -1693,7 +1697,7 @@ mod execution_projector_tests {
             "run-1",
             "task-1",
             execution_id,
-            "tool_started",
+            RuntimeEventKind::ToolStarted,
             serde_json::json!({
                 "call_id": "call-2",
                 "name": "shell",
@@ -1704,7 +1708,7 @@ mod execution_projector_tests {
             "run-1",
             "task-1",
             execution_id,
-            "completed",
+            RuntimeEventKind::Completed,
             serde_json::json!({}),
         ));
 

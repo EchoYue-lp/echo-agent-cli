@@ -1,5 +1,10 @@
 import { useEffect, useState } from 'react';
-import { pluginApi, type PluginInfo } from '../../api/endpoints';
+import {
+  pluginApi,
+  type PluginInfo,
+  type PluginOutputStyle,
+  type PluginThemeDefinition,
+} from '../../api/endpoints';
 import {
   Package,
   Plus,
@@ -14,6 +19,10 @@ import {
   Check,
   AlertCircle,
   Loader2,
+  FolderPlus,
+  ShieldCheck,
+  Palette,
+  TextQuote,
 } from 'lucide-react';
 
 export function PluginPanel() {
@@ -27,6 +36,14 @@ export function PluginPanel() {
   const [installing, setInstalling] = useState(false);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [showDeveloperTools, setShowDeveloperTools] = useState(false);
+  const [developerPath, setDeveloperPath] = useState('');
+  const [scaffoldName, setScaffoldName] = useState('my-plugin');
+  const [developerBusy, setDeveloperBusy] = useState(false);
+  const [pluginThemes, setPluginThemes] = useState<PluginThemeDefinition[]>([]);
+  const [outputStyles, setOutputStyles] = useState<PluginOutputStyle[]>([]);
+  const [activeOutputStyle, setActiveOutputStyle] = useState<string | null>(null);
+  const [runtimeBusy, setRuntimeBusy] = useState(false);
 
   const mutationMessage = (
     result: { wiring_ok?: boolean; errors?: string[]; message?: string },
@@ -46,13 +63,36 @@ export function PluginPanel() {
   const loadPlugins = async () => {
     try {
       setLoading(true);
-      const data = await pluginApi.list();
+      const [data, themes, styles] = await Promise.all([
+        pluginApi.list(),
+        pluginApi.themes(),
+        pluginApi.outputStyles(),
+      ]);
       setPlugins(data);
+      setPluginThemes(themes);
+      setOutputStyles(styles.styles);
+      setActiveOutputStyle(styles.active);
       setError(null);
     } catch (e: any) {
       setError(e.message || 'Failed to load plugins');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleOutputStyleChange = async (name: string) => {
+    try {
+      setRuntimeBusy(true);
+      const result = await pluginApi.activateOutputStyle(name || null);
+      setActiveOutputStyle(result.active);
+      setMessage({
+        type: 'success',
+        text: result.active ? `Output style '${result.active}' activated` : 'Output style cleared',
+      });
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.message || 'Failed to activate output style' });
+    } finally {
+      setRuntimeBusy(false);
     }
   };
 
@@ -128,6 +168,43 @@ export function PluginPanel() {
     }
   };
 
+  const handleScaffold = async () => {
+    if (!developerPath.trim() || !scaffoldName.trim()) return;
+    try {
+      setDeveloperBusy(true);
+      const result = await pluginApi.scaffold(developerPath.trim(), scaffoldName.trim());
+      setMessage(
+        result.success
+          ? { type: 'success', text: result.message || `Plugin scaffolded at ${result.path}` }
+          : { type: 'error', text: result.error || 'Scaffold failed' }
+      );
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.message || 'Scaffold failed' });
+    } finally {
+      setDeveloperBusy(false);
+    }
+  };
+
+  const handleValidate = async () => {
+    if (!developerPath.trim()) return;
+    try {
+      setDeveloperBusy(true);
+      const report = await pluginApi.validate(developerPath.trim());
+      setMessage(
+        report.valid
+          ? {
+              type: 'success',
+              text: `Plugin '${report.name || 'unknown'}' is valid: ${report.components.join(', ')}`,
+            }
+          : { type: 'error', text: report.errors.join('; ') || 'Validation failed' }
+      );
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.message || 'Validation failed' });
+    } finally {
+      setDeveloperBusy(false);
+    }
+  };
+
   const filteredPlugins = searchQuery
     ? plugins.filter(
         (p) =>
@@ -153,6 +230,14 @@ export function PluginPanel() {
           </span>
         </div>
         <div className="flex gap-2">
+          <button
+            onClick={() => setShowDeveloperTools(!showDeveloperTools)}
+            className="p-2 rounded-md transition-colors hover:bg-[var(--bg-hover)]"
+            style={{ color: 'var(--text-secondary)' }}
+            title="Plugin developer tools"
+          >
+            <FolderPlus className="w-4 h-4" />
+          </button>
           <button
             onClick={handleReload}
             disabled={loading}
@@ -197,6 +282,144 @@ export function PluginPanel() {
           <button onClick={() => setMessage(null)} className="ml-auto">
             <X className="w-3 h-3" />
           </button>
+        </div>
+      )}
+
+      {showDeveloperTools && (
+        <div
+          className="p-4 border space-y-3"
+          style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-primary)' }}
+        >
+          <div className="grid grid-cols-1 sm:grid-cols-[1fr_180px] gap-2">
+            <input
+              type="text"
+              placeholder="Plugin directory"
+              value={developerPath}
+              onChange={(event) => setDeveloperPath(event.target.value)}
+              className="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:border-[var(--accent)]"
+              style={{
+                background: 'var(--bg-input)',
+                borderColor: 'var(--border-primary)',
+                color: 'var(--text-primary)',
+              }}
+            />
+            <input
+              type="text"
+              placeholder="Plugin name"
+              value={scaffoldName}
+              onChange={(event) => setScaffoldName(event.target.value)}
+              className="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:border-[var(--accent)]"
+              style={{
+                background: 'var(--bg-input)',
+                borderColor: 'var(--border-primary)',
+                color: 'var(--text-primary)',
+              }}
+            />
+          </div>
+          <div className="flex gap-2">
+            <button
+              onClick={handleScaffold}
+              disabled={developerBusy || !developerPath.trim() || !scaffoldName.trim()}
+              className="flex items-center gap-1 px-3 py-2 rounded-md text-sm text-[var(--text-on-accent)] disabled:opacity-50"
+              style={{ background: 'var(--accent)' }}
+            >
+              {developerBusy ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <FolderPlus className="w-4 h-4" />
+              )}
+              Scaffold
+            </button>
+            <button
+              onClick={handleValidate}
+              disabled={developerBusy || !developerPath.trim()}
+              className="flex items-center gap-1 px-3 py-2 border rounded-md text-sm disabled:opacity-50"
+              style={{ borderColor: 'var(--border-primary)', color: 'var(--text-secondary)' }}
+            >
+              <ShieldCheck className="w-4 h-4" />
+              Validate
+            </button>
+          </div>
+        </div>
+      )}
+
+      {(pluginThemes.length > 0 || outputStyles.length > 0) && (
+        <div
+          className="grid grid-cols-1 gap-4 border-y py-3 sm:grid-cols-2"
+          style={{ borderColor: 'var(--border-primary)' }}
+        >
+          <div className="space-y-2">
+            <div
+              className="flex items-center gap-2 text-sm font-medium"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              <Palette className="h-4 w-4" />
+              Plugin themes
+            </div>
+            {pluginThemes.length === 0 ? (
+              <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                None loaded
+              </div>
+            ) : (
+              <div className="space-y-1.5">
+                {pluginThemes.map((theme) => (
+                  <div
+                    key={`${theme.plugin}:${theme.name}`}
+                    className="flex items-center gap-2 text-xs"
+                  >
+                    <div className="flex h-4 items-center" aria-hidden="true">
+                      {Object.values(theme.colors)
+                        .slice(0, 6)
+                        .map((color, index) => (
+                          <span
+                            key={`${color}:${index}`}
+                            className="h-3 w-3 border first:rounded-l-sm last:rounded-r-sm"
+                            style={{ background: color, borderColor: 'var(--border-primary)' }}
+                          />
+                        ))}
+                    </div>
+                    <span style={{ color: 'var(--text-primary)' }}>
+                      {theme.display_name || theme.name}
+                    </span>
+                    <span style={{ color: 'var(--text-tertiary)' }}>{theme.plugin}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <label className="space-y-2">
+            <span
+              className="flex items-center gap-2 text-sm font-medium"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              <TextQuote className="h-4 w-4" />
+              Output style
+            </span>
+            <select
+              value={activeOutputStyle || ''}
+              onChange={(event) => handleOutputStyleChange(event.target.value)}
+              disabled={runtimeBusy}
+              className="w-full rounded-md border px-3 py-2 text-sm disabled:opacity-50"
+              style={{
+                background: 'var(--bg-input)',
+                borderColor: 'var(--border-primary)',
+                color: 'var(--text-primary)',
+              }}
+            >
+              <option value="">Default</option>
+              {outputStyles.map((style) => (
+                <option key={`${style.plugin}:${style.name}`} value={style.name}>
+                  {style.name} ({style.plugin})
+                </option>
+              ))}
+            </select>
+            {activeOutputStyle && (
+              <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                {outputStyles.find((style) => style.name === activeOutputStyle)?.description}
+              </div>
+            )}
+          </label>
         </div>
       )}
 

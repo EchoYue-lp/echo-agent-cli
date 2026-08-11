@@ -371,6 +371,8 @@ pub enum TodoStatus {
     Blocked,
     Completed,
     Failed,
+    Cancelled,
+    TimedOut,
     Skipped,
 }
 
@@ -382,6 +384,8 @@ impl TodoStatus {
             TodoStatus::Blocked => "blocked",
             TodoStatus::Completed => "completed",
             TodoStatus::Failed => "failed",
+            TodoStatus::Cancelled => "cancelled",
+            TodoStatus::TimedOut => "timed_out",
             TodoStatus::Skipped => "skipped",
         }
     }
@@ -394,6 +398,8 @@ impl TodoStatus {
             "blocked" => TodoStatus::Blocked,
             "completed" => TodoStatus::Completed,
             "failed" => TodoStatus::Failed,
+            "cancelled" => TodoStatus::Cancelled,
+            "timed_out" => TodoStatus::TimedOut,
             "skipped" => TodoStatus::Skipped,
             _ => return None,
         })
@@ -408,6 +414,8 @@ impl TodoStatus {
             TodoStatus::Blocked => echo_agent::tasks::TaskStatus::Blocked(detail),
             TodoStatus::Completed => echo_agent::tasks::TaskStatus::Completed,
             TodoStatus::Failed => echo_agent::tasks::TaskStatus::Failed(detail),
+            TodoStatus::Cancelled => echo_agent::tasks::TaskStatus::Cancelled,
+            TodoStatus::TimedOut => echo_agent::tasks::TaskStatus::TimedOut { error: detail },
             TodoStatus::Skipped => echo_agent::tasks::TaskStatus::Skipped,
         }
     }
@@ -420,10 +428,10 @@ impl TodoStatus {
             echo_agent::tasks::TaskStatus::Blocked(_) => Ok(TodoStatus::Blocked),
             echo_agent::tasks::TaskStatus::Completed => Ok(TodoStatus::Completed),
             echo_agent::tasks::TaskStatus::Failed(_) => Ok(TodoStatus::Failed),
+            echo_agent::tasks::TaskStatus::Cancelled => Ok(TodoStatus::Cancelled),
+            echo_agent::tasks::TaskStatus::TimedOut { .. } => Ok(TodoStatus::TimedOut),
             echo_agent::tasks::TaskStatus::Skipped => Ok(TodoStatus::Skipped),
-            echo_agent::tasks::TaskStatus::Cancelled
-            | echo_agent::tasks::TaskStatus::TimedOut { .. }
-            | echo_agent::tasks::TaskStatus::Retrying { .. }
+            echo_agent::tasks::TaskStatus::Retrying { .. }
             | echo_agent::tasks::TaskStatus::Paused(_) => Err(format!(
                 "framework task status {status:?} has no lossless EKO todo projection"
             )),
@@ -440,11 +448,10 @@ impl TodoStatus {
             echo_agent::tasks::TaskStatus::Blocked(_)
             | echo_agent::tasks::TaskStatus::Paused(_) => TodoStatus::Blocked,
             echo_agent::tasks::TaskStatus::Completed => TodoStatus::Completed,
-            echo_agent::tasks::TaskStatus::Failed(_)
-            | echo_agent::tasks::TaskStatus::TimedOut { .. } => TodoStatus::Failed,
-            echo_agent::tasks::TaskStatus::Skipped | echo_agent::tasks::TaskStatus::Cancelled => {
-                TodoStatus::Skipped
-            }
+            echo_agent::tasks::TaskStatus::Failed(_) => TodoStatus::Failed,
+            echo_agent::tasks::TaskStatus::Cancelled => TodoStatus::Cancelled,
+            echo_agent::tasks::TaskStatus::TimedOut { .. } => TodoStatus::TimedOut,
+            echo_agent::tasks::TaskStatus::Skipped => TodoStatus::Skipped,
         }
     }
 }
@@ -599,6 +606,9 @@ impl ArtifactKind {
 #[ts(export, rename = "RuntimeEventKind")]
 pub enum RuntimeEventKind {
     RunCreated,
+    RunStarted,
+    RunCompleted,
+    RunFailed,
     RunStatusChanged,
     /// User-uploaded attachments were bound to this run (so plan-level
     /// subagents can see the same images/files as the main agent).
@@ -607,15 +617,39 @@ pub enum RuntimeEventKind {
     TaskStarted,
     TaskCompleted,
     TaskFailed,
+    TaskCancelled,
+    TaskTimedOut,
     TaskSkipped,
     TaskBlocked,
     TodoUpdated,
+    #[serde(rename = "started")]
+    Started,
+    #[serde(rename = "running")]
+    Running,
+    #[serde(rename = "completed")]
+    Completed,
+    #[serde(rename = "failed")]
+    Failed,
+    #[serde(rename = "cancelled")]
+    Cancelled,
+    #[serde(rename = "timed_out")]
+    TimedOut,
     SubagentAssigned,
     SubagentReleased,
+    IsolationObserved,
+    ThinkingStarted,
+    ThinkingDelta,
+    ThinkingEnded,
+    TokenDelta,
+    Usage,
     ToolStarted,
+    ToolOutput,
     ToolCompleted,
     ToolFailed,
     ArtifactProduced,
+    MergeStarted,
+    MergeCompleted,
+    MergeFailed,
     ReviewPassed,
     ReviewNeedsFix,
     ReviewBlocked,
@@ -631,21 +665,42 @@ impl RuntimeEventKind {
         use RuntimeEventKind::*;
         match self {
             RunCreated => "run_created",
+            RunStarted => "run_started",
+            RunCompleted => "run_completed",
+            RunFailed => "run_failed",
             RunStatusChanged => "run_status_changed",
             RunAttachmentsUpdated => "run_attachments_updated",
             PlanRevisionCommitted => "plan_revision_committed",
             TaskStarted => "task_started",
             TaskCompleted => "task_completed",
             TaskFailed => "task_failed",
+            TaskCancelled => "task_cancelled",
+            TaskTimedOut => "task_timed_out",
             TaskSkipped => "task_skipped",
             TaskBlocked => "task_blocked",
             TodoUpdated => "todo_updated",
+            Started => "started",
+            Running => "running",
+            Completed => "completed",
+            Failed => "failed",
+            Cancelled => "cancelled",
+            TimedOut => "timed_out",
             SubagentAssigned => "subagent_assigned",
             SubagentReleased => "subagent_released",
+            IsolationObserved => "isolation_observed",
+            ThinkingStarted => "thinking_started",
+            ThinkingDelta => "thinking_delta",
+            ThinkingEnded => "thinking_ended",
+            TokenDelta => "token_delta",
+            Usage => "usage",
             ToolStarted => "tool_started",
+            ToolOutput => "tool_output",
             ToolCompleted => "tool_completed",
             ToolFailed => "tool_failed",
             ArtifactProduced => "artifact_produced",
+            MergeStarted => "merge_started",
+            MergeCompleted => "merge_completed",
+            MergeFailed => "merge_failed",
             ReviewPassed => "review_passed",
             ReviewNeedsFix => "review_needs_fix",
             ReviewBlocked => "review_blocked",
@@ -656,26 +711,68 @@ impl RuntimeEventKind {
             Note => "note",
         }
     }
+
+    /// Events that interactive surfaces should render as explicit lifecycle
+    /// notices instead of treating as high-volume progress.
+    pub fn is_attention_event(self) -> bool {
+        matches!(
+            self,
+            RuntimeEventKind::RunFailed
+                | RuntimeEventKind::RunCancelled
+                | RuntimeEventKind::TaskFailed
+                | RuntimeEventKind::TaskCancelled
+                | RuntimeEventKind::TaskTimedOut
+                | RuntimeEventKind::Failed
+                | RuntimeEventKind::Cancelled
+                | RuntimeEventKind::TimedOut
+                | RuntimeEventKind::ArtifactProduced
+                | RuntimeEventKind::MergeStarted
+                | RuntimeEventKind::MergeCompleted
+                | RuntimeEventKind::MergeFailed
+        )
+    }
+
     #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         use RuntimeEventKind::*;
         Some(match s {
             "run_created" => RunCreated,
+            "run_started" => RunStarted,
+            "run_completed" => RunCompleted,
+            "run_failed" => RunFailed,
             "run_status_changed" => RunStatusChanged,
             "run_attachments_updated" => RunAttachmentsUpdated,
             "plan_revision_committed" => PlanRevisionCommitted,
             "task_started" => TaskStarted,
             "task_completed" => TaskCompleted,
             "task_failed" => TaskFailed,
+            "task_cancelled" => TaskCancelled,
+            "task_timed_out" => TaskTimedOut,
             "task_skipped" => TaskSkipped,
             "task_blocked" => TaskBlocked,
             "todo_updated" => TodoUpdated,
+            "started" => Started,
+            "running" => Running,
+            "completed" => Completed,
+            "failed" => Failed,
+            "cancelled" => Cancelled,
+            "timed_out" => TimedOut,
             "subagent_assigned" => SubagentAssigned,
             "subagent_released" => SubagentReleased,
+            "isolation_observed" => IsolationObserved,
+            "thinking_started" => ThinkingStarted,
+            "thinking_delta" => ThinkingDelta,
+            "thinking_ended" => ThinkingEnded,
+            "token_delta" => TokenDelta,
+            "usage" => Usage,
             "tool_started" => ToolStarted,
+            "tool_output" => ToolOutput,
             "tool_completed" => ToolCompleted,
             "tool_failed" => ToolFailed,
             "artifact_produced" => ArtifactProduced,
+            "merge_started" => MergeStarted,
+            "merge_completed" => MergeCompleted,
+            "merge_failed" => MergeFailed,
             "review_passed" => ReviewPassed,
             "review_needs_fix" => ReviewNeedsFix,
             "review_blocked" => ReviewBlocked,
@@ -686,6 +783,12 @@ impl RuntimeEventKind {
             "note" => Note,
             _ => return None,
         })
+    }
+}
+
+impl std::fmt::Display for RuntimeEventKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
@@ -1934,6 +2037,25 @@ mod tests {
             TodoStatus::try_from_task_status(&framework_task.execution.status),
             Ok(TodoStatus::Failed)
         );
+    }
+
+    #[test]
+    fn task_status_projection_preserves_cancelled_and_timed_out() {
+        for (framework, expected) in [
+            (
+                echo_agent::tasks::TaskStatus::Cancelled,
+                TodoStatus::Cancelled,
+            ),
+            (
+                echo_agent::tasks::TaskStatus::TimedOut {
+                    error: "deadline".to_string(),
+                },
+                TodoStatus::TimedOut,
+            ),
+        ] {
+            assert_eq!(TodoStatus::try_from_task_status(&framework), Ok(expected));
+            assert_eq!(TodoStatus::project_task_status(&framework), expected);
+        }
     }
 
     #[test]

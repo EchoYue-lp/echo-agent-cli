@@ -77,9 +77,9 @@ pub enum ExecEventScope {
 /// A lightweight execution-flow event emitted to the frontend via the unified
 /// `execution://event` Tauri channel.
 ///
-/// Replaces the pre-unification trace pair. The `event` field is a string (e.g.
-/// `"tool_started"`, `"run_completed"`) matching the frontend's
-/// `SubagentRunEventKind`; `payload` carries event-specific fields
+/// Replaces the pre-unification trace pair. `event` is typed inside the
+/// runtime and serializes to the frontend's snake_case event name. `payload`
+/// carries event-specific fields
 /// (`content`/`name`/`args`/...) as a flat JSON object.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecEvent {
@@ -91,20 +91,24 @@ pub struct ExecEvent {
     /// (`{run_id}:{task_id}:{plan_revision}:{attempt}`).
     /// Present only when `scope == Subagent`.
     pub subagent_run_id: Option<String>,
-    pub event: String,
+    pub event: RuntimeEventKind,
     pub agent: Option<String>,
     pub payload: serde_json::Value,
 }
 
 impl ExecEvent {
     /// Construct a run-level event (no task_id).
-    pub fn run(run_id: impl Into<String>, event: &'static str, payload: serde_json::Value) -> Self {
+    pub fn run(
+        run_id: impl Into<String>,
+        event: RuntimeEventKind,
+        payload: serde_json::Value,
+    ) -> Self {
         Self {
             run_id: run_id.into(),
             scope: ExecEventScope::Run,
             task_id: None,
             subagent_run_id: None,
-            event: event.to_string(),
+            event,
             agent: None,
             payload,
         }
@@ -114,7 +118,7 @@ impl ExecEvent {
     pub fn task(
         run_id: impl Into<String>,
         task_id: impl Into<String>,
-        event: &'static str,
+        event: RuntimeEventKind,
         payload: serde_json::Value,
     ) -> Self {
         Self {
@@ -122,7 +126,7 @@ impl ExecEvent {
             scope: ExecEventScope::Task,
             task_id: Some(task_id.into()),
             subagent_run_id: None,
-            event: event.to_string(),
+            event,
             agent: None,
             payload,
         }
@@ -133,7 +137,7 @@ impl ExecEvent {
         run_id: impl Into<String>,
         task_id: impl Into<String>,
         subagent_run_id: impl Into<String>,
-        event: &'static str,
+        event: RuntimeEventKind,
         payload: serde_json::Value,
     ) -> Self {
         Self {
@@ -141,7 +145,7 @@ impl ExecEvent {
             scope: ExecEventScope::Subagent,
             task_id: Some(task_id.into()),
             subagent_run_id: Some(subagent_run_id.into()),
-            event: event.to_string(),
+            event,
             agent: None,
             payload,
         }
@@ -173,6 +177,16 @@ fn subagent_execution_id(
     claim: &echo_agent::tasks::TaskClaim,
 ) -> String {
     claim.execution_id(run_id, task_id)
+}
+
+fn subagent_terminal_event(status: SubagentRunStatus) -> RuntimeEventKind {
+    match status {
+        SubagentRunStatus::Running => RuntimeEventKind::Running,
+        SubagentRunStatus::Completed => RuntimeEventKind::Completed,
+        SubagentRunStatus::Failed => RuntimeEventKind::Failed,
+        SubagentRunStatus::Cancelled => RuntimeEventKind::Cancelled,
+        SubagentRunStatus::TimedOut => RuntimeEventKind::TimedOut,
+    }
 }
 
 fn task_isolation_id(run_id: &str, task_id: &str) -> String {
@@ -337,7 +351,7 @@ pub async fn execute_run(
         trace_sink.as_ref(),
         ExecEvent::run(
             run_id.to_string(),
-            "run_started",
+            RuntimeEventKind::RunStarted,
             serde_json::json!({
                 "goal": &run.goal,
                 "conversation_id": &run.conversation_id,
@@ -360,7 +374,11 @@ pub async fn execute_run(
             .filter(|task| {
                 !matches!(
                     task.status,
-                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                    TodoStatus::Completed
+                        | TodoStatus::Failed
+                        | TodoStatus::Cancelled
+                        | TodoStatus::TimedOut
+                        | TodoStatus::Skipped
                 )
             })
             .count();
@@ -422,7 +440,7 @@ pub async fn execute_run(
                 trace_sink.as_ref(),
                 ExecEvent::run(
                     run_id.to_string(),
-                    "run_completed",
+                    RuntimeEventKind::RunCompleted,
                     serde_json::json!({ "status": "completed" }),
                 ),
             );
@@ -454,7 +472,7 @@ pub async fn execute_run(
                 trace_sink.as_ref(),
                 ExecEvent::run(
                     run_id.to_string(),
-                    "run_failed",
+                    RuntimeEventKind::RunFailed,
                     serde_json::json!({
                         "failed_task_id": failed_task_id,
                         "error": error,
@@ -483,7 +501,7 @@ pub async fn execute_run(
                 trace_sink.as_ref(),
                 ExecEvent::run(
                     run_id.to_string(),
-                    "run_cancelled",
+                    RuntimeEventKind::RunCancelled,
                     serde_json::json!({ "status": "cancelled" }),
                 ),
             );
@@ -514,7 +532,7 @@ pub async fn execute_run(
                 trace_sink.as_ref(),
                 ExecEvent::run(
                     run_id.to_string(),
-                    "run_status_changed",
+                    RuntimeEventKind::RunStatusChanged,
                     serde_json::json!({
                         "status": "paused",
                         "failed_task_id": failed_task_id,
@@ -554,7 +572,7 @@ pub async fn execute_run(
                 trace_sink.as_ref(),
                 ExecEvent::run(
                     run_id.to_string(),
-                    "run_failed",
+                    RuntimeEventKind::RunFailed,
                     serde_json::json!({ "error": e.to_string() }),
                 ),
             );
@@ -633,7 +651,7 @@ fn finalize_cancelled_run_state(store: &TaskRuntimeStore, run_id: &str) {
             let _ = store.set_task_status(
                 run_id,
                 &todo.task_id,
-                TodoStatus::Skipped,
+                TodoStatus::Cancelled,
                 None,
                 Some("cancelled with parent run"),
             );
@@ -927,7 +945,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                 ExecEvent::task(
                     run_id.clone(),
                     task.id.clone(),
-                    "merge_started",
+                    RuntimeEventKind::MergeStarted,
                     serde_json::json!({
                         "execution_id": execution_id,
                         "branch": branch,
@@ -968,7 +986,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                         ExecEvent::task(
                             run_id,
                             task.id.clone(),
-                            "merge_completed",
+                            RuntimeEventKind::MergeCompleted,
                             serde_json::json!({
                                 "execution_id": execution_id,
                                 "integration_status": outcome.status.as_str(),
@@ -995,7 +1013,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                         ExecEvent::task(
                             run_id,
                             task.id.clone(),
-                            "merge_failed",
+                            RuntimeEventKind::MergeFailed,
                             serde_json::json!({
                                 "execution_id": execution_id,
                                 "branch": branch,
@@ -1018,7 +1036,91 @@ struct TaskDispatchSuccess {
     full_output: String,
 }
 
-type TaskDispatchResult = Result<TaskDispatchSuccess, (String, String)>;
+#[derive(Debug, Clone)]
+struct ExecutionFailure {
+    status: SubagentRunStatus,
+    message: String,
+}
+
+impl ExecutionFailure {
+    fn failed(message: impl Into<String>) -> Self {
+        Self {
+            status: SubagentRunStatus::Failed,
+            message: message.into(),
+        }
+    }
+
+    fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            status: SubagentRunStatus::Cancelled,
+            message: message.into(),
+        }
+    }
+
+    fn from_react(error: echo_agent::error::ReactError, context: &str) -> Self {
+        let status = echo_agent::agent::subagent::subagent_status_from_error(&error).into();
+        Self {
+            status,
+            message: format!("{context}: {error}"),
+        }
+    }
+}
+
+impl std::fmt::Display for ExecutionFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TaskDispatchFailure {
+    task_id: String,
+    status: SubagentRunStatus,
+    message: String,
+}
+
+impl TaskDispatchFailure {
+    fn failed(task_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            status: SubagentRunStatus::Failed,
+            message: message.into(),
+        }
+    }
+
+    fn cancelled(task_id: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            status: SubagentRunStatus::Cancelled,
+            message: message.into(),
+        }
+    }
+
+    fn from_execution(task_id: impl Into<String>, failure: ExecutionFailure) -> Self {
+        Self {
+            task_id: task_id.into(),
+            status: failure.status,
+            message: failure.message,
+        }
+    }
+
+    fn into_react(self) -> echo_agent::error::ReactError {
+        use echo_agent::error::AgentError;
+        match self.status {
+            SubagentRunStatus::Cancelled => {
+                echo_agent::error::ReactError::Agent(Box::new(AgentError::Cancelled(self.message)))
+            }
+            SubagentRunStatus::TimedOut => {
+                echo_agent::error::ReactError::Agent(Box::new(AgentError::Timeout(self.message)))
+            }
+            SubagentRunStatus::Running
+            | SubagentRunStatus::Completed
+            | SubagentRunStatus::Failed => echo_agent::error::ReactError::Other(self.message),
+        }
+    }
+}
+
+type TaskDispatchResult = Result<TaskDispatchSuccess, TaskDispatchFailure>;
 
 /// Pick the largest deterministic subset of the ready frontier that has no
 /// writer ownership conflicts. Read-only tasks never consume ownership.
@@ -1186,6 +1288,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         runtime_task: echo_agent::tasks::Task,
     ) -> echo_agent::error::Result<Self::DispatchOutput> {
         let task = self.plan_task(&runtime_task.spec.id)?;
+        let active_task_id = task.id.clone();
         let execution_id = subagent_execution_id(&context.run_id, &task.id, &claim);
         match self
             .store
@@ -1231,7 +1334,15 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 self.trace_sink.clone(),
             )
             .await
-            .map_err(|(_, error)| echo_agent::error::ReactError::Other(error))
+            .map_err(|failure| {
+                if failure.task_id != active_task_id {
+                    return echo_agent::error::ReactError::Other(format!(
+                        "dispatcher returned failure for task '{}' while '{}' was active",
+                        failure.task_id, active_task_id
+                    ));
+                }
+                failure.into_react()
+            })
     }
 
     async fn resolve_dispatch(
@@ -1246,28 +1357,27 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             Ok(dispatched) => dispatched,
             Err(error) => {
                 let message = error.to_string();
-                if self.cancel.is_cancelled() {
-                    if !self.set_claimed_status(
-                        run_id,
-                        &task,
-                        &claim,
-                        TodoStatus::Skipped,
-                        Some("cancelled with parent run"),
-                    )? {
-                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
-                    }
-                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Cancelled);
-                }
+                let status = echo_agent::agent::subagent::subagent_status_from_error(&error);
+                let todo_status = match status {
+                    echo_agent::agent::subagent::SubagentStatus::Cancelled => TodoStatus::Cancelled,
+                    echo_agent::agent::subagent::SubagentStatus::TimedOut => TodoStatus::TimedOut,
+                    echo_agent::agent::subagent::SubagentStatus::Completed
+                    | echo_agent::agent::subagent::SubagentStatus::Failed => TodoStatus::Failed,
+                };
                 if !self.set_claimed_status(
                     run_id,
                     &task,
                     &claim,
-                    TodoStatus::Failed,
+                    todo_status,
                     Some(&format!("error: {message}")),
                 )? {
                     return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
                 }
-                return Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error: message });
+                return Ok(if todo_status == TodoStatus::Cancelled {
+                    echo_agent::tasks::RuntimeTaskResolution::Cancelled
+                } else {
+                    echo_agent::tasks::RuntimeTaskResolution::Failed { error: message }
+                });
             }
         };
 
@@ -1766,7 +1876,7 @@ async fn execute_task(
                 "CP B preflight rejected task '{}': {}",
                 task_id, rejection.reason
             );
-            return Err((task_id.clone(), msg));
+            return Err(TaskDispatchFailure::failed(task_id.clone(), msg));
         }
     }
 
@@ -1835,8 +1945,8 @@ async fn execute_task(
         );
         let wp = tokio::select! {
             biased;
-            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
-            p = write_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
+            _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for write permit")),
+            p = write_sem.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
         };
         tracing::info!(
             run_id = %run_id,
@@ -1851,8 +1961,8 @@ async fn execute_task(
         );
         let sp = tokio::select! {
             biased;
-            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for shell permit".to_string())),
-            p = shell_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
+            _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for shell permit")),
+            p = shell_sem.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
         };
         tracing::info!(
             run_id = %run_id,
@@ -1869,8 +1979,8 @@ async fn execute_task(
         );
         let wp = tokio::select! {
             biased;
-            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
-            p = write_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
+            _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for write permit")),
+            p = write_sem.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
         };
         tracing::info!(
             run_id = %run_id,
@@ -1926,9 +2036,9 @@ async fn execute_task(
                 let guard = tokio::select! {
                     biased;
                     _ = task_cancel.cancelled() => {
-                        return Err((
+                        return Err(TaskDispatchFailure::cancelled(
                             task_id.clone(),
-                            "cancelled while waiting for file write lock".to_string(),
+                            "cancelled while waiting for file write lock",
                         ));
                     }
                     guard = mtx.lock_owned() => guard,
@@ -1951,8 +2061,8 @@ async fn execute_task(
     );
     let _llm_permit = tokio::select! {
         biased;
-        _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for LLM permit".to_string())),
-        p = llm_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
+        _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for LLM permit")),
+        p = llm_sem.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
     };
     tracing::info!(
         run_id = %run_id,
@@ -1979,7 +2089,7 @@ async fn execute_task(
     )
     .to_value()
     .map_err(|error| {
-        (
+        TaskDispatchFailure::failed(
             task_id.clone(),
             format!("failed to serialize Subagent prompt payload: {error}"),
         )
@@ -2025,7 +2135,7 @@ async fn execute_task(
         task.kind.is_read_only(),
         app_owns_subagent_events,
     ) {
-        return Err((
+        return Err(TaskDispatchFailure::failed(
             task_id,
             format!("failed to persist Subagent start boundary: {error}"),
         ));
@@ -2055,15 +2165,15 @@ async fn execute_task(
         match dispatch_result {
             Ok(sub_result)
                 if sub_result.outcome.status
-                    == echo_agent::agent::subagent::SubagentStatus::Cancelled =>
+                    != echo_agent::agent::subagent::SubagentStatus::Completed =>
             {
-                tracing::info!(
-                    run_id = %run_id,
-                    task_id = %task_id,
-                    agent_role = %task.agent_role,
-                    "task_runtime: read-only subagent cancelled"
-                );
-                Err("task cancelled".to_string())
+                let status = sub_result.outcome.status.into();
+                let message = if sub_result.outcome.summary.trim().is_empty() {
+                    sub_result.output.clone()
+                } else {
+                    sub_result.outcome.summary.clone()
+                };
+                Err(ExecutionFailure { status, message })
             }
             Ok(sub_result) => {
                 tracing::info!(
@@ -2118,15 +2228,15 @@ async fn execute_task(
         match dispatch_result {
             Ok(sub_result)
                 if sub_result.outcome.status
-                    == echo_agent::agent::subagent::SubagentStatus::Cancelled =>
+                    != echo_agent::agent::subagent::SubagentStatus::Completed =>
             {
-                tracing::info!(
-                    run_id = %run_id,
-                    task_id = %task_id,
-                    agent_role = %task.agent_role,
-                    "task_runtime: writer subagent cancelled"
-                );
-                Err("task cancelled".to_string())
+                let status = sub_result.outcome.status.into();
+                let message = if sub_result.outcome.summary.trim().is_empty() {
+                    sub_result.output.clone()
+                } else {
+                    sub_result.outcome.summary.clone()
+                };
+                Err(ExecutionFailure { status, message })
             }
             Ok(sub_result) => {
                 tracing::info!(
@@ -2144,10 +2254,10 @@ async fn execute_task(
                     sub_result.output.clone(),
                 ))
             }
-            Err(e) => Err(if task_cancel.is_cancelled() {
-                "task cancelled".to_string()
+            Err(error) => Err(if task_cancel.is_cancelled() {
+                ExecutionFailure::cancelled("task cancelled")
             } else {
-                e
+                error
             }),
         }
     } else {
@@ -2231,7 +2341,7 @@ async fn execute_task(
                 full_output: Some(&full_output),
                 dispatch_hook: app_owns_subagent_events,
             }) {
-                return Err((
+                return Err(TaskDispatchFailure::failed(
                     task_id,
                     format!("Subagent completed but terminal boundary was not persisted: {error}"),
                 ));
@@ -2271,7 +2381,7 @@ async fn execute_task(
                 ExecEvent::task(
                     run_id.clone(),
                     task_id.clone(),
-                    "task_completed",
+                    RuntimeEventKind::TaskCompleted,
                     terminal_payload.clone(),
                 )
                 .with_agent(task.agent_role.clone()),
@@ -2283,7 +2393,7 @@ async fn execute_task(
                         run_id.clone(),
                         task_id.clone(),
                         execution_id.clone(),
-                        "completed",
+                        RuntimeEventKind::Completed,
                         terminal_payload,
                     )
                     .with_agent(task.agent_role.clone()),
@@ -2295,18 +2405,11 @@ async fn execute_task(
                 full_output,
             })
         }
-        Err(e) => {
-            let cancelled = task_cancel.is_cancelled() || e.contains("cancelled");
-            let status = if cancelled {
-                SubagentRunStatus::Cancelled
-            } else if e.to_ascii_lowercase().contains("timed out")
-                || e.to_ascii_lowercase().contains("timeout")
-            {
-                SubagentRunStatus::TimedOut
-            } else {
-                SubagentRunStatus::Failed
-            };
-            let task_result = SubagentTaskResult::terminal(status, e.clone(), vec![e.clone()]);
+        Err(failure) => {
+            let status = failure.status;
+            let message = failure.message;
+            let task_result =
+                SubagentTaskResult::terminal(status, message.clone(), vec![message.clone()]);
             if let Err(error) = store.put_summary(&TaskExecutionSummary {
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
@@ -2329,7 +2432,7 @@ async fn execute_task(
                 attempt,
                 status: status.as_str(),
                 result: Some(&task_result),
-                full_output: Some(&e),
+                full_output: Some(&message),
                 dispatch_hook: app_owns_subagent_events,
             }) {
                 tracing::warn!(
@@ -2339,7 +2442,7 @@ async fn execute_task(
                     "failed to persist Subagent terminal boundary"
                 );
             }
-            if cancelled {
+            if status == SubagentRunStatus::Cancelled {
                 tracing::info!(
                     run_id = %run_id,
                     task_id = %task_id,
@@ -2351,13 +2454,13 @@ async fn execute_task(
                     run_id = %run_id,
                     task_id = %task_id,
                     agent_role = %task.agent_role,
-                    error = %e,
+                    error = %message,
                     "task_runtime: task failed"
                 );
             }
             let terminal_payload = serde_json::json!({
                 "execution_id": &execution_id,
-                "error": &e,
+                "error": &message,
                 "terminal_status": status.as_str(),
                 "contract_version": task_result.contract_version,
                 "summary": &task_result.summary,
@@ -2366,10 +2469,12 @@ async fn execute_task(
                 "remaining_work": &task_result.remaining_work,
                 "touched_files": &task_result.touched_files,
             });
-            let task_terminal_event = if cancelled {
-                "task_cancelled"
-            } else {
-                "task_failed"
+            let task_terminal_event = match status {
+                SubagentRunStatus::Cancelled => RuntimeEventKind::TaskCancelled,
+                SubagentRunStatus::TimedOut => RuntimeEventKind::TaskTimedOut,
+                SubagentRunStatus::Running
+                | SubagentRunStatus::Completed
+                | SubagentRunStatus::Failed => RuntimeEventKind::TaskFailed,
             };
             emit_exec(
                 trace_sink.as_ref(),
@@ -2388,13 +2493,16 @@ async fn execute_task(
                         run_id,
                         task_id.clone(),
                         execution_id,
-                        status.as_str(),
+                        subagent_terminal_event(status),
                         terminal_payload,
                     )
                     .with_agent(task.agent_role.clone()),
                 );
             }
-            Err((task_id, e))
+            Err(TaskDispatchFailure::from_execution(
+                task_id,
+                ExecutionFailure { status, message },
+            ))
         }
     }
 }
@@ -2591,7 +2699,7 @@ fn emit_task_started(
         ExecEvent::task(
             run_id,
             task.id.clone(),
-            "task_started",
+            RuntimeEventKind::TaskStarted,
             runtime_contract_started_payload(contract, task, execution_id),
         )
         .with_agent(task.agent_role.clone()),
@@ -2611,7 +2719,7 @@ fn emit_primary_subagent_started(
             run_id,
             task.id.clone(),
             execution_id,
-            "started",
+            RuntimeEventKind::Started,
             runtime_contract_started_payload(contract, task, execution_id),
         )
         .with_agent(task.agent_role.clone()),
@@ -2631,7 +2739,7 @@ fn emit_primary_subagent_isolation_observed(
             run_id,
             task.id.clone(),
             execution_id,
-            "isolation_observed",
+            RuntimeEventKind::IsolationObserved,
             runtime_isolation_observed_payload(contract, "primary"),
         )
         .with_agent(task.agent_role.clone()),
@@ -2699,7 +2807,7 @@ async fn run_readonly_subagent(
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
-) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
+) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
     primary_agent
         .read_async(|agent| {
             let task_input = task_input.to_string();
@@ -2733,7 +2841,9 @@ async fn run_readonly_subagent(
                         Some(prompt_payload),
                     )
                     .await
-                    .map_err(|e| format!("subagent dispatch failed: {e}"))
+                    .map_err(|error| {
+                        ExecutionFailure::from_react(error, "subagent dispatch failed")
+                    })
             })
         })
         .await
@@ -2789,7 +2899,7 @@ async fn run_writer_subagent(
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
-) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
+) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer Subagent sees the same images/files as the primary agent would
     // (parity with run_main_agent_task, executor.rs:1373-1380).
@@ -2854,7 +2964,9 @@ async fn run_writer_subagent(
                         )
                         .await
                 }
-                .map_err(|e| format!("writer subagent dispatch failed: {e}"))
+                .map_err(|error| {
+                    ExecutionFailure::from_react(error, "writer subagent dispatch failed")
+                })
             })
         })
         .await
@@ -2943,7 +3055,7 @@ async fn run_main_agent_task(
     prompt: &str,
     cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
-) -> Result<(SubagentTaskResult, String), String> {
+) -> Result<(SubagentTaskResult, String), ExecutionFailure> {
     let run_id = run_id.to_string();
     let task_id = task.id.clone();
     let agent_role = task.agent_role.clone();
@@ -3010,12 +3122,16 @@ async fn run_main_agent_task(
                             invocation,
                         )
                         .await
-                        .map_err(|e| format!("main agent stream failed: {e}"))?
+                        .map_err(|error| {
+                            ExecutionFailure::from_react(error, "main agent stream failed")
+                        })?
                 } else {
                     agent
                         .execute_stream_with_invocation_context(&prompt, cancel, invocation)
                         .await
-                        .map_err(|e| format!("main agent stream failed: {e}"))?
+                        .map_err(|error| {
+                            ExecutionFailure::from_react(error, "main agent stream failed")
+                        })?
                 };
                 let mut stream = echo_core::agent::envelope_event_stream(
                     raw_stream,
@@ -3031,7 +3147,9 @@ async fn run_main_agent_task(
 
                 while let Some(event_result) = stream.next().await {
                     let event = event_result
-                        .map_err(|e| format!("main agent stream failed: {e}"))?
+                        .map_err(|error| {
+                            ExecutionFailure::from_react(error, "main agent stream failed")
+                        })?
                         .payload;
                     match event {
                         AgentEvent::Token(content) => {
@@ -3042,7 +3160,7 @@ async fn run_main_agent_task(
                                         run_id.clone(),
                                         task_id.clone(),
                                         execution_id.clone(),
-                                        "thinking_delta",
+                                        RuntimeEventKind::ThinkingDelta,
                                         serde_json::json!({ "content": content }),
                                     )
                                     .with_agent(agent_role.clone()),
@@ -3055,7 +3173,7 @@ async fn run_main_agent_task(
                                         run_id.clone(),
                                         task_id.clone(),
                                         execution_id.clone(),
-                                        "token_delta",
+                                        RuntimeEventKind::TokenDelta,
                                         serde_json::json!({ "content": content }),
                                     )
                                     .with_agent(agent_role.clone()),
@@ -3070,7 +3188,7 @@ async fn run_main_agent_task(
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
-                                    "thinking_started",
+                                    RuntimeEventKind::ThinkingStarted,
                                     serde_json::json!({}),
                                 )
                                 .with_agent(agent_role.clone()),
@@ -3087,7 +3205,7 @@ async fn run_main_agent_task(
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
-                                    "thinking_ended",
+                                    RuntimeEventKind::ThinkingEnded,
                                     serde_json::json!({
                                         "prompt_tokens": prompt_tokens,
                                         "completion_tokens": completion_tokens,
@@ -3121,7 +3239,7 @@ async fn run_main_agent_task(
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
-                                    "usage",
+                                    RuntimeEventKind::Usage,
                                     usage_payload,
                                 )
                                 .with_agent(agent_role.clone()),
@@ -3148,9 +3266,9 @@ async fn run_main_agent_task(
                                 replay_safe,
                             ) {
                                 event_cancel.cancel();
-                                return Err(format!(
+                                return Err(ExecutionFailure::failed(format!(
                                     "failed to persist tool start boundary for {name}: {error}"
-                                ));
+                                )));
                             }
                             emit_exec(
                                 trace_sink.as_ref(),
@@ -3158,7 +3276,7 @@ async fn run_main_agent_task(
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
-                                    "tool_started",
+                                    RuntimeEventKind::ToolStarted,
                                     serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
@@ -3201,9 +3319,9 @@ async fn run_main_agent_task(
                                 None,
                             ) {
                                 event_cancel.cancel();
-                                return Err(format!(
+                                return Err(ExecutionFailure::failed(format!(
                                     "tool {name} completed but its terminal boundary was not persisted: {error}"
-                                ));
+                                )));
                             }
                             emit_exec(
                                 trace_sink.as_ref(),
@@ -3211,7 +3329,7 @@ async fn run_main_agent_task(
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
-                                    "tool_completed",
+                                    RuntimeEventKind::ToolCompleted,
                                     serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
@@ -3250,9 +3368,9 @@ async fn run_main_agent_task(
                                 Some(&failure),
                             ) {
                                 event_cancel.cancel();
-                                return Err(format!(
+                                return Err(ExecutionFailure::failed(format!(
                                     "tool {name} failed but its terminal boundary was not persisted: {store_error}"
-                                ));
+                                )));
                             }
                             emit_exec(
                                 trace_sink.as_ref(),
@@ -3260,7 +3378,7 @@ async fn run_main_agent_task(
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
-                                    "tool_completed",
+                                    RuntimeEventKind::ToolCompleted,
                                     serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
@@ -3281,14 +3399,14 @@ async fn run_main_agent_task(
                                 echo_agent::tools::ToolStreamEvent::Progress {
                                     message,
                                     percent,
-                                } => ("tool_output", serde_json::json!({
+                                } => (RuntimeEventKind::ToolOutput, serde_json::json!({
                                     "call_id": call_id,
                                     "name": name,
                                     "message": message,
                                     "percent": percent,
                                 })),
                                 echo_agent::tools::ToolStreamEvent::Output { channel, chunk } => {
-                                    ("tool_output", serde_json::json!({
+                                    (RuntimeEventKind::ToolOutput, serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
                                         "channel": match channel {
@@ -3313,7 +3431,7 @@ async fn run_main_agent_task(
                                         );
                                     }
                                     (
-                                        "tool_completed",
+                                        RuntimeEventKind::ToolCompleted,
                                         serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
@@ -3344,10 +3462,10 @@ async fn run_main_agent_task(
                             }
                         }
                         AgentEvent::Cancelled => {
-                            return Err("task cancelled".to_string());
+                            return Err(ExecutionFailure::cancelled("task cancelled"));
                         }
                         AgentEvent::Error { source, message } => {
-                            return Err(format!("{source}: {message}"));
+                            return Err(ExecutionFailure::failed(format!("{source}: {message}")));
                         }
                         _ => {}
                     }
@@ -4199,7 +4317,7 @@ mod tests {
                 "run-1",
                 "task-1",
                 "task-1:1",
-                "completed",
+                RuntimeEventKind::Completed,
                 serde_json::json!({"output": "done"}),
             ),
         );
@@ -4786,14 +4904,14 @@ Read the runtime path and found one missing branch.
                 if delay_ms > 0 {
                     tokio::select! {
                         _ = context.cancel.cancelled() => {
-                            return Err((task_id, "cancelled".into()));
+                            return Err(TaskDispatchFailure::cancelled(task_id, "cancelled"));
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
                     }
                 }
                 // Honor cancellation even in the mock.
                 if context.cancel.is_cancelled() {
-                    return Err((task_id, "cancelled".into()));
+                    return Err(TaskDispatchFailure::cancelled(task_id, "cancelled"));
                 }
                 match results {
                     Some(Ok((result, full_output))) => Ok(TaskDispatchSuccess {
@@ -4801,7 +4919,7 @@ Read the runtime path and found one missing branch.
                         result,
                         full_output,
                     }),
-                    Some(Err(e)) => Err((task_id, e)),
+                    Some(Err(error)) => Err(TaskDispatchFailure::failed(task_id, error)),
                     // Default: generic success for unscripted tasks.
                     None => Ok(TaskDispatchSuccess {
                         task_id,
@@ -5324,7 +5442,7 @@ Read the runtime path and found one missing branch.
         assert_eq!(
             todos
                 .iter()
-                .filter(|todo| todo.status == TodoStatus::Skipped)
+                .filter(|todo| todo.status == TodoStatus::Cancelled)
                 .count(),
             4
         );
@@ -5844,7 +5962,7 @@ Read the runtime path and found one missing branch.
             .clone();
         assert!(
             events.iter().any(|event| {
-                event.event == "tool_started"
+                event.event == RuntimeEventKind::ToolStarted
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
                     && event.subagent_run_id.as_deref() == Some("run-trace:implementation-a:1:1")
@@ -5854,7 +5972,7 @@ Read the runtime path and found one missing branch.
         );
         assert!(
             events.iter().any(|event| {
-                event.event == "tool_completed"
+                event.event == RuntimeEventKind::ToolCompleted
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
                     && event.subagent_run_id.as_deref() == Some("run-trace:implementation-a:1:1")

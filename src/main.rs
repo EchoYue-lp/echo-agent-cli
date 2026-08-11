@@ -267,8 +267,16 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             webhook_emitter.clone(),
         )
         .await;
+        if let Some(scheduler) = tui_scheduler.as_ref()
+            && let Err(error) = runtime
+                .plugin_runtime
+                .bind_scheduler(scheduler.clone())
+                .await
+        {
+            tracing::warn!(%error, "failed to bind plugin monitors to TUI scheduler");
+        }
 
-        echo_agent_cli::tui::run_tui(
+        let tui_result = echo_agent_cli::tui::run_tui(
             agent_handle.clone(),
             &app_config.tui,
             "💬 通用",
@@ -296,10 +304,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             runtime.plugin_runtime.clone(),
             args.no_alt_screen,
         )
-        .await?;
+        .await;
 
         // ── Memory review on session end (TUI) ──────────────────────
-        if let Some(ref review_integration) = runtime.review_integration
+        if tui_result.is_ok()
+            && let Some(ref review_integration) = runtime.review_integration
             && let Some(review_result) = review_integration.on_session_end().await
         {
             match review_result {
@@ -320,11 +329,16 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             }
         }
 
+        if let Some(store) = task_runtime_store.as_ref()
+            && let Err(error) = store.shutdown_hook_events().await
+        {
+            tracing::warn!(%error, "failed to shut down task hook dispatcher");
+        }
         runtime.browser_runtime.shutdown().await;
         drop(runtime);
         cancel_token.cancel();
 
-        return Ok(());
+        return tui_result;
     }
 
     #[cfg(not(feature = "tui"))]
@@ -342,6 +356,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    let mut mode_error: Option<anyhow::Error> = None;
     if run_channels {
         #[cfg(feature = "channels")]
         {
@@ -359,7 +374,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             ));
 
             if run_cli {
-                cli::run_cli_mode(
+                if let Err(error) = cli::run_cli_mode(
                     agent_handle,
                     runtime.hitl_dispatcher.clone(),
                     &args,
@@ -372,11 +387,21 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     webhook_emitter.clone(),
                     runtime.plugin_runtime.clone(),
                 )
-                .await?;
+                .await
+                {
+                    mode_error = Some(error);
+                }
             } else {
                 // 仅 channels 模式，等待 channels 或 Ctrl+C
-                channels_handle.await??;
+                let channels_result = channels_handle.await;
+                if let Some(store) = task_runtime_store.as_ref()
+                    && let Err(error) = store.shutdown_hook_events().await
+                {
+                    tracing::warn!(%error, "failed to shut down task hook dispatcher");
+                }
                 runtime.browser_runtime.shutdown().await;
+                cancel_token.cancel();
+                channels_result??;
                 return Ok(());
             }
             // channels 会在后台运行，主模式退出后自动结束
@@ -389,7 +414,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         }
     } else if run_cli {
         // 仅 CLI 模式
-        cli::run_cli_mode(
+        if let Err(error) = cli::run_cli_mode(
             agent_handle,
             runtime.hitl_dispatcher.clone(),
             &args,
@@ -397,12 +422,15 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             runtime.review_integration.clone(),
             runtime.prompt_assembly.clone(),
             pool,
-            task_runtime_store,
+            task_runtime_store.clone(),
             conversation_id,
             webhook_emitter,
             runtime.plugin_runtime.clone(),
         )
-        .await?;
+        .await
+        {
+            mode_error = Some(error);
+        }
     } else {
         // No legacy mode specified — should have entered TUI above
         eprintln!("请使用 TUI（默认）、Tauri 桌面模式、或 --cli 模式。");
@@ -410,11 +438,19 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     }
 
     // Keep runtime alive until shutdown
+    if let Some(store) = task_runtime_store.as_ref()
+        && let Err(error) = store.shutdown_hook_events().await
+    {
+        tracing::warn!(%error, "failed to shut down task hook dispatcher");
+    }
     runtime.browser_runtime.shutdown().await;
     drop(runtime);
     cancel_token.cancel();
 
-    Ok(())
+    match mode_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 // ── 单元测试 ─────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ use echo_core::tools::TraceSinkFn;
 use futures::StreamExt;
 
 use crate::tasks::task_runtime::executor::ExecEvent;
+use crate::tasks::task_runtime::types::RuntimeEventKind;
 
 /// Complete product event stream consumed by every interactive surface.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -321,7 +322,7 @@ fn ensure_task_mode_run(
         if let Some(trace_sink) = trace_sink {
             trace_sink(ExecEvent::run(
                 run_id.to_string(),
-                "run_started",
+                RuntimeEventKind::RunStarted,
                 serde_json::json!({
                     "conversation_id": conversation_id,
                     "goal": goal,
@@ -359,7 +360,7 @@ fn finalize_task_mode_run(
         {
             trace_sink(ExecEvent::run(
                 run_id.to_string(),
-                "run_cancelled",
+                RuntimeEventKind::RunCancelled,
                 serde_json::json!({ "status": "cancelled", "mode": "task" }),
             ));
         }
@@ -375,7 +376,7 @@ fn finalize_task_mode_run(
     {
         trace_sink(ExecEvent::run(
             run_id.to_string(),
-            "run_failed",
+            RuntimeEventKind::RunFailed,
             serde_json::json!({ "error": reason, "mode": "task" }),
         ));
     }

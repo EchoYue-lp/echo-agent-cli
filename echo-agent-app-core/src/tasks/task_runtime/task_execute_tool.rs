@@ -619,7 +619,11 @@ fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
             plan.tasks.iter().any(|task| {
                 !matches!(
                     task.status,
-                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                    TodoStatus::Completed
+                        | TodoStatus::Failed
+                        | TodoStatus::Cancelled
+                        | TodoStatus::TimedOut
+                        | TodoStatus::Skipped
                 )
             })
         })
