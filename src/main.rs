@@ -228,16 +228,13 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
     // Spawn config watcher (reloads hooks + webhook endpoints on change).
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    if let Some(config_path) =
-        echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref())
-    {
-        echo_agent_cli::config_watcher::spawn_config_watcher(
-            config_path,
-            agent_handle.clone(),
-            Some(webhook_emitter.clone()),
-            cancel_token.clone(),
-        );
-    }
+    let config_path = echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref());
+    echo_agent_cli::config_watcher::spawn_config_watcher(
+        config_path,
+        agent_handle.clone(),
+        Some(webhook_emitter.clone()),
+        cancel_token.clone(),
+    );
 
     // ── User-facing TUI mode (default) ─────────────────────────────────
     #[cfg(feature = "tui")]

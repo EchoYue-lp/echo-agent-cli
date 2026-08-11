@@ -6,16 +6,17 @@ use std::sync::Arc;
 
 use echo_agent::lsp::{LspConfig, LspManager};
 use echo_agent::plugin::{
-    InstallSource, PluginEntry, PluginIntegrator, PluginRegistry, PluginScope, PluginWiringResult,
-    WiredPluginComponents,
+    InstallSource, PluginEntry, PluginIntegrator, PluginLifecycle, PluginLifecycleManager,
+    PluginRegistry, PluginScope, PluginWiringResult, WiredPluginComponents,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::agent_handle::AgentHandle;
+pub use crate::plugin_components::{PluginOutputStyle, PluginThemeDefinition};
 use crate::plugin_components::{
-    PluginOutputStyle, PluginThemeDefinition, PreparedApplicationComponents,
-    prepare_application_components, register_plugin_agents, validate_application_component_files,
+    PreparedApplicationComponents, prepare_application_components, register_plugin_agents,
+    validate_application_component_files,
 };
 use crate::scheduler::{CronTask, SchedulerRunner};
 
@@ -113,6 +114,16 @@ struct PluginRuntimeState {
     registry: PluginRegistry,
     framework_components: HashMap<String, WiredPluginComponents>,
     prepared: PreparedApplicationComponents,
+    lifecycle: PluginLifecycleManager,
+    active_theme: Option<String>,
+    active_output_style: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PluginPreferences {
+    #[serde(default)]
+    active_theme: Option<String>,
+    #[serde(default)]
     active_output_style: Option<String>,
 }
 
@@ -121,6 +132,7 @@ pub struct PluginRuntimeService {
     lsp: PluginLspRuntime,
     scheduler: RwLock<Option<Arc<SchedulerRunner>>>,
     registry_source: RegistrySource,
+    preferences_file: PathBuf,
     state: Mutex<PluginRuntimeState>,
 }
 
@@ -134,16 +146,29 @@ impl PluginRuntimeService {
         lsp: PluginLspRuntime,
         registry_source: RegistrySource,
     ) -> Arc<Self> {
+        let preferences_file = match &registry_source {
+            RegistrySource::Default => echo_agent::plugin::plugin_data_base_dir()
+                .join("plugins")
+                .join("preferences.json"),
+            #[cfg(test)]
+            RegistrySource::Custom { state_file, .. } => {
+                state_file.with_file_name("preferences.json")
+            }
+        };
+        let preferences = load_preferences(&preferences_file);
         let service = Arc::new(Self {
             agent_handle,
             lsp,
             scheduler: RwLock::new(None),
             registry_source,
+            preferences_file,
             state: Mutex::new(PluginRuntimeState {
                 registry: PluginRegistry::new(None),
                 framework_components: HashMap::new(),
                 prepared: PreparedApplicationComponents::default(),
-                active_output_style: None,
+                lifecycle: PluginLifecycleManager::new(),
+                active_theme: preferences.active_theme,
+                active_output_style: preferences.active_output_style,
             }),
         });
         if let Err(error) = service.reload().await {
@@ -305,12 +330,16 @@ impl PluginRuntimeService {
             .registry
             .uninstall(name, keep_data)
             .map_err(|error| anyhow::anyhow!("Uninstall plugin '{name}' failed: {error}"))?;
+        let lifecycle_error = state.lifecycle.unregister(name).err();
         summary.total = state.registry.count();
         summary.enabled = state.registry.list_enabled().len();
         if !was_enabled {
             self.fire_plugin_disabled(name).await;
         }
-        Ok(summary)
+        match lifecycle_error {
+            Some(error) => Err(anyhow::anyhow!(error)),
+            None => Ok(summary),
+        }
     }
 
     pub async fn list(&self) -> Vec<PluginEntry> {
@@ -328,8 +357,93 @@ impl PluginRuntimeService {
         self.state.lock().await.registry.get(name).cloned()
     }
 
+    pub async fn configure(
+        &self,
+        name: &str,
+        values: HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<ReloadSummary> {
+        let mut state = self.state.lock().await;
+        let project_root = self.project_root().await;
+        let mut candidate = self.registry_for(project_root);
+        self.scan_registry(&mut candidate)?;
+        let previous = candidate
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Plugin '{name}' not found"))?
+            .user_config
+            .clone();
+        candidate
+            .configure(name, values)
+            .map_err(|error| anyhow::anyhow!("Configure plugin '{name}' failed: {error}"))?;
+        match self.apply_candidate(&mut state, candidate).await {
+            Ok(summary) => Ok(summary),
+            Err(error) => {
+                self.restore_plugin_config(name, previous).await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Register native lifecycle callbacks and synchronize them immediately.
+    pub async fn register_lifecycle(
+        &self,
+        name: &str,
+        callbacks: Arc<dyn PluginLifecycle>,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        let enabled = state
+            .registry
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Plugin '{name}' not found"))?
+            .enabled;
+        state
+            .lifecycle
+            .register(name, callbacks)
+            .map_err(anyhow::Error::msg)?;
+        if enabled && let Err(error) = state.lifecycle.activate(name) {
+            let cleanup_error = state.lifecycle.unregister(name).err();
+            return Err(anyhow::anyhow!(append_errors(
+                error,
+                cleanup_error.into_iter().collect(),
+            )));
+        }
+        Ok(())
+    }
+
     pub async fn themes(&self) -> Vec<PluginThemeDefinition> {
         self.state.lock().await.prepared.themes.clone()
+    }
+
+    pub async fn active_theme(&self) -> Option<String> {
+        self.state.lock().await.active_theme.clone()
+    }
+
+    pub async fn activate_theme(
+        &self,
+        name: Option<&str>,
+    ) -> anyhow::Result<Option<PluginThemeDefinition>> {
+        let mut state = self.state.lock().await;
+        let theme = match name {
+            Some(name) => Some(
+                state
+                    .prepared
+                    .themes
+                    .iter()
+                    .find(|theme| theme.name == name)
+                    .ok_or_else(|| anyhow::anyhow!("Theme '{name}' not found"))?
+                    .clone(),
+            ),
+            None => None,
+        };
+        let selected = name.map(str::to_string);
+        persist_preferences(
+            &self.preferences_file,
+            &PluginPreferences {
+                active_theme: selected.clone(),
+                active_output_style: state.active_output_style.clone(),
+            },
+        )?;
+        state.active_theme = selected;
+        Ok(theme)
     }
 
     pub async fn output_styles(&self) -> Vec<PluginOutputStyle> {
@@ -355,6 +469,14 @@ impl PluginRuntimeService {
             ),
             None => None,
         };
+        let selected = name.map(str::to_string);
+        persist_preferences(
+            &self.preferences_file,
+            &PluginPreferences {
+                active_theme: state.active_theme.clone(),
+                active_output_style: selected.clone(),
+            },
+        )?;
         self.agent_handle
             .read_async(|agent| {
                 Box::pin(async move {
@@ -364,7 +486,7 @@ impl PluginRuntimeService {
                 })
             })
             .await;
-        state.active_output_style = name.map(str::to_string);
+        state.active_output_style = selected;
         Ok(())
     }
 
@@ -434,10 +556,36 @@ impl PluginRuntimeService {
         candidate
             .resolve_enabled_dependencies()
             .map_err(|error| anyhow::anyhow!("Plugin dependency validation failed: {error}"))?;
+        let candidate_plugins = candidate
+            .list_enabled()
+            .into_iter()
+            .map(|entry| entry.manifest.name.clone())
+            .collect::<Vec<_>>();
+        let previous_plugins = state
+            .registry
+            .list_enabled()
+            .into_iter()
+            .map(|entry| entry.manifest.name.clone())
+            .collect::<Vec<_>>();
         let prepared = prepare_application_components(&mut candidate)
             .map_err(|errors| anyhow::anyhow!(errors.join("; ")))?;
         self.validate_agent_collisions(state, &prepared).await?;
         let mut replacement_lsp = self.prepare_lsp(&prepared).await?;
+
+        let deactivate_errors = state.lifecycle.deactivate_all();
+        if !deactivate_errors.is_empty() {
+            let mut errors = deactivate_errors;
+            errors.extend(
+                state
+                    .lifecycle
+                    .activate_enabled(previous_plugins.iter().map(String::as_str)),
+            );
+            replacement_lsp.shutdown_all().await;
+            return Err(anyhow::anyhow!(
+                "Plugin lifecycle deactivation failed: {}",
+                errors.join("; ")
+            ));
+        }
 
         let scheduler = self.scheduler.read().await.clone();
         if let Some(scheduler) = scheduler.as_ref()
@@ -446,7 +594,13 @@ impl PluginRuntimeService {
                     .await
         {
             replacement_lsp.shutdown_all().await;
-            return Err(error);
+            let mut errors = vec![error.to_string()];
+            errors.extend(
+                state
+                    .lifecycle
+                    .activate_enabled(previous_plugins.iter().map(String::as_str)),
+            );
+            return Err(anyhow::anyhow!(errors.join("; ")));
         }
 
         let previous_registry = std::mem::replace(
@@ -483,17 +637,91 @@ impl PluginRuntimeService {
                         format!("{}; rollback plugin monitors failed: {error}", failed.error);
                 }
                 replacement_lsp.shutdown_all().await;
+                failed.error = append_errors(
+                    failed.error,
+                    state
+                        .lifecycle
+                        .activate_enabled(previous_plugins.iter().map(String::as_str)),
+                );
                 return Err(anyhow::anyhow!(failed.error));
             }
         };
 
-        {
+        let mut previous_lsp = {
             let mut current = self.lsp.manager.write().await;
-            current.shutdown_all().await;
-            *current = replacement_lsp;
+            std::mem::replace(&mut *current, replacement_lsp)
+        };
+
+        let activation_errors = state
+            .lifecycle
+            .activate_enabled(candidate_plugins.iter().map(String::as_str));
+        if !activation_errors.is_empty() {
+            let mut errors = vec![format!(
+                "Plugin lifecycle activation failed: {}",
+                activation_errors.join("; ")
+            )];
+            errors.extend(state.lifecycle.deactivate_all());
+
+            let candidate_monitors = applied.prepared.monitors.clone();
+            let previous_monitors = applied.previous_prepared.monitors.clone();
+            let rollback = self
+                .replace_agent_components(
+                    applied.registry,
+                    applied.wiring.components_by_plugin,
+                    applied.prepared,
+                    applied.previous_registry,
+                    applied.previous_prepared,
+                )
+                .await;
+            match rollback {
+                Ok(restored) => {
+                    if let Some(scheduler) = scheduler.as_ref()
+                        && let Err(error) = replace_plugin_monitors(
+                            scheduler,
+                            &candidate_monitors,
+                            &previous_monitors,
+                        )
+                        .await
+                    {
+                        errors.push(format!("rollback plugin monitors failed: {error}"));
+                    }
+                    {
+                        let mut current = self.lsp.manager.write().await;
+                        let mut candidate_lsp = std::mem::replace(&mut *current, previous_lsp);
+                        candidate_lsp.shutdown_all().await;
+                    }
+                    state.registry = restored.registry;
+                    state.framework_components = restored.wiring.components_by_plugin;
+                    state.prepared = restored.prepared;
+                    errors.extend(
+                        state
+                            .lifecycle
+                            .activate_enabled(previous_plugins.iter().map(String::as_str)),
+                    );
+                }
+                Err(failed) => {
+                    errors.push(format!(
+                        "rollback agent components failed: {}",
+                        failed.error
+                    ));
+                    previous_lsp.shutdown_all().await;
+                    state.registry = failed.registry;
+                    state.framework_components = failed.framework_components;
+                    state.prepared = failed.prepared;
+                    errors.extend(
+                        state
+                            .lifecycle
+                            .activate_enabled(candidate_plugins.iter().map(String::as_str)),
+                    );
+                }
+            }
+            return Err(anyhow::anyhow!(errors.join("; ")));
         }
 
+        previous_lsp.shutdown_all().await;
+
         let active_style = state.active_output_style.clone();
+        let active_theme = state.active_theme.clone();
         state.registry = applied.registry;
         state.framework_components = applied.wiring.components_by_plugin.clone();
         state.prepared = applied.prepared;
@@ -536,17 +764,30 @@ impl PluginRuntimeService {
             }
         }
 
+        if let Some(theme) = active_theme
+            && !state
+                .prepared
+                .themes
+                .iter()
+                .any(|candidate| candidate.name == theme)
+        {
+            state.active_theme = None;
+        }
+
         let total = state.registry.count();
         let enabled = state.registry.list_enabled().len();
-        let summary =
+        let mut summary =
             ReloadSummary::from_components(total, enabled, &applied.wiring, &state.prepared);
-        let loaded_plugins = state
-            .registry
-            .list_enabled()
-            .into_iter()
-            .map(|entry| entry.manifest.name.clone())
-            .collect::<Vec<_>>();
-        self.fire_loaded_events(&loaded_plugins).await;
+        if let Err(error) = persist_preferences(
+            &self.preferences_file,
+            &PluginPreferences {
+                active_theme: state.active_theme.clone(),
+                active_output_style: state.active_output_style.clone(),
+            },
+        ) {
+            summary.errors.push(error.to_string());
+        }
+        self.fire_loaded_events(&candidate_plugins).await;
         tracing::info!(
             total,
             enabled,
@@ -624,17 +865,27 @@ impl PluginRuntimeService {
                             restore_error,
                         ));
                     }
-                    Ok((candidate, wiring, candidate_prepared))
+                    Ok((
+                        candidate,
+                        wiring,
+                        candidate_prepared,
+                        previous_registry,
+                        previous_prepared,
+                    ))
                 })
             })
             .await;
 
         match outcome {
-            Ok((registry, wiring, prepared)) => Ok(AppliedAgentComponents {
-                registry,
-                wiring,
-                prepared,
-            }),
+            Ok((registry, wiring, prepared, previous_registry, previous_prepared)) => {
+                Ok(AppliedAgentComponents {
+                    registry,
+                    wiring,
+                    prepared,
+                    previous_registry,
+                    previous_prepared,
+                })
+            }
             Err((error, registry, restored, prepared, restore_agent_error)) => {
                 let mut errors = vec![error];
                 if !restored.errors.is_empty() {
@@ -776,6 +1027,15 @@ impl PluginRuntimeService {
         }
     }
 
+    async fn restore_plugin_config(&self, name: &str, values: HashMap<String, serde_json::Value>) {
+        let mut registry = self.registry_for(self.project_root().await);
+        if self.scan_registry(&mut registry).is_ok()
+            && let Err(error) = registry.configure(name, values)
+        {
+            tracing::error!(plugin = %name, %error, "failed to roll back plugin configuration");
+        }
+    }
+
     async fn rollback_install(&self, name: &str) {
         let mut registry = self.registry_for(self.project_root().await);
         if self.scan_registry(&mut registry).is_ok()
@@ -836,10 +1096,50 @@ impl PluginRuntimeService {
     }
 }
 
+fn load_preferences(path: &Path) -> PluginPreferences {
+    match std::fs::read_to_string(path) {
+        Ok(content) => serde_json::from_str(&content).unwrap_or_else(|error| {
+            tracing::warn!(%error, "Ignoring invalid plugin preferences");
+            PluginPreferences::default()
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PluginPreferences::default(),
+        Err(error) => {
+            tracing::warn!(%error, "Failed to read plugin preferences");
+            PluginPreferences::default()
+        }
+    }
+}
+
+fn append_errors(mut primary: String, errors: Vec<String>) -> String {
+    if !errors.is_empty() {
+        primary.push_str("; ");
+        primary.push_str(&errors.join("; "));
+    }
+    primary
+}
+
+fn persist_preferences(path: &Path, preferences: &PluginPreferences) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let content = serde_json::to_string_pretty(preferences)?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
 struct AppliedAgentComponents {
     registry: PluginRegistry,
     wiring: PluginWiringResult,
     prepared: PreparedApplicationComponents,
+    previous_registry: PluginRegistry,
+    previous_prepared: PreparedApplicationComponents,
 }
 
 struct FailedAgentComponents {
@@ -1064,6 +1364,44 @@ mod tests {
     use echo_agent::testing::MockLlmClient;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct LifecycleCounts {
+        init: AtomicUsize,
+        activate: AtomicUsize,
+        deactivate: AtomicUsize,
+        shutdown: AtomicUsize,
+        fail_next_activation: AtomicBool,
+    }
+
+    struct TestLifecycle(Arc<LifecycleCounts>);
+
+    impl PluginLifecycle for TestLifecycle {
+        fn init(&self) -> Result<(), String> {
+            self.0.init.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn activate(&self) -> Result<(), String> {
+            self.0.activate.fetch_add(1, Ordering::SeqCst);
+            if self.0.fail_next_activation.swap(false, Ordering::SeqCst) {
+                Err("injected activation failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn deactivate(&self) -> Result<(), String> {
+            self.0.deactivate.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn shutdown(&self) -> Result<(), String> {
+            self.0.shutdown.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
 
     fn write_fixture(root: &Path) -> Result<PathBuf, String> {
         let plugin = root.join(".echo-agent/plugins/runtime-fixture");
@@ -1305,6 +1643,135 @@ done
     }
 
     #[tokio::test]
+    async fn native_lifecycle_brackets_reload_configure_and_unregisters_on_uninstall()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let manifest_path = plugin.join(".echo-plugin/manifest.yaml");
+        let mut manifest =
+            std::fs::read_to_string(&manifest_path).map_err(|error| error.to_string())?;
+        manifest.push_str(
+            "config:\n  label:\n    type: string\n    title: Label\n    default: initial\n",
+        );
+        std::fs::write(&manifest_path, manifest).map_err(|error| error.to_string())?;
+        let runtime = service(temp.path()).await?;
+        let counts = Arc::new(LifecycleCounts::default());
+        runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&counts))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        runtime
+            .configure(
+                "runtime-fixture",
+                HashMap::from([("label".to_string(), serde_json::json!("updated"))]),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(counts.init.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.activate.load(Ordering::SeqCst), 3);
+        assert_eq!(counts.deactivate.load(Ordering::SeqCst), 2);
+
+        runtime
+            .uninstall("runtime-fixture", false)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(counts.deactivate.load(Ordering::SeqCst), 3);
+        assert_eq!(counts.shutdown.load(Ordering::SeqCst), 1);
+
+        write_fixture(temp.path())?;
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::new(LifecycleCounts::default()))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_native_lifecycle_registration_shuts_down_and_can_retry() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let counts = Arc::new(LifecycleCounts::default());
+        counts.fail_next_activation.store(true, Ordering::SeqCst);
+
+        let error = runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&counts))),
+            )
+            .await
+            .err()
+            .ok_or_else(|| "failing lifecycle registration unexpectedly succeeded".to_string())?;
+        assert!(error.to_string().contains("injected activation failure"));
+        assert_eq!(counts.init.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.activate.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.shutdown.load(Ordering::SeqCst), 1);
+
+        runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::new(LifecycleCounts::default()))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activation_failure_restores_previous_components_and_lifecycle() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = write_fixture(temp.path())?;
+        let runtime = service(temp.path()).await?;
+        let counts = Arc::new(LifecycleCounts::default());
+        runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&counts))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+        std::fs::write(
+            plugin.join("themes/example.json"),
+            "{\n  \"name\": \"runtime-fixture-dark\",\n  \"dark\": true,\n  \"colors\": {\"accent\": \"#000000\"}\n}\n",
+        )
+        .map_err(|error| error.to_string())?;
+        counts.fail_next_activation.store(true, Ordering::SeqCst);
+
+        let error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "lifecycle activation failure unexpectedly succeeded".to_string())?;
+        assert!(error.to_string().contains("injected activation failure"));
+        let themes = runtime.themes().await;
+        let accent = themes
+            .first()
+            .and_then(|theme| theme.colors.get("accent"))
+            .map(String::as_str);
+        assert_eq!(accent, Some("#5b8def"));
+        assert_eq!(counts.init.load(Ordering::SeqCst), 1);
+        assert_eq!(counts.activate.load(Ordering::SeqCst), 3);
+        assert_eq!(counts.deactivate.load(Ordering::SeqCst), 1);
+        #[cfg(unix)]
+        assert_eq!(
+            runtime.lsp.manager.read().await.running_servers(),
+            ["fixture"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn scheduler_binding_uses_the_same_lock_order_as_reload() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let runtime = service(temp.path()).await?;
@@ -1347,6 +1814,44 @@ done
             .map_err(|_| "scheduler binding deadlocked".to_string())?
             .map_err(|error| error.to_string())??;
         assert_eq!(monitor_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn theme_and_output_style_preferences_survive_runtime_restart() -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        write_fixture(temporary.path())?;
+        let runtime = service(temporary.path()).await?;
+        runtime
+            .activate_theme(Some("runtime-fixture-dark"))
+            .await
+            .map_err(|error| error.to_string())?;
+        runtime
+            .activate_output_style(Some("runtime-fixture-concise"))
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(runtime);
+
+        let restored = service(temporary.path()).await?;
+
+        assert_eq!(
+            restored.active_theme().await.as_deref(),
+            Some("runtime-fixture-dark")
+        );
+        assert_eq!(
+            restored.active_output_style().await.as_deref(),
+            Some("runtime-fixture-concise")
+        );
+        let messages = restored
+            .agent_handle
+            .read_async(|agent| Box::pin(async move { agent.get_messages().await }))
+            .await;
+        assert!(messages.iter().any(|message| {
+            message
+                .content
+                .as_text_ref()
+                .is_some_and(|content| content.contains("Answer directly"))
+        }));
         Ok(())
     }
 

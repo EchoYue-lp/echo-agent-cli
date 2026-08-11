@@ -153,8 +153,15 @@ pub struct RunSkillScriptTool { /* L62-315 */ }
 | `triggers` | | 用户语句关键词，由 `KeywordClassifier` 消费 |
 | `allowed-tools`（别名 `allowed_tools`） | | 已注册工具的白名单（详见 §8） |
 | `depends_on` | | 自动先激活的其他 skill；DFS 检测循环 + warn (`loader.rs:387-446`) |
-| `hooks` | | `PreToolUse` / `PostToolUse` hook 定义 |
+| `hooks` | | 31 个主 Hook 事件中的任意事件规则；Action 共 `command` / `prompt` / `permission` / `http` / `mcp_tool` / `agent` / `activate_skill` 7 类 |
 | `sandbox` | | 单 skill 沙箱策略：`isolation`/`network`/`allowed_paths`/`denied_paths`/`timeout` |
+
+Hook stdout 的规范控制字段是 `updatedInput`、`injected_context` 和
+`permission_mode_override`；`modified_input`、`message`、`permission_mode` 不是别名。
+插件拥有的 Skill 在解析 frontmatter 前先对完整 `SKILL.md` 应用
+`PluginVariables`，所以 `${user_config.KEY}` 等变量在正文和 frontmatter Hook Action
+中都生效。事件、matcher 和返回契约的权威说明见
+`echo-agent/docs/{en,zh}/23-hooks.md`。
 
 ### §3.2 Legacy 字段（仍解析但 deprecation warn）
 
@@ -257,7 +264,7 @@ for desc in agent.skill_descriptors() {
 | Frontmatter 解析 | 完整 `serde_yaml_ng`（`loader.rs`） | 手写 mini key-value 解析器 |
 | 状态 | 已激活集合 / sandbox policies / code skills / session_id | 仅 `loaded_skills: Vec<String>` |
 | 谁在用 | 每一轮 ReactAgent | CLI `/skills` 命令 |
-| 安装/卸载 | 不提供（仅发现） | 提供：`install`（git clone https only）/ `uninstall` |
+| 安装/卸载 | 不负责安装，只负责运行时发现 | 提供：`install`（git clone https only）/ `uninstall` |
 
 ```rust,ignore
 // echo-agent-cli/echo-agent-app-core/src/skills_hub/registry.rs:42

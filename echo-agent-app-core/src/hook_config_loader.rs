@@ -121,9 +121,17 @@ impl HookConfigLoader {
     /// 再叠加两个 hooks.yaml 文件。语义与 `load_merged` 完全一致,
     /// 只是内嵌来源从磁盘重读而非从内存取。
     pub fn load_merged_from_disk() -> HooksLoadResult {
+        Self::load_merged_from_disk_at(None)
+    }
+
+    /// Reload from an explicitly selected app config plus both hooks files.
+    pub fn load_merged_from_disk_at(config_path: Option<&Path>) -> HooksLoadResult {
         let mut config_errors = Vec::new();
         let mut app_config = AppConfig::default();
-        for path in echo_agent::config::config_search_paths() {
+        let search_paths = config_path
+            .map(|path| vec![path.to_path_buf()])
+            .unwrap_or_else(echo_agent::config::config_search_paths);
+        for path in search_paths {
             if !path.exists() {
                 continue;
             }

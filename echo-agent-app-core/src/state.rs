@@ -945,28 +945,35 @@ impl AppState {
         let mem_root = workspace.root.clone();
         if let Some(store) = crate::infra::create_memory_store_for_workspace(&mem_root) {
             let echo_agent_dir = crate::workspace::layout::WorkspaceLayout::state_dir(&mem_root); // {root}/.eko
+            if let Some(ref ri) = self.review_integration {
+                ri.rebind(echo_agent_dir.clone(), store.clone());
+            }
             // (a) 主 agent：替换 warm 层 store（重新注册 remember/recall/search_memory/
             //     forget 工具）+ 重建 hot 层 MemoryLayerManager。
             let store_for_mgr = store.clone();
-            let echo_dir_for_mgr = echo_agent_dir.clone();
+            let layer_manager = self
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.create_layer_manager())
+                .unwrap_or_else(|| {
+                    echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
+                        echo_agent_dir.clone(),
+                        store_for_mgr.clone(),
+                    )
+                    .build_layer_manager()
+                });
             self.connection
                 .agent
                 .write_async(|a| {
                     Box::pin(async move {
                         a.install_memory_store(store_for_mgr.clone()).await;
-                        let mgr = echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
-                            echo_dir_for_mgr,
-                            store_for_mgr,
-                        )
-                        .build_layer_manager();
-                        a.install_memory_layer_manager(std::sync::Arc::new(mgr));
+                        a.install_memory_layer_manager(std::sync::Arc::new(layer_manager));
                     })
                 })
                 .await;
             // (b) ReviewIntegration：rebind 到新 dir/store（后续 /memory-review、
             //     dreaming、session-end 都用新 workspace 的记忆）。
             if let Some(ref ri) = self.review_integration {
-                ri.rebind(echo_agent_dir.clone(), store.clone());
                 let curator = ri.curator();
                 self.connection
                     .agent
@@ -1091,25 +1098,32 @@ impl AppState {
         // 不再读已退出 workspace 的 .eko/memory/。
         if let Some(store) = crate::infra::create_global_memory_store() {
             let (global_store_path, global_echo_dir) = crate::infra::global_memory_paths();
+            if let Some(ref ri) = self.review_integration {
+                ri.rebind(global_echo_dir.clone(), store.clone());
+            }
             // 主 agent：替换 store + 重建 layer manager。
             let store_for_mgr = store.clone();
-            let echo_dir_for_mgr = global_echo_dir.clone();
+            let layer_manager = self
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.create_layer_manager())
+                .unwrap_or_else(|| {
+                    echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
+                        global_echo_dir.clone(),
+                        store_for_mgr.clone(),
+                    )
+                    .build_layer_manager()
+                });
             self.connection
                 .agent
                 .write_async(|a| {
                     Box::pin(async move {
                         a.install_memory_store(store_for_mgr.clone()).await;
-                        let mgr = echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
-                            echo_dir_for_mgr,
-                            store_for_mgr,
-                        )
-                        .build_layer_manager();
-                        a.install_memory_layer_manager(std::sync::Arc::new(mgr));
+                        a.install_memory_layer_manager(std::sync::Arc::new(layer_manager));
                     })
                 })
                 .await;
             if let Some(ref ri) = self.review_integration {
-                ri.rebind(global_echo_dir.clone(), store.clone());
                 let curator = ri.curator();
                 self.connection
                     .agent

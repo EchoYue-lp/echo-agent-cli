@@ -11,7 +11,8 @@ import CommandPalette, { type CommandItem } from './components/common/CommandPal
 import NewTaskDialog from './components/workspace/NewTaskDialog';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useConversationStore } from './stores/conversationStore';
-import { useUiStore } from './stores/uiStore';
+import { applyPluginTheme, useUiStore } from './stores/uiStore';
+import { pluginApi } from './api/endpoints';
 import { useWorkspaceStore } from './stores/workspaceStore';
 import { useTaskRuntimeStore } from './stores/taskRuntimeStore';
 import { RequireAuth } from './components/Auth/RequireAuth';
@@ -36,6 +37,16 @@ function App() {
     initWorkspaces();
     initConversations();
   }, [initWorkspaces, initConversations]);
+
+  useEffect(() => {
+    pluginApi
+      .themes()
+      .then((result) => {
+        const active = result.themes.find((theme) => theme.name === result.active) || null;
+        applyPluginTheme(active);
+      })
+      .catch(() => undefined);
+  }, []);
 
   // Load the active conversation's TaskRuntime run so the main-window
   // ParallelExecutionBlock and the RightRail can render subagent state.

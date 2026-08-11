@@ -33,7 +33,15 @@ pub struct HooksReloadSummary {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HookTestResult {
     pub event: String,
-    pub registered: bool,
+    pub matcher: String,
+    pub matches: Vec<HookTestMatch>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HookTestMatch {
+    pub source: String,
+    pub matcher: String,
+    pub action: String,
 }
 
 // ── IPC Commands ────────────────────────────────────────────────────────────
@@ -74,18 +82,33 @@ pub fn list_hook_events() -> Vec<&'static str> {
 pub async fn test_hook(
     state: tauri::State<'_, TauriState>,
     event: String,
+    matcher: Option<String>,
 ) -> Result<HookTestResult, IpcError> {
     let hook_event = echo_agent::skills::hooks::HookEvent::from_name(&event)
         .ok_or_else(|| IpcError::Validation(format!("Unknown hook event: {event}")))?;
-    let registered = state
+    let matcher = matcher.unwrap_or_else(|| "*".to_string());
+    let context = echo_agent::skills::hooks::HookContext::for_dry_run(hook_event, &matcher);
+    let dry_run = state
         .app_state
         .connection
         .primary_agent()
         .read_async(|agent| {
-            Box::pin(async move { agent.hook_registry().read().await.has_hooks_for(hook_event) })
+            Box::pin(async move { agent.hook_registry().read().await.dry_run(&context) })
         })
         .await;
-    Ok(HookTestResult { event, registered })
+    Ok(HookTestResult {
+        event,
+        matcher,
+        matches: dry_run
+            .matches
+            .into_iter()
+            .map(|item| HookTestMatch {
+                source: item.source,
+                matcher: item.matcher,
+                action: item.action,
+            })
+            .collect(),
+    })
 }
 
 /// Reload user-configured hooks from disk and re-register them on the live

@@ -23,7 +23,9 @@ import {
   ShieldCheck,
   Palette,
   TextQuote,
+  Save,
 } from 'lucide-react';
+import { applyPluginTheme, useUiStore } from '../../stores/uiStore';
 
 export function PluginPanel() {
   const [plugins, setPlugins] = useState<PluginInfo[]>([]);
@@ -41,6 +43,7 @@ export function PluginPanel() {
   const [scaffoldName, setScaffoldName] = useState('my-plugin');
   const [developerBusy, setDeveloperBusy] = useState(false);
   const [pluginThemes, setPluginThemes] = useState<PluginThemeDefinition[]>([]);
+  const activeTheme = useUiStore((state) => state.activePluginTheme);
   const [outputStyles, setOutputStyles] = useState<PluginOutputStyle[]>([]);
   const [activeOutputStyle, setActiveOutputStyle] = useState<string | null>(null);
   const [runtimeBusy, setRuntimeBusy] = useState(false);
@@ -69,7 +72,8 @@ export function PluginPanel() {
         pluginApi.outputStyles(),
       ]);
       setPlugins(data);
-      setPluginThemes(themes);
+      setPluginThemes(themes.themes);
+      applyPluginTheme(themes.themes.find((theme) => theme.name === themes.active) || null);
       setOutputStyles(styles.styles);
       setActiveOutputStyle(styles.active);
       setError(null);
@@ -78,6 +82,31 @@ export function PluginPanel() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleThemeChange = async (name: string) => {
+    try {
+      setRuntimeBusy(true);
+      const result = await pluginApi.activateTheme(name || null);
+      applyPluginTheme(result.theme);
+      setMessage({
+        type: 'success',
+        text: result.active ? `Theme '${result.active}' activated` : 'Theme reset to default',
+      });
+    } catch (e: any) {
+      setMessage({ type: 'error', text: e.message || 'Failed to activate theme' });
+    } finally {
+      setRuntimeBusy(false);
+    }
+  };
+
+  const handleConfigure = async (name: string, values: Record<string, unknown>) => {
+    const result = await pluginApi.configure(name, values);
+    if (!result.success) {
+      throw new Error(result.errors?.join('; ') || result.error || 'Configuration failed');
+    }
+    setMessage({ type: 'success', text: result.message || `Plugin '${name}' configured` });
+    await loadPlugins();
   };
 
   const handleOutputStyleChange = async (name: string) => {
@@ -361,30 +390,24 @@ export function PluginPanel() {
                 None loaded
               </div>
             ) : (
-              <div className="space-y-1.5">
+              <select
+                value={activeTheme || ''}
+                onChange={(event) => handleThemeChange(event.target.value)}
+                disabled={runtimeBusy}
+                className="w-full rounded-md border px-3 py-2 text-sm disabled:opacity-50"
+                style={{
+                  background: 'var(--bg-input)',
+                  borderColor: 'var(--border-primary)',
+                  color: 'var(--text-primary)',
+                }}
+              >
+                <option value="">Default</option>
                 {pluginThemes.map((theme) => (
-                  <div
-                    key={`${theme.plugin}:${theme.name}`}
-                    className="flex items-center gap-2 text-xs"
-                  >
-                    <div className="flex h-4 items-center" aria-hidden="true">
-                      {Object.values(theme.colors)
-                        .slice(0, 6)
-                        .map((color, index) => (
-                          <span
-                            key={`${color}:${index}`}
-                            className="h-3 w-3 border first:rounded-l-sm last:rounded-r-sm"
-                            style={{ background: color, borderColor: 'var(--border-primary)' }}
-                          />
-                        ))}
-                    </div>
-                    <span style={{ color: 'var(--text-primary)' }}>
-                      {theme.display_name || theme.name}
-                    </span>
-                    <span style={{ color: 'var(--text-tertiary)' }}>{theme.plugin}</span>
-                  </div>
+                  <option key={`${theme.plugin}:${theme.name}`} value={theme.name}>
+                    {theme.display_name || theme.name} ({theme.plugin})
+                  </option>
                 ))}
-              </div>
+              </select>
             )}
           </div>
 
@@ -534,6 +557,7 @@ export function PluginPanel() {
               onToggleExpand={() => setExpanded(expanded === plugin.name ? null : plugin.name)}
               onToggle={() => handleToggle(plugin)}
               onUninstall={() => handleUninstall(plugin.name)}
+              onConfigure={(values) => handleConfigure(plugin.name, values)}
             />
           ))}
         </div>
@@ -548,12 +572,14 @@ function PluginCard({
   onToggleExpand,
   onToggle,
   onUninstall,
+  onConfigure,
 }: {
   plugin: PluginInfo;
   expanded: boolean;
   onToggleExpand: () => void;
   onToggle: () => void;
   onUninstall: () => void;
+  onConfigure: (values: Record<string, unknown>) => Promise<void>;
 }) {
   return (
     <div
@@ -678,10 +704,8 @@ function PluginCard({
             </div>
           )}
 
-          {plugin.config_keys.length > 0 && (
-            <div className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-              Config: {plugin.config_keys.join(', ')}
-            </div>
+          {Object.keys(plugin.config).length > 0 && (
+            <PluginConfigForm plugin={plugin} onConfigure={onConfigure} />
           )}
 
           <div className="text-xs font-mono mt-1" style={{ color: 'var(--text-tertiary)' }}>
@@ -689,6 +713,106 @@ function PluginCard({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function PluginConfigForm({
+  plugin,
+  onConfigure,
+}: {
+  plugin: PluginInfo;
+  onConfigure: (values: Record<string, unknown>) => Promise<void>;
+}) {
+  const [values, setValues] = useState<Record<string, unknown>>(plugin.config_values);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => setValues(plugin.config_values), [plugin.config_values]);
+
+  const setValue = (key: string, value: unknown) =>
+    setValues((current) => ({ ...current, [key]: value }));
+
+  const save = async () => {
+    try {
+      setSaving(true);
+      setError(null);
+      await onConfigure(values);
+    } catch (reason: any) {
+      setError(reason.message || 'Configuration failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2 border-t pt-2" style={{ borderColor: 'var(--border-primary)' }}>
+      {Object.entries(plugin.config).map(([key, field]) => {
+        const value = values[key] ?? field.default ?? '';
+        return (
+          <label key={key} className="block space-y-1 text-xs">
+            <span style={{ color: 'var(--text-secondary)' }}>
+              {field.title || key}
+              {field.required ? ' *' : ''}
+            </span>
+            {field.type === 'boolean' ? (
+              <input
+                type="checkbox"
+                checked={Boolean(value)}
+                onChange={(event) => setValue(key, event.target.checked)}
+              />
+            ) : (
+              <input
+                type={field.sensitive ? 'password' : field.type === 'number' ? 'number' : 'text'}
+                value={Array.isArray(value) ? value.join(', ') : String(value)}
+                min={field.min ?? undefined}
+                max={field.max ?? undefined}
+                onChange={(event) => {
+                  const raw = event.target.value;
+                  setValue(
+                    key,
+                    field.multiple
+                      ? raw
+                          .split(',')
+                          .map((item) => item.trim())
+                          .filter(Boolean)
+                      : field.type === 'number'
+                        ? raw === ''
+                          ? null
+                          : Number(raw)
+                        : raw
+                  );
+                }}
+                className="w-full rounded-md border px-2 py-1.5"
+                style={{
+                  background: 'var(--bg-input)',
+                  borderColor: 'var(--border-primary)',
+                  color: 'var(--text-primary)',
+                }}
+              />
+            )}
+            {field.description && (
+              <span className="block" style={{ color: 'var(--text-tertiary)' }}>
+                {field.description}
+              </span>
+            )}
+          </label>
+        );
+      })}
+      {error && <div style={{ color: 'var(--color-error)' }}>{error}</div>}
+      <button
+        onClick={save}
+        disabled={saving}
+        className="flex items-center gap-1 rounded-md border px-2 py-1.5 text-xs disabled:opacity-50"
+        style={{ borderColor: 'var(--border-primary)', color: 'var(--text-secondary)' }}
+      >
+        {saving ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <Save className="h-3.5 w-3.5" />
+        )}
+        Save
+      </button>
     </div>
   );
 }

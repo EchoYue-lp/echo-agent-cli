@@ -1119,7 +1119,9 @@ async fn cmd_skill_health(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     };
 
-    let monitor = echo_agent::evolution::SkillHealthMonitor::new(store);
+    let observer = echo_agent_app_core::evolution::evolution_hook_observer(&ctx.agent).await;
+    let monitor =
+        echo_agent::evolution::SkillHealthMonitor::new(store).with_evolution_observer(observer);
 
     if args.is_empty() {
         // Show health overview for all skills

@@ -3479,6 +3479,7 @@ async fn handle_slash_command(
             let mut parts = args.split_whitespace();
             let sub = parts.next().unwrap_or("list");
             let target = parts.next().unwrap_or("");
+            let matcher = parts.next().unwrap_or("*");
             let content = match sub {
                 "list" | "ls" => {
                     agent
@@ -3525,14 +3526,33 @@ async fn handle_slash_command(
                 }
                 "test" if !target.is_empty() => match parse_hook_event(target) {
                     Some(event) => {
-                        let has = agent
+                        let matcher = matcher.to_string();
+                        let result = agent
                             .read_async(|value| {
                                 Box::pin(async move {
-                                    value.hook_registry().read().await.has_hooks_for(event)
+                                    let context =
+                                        echo_agent::skills::hooks::HookContext::for_dry_run(
+                                            event, &matcher,
+                                        );
+                                    value.hook_registry().read().await.dry_run(&context)
                                 })
                             })
                             .await;
-                        format!("Hooks for {target}: {}", if has { "yes" } else { "no" })
+                        if result.matches.is_empty() {
+                            format!("Dry-run {target}: no matching actions")
+                        } else {
+                            result
+                                .matches
+                                .into_iter()
+                                .map(|item| {
+                                    format!(
+                                        "{} · matcher={} · action={}",
+                                        item.source, item.matcher, item.action
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
                     }
                     None => format!("Unknown hook event: {target}"),
                 },
@@ -3545,7 +3565,7 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::Plugins) => {
             let content = match app.plugin_runtime.clone() {
-                Some(runtime) => handle_tui_plugin_command(runtime, args).await,
+                Some(runtime) => handle_tui_plugin_command(app, runtime, args).await,
                 None => "Plugin runtime is not initialized.".to_string(),
             };
             app.messages.push(ChatMessage {
@@ -5009,7 +5029,29 @@ fn with_plugin_wiring_errors(
     message
 }
 
+async fn sync_tui_plugin_theme(
+    app: &mut TuiApp,
+    runtime: &echo_agent_app_core::plugin_runtime::PluginRuntimeService,
+) {
+    let active = runtime.active_theme().await;
+    let theme = match active {
+        Some(active) => runtime
+            .themes()
+            .await
+            .into_iter()
+            .find(|theme| theme.name == active)
+            .map_or_else(
+                || app.default_theme.clone(),
+                |theme| crate::tui::Theme::from_plugin_theme(&theme),
+            ),
+        None => app.default_theme.clone(),
+    };
+    app.theme = theme;
+    app.rebuild_message_groups();
+}
+
 async fn handle_tui_plugin_command(
+    app: &mut TuiApp,
     runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
     args: &str,
 ) -> String {
@@ -5054,6 +5096,7 @@ async fn handle_tui_plugin_command(
                 .await
             {
                 Ok((plugin_id, summary)) => {
+                    sync_tui_plugin_theme(app, &runtime).await;
                     let enabled = runtime
                         .get(&plugin_id)
                         .await
@@ -5078,10 +5121,13 @@ async fn handle_tui_plugin_command(
             };
             let keep_data = rest.contains(&"--keep-data");
             match runtime.uninstall(name, keep_data).await {
-                Ok(summary) => with_plugin_wiring_errors(
-                    format!("Plugin '{name}' uninstalled and unloaded."),
-                    &summary,
-                ),
+                Ok(summary) => {
+                    sync_tui_plugin_theme(app, &runtime).await;
+                    with_plugin_wiring_errors(
+                        format!("Plugin '{name}' uninstalled and unloaded."),
+                        &summary,
+                    )
+                }
                 Err(error) => format!("Plugin uninstall failed: {error}"),
             }
         }
@@ -5095,10 +5141,13 @@ async fn handle_tui_plugin_command(
                 runtime.disable(name).await
             };
             match result {
-                Ok(summary) => with_plugin_wiring_errors(
-                    format!("Plugin '{name}' {sub}d in the current session."),
-                    &summary,
-                ),
+                Ok(summary) => {
+                    sync_tui_plugin_theme(app, &runtime).await;
+                    with_plugin_wiring_errors(
+                        format!("Plugin '{name}' {sub}d in the current session."),
+                        &summary,
+                    )
+                }
                 Err(error) => format!("Plugin {sub} failed: {error}"),
             }
         }
@@ -5134,6 +5183,7 @@ async fn handle_tui_plugin_command(
         }
         "reload" => match runtime.reload().await {
             Ok(summary) => {
+                sync_tui_plugin_theme(app, &runtime).await;
                 let mut content = format!(
                     "Reloaded {} plugins ({} enabled).\nSkills: {} · Hooks: {} · MCP: {} · Agents: {} · LSP: {} · Monitors: {} · Themes: {} · Styles: {}",
                     summary.total,
@@ -5156,6 +5206,7 @@ async fn handle_tui_plugin_command(
             Err(error) => format!("Plugin reload failed: {error}"),
         },
         "themes" => {
+            let active = runtime.active_theme().await;
             let themes = runtime.themes().await;
             if themes.is_empty() {
                 "No plugin themes are loaded.".to_string()
@@ -5164,7 +5215,8 @@ async fn handle_tui_plugin_command(
                     .into_iter()
                     .map(|theme| {
                         format!(
-                            "{} [{}] from {}",
+                            "{}{} [{}] from {}",
+                            if active.as_deref() == Some(theme.name.as_str()) { "* " } else { "  " },
                             theme.display_name.as_deref().unwrap_or(&theme.name),
                             if theme.dark { "dark" } else { "light" },
                             theme.plugin
@@ -5172,6 +5224,44 @@ async fn handle_tui_plugin_command(
                     })
                     .collect::<Vec<_>>()
                     .join("\n")
+            }
+        }
+        "theme" => {
+            let Some(name) = rest.first().copied() else {
+                return "Usage: /plugins theme <name|default>".to_string();
+            };
+            let selected = (!matches!(name, "default" | "off" | "none")).then_some(name);
+            match runtime.activate_theme(selected).await {
+                Ok(_) => {
+                    sync_tui_plugin_theme(app, &runtime).await;
+                    match selected {
+                        Some(name) => format!("Theme '{name}' activated."),
+                        None => "Theme reset to default.".to_string(),
+                    }
+                }
+                Err(error) => format!("Theme activation failed: {error}"),
+            }
+        }
+        "config" | "configure" => {
+            let Some(name) = rest.first().copied() else {
+                return "Usage: /plugins config <name> <json-object>".to_string();
+            };
+            let json = rest.get(1..).unwrap_or(&[]).join(" ");
+            let values = match serde_json::from_str::<
+                std::collections::HashMap<String, serde_json::Value>,
+            >(&json) {
+                Ok(values) => values,
+                Err(error) => return format!("Plugin config JSON is invalid: {error}"),
+            };
+            match runtime.configure(name, values).await {
+                Ok(summary) => {
+                    sync_tui_plugin_theme(app, &runtime).await;
+                    with_plugin_wiring_errors(
+                        format!("Plugin '{name}' configured and reloaded."),
+                        &summary,
+                    )
+                }
+                Err(error) => format!("Plugin configuration failed: {error}"),
             }
         }
         "styles" => {
@@ -5246,7 +5336,7 @@ async fn handle_tui_plugin_command(
                 format!("Plugin validation failed:\n{}", report.errors.join("\n"))
             }
         }
-        _ => "Usage: /plugins [list|install|uninstall|enable|disable|info|reload|themes|styles|style|init|validate]".to_string(),
+        _ => "Usage: /plugins [list|install|uninstall|enable|disable|info|reload|config|themes|theme|styles|style|init|validate]".to_string(),
     }
 }
 

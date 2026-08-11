@@ -162,14 +162,13 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // ── Config watcher ──
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    if let Some(config_path) = config_watcher::resolve_config_path(args.config.as_deref()) {
-        config_watcher::spawn_config_watcher(
-            config_path,
-            agent_handle.clone(),
-            Some(webhook_emitter.clone()),
-            cancel_token.clone(),
-        );
-    }
+    let config_path = config_watcher::resolve_config_path(args.config.as_deref());
+    config_watcher::spawn_config_watcher(
+        config_path,
+        agent_handle.clone(),
+        Some(webhook_emitter.clone()),
+        cancel_token.clone(),
+    );
 
     // Cron definitions are independent of TaskRun lifecycle state.
     let scheduler_store: Arc<dyn echo_agent::memory::Store> = {

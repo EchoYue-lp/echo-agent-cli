@@ -51,8 +51,9 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             };
             let scope = rest
                 .windows(2)
-                .find(|w| w[0] == "--scope")
-                .and_then(|w| PluginScope::from_arg(w[1]))
+                .find(|window| window.first() == Some(&"--scope"))
+                .and_then(|window| window.get(1))
+                .and_then(|value| PluginScope::from_arg(value))
                 .unwrap_or(PluginScope::User);
 
             let source = InstallSource::parse(source_str);
@@ -267,18 +268,78 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
+            let active = runtime.active_theme().await;
             let themes = runtime.themes().await;
             if themes.is_empty() {
                 println!("No plugin themes are loaded.");
             } else {
                 for theme in themes {
                     println!(
-                        "{} [{}] from {}",
+                        "{}{} [{}] from {}",
+                        if active.as_deref() == Some(theme.name.as_str()) {
+                            "* "
+                        } else {
+                            "  "
+                        },
                         theme.display_name.as_deref().unwrap_or(&theme.name),
                         if theme.dark { "dark" } else { "light" },
                         theme.plugin
                     );
                 }
+            }
+        }
+
+        "theme" => {
+            let Some(name) = rest.first().copied() else {
+                println!("Usage: /plugins theme <name|default>");
+                return CommandOutcome::Continue;
+            };
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
+                return CommandOutcome::Continue;
+            };
+            let selected = (!matches!(name, "default" | "off" | "none")).then_some(name);
+            match runtime.activate_theme(selected).await {
+                Ok(_) => match selected {
+                    Some(name) => println!("Theme '{name}' activated."),
+                    None => println!("Theme reset to default."),
+                },
+                Err(error) => println!("Theme activation failed: {error}"),
+            }
+        }
+
+        "config" | "configure" => {
+            let Some(name) = rest.first().copied() else {
+                println!("Usage: /plugins config <name> <json-object>");
+                return CommandOutcome::Continue;
+            };
+            let Some(json) = rest.get(1..).map(|values| values.join(" ")) else {
+                println!("Usage: /plugins config <name> <json-object>");
+                return CommandOutcome::Continue;
+            };
+            let values = match serde_json::from_str::<
+                std::collections::HashMap<String, serde_json::Value>,
+            >(&json)
+            {
+                Ok(values) => values,
+                Err(error) => {
+                    println!("Plugin config JSON is invalid: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
+            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+                println!("Plugin runtime is not initialized.");
+                return CommandOutcome::Continue;
+            };
+            match runtime.configure(name, values).await {
+                Ok(summary) if summary.errors.is_empty() => {
+                    println!("Plugin '{name}' configured and reloaded.");
+                }
+                Ok(summary) => {
+                    println!("Plugin '{name}' configured with reload errors:");
+                    println!("{}", summary.errors.join("\n"));
+                }
+                Err(error) => println!("Plugin configuration failed: {error}"),
             }
         }
 
@@ -366,7 +427,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         _ => {
             println!("Unknown subcommand: {sub}");
             println!(
-                "Available: list, install, uninstall, enable, disable, info, reload, themes, styles, style, init, validate"
+                "Available: list, install, uninstall, enable, disable, info, reload, config, themes, theme, styles, style, init, validate"
             );
         }
     }

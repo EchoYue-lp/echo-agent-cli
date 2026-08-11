@@ -123,6 +123,60 @@ impl Theme {
             Self::dark()
         }
     }
+
+    /// Apply a plugin theme's semantic colors to the TUI palette.
+    pub fn from_plugin_theme(
+        definition: &echo_agent_app_core::plugin_runtime::PluginThemeDefinition,
+    ) -> Self {
+        let mut theme = if definition.dark {
+            Self::dark()
+        } else {
+            Self::light()
+        };
+        for (key, value) in &definition.colors {
+            let Some(color) = parse_plugin_color(value) else {
+                continue;
+            };
+            match key
+                .trim_start_matches("--")
+                .replace('_', "-")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "bg" | "background" | "bg-primary" => theme.bg = color,
+                "surface0" | "surface-0" | "bg-secondary" => theme.surface0 = color,
+                "surface1" | "surface-1" | "bg-tertiary" => theme.surface1 = color,
+                "overlay0" | "overlay-0" | "border-primary" | "text-tertiary" => {
+                    theme.overlay0 = color;
+                }
+                "text" | "text-primary" => theme.text = color,
+                "subtext" | "text-secondary" => theme.subtext = color,
+                "accent" | "peach" => theme.peach = color,
+                "blue" => theme.blue = color,
+                "green" | "color-success" => theme.green = color,
+                "yellow" | "color-warning" => theme.yellow = color,
+                "mauve" => theme.mauve = color,
+                "teal" => theme.teal = color,
+                "red" | "color-error" => theme.red = color,
+                "cyan" => theme.cyan = color,
+                "lavender" => theme.lavender = color,
+                _ => {}
+            }
+        }
+        theme
+    }
+}
+
+fn parse_plugin_color(value: &str) -> Option<Color> {
+    let hex = value.trim().strip_prefix('#')?;
+    if hex.chars().count() != 6 || !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+        return None;
+    }
+    let packed = u32::from_str_radix(hex, 16).ok()?;
+    let red = u8::try_from((packed >> 16) & 0xff).ok()?;
+    let green = u8::try_from((packed >> 8) & 0xff).ok()?;
+    let blue = u8::try_from(packed & 0xff).ok()?;
+    Some(Color::Rgb(red, green, blue))
 }
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -274,6 +328,8 @@ pub struct TuiApp {
     pub permission_mode: String,
     /// Color theme (auto-detected from terminal).
     pub theme: Theme,
+    /// Built-in theme restored when a plugin theme is deactivated.
+    default_theme: Theme,
     /// Parallel task progress entries shown in the task strip.
     pub parallel_tasks: Vec<TaskProgressEntry>,
     /// Clipboard lease — keeps the clipboard handle alive on Linux/X11.
@@ -732,6 +788,7 @@ pub struct WrappedLine {
 
 impl TuiApp {
     pub fn new(model: String, mode: String, theme: Theme) -> Self {
+        let default_theme = theme.clone();
         Self {
             input: String::new(),
             cursor: 0,
@@ -769,6 +826,7 @@ impl TuiApp {
             history_idx: None,
             permission_mode: "ask".to_string(),
             theme,
+            default_theme,
             parallel_tasks: vec![],
             clipboard_lease: None,
             wrapped_lines: vec![],
@@ -1659,11 +1717,34 @@ fn collect_project_files(root: &std::path::Path, limit: usize) -> Vec<String> {
 #[allow(clippy::items_after_test_module)]
 mod state_tests {
     use super::{Theme, TuiApp, Viewport, tui_viewport};
+    use ratatui::style::Color;
 
     fn app() -> TuiApp {
         let theme =
             Theme::from_color_theme(&echo_agent_app_core::output::theme::ColorTheme::dark());
         TuiApp::new("test-model".to_string(), "test".to_string(), theme)
+    }
+
+    #[test]
+    fn plugin_theme_maps_css_and_semantic_colors_without_panicking() {
+        let definition = echo_agent_app_core::plugin_runtime::PluginThemeDefinition {
+            name: "local-theme".to_string(),
+            display_name: None,
+            dark: false,
+            colors: std::collections::HashMap::from([
+                ("--bg-primary".to_string(), "#010203".to_string()),
+                ("accent".to_string(), "#a0b0c0".to_string()),
+                ("red".to_string(), "not-a-color".to_string()),
+            ]),
+            plugin: "test".to_string(),
+        };
+
+        let theme = Theme::from_plugin_theme(&definition);
+
+        assert!(!theme.is_dark);
+        assert_eq!(theme.bg, Color::Rgb(1, 2, 3));
+        assert_eq!(theme.peach, Color::Rgb(160, 176, 192));
+        assert_eq!(theme.red, Theme::light().red);
     }
 
     #[test]
@@ -1850,6 +1931,15 @@ pub async fn run_tui(
     let mode = mode_display.to_string();
 
     let mut app = TuiApp::new(model, mode, theme);
+    if let Some(active) = plugin_runtime.active_theme().await
+        && let Some(theme) = plugin_runtime
+            .themes()
+            .await
+            .into_iter()
+            .find(|theme| theme.name == active)
+    {
+        app.theme = Theme::from_plugin_theme(&theme);
+    }
     // 读取当前模型的上下文窗口上限（与 GUI panels.rs 同样走 agent.config().get_token_limit()）。
     app.context_window_size = agent.read(|a| a.config().get_token_limit() as u32).await;
     app.context_snapshot.context_window_size = app.context_window_size;

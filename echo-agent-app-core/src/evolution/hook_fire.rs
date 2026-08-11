@@ -9,7 +9,22 @@
 //! best-effort: errors are logged and never propagated to the caller.
 
 use echo_agent::agent::AgentHandle;
+use echo_agent::evolution::{EvolutionObserver, HookEvolutionObserver};
 use echo_core::hooks::{HookContext, HookEvent};
+use std::sync::Arc;
+
+/// Build the framework adapter for this agent's shared HookRegistry.
+pub async fn evolution_hook_observer(agent: &AgentHandle) -> Arc<dyn EvolutionObserver> {
+    agent
+        .read(|agent| {
+            Arc::new(HookEvolutionObserver::new(
+                agent.hook_registry().clone(),
+                agent.config().get_session_id().unwrap_or(""),
+                agent.config().get_agent_name(),
+            )) as Arc<dyn EvolutionObserver>
+        })
+        .await
+}
 
 /// Fire an evolution lifecycle hook event.
 ///

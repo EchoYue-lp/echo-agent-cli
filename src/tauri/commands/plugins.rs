@@ -10,7 +10,7 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::plugin::{InstallSource, PluginEntry, PluginScope};
+use echo_agent::plugin::{InstallSource, PluginEntry, PluginScope, PluginUserConfigEntry};
 use echo_agent_app_core::plugin_runtime::PluginRuntimeService;
 use serde::{Deserialize, Serialize};
 
@@ -30,7 +30,8 @@ pub struct PluginInfo {
     pub capabilities: Vec<String>,
     pub keywords: Vec<String>,
     pub dependencies: Vec<DependencyInfo>,
-    pub config_keys: Vec<String>,
+    pub config: std::collections::HashMap<String, PluginUserConfigEntry>,
+    pub config_values: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,7 +69,8 @@ fn entry_to_info(entry: &PluginEntry) -> PluginInfo {
                 version: d.version_constraint().map(|s| s.to_string()),
             })
             .collect(),
-        config_keys: entry.manifest.config.keys().cloned().collect(),
+        config: entry.manifest.config.clone(),
+        config_values: entry.user_config.clone(),
     }
 }
 
@@ -204,6 +206,24 @@ pub async fn disable_plugin(
 }
 
 #[tauri::command]
+pub async fn configure_plugin(
+    state: tauri::State<'_, TauriState>,
+    name: String,
+    values: std::collections::HashMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, IpcError> {
+    let service = require_service(&state)?;
+    let summary = service
+        .configure(&name, values)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    Ok(serde_json::json!({
+        "success": summary.errors.is_empty(),
+        "message": format!("Plugin '{}' configured", name),
+        "errors": summary.errors,
+    }))
+}
+
+#[tauri::command]
 pub async fn reload_plugins(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
@@ -238,8 +258,27 @@ pub async fn list_plugin_themes(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let service = require_service(&state)?;
-    serde_json::to_value(service.themes().await)
-        .map_err(|error| IpcError::Internal(format!("Failed to serialize themes: {error}")))
+    let themes = service.themes().await;
+    let active = service.active_theme().await;
+    Ok(serde_json::json!({ "themes": themes, "active": active }))
+}
+
+#[tauri::command]
+pub async fn activate_plugin_theme(
+    state: tauri::State<'_, TauriState>,
+    name: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    let service = require_service(&state)?;
+    let selected = name.filter(|value| !value.trim().is_empty());
+    let theme = service
+        .activate_theme(selected.as_deref())
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    Ok(serde_json::json!({
+        "success": true,
+        "active": selected,
+        "theme": theme,
+    }))
 }
 
 #[tauri::command]

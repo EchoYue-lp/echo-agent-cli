@@ -9,8 +9,7 @@ use echo_agent::agent::subagent::{
 };
 use echo_agent::agent::{Agent, ReactAgent, ReactAgentBuilder};
 use echo_agent::lsp::LspConfig;
-use echo_agent::plugin::PluginRegistry;
-use echo_agent::plugin::ResolvedComponents;
+use echo_agent::plugin::{PluginRegistry, PluginVariables, ResolvedComponents};
 use serde::{Deserialize, Serialize};
 
 use crate::scheduler::{CronTask, CronTaskStatus};
@@ -109,6 +108,13 @@ pub(crate) fn prepare_application_components(
     let mut errors = Vec::new();
 
     for plugin in ordered {
+        let variables = match registry.variables_for(&plugin) {
+            Ok(variables) => variables,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
         let resolved = match registry.resolve_components(&plugin) {
             Ok(resolved) => resolved,
             Err(error) => {
@@ -117,7 +123,7 @@ pub(crate) fn prepare_application_components(
             }
         };
         for path in resolved.agent_files {
-            match read_plugin_agent(&plugin, &path) {
+            match read_plugin_agent_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(agent) => {
                     let name = agent.definition.name.clone();
                     if !agent_names.insert(name.clone()) {
@@ -133,7 +139,9 @@ pub(crate) fn prepare_application_components(
         }
 
         if let Some(path) = resolved.lsp_config_file {
-            match LspConfig::from_file(&path) {
+            match read_component_text(&path, Some(&variables))
+                .and_then(|content| LspConfig::from_yaml(&content))
+            {
                 Ok(config) => {
                     let duplicate = config
                         .servers
@@ -156,7 +164,7 @@ pub(crate) fn prepare_application_components(
         }
 
         if let Some(path) = resolved.monitors_file {
-            match read_monitors(&plugin, &path) {
+            match read_monitors_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(monitors) => {
                     for monitor in monitors {
                         if !monitor_ids.insert(monitor.id.clone()) {
@@ -174,7 +182,7 @@ pub(crate) fn prepare_application_components(
         }
 
         for path in resolved.theme_files {
-            match read_theme(&plugin, &path) {
+            match read_theme_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(theme) => {
                     if !theme_names.insert(theme.name.clone()) {
                         errors.push(format!(
@@ -190,7 +198,7 @@ pub(crate) fn prepare_application_components(
         }
 
         for path in resolved.output_style_files {
-            match read_output_style(&plugin, &path) {
+            match read_output_style_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(style) => {
                     if !output_style_names.insert(style.name.clone()) {
                         errors.push(format!(
@@ -250,7 +258,15 @@ pub(crate) fn validate_application_component_files(
 }
 
 fn read_plugin_agent(plugin: &str, path: &Path) -> Result<PreparedPluginAgent, String> {
-    let content = std::fs::read_to_string(path).map_err(|error| {
+    read_plugin_agent_with_variables(plugin, path, None)
+}
+
+fn read_plugin_agent_with_variables(
+    plugin: &str,
+    path: &Path,
+    variables: Option<&PluginVariables>,
+) -> Result<PreparedPluginAgent, String> {
+    let content = read_component_text(path, variables).map_err(|error| {
         format!(
             "Plugin '{plugin}' Subagent '{}': failed to read: {error}",
             path.display()
@@ -266,7 +282,15 @@ fn read_plugin_agent(plugin: &str, path: &Path) -> Result<PreparedPluginAgent, S
 }
 
 fn read_monitors(plugin: &str, path: &Path) -> Result<Vec<CronTask>, String> {
-    let content = std::fs::read_to_string(path).map_err(|error| {
+    read_monitors_with_variables(plugin, path, None)
+}
+
+fn read_monitors_with_variables(
+    plugin: &str,
+    path: &Path,
+    variables: Option<&PluginVariables>,
+) -> Result<Vec<CronTask>, String> {
+    let content = read_component_text(path, variables).map_err(|error| {
         format!(
             "Plugin '{plugin}' monitors '{}': failed to read: {error}",
             path.display()
@@ -323,7 +347,15 @@ fn read_monitors(plugin: &str, path: &Path) -> Result<Vec<CronTask>, String> {
 }
 
 fn read_theme(plugin: &str, path: &Path) -> Result<PluginThemeDefinition, String> {
-    let content = std::fs::read_to_string(path).map_err(|error| {
+    read_theme_with_variables(plugin, path, None)
+}
+
+fn read_theme_with_variables(
+    plugin: &str,
+    path: &Path,
+    variables: Option<&PluginVariables>,
+) -> Result<PluginThemeDefinition, String> {
+    let content = read_component_text(path, variables).map_err(|error| {
         format!(
             "Plugin '{plugin}' theme '{}': failed to read: {error}",
             path.display()
@@ -355,7 +387,15 @@ fn read_theme(plugin: &str, path: &Path) -> Result<PluginThemeDefinition, String
 }
 
 fn read_output_style(plugin: &str, path: &Path) -> Result<PluginOutputStyle, String> {
-    let content = std::fs::read_to_string(path).map_err(|error| {
+    read_output_style_with_variables(plugin, path, None)
+}
+
+fn read_output_style_with_variables(
+    plugin: &str,
+    path: &Path,
+    variables: Option<&PluginVariables>,
+) -> Result<PluginOutputStyle, String> {
+    let content = read_component_text(path, variables).map_err(|error| {
         format!(
             "Plugin '{plugin}' output style '{}': failed to read: {error}",
             path.display()
@@ -390,6 +430,14 @@ fn read_output_style(plugin: &str, path: &Path) -> Result<PluginOutputStyle, Str
         description: metadata.description.trim().to_string(),
         instructions,
         plugin: plugin.to_string(),
+    })
+}
+
+fn read_component_text(path: &Path, variables: Option<&PluginVariables>) -> Result<String, String> {
+    let content = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
+    Ok(match variables {
+        Some(variables) => variables.substitute(&content),
+        None => content,
     })
 }
 
@@ -518,6 +566,44 @@ mod tests {
         let style = read_output_style("test", &path)?;
         assert_eq!(style.name, "concise");
         assert!(style.instructions.contains("你好"));
+        Ok(())
+    }
+
+    #[test]
+    fn application_components_expand_plugin_and_manifest_config_variables() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let theme_path = temp.path().join("theme.json");
+        let style_path = temp.path().join("style.md");
+        std::fs::write(
+            &theme_path,
+            r##"{"name":"configured","dark":true,"colors":{"accent":"${user_config.accent}"}}"##,
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            &style_path,
+            "---\nname: configured\n---\nWrite artifacts under ${ECHO_PLUGIN_DATA}.\n",
+        )
+        .map_err(|error| error.to_string())?;
+        let data_dir = temp.path().join("data");
+        let variables = PluginVariables::new("configured", temp.path().into(), temp.path().into())
+            .with_plugin_data(data_dir.clone())
+            .with_user_config(HashMap::from([(
+                "accent".to_string(),
+                "#123456".to_string(),
+            )]));
+
+        let theme = read_theme_with_variables("configured", &theme_path, Some(&variables))?;
+        let style = read_output_style_with_variables("configured", &style_path, Some(&variables))?;
+
+        assert_eq!(
+            theme.colors.get("accent").map(String::as_str),
+            Some("#123456")
+        );
+        assert!(
+            style
+                .instructions
+                .contains(&data_dir.to_string_lossy().to_string())
+        );
         Ok(())
     }
 }

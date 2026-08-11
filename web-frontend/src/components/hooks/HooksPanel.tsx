@@ -32,6 +32,7 @@ export function HooksPanel() {
   const [testing, setTesting] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
   const [selectedEvent, setSelectedEvent] = useState('PreToolUse');
+  const [matcher, setMatcher] = useState('*');
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -88,10 +89,16 @@ export function HooksPanel() {
     try {
       setTesting(true);
       setMessage(null);
-      const result = await hooksApi.test(selectedEvent);
+      const result = await hooksApi.test(selectedEvent, matcher);
+      const details = result.matches
+        .map((item) => `${item.source}: ${item.action} (${item.matcher || '*'})`)
+        .join('; ');
       setMessage({
-        type: result.registered ? 'success' : 'error',
-        text: `${result.event}: ${result.registered ? 'registered' : 'not registered'}`,
+        type: result.matches.length > 0 ? 'success' : 'error',
+        text:
+          result.matches.length > 0
+            ? `${result.event} dry-run matched ${result.matches.length}: ${details}`
+            : `${result.event} dry-run matched no actions`,
       });
     } catch (e: any) {
       setMessage({ type: 'error', text: e.message || 'Hook test failed' });
@@ -107,6 +114,14 @@ export function HooksPanel() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
+          <input
+            value={matcher}
+            onChange={(event) => setMatcher(event.target.value)}
+            className="h-9 w-32 rounded-md border bg-[var(--bg-input)] px-2 text-xs"
+            style={{ color: 'var(--text-secondary)', borderColor: 'var(--border-primary)' }}
+            aria-label="Hook matcher"
+            placeholder="Matcher"
+          />
           <Webhook className="w-5 h-5" style={{ color: 'var(--accent)' }} />
           <h2 className="text-lg font-semibold" style={{ color: 'var(--text-primary)' }}>
             Hooks
@@ -135,8 +150,8 @@ export function HooksPanel() {
             disabled={events.length === 0 || testing}
             className="flex h-9 w-9 items-center justify-center rounded-md transition-colors disabled:opacity-50 hover:bg-[var(--bg-hover)]"
             style={{ color: 'var(--text-secondary)', border: '1px solid var(--border-primary)' }}
-            title="Test hook event"
-            aria-label="Test hook event"
+            title="Dry-run hook matching"
+            aria-label="Dry-run hook matching"
           >
             {testing ? (
               <Loader2 className="h-4 w-4 animate-spin" />

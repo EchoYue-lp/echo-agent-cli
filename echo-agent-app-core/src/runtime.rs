@@ -242,6 +242,8 @@ impl AgentRuntime {
             tracing::info!("ReviewIntegration created for session");
         }
         if let Some(review_integration) = &review_integration {
+            let evolution_observer = crate::evolution::evolution_hook_observer(&agent_handle).await;
+            review_integration.set_evolution_observer(evolution_observer);
             let layer_manager = Arc::new(review_integration.create_layer_manager());
             let trigger_sink = review_integration.clone();
             let skill_policy = review_integration.clone();

@@ -1669,7 +1669,20 @@ export interface PluginInfo {
   capabilities: string[];
   keywords: string[];
   dependencies: { name: string; version: string | null }[];
-  config_keys: string[];
+  config: Record<string, PluginConfigEntry>;
+  config_values: Record<string, unknown>;
+}
+
+export interface PluginConfigEntry {
+  type: 'string' | 'number' | 'boolean' | 'directory' | 'file';
+  title: string;
+  description: string;
+  sensitive: boolean;
+  required: boolean;
+  default: unknown | null;
+  multiple: boolean;
+  min: number | null;
+  max: number | null;
 }
 
 export interface PluginMutationResult {
@@ -1693,6 +1706,11 @@ export interface PluginThemeDefinition {
   dark: boolean;
   colors: Record<string, string>;
   plugin: string;
+}
+
+export interface PluginThemesResult {
+  themes: PluginThemeDefinition[];
+  active: string | null;
 }
 
 export interface PluginOutputStyle {
@@ -1740,6 +1758,10 @@ export const pluginApi = {
           name,
         })
       : post<PluginMutationResult>(`/plugins/${name}/disable`),
+  configure: (name: string, values: Record<string, unknown>) =>
+    isTauri()
+      ? apiInvoke<PluginMutationResult>('configure_plugin', { name, values })
+      : post<PluginMutationResult>(`/plugins/${name}/config`, { values }),
   reload: () =>
     isTauri()
       ? apiInvoke<{
@@ -1790,8 +1812,18 @@ export const pluginApi = {
       : post<PluginValidationReport>('/plugins/validate', { directory }),
   themes: () =>
     isTauri()
-      ? apiInvoke<PluginThemeDefinition[]>('list_plugin_themes')
-      : get<PluginThemeDefinition[]>('/plugins/themes'),
+      ? apiInvoke<PluginThemesResult>('list_plugin_themes')
+      : get<PluginThemesResult>('/plugins/themes'),
+  activateTheme: (name: string | null) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; active: string | null; theme: PluginThemeDefinition | null }>(
+          'activate_plugin_theme',
+          { name }
+        )
+      : post<{ success: boolean; active: string | null; theme: PluginThemeDefinition | null }>(
+          '/plugins/theme',
+          { name }
+        ),
   outputStyles: () =>
     isTauri()
       ? apiInvoke<PluginOutputStylesResult>('list_plugin_output_styles')
@@ -1825,7 +1857,8 @@ export interface HooksReloadSummary {
 
 export interface HookTestResult {
   event: string;
-  registered: boolean;
+  matcher: string;
+  matches: { source: string; matcher: string; action: string }[];
 }
 
 export const hooksApi = {
@@ -1837,10 +1870,10 @@ export const hooksApi = {
       : post<HooksReloadSummary>('/hooks/reload'),
   events: () =>
     isTauri() ? apiInvoke<string[]>('list_hook_events') : get<string[]>('/hooks/events'),
-  test: (event: string) =>
+  test: (event: string, matcher?: string) =>
     isTauri()
-      ? apiInvoke<HookTestResult>('test_hook', { event })
-      : post<HookTestResult>('/hooks/test', { event }),
+      ? apiInvoke<HookTestResult>('test_hook', { event, matcher })
+      : post<HookTestResult>('/hooks/test', { event, matcher }),
 };
 
 // ── Scheduler API (定时任务) ──────────────────────────────────────

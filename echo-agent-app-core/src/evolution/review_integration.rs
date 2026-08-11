@@ -13,8 +13,9 @@
 //! persists semantic proposals into the workspace Review Inbox.
 
 use echo_agent::evolution::{
-    Curator, CuratorConfig, MemoryLayerManager, MemoryReviewer, MemoryRuntimeIntegrationBuilder,
-    ReviewChange, ReviewConfig, ReviewReport, SkillCandidateDetector, SkillDraftGenerator,
+    Curator, CuratorConfig, EvolutionObserver, MemoryLayerManager, MemoryReviewer,
+    MemoryRuntimeIntegrationBuilder, ReviewChange, ReviewConfig, ReviewReport,
+    SkillCandidateDetector, SkillDraftGenerator,
 };
 use echo_agent::memory::Store;
 use echo_agent::memory::TypedMemoryStore;
@@ -42,6 +43,8 @@ pub struct ReviewIntegration {
     echo_agent_dir: RwLock<PathBuf>,
     /// The underlying Store for creating TypedMemoryStore on demand.
     store: RwLock<Arc<dyn Store>>,
+    /// Framework observer wired to the shared agent HookRegistry.
+    evolution_observer: RwLock<Option<Arc<dyn EvolutionObserver>>>,
 }
 
 impl ReviewIntegration {
@@ -51,7 +54,17 @@ impl ReviewIntegration {
             config,
             echo_agent_dir: RwLock::new(echo_agent_dir),
             store: RwLock::new(store),
+            evolution_observer: RwLock::new(None),
         }
+    }
+
+    /// Attach the runtime observer used by memory, candidate and health paths.
+    pub fn set_evolution_observer(&self, observer: Arc<dyn EvolutionObserver>) {
+        let mut current = self
+            .evolution_observer
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        *current = Some(observer);
     }
 
     /// Rebind to a new project directory + Store (used on workspace switch).
@@ -151,8 +164,11 @@ impl ReviewIntegration {
 
         // ── Skill candidate detection ──────────────────────────────
         if self.config.detect_skill_candidates {
-            let detector =
+            let mut detector =
                 SkillCandidateDetector::new().with_curator(workspace_curator(&echo_agent_dir));
+            if let Some(observer) = self.current_evolution_observer() {
+                detector = detector.with_evolution_observer(observer);
+            }
             match detector.detect(&typed_store, change_log.as_ref()).await {
                 Ok(candidate_report) => {
                     for candidate in &candidate_report.new_candidates {
@@ -210,6 +226,17 @@ impl ReviewIntegration {
         self.runtime_builder().build_layer_manager()
     }
 
+    /// Create a manager with caller-specific event correlation metadata.
+    /// Pool agents use this so shared storage does not imply a shared session ID.
+    pub fn create_layer_manager_with_observer(
+        &self,
+        observer: Arc<dyn EvolutionObserver>,
+    ) -> MemoryLayerManager {
+        self.runtime_builder()
+            .evolution_observer(observer)
+            .build_layer_manager()
+    }
+
     /// Create framework runtime wiring without owning product lifecycle policy.
     fn runtime_builder(&self) -> MemoryRuntimeIntegrationBuilder {
         // Read current values; on lock poisoning fall back to whatever we can
@@ -225,7 +252,18 @@ impl ReviewIntegration {
             .read()
             .map(|g| g.clone())
             .unwrap_or_else(|e| e.into_inner().clone());
-        MemoryRuntimeIntegrationBuilder::new(echo_agent_dir, store)
+        let mut builder = MemoryRuntimeIntegrationBuilder::new(echo_agent_dir, store);
+        if let Some(observer) = self.current_evolution_observer() {
+            builder = builder.evolution_observer(observer);
+        }
+        builder
+    }
+
+    fn current_evolution_observer(&self) -> Option<Arc<dyn EvolutionObserver>> {
+        self.evolution_observer
+            .read()
+            .map(|observer| observer.clone())
+            .unwrap_or_else(|error| error.into_inner().clone())
     }
 
     fn current_echo_agent_dir(&self) -> PathBuf {
@@ -444,6 +482,20 @@ pub fn format_review_report(report: &ReviewReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingEvolutionObserver {
+        writes: Arc<AtomicUsize>,
+    }
+
+    impl EvolutionObserver for CountingEvolutionObserver {
+        fn on_memory_write<'a>(&'a self, _key: &'a str, _source: &'a str) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.writes.fetch_add(1, Ordering::Relaxed);
+            })
+        }
+    }
 
     #[test]
     fn test_discover_echo_agent_dir_returns_path() {
@@ -559,6 +611,46 @@ mod tests {
             .await
             .ok_or_else(|| "secondary memory disappeared during review".to_string())?;
         assert_eq!(secondary.1.meta.status, MemoryStatus::Active);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn evolution_observer_survives_rebind_and_manager_rebuild() -> Result<(), String> {
+        use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let first_store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
+        let ri = ReviewIntegration::new(
+            ReviewConfig::default(),
+            temp.path().join("first/.eko"),
+            first_store,
+        );
+        let writes = Arc::new(AtomicUsize::new(0));
+        ri.set_evolution_observer(Arc::new(CountingEvolutionObserver {
+            writes: writes.clone(),
+        }));
+
+        let meta = || {
+            MemoryMeta::new(
+                MemoryType::ProjectFact,
+                MemorySource::AutoExtracted,
+                "observer-test",
+            )
+            .with_confidence(0.6)
+        };
+        ri.create_layer_manager()
+            .write_memory("first", "first write", meta())
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let second_store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
+        ri.rebind(temp.path().join("second/.eko"), second_store);
+        ri.create_layer_manager()
+            .write_memory("second", "second write", meta())
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(writes.load(Ordering::Relaxed), 2);
         Ok(())
     }
 

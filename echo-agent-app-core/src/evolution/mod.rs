@@ -17,7 +17,7 @@ pub use evidence::{
     EvidenceKind, EvidenceRef, EvidenceReviewFilter, EvidenceReviewItem, EvidenceScope,
     EvidenceSource, EvidenceStore, EvidenceTarget, capture_memory_conflict, capture_review_outcome,
 };
-pub use hook_fire::fire_evolution_hook;
+pub use hook_fire::{evolution_hook_observer, fire_evolution_hook};
 pub use review_integration::{
     ReviewIntegration, discover_echo_agent_dir, format_review_report, workspace_curator,
 };

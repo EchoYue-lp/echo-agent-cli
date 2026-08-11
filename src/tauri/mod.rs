@@ -180,10 +180,12 @@ pub fn build_tauri_app(
             commands::plugins::uninstall_plugin,
             commands::plugins::enable_plugin,
             commands::plugins::disable_plugin,
+            commands::plugins::configure_plugin,
             commands::plugins::reload_plugins,
             commands::plugins::scaffold_plugin,
             commands::plugins::validate_plugin,
             commands::plugins::list_plugin_themes,
+            commands::plugins::activate_plugin_theme,
             commands::plugins::list_plugin_output_styles,
             commands::plugins::activate_plugin_output_style,
             // Hooks

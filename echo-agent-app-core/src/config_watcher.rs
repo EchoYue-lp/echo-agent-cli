@@ -1,5 +1,5 @@
-//! Hooks-config file watcher — monitors `echo-agent.yaml` for changes and
-//! hot-reloads user **hooks and webhook endpoints** (and fires the
+//! Hooks-config file watcher — monitors the app config plus global/project
+//! `hooks.yaml` files and hot-reloads user **hooks and webhook endpoints** (and fires the
 //! `ConfigChange` lifecycle hook).
 //!
 //! ## Scope (intentional)
@@ -33,7 +33,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::agent_handle::AgentHandle;
-use crate::infra;
 
 /// Quiet window for the resettable debounce. A save is considered "settled"
 /// when no qualifying event has arrived for this long.
@@ -45,10 +44,7 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 /// override path if provided.
 pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = explicit {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Some(path);
-        }
+        return Some(PathBuf::from(p));
     }
     echo_agent::config::config_search_paths()
         .into_iter()
@@ -64,19 +60,13 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 ///
 /// The watcher stops when the cancellation token is triggered.
 pub fn spawn_config_watcher(
-    config_path: PathBuf,
+    config_path: Option<PathBuf>,
     agent: AgentHandle,
     webhook_emitter: Option<std::sync::Arc<crate::webhook::WebhookEmitter>>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let Some(parent) = config_path.parent() else {
-            warn!(
-                "Config path {} has no parent directory; cannot watch",
-                config_path.display()
-            );
-            return;
-        };
+        let targets = config_watch_targets(config_path.as_deref());
 
         // Use a bounded async channel to receive filesystem events.
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -94,23 +84,24 @@ pub fn spawn_config_watcher(
             }
         };
 
-        // Watch the PARENT directory (recursive=false). This survives the
-        // atomic-write-temp-then-rename pattern used by most editors, which
-        // would invalidate a direct file watch. We filter to our target below.
-        if let Err(e) = watcher.watch(parent, RecursiveMode::NonRecursive) {
-            warn!(
-                "Failed to watch config parent directory {}: {}",
-                parent.display(),
-                e
-            );
+        let mut watched = std::collections::HashSet::new();
+        for target in &targets {
+            let Some(directory) = nearest_existing_parent(target) else {
+                continue;
+            };
+            if !watched.insert(directory.clone()) {
+                continue;
+            }
+            if let Err(error) = watcher.watch(&directory, RecursiveMode::Recursive) {
+                warn!(path = %directory.display(), %error, "Failed to watch config directory");
+            }
+        }
+        if watched.is_empty() {
+            warn!("No existing directory is available for config watching");
             return;
         }
 
-        info!(
-            "Config watcher started: watching {} for changes to {}",
-            parent.display(),
-            config_path.display()
-        );
+        info!(targets = ?targets, "Config watcher started");
 
         loop {
             tokio::select! {
@@ -130,14 +121,15 @@ pub fn spawn_config_watcher(
                             continue;
                         }
                     };
-                    // Filter: only react to data-modify events that touch our
-                    // target config file specifically.
-                    if !is_config_write_event(&notify_event.kind) {
+                    // React to writes and removals that touch one of the
+                    // watched config files. A removal must rebuild the merged
+                    // registry so hooks from the deleted source stop running.
+                    if !is_config_change_event(&notify_event.kind) {
                         continue;
                     }
-                    if !event_touches_target(&notify_event, &config_path) {
+                    let Some(changed_path) = event_touched_target(&notify_event, &targets) else {
                         continue;
-                    }
+                    };
 
                     // Resettable debounce: keep resetting the quiet window while
                     // events keep arriving. Drain the channel non-blockingly so
@@ -150,8 +142,8 @@ pub fn spawn_config_watcher(
                             _ = &mut settled => break,
                             extra = rx.recv() => {
                                 let Some(Ok(ev)) = extra else { continue };
-                                if is_config_write_event(&ev.kind)
-                                    && event_touches_target(&ev, &config_path)
+                                if is_config_change_event(&ev.kind)
+                                    && event_touched_target(&ev, &targets).is_some()
                                 {
                                     // Qualifying event during quiet window:
                                     // reset the debounce timer.
@@ -164,47 +156,81 @@ pub fn spawn_config_watcher(
                         break;
                     }
 
-                    info!("Config file changed: {}", config_path.display());
-                    handle_config_change(&config_path, &agent, webhook_emitter.as_deref()).await;
+                    info!("Config file changed: {}", changed_path.display());
+                    handle_config_change(
+                        &changed_path,
+                        config_path.as_deref(),
+                        &agent,
+                        webhook_emitter.as_deref(),
+                    )
+                    .await;
                 }
             }
         }
     })
 }
 
-fn is_config_write_event(kind: &EventKind) -> bool {
-    matches!(kind, EventKind::Create(_) | EventKind::Modify(_))
+fn is_config_change_event(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    )
 }
 
-/// True when `event` modifies the file at `target` (compared by canonical path
+/// Return the watched target changed by `event` (compared by canonical path
 /// when possible, falling back to a suffix/contains match on the event paths).
 ///
 /// Path comparison is character-safe (uses `Path` API only).
-fn event_touches_target(event: &notify::Event, target: &Path) -> bool {
-    // Canonicalize both sides when possible to normalize symlinks/relative paths.
-    let target_canon = target
-        .canonicalize()
-        .unwrap_or_else(|_| target.to_path_buf());
-    for p in &event.paths {
-        let p_canon = p.canonicalize().unwrap_or_else(|_| p.clone());
-        if p_canon == target_canon {
-            return true;
-        }
-        // Fallback: compare by final component (covers the case where the file
-        // was just created and not yet canonicalizable).
-        if p.file_name() == target.file_name() {
-            return true;
+fn event_touched_target(event: &notify::Event, targets: &[PathBuf]) -> Option<PathBuf> {
+    for target in targets {
+        let target_canon = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        for path in &event.paths {
+            let path_canon = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if path_canon == target_canon || path == target {
+                return Some(target.clone());
+            }
         }
     }
-    false
+    None
+}
+
+fn config_watch_targets(config_path: Option<&Path>) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    if let Some(path) = config_path {
+        targets.push(path.to_path_buf());
+    }
+    targets.push(echo_agent::paths::user_data_path("hooks.yaml"));
+    if let Ok(cwd) = std::env::current_dir() {
+        targets.push(cwd.join(".eko").join("hooks.yaml"));
+    }
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
+    let mut current = path.parent();
+    while let Some(candidate) = current {
+        // Never fall back to a recursive filesystem-root watch when an
+        // explicitly configured path has no existing ancestor directory.
+        candidate.parent()?;
+        if candidate.is_dir() {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
 }
 
 async fn handle_config_change(
-    config_path: &std::path::Path,
+    changed_path: &std::path::Path,
+    config_path: Option<&std::path::Path>,
     agent: &AgentHandle,
     webhook_emitter: Option<&crate::webhook::WebhookEmitter>,
 ) {
-    let path_str = config_path.to_str().unwrap_or("").to_string();
+    let path_str = changed_path.to_string_lossy().to_string();
 
     // 1. Fire ConfigChange hook
     let path_for_hook = path_str.clone();
@@ -225,10 +251,69 @@ async fn handle_config_change(
     // Model selection, MCP topology, and runtime limits are wired into
     // long-lived subsystems at agent build time and are NOT reloaded here — a
     // restart is required for those to take effect (see module docs).
-    let new_config = echo_agent::config::load_config(Some(&path_str));
-
-    infra::load_user_hooks(agent, &new_config).await;
+    let new_config = config_path
+        .and_then(Path::to_str)
+        .map(|path| echo_agent::config::load_config(Some(path)))
+        .unwrap_or_else(|| echo_agent::config::load_config(None));
+    let loaded = crate::hook_config_loader::HookConfigLoader::load_merged_from_disk_at(config_path);
+    if loaded.errors.is_empty() {
+        let definition = loaded.definition;
+        agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    let mut registry = agent.hook_registry().write().await;
+                    registry.clear_user_hooks();
+                    if !definition.is_empty() {
+                        registry.register_user_hooks(definition);
+                    }
+                })
+            })
+            .await;
+    } else {
+        warn!(errors = %loaded.errors.join("; "), "Hook config reload rejected; keeping last known-good hooks");
+    }
     if let Some(emitter) = webhook_emitter {
         emitter.reload_from_config(&new_config).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_targets_include_app_global_and_project_hook_files() -> Result<(), String> {
+        let current = std::env::current_dir().map_err(|error| error.to_string())?;
+        let app = current.join("echo-agent.test.yaml");
+        let targets = config_watch_targets(Some(&app));
+
+        assert!(targets.contains(&app));
+        assert!(targets.contains(&echo_agent::paths::user_data_path("hooks.yaml")));
+        assert!(targets.contains(&current.join(".eko/hooks.yaml")));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_path_never_falls_back_to_filesystem_root() {
+        assert_eq!(
+            nearest_existing_parent(Path::new("/definitely-missing/hooks.yaml")),
+            None
+        );
+    }
+
+    #[test]
+    fn create_modify_and_remove_events_trigger_reload() {
+        assert!(is_config_change_event(&EventKind::Create(
+            notify::event::CreateKind::File
+        )));
+        assert!(is_config_change_event(&EventKind::Modify(
+            notify::event::ModifyKind::Data(notify::event::DataChange::Content)
+        )));
+        assert!(is_config_change_event(&EventKind::Remove(
+            notify::event::RemoveKind::File
+        )));
+        assert!(!is_config_change_event(&EventKind::Access(
+            notify::event::AccessKind::Read
+        )));
     }
 }

@@ -645,22 +645,31 @@ impl AgentPool {
             .collect();
         for handle in agents {
             let store_clone = store.clone();
-            let dir_clone = echo_agent_dir.clone();
+            let evolution_observer = crate::evolution::evolution_hook_observer(&handle).await;
             let skill_curator = self
                 .shared
                 .review_integration
                 .as_ref()
                 .map(|integration| integration.curator());
+            let layer_manager = self
+                .shared
+                .review_integration
+                .as_ref()
+                .map(|integration| {
+                    integration.create_layer_manager_with_observer(evolution_observer)
+                })
+                .unwrap_or_else(|| {
+                    echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
+                        echo_agent_dir.clone(),
+                        store_clone.clone(),
+                    )
+                    .build_layer_manager()
+                });
             handle
                 .write_async(|agent| {
                     Box::pin(async move {
                         agent.install_memory_store(store_clone.clone()).await;
-                        let mgr = echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
-                            dir_clone,
-                            store_clone,
-                        )
-                        .build_layer_manager();
-                        agent.install_memory_layer_manager(Arc::new(mgr));
+                        agent.install_memory_layer_manager(Arc::new(layer_manager));
                         agent.set_skill_curator(skill_curator);
                     })
                 })
@@ -904,7 +913,13 @@ impl AgentPool {
             agent.install_store(st.clone()).await;
         }
         if let Some(ref review_integration) = self.shared.review_integration {
-            let layer_manager = Arc::new(review_integration.create_layer_manager());
+            let evolution_observer = Arc::new(echo_agent::evolution::HookEvolutionObserver::new(
+                agent.hook_registry().clone(),
+                agent.config().get_session_id().unwrap_or(""),
+                agent.config().get_agent_name(),
+            ));
+            let layer_manager =
+                Arc::new(review_integration.create_layer_manager_with_observer(evolution_observer));
             agent.install_memory_layer_manager(layer_manager);
             agent.set_memory_trigger_sink(Some(review_integration.clone()));
             agent.set_skill_load_policy(Some(review_integration.clone()));

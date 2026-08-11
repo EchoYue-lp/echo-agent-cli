@@ -2,7 +2,7 @@
 //!
 //! `/hooks list` — list registered hook sources and rule counts
 //! `/hooks reload` — reload hooks from config files (~/.eko/hooks.yaml, .eko/hooks.yaml)
-//! `/hooks test <event>` — test if hooks are registered for a given event
+//! `/hooks test <event> [matcher]` — dry-run matching without executing actions
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
@@ -72,8 +72,9 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "test" => {
             let event_name = args.get(1).copied().unwrap_or("").to_string();
+            let matcher = args.get(2).copied().unwrap_or("*").to_string();
             if event_name.is_empty() {
-                println!("Usage: /hooks test <event>");
+                println!("Usage: /hooks test <event> [matcher]");
                 println!("  Events: PreToolUse, PostToolUse, SessionStart, SessionEnd, Stop, ...");
                 return CommandOutcome::Continue;
             }
@@ -86,16 +87,21 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         .read_async(|a| {
                             Box::pin(async move {
                                 let registry = a.hook_registry().read().await;
-                                let has = registry.has_hooks_for(evt);
-                                println!(
-                                    "Hooks for {}: {}",
-                                    event_name,
-                                    if has {
-                                        "YES (hooks registered)"
-                                    } else {
-                                        "NO (no hooks)"
-                                    }
+                                let context = echo_agent::skills::hooks::HookContext::for_dry_run(
+                                    evt, &matcher,
                                 );
+                                let result = registry.dry_run(&context);
+                                println!("Dry-run {} matcher '{}':", event_name, matcher);
+                                if result.matches.is_empty() {
+                                    println!("  no matching actions");
+                                } else {
+                                    for item in result.matches {
+                                        println!(
+                                            "  {} · matcher={} · action={}",
+                                            item.source, item.matcher, item.action
+                                        );
+                                    }
+                                }
                             })
                         })
                         .await;
