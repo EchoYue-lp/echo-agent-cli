@@ -67,6 +67,8 @@ pub struct ReplConfig {
     /// Shared webhook emitter (built from `AppConfig.webhooks` at bootstrap).
     /// `None` means no endpoints configured — emit calls are skipped cheaply.
     pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
+    /// Authoritative application state used by workspace and other stateful commands.
+    pub app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
 }
 
 impl Default for ReplConfig {
@@ -87,6 +89,7 @@ impl Default for ReplConfig {
             task_runtime_store: None,
             conversation_id: uuid::Uuid::new_v4().to_string(),
             webhook_emitter: None,
+            app_state: None,
         }
     }
 }
@@ -200,6 +203,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         .with_plugin_runtime_opt(config.plugin_runtime.clone())
         .with_prompt_assembly(config.prompt_assembly.clone())
         .with_review_integration(config.review_integration.clone())
+        .with_app_state_opt(config.app_state.clone())
         .with_interaction_mode(interaction_mode.clone())
         .with_staged_attachments(staged_attachments.clone());
 
@@ -251,9 +255,6 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 
     // ── Auto-memory: extract observations on session end ────────────
     run_auto_memory_on_exit(&agent, &config.review_integration).await;
-
-    // ── Reflection: summarize session learnings ─────────────────────
-    run_reflection_on_exit(&agent).await;
 
     // ── Memory review: staleness scoring, conflict detection, GC ────
     run_memory_review_on_exit(&agent, &config.review_integration).await;
@@ -329,75 +330,6 @@ async fn run_auto_memory_on_exit(
             candidates.len()
         ),
         Err(error) => println!("  Auto-memory: failed to queue candidates ({error})"),
-    }
-}
-
-/// Run lightweight reflection when the session ends.
-///
-/// Generates a brief summary of session learnings and appends to
-/// `.eko/memory/PROJECT.md`. Non-blocking: errors are silently
-/// ignored to avoid disrupting exit flow.
-async fn run_reflection_on_exit(agent: &AgentHandle) {
-    // Get LLM client from agent
-    let llm_client = agent.read(|a| a.llm_client().cloned()).await;
-
-    let Some(llm) = llm_client else {
-        return;
-    };
-
-    // Get message count to ensure there's enough context for reflection
-    let message_count = agent
-        .read_async(|a| {
-            Box::pin(async move {
-                let ctx = a.context().lock().await;
-                ctx.messages().len()
-            })
-        })
-        .await;
-
-    // Need at least a few exchanges for meaningful reflection
-    if message_count < 4 {
-        return;
-    }
-
-    let prompt = "Reflect on the current session and summarize key learnings in 1-2 sentences.\n\
-                  Focus on reusable insights. Be specific. Max 200 tokens.\n\nReflection:";
-
-    let messages = vec![echo_agent::prelude::Message::user(prompt.to_string())];
-    let options = echo_agent::prelude::SimpleChatOptions::default().with_max_tokens(300);
-
-    let reflection = match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        llm.chat_simple_with_options(messages, options),
-    )
-    .await
-    {
-        Ok(Ok(text)) => text,
-        Ok(Err(_)) | Err(_) => return, // Silently skip on failure
-    };
-
-    // Write to .eko/memory/PROJECT.md
-    let memory_dir = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".eko")
-        .join("memory");
-    let _ = std::fs::create_dir_all(&memory_dir);
-    let memory_file = memory_dir.join("PROJECT.md");
-
-    let entry = format!(
-        "\n## [session] Reflection ({})\n{}\n",
-        chrono::Local::now().format("%Y-%m-%d %H:%M"),
-        reflection.trim()
-    );
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&memory_file)
-    {
-        use std::io::Write;
-        let _ = file.write_all(entry.as_bytes());
-        println!("  🪞 Reflection saved to {}", memory_file.display());
     }
 }
 
@@ -814,7 +746,9 @@ async fn chat_with_agent(
                 clear_spinner!();
                 output.print_warning("执行已取消");
             }
-            AgentEvent::Error { source, message } => {
+            AgentEvent::Error {
+                source, message, ..
+            } => {
                 clear_spinner!();
                 output.print_error(&format!("[{}] {}", source, message));
             }

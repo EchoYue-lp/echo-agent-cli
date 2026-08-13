@@ -353,10 +353,16 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
             Ok(output) if output.status.success() => {
                 String::from_utf8_lossy(&output.stdout).to_string()
             }
-            _ => {
-                // Fallback to accumulated changes summary
-                let g = cl.lock().await;
-                g.diff_summary()
+            Ok(output) => {
+                println!(
+                    "Failed to inspect changes: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+                return CommandOutcome::Continue;
+            }
+            Err(error) => {
+                println!("Failed to inspect changes: {error}");
+                return CommandOutcome::Continue;
             }
         };
 

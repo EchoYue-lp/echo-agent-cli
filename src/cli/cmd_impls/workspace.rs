@@ -7,11 +7,11 @@ use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
 
 // ── WorkspaceCommand ────────────────────────────────────────────────
 
-async fn cmd_workspace(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_workspace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     match args.first().copied() {
         Some("new") => ws_new(args.get(1..).unwrap_or(&[])),
         Some("list") | Some("ls") => ws_list(),
-        Some("switch") | Some("sw") => ws_switch(args.get(1).copied()),
+        Some("switch") | Some("sw") => ws_switch(ctx, args.get(1).copied()).await,
         Some("link") => ws_link(args.get(1).copied()),
         Some("migrate") => ws_migrate(args.get(1).copied().unwrap_or("")),
         Some("info") | None => ws_info(),
@@ -111,7 +111,7 @@ fn ws_list() {
 }
 
 /// `/workspace switch <name>`
-fn ws_switch(name: Option<&str>) {
+async fn ws_switch(ctx: &CommandContext, name: Option<&str>) {
     let name = match name {
         Some(n) => n,
         None => {
@@ -130,6 +130,14 @@ fn ws_switch(name: Option<&str>) {
 
     match registry.open_by_name(name) {
         Ok(ws) => {
+            let Some(app_state) = ctx.app_state.as_ref() else {
+                println!("Workspace switching is unavailable in this runtime.");
+                return;
+            };
+            if let Err(error) = app_state.switch_workspace(ws.clone()).await {
+                println!("Failed to switch workspace: {error}");
+                return;
+            }
             println!("Switched to workspace: {} ({})", ws.name, ws.id);
             println!("  Root: {}", ws.root.display());
             println!("  Kind: {}", ws.kind.display_name());

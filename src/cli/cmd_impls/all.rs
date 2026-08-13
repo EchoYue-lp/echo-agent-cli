@@ -127,7 +127,7 @@ async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     ctx.agent
                         .write_async(|agent| {
                             Box::pin(async move {
-                                echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
                                     agent,
                                     root.as_deref(),
                                 )
@@ -198,7 +198,7 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         ctx.agent
                             .write_async(|agent| {
                                 Box::pin(async move {
-                                    echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                    echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
                                         agent,
                                         root.as_deref(),
                                     )

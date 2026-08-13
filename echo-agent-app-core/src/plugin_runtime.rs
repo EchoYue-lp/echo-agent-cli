@@ -1162,17 +1162,7 @@ async fn unload_agent_components(
     for plugin_agent in &application.agents {
         let _ = agent.unregister_subagent(plugin_agent.name()).await;
     }
-    for (plugin_name, components) in framework {
-        let source_tag = format!("plugin:{plugin_name}");
-        let _ = agent.unregister_skills_by_source(&source_tag).await;
-        if components.hooks_registered {
-            let source = echo_agent::skills::hooks::HookSource::Plugin(plugin_name.clone());
-            agent.hook_registry().write().await.unregister(&source);
-        }
-        for server_name in &components.mcp_servers {
-            let _ = agent.disconnect_mcp(server_name).await;
-        }
-    }
+    echo_agent::plugin::PluginIntegrator::unwire(agent, framework).await;
 }
 
 async fn replace_plugin_monitors(
@@ -1511,11 +1501,15 @@ done
             crate::scheduler::CronTaskStore::new().with_path(temp.path().join("cron-tasks.json"));
         let fire_fn: echo_agent::scheduler::FireFn =
             Arc::new(|_| Box::pin(async { Ok("fixture monitor fired".to_string()) }));
-        let scheduler = Arc::new(SchedulerRunner::new(
-            cron_store,
-            echo_agent::agent::CancellationToken::new(),
-            fire_fn,
-        ));
+        let scheduler = Arc::new(
+            SchedulerRunner::new(
+                cron_store,
+                echo_agent::agent::CancellationToken::new(),
+                fire_fn,
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+        );
         assert_eq!(
             runtime
                 .bind_scheduler(scheduler.clone())
@@ -1601,11 +1595,15 @@ done
             crate::scheduler::CronTaskStore::new().with_path(temp.path().join("cron-tasks.json"));
         let fire_fn: echo_agent::scheduler::FireFn =
             Arc::new(|_| Box::pin(async { Ok("fixture monitor fired".to_string()) }));
-        let scheduler = Arc::new(SchedulerRunner::new(
-            cron_store,
-            echo_agent::agent::CancellationToken::new(),
-            fire_fn,
-        ));
+        let scheduler = Arc::new(
+            SchedulerRunner::new(
+                cron_store,
+                echo_agent::agent::CancellationToken::new(),
+                fire_fn,
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+        );
         runtime
             .bind_scheduler(scheduler.clone())
             .await
@@ -1779,11 +1777,15 @@ done
             crate::scheduler::CronTaskStore::new().with_path(temp.path().join("cron-tasks.json"));
         let fire_fn: echo_agent::scheduler::FireFn =
             Arc::new(|_| Box::pin(async { Ok("fixture monitor fired".to_string()) }));
-        let scheduler = Arc::new(SchedulerRunner::new(
-            cron_store,
-            echo_agent::agent::CancellationToken::new(),
-            fire_fn,
-        ));
+        let scheduler = Arc::new(
+            SchedulerRunner::new(
+                cron_store,
+                echo_agent::agent::CancellationToken::new(),
+                fire_fn,
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+        );
 
         let state_guard = runtime.state.lock().await;
         let (started, bind_started) = tokio::sync::oneshot::channel();

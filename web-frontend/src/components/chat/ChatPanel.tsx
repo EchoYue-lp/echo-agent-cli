@@ -319,7 +319,7 @@ export function ChatPanel() {
                 sendApproval(approvalRequest.requestId, false, `修改意见: ${feedback}`)
               }
               onApproveAll={() =>
-                sendApproval(approvalRequest.requestId, true, undefined, 'session_all_tools')
+                sendApproval(approvalRequest.requestId, true, undefined, 'session_tool')
               }
             />
           </div>

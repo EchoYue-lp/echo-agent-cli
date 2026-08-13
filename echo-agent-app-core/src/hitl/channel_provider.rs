@@ -156,7 +156,7 @@ fn parse_approval(value: &str) -> Result<HumanLoopResponse, String> {
     match command.as_str() {
         "y" | "yes" | "approve" | "同意" => Ok(HumanLoopResponse::Approved),
         "a" | "all" | "全部同意" => Ok(HumanLoopResponse::ApprovedWithScope {
-            scope: ApprovalScope::SessionAllTools,
+            scope: ApprovalScope::SessionTool,
         }),
         "n" | "no" | "reject" | "拒绝" => Ok(HumanLoopResponse::Rejected {
             reason: detail.map(str::to_string),

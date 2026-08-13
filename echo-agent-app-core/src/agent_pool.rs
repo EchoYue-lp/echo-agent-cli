@@ -431,8 +431,13 @@ impl AgentPool {
                         agent.set_temperature(runtime.temperature);
                         agent.set_max_tokens(runtime.max_tokens);
                         // Apply context_window as token_limit when set.
-                        if let Some(cw) = runtime.context_window {
-                            agent.set_token_limit(cw as usize);
+                        if let Some(cw) = runtime.context_window
+                            && let Err(error) = agent.set_token_limit(cw as usize)
+                        {
+                            tracing::error!(
+                                error = %error,
+                                "AgentPool: failed to apply model context window"
+                            );
                         }
                         match runtime.thinking.as_deref() {
                             Some(spec) if !spec.trim().is_empty() => {
@@ -683,7 +688,7 @@ impl AgentPool {
         );
     }
 
-    /// Refresh hot-memory and instruction projections on every existing agent.
+    /// Refresh the AGENTS/instructions projection on every existing agent.
     pub async fn refresh_instruction_context(&self) {
         let root = self.working_dir.read().await.clone();
         let agents: Vec<AgentHandle> = self
@@ -699,6 +704,32 @@ impl AgentPool {
                 .write_async(|agent| {
                     Box::pin(async move {
                         crate::unified_memory::refresh_instruction_projection(
+                            agent,
+                            root.as_deref(),
+                        )
+                        .await;
+                    })
+                })
+                .await;
+        }
+    }
+
+    /// Refresh the independently-owned MEMORY.md projection for every pooled agent.
+    pub async fn refresh_hot_memory_context(&self) {
+        let root = self.working_dir.read().await.clone();
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect();
+        for handle in agents {
+            let root = root.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        crate::unified_memory::refresh_hot_memory_projection(
                             agent,
                             root.as_deref(),
                         )

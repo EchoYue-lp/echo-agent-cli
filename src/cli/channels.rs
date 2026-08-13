@@ -3,8 +3,8 @@
 //! 与框架层 `AgentChannelHandler::standard`（裸建 `ReactAgent`，不经 bootstrap）不同，
 //! 此处 agent 从 `AgentPool::acquire` 取，经 `AgentRuntime::bootstrap` 全套接通
 //! （state_store / store / compressor / MemoryLayerManager / permission_service /
-//! cache_user_id / conversation_id）。per-sender 隔离由 pool key
-//! `channel:{channel_id}:{sender_id}` 承载，对齐 Claude Code "one session per user"。
+//! cache_user_id / conversation_id）。会话按平台 conversation 隔离，群聊不会按 sender
+//! 交叉复用上下文。
 //!
 //! 归属（spec §D1-6）：`AgentPool` 是 EKO 产品概念，handler 放应用层（bin crate），
 //! 不进框架 `channels.rs`。框架 `AgentChannelHandler::new` 保留供纯框架/测试用。
@@ -62,14 +62,14 @@ impl AppChannelMessageHandler {
         }
     }
 
-    /// per-sender conversation_id（= pool key）。sender 维度隔离。
-    fn conversation_id(channel_id: &str, sender_id: &str) -> String {
-        format!("channel:{channel_id}:{sender_id}")
+    /// Per-conversation pool key.
+    fn conversation_id(channel_id: &str, chat_id: &str) -> String {
+        format!("channel:{channel_id}:{chat_id}")
     }
 
-    /// per-sender cache_user_id（DeepSeek KVCache 隔离 + 隐私）。
-    fn cache_user_id(channel_id: &str, sender_id: &str) -> String {
-        sanitize_cache_user_id(&format!("im-{channel_id}-{sender_id}"))
+    /// Per-conversation provider cache identity.
+    fn cache_user_id(channel_id: &str, chat_id: &str) -> String {
+        sanitize_cache_user_id(&format!("im-{channel_id}-{chat_id}"))
     }
 }
 
@@ -83,7 +83,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         use futures::StreamExt;
 
         let channel_id = msg.channel_id.clone();
-        let to = msg.sender_id.clone();
+        let to = msg.reply_target().to_string();
         let chat_type = msg.chat_type;
         let mut stream = self.handle_stream(msg).await?;
         let mut reply = String::new();
@@ -121,15 +121,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         if let Some(message) = immediate {
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
-                &msg.sender_id,
+                msg.reply_target(),
                 msg.chat_type,
                 message,
             );
             return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
         }
 
-        let conv = Self::conversation_id(&msg.channel_id, &msg.sender_id);
-        let cache_id = Self::cache_user_id(&msg.channel_id, &msg.sender_id);
+        let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id());
+        let cache_id = Self::cache_user_id(&msg.channel_id, msg.conversation_id());
 
         // 1. pool 取/复用 per-sender agent（bootstrap 等价全套已注入）
         let agent = self
@@ -153,7 +153,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         if let Some(message) = channel_trace_response(&agent, &msg.text).await {
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
-                &msg.sender_id,
+                msg.reply_target(),
                 msg.chat_type,
                 message,
             );
@@ -162,7 +162,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         if let Some(message) = channel_analysis_response(&agent, &msg.text).await {
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
-                &msg.sender_id,
+                msg.reply_target(),
                 msg.chat_type,
                 message,
             );
@@ -171,7 +171,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         if let Some(message) = channel_papers_response(&agent, &msg.text).await {
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
-                &msg.sender_id,
+                msg.reply_target(),
                 msg.chat_type,
                 message,
             );
@@ -180,7 +180,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         if let Some(message) = channel_skills_response(&agent, &msg.text).await {
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
-                &msg.sender_id,
+                msg.reply_target(),
                 msg.chat_type,
                 message,
             );
@@ -220,7 +220,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 tracing::warn!(%error, conv = %conv, "channel user-turn preparation failed");
                 let outbound = echo_agent::channels::OutboundMessage::new(
                     &msg.channel_id,
-                    &msg.sender_id,
+                    msg.reply_target(),
                     msg.chat_type,
                     format!("无法安全保存这条长消息，请检查本地磁盘后重试：{error}"),
                 );
@@ -286,7 +286,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
 
         // 4. 聚合成逐段 OutboundMessage 流
         let channel_id = msg.channel_id.clone();
-        let to = msg.sender_id.clone();
+        let to = msg.reply_target().to_string();
         let chat_type = msg.chat_type;
         Ok(aggregate_by_sentence(event_stream, channel_id, to, chat_type).await)
     }
@@ -744,18 +744,20 @@ mod tests {
         fn events_to_stream(
             events: Vec<Result<AgentEvent>>,
         ) -> BoxStream<'static, Result<ChannelRenderEvent>> {
-            let identity = EventIdentity {
-                turn_id: "channel-test".to_string(),
-                ..EventIdentity::default()
+            let identity = match EventIdentity::new("channel-test-stream", "channel-test") {
+                Ok(identity) => identity,
+                Err(error) => return futures::stream::once(async { Err(error) }).boxed(),
             };
             futures::stream::iter(events.into_iter().enumerate().map(move |(index, event)| {
-                event.map(|payload| {
+                event.and_then(|payload| {
                     let sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
-                    ChannelRenderEvent::Driver(
-                        echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(Box::new(
-                            EventEnvelope::new(&identity, sequence, None, payload),
-                        )),
-                    )
+                    EventEnvelope::new(&identity, sequence, None, payload).map(|envelope| {
+                        ChannelRenderEvent::Driver(
+                            echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(Box::new(
+                                envelope,
+                            )),
+                        )
+                    })
                 })
             }))
             .boxed()
@@ -851,10 +853,7 @@ mod tests {
         async fn error_flushes_then_propagates() -> std::result::Result<(), String> {
             let evs = events_to_stream(vec![
                 Ok(AgentEvent::Token("partial".into())),
-                Ok(AgentEvent::Error {
-                    source: "llm".into(),
-                    message: "boom".into(),
-                }),
+                Ok(AgentEvent::error_message("llm", "boom")),
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let mut s = out;

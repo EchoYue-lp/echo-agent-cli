@@ -110,8 +110,10 @@ async fn apply_runtime_model(
                 // Apply context_window: if set, use it as token_limit so the
                 // agent gets the right budget/compression behavior. If not
                 // set, leave token_limit unchanged (framework infers).
-                if let Some(cw) = runtime.context_window {
-                    agent.set_token_limit(cw as usize);
+                if let Some(cw) = runtime.context_window
+                    && let Err(error) = agent.set_token_limit(cw as usize)
+                {
+                    tracing::error!(error = %error, "failed to apply model context window");
                 }
                 tracing::info!(
                     provider = %runtime.provider,

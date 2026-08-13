@@ -1007,14 +1007,14 @@ impl TaskRuntimeStore {
             if task.status != TodoStatus::Pending || current.spec != expected_task.spec {
                 return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
             }
-            let claim = echo_agent::tasks::TaskClaim {
-                revision: expected_revision,
-                attempt: task.retry_count.saturating_add(1),
-                spec_hash: current
+            let claim = echo_agent::tasks::TaskClaim::new(
+                expected_revision,
+                task.retry_count.saturating_add(1),
+                current
                     .spec
                     .stable_hash()
                     .map_err(StoreError::InvalidPlan)?,
-            };
+            );
             self.append_task_status_event(TaskStatusEvent {
                 run_id,
                 task_id: &task.id,
@@ -1670,11 +1670,17 @@ impl TaskRuntimeStore {
                                     .as_ref()
                                     .map(|claim| claim.execution_id(&run.run_id, &task.id))
                             });
-                            let completed_subagent = execution_id.as_deref().and_then(|id| {
-                                self.recoverable_subagent_result(&run.run_id, &todo.task_id, id)
+                            let completed_subagent =
+                                task.and_then(|task| task.claim.as_ref()).and_then(|claim| {
+                                    self.recoverable_subagent_result_for_attempt(
+                                        &run.run_id,
+                                        &todo.task_id,
+                                        claim.revision,
+                                        claim.attempt,
+                                    )
                                     .ok()
                                     .flatten()
-                            });
+                                });
 
                             let active_tool = active_tools
                                 .iter()
@@ -2033,20 +2039,34 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Return a completed Subagent result for this exact attempt. A later
-    /// SubagentAssigned with the same id clears an older terminal fact, which is
-    /// how an explicitly confirmed retry avoids reusing stale output.
-    pub(crate) fn recoverable_subagent_result(
+    /// Return a completed Subagent result for a stable logical attempt.
+    ///
+    /// A physical claim gets a fresh execution id when an interrupted task is
+    /// reclaimed. Revision and attempt remain stable across that reclaim, so
+    /// they form the durable idempotency key. A later assignment for the same
+    /// logical attempt clears the terminal fact, while a retry or edited task
+    /// has a different attempt or revision and cannot reuse stale output.
+    pub(crate) fn recoverable_subagent_result_for_attempt(
         &self,
         run_id: &str,
         task_id: &str,
-        execution_id: &str,
+        plan_revision: u64,
+        attempt: u32,
     ) -> Result<Option<RecoverableSubagentResult>, StoreError> {
         let mut result = None;
         for event in self.list_events(run_id, 0)? {
-            if event.task_id.as_deref() != Some(task_id)
-                || event.step_id.as_deref() != Some(execution_id)
-            {
+            let matches_attempt = event.task_id.as_deref() == Some(task_id)
+                && event
+                    .payload
+                    .get("plan_revision")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(plan_revision)
+                && event
+                    .payload
+                    .get("attempt")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(u64::from(attempt));
+            if !matches_attempt {
                 continue;
             }
             match event.event_type {
@@ -2786,7 +2806,12 @@ mod tests {
 
         assert_eq!(store.recover_incomplete(), 1);
         assert_eq!(
-            store.recoverable_subagent_result("r1", "t1", &execution_id)?,
+            store.recoverable_subagent_result_for_attempt(
+                "r1",
+                "t1",
+                claim.revision,
+                claim.attempt,
+            )?,
             Some(RecoverableSubagentResult {
                 result,
                 full_output: "durable full output".to_string(),
@@ -3155,15 +3180,15 @@ mod tests {
             .first()
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        let old_claim = echo_agent::tasks::TaskClaim {
-            revision: 1,
-            attempt: 1,
-            spec_hash: original
+        let old_claim = echo_agent::tasks::TaskClaim::new(
+            1,
+            1,
+            original
                 .to_task()
                 .spec
                 .stable_hash()
                 .map_err(StoreError::InvalidPlan)?,
-        };
+        );
         let old_execution_id = old_claim.execution_id("r1", &original.id);
         let durable_result = SubagentTaskResult::terminal(
             SubagentRunStatus::Completed,
@@ -3235,12 +3260,22 @@ mod tests {
         assert_ne!(old_claim.spec_hash, new_claim.spec_hash);
         assert!(
             store
-                .recoverable_subagent_result("r1", "t1", &old_execution_id)?
+                .recoverable_subagent_result_for_attempt(
+                    "r1",
+                    "t1",
+                    old_claim.revision,
+                    old_claim.attempt,
+                )?
                 .is_some()
         );
         assert!(
             store
-                .recoverable_subagent_result("r1", "t1", &new_execution_id)?
+                .recoverable_subagent_result_for_attempt(
+                    "r1",
+                    "t1",
+                    new_claim.revision,
+                    new_claim.attempt,
+                )?
                 .is_none()
         );
         Ok(())

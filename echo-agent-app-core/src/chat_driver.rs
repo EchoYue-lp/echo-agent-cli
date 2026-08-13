@@ -235,7 +235,8 @@ pub async fn drive_chat(
             &turn.instruction,
             &res.attachments,
             Some(&trace_sink),
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
     }
     let _cancel_registration =
         if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
@@ -480,13 +481,13 @@ async fn drive_chat_inner(
         // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
         // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. task_execute)
         // running inside the framework's spawned tool executor.
-        let event_identity = EventIdentity {
-            conversation_id: conversation_id.clone(),
-            run_id: active_run_id.clone(),
-            turn_id: turn_id.clone(),
-            execution_id: None,
-            parent_event_id: None,
-        };
+        let event_identity = EventIdentity::for_chat(
+            conversation_id.clone(),
+            turn_id.clone(),
+            turn_id.clone(),
+            active_run_id.clone(),
+        )
+        .map_err(|error| error.to_string())?;
         let invocation = echo_core::agent::AgentInvocationContext {
             history: None,
             runtime: Some(echo_core::tools::ExternalRunContext {
@@ -523,15 +524,22 @@ async fn drive_chat_inner(
                         error: e.to_string(),
                     });
                 }
-                let _ = sink.on_event(ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
+                match EventEnvelope::new(
                     &event_identity,
                     1,
                     None,
-                    AgentEvent::Error {
-                        source: "chat_driver".into(),
-                        message: e.to_string(),
-                    },
-                ))));
+                    AgentEvent::from_error("chat_driver", &e),
+                ) {
+                    Ok(event) => {
+                        let _ = sink.on_event(ChatDriverEvent::Agent(Box::new(event)));
+                    }
+                    Err(envelope_error) => {
+                        tracing::error!(
+                            error = %envelope_error,
+                            "failed to construct terminal chat event"
+                        );
+                    }
+                }
                 return Err(e.to_string());
             }
         };
@@ -740,10 +748,10 @@ mod tests {
             events.iter().enumerate().all(|(index, event)| {
                 event.schema_version == echo_agent::agent::AGENT_EVENT_SCHEMA_VERSION
                     && event.sequence == (index as u64).saturating_add(1)
-                    && event.conversation_id.as_deref() == Some(conversation_id)
-                    && event.turn_id == turn_id
+                    && event.conversation_id.as_ref().map(|id| id.as_str()) == Some(conversation_id)
+                    && event.turn_id.as_str() == turn_id
                     && event.run_id.is_none()
-                    && !event.event_id.is_empty()
+                    && !event.event_id.as_str().is_empty()
             }) && terminal_count == 1
         }
 
@@ -1127,28 +1135,22 @@ mod tests {
 
         let (tx, mut rx) = mpsc::unbounded_channel::<ChatDriverEvent>();
         let sink = ChannelChatSink::new(tx);
-        let identity = EventIdentity {
-            turn_id: "turn-1".to_string(),
-            ..EventIdentity::default()
-        };
+        let identity =
+            EventIdentity::new("stream-1", "turn-1").map_err(|error| error.to_string())?;
 
         // on_event forwards each event to the channel and keeps going.
         assert!(
-            sink.on_event(ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
-                &identity,
-                1,
-                None,
-                AgentEvent::Token("hel".to_string()),
-            )))),
+            sink.on_event(ChatDriverEvent::Agent(Box::new(
+                EventEnvelope::new(&identity, 1, None, AgentEvent::Token("hel".to_string()),)
+                    .map_err(|error| error.to_string())?
+            ))),
             "on_event should return true to continue"
         );
         assert!(
-            sink.on_event(ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
-                &identity,
-                2,
-                None,
-                AgentEvent::Token("lo".to_string()),
-            )))),
+            sink.on_event(ChatDriverEvent::Agent(Box::new(
+                EventEnvelope::new(&identity, 2, None, AgentEvent::Token("lo".to_string()),)
+                    .map_err(|error| error.to_string())?
+            ))),
             "second event should also be accepted"
         );
 

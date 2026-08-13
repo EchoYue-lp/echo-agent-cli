@@ -37,35 +37,6 @@ pub fn build_tauri_app(
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(TauriState::new(app_state, browser_runtime))
-        .setup(|app| {
-            use tauri::{Emitter, Manager};
-
-            // Auto-open DevTools in debug builds so `cargo tauri dev` users can
-            // inspect the WebView console immediately (Cmd+Option+I to toggle).
-            #[cfg(debug_assertions)]
-            {
-                if let Some(window) = app.get_webview_window("main") {
-                    window.open_devtools();
-                }
-            }
-
-            let app_handle = app.handle().clone();
-            let mut browser_events = app.state::<TauriState>().browser_runtime.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match browser_events.recv().await {
-                        Ok(event) => {
-                            let _ = app_handle.emit("browser://event", event);
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
-                            tracing::warn!(count, "browser event receiver lagged");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-            Ok(())
-        })
         .invoke_handler(tauri::generate_handler![
             // Native IPC (existing)
             ipc::native_read_file,
@@ -312,6 +283,27 @@ pub fn build_tauri_app(
             // Register global shortcut: CmdOrCtrl+Shift+E toggles window visibility
             use tauri::Manager;
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+            #[cfg(debug_assertions)]
+            if let Some(window) = app.get_webview_window("main") {
+                window.open_devtools();
+            }
+
+            let browser_app_handle = app.handle().clone();
+            let mut browser_events = app.state::<TauriState>().browser_runtime.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match browser_events.recv().await {
+                        Ok(event) => {
+                            let _ = browser_app_handle.emit("browser://event", event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            tracing::warn!(count, "browser event receiver lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
 
             let handle = app.handle().clone();
             app.global_shortcut()

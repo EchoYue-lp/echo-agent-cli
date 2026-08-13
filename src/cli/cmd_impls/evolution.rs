@@ -171,7 +171,13 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
     match sub {
         "status" => {
-            let status = curator.status();
+            let status = match curator.status() {
+                Ok(status) => status,
+                Err(error) => {
+                    eprintln!("Curator state unavailable: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
             println!("\n--- Curator Status ---");
             println!("  Total skills: {}", status.total);
             println!("  Active:       {}", status.active);
@@ -624,7 +630,13 @@ async fn cmd_skill_candidates(ctx: &CommandContext, args: &[&str]) -> CommandOut
 
     // Load curator state to find candidates and drafts.
     let curator = current_curator(ctx);
-    let state = curator.load_state();
+    let state = match curator.load_state() {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("Curator state unavailable: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
 
     let candidates_and_drafts: Vec<_> = state
         .skills
@@ -725,7 +737,13 @@ async fn cmd_skill_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcom
     let curator = current_curator(ctx);
 
     // Check current lifecycle state.
-    let state = curator.load_state();
+    let state = match curator.load_state() {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("Curator state unavailable: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
     match state.skills.get(name) {
         Some(meta) => match meta.lifecycle {
             echo_agent::evolution::SkillLifecycle::Draft => {
@@ -830,7 +848,13 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         None => {
             // List available candidates.
             let curator = current_curator(ctx);
-            let state = curator.load_state();
+            let state = match curator.load_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    eprintln!("Curator state unavailable: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
             let candidates: Vec<_> = state
                 .skills
                 .iter()
@@ -1038,7 +1062,7 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
 
                 let curator = current_curator(ctx);
-                let merger = echo_agent::evolution::SkillMerger::new(store.clone(), curator);
+                let merger = echo_agent::evolution::SkillMerger::new(curator);
 
                 let mut primary_desc_mut = primary_desc;
                 match merger
@@ -1068,13 +1092,6 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                             &proposal.primary_skill,
                         )
                         .await;
-                        println!(
-                            "\nNote: The updated skill descriptor needs to be written back to the registry."
-                        );
-                        println!(
-                            "This is a manual step - update the SKILL.md file for '{}' with the merged content.",
-                            proposal.primary_skill
-                        );
                     }
                     Err(e) => {
                         println!("Error executing merge: {e}");
@@ -1329,7 +1346,7 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             return CommandOutcome::Continue;
         }
 
-        let patch = &patches[idx - 1];
+        let patch = patches[idx - 1].clone();
 
         // Get the SkillDescriptor (provides .location = SKILL.md path).
         // Clone the full descriptor — we only need .location for apply_patch.
@@ -1354,13 +1371,21 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         }
         let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
 
+        let patch = match patch.bind_to_source(&descriptor.location).await {
+            Ok(patch) => patch,
+            Err(error) => {
+                println!("Failed to bind patch to current source: {error}");
+                return CommandOutcome::Continue;
+            }
+        };
+
         println!(
             "Applying patch #{} ({}) to '{}'...",
             idx,
             patch.patch_type.label(),
             skill_name
         );
-        match patcher.apply_patch(patch, &descriptor, &change_log).await {
+        match patcher.apply_patch(&patch, &descriptor, &change_log).await {
             Ok(()) => {
                 println!("✓ Patch applied to {}", descriptor.location.display());
                 // Fire SkillPatchApplied hook.

@@ -26,6 +26,7 @@
 //!   additional reloads.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use notify::{Config, EventKind, RecursiveMode, Watcher};
@@ -37,6 +38,16 @@ use crate::agent_handle::AgentHandle;
 /// Quiet window for the resettable debounce. A save is considered "settled"
 /// when no qualifying event has arrived for this long.
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
+
+fn workspace_target_updates() -> &'static tokio::sync::broadcast::Sender<PathBuf> {
+    static UPDATES: OnceLock<tokio::sync::broadcast::Sender<PathBuf>> = OnceLock::new();
+    UPDATES.get_or_init(|| tokio::sync::broadcast::channel(16).0)
+}
+
+/// Retarget every live config watcher after EKO switches workspace.
+pub fn notify_config_watcher_workspace(root: PathBuf) {
+    let _ = workspace_target_updates().send(root.join(".eko").join("hooks.yaml"));
+}
 
 /// Resolve the config file path that was actually loaded.
 ///
@@ -66,7 +77,9 @@ pub fn spawn_config_watcher(
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let targets = config_watch_targets(config_path.as_deref());
+        let mut targets = config_watch_targets(config_path.as_deref());
+        let mut workspace_target = current_workspace_hook_target();
+        let mut workspace_updates = workspace_target_updates().subscribe();
 
         // Use a bounded async channel to receive filesystem events.
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -108,6 +121,26 @@ pub fn spawn_config_watcher(
                 _ = cancel.cancelled() => {
                     info!("Config watcher shutting down");
                     break;
+                }
+                update = workspace_updates.recv() => {
+                    let target = match update {
+                        Ok(target) => target,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+                    if let Some(previous) = workspace_target.replace(target.clone()) {
+                        targets.retain(|candidate| candidate != &previous);
+                    }
+                    if !targets.contains(&target) {
+                        targets.push(target.clone());
+                    }
+                    if let Some(directory) = nearest_existing_parent(&target)
+                        && watched.insert(directory.clone())
+                        && let Err(error) = watcher.watch(&directory, RecursiveMode::Recursive)
+                    {
+                        warn!(path = %directory.display(), %error, "Failed to watch workspace config directory");
+                    }
+                    info!(path = %target.display(), "Config watcher retargeted to workspace");
                 }
                 result = rx.recv() => {
                     let Some(event) = result else {
@@ -202,12 +235,18 @@ fn config_watch_targets(config_path: Option<&Path>) -> Vec<PathBuf> {
         targets.push(path.to_path_buf());
     }
     targets.push(echo_agent::paths::user_data_path("hooks.yaml"));
-    if let Ok(cwd) = std::env::current_dir() {
-        targets.push(cwd.join(".eko").join("hooks.yaml"));
+    if let Some(project) = current_workspace_hook_target() {
+        targets.push(project);
     }
     targets.sort();
     targets.dedup();
     targets
+}
+
+fn current_workspace_hook_target() -> Option<PathBuf> {
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(".eko").join("hooks.yaml"))
 }
 
 fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {

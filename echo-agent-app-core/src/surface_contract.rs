@@ -151,27 +151,35 @@ fn capability_matrix_has_evidence_for_every_surface() {
 
 #[test]
 fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
-    let identity = EventIdentity {
-        conversation_id: Some("conversation-1".to_string()),
-        run_id: Some("run-1".to_string()),
-        turn_id: "turn-1".to_string(),
-        execution_id: Some("execution-1".to_string()),
-        parent_event_id: Some("parent-1".to_string()),
-    };
+    let identity = EventIdentity::new("stream-1", "turn-1")
+        .map_err(|error| error.to_string())?
+        .with_conversation_id("conversation-1")
+        .map_err(|error| error.to_string())?
+        .with_run_id("run-1")
+        .map_err(|error| error.to_string())?
+        .with_message_id("message-1")
+        .map_err(|error| error.to_string())?
+        .with_execution_id("execution-1")
+        .map_err(|error| error.to_string())?
+        .with_parent_event_id("parent-1")
+        .map_err(|error| error.to_string())?;
     let events = [
-        ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
-            &identity,
-            7,
-            identity.parent_event_id.clone(),
-            AgentEvent::ToolError {
-                call_id: "call-1".to_string(),
-                name: "shell".to_string(),
-                error: "timed out".to_string(),
-                failure: echo_agent::tools::ToolFailure::new(
-                    echo_agent::tools::ToolFailureCategory::Timeout,
-                ),
-            },
-        ))),
+        ChatDriverEvent::Agent(Box::new(
+            EventEnvelope::new(
+                &identity,
+                7,
+                identity.parent_event_id.clone(),
+                AgentEvent::ToolError {
+                    call_id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    error: "timed out".to_string(),
+                    failure: echo_agent::tools::ToolFailure::new(
+                        echo_agent::tools::ToolFailureCategory::Timeout,
+                    ),
+                },
+            )
+            .map_err(|error| error.to_string())?,
+        )),
         ChatDriverEvent::Execution(ExecEvent::subagent(
             "run-1",
             "task-1",
@@ -225,6 +233,12 @@ fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
     let agent = values
         .first()
         .ok_or_else(|| "agent event missing".to_string())?;
+    assert_eq!(
+        agent
+            .pointer("/event/stream_id")
+            .and_then(serde_json::Value::as_str),
+        Some("stream-1")
+    );
     assert_eq!(
         agent
             .pointer("/event/run_id")

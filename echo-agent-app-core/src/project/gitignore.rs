@@ -170,15 +170,29 @@ fn globstar_match(pattern: &str, path: &str) -> bool {
         }
         let is_last = i == parts.len() - 1;
         if is_last {
-            // Last part: must match the end of the path
-            return simple_glob(part, remaining) || remaining.ends_with(part);
+            return remaining
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(remaining.len()))
+                .filter_map(|index| remaining.get(index..))
+                .any(|candidate| simple_glob(part, candidate));
         } else {
             // Middle part: find a match, then continue
             let mut found = false;
-            for j in 0..=remaining.len() {
-                let candidate = &remaining[j..];
+            for j in remaining
+                .char_indices()
+                .map(|(index, _)| index)
+                .chain(std::iter::once(remaining.len()))
+            {
+                let Some(candidate) = remaining.get(j..) else {
+                    continue;
+                };
                 if simple_glob(part, candidate) {
-                    remaining = &remaining[j + part.len()..];
+                    let next = j.saturating_add(part.len()).min(remaining.len());
+                    let Some(suffix) = remaining.get(next..) else {
+                        continue;
+                    };
+                    remaining = suffix;
                     found = true;
                     break;
                 }
@@ -211,6 +225,12 @@ mod tests {
                 .iter()
                 .any(|p| p.raw == "important.log" && p.negated)
         );
+    }
+
+    #[test]
+    fn globstar_handles_multibyte_paths_without_panicking() {
+        assert!(globstar_match("**/*.rs", "源码/模块/main.rs"));
+        assert!(!globstar_match("**/*.md", "源码/模块/main.rs"));
     }
 
     #[test]

@@ -249,14 +249,14 @@ cmd!(
 // ── CheckpointCommand ─────────────────────────────────────────────────
 
 async fn cmd_checkpoint(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent
-        .read_async(|a| {
-            Box::pin(async move {
-                a.force_checkpoint().await;
-            })
-        })
+    let result = ctx
+        .agent
+        .read_async(|a| Box::pin(async move { a.force_checkpoint().await }))
         .await;
-    println!("Checkpoint saved.");
+    match result {
+        Ok(()) => println!("Checkpoint saved."),
+        Err(error) => eprintln!("Failed to save checkpoint: {error}"),
+    }
     CommandOutcome::Continue
 }
 cmd!(

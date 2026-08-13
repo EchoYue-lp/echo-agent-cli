@@ -255,7 +255,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tracing::info!("HITL: REPL provider swapped for TUI provider");
             pending
         };
-        let (_, tui_scheduler) = cli::start_headless_services(
+        let (_, tui_scheduler, _tui_app_state) = cli::start_headless_services(
             agent_handle.clone(),
             runtime.hitl_dispatcher.clone(),
             &app_config,
@@ -263,7 +263,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             task_runtime_store.clone(),
             webhook_emitter.clone(),
         )
-        .await;
+        .await?;
         if let Some(scheduler) = tui_scheduler.as_ref()
             && let Err(error) = runtime
                 .plugin_runtime

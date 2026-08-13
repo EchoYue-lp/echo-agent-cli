@@ -122,7 +122,7 @@ pub struct AgentCreateParams {
     /// React loop checkpoint interval in iterations (0 = only at end).
     /// Used by background tasks to enable crash recovery.
     pub react_checkpoint_interval: Option<usize>,
-    /// Shared runtime state store (sqlite-backed). When supplied, the agent
+    /// Shared runtime state store. When supplied, the agent
     /// will save `AgentCheckpoint`s + TaskNode DAG entries every iteration.
     pub state_store: Option<Arc<dyn RuntimeStateStore>>,
     /// Optional caller-supplied stable context to inject into the root system
@@ -202,6 +202,21 @@ pub async fn create_agent_with_diagnostics(
         app_config,
         app_config.model.default_model_id.as_deref(),
     );
+    if model_config::provider_requires_api_key(&runtime_model.provider)
+        && runtime_model.auth_token.is_none()
+    {
+        let variables = model_config::env_vars_display(&runtime_model.provider);
+        return Err(format!(
+            "Provider '{}' requires an API key for model '{}'. Configure a token or set one of: {}",
+            runtime_model.provider,
+            runtime_model.model,
+            if variables.is_empty() {
+                "the provider-specific API key variable"
+            } else {
+                variables.as_str()
+            }
+        ));
+    }
     let model = params.model.as_deref().unwrap_or(&runtime_model.model);
     let temperature = runtime_model.temperature.or(app_config.model.temperature);
     let max_tokens = runtime_model.max_tokens.or(app_config.model.max_tokens);
@@ -960,7 +975,6 @@ fn build_writer_subagent_agent(
         "writer subagent built: LLM client status (full write tools)"
     );
     subagent.config_mut().set_cache_user_id(cache_user_id);
-    subagent.set_plan_mode(true);
     Ok(subagent)
 }
 
@@ -1179,7 +1193,7 @@ pub fn spawn_dreaming_task(
                                 primary_agent
                                     .write_async(|agent| {
                                         Box::pin(async move {
-                                            crate::unified_memory::refresh_instruction_projection(
+                                            crate::unified_memory::refresh_hot_memory_projection(
                                                 agent,
                                                 root.as_deref(),
                                             )
@@ -1188,7 +1202,7 @@ pub fn spawn_dreaming_task(
                                     })
                                     .await;
                                 if let Some(ref agent_pool) = pool {
-                                    agent_pool.refresh_instruction_context().await;
+                                    agent_pool.refresh_hot_memory_context().await;
                                 }
                             }
                         }
@@ -2141,6 +2155,13 @@ mod resolve_subagent_model_tests {
         )?;
 
         assert!(subagent.sandbox_manager().is_some());
+        assert!(!subagent.is_plan_mode());
+        for tool in ["write_file", "edit_file", "shell"] {
+            assert!(
+                subagent.list_tools().iter().any(|name| name == tool),
+                "writer subagent must expose {tool}"
+            );
+        }
         assert!(subagent.list_tools().iter().any(|name| name == "run_code"));
         assert!(
             !subagent

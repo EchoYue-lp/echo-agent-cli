@@ -75,7 +75,7 @@ fn handle_approval(
     match choice.as_str() {
         "y" | "yes" | "" => Ok(HumanLoopResponse::Approved),
         "a" | "all" => Ok(HumanLoopResponse::ApprovedWithScope {
-            scope: ApprovalScope::SessionAllTools,
+            scope: ApprovalScope::SessionTool,
         }),
         "n" | "no" => {
             println!("  请输入拒绝原因（直接回车跳过）: ");

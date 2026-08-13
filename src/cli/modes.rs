@@ -26,6 +26,7 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         task_runtime_store: None,
         conversation_id: String::new(),
         webhook_emitter: None,
+        app_state: None,
     }
 }
 
@@ -38,10 +39,11 @@ pub async fn start_headless_services(
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
     webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
-) -> (
+) -> Result<(
     Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
-) {
+    std::sync::Arc<echo_agent_app_core::state::AppState>,
+)> {
     let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
         let file_path =
             echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
@@ -59,8 +61,12 @@ pub async fn start_headless_services(
     state.connection.pool = Some(pool);
     state.tasks.runtime = task_runtime_store;
     state.start_task_service().await;
-    state.start_scheduler_with_store(Some(scheduler_store));
-    (state.tasks.service.clone(), state.scheduler.runner.clone())
+    state
+        .start_scheduler_with_store(Some(scheduler_store))
+        .await?;
+    let task_service = state.tasks.service.clone();
+    let scheduler = state.scheduler.runner.clone();
+    Ok((task_service, scheduler, std::sync::Arc::new(state)))
 }
 
 /// 运行 CLI 模式
@@ -80,7 +86,7 @@ pub async fn run_cli_mode(
     webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
 ) -> Result<()> {
-    let (task_service, scheduler_runner) = start_headless_services(
+    let (task_service, scheduler_runner, app_state) = start_headless_services(
         agent.clone(),
         hitl_dispatcher,
         app_config,
@@ -88,7 +94,7 @@ pub async fn run_cli_mode(
         task_runtime_store.clone(),
         webhook_emitter.clone(),
     )
-    .await;
+    .await?;
     if let Some(scheduler) = scheduler_runner.as_ref()
         && let Err(error) = plugin_runtime.bind_scheduler(scheduler.clone()).await
     {
@@ -105,6 +111,7 @@ pub async fn run_cli_mode(
     repl_config.conversation_id = conversation_id;
     repl_config.webhook_emitter = Some(webhook_emitter);
     repl_config.plugin_runtime = Some(plugin_runtime);
+    repl_config.app_state = Some(app_state);
 
     crate::cli::run_repl(agent, repl_config).await
 }
@@ -143,7 +150,7 @@ pub async fn run_channels_mode(
         };
         match QqChannel::new(config) {
             Ok(ch) => {
-                manager.register(Box::new(ch));
+                manager.register(Box::new(ch))?;
                 tracing::info!("已注册 QQ Bot 通道");
             }
             Err(e) => tracing::warn!("QQ Bot 注册失败: {e}"),
@@ -173,7 +180,7 @@ pub async fn run_channels_mode(
         };
         match FeishuChannel::new(config) {
             Ok(ch) => {
-                manager.register(Box::new(ch));
+                manager.register(Box::new(ch))?;
                 tracing::info!("已注册飞书通道（{}模式）", app_config.channels.feishu.mode);
             }
             Err(e) => tracing::warn!("飞书注册失败: {e}"),
@@ -215,9 +222,17 @@ pub async fn run_channels_mode(
 
     tracing::info!("启动 {} 个 IM 通道...", manager.len());
     let start_results = manager.start_all(handler_factory).await;
-    let failures: Vec<_> = start_results.iter().filter(|r| r.is_err()).collect();
+    let failures: Vec<_> = start_results
+        .iter()
+        .filter(|result| result.result.is_err())
+        .collect();
     if !failures.is_empty() {
         tracing::warn!(
+            failed_channels = %failures
+                .iter()
+                .map(|failure| failure.channel_id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
             "{} 个通道启动失败（共 {} 个）",
             failures.len(),
             start_results.len()

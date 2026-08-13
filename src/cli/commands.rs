@@ -34,6 +34,7 @@ pub struct CommandHandler {
         Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
     staged_attachments:
         Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
+    app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
 }
 
 impl CommandHandler {
@@ -52,6 +53,7 @@ impl CommandHandler {
                 echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             )),
             staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            app_state: None,
         }
     }
 
@@ -134,6 +136,14 @@ impl CommandHandler {
         self
     }
 
+    pub fn with_app_state_opt(
+        mut self,
+        app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
+    ) -> Self {
+        self.app_state = app_state;
+        self
+    }
+
     pub fn with_interaction_mode(
         mut self,
         mode: Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
@@ -192,6 +202,7 @@ impl CommandHandler {
                 review_integration: self.review_integration.clone(),
                 interaction_mode: self.interaction_mode.clone(),
                 staged_attachments: self.staged_attachments.clone(),
+                app_state: self.app_state.clone(),
             };
 
             if let Some(outcome) = registry.dispatch(cmd_name, &ctx, args).await {

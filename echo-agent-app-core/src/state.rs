@@ -411,6 +411,8 @@ pub struct WorkspaceState {
     pub current: RwLock<Option<Workspace>>,
     /// 工作区注册表。
     pub registry: Arc<WorkspaceRegistry>,
+    /// Process directory to restore when leaving workspace mode.
+    pub global_cwd: std::path::PathBuf,
 }
 
 /// 全局应用状态
@@ -574,6 +576,8 @@ impl AppState {
             },
             workspace: WorkspaceState {
                 current: RwLock::new(None),
+                global_cwd: std::env::current_dir()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 registry: Arc::new(WorkspaceRegistry::new().unwrap_or_else(|e| {
                     tracing::warn!("Failed to init workspace registry: {e}");
                     let fallback_dir = std::env::temp_dir().join("echo-workspaces");
@@ -636,20 +640,20 @@ impl AppState {
     /// 启动定时任务调度器（仅在 Web 或双模式下调用）
     ///
     /// Call this **before** wrapping in `Arc`.
-    pub fn start_scheduler(&mut self) {
-        self.start_scheduler_with_store(None);
+    pub async fn start_scheduler(&mut self) -> echo_agent::error::Result<()> {
+        self.start_scheduler_with_store(None).await
     }
 
     /// 启动定时任务调度器，可选 Store 后端
-    pub fn start_scheduler_with_store(
+    pub async fn start_scheduler_with_store(
         &mut self,
         backend: Option<Arc<dyn echo_agent::memory::Store>>,
-    ) {
+    ) -> echo_agent::error::Result<()> {
         if self.scheduler.runner.is_some() {
-            return;
+            return Ok(());
         }
         let store = match backend {
-            Some(b) => crate::scheduler::CronTaskStore::with_store(b),
+            Some(b) => crate::scheduler::CronTaskStore::with_store(b).await?,
             None => crate::scheduler::CronTaskStore::new(),
         };
         // Phase C: pass the agent pool so each cron run acquires its OWN
@@ -667,11 +671,13 @@ impl AppState {
             // CronTaskCompleted on the same endpoint set as chat. `emit`
             // cheaply no-ops when no endpoints are registered.
             Some(self.webhook.emitter.clone()),
-        );
+        )
+        .await?;
         let runner = Arc::new(runner);
         runner.clone().spawn();
         self.scheduler.runner = Some(runner);
         tracing::info!("Scheduler runner started");
+        Ok(())
     }
 
     /// 启动后台任务服务（所有模式都应调用）
@@ -847,6 +853,7 @@ impl AppState {
             let mut current = self.workspace.current.write().await;
             *current = Some(workspace.clone());
         }
+        crate::config_watcher::notify_config_watcher_workspace(workspace.root.clone());
 
         // 切换进程工作目录到工作区根目录。
         // 这样所有工具（shell、文件读写、搜索等）都会自动在工作区目录下执行。
@@ -1053,6 +1060,14 @@ impl AppState {
     pub async fn exit_workspace(&self) {
         let mut current = self.workspace.current.write().await;
         *current = None;
+        if let Err(error) = std::env::set_current_dir(&self.workspace.global_cwd) {
+            tracing::warn!(
+                path = %self.workspace.global_cwd.display(),
+                %error,
+                "Failed to restore process directory after workspace exit"
+            );
+        }
+        crate::config_watcher::notify_config_watcher_workspace(self.workspace.global_cwd.clone());
 
         // 重置 persistence 到全局默认路径
         let global_persistence = Persistence::new();

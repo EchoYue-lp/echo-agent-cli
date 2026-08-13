@@ -1387,7 +1387,7 @@ pub async fn curator_action(
     match action.as_str() {
         "status" => Ok(json!({
             "success": true,
-            "status": curator_status_json(curator.status()),
+            "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?),
         })),
         "run" => {
             let transitions = curator
@@ -1417,7 +1417,7 @@ pub async fn curator_action(
                 "success": true,
                 "transitions": transition_values,
                 "count": transitions.len(),
-                "status": curator_status_json(curator.status()),
+                "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?),
             }))
         }
         "pin" => {
@@ -1428,7 +1428,7 @@ pub async fn curator_action(
                 .pin_skill(&name)
                 .map_err(|e| IpcError::Internal(e.to_string()))?;
             Ok(
-                json!({"success": true, "pinned": name, "status": curator_status_json(curator.status())}),
+                json!({"success": true, "pinned": name, "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?)}),
             )
         }
         "unpin" => {
@@ -1439,7 +1439,7 @@ pub async fn curator_action(
                 .unpin_skill(&name)
                 .map_err(|e| IpcError::Internal(e.to_string()))?;
             Ok(
-                json!({"success": true, "unpinned": name, "status": curator_status_json(curator.status())}),
+                json!({"success": true, "unpinned": name, "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?)}),
             )
         }
         _ => Err(IpcError::Validation(format!(

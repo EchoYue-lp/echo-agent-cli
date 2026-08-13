@@ -311,6 +311,10 @@ impl AgentRuntime {
                 "KeywordClassifier populated from skill descriptors"
             );
         }
+        let available_skill_names = skill_descriptions
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<Vec<_>>();
 
         // ── 12. TriggerSupervisor (Keyword + LLM + Hook fusion) + IntentRouter ──
         // Build LLM classifier as fallback if LLM client is available,
@@ -343,8 +347,10 @@ impl AgentRuntime {
                     confidence_threshold: 0.7,
                     enable_direct_answer: true,
                     enable_skill_routing: true,
+                    classification_timeout_ms: 5_000,
                 },
-            );
+            )
+            .with_available_skills(available_skill_names);
             agent_handle
                 .write_async(|a| {
                     Box::pin(async move {

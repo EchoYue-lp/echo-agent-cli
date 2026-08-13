@@ -1057,6 +1057,22 @@ impl ExecutionFailure {
         }
     }
 
+    fn from_agent_failure(
+        failure: &echo_agent::error::AgentFailure,
+        message: impl Into<String>,
+    ) -> Self {
+        let status = match failure.terminal_kind {
+            echo_agent::error::AgentTerminalKind::Cancelled => SubagentRunStatus::Cancelled,
+            echo_agent::error::AgentTerminalKind::TimedOut => SubagentRunStatus::TimedOut,
+            echo_agent::error::AgentTerminalKind::Failed
+            | echo_agent::error::AgentTerminalKind::PermissionDenied => SubagentRunStatus::Failed,
+        };
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
     fn from_react(error: echo_agent::error::ReactError, context: &str) -> Self {
         let status = echo_agent::agent::subagent::subagent_status_from_error(&error).into();
         Self {
@@ -1290,10 +1306,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         let task = self.plan_task(&runtime_task.spec.id)?;
         let active_task_id = task.id.clone();
         let execution_id = subagent_execution_id(&context.run_id, &task.id, &claim);
-        match self
-            .store
-            .recoverable_subagent_result(&context.run_id, &task.id, &execution_id)
-        {
+        match self.store.recoverable_subagent_result_for_attempt(
+            &context.run_id,
+            &task.id,
+            claim.revision,
+            claim.attempt,
+        ) {
             Ok(Some(recovered)) => {
                 tracing::info!(
                     run_id = %context.run_id,
@@ -1559,6 +1577,27 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 }
             }
         }
+    }
+
+    async fn abandon_claim(
+        &self,
+        run_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+        runtime_task: &echo_agent::tasks::Task,
+        abandonment: echo_agent::tasks::RuntimeClaimAbandonment,
+    ) -> echo_agent::error::Result<()> {
+        let task = self.plan_task(&runtime_task.spec.id)?;
+        let (status, summary) = match abandonment {
+            echo_agent::tasks::RuntimeClaimAbandonment::Cancelled => (
+                TodoStatus::Cancelled,
+                "dispatch cancelled before resolution".to_string(),
+            ),
+            echo_agent::tasks::RuntimeClaimAbandonment::Failed { error } => {
+                (TodoStatus::Failed, error)
+            }
+        };
+        let _ = self.set_claimed_status(run_id, &task, claim, status, Some(&summary))?;
+        Ok(())
     }
 
     async fn block_task(
@@ -3112,7 +3151,8 @@ async fn run_main_agent_task(
                     visible_tools,
                     run_budget: None,
                 };
-                let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
+                let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation)
+                    .map_err(|error| ExecutionFailure::from_react(error, "invalid task event identity"))?;
                 // Multimodal path when the run has attachments; plain text otherwise.
                 let raw_stream = if let Some(msg) = run_message {
                     agent
@@ -3464,8 +3504,15 @@ async fn run_main_agent_task(
                         AgentEvent::Cancelled => {
                             return Err(ExecutionFailure::cancelled("task cancelled"));
                         }
-                        AgentEvent::Error { source, message } => {
-                            return Err(ExecutionFailure::failed(format!("{source}: {message}")));
+                        AgentEvent::Error {
+                            source,
+                            message,
+                            failure,
+                        } => {
+                            return Err(ExecutionFailure::from_agent_failure(
+                                &failure,
+                                format!("{source}: {message}"),
+                            ));
                         }
                         _ => {}
                     }
@@ -3725,7 +3772,19 @@ pub async fn drive_agent_run(
                 visible_tools,
                 run_budget: None,
             };
-            let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
+            let event_identity = match echo_core::agent::EventIdentity::from_invocation(&invocation)
+            {
+                Ok(identity) => identity,
+                Err(error) => {
+                    tracing::error!(
+                        source_id = %source_id,
+                        run_id = %run_id_for_scope,
+                        error = %error,
+                        "Run agent event identity is invalid"
+                    );
+                    return Some(error.to_string());
+                }
+            };
 
             // Execute the prompt. The agent's ReAct loop will call
             // task_create + task_execute, which runs the plan through
@@ -3750,7 +3809,10 @@ pub async fn drive_agent_run(
                         }
                         match event_result {
                             Ok(event) => {
-                                if let AgentEvent::Error { source, message } = event.payload {
+                                if let AgentEvent::Error {
+                                    source, message, ..
+                                } = event.payload
+                                {
                                     let error = format!("{source}: {message}");
                                     tracing::warn!(
                                         source_id = %source_id,

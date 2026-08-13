@@ -131,7 +131,7 @@ pub async fn add_memory(
                 agent
                     .write_async(|value| {
                         Box::pin(async move {
-                            echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
                                 value,
                                 root.as_deref(),
                             )
@@ -140,7 +140,7 @@ pub async fn add_memory(
                     })
                     .await;
                 if let Some(pool) = &state.app_state.connection.pool {
-                    pool.refresh_instruction_context().await;
+                    pool.refresh_hot_memory_context().await;
                 }
             }
             Ok(serde_json::json!({
@@ -224,7 +224,7 @@ pub async fn delete_memory(
                 agent
                     .write_async(|value| {
                         Box::pin(async move {
-                            echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
                                 value,
                                 root.as_deref(),
                             )
@@ -233,7 +233,7 @@ pub async fn delete_memory(
                     })
                     .await;
                 if let Some(pool) = &state.app_state.connection.pool {
-                    pool.refresh_instruction_context().await;
+                    pool.refresh_hot_memory_context().await;
                 }
             }
             Ok(serde_json::json!({

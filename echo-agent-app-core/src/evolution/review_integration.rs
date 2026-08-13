@@ -336,14 +336,22 @@ impl echo_agent::skills::external::SkillLoadPolicy for ReviewIntegration {
         {
             return false;
         }
-        let Some(meta) = self.curator().skill_for_path(&descriptor.location) else {
-            return true;
-        };
-        matches!(
-            meta.lifecycle,
-            echo_agent::evolution::SkillLifecycle::Active
-                | echo_agent::evolution::SkillLifecycle::Stale
-        )
+        match self.curator().skill_for_path(&descriptor.location) {
+            Ok(Some(meta)) => matches!(
+                meta.lifecycle,
+                echo_agent::evolution::SkillLifecycle::Active
+                    | echo_agent::evolution::SkillLifecycle::Stale
+            ),
+            Ok(None) => true,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    path = %descriptor.location.display(),
+                    "refusing to load skill because curator state is unreadable"
+                );
+                false
+            }
+        }
     }
 }
 
@@ -563,6 +571,36 @@ mod tests {
             &integration,
             &descriptor,
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn skill_policy_rejects_unreadable_curator_state() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let echo_dir = temp.path().join("workspace/.eko");
+        let state_path = echo_dir.join("evolution/curator-state.json");
+        let state_parent = state_path
+            .parent()
+            .ok_or_else(|| "curator state path has no parent".to_string())?;
+        std::fs::create_dir_all(state_parent).map_err(|error| error.to_string())?;
+        std::fs::write(&state_path, b"{not-json").map_err(|error| error.to_string())?;
+
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let integration = ReviewIntegration::new(ReviewConfig::default(), echo_dir.clone(), store);
+        let mut descriptor = echo_agent::skills::external::parse_skill_md(
+            "---\nname: test-skill\ndescription: test skill\n---\nbody",
+        )
+        .map_err(|error| error.to_string())?;
+        descriptor.location = echo_dir.join("skills/test-skill/SKILL.md");
+
+        assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
+            &integration,
+            &descriptor,
+        ));
+        assert_eq!(
+            std::fs::read_to_string(state_path).map_err(|error| error.to_string())?,
+            "{not-json"
+        );
         Ok(())
     }
 

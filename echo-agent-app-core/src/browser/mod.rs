@@ -702,7 +702,7 @@ impl BrowserRuntime {
                 if let Some(key) = locator_failure_key.as_ref() {
                     self.inner.locator_failures.lock().await.remove(key);
                 }
-                let mut result = tool_result(raw_result);
+                let (mut result, result_frame) = tool_result_with_frame(raw_result);
                 if matches!(action, BrowserAction::Console | BrowserAction::Network) {
                     result.output = redact_browser_diagnostics(&result.output);
                     result.data = None;
@@ -769,10 +769,10 @@ impl BrowserRuntime {
                         })
                     }
                     BrowserAction::Screenshot => {
-                        let frame = browser_frame(&result);
-                        self.inner
-                            .sessions
-                            .emit(BrowserEvent::Screenshot { observation, frame });
+                        self.inner.sessions.emit(BrowserEvent::Screenshot {
+                            observation,
+                            frame: result_frame,
+                        });
                     }
                     BrowserAction::Navigate
                     | BrowserAction::Click
@@ -791,7 +791,7 @@ impl BrowserRuntime {
                             )
                             .await
                         {
-                            let frame_result = tool_result(raw_frame);
+                            let (frame_result, frame) = tool_result_with_frame(raw_frame);
                             let frame_observation = self.inner.sessions.observation(
                                 &lease,
                                 "browser_screenshot",
@@ -799,7 +799,7 @@ impl BrowserRuntime {
                             );
                             self.inner.sessions.emit(BrowserEvent::Screenshot {
                                 observation: frame_observation,
-                                frame: browser_frame(&frame_result),
+                                frame,
                             });
                         }
                     }
@@ -991,11 +991,16 @@ impl BrowserRuntime {
             message: "no HITL provider is available for consequential browser action".to_string(),
         })?;
         let request = HumanLoopRequest {
+            request_id: None,
+            session_id: Some(conversation_id.to_string()),
+            agent_name: None,
             kind: HumanLoopKind::Approval,
             prompt: risk.prompt(params),
             tool_name: Some(action.name().to_string()),
             args: Some(risk.confirmation_args(action, params)),
             risk_level: Some(risk.risk_level()),
+            approval_context: None,
+            suggestions: Vec::new(),
             timeout: Some(Duration::from_secs(5 * 60)),
             task_id: None,
             options: None,
@@ -1575,7 +1580,7 @@ fn data_categories_schema() -> Value {
     })
 }
 
-fn tool_result(result: McpToolCallResult) -> ToolResult {
+fn tool_result_with_frame(result: McpToolCallResult) -> (ToolResult, Option<BrowserFrame>) {
     let text = McpClient::content_to_text(&result.content);
     if result.is_error {
         let mut tool_result = ToolResult::error(text);
@@ -1585,7 +1590,7 @@ fn tool_result(result: McpToolCallResult) -> ToolResult {
                 error_code: "playwright_mcp_error".to_string(),
             };
         }
-        return tool_result;
+        return (tool_result, None);
     }
 
     let image = result.content.iter().find_map(|content| match content {
@@ -1602,12 +1607,12 @@ fn tool_result(result: McpToolCallResult) -> ToolResult {
     } else {
         ToolResult::success(text)
     };
-    if let Some((bytes, mime_type)) = image {
+    let frame = image.and_then(|(bytes, mime_type)| browser_frame(&bytes, &mime_type));
+    if let Some(frame) = frame.as_ref() {
         tool_result.kind = ToolResultKind::Image {
-            mime_type: mime_type.clone(),
+            mime_type: frame.mime_type.clone(),
         };
-        tool_result.bytes = Some(bytes);
-        tool_result.mime_type = Some(mime_type);
+        tool_result.mime_type = Some(frame.mime_type.clone());
     }
     if !result.extra.is_empty()
         && let Ok(extra) = serde_json::to_string_pretty(&result.extra)
@@ -1615,11 +1620,10 @@ fn tool_result(result: McpToolCallResult) -> ToolResult {
         tool_result.output.push_str("\n\nAdditional fields:\n");
         tool_result.output.push_str(&extra);
     }
-    tool_result
+    (tool_result, frame)
 }
 
-fn browser_frame(result: &ToolResult) -> Option<BrowserFrame> {
-    let bytes = result.bytes.as_ref()?;
+fn browser_frame(bytes: &[u8], mime_type: &str) -> Option<BrowserFrame> {
     if bytes.len() > 8 * 1024 * 1024 {
         tracing::warn!(
             bytes = bytes.len(),
@@ -1627,7 +1631,6 @@ fn browser_frame(result: &ToolResult) -> Option<BrowserFrame> {
         );
         return None;
     }
-    let mime_type = result.mime_type.as_deref().unwrap_or("image/png");
     Some(BrowserFrame {
         data_url: format!(
             "data:{mime_type};base64,{}",
@@ -1932,7 +1935,7 @@ mod tests {
     #[test]
     fn screenshot_result_preserves_image_bytes() {
         let encoded = base64::engine::general_purpose::STANDARD.encode([1_u8, 2, 3]);
-        let result = tool_result(McpToolCallResult {
+        let (result, frame) = tool_result_with_frame(McpToolCallResult {
             content: vec![McpContent::Image {
                 data: encoded,
                 mime_type: "image/png".to_string(),
@@ -1942,8 +1945,11 @@ mod tests {
             extra: serde_json::Map::new(),
         });
 
-        assert_eq!(result.bytes.as_deref(), Some([1_u8, 2, 3].as_slice()));
         assert_eq!(result.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            frame.as_ref().map(|value| value.data_url.as_str()),
+            Some("data:image/png;base64,AQID")
+        );
         assert_eq!(
             result.kind,
             ToolResultKind::Image {
@@ -1954,10 +1960,7 @@ mod tests {
 
     #[test]
     fn screenshot_frame_is_serializable_for_tauri_events() {
-        let mut result = ToolResult::success("captured");
-        result.bytes = Some(vec![1_u8, 2, 3]);
-        result.mime_type = Some("image/png".to_string());
-        let frame = browser_frame(&result);
+        let frame = browser_frame(&[1_u8, 2, 3], "image/png");
         assert_eq!(
             frame.as_ref().map(|value| value.data_url.as_str()),
             Some("data:image/png;base64,AQID")

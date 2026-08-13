@@ -4,13 +4,13 @@
 //! arguments and output stay in local files and are read lazily by `detail_ref`.
 
 use echo_agent::tools::ToolFailure;
+use echo_agent::utils::time::now_millis;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 pub const TOOL_ARGS_PREVIEW_CHARS: usize = 160;
@@ -598,13 +598,6 @@ fn execution_key(owner: &ToolExecutionOwner, call_id: &str) -> String {
             format!("subagent\0{subagent_run_id}\0{call_id}")
         }
     }
-}
-
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 fn lock_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {

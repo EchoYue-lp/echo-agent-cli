@@ -240,7 +240,7 @@ fn send_pending_response(approval: &mut echo_agent_app_core::hitl::PendingApprov
                 return;
             }
             3 => HumanLoopResponse::ApprovedWithScope {
-                scope: ApprovalScope::SessionAllTools,
+                scope: ApprovalScope::SessionTool,
             },
             _ => HumanLoopResponse::Approved,
         },
@@ -2719,8 +2719,13 @@ async fn handle_slash_command(
                                 }
                                 value.set_temperature(runtime.temperature);
                                 value.set_max_tokens(runtime.max_tokens);
-                                if let Some(limit) = runtime.context_window {
-                                    value.set_token_limit(limit as usize);
+                                if let Some(limit) = runtime.context_window
+                                    && let Err(error) = value.set_token_limit(limit as usize)
+                                {
+                                    tracing::error!(
+                                        error = %error,
+                                        "TUI: failed to apply model context window"
+                                    );
                                 }
                             })
                             .await;
@@ -2843,7 +2848,7 @@ async fn handle_slash_command(
                                 agent
                                     .write_async(|value| {
                                         Box::pin(async move {
-                                            echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
                                                 value,
                                                 root.as_deref(),
                                             )
@@ -2852,7 +2857,7 @@ async fn handle_slash_command(
                                     })
                                     .await;
                                 if let Some(pool) = &app.pool {
-                                    pool.refresh_instruction_context().await;
+                                    pool.refresh_hot_memory_context().await;
                                 }
                             }
                             format!("Memory saved with key: {key}")
@@ -2914,7 +2919,7 @@ async fn handle_slash_command(
                                         agent
                                         .write_async(|value| {
                                             Box::pin(async move {
-                                                echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
                                                     value,
                                                     root.as_deref(),
                                                 )
@@ -2923,7 +2928,7 @@ async fn handle_slash_command(
                                         })
                                         .await;
                                         if let Some(pool) = &app.pool {
-                                            pool.refresh_instruction_context().await;
+                                            pool.refresh_hot_memory_context().await;
                                         }
                                     }
                                     format!("Removed memory: {key}")
@@ -4039,7 +4044,16 @@ async fn handle_slash_command(
                         &echo_agent_app_core::evolution::discover_echo_agent_dir(),
                     )
                 });
-            let state = curator.load_state();
+            let state = match curator.load_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Curator state unavailable: {error}"),
+                    });
+                    return;
+                }
+            };
             let items: Vec<_> = state
                 .skills
                 .iter()

@@ -333,9 +333,9 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                                 Ok(PendingResponse::Approval { approved, reason, scope }) => {
                                     if approved {
                                         match scope.as_deref() {
-                                            Some("session_all_tools") => {
+                                            Some("session_tool") => {
                                                 Ok(HumanLoopResponse::ApprovedWithScope {
-                                                    scope: echo_agent::human_loop::ApprovalScope::SessionAllTools,
+                                                    scope: echo_agent::human_loop::ApprovalScope::SessionTool,
                                                 })
                                             }
                                             _ => Ok(HumanLoopResponse::Approved),
@@ -1560,7 +1560,9 @@ fn agent_event_to_chat_event(
         },
         AgentEvent::FinalAnswer(data) => ChatEvent::FinalAnswer { data: data.clone() },
         AgentEvent::Cancelled => ChatEvent::Cancelled,
-        AgentEvent::Error { source, message } => ChatEvent::Error {
+        AgentEvent::Error {
+            source, message, ..
+        } => ChatEvent::Error {
             message: format!("{source}: {message}"),
         },
         other => ChatEvent::Notice {

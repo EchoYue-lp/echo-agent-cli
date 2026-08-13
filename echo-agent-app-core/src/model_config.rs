@@ -96,6 +96,14 @@ pub fn provider_templates() -> Vec<ProviderTemplate> {
         .collect()
 }
 
+pub fn provider_requires_api_key(provider: &str) -> bool {
+    all_provider_metadata()
+        .iter()
+        .find(|metadata| metadata.id.eq_ignore_ascii_case(provider))
+        .map(|metadata| metadata.requires_api_key)
+        .unwrap_or(false)
+}
+
 pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
     if config.configured_models.is_empty() {
         let legacy = ConfiguredModel {
@@ -395,6 +403,14 @@ mod tests {
     fn effective_context_window_uses_framework_default_for_unknown_models() {
         let model = configured_model("custom", "local-model", None);
         assert_eq!(effective_context_window(&model), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn api_key_requirement_is_explicit_not_assumed() {
+        assert!(provider_requires_api_key("openai"));
+        assert!(provider_requires_api_key("ANTHROPIC"));
+        assert!(!provider_requires_api_key("ollama"));
+        assert!(!provider_requires_api_key("custom-local-provider"));
     }
 
     #[test]

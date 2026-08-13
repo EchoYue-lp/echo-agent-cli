@@ -105,6 +105,7 @@ pub struct CommandContext {
     /// Attachments staged for the next CLI chat turn.
     pub staged_attachments:
         Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
+    pub app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
 }
 
 impl CommandContext {
@@ -123,6 +124,7 @@ impl CommandContext {
                 echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             )),
             staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            app_state: None,
         }
     }
 

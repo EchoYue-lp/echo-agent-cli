@@ -161,16 +161,16 @@ async fn register_task_execute_on_agent(agent_handle: &AgentHandle, store: Arc<T
 /// cron→launch_cron_run path (all cron, not just `[plan]`).
 /// Phase C: `pool` enables per-run agent isolation (recommended when an
 /// `AgentPool` exists); falls back to the shared `agent` when `None`.
-pub fn new_scheduler_runner(
+pub async fn new_scheduler_runner(
     store: CronTaskStore,
     cancel: echo_agent::agent::CancellationToken,
     agent: AgentHandle,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
-) -> SchedulerRunner {
+) -> echo_agent::error::Result<SchedulerRunner> {
     let fire_fn = build_fire_fn(agent, task_runtime_store, pool, webhook_emitter);
-    SchedulerRunner::new(store, cancel, fire_fn)
+    SchedulerRunner::new(store, cancel, fire_fn).await
 }
 
 #[cfg(test)]

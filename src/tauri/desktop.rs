@@ -229,7 +229,9 @@ async fn run_desktop() -> anyhow::Result<()> {
     state_inner.set_pool(pool);
 
     state_inner.start_task_service().await;
-    state_inner.start_scheduler_with_store(Some(scheduler_store));
+    state_inner
+        .start_scheduler_with_store(Some(scheduler_store))
+        .await?;
     if let Some(scheduler) = state_inner.scheduler.runner.as_ref()
         && let Err(error) = runtime
             .plugin_runtime

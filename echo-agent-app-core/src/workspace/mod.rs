@@ -12,7 +12,7 @@
 //!     ├── sessions/          # 会话历史
 //!     ├── conversations/     # 对话记录（前端持久化）
 //!     ├── memory/            # 向量存储、压缩历史
-//!     ├── tasks/             # 后台任务 SQLite DB
+//!     ├── tasks/             # 后台任务文件状态
 //!     ├── traces/            # 执行轨迹 JSONL
 //!     ├── uploads/           # 上传临时文件
 //!     ├── data/              # 数据集（数据分析工作区）
