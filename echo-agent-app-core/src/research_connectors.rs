@@ -15,9 +15,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::research::{
-    BiomedicalEntity, CreateSourceRequest, EuropePmcSupplement, ResearchError, ResearchResult,
-    SourceIngestResult, SourceKind, SourceProvenance, SourceRecord, get_source, ingest_source,
-    save_europe_pmc_supplement, write_full_text_xml,
+    BiomedicalEntity, CreateSourceRequest, EuropePmcEnrichmentAttempt, EuropePmcSupplementUpdate,
+    ResearchError, ResearchResult, SourceIngestResult, SourceKind, SourceProvenance, SourceRecord,
+    get_source, ingest_source, save_europe_pmc_supplement, write_full_text_xml,
 };
 
 const AUTO_INGEST_TOOLS: &[&str] = &[
@@ -200,21 +200,23 @@ pub async fn enrich_from_europe_pmc(
         ));
     };
     let client = EuropePmcClient::new().map_err(external)?;
-    let previous = source.europe_pmc.clone().unwrap_or_default();
-    let citations = client
-        .citations(provider_source, provider_id)
-        .await
-        .map(|items| items.into_iter().map(|item| item.id).collect())
-        .map_err(|error| error.to_string());
-    let references = client
-        .references(provider_source, provider_id)
-        .await
-        .map(|items| items.into_iter().map(|item| item.id).collect())
-        .map_err(|error| error.to_string());
-    let entities = client
-        .text_mined_terms(provider_source, provider_id)
-        .await
-        .map(|items| {
+    let mut warnings = Vec::new();
+    let citations = match client.citations(provider_source, provider_id).await {
+        Ok(items) => Some(items.into_iter().map(|item| item.id).collect()),
+        Err(error) => {
+            warnings.push(format!("citations: {error}"));
+            None
+        }
+    };
+    let references = match client.references(provider_source, provider_id).await {
+        Ok(items) => Some(items.into_iter().map(|item| item.id).collect()),
+        Err(error) => {
+            warnings.push(format!("references: {error}"));
+            None
+        }
+    };
+    let entities = match client.text_mined_terms(provider_source, provider_id).await {
+        Ok(items) => Some(
             items
                 .into_iter()
                 .map(|item| BiomedicalEntity {
@@ -222,85 +224,61 @@ pub async fn enrich_from_europe_pmc(
                     semantic_type: item.semantic_type,
                     frequency: item.frequency,
                 })
-                .collect()
-        })
-        .map_err(|error| error.to_string());
-    let full_text_path = if let Some(pmcid) = source.pmcid.as_deref() {
-        client
-            .full_text_xml(pmcid)
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|xml| {
-                write_full_text_xml(workspace_root, source_id, &xml)
-                    .map(Some)
-                    .map_err(|error| error.to_string())
-            })
-    } else {
-        Ok(previous.full_text_path.clone())
-    };
-    let mut warnings = Vec::new();
-    let supplement = merge_europe_pmc_results(
-        previous,
-        citations,
-        references,
-        entities,
-        full_text_path,
-        &mut warnings,
-    );
-    let source = save_europe_pmc_supplement(workspace_root, source_id, supplement)?;
-    Ok(EuropePmcEnrichmentResult { source, warnings })
-}
-
-fn merge_europe_pmc_results(
-    previous: EuropePmcSupplement,
-    citations: Result<Vec<String>, String>,
-    references: Result<Vec<String>, String>,
-    entities: Result<Vec<BiomedicalEntity>, String>,
-    full_text_path: Result<Option<String>, String>,
-    warnings: &mut Vec<String>,
-) -> EuropePmcSupplement {
-    EuropePmcSupplement {
-        citation_ids: retain_enrichment_dimension(
-            "citations",
-            citations,
-            previous.citation_ids,
-            warnings,
+                .collect(),
         ),
-        reference_ids: retain_enrichment_dimension(
-            "references",
-            references,
-            previous.reference_ids,
-            warnings,
-        ),
-        biomedical_entities: retain_enrichment_dimension(
-            "text-mined terms",
-            entities,
-            previous.biomedical_entities,
-            warnings,
-        ),
-        full_text_path: retain_enrichment_dimension(
-            "full text",
-            full_text_path,
-            previous.full_text_path,
-            warnings,
-        ),
-        enriched_at: Some(Utc::now()),
-    }
-}
-
-fn retain_enrichment_dimension<T>(
-    label: &str,
-    result: Result<T, String>,
-    previous: T,
-    warnings: &mut Vec<String>,
-) -> T {
-    match result {
-        Ok(value) => value,
         Err(error) => {
-            warnings.push(format!("{label}: {error}"));
-            previous
+            warnings.push(format!("text-mined terms: {error}"));
+            None
         }
-    }
+    };
+    let supports_full_text = source.pmcid.is_some();
+    let full_text_path = if let Some(pmcid) = source.pmcid.as_deref() {
+        match client.full_text_xml(pmcid).await {
+            Ok(xml) => match write_full_text_xml(workspace_root, source_id, &xml) {
+                Ok(path) => Some(Some(path)),
+                Err(error) => {
+                    warnings.push(format!("full text: {error}"));
+                    None
+                }
+            },
+            Err(error) => {
+                warnings.push(format!("full text: {error}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let successful_fields = enrichment_fields(
+        citations.is_some(),
+        references.is_some(),
+        entities.is_some(),
+        supports_full_text && full_text_path.is_some(),
+    );
+    let failed_fields = enrichment_fields(
+        citations.is_none(),
+        references.is_none(),
+        entities.is_none(),
+        supports_full_text && full_text_path.is_none(),
+    );
+    let source = save_europe_pmc_supplement(
+        workspace_root,
+        source_id,
+        EuropePmcSupplementUpdate {
+            citation_ids: citations,
+            reference_ids: references,
+            biomedical_entities: entities,
+            full_text_path,
+            attempt: Some(EuropePmcEnrichmentAttempt {
+                attempt_id: uuid::Uuid::new_v4().to_string(),
+                provider: "europe_pmc".to_string(),
+                attempted_at: Utc::now(),
+                successful_fields,
+                failed_fields,
+            }),
+        },
+    )?;
+    Ok(EuropePmcEnrichmentResult { source, warnings })
 }
 
 pub fn ingest_tool_output(
@@ -308,10 +286,26 @@ pub fn ingest_tool_output(
     tool: &str,
     output: &str,
 ) -> ResearchResult<Vec<SourceIngestResult>> {
+    ingest_tool_output_with_status(workspace_root, tool, output).map_err(|failure| failure.error)
+}
+
+struct IngestFailure {
+    error: ResearchError,
+    persisted_count: usize,
+}
+
+fn ingest_tool_output_with_status(
+    workspace_root: &Path,
+    tool: &str,
+    output: &str,
+) -> Result<Vec<SourceIngestResult>, IngestFailure> {
     if !AUTO_INGEST_TOOLS.contains(&tool) {
         return Ok(Vec::new());
     }
-    let value: Value = serde_json::from_str(output)?;
+    let value: Value = serde_json::from_str(output).map_err(|error| IngestFailure {
+        error: error.into(),
+        persisted_count: 0,
+    })?;
     let query = value
         .get("query")
         .and_then(Value::as_str)
@@ -320,13 +314,34 @@ pub fn ingest_tool_output(
         .get("papers")
         .or_else(|| value.get("studies"))
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    records
+        .ok_or_else(|| IngestFailure {
+            error: ResearchError::Invalid(
+                "research provider output must contain a papers or studies array".to_string(),
+            ),
+            persisted_count: 0,
+        })?;
+    let mut ingested = Vec::new();
+    for request in records
         .iter()
         .filter_map(|record| source_request_from_tool_record(tool, query.as_deref(), record))
-        .map(|request| ingest_source(workspace_root, request))
-        .collect()
+    {
+        match ingest_source(workspace_root, request) {
+            Ok(record) => ingested.push(record),
+            Err(error) if ingested.is_empty() => {
+                return Err(IngestFailure {
+                    error,
+                    persisted_count: 0,
+                });
+            }
+            Err(error) => {
+                return Err(IngestFailure {
+                    error,
+                    persisted_count: ingested.len(),
+                });
+            }
+        }
+    }
+    Ok(ingested)
 }
 
 struct AutoIngestResearchTool {
@@ -339,31 +354,73 @@ impl AutoIngestResearchTool {
     }
 }
 
-fn apply_auto_ingest(workspace_root: &Path, tool_name: &str, result: ToolResult) -> ToolResult {
+fn apply_auto_ingest(workspace_root: &Path, tool_name: &str, mut result: ToolResult) -> ToolResult {
     if !result.success {
         return result;
     }
-    match ingest_tool_output(workspace_root, tool_name, &result.output) {
-        Ok(records) if !records.is_empty() => {
+    match ingest_tool_output_with_status(workspace_root, tool_name, &result.output) {
+        Ok(records) => {
             let created = records.iter().filter(|record| record.created).count();
-            tracing::info!(
-                tool = tool_name,
-                created,
-                total = records.len(),
-                "research results ingested"
+            let status = if records.is_empty() {
+                "no_records"
+            } else {
+                "persisted"
+            };
+            result
+                .metadata
+                .insert("provider_call".to_string(), "completed".to_string());
+            result.metadata.insert(
+                "research_persistence_status".to_string(),
+                status.to_string(),
             );
+            result.metadata.insert(
+                "research_persisted_count".to_string(),
+                records.len().to_string(),
+            );
+            if !records.is_empty() {
+                tracing::info!(
+                    tool = tool_name,
+                    created,
+                    total = records.len(),
+                    "research results ingested"
+                );
+            }
             result
         }
-        Ok(_) => result,
-        Err(error) => ToolResult::failure(
-            ToolFailureCategory::PartialSideEffect,
-            format!(
-                "{tool_name} completed, but EKO could not persist its research results: {error}"
-            ),
-        )
-        .with_output(result.output)
-        .with_meta("provider_call", "completed")
-        .with_meta("research_ingest", "failed"),
+        Err(failure) => {
+            let IngestFailure {
+                error,
+                persisted_count,
+            } = failure;
+            tracing::warn!(tool = tool_name, %error, "research result ingestion failed");
+            let persistence_status = if persisted_count > 0 {
+                "partial"
+            } else {
+                "failed"
+            };
+            let mut failed = ToolResult::failure(
+                ToolFailureCategory::PartialSideEffect,
+                format!("{tool_name} completed, but EKO research persistence failed: {error}"),
+            )
+            .with_output(result.output);
+            failed.metadata = result.metadata;
+            failed
+                .metadata
+                .insert("provider_call".to_string(), "completed".to_string());
+            failed.metadata.insert(
+                "research_retrieval_status".to_string(),
+                "succeeded".to_string(),
+            );
+            failed.metadata.insert(
+                "research_persistence_status".to_string(),
+                persistence_status.to_string(),
+            );
+            failed.metadata.insert(
+                "research_persisted_count".to_string(),
+                persisted_count.to_string(),
+            );
+            failed
+        }
     }
 }
 
@@ -414,6 +471,24 @@ impl Tool for AutoIngestResearchTool {
     fn exempt_from_batch_timeout(&self) -> bool {
         self.inner.exempt_from_batch_timeout()
     }
+}
+
+fn enrichment_fields(
+    citations: bool,
+    references: bool,
+    biomedical_entities: bool,
+    full_text_path: bool,
+) -> Vec<String> {
+    [
+        (citations, "citation_ids"),
+        (references, "reference_ids"),
+        (biomedical_entities, "biomedical_entities"),
+        (full_text_path, "full_text_path"),
+    ]
+    .into_iter()
+    .filter(|(included, _)| *included)
+    .map(|(_, field)| field.to_string())
+    .collect()
 }
 
 pub fn install_auto_ingest_tools(agent: &mut ReactAgent) {
@@ -653,6 +728,34 @@ fn trial_notes(record: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent::error::Result as AgentResult;
+
+    struct SuccessfulResearchTool {
+        output: String,
+    }
+
+    impl Tool for SuccessfulResearchTool {
+        fn name(&self) -> &str {
+            "semantic_scholar_search"
+        }
+
+        fn description(&self) -> &str {
+            "test research provider"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn execute_with_context<'a>(
+            &'a self,
+            _parameters: ToolParameters,
+            _context: &'a ToolContext,
+        ) -> BoxFuture<'a, AgentResult<ToolResult>> {
+            let output = self.output.clone();
+            Box::pin(async move { Ok(ToolResult::success(output)) })
+        }
+    }
 
     #[test]
     fn tool_results_are_ingested_idempotently() -> ResearchResult<()> {
@@ -672,72 +775,132 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn failed_enrichment_dimensions_preserve_previous_values() {
-        let previous = EuropePmcSupplement {
-            citation_ids: vec!["c-old".to_string()],
-            reference_ids: vec!["r-old".to_string()],
-            biomedical_entities: vec![BiomedicalEntity {
-                name: "BRCA1".to_string(),
-                semantic_type: Some("gene".to_string()),
-                frequency: Some(2),
-            }],
-            full_text_path: Some("research/full-text/source.xml".to_string()),
-            enriched_at: None,
+    #[tokio::test]
+    async fn auto_ingest_reports_malformed_provider_output_as_failure() -> AgentResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let tool = AutoIngestResearchTool::new(Box::new(SuccessfulResearchTool {
+            output: "not json".to_string(),
+        }));
+        let context = ToolContext {
+            working_dir: Some(workspace.path().to_path_buf()),
+            ..ToolContext::default()
         };
-        let mut warnings = Vec::new();
 
-        let merged = merge_europe_pmc_results(
-            previous,
-            Err("temporary outage".to_string()),
-            Ok(vec!["r-new".to_string()]),
-            Err("rate limited".to_string()),
-            Err("timeout".to_string()),
-            &mut warnings,
-        );
-
-        assert_eq!(merged.citation_ids, vec!["c-old".to_string()]);
-        assert_eq!(merged.reference_ids, vec!["r-new".to_string()]);
-        assert_eq!(
-            merged
-                .biomedical_entities
-                .first()
-                .map(|item| item.name.as_str()),
-            Some("BRCA1")
-        );
-        assert_eq!(
-            merged.full_text_path.as_deref(),
-            Some("research/full-text/source.xml")
-        );
-        assert_eq!(warnings.len(), 3);
-    }
-
-    #[test]
-    fn auto_ingest_failure_is_visible_and_preserves_provider_output() -> ResearchResult<()> {
-        let workspace = tempfile::tempdir().map_err(ResearchError::Io)?;
-        let blocked_root = workspace.path().join("not-a-directory");
-        std::fs::write(&blocked_root, "file").map_err(ResearchError::Io)?;
-        let output = serde_json::json!({
-            "query": "test",
-            "papers": [{"title": "A Paper", "doi": "10.1/test"}]
-        })
-        .to_string();
-
-        let result = apply_auto_ingest(
-            &blocked_root,
-            "semantic_scholar_search",
-            ToolResult::success(output.clone()),
-        );
+        let result = tool
+            .execute_with_context(ToolParameters::new(), &context)
+            .await?;
 
         assert!(!result.success);
-        assert_eq!(result.output, output);
+        assert_eq!(
+            result
+                .metadata
+                .get("research_retrieval_status")
+                .map(String::as_str),
+            Some("succeeded")
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get("research_persistence_status")
+                .map(String::as_str),
+            Some("failed")
+        );
         assert_eq!(
             result.failure.as_ref().map(|failure| failure.category),
             Some(ToolFailureCategory::PartialSideEffect)
         );
+        assert_eq!(result.output, "not json");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("persistence failed"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_ingest_reports_local_persistence_failure() -> AgentResult<()> {
+        let workspace = tempfile::tempdir()?;
+        std::fs::write(
+            workspace.path().join("research"),
+            "blocks directory creation",
+        )?;
+        let tool = AutoIngestResearchTool::new(Box::new(SuccessfulResearchTool {
+            output: serde_json::json!({
+                "query": "test",
+                "papers": [{"title": "Cannot persist", "doi": "10.1/failure"}]
+            })
+            .to_string(),
+        }));
+        let context = ToolContext {
+            working_dir: Some(workspace.path().to_path_buf()),
+            ..ToolContext::default()
+        };
+
+        let result = tool
+            .execute_with_context(ToolParameters::new(), &context)
+            .await?;
+
+        assert!(!result.success);
         assert_eq!(
-            result.metadata.get("provider_call").map(String::as_str),
-            Some("completed")
+            result
+                .metadata
+                .get("research_persistence_status")
+                .map(String::as_str),
+            Some("failed")
+        );
+        assert_eq!(
+            result.failure.as_ref().map(|failure| failure.category),
+            Some(ToolFailureCategory::PartialSideEffect)
+        );
+        assert!(result.output.contains("Cannot persist"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn auto_ingest_reports_partial_persistence_after_first_record() -> AgentResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let oversized_title = "x".repeat(4 * 1024 * 1024);
+        let tool = AutoIngestResearchTool::new(Box::new(SuccessfulResearchTool {
+            output: serde_json::json!({
+                "query": "partial",
+                "papers": [
+                    {"title": "Persisted first", "doi": "10.1/first"},
+                    {"title": oversized_title, "doi": "10.1/too-large"}
+                ]
+            })
+            .to_string(),
+        }));
+        let context = ToolContext {
+            working_dir: Some(workspace.path().to_path_buf()),
+            ..ToolContext::default()
+        };
+
+        let result = tool
+            .execute_with_context(ToolParameters::new(), &context)
+            .await?;
+
+        assert!(!result.success);
+        assert_eq!(
+            result
+                .metadata
+                .get("research_persistence_status")
+                .map(String::as_str),
+            Some("partial")
+        );
+        assert_eq!(
+            result
+                .metadata
+                .get("research_persisted_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            crate::research::list_sources(workspace.path(), None, None)
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+                .len(),
+            1
         );
         Ok(())
     }

@@ -1003,6 +1003,7 @@ mod tests {
     use futures::future::BoxFuture;
 
     struct ScriptTool;
+    struct ArtifactFailureTool;
 
     impl Tool for ScriptTool {
         fn name(&self) -> &str {
@@ -1032,7 +1033,11 @@ mod tests {
                     .ok_or_else(|| {
                         echo_agent::error::ReactError::Other("missing script path".to_string())
                     })?;
-                fs::write(directory.join("result.json"), "{\"value\": 42}\n")?;
+                let execution_id = context.execution_id.as_deref().unwrap_or("missing");
+                fs::write(
+                    directory.join("result.json"),
+                    format!("{{\"execution_id\":\"{execution_id}\"}}\n"),
+                )?;
                 fs::write(
                     directory.join("environment.json"),
                     "{\"python\": \"test\"}\n",
@@ -1040,6 +1045,40 @@ mod tests {
                 Ok(ToolResult::success(format!("ran {script}"))
                     .with_meta("exit_code", "0")
                     .with_meta("sandbox_type", "test"))
+            })
+        }
+    }
+
+    impl Tool for ArtifactFailureTool {
+        fn name(&self) -> &str {
+            "run_code"
+        }
+
+        fn description(&self) -> &str {
+            "test artifact persistence failure"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn execute_with_context<'a>(
+            &'a self,
+            _parameters: ToolParameters,
+            context: &'a ToolContext,
+        ) -> BoxFuture<'a, AgentResult<ToolResult>> {
+            Box::pin(async move {
+                let directory = context.working_dir.as_ref().ok_or_else(|| {
+                    echo_agent::error::ReactError::Other("missing working directory".to_string())
+                })?;
+                let run_id = context.execution_id.as_deref().ok_or_else(|| {
+                    echo_agent::error::ReactError::Other("missing execution id".to_string())
+                })?;
+                fs::write(directory.join("result.json"), "new output")?;
+                fs::write(directory.join(RUNS_DIR).join(run_id), "blocks artifact dir")?;
+                Ok(ToolResult::success(
+                    "ran but artifact persistence will fail",
+                ))
             })
         }
     }
@@ -1253,10 +1292,55 @@ mod tests {
         let second_run = second
             .last_run
             .ok_or_else(|| AnalysisError::Invalid("missing second run".to_string()))?;
+        let second_result = second_run
+            .outputs
+            .iter()
+            .find(|artifact| artifact.path.ends_with("result.json"))
+            .ok_or_else(|| AnalysisError::Invalid("missing second result artifact".to_string()))?;
 
         assert_ne!(first_run.run_id, second_run.run_id);
+        assert_ne!(first_result.path, second_result.path);
+        assert_ne!(first_result.sha256, second_result.sha256);
         assert!(first_path.is_file());
         assert_eq!(hash_file(&first_path)?, first_hash);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn artifact_failure_does_not_publish_a_new_run_record() -> AnalysisResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let created = create_analysis(workspace.path(), "Publish", AnalysisLanguage::Python)?;
+        let successful_manager = ToolManager::new();
+        successful_manager.register(Box::new(ScriptTool));
+        let completed = run_analysis(
+            &successful_manager,
+            workspace.path(),
+            &created.manifest.analysis_id,
+            None,
+        )
+        .await?;
+        let previous_run_id = completed
+            .last_run
+            .as_ref()
+            .map(|run| run.run_id.clone())
+            .ok_or_else(|| AnalysisError::Invalid("missing previous run".to_string()))?;
+
+        let failed_manager = ToolManager::new();
+        failed_manager.register(Box::new(ArtifactFailureTool));
+        let result = run_analysis(
+            &failed_manager,
+            workspace.path(),
+            &created.manifest.analysis_id,
+            None,
+        )
+        .await;
+        assert!(matches!(result, Err(AnalysisError::Io(_))));
+
+        let reloaded = load_analysis(workspace.path(), &created.manifest.analysis_id)?;
+        assert_eq!(
+            reloaded.last_run.map(|run| run.run_id),
+            Some(previous_run_id)
+        );
         Ok(())
     }
 

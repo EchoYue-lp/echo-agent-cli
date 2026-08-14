@@ -133,6 +133,28 @@ pub struct EuropePmcSupplement {
     pub biomedical_entities: Vec<BiomedicalEntity>,
     pub full_text_path: Option<String>,
     pub enriched_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub enrichment_attempts: Vec<EuropePmcEnrichmentAttempt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EuropePmcEnrichmentAttempt {
+    pub attempt_id: String,
+    pub provider: String,
+    pub attempted_at: DateTime<Utc>,
+    #[serde(default)]
+    pub successful_fields: Vec<String>,
+    #[serde(default)]
+    pub failed_fields: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct EuropePmcSupplementUpdate {
+    pub citation_ids: Option<Vec<String>>,
+    pub reference_ids: Option<Vec<String>>,
+    pub biomedical_entities: Option<Vec<BiomedicalEntity>>,
+    pub full_text_path: Option<Option<String>>,
+    pub attempt: Option<EuropePmcEnrichmentAttempt>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -629,19 +651,34 @@ pub fn ingest_source(
 pub fn save_europe_pmc_supplement(
     workspace_root: &Path,
     source_id: &str,
-    mut supplement: EuropePmcSupplement,
+    update: EuropePmcSupplementUpdate,
 ) -> ResearchResult<SourceRecord> {
     let mut source = get_source(workspace_root, source_id)?;
-    supplement.citation_ids = normalized_values(supplement.citation_ids);
-    supplement.reference_ids = normalized_values(supplement.reference_ids);
-    supplement
-        .biomedical_entities
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    supplement.biomedical_entities.dedup_by(|left, right| {
-        left.name == right.name && left.semantic_type == right.semantic_type
-    });
-    supplement.full_text_path = clean_optional(supplement.full_text_path);
-    supplement.enriched_at = Some(Utc::now());
+    let mut supplement = source.europe_pmc.take().unwrap_or_default();
+    if let Some(citation_ids) = update.citation_ids {
+        supplement.citation_ids = normalized_values(citation_ids);
+    }
+    if let Some(reference_ids) = update.reference_ids {
+        supplement.reference_ids = normalized_values(reference_ids);
+    }
+    if let Some(mut biomedical_entities) = update.biomedical_entities {
+        biomedical_entities.sort_by(|left, right| left.name.cmp(&right.name));
+        biomedical_entities.dedup_by(|left, right| {
+            left.name == right.name && left.semantic_type == right.semantic_type
+        });
+        supplement.biomedical_entities = biomedical_entities;
+    }
+    if let Some(full_text_path) = update.full_text_path {
+        supplement.full_text_path = clean_optional(full_text_path);
+    }
+    if let Some(mut attempt) = update.attempt {
+        attempt.successful_fields = normalized_values(attempt.successful_fields);
+        attempt.failed_fields = normalized_values(attempt.failed_fields);
+        if !attempt.successful_fields.is_empty() {
+            supplement.enriched_at = Some(attempt.attempted_at);
+        }
+        supplement.enrichment_attempts.push(attempt);
+    }
     source.europe_pmc = Some(supplement);
     source.updated_at = Utc::now();
     write_json(&source_path(workspace_root, source_id)?, &source)?;
@@ -1130,8 +1167,8 @@ pub fn export_review(
         .record
         .source_ids
         .iter()
-        .filter_map(|source_id| get_source(workspace_root, source_id).ok())
-        .collect::<Vec<_>>();
+        .map(|source_id| get_source(workspace_root, source_id))
+        .collect::<ResearchResult<Vec<_>>>()?;
     let evidence = list_evidence(workspace_root, None, Some(review_id))?;
     let audit = audit_review(workspace_root, review_id)?;
     let markdown = render_review_markdown(&document, &sources, &evidence, &audit);
@@ -2054,6 +2091,94 @@ mod tests {
     }
 
     #[test]
+    fn europe_pmc_update_preserves_failed_dimensions() -> ResearchResult<()> {
+        let workspace = temp_workspace()?;
+        let source = create_source(
+            workspace.path(),
+            CreateSourceRequest {
+                title: "Enriched source".to_string(),
+                pmcid: Some("PMC123".to_string()),
+                europe_pmc: Some(EuropePmcSupplement {
+                    citation_ids: vec!["old-citation".to_string()],
+                    reference_ids: vec!["old-reference".to_string()],
+                    biomedical_entities: vec![BiomedicalEntity {
+                        name: "old-entity".to_string(),
+                        semantic_type: Some("gene".to_string()),
+                        frequency: Some(1),
+                    }],
+                    full_text_path: Some("research/full-text/old.xml".to_string()),
+                    enriched_at: Some(Utc::now()),
+                    enrichment_attempts: Vec::new(),
+                }),
+                ..CreateSourceRequest::default()
+            },
+        )?;
+
+        for failed_field in [
+            "citation_ids",
+            "reference_ids",
+            "biomedical_entities",
+            "full_text_path",
+        ] {
+            let before = get_source(workspace.path(), &source.id)?
+                .europe_pmc
+                .ok_or_else(|| ResearchError::Invalid("missing prior supplement".to_string()))?;
+            let saved = save_europe_pmc_supplement(
+                workspace.path(),
+                &source.id,
+                EuropePmcSupplementUpdate {
+                    citation_ids: (failed_field != "citation_ids")
+                        .then(|| vec!["new-citation".to_string()]),
+                    reference_ids: (failed_field != "reference_ids")
+                        .then(|| vec!["new-reference".to_string()]),
+                    biomedical_entities: (failed_field != "biomedical_entities").then(|| {
+                        vec![BiomedicalEntity {
+                            name: "new-entity".to_string(),
+                            semantic_type: Some("disease".to_string()),
+                            frequency: Some(2),
+                        }]
+                    }),
+                    full_text_path: (failed_field != "full_text_path")
+                        .then(|| Some("research/full-text/new.xml".to_string())),
+                    attempt: Some(EuropePmcEnrichmentAttempt {
+                        attempt_id: failed_field.to_string(),
+                        provider: "europe_pmc".to_string(),
+                        attempted_at: Utc::now(),
+                        successful_fields: Vec::new(),
+                        failed_fields: vec![failed_field.to_string()],
+                    }),
+                },
+            )?;
+            let after = saved
+                .europe_pmc
+                .ok_or_else(|| ResearchError::Invalid("missing merged supplement".to_string()))?;
+
+            match failed_field {
+                "citation_ids" => assert_eq!(after.citation_ids, before.citation_ids),
+                "reference_ids" => assert_eq!(after.reference_ids, before.reference_ids),
+                "biomedical_entities" => assert_eq!(
+                    after
+                        .biomedical_entities
+                        .first()
+                        .map(|entity| entity.name.as_str()),
+                    before
+                        .biomedical_entities
+                        .first()
+                        .map(|entity| entity.name.as_str())
+                ),
+                "full_text_path" => assert_eq!(after.full_text_path, before.full_text_path),
+                _ => return Err(ResearchError::Invalid("unknown test field".to_string())),
+            }
+            let attempt = after
+                .enrichment_attempts
+                .last()
+                .ok_or_else(|| ResearchError::Invalid("missing enrichment attempt".to_string()))?;
+            assert_eq!(attempt.failed_fields, vec![failed_field.to_string()]);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn medical_review_accepts_peco_and_derives_prisma() -> ResearchResult<()> {
         let workspace = temp_workspace()?;
         let source = create_source(
@@ -2173,6 +2298,48 @@ mod tests {
                 .iter()
                 .all(|artifact| workspace.path().join(&artifact.path).is_file())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn audit_and_export_both_reject_missing_declared_source() -> ResearchResult<()> {
+        let workspace = temp_workspace()?;
+        let source = create_source(
+            workspace.path(),
+            CreateSourceRequest {
+                title: "Missing later".to_string(),
+                ..CreateSourceRequest::default()
+            },
+        )?;
+        let mut review = create_review(
+            workspace.path(),
+            CreateReviewRequest {
+                title: "Missing source review".to_string(),
+                question: "Where did it go?".to_string(),
+                domain: ReviewDomain::Academic,
+            },
+        )?;
+        review.record.source_ids.push(source.id.clone());
+        let review = save_review(
+            workspace.path(),
+            &review.record.id,
+            review.record.clone(),
+            &review.revision,
+        )?;
+        fs::remove_file(source_path(workspace.path(), &source.id)?)?;
+
+        let audit = audit_review(workspace.path(), &review.record.id)?;
+        assert!(audit.issues.iter().any(|issue| {
+            issue.code == "missing_source" && issue.source_id.as_deref() == Some(source.id.as_str())
+        }));
+        assert!(matches!(
+            export_review(
+                workspace.path(),
+                &review.record.id,
+                ReviewExportFormat::Markdown
+            ),
+            Err(ResearchError::NotFound(_))
+        ));
         Ok(())
     }
 
