@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { sessionApi, workspaceApi, type Workspace } from '../api/endpoints';
 import { useChatStore } from './chatStore';
 import { useConversationStore } from './conversationStore';
+import { useFileStore } from './fileStore';
 
 interface WorkspaceState {
   /** All workspaces */
@@ -20,7 +21,7 @@ interface WorkspaceState {
   /** Delete a workspace */
   delete: (id: string) => Promise<void>;
   /** Exit workspace (back to global mode) */
-  exit: () => void;
+  exit: () => Promise<void>;
 }
 
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
@@ -58,6 +59,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           (res as any).debug_conversation_count
         );
       set({ current: res.workspace });
+      useFileStore.getState().markWorkspaceChanged();
 
       // Clear current chat
       useChatStore.getState().clearMessages();
@@ -102,7 +104,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     await get().init();
   },
 
-  exit: () => {
+  exit: async () => {
+    await workspaceApi.exit();
     set({ current: null });
+    useFileStore.getState().markWorkspaceChanged();
   },
 }));

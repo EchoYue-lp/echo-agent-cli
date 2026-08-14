@@ -140,8 +140,15 @@ impl WebhookEmitter {
                 timestamp: chrono::Utc::now(),
                 data: event,
             };
-            let body = match serde_json::to_vec(&payload) {
-                Ok(b) => b,
+            let body = match serde_json::to_value(&payload).and_then(|mut value| {
+                echo_core::utils::retention::ContentRetentionPolicy {
+                    max_string_chars: 4_096,
+                    max_array_items: 256,
+                }
+                .sanitize_json(&mut value);
+                serde_json::to_vec(&value)
+            }) {
+                Ok(body) => body,
                 Err(e) => {
                     tracing::warn!("Webhook: failed to serialize payload: {e}");
                     return;
@@ -206,4 +213,37 @@ async fn deliver(
         return Err(format!("HTTP {}", resp.status()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn webhook_payload_redacts_secrets_and_bounds_errors() -> Result<(), String> {
+        let payload = WebhookPayload {
+            event: "tool_failed".to_string(),
+            timestamp: chrono::Utc::now(),
+            data: WebhookEvent::ToolFailed {
+                name: "shell".to_string(),
+                error: format!(
+                    "{{\"OPENAI_API_KEY\":\"short-secret\"}} Bearer {} {}",
+                    "a".repeat(24),
+                    "x".repeat(5_000)
+                ),
+            },
+        };
+        let mut value = serde_json::to_value(payload).map_err(|error| error.to_string())?;
+        echo_core::utils::retention::ContentRetentionPolicy {
+            max_string_chars: 4_096,
+            max_array_items: 256,
+        }
+        .sanitize_json(&mut value);
+        let body = value.to_string();
+        assert!(!body.contains("short-secret"));
+        assert!(!body.contains(&"a".repeat(24)));
+        assert!(body.contains("[REDACTED]"));
+        assert!(body.contains("[TRUNCATED]"));
+        Ok(())
+    }
 }

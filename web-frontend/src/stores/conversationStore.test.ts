@@ -4,18 +4,21 @@ const mocks = vi.hoisted(() => ({
   getConversation: vi.fn(),
   listToolExecutions: vi.fn(),
   restoreConversation: vi.fn(),
+  branchConversation: vi.fn(),
+  listConversations: vi.fn(),
   resetSession: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
   sessionApi: { reset: mocks.resetSession },
   conversationApi: {
-    list: vi.fn(),
+    list: mocks.listConversations,
     get: mocks.getConversation,
     save: vi.fn(),
     update: vi.fn(),
     delete: vi.fn(),
     restore: mocks.restoreConversation,
+    branch: mocks.branchConversation,
   },
   toolExecutionApi: { list: mocks.listToolExecutions },
 }));
@@ -36,6 +39,14 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.listToolExecutions.mockResolvedValue([]);
   mocks.restoreConversation.mockResolvedValue(undefined);
+  mocks.listConversations.mockResolvedValue([]);
+  mocks.branchConversation.mockResolvedValue({
+    success: true,
+    id: 'branch-1',
+    source_id: 'conversation-1',
+    message_count: 2,
+    target_content: 'canonical user prompt',
+  });
   mocks.resetSession.mockResolvedValue(undefined);
   useChatStore.getState().clearMessages();
   useConversationStore.setState({ activeId: null, isLoading: false, conversations: [] });
@@ -132,5 +143,19 @@ describe('conversation message identity', () => {
 
     expect(useConversationStore.getState()).toMatchObject({ activeId: null, isLoading: false });
     expect(mocks.restoreConversation).not.toHaveBeenCalled();
+  });
+
+  it('activates only the canonical branch returned by the backend', async () => {
+    useConversationStore.setState({
+      activeId: 'conversation-1',
+      conversations: [],
+      isLoading: false,
+    });
+
+    const result = await useConversationStore.getState().branchCurrent(2);
+
+    expect(mocks.branchConversation).toHaveBeenCalledWith('conversation-1', 2);
+    expect(result).toEqual({ id: 'branch-1', targetContent: 'canonical user prompt' });
+    expect(useConversationStore.getState().activeId).toBe('branch-1');
   });
 });

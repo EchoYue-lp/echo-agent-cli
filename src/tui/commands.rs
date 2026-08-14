@@ -70,6 +70,7 @@ pub enum SlashCommand {
     Compact,
     Copy,
     OpenArtifact,
+    Workspace,
 
     // -- Context --
     Model,
@@ -152,6 +153,7 @@ impl SlashCommand {
             Self::Compact => "Compress context window",
             Self::Copy => "Copy the last response to clipboard (or Ctrl+Y)",
             Self::OpenArtifact => "Open the latest or specified tool-output artifact",
+            Self::Workspace => "Manage workspaces",
 
             Self::Model => "Switch or show current model",
             Self::Think => "Toggle reasoning/thinking display",
@@ -224,7 +226,8 @@ impl SlashCommand {
             | Self::DeleteSession
             | Self::Compact
             | Self::Copy
-            | Self::OpenArtifact => Category::Session,
+            | Self::OpenArtifact
+            | Self::Workspace => Category::Session,
             Self::Model
             | Self::Think
             | Self::System
@@ -301,6 +304,7 @@ impl SlashCommand {
             Self::Rename => "<title>",
             Self::DeleteSession => "<conversation-id>",
             Self::OpenArtifact => "[call-id|path]",
+            Self::Workspace => "[new|list|switch|exit|link|migrate|info] [args]",
             Self::CodeReview => "[file-or-dir]",
             Self::Attach => "<file-path>",
             Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",

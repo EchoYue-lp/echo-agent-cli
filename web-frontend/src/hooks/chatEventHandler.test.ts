@@ -110,4 +110,24 @@ describe('chat and TaskRuntime lifecycle separation', () => {
       totalCached: 28_000,
     });
   });
+
+  it('keeps partial output and the failed terminal state on an error event', () => {
+    const assistantId = useChatStore.getState().startAssistantMessage('assistant-1');
+    useChatStore.getState().appendToken(assistantId, 'partial answer');
+    const context = {
+      assistantIdRef: { current: assistantId as string | null },
+      currentMessageKeyRef: { current: 'message-key' as string | null },
+      currentMessageIdRef: { current: 'message-id' as string | null },
+      isCancelledRef: { current: false },
+      currentThinkingIdRef: { current: null as string | null },
+    };
+
+    handleChatEvent({ type: 'error', message: 'provider disconnected' }, context);
+
+    const state = useChatStore.getState();
+    expect(state.runStatus).toBe('failed');
+    expect(state.messages.at(-1)?.content).toContain('partial answer');
+    expect(state.messages.at(-1)?.content).toContain('[Error] provider disconnected');
+    expect(state.messages.at(-1)?.isStreaming).toBe(false);
+  });
 });

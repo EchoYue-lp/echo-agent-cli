@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub use crate::hitl::HitlDispatcher;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::agent_handle::AgentHandle;
 use crate::persistence::Persistence;
@@ -159,6 +159,71 @@ impl PermissionBehavior {
 }
 
 impl PermissionRuleConfig {
+    pub fn to_framework_rule(
+        &self,
+    ) -> std::result::Result<echo_agent::tools::permission::PermissionRule, String> {
+        use echo_agent::tools::permission::{
+            PermissionRule, RuleBehavior, RuleMatcher, RuleSource, ToolPermission,
+        };
+
+        let matcher = if self.matcher == "*" {
+            RuleMatcher::All
+        } else if let Some(name) = self.matcher.strip_prefix("tool:") {
+            if name.is_empty() {
+                return Err("tool permission matcher requires a name".to_string());
+            }
+            RuleMatcher::Tool {
+                name: name.to_string(),
+            }
+        } else if let Some(pattern) = self.matcher.strip_prefix("pattern:") {
+            if pattern.is_empty() {
+                return Err("pattern permission matcher cannot be empty".to_string());
+            }
+            RuleMatcher::Pattern {
+                pattern: pattern.to_string(),
+            }
+        } else if let Some(flag) = self
+            .matcher
+            .strip_prefix("perm:")
+            .or_else(|| self.matcher.strip_prefix("permission:"))
+        {
+            let permission = match flag {
+                "read" => ToolPermission::Read,
+                "write" => ToolPermission::Write,
+                "network" => ToolPermission::Network,
+                "execute" => ToolPermission::Execute,
+                "sensitive" => ToolPermission::Sensitive,
+                _ => return Err(format!("unknown permission matcher: {flag}")),
+            };
+            RuleMatcher::Permission { permission }
+        } else {
+            return Err(format!("unsupported permission matcher: {}", self.matcher));
+        };
+        let behavior = match self.behavior {
+            PermissionBehavior::Allow => RuleBehavior::Allow,
+            PermissionBehavior::Deny => RuleBehavior::Deny {
+                reason: "denied by EKO permission rule".to_string(),
+            },
+            PermissionBehavior::Ask => RuleBehavior::Ask {
+                suggestions: vec!["allow".to_string(), "deny".to_string()],
+            },
+        };
+        let source = match self.source.as_str() {
+            "session" => RuleSource::Session,
+            "cliArg" | "cli_arg" => RuleSource::CliArg,
+            "projectSettings" | "project_settings" => RuleSource::ProjectSettings,
+            "localSettings" | "local_settings" => RuleSource::LocalSettings,
+            "managed" => RuleSource::Managed,
+            _ => RuleSource::UserSettings,
+        };
+        Ok(PermissionRule {
+            matcher,
+            behavior,
+            source,
+            description: Some("EKO application permission rule".to_string()),
+        })
+    }
+
     /// Check whether this rule applies to a given tool by name.
     ///
     /// Supported matcher patterns:
@@ -337,6 +402,8 @@ impl ConnectionState {
 /// 配置状态：应用 / Web / 沙箱 / 权限
 pub struct ConfigState {
     pub app_config: RwLock<echo_agent::config::AppConfig>,
+    /// Immutable startup source used for every application-side config commit.
+    pub config_path: std::path::PathBuf,
     pub web_config: RwLock<WebConfig>,
     pub sandbox_config: RwLock<SandboxConfigData>,
     pub permission_mode: RwLock<String>,
@@ -413,6 +480,9 @@ pub struct WorkspaceState {
     pub registry: Arc<WorkspaceRegistry>,
     /// Process directory to restore when leaving workspace mode.
     pub global_cwd: std::path::PathBuf,
+    /// Serializes generation changes so two UI or automation requests cannot
+    /// interleave primary/pool/store rebinding.
+    pub transition: Mutex<()>,
 }
 
 /// 全局应用状态
@@ -478,6 +548,7 @@ impl AppState {
             },
             config: ConfigState {
                 app_config: RwLock::new(app_config),
+                config_path: crate::config_watcher::resolve_config_save_path(None),
                 web_config: RwLock::new(config),
                 sandbox_config: RwLock::new(SandboxConfigData::default()),
                 permission_mode: RwLock::new("default".to_string()),
@@ -576,6 +647,7 @@ impl AppState {
             },
             workspace: WorkspaceState {
                 current: RwLock::new(None),
+                transition: Mutex::new(()),
                 global_cwd: std::env::current_dir()
                     .unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 registry: Arc::new(WorkspaceRegistry::new().unwrap_or_else(|e| {
@@ -597,6 +669,20 @@ impl AppState {
             review_integration: None,
             plugin_runtime: None,
         }
+    }
+
+    /// Bind config persistence to the source selected during bootstrap.
+    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.config.config_path = path;
+        self
+    }
+
+    /// Persist one complete config snapshot to the immutable bootstrap source.
+    pub fn save_app_config(
+        &self,
+        config: &echo_agent::config::AppConfig,
+    ) -> std::result::Result<(), String> {
+        echo_agent::config::save_config_file(&self.config.config_path, config)
     }
 
     /// Attach the shared review integration created during runtime bootstrap.
@@ -848,33 +934,39 @@ impl AppState {
     ///
     /// 这会重新初始化 persistence 和 session manager 以使用工作区路径。
     pub async fn switch_workspace(&self, workspace: Workspace) -> anyhow::Result<()> {
-        // 更新当前工作区
-        {
-            let mut current = self.workspace.current.write().await;
-            *current = Some(workspace.clone());
+        let _transition = self.workspace.transition.lock().await;
+        if !self.session.active_chat_turns.is_empty() {
+            anyhow::bail!("Cannot switch workspace while a foreground chat turn is running");
         }
-        crate::config_watcher::notify_config_watcher_workspace(workspace.root.clone());
+        ensure_no_running_task_runs(self.tasks.runtime.as_deref())?;
+        let root = validated_workspace_root(&workspace.root)?;
+        let state_dir = crate::workspace::layout::WorkspaceLayout::state_dir(&root);
+        let sessions_dir = crate::workspace::layout::WorkspaceLayout::sessions(&root);
+        std::fs::create_dir_all(&state_dir)?;
+        std::fs::create_dir_all(&sessions_dir)?;
+        let conversation_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(
+            echo_agent::memory::FileConversationStore::new(&state_dir).map_err(|error| {
+                anyhow::anyhow!("Failed to prepare workspace conversation store: {error}")
+            })?,
+        );
+        let runtime_store = crate::infra::create_runtime_state_store_in(&sessions_dir)
+            .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace runtime state store"))?;
+        let memory_store = crate::infra::create_memory_store_for_workspace(&root)
+            .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace memory store"))?;
+        if let Some(pool) = &self.connection.pool {
+            pool.reset_for_workspace_transition().await?;
+        }
+        let mut workspace = workspace;
+        workspace.root = root;
 
         // 切换进程工作目录到工作区根目录。
         // 这样所有工具（shell、文件读写、搜索等）都会自动在工作区目录下执行。
-        if workspace.root.exists() {
-            if let Err(e) = std::env::set_current_dir(&workspace.root) {
-                tracing::warn!(
-                    root = %workspace.root.display(),
-                    "Failed to set_current_dir to workspace root: {e}"
-                );
-            } else {
-                tracing::info!(
-                    root = %workspace.root.display(),
-                    "Process CWD switched to workspace root"
-                );
-            }
-        } else {
-            tracing::warn!(
-                root = %workspace.root.display(),
-                "Workspace root does not exist, skipping CWD switch"
-            );
-        }
+        std::env::set_current_dir(&workspace.root).map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to switch process directory to {}: {error}",
+                workspace.root.display()
+            )
+        })?;
 
         // 更新 agent 的 working_dir 配置（影响 project rules 注入等）
         let new_wd = Some(workspace.root.clone());
@@ -898,51 +990,26 @@ impl AppState {
         }
 
         // 重新初始化 persistence 以使用工作区路径
-        let new_persistence = Persistence::with_base_dir(
-            crate::workspace::layout::WorkspaceLayout::sessions(&workspace.root),
-        );
+        let new_persistence = Persistence::with_base_dir(sessions_dir.clone());
         {
             let mut persistence = self.storage.persistence.write().await;
             *persistence = new_persistence;
         }
 
         // 重新初始化 conversation_store 到工作区的存储目录（U1c：文件后端）
-        let conv_dir = crate::workspace::layout::WorkspaceLayout::conversations(&workspace.root);
-        std::fs::create_dir_all(&conv_dir).ok();
-        match echo_agent::memory::FileConversationStore::new(&conv_dir) {
-            Ok(store) => {
-                let new_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(store);
-                {
-                    let mut guard = self.storage.conversation_store.write().await;
-                    *guard = Some(new_store.clone());
-                }
-                self.connection
-                    .agent
-                    .try_write(|a| a.set_conversation_store(new_store));
-                tracing::info!(
-                    workspace = %workspace.id,
-                    dir = %conv_dir.display(),
-                    "Switched conversation store to workspace"
-                );
-
-                let runtime_dir =
-                    crate::workspace::layout::WorkspaceLayout::sessions(&workspace.root);
-                if let Some(runtime_store) =
-                    crate::infra::create_runtime_state_store_in(&runtime_dir)
-                {
-                    self.connection
-                        .agent
-                        .try_write(|a| a.set_state_store(runtime_store));
-                    tracing::info!(
-                        workspace = %workspace.id,
-                        db = %runtime_dir.join("runtime_state.db").display(),
-                        "Switched runtime state store to workspace"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to reinit conversation store for workspace: {e}");
-            }
+        {
+            let mut guard = self.storage.conversation_store.write().await;
+            *guard = Some(conversation_store.clone());
+        }
+        self.connection
+            .agent
+            .write(|agent| {
+                agent.set_conversation_store(conversation_store.clone());
+                agent.set_state_store(runtime_store.clone());
+            })
+            .await;
+        if let Some(pool) = &self.connection.pool {
+            pool.apply_conversation_store(conversation_store).await;
         }
 
         // 重新初始化 memory store 到工作区的存储目录（物理隔离：动态记忆
@@ -950,7 +1017,8 @@ impl AppState {
         // hot 层 MEMORY.md 的 echo_agent_dir 与 warm 层 store.json 同根，
         // 都落在 {workspace.root}/.eko/，保证两层一致。
         let mem_root = workspace.root.clone();
-        if let Some(store) = crate::infra::create_memory_store_for_workspace(&mem_root) {
+        {
+            let store = memory_store;
             let echo_agent_dir = crate::workspace::layout::WorkspaceLayout::state_dir(&mem_root); // {root}/.eko
             if let Some(ref ri) = self.review_integration {
                 ri.rebind(echo_agent_dir.clone(), store.clone());
@@ -1019,11 +1087,6 @@ impl AppState {
             if let Some(ref pool) = self.connection.pool {
                 pool.apply_memory_store(&mem_root).await;
             }
-        } else {
-            tracing::warn!(
-                workspace = %workspace.id,
-                "Failed to create workspace memory store; keeping previous store"
-            );
         }
 
         tracing::info!(
@@ -1034,6 +1097,12 @@ impl AppState {
 
         // 根据工作区类型配置 Agent（自动激活 Skills 和注入系统提示词）
         self.apply_workspace_routing(&workspace).await;
+
+        {
+            let mut current = self.workspace.current.write().await;
+            *current = Some(workspace.clone());
+        }
+        crate::config_watcher::notify_config_watcher_workspace(workspace.root.clone());
 
         Ok(())
     }
@@ -1057,17 +1126,27 @@ impl AppState {
     }
 
     /// 退出工作区（回到全局默认路径）。
-    pub async fn exit_workspace(&self) {
-        let mut current = self.workspace.current.write().await;
-        *current = None;
-        if let Err(error) = std::env::set_current_dir(&self.workspace.global_cwd) {
-            tracing::warn!(
-                path = %self.workspace.global_cwd.display(),
-                %error,
-                "Failed to restore process directory after workspace exit"
-            );
+    pub async fn exit_workspace(&self) -> anyhow::Result<()> {
+        let _transition = self.workspace.transition.lock().await;
+        if !self.session.active_chat_turns.is_empty() {
+            anyhow::bail!("Cannot exit workspace while a foreground chat turn is running");
         }
-        crate::config_watcher::notify_config_watcher_workspace(self.workspace.global_cwd.clone());
+        ensure_no_running_task_runs(self.tasks.runtime.as_deref())?;
+        let global_cwd = self.workspace.global_cwd.canonicalize().map_err(|error| {
+            anyhow::anyhow!("Failed to resolve the global working directory: {error}")
+        })?;
+        let conversation_store = crate::infra::create_conversation_store()
+            .ok_or_else(|| anyhow::anyhow!("Failed to prepare global conversation store"))?;
+        let runtime_store = crate::infra::create_runtime_state_store()
+            .ok_or_else(|| anyhow::anyhow!("Failed to prepare global runtime state store"))?;
+        let memory_store = crate::infra::create_global_memory_store()
+            .ok_or_else(|| anyhow::anyhow!("Failed to prepare global memory store"))?;
+        if let Some(pool) = &self.connection.pool {
+            pool.reset_for_workspace_transition().await?;
+        }
+        std::env::set_current_dir(&global_cwd).map_err(|error| {
+            anyhow::anyhow!("Failed to restore process directory after workspace exit: {error}")
+        })?;
 
         // 重置 persistence 到全局默认路径
         let global_persistence = Persistence::new();
@@ -1090,28 +1169,30 @@ impl AppState {
             .await;
 
         // 重置 conversation_store 到全局默认路径（U1c：文件后端）
-        let global_base = crate::persistence::Persistence::base_dir();
-        match echo_agent::memory::FileConversationStore::new(&global_base) {
-            Ok(store) => {
-                let mut guard = self.storage.conversation_store.write().await;
-                *guard = Some(Arc::new(store));
-            }
-            Err(e) => {
-                tracing::warn!("Failed to reset conversation store to global: {e}");
+        {
+            let store = conversation_store;
+            let mut guard = self.storage.conversation_store.write().await;
+            *guard = Some(store.clone());
+            drop(guard);
+            self.connection
+                .agent
+                .write(|agent| agent.set_conversation_store(store.clone()))
+                .await;
+            if let Some(pool) = &self.connection.pool {
+                pool.apply_conversation_store(store).await;
             }
         }
 
         // 重置 runtime_state_store 到全局默认路径
-        if let Some(runtime_store) = crate::infra::create_runtime_state_store() {
-            self.connection
-                .agent
-                .try_write(|a| a.set_state_store(runtime_store));
-        }
+        self.connection
+            .agent
+            .try_write(|a| a.set_state_store(runtime_store));
 
         // 重置 memory store 到全局默认路径（~/.eko/store.json）。
         // 与 switch_workspace 的 memory 重载对称：exit 后动态记忆回到全局 store，
         // 不再读已退出 workspace 的 .eko/memory/。
-        if let Some(store) = crate::infra::create_global_memory_store() {
+        {
+            let store = memory_store;
             let (global_store_path, global_echo_dir) = crate::infra::global_memory_paths();
             if let Some(ref ri) = self.review_integration {
                 ri.rebind(global_echo_dir.clone(), store.clone());
@@ -1196,7 +1277,14 @@ impl AppState {
                 .await;
         }
 
+        {
+            let mut current = self.workspace.current.write().await;
+            *current = None;
+        }
+        crate::config_watcher::notify_config_watcher_workspace(global_cwd);
+
         tracing::info!("Exited workspace, using global default paths");
+        Ok(())
     }
 
     /// 获取工作区感知的 sessions 目录。
@@ -1215,5 +1303,115 @@ impl AppState {
         } else {
             Persistence::base_dir().join("tasks.db")
         }
+    }
+}
+
+fn validated_workspace_root(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let root = root.canonicalize().map_err(|error| {
+        anyhow::anyhow!(
+            "Workspace root is missing or cannot be resolved ({}): {error}",
+            root.display()
+        )
+    })?;
+    if !root.is_dir() {
+        anyhow::bail!("Workspace root is not a directory: {}", root.display());
+    }
+    Ok(root)
+}
+
+fn ensure_no_running_task_runs(
+    runtime: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> anyhow::Result<()> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    let running = runtime
+        .list_runs_in(&[crate::tasks::task_runtime::TaskRunStatus::Running])
+        .map_err(|error| anyhow::anyhow!("Failed to inspect active task runs: {error}"))?;
+    if running.is_empty() {
+        return Ok(());
+    }
+    let run_ids = running
+        .iter()
+        .take(5)
+        .map(|run| run.run_id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!("Cannot change workspace while TaskRun is running: {run_ids}")
+}
+
+#[cfg(test)]
+mod permission_rule_tests {
+    use super::*;
+    use echo_agent::tools::permission::{RuleBehavior, RuleMatcher, RuleSource, ToolPermission};
+
+    #[test]
+    fn application_permission_rule_converts_without_losing_semantics()
+    -> std::result::Result<(), String> {
+        let config = PermissionRuleConfig {
+            matcher: "permission:write".to_string(),
+            behavior: PermissionBehavior::Deny,
+            source: "projectSettings".to_string(),
+        };
+
+        let rule = config.to_framework_rule()?;
+        assert!(matches!(
+            rule.matcher,
+            RuleMatcher::Permission {
+                permission: ToolPermission::Write
+            }
+        ));
+        assert!(matches!(rule.behavior, RuleBehavior::Deny { .. }));
+        assert_eq!(rule.source, RuleSource::ProjectSettings);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_preflight_rejects_missing_and_non_directory_roots()
+    -> std::result::Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let file = temp.path().join("workspace-file");
+        std::fs::write(&file, "not a directory").map_err(|error| error.to_string())?;
+
+        assert!(validated_workspace_root(&temp.path().join("missing")).is_err());
+        assert!(validated_workspace_root(&file).is_err());
+        assert_eq!(
+            validated_workspace_root(temp.path()).map_err(|error| error.to_string())?,
+            temp.path()
+                .canonicalize()
+                .map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_preflight_rejects_running_task_runs() -> std::result::Result<(), String> {
+        use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
+
+        let runtime = crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+            .map_err(|error| error.to_string())?;
+        runtime
+            .create_run(
+                "workspace-transition-run",
+                "workspace-a",
+                "conversation-a",
+                "message-a",
+                DomainProfile::General,
+                "verify workspace transition",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(ensure_no_running_task_runs(Some(&runtime)).is_ok());
+
+        runtime
+            .transition_run("workspace-transition-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let error = match ensure_no_running_task_runs(Some(&runtime)) {
+            Ok(()) => return Err("a running TaskRun did not block workspace change".to_string()),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("workspace-transition-run"));
+        Ok(())
     }
 }

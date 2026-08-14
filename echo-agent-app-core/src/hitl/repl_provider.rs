@@ -62,14 +62,20 @@ fn handle_approval(
         }
     }
 
-    println!("\n  [y] 同意  [n] 拒绝  [m] 修改意见  [a] 本次会话全部同意");
+    println!("\n  [y] 同意  [n] 拒绝  [m] 修改意见  [a] 本工具本次会话同意");
     println!("  Choice: ");
 
     // Read from stdin (blocking — acceptable for REPL mode)
     let mut input = String::new();
-    std::io::stdin()
+    let bytes_read = std::io::stdin()
         .read_line(&mut input)
         .map_err(|e| echo_agent::error::ReactError::Other(format!("stdin read error: {e}")))?;
+
+    if bytes_read == 0 {
+        return Ok(HumanLoopResponse::Rejected {
+            reason: Some("Approval input closed".to_string()),
+        });
+    }
 
     let choice = input.trim().to_lowercase();
     match choice.as_str() {
@@ -123,9 +129,15 @@ fn handle_input(
     println!("\n  > ");
 
     let mut input = String::new();
-    std::io::stdin()
+    let bytes_read = std::io::stdin()
         .read_line(&mut input)
         .map_err(|e| echo_agent::error::ReactError::Other(format!("stdin read error: {e}")))?;
+
+    if bytes_read == 0 {
+        return Ok(HumanLoopResponse::Rejected {
+            reason: Some("Input closed".to_string()),
+        });
+    }
 
     let text = input.trim().to_string();
     if text.is_empty() {
@@ -154,9 +166,15 @@ fn handle_selection(
     println!("\n  Choice (number or text): ");
 
     let mut input = String::new();
-    std::io::stdin()
+    let bytes_read = std::io::stdin()
         .read_line(&mut input)
         .map_err(|e| echo_agent::error::ReactError::Other(format!("stdin read error: {e}")))?;
+
+    if bytes_read == 0 {
+        return Ok(HumanLoopResponse::Rejected {
+            reason: Some("Selection input closed".to_string()),
+        });
+    }
 
     let trimmed = input.trim();
 

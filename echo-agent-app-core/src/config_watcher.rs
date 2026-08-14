@@ -62,6 +62,25 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
         .find(|path| path.exists())
 }
 
+/// Resolve the immutable file targeted by application-side configuration edits.
+/// Relative paths are anchored before workspace switches can change the process
+/// working directory.
+pub fn resolve_config_save_path(explicit: Option<&str>) -> PathBuf {
+    let selected = resolve_config_path(explicit).unwrap_or_else(|| {
+        echo_agent::config::config_search_paths()
+            .into_iter()
+            .nth(1)
+            .unwrap_or_else(|| echo_agent::paths::user_data_path("config.yaml"))
+    });
+    if selected.is_absolute() {
+        selected
+    } else {
+        std::env::current_dir()
+            .map(|directory| directory.join(&selected))
+            .unwrap_or(selected)
+    }
+}
+
 /// Spawn a background task that watches the config file for changes and
 /// hot-reloads user hooks and webhook endpoints.
 ///

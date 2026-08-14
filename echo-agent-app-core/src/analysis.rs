@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -293,7 +293,7 @@ pub fn create_analysis(
         updated_at: now,
     };
 
-    atomic_write(
+    echo_core::utils::fs::atomic_write(
         &analysis_dir.join(language.script_name()),
         language.starter_script().as_bytes(),
     )?;
@@ -363,7 +363,7 @@ pub fn save_analysis(
     let analysis_dir = analysis_dir(workspace_root, analysis_id)?;
     let script_path = safe_existing_relative_file(&analysis_dir, &document.manifest.script_path)?;
 
-    atomic_write(&script_path, request.script.as_bytes())?;
+    echo_core::utils::fs::atomic_write(&script_path, request.script.as_bytes())?;
     document.manifest.title = title.to_string();
     document.manifest.input_paths = input_paths;
     document.manifest.parameters = request.parameters;
@@ -452,7 +452,7 @@ pub async fn run_analysis(
         ),
     };
 
-    let outputs = collect_outputs(workspace_root, &analysis_dir)?;
+    let outputs = archive_outputs(workspace_root, &analysis_dir, &run_id)?;
     let environment = read_environment(&analysis_dir.join("environment.json"))?;
     let record = AnalysisRunRecord {
         contract_version: CONTRACT_VERSION,
@@ -804,6 +804,70 @@ fn collect_outputs(
     Ok(outputs)
 }
 
+fn archive_outputs(
+    workspace_root: &Path,
+    analysis_dir: &Path,
+    run_id: &str,
+) -> AnalysisResult<Vec<AnalysisOutputArtifact>> {
+    let generated = collect_outputs(workspace_root, analysis_dir)?;
+    let artifact_root = analysis_dir.join(RUNS_DIR).join(run_id).join("artifacts");
+    let canonical_analysis = analysis_dir.canonicalize()?;
+    let mut archived = Vec::with_capacity(generated.len());
+
+    for artifact in generated {
+        let source = PathBuf::from(&artifact.absolute_path).canonicalize()?;
+        let relative = source.strip_prefix(&canonical_analysis).map_err(|_| {
+            AnalysisError::Invalid(format!(
+                "generated artifact is outside analysis directory: {}",
+                source.display()
+            ))
+        })?;
+        let target = artifact_root.join(relative);
+        copy_artifact_atomically(&source, &target)?;
+        let metadata = fs::metadata(&target)?;
+        let path = target
+            .strip_prefix(workspace_root)
+            .map_err(|_| {
+                AnalysisError::Invalid("archived artifact is outside workspace".to_string())
+            })?
+            .to_string_lossy()
+            .to_string();
+        archived.push(AnalysisOutputArtifact {
+            path,
+            absolute_path: target.display().to_string(),
+            kind: output_kind(&target).to_string(),
+            bytes: metadata.len(),
+            sha256: hash_file(&target)?,
+        });
+    }
+    archived.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(archived)
+}
+
+fn copy_artifact_atomically(source: &Path, target: &Path) -> AnalysisResult<()> {
+    let parent = target.parent().ok_or_else(|| {
+        AnalysisError::Invalid(format!("artifact path has no parent: {}", target.display()))
+    })?;
+    fs::create_dir_all(parent)?;
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| AnalysisError::Invalid("artifact file name is not UTF-8".to_string()))?;
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let copy_result = (|| -> std::io::Result<()> {
+        let mut input = File::open(source)?;
+        let mut output = File::create(&temporary)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        fs::rename(&temporary, target)
+    })();
+    if let Err(error) = copy_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
 fn collect_output_paths(current: &Path, paths: &mut Vec<PathBuf>) -> AnalysisResult<()> {
     if paths.len() >= MAX_OUTPUT_FILES {
         return Ok(());
@@ -927,32 +991,7 @@ fn read_optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> AnalysisResu
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> AnalysisResult<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    atomic_write(path, &bytes)?;
-    Ok(())
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
-    })?;
-    fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "file name is not valid UTF-8",
-            )
-        })?;
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = File::create(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error);
-    }
+    echo_core::utils::fs::atomic_write(path, &bytes)?;
     Ok(())
 }
 
@@ -1175,6 +1214,49 @@ mod tests {
                 .as_ref()
                 .is_some_and(|run| run.environment.is_empty())
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rerun_preserves_prior_run_artifacts() -> AnalysisResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let created = create_analysis(workspace.path(), "History", AnalysisLanguage::Python)?;
+        let manager = ToolManager::new();
+        manager.register(Box::new(ScriptTool));
+
+        let first = run_analysis(
+            &manager,
+            workspace.path(),
+            &created.manifest.analysis_id,
+            None,
+        )
+        .await?;
+        let first_run = first
+            .last_run
+            .ok_or_else(|| AnalysisError::Invalid("missing first run".to_string()))?;
+        let first_result = first_run
+            .outputs
+            .iter()
+            .find(|artifact| artifact.path.ends_with("result.json"))
+            .ok_or_else(|| AnalysisError::Invalid("missing first result artifact".to_string()))?;
+        let first_path = PathBuf::from(&first_result.absolute_path);
+        let first_hash = first_result.sha256.clone();
+        assert!(first_result.path.contains(&first_run.run_id));
+
+        let second = run_analysis(
+            &manager,
+            workspace.path(),
+            &created.manifest.analysis_id,
+            None,
+        )
+        .await?;
+        let second_run = second
+            .last_run
+            .ok_or_else(|| AnalysisError::Invalid("missing second run".to_string()))?;
+
+        assert_ne!(first_run.run_id, second_run.run_id);
+        assert!(first_path.is_file());
+        assert_eq!(hash_file(&first_path)?, first_hash);
         Ok(())
     }
 

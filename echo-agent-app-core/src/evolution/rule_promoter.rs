@@ -13,6 +13,7 @@ use echo_agent::memory::{
     MemoryFilter, MemoryStatus, MemoryType, Store, TypedMemoryEntry, TypedMemoryStore,
 };
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Criteria for memory promotion to a rule.
@@ -64,6 +65,7 @@ pub struct RulePromoter {
     store: Arc<dyn Store>,
     security_guard: EvolutionSecurityGuard,
     criteria: PromotionCriteria,
+    rules_path: PathBuf,
 }
 
 impl RulePromoter {
@@ -75,6 +77,7 @@ impl RulePromoter {
                 echo_agent::evolution::SecurityConfig::default(),
             ),
             criteria: PromotionCriteria::default(),
+            rules_path: InstructionProvider::agents_instructions_path(),
         }
     }
 
@@ -86,7 +89,14 @@ impl RulePromoter {
                 echo_agent::evolution::SecurityConfig::default(),
             ),
             criteria,
+            rules_path: InstructionProvider::agents_instructions_path(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_rules_path(mut self, rules_path: PathBuf) -> Self {
+        self.rules_path = rules_path;
+        self
     }
 
     /// Scan memories and generate rule promotion proposals.
@@ -192,19 +202,34 @@ impl RulePromoter {
             ));
         }
 
-        // Load existing learned-rules content (formerly AGENTS.md; renamed by
-        // InstructionProvider::load_for on first load after upgrade).
-        let existing_content =
-            std::fs::read_to_string(InstructionProvider::agents_instructions_path())
-                .unwrap_or_else(|_| String::new());
+        let existing_content = match std::fs::read_to_string(&self.rules_path) {
+            Ok(content) => Some(content),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(format!(
+                    "Failed to read {}: {error}",
+                    self.rules_path.display()
+                ));
+            }
+        };
+
+        // Resolve and validate the memory before mutating the user-editable file.
+        let typed_store = TypedMemoryStore::new(self.store.clone());
+        let namespace_refs: Vec<&str> = proposal.namespace.iter().map(|s| s.as_str()).collect();
+        let entry = typed_store
+            .get_typed(&namespace_refs, &proposal.memory_key)
+            .await
+            .map_err(|error| format!("Failed to get memory: {error}"))?
+            .ok_or_else(|| format!("Memory {} not found", proposal.memory_key))?;
 
         // Append new rule
-        let new_content = if existing_content.is_empty() {
+        let new_content = if existing_content.as_deref().is_none_or(str::is_empty) {
             format!(
                 "# Agent Rules\n\nAuto-promoted rules from high-confidence memories.\n\n## Rules\n\n{}",
                 proposal.rule_text
             )
         } else {
+            let existing_content = existing_content.as_deref().unwrap_or_default();
             // Check if "## Rules" section exists
             if existing_content.contains("## Rules") {
                 format!("{}\n{}", existing_content.trim_end(), proposal.rule_text)
@@ -218,19 +243,10 @@ impl RulePromoter {
         };
 
         // Write to learned-rules.md (auto-promoted rules; user-editable).
-        InstructionProvider::save_agents_instructions(&new_content)
+        InstructionProvider::save_agents_instructions_at(&self.rules_path, &new_content)
             .map_err(|e| format!("Failed to write learned-rules.md: {}", e))?;
 
         // Mark memory as promoted by updating its content
-        let typed_store = TypedMemoryStore::new(self.store.clone());
-        let namespace_refs: Vec<&str> = proposal.namespace.iter().map(|s| s.as_str()).collect();
-
-        let entry = typed_store
-            .get_typed(&namespace_refs, &proposal.memory_key)
-            .await
-            .map_err(|e| format!("Failed to get memory: {}", e))?
-            .ok_or_else(|| format!("Memory {} not found", proposal.memory_key))?;
-
         let updated_content = format!(
             "{}\n\n<!-- PROMOTED_TO_RULE: {} -->",
             entry.content.trim_end(),
@@ -239,7 +255,7 @@ impl RulePromoter {
 
         // Update the memory with the marker
         let updated_meta = entry.meta.clone();
-        typed_store
+        if let Err(error) = typed_store
             .put_typed(
                 &namespace_refs,
                 &proposal.memory_key,
@@ -247,7 +263,10 @@ impl RulePromoter {
                 updated_meta,
             )
             .await
-            .map_err(|e| format!("Failed to mark memory as promoted: {}", e))?;
+        {
+            restore_rules_file(&self.rules_path, existing_content.as_deref())?;
+            return Err(format!("Failed to mark memory as promoted: {error}"));
+        }
 
         // Log the change
         let change_entry =
@@ -260,9 +279,28 @@ impl RulePromoter {
                 .after(serde_json::json!({"status": "promoted_to_rule"}))
                 .build(change_log);
 
-        change_log
-            .record(change_entry)
-            .map_err(|e| format!("Failed to record promotion change: {}", e))?;
+        if let Err(error) = change_log.record(change_entry) {
+            let memory_restore = typed_store
+                .put_typed(
+                    &namespace_refs,
+                    &proposal.memory_key,
+                    &entry.content,
+                    entry.meta.clone(),
+                )
+                .await;
+            let file_restore = restore_rules_file(&self.rules_path, existing_content.as_deref());
+            if let Err(restore_error) = memory_restore {
+                return Err(format!(
+                    "Failed to record promotion change: {error}; memory rollback failed: {restore_error}"
+                ));
+            }
+            if let Err(restore_error) = file_restore {
+                return Err(format!(
+                    "Failed to record promotion change: {error}; file rollback failed: {restore_error}"
+                ));
+            }
+            return Err(format!("Failed to record promotion change: {error}"));
+        }
 
         Ok(())
     }
@@ -270,6 +308,19 @@ impl RulePromoter {
     /// Get the current promotion criteria.
     pub fn criteria(&self) -> &PromotionCriteria {
         &self.criteria
+    }
+}
+
+fn restore_rules_file(path: &std::path::Path, previous: Option<&str>) -> Result<(), String> {
+    if let Some(previous) = previous {
+        InstructionProvider::save_agents_instructions_at(path, previous)
+            .map_err(|error| format!("Failed to restore learned-rules.md: {error}"))
+    } else {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("Failed to remove new learned-rules.md: {error}")),
+        }
     }
 }
 
@@ -281,6 +332,44 @@ mod tests {
     /// namespace),导致晋升永远命中空集——"记忆 → learned-rules.md 规则"链路完全断开。
     use super::*;
     use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource};
+
+    struct RecordingChangeLog {
+        fail: bool,
+    }
+
+    impl ChangeLog for RecordingChangeLog {
+        fn record(
+            &self,
+            _entry: echo_agent::evolution::ChangeEntry,
+        ) -> echo_agent::error::Result<()> {
+            if self.fail {
+                Err(echo_agent::error::ReactError::Other(
+                    "injected audit failure".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn query(
+            &self,
+            _filter: &echo_agent::evolution::ChangeFilter,
+        ) -> echo_agent::error::Result<Vec<echo_agent::evolution::ChangeEntry>> {
+            Ok(Vec::new())
+        }
+
+        fn latest_for(
+            &self,
+            _entity_type: EntityType,
+            _entity_key: &str,
+        ) -> echo_agent::error::Result<Option<echo_agent::evolution::ChangeEntry>> {
+            Ok(None)
+        }
+
+        fn len(&self) -> usize {
+            0
+        }
+    }
 
     fn high_conf_project_fact() -> MemoryMeta {
         MemoryMeta::new(MemoryType::ProjectFact, MemorySource::ExplicitSave, "test")
@@ -374,5 +463,100 @@ mod tests {
             proposals.is_empty(),
             "已带 PROMOTED_TO_RULE 标记的记忆不应重复晋升"
         );
+    }
+
+    #[tokio::test]
+    async fn promotion_read_failure_preserves_rules_and_memory() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let rules_path = dir.path().join("learned-rules.md");
+        std::fs::create_dir(&rules_path).map_err(|error| error.to_string())?;
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let typed = TypedMemoryStore::new(store.clone());
+        typed
+            .put_typed(
+                WARM_NAMESPACE,
+                "eligible",
+                "original",
+                high_conf_project_fact(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let promoter = RulePromoter::new(store.clone()).with_rules_path(rules_path.clone());
+        let proposal = RuleProposal {
+            memory_key: "eligible".to_string(),
+            namespace: WARM_NAMESPACE
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            rule_text: "- preserve existing rules".to_string(),
+            confidence: 0.99,
+            memory_type: MemoryType::ProjectFact,
+            proposed_at: Utc::now(),
+            reason: "test".to_string(),
+        };
+
+        assert!(
+            promoter
+                .promote_rule(&proposal, &RecordingChangeLog { fail: false })
+                .await
+                .is_err()
+        );
+        assert!(rules_path.is_dir());
+        let memory = typed
+            .get_typed(WARM_NAMESPACE, "eligible")
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "promoted memory disappeared after read failure".to_string())?;
+        assert_eq!(memory.content, "original");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promotion_audit_failure_rolls_back_file_and_memory() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let rules_path = dir.path().join("learned-rules.md");
+        std::fs::write(&rules_path, "# Existing\n").map_err(|error| error.to_string())?;
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let typed = TypedMemoryStore::new(store.clone());
+        typed
+            .put_typed(
+                WARM_NAMESPACE,
+                "eligible",
+                "original",
+                high_conf_project_fact(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let promoter = RulePromoter::new(store.clone()).with_rules_path(rules_path.clone());
+        let proposal = RuleProposal {
+            memory_key: "eligible".to_string(),
+            namespace: WARM_NAMESPACE
+                .iter()
+                .map(|value| value.to_string())
+                .collect(),
+            rule_text: "- new rule".to_string(),
+            confidence: 0.99,
+            memory_type: MemoryType::ProjectFact,
+            proposed_at: Utc::now(),
+            reason: "test".to_string(),
+        };
+
+        assert!(
+            promoter
+                .promote_rule(&proposal, &RecordingChangeLog { fail: true })
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&rules_path).map_err(|error| error.to_string())?,
+            "# Existing\n"
+        );
+        let memory = typed
+            .get_typed(WARM_NAMESPACE, "eligible")
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "promoted memory disappeared after audit failure".to_string())?;
+        assert_eq!(memory.content, "original");
+        Ok(())
     }
 }

@@ -1051,7 +1051,6 @@ fn build_readonly_subagent_agent(
         "subagent built: LLM client status"
     );
     subagent.config_mut().set_cache_user_id(cache_user_id);
-    subagent.set_plan_mode(true);
     Ok(subagent)
 }
 

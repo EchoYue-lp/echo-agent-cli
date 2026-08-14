@@ -299,10 +299,12 @@ impl InstructionProvider {
     /// Save auto-promoted rules to the learned-rules file.
     pub fn save_agents_instructions(content: &str) -> std::io::Result<()> {
         let path = Self::agents_instructions_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(path, content)
+        Self::save_agents_instructions_at(&path, content)
+    }
+
+    /// Save auto-promoted rules to one previously resolved authority path.
+    pub fn save_agents_instructions_at(path: &Path, content: &str) -> std::io::Result<()> {
+        echo_core::utils::fs::atomic_write(path, content.as_bytes())
     }
 }
 

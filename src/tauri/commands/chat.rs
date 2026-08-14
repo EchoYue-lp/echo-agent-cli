@@ -626,7 +626,6 @@ pub async fn send_chat_message(
     let cleanup_key = message_key.clone();
     let active_chat_turns = state.app_state.session.active_chat_turns.clone();
     let active_turn_key_for_cleanup = active_turn_key.clone();
-    let cancel_for_status = cancel_token.clone();
     // Build the prepared turn (instruction + input resources, mode hint folded
     // in, long pastes spilled to user-input artifacts). Replaces the old
     // (message, multimodal_message) pair handed to drive_chat.
@@ -687,12 +686,9 @@ pub async fn send_chat_message(
         let outcome =
             echo_agent_app_core::chat_driver::drive_chat(&agent_handle_clone, &prepared_turn, res)
                 .await;
-        let terminal_status = if cancel_for_status.is_cancelled() {
-            "cancelled"
-        } else if outcome.is_ok() {
-            "completed"
-        } else {
-            "failed"
+        let terminal_status = match &outcome {
+            Ok(outcome) => outcome.status(),
+            Err(_) => "failed",
         };
         if let Err(e) = &outcome {
             tracing::warn!(error = %e, "drive_chat chat turn errored");

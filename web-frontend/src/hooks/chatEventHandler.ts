@@ -139,9 +139,10 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'error': {
       ctx.isCancelledRef.current = true;
-      store.setRunStatus('failed');
       if (ctx.assistantIdRef.current) {
-        store.finalizeAssistantMessage(ctx.assistantIdRef.current, `[Error] ${event.message}`);
+        store.failAssistantMessage(ctx.assistantIdRef.current, event.message);
+      } else {
+        store.setRunStatus('failed');
       }
       ctx.assistantIdRef.current = null;
       ctx.currentMessageKeyRef.current = null;

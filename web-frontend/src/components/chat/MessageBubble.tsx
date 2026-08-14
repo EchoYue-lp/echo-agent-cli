@@ -12,7 +12,7 @@ import { useChatStore } from '../../stores/chatStore';
 
 interface MessageBubbleProps {
   message: ChatMessage;
-  onRegenerate?: () => void;
+  onRegenerate?: (messageId: string) => void;
   onEditAndResend?: (messageId: string, newContent: string) => void;
 }
 
@@ -390,7 +390,7 @@ export const MessageBubble = memo(function MessageBubble({
                       <ActionButton
                         icon={<RefreshCw size={13} />}
                         label="重新生成"
-                        onClick={onRegenerate}
+                        onClick={() => onRegenerate(message.id)}
                       />
                     )}
                   </div>

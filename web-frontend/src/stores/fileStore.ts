@@ -15,6 +15,7 @@ export interface FileDocument {
   dirty: boolean;
   editing: boolean;
   conflict: boolean;
+  stale: boolean;
 }
 
 interface FileStore {
@@ -28,6 +29,7 @@ interface FileStore {
   saving: boolean;
   error: string | null;
   viewMode: 'content' | 'edit' | 'diff';
+  generation: number;
   loadTree: (depth?: number) => Promise<void>;
   loadChanges: () => Promise<void>;
   selectFile: (path: string, forceReload?: boolean) => Promise<void>;
@@ -39,6 +41,7 @@ interface FileStore {
   refreshSelectedFromDisk: () => Promise<void>;
   closeFile: (path: string, force?: boolean) => boolean;
   clearError: () => void;
+  markWorkspaceChanged: () => void;
 }
 
 export type { FileEntry, FileContent, FileTreeNode, DiffHunk, WorkspaceChange };
@@ -54,32 +57,40 @@ export const useFileStore = create<FileStore>((set, get) => ({
   saving: false,
   error: null,
   viewMode: 'content',
+  generation: 0,
 
   loadTree: async (depth = 4) => {
     set({ loading: true, error: null });
+    const generation = get().generation;
     try {
       const tree = await filesApi.tree(depth);
+      if (get().generation !== generation) return;
       set({ tree, loading: false });
     } catch (error) {
+      if (get().generation !== generation) return;
       set({ error: errorMessage(error), loading: false });
     }
   },
 
   loadChanges: async () => {
+    const generation = get().generation;
     try {
-      set({ changes: await filesApi.changes() });
+      const changes = await filesApi.changes();
+      if (get().generation !== generation) return;
+      set({ changes });
     } catch (error) {
+      if (get().generation !== generation) return;
       set({ error: errorMessage(error) });
     }
   },
 
   selectFile: async (path, forceReload = false) => {
     const existing = get().documents[path];
-    if (existing && !forceReload) {
+    if (existing && !forceReload && !existing.stale) {
       set({ selectedFile: path, viewMode: existing.editing ? 'edit' : 'content', error: null });
       return;
     }
-    if (existing?.dirty && forceReload) {
+    if (existing?.dirty && (forceReload || existing.stale)) {
       set((state) => ({
         selectedFile: path,
         documents: {
@@ -92,8 +103,10 @@ export const useFileStore = create<FileStore>((set, get) => ({
     }
 
     set({ selectedFile: path, loading: true, error: null, diffHunks: [], viewMode: 'content' });
+    const generation = get().generation;
     try {
       const file = await filesApi.read(path);
+      if (get().generation !== generation) return;
       set((state) => ({
         openFiles: state.openFiles.includes(path) ? state.openFiles : [...state.openFiles, path],
         documents: {
@@ -104,22 +117,26 @@ export const useFileStore = create<FileStore>((set, get) => ({
             dirty: false,
             editing: false,
             conflict: false,
+            stale: false,
           },
         },
         loading: false,
       }));
     } catch (error) {
+      if (get().generation !== generation) return;
       set({ error: errorMessage(error), loading: false });
     }
   },
 
   loadDiff: async (path, gitRef = 'HEAD') => {
     set({ selectedFile: path, loading: true, error: null, viewMode: 'diff' });
+    const generation = get().generation;
     try {
       const [data, file] = await Promise.all([
         filesApi.diff(path, gitRef),
         get().documents[path] ? Promise.resolve(null) : filesApi.read(path).catch(() => null),
       ]);
+      if (get().generation !== generation) return;
       set((state) => ({
         openFiles: state.openFiles.includes(path) ? state.openFiles : [...state.openFiles, path],
         documents: file
@@ -131,6 +148,7 @@ export const useFileStore = create<FileStore>((set, get) => ({
                 dirty: false,
                 editing: false,
                 conflict: false,
+                stale: false,
               },
             }
           : state.documents,
@@ -138,6 +156,7 @@ export const useFileStore = create<FileStore>((set, get) => ({
         loading: false,
       }));
     } catch (error) {
+      if (get().generation !== generation) return;
       set({ error: errorMessage(error), loading: false });
     }
   },
@@ -181,9 +200,20 @@ export const useFileStore = create<FileStore>((set, get) => ({
     if (!selectedFile) return false;
     const document = get().documents[selectedFile];
     if (!document || !document.dirty || document.file.kind !== 'text') return true;
+    if (document.stale) {
+      set({ error: '工作区已变化，请先恢复当前工作区的磁盘版本', saving: false });
+      return false;
+    }
     set({ saving: true, error: null });
+    const generation = get().generation;
     try {
-      const file = await filesApi.write(selectedFile, document.draft, document.file.revision);
+      const file = await filesApi.write(
+        selectedFile,
+        document.draft,
+        document.file.workspace_id,
+        document.file.revision
+      );
+      if (get().generation !== generation) return false;
       set((state) => {
         const current = state.documents[selectedFile];
         if (!current) return { saving: false };
@@ -198,6 +228,7 @@ export const useFileStore = create<FileStore>((set, get) => ({
               dirty: editedDuringSave,
               editing: true,
               conflict: false,
+              stale: false,
             },
           },
         };
@@ -213,7 +244,7 @@ export const useFileStore = create<FileStore>((set, get) => ({
           ...state.documents,
           [selectedFile]: {
             ...(state.documents[selectedFile] ?? document),
-            conflict: message.includes('changed on disk'),
+            conflict: message.includes('changed on disk') || message.includes('Workspace changed'),
           },
         },
       }));
@@ -237,10 +268,18 @@ export const useFileStore = create<FileStore>((set, get) => ({
     if (!selectedFile) return;
     const document = get().documents[selectedFile];
     if (!document) return;
+    const generation = get().generation;
     try {
       const file = await filesApi.read(selectedFile);
+      if (get().generation !== generation) return;
       const latest = get().documents[selectedFile];
-      if (!latest || latest.file.revision !== document.file.revision) return;
+      if (
+        !latest ||
+        latest.file.revision !== document.file.revision ||
+        latest.file.workspace_id !== document.file.workspace_id ||
+        file.workspace_id !== document.file.workspace_id
+      )
+        return;
       if (file.revision === latest.file.revision) return;
       if (latest.dirty) {
         set((state) => {
@@ -277,11 +316,13 @@ export const useFileStore = create<FileStore>((set, get) => ({
               dirty: false,
               editing: current.editing,
               conflict: false,
+              stale: false,
             },
           },
         };
       });
     } catch (error) {
+      if (get().generation !== generation) return;
       set({ error: errorMessage(error) });
     }
   },
@@ -299,4 +340,22 @@ export const useFileStore = create<FileStore>((set, get) => ({
   },
 
   clearError: () => set({ error: null }),
+
+  markWorkspaceChanged: () =>
+    set((state) => ({
+      generation: state.generation + 1,
+      tree: [],
+      changes: [],
+      diffHunks: [],
+      loading: false,
+      saving: false,
+      documents: Object.fromEntries(
+        Object.entries(state.documents).map(([path, document]) => [
+          path,
+          { ...document, stale: true, conflict: true },
+        ])
+      ),
+      error:
+        Object.keys(state.documents).length > 0 ? '工作区已变化，已打开的文件需要重新加载' : null,
+    })),
 }));

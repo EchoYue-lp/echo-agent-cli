@@ -163,6 +163,7 @@ async fn run_desktop() -> anyhow::Result<()> {
     // ── Config watcher ──
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let config_path = config_watcher::resolve_config_path(args.config.as_deref());
+    let config_save_path = config_watcher::resolve_config_save_path(args.config.as_deref());
     config_watcher::spawn_config_watcher(
         config_path,
         agent_handle.clone(),
@@ -190,6 +191,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         conversation_store,
         app_config.clone(),
     )
+    .with_config_path(config_save_path)
     .with_review_integration(runtime.review_integration.clone())
     .with_prompt_assembly(runtime.prompt_assembly.clone())
     .with_plugin_runtime(Some(runtime.plugin_runtime.clone()));

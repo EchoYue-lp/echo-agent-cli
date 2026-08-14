@@ -21,6 +21,7 @@ pub struct FileEntry {
 
 #[derive(Debug, Serialize)]
 pub struct FileContent {
+    pub workspace_id: String,
     pub path: String,
     pub content: String,
     pub size: u64,
@@ -146,8 +147,8 @@ pub async fn read_file(
     state: tauri::State<'_, TauriState>,
     path: String,
 ) -> Result<FileContent, IpcError> {
-    let base = get_workspace_root(&state).await;
-    read_workspace_file(&base, path)
+    let scope = get_workspace_scope(&state).await;
+    read_workspace_file(&scope.root, &scope.id, path)
 }
 
 #[tauri::command]
@@ -155,18 +156,33 @@ pub async fn write_file(
     state: tauri::State<'_, TauriState>,
     path: String,
     content: String,
+    expected_workspace_id: String,
     expected_revision: String,
 ) -> Result<FileContent, IpcError> {
-    let base = get_workspace_root(&state).await;
-    write_workspace_file(&base, path, content, expected_revision)
+    let scope = get_workspace_scope(&state).await;
+    write_workspace_file(
+        &scope.root,
+        &scope.id,
+        path,
+        content,
+        expected_workspace_id,
+        expected_revision,
+    )
 }
 
 fn write_workspace_file(
     base: &std::path::Path,
+    workspace_id: &str,
     path: String,
     content: String,
+    expected_workspace_id: String,
     expected_revision: String,
 ) -> Result<FileContent, IpcError> {
+    if workspace_id != expected_workspace_id {
+        return Err(IpcError::Validation(
+            "Workspace changed; reload the file before saving".to_string(),
+        ));
+    }
     let target = base.join(&path);
     crate::tauri::path_validator::validate_within_base(&target, base)
         .map_err(IpcError::Validation)?;
@@ -179,32 +195,18 @@ fn write_workspace_file(
         ));
     }
 
-    let current = std::fs::read(&target).map_err(|error| IpcError::Internal(error.to_string()))?;
-    if file_revision(&current) != expected_revision {
+    let replaced =
+        echo_core::utils::fs::atomic_compare_and_swap(&target, content.as_bytes(), |current| {
+            file_revision(current) == expected_revision
+        })
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if !replaced {
         return Err(IpcError::Validation(
             "File changed on disk; reload it before saving".to_string(),
         ));
     }
 
-    let parent = target
-        .parent()
-        .ok_or_else(|| IpcError::Validation("File has no parent directory".to_string()))?;
-    let file_name = target
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| IpcError::Validation("File name is not valid UTF-8".to_string()))?;
-    let temporary = parent.join(format!(".{file_name}.eko-{}.tmp", uuid::Uuid::new_v4()));
-    std::fs::write(&temporary, content.as_bytes())
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
-    if let Ok(metadata) = std::fs::metadata(&target) {
-        let _ = std::fs::set_permissions(&temporary, metadata.permissions());
-    }
-    if let Err(error) = std::fs::rename(&temporary, &target) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(IpcError::Internal(error.to_string()));
-    }
-
-    read_workspace_file(base, path)
+    read_workspace_file(base, workspace_id, path)
 }
 
 #[tauri::command]
@@ -222,7 +224,10 @@ pub async fn workspace_changes(
     .map_err(|error| IpcError::Internal(format!("git status task failed: {error}")))?
     .map_err(|error| IpcError::Internal(error.to_string()))?;
     if !output.status.success() {
-        return Ok(Vec::new());
+        return Err(IpcError::Internal(format!(
+            "git status failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
     }
 
     Ok(parse_workspace_changes(&String::from_utf8_lossy(
@@ -293,18 +298,44 @@ pub async fn diff_file(
         let base = base.clone();
         let ref_str = ref_str.clone();
         let path = path.clone();
-        tokio::task::spawn_blocking(move || {
-            let output = std::process::Command::new("git")
-                .args(["show", &format!("{}:{}", ref_str, path)])
+        tokio::task::spawn_blocking(move || -> Result<String, IpcError> {
+            let commit = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", &format!("{ref_str}^{{commit}}")])
                 .current_dir(&base)
-                .output();
-            match output {
-                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-                _ => String::new(),
+                .output()
+                .map_err(|error| IpcError::Internal(format!("git rev-parse failed: {error}")))?;
+            if !commit.status.success() {
+                return Err(IpcError::Validation(format!(
+                    "invalid git reference: {}",
+                    String::from_utf8_lossy(&commit.stderr).trim()
+                )));
             }
+            let object = format!("{ref_str}:{path}");
+            let exists = std::process::Command::new("git")
+                .args(["cat-file", "-e", &object])
+                .current_dir(&base)
+                .output()
+                .map_err(|error| IpcError::Internal(format!("git cat-file failed: {error}")))?;
+            if !exists.status.success() {
+                return Ok(String::new());
+            }
+            let output = std::process::Command::new("git")
+                .args(["show", &object])
+                .current_dir(&base)
+                .output()
+                .map_err(|error| IpcError::Internal(format!("git show failed: {error}")))?;
+            if !output.status.success() {
+                return Err(IpcError::Internal(format!(
+                    "git show failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            String::from_utf8(output.stdout).map_err(|error| {
+                IpcError::Validation(format!("git object is not UTF-8 text: {error}"))
+            })
         })
         .await
-        .unwrap_or_default()
+        .map_err(|error| IpcError::Internal(format!("git diff task failed: {error}")))??
     };
 
     use similar::{ChangeTag, TextDiff};
@@ -394,7 +425,6 @@ pub async fn file_tree(
 #[tauri::command]
 pub async fn browse_directories(path: Option<String>) -> Result<BrowseResult, IpcError> {
     let home = dirs_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-    let home_canonical = home.canonicalize().unwrap_or_else(|_| home.clone());
 
     let target = if let Some(ref p) = path {
         std::path::PathBuf::from(p)
@@ -402,19 +432,15 @@ pub async fn browse_directories(path: Option<String>) -> Result<BrowseResult, Ip
         home.clone()
     };
 
-    let target = if target.exists() && target.is_dir() {
-        target
-    } else {
-        home.clone()
-    };
-
-    let canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
-
-    if !canonical.starts_with(&home_canonical) && canonical != home_canonical {
-        return Err(IpcError::Validation(
-            "Access denied: cannot browse outside home directory".to_string(),
-        ));
+    if !target.is_dir() {
+        return Err(IpcError::Validation(format!(
+            "Directory does not exist: {}",
+            target.display()
+        )));
     }
+    let canonical = target
+        .canonicalize()
+        .map_err(|error| IpcError::Validation(format!("Cannot resolve directory: {error}")))?;
 
     let parent = canonical.parent().map(|p| p.to_string_lossy().to_string());
 
@@ -449,10 +475,28 @@ pub async fn browse_directories(path: Option<String>) -> Result<BrowseResult, Ip
 // ── Helpers ────────────────────────────────────────────────────────
 
 async fn get_workspace_root(state: &TauriState) -> std::path::PathBuf {
-    if let Some(ws) = state.app_state.current_workspace().await {
-        ws.project_root.unwrap_or(ws.root)
+    get_workspace_scope(state).await.root
+}
+
+struct WorkspaceScope {
+    id: String,
+    root: std::path::PathBuf,
+}
+
+async fn get_workspace_scope(state: &TauriState) -> WorkspaceScope {
+    let (namespace, root) = if let Some(workspace) = state.app_state.current_workspace().await {
+        let namespace = format!("workspace:{}", workspace.id);
+        let root = workspace.project_root.unwrap_or(workspace.root);
+        (namespace, root)
     } else {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        ("global".to_string(), root)
+    };
+    let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
+    let root_hash = hex::encode(Sha256::digest(canonical_root.to_string_lossy().as_bytes()));
+    WorkspaceScope {
+        id: format!("{namespace}:{root_hash}"),
+        root: canonical_root,
     }
 }
 
@@ -481,7 +525,11 @@ fn detect_language(path: &str) -> Option<String> {
     Some(lang.to_string())
 }
 
-fn read_workspace_file(base: &std::path::Path, path: String) -> Result<FileContent, IpcError> {
+fn read_workspace_file(
+    base: &std::path::Path,
+    workspace_id: &str,
+    path: String,
+) -> Result<FileContent, IpcError> {
     let target = base.join(&path);
     crate::tauri::path_validator::validate_within_base(&target, base)
         .map_err(IpcError::Validation)?;
@@ -505,6 +553,7 @@ fn read_workspace_file(base: &std::path::Path, path: String) -> Result<FileConte
 
     match preview_type {
         Some((kind, mime_type)) => Ok(FileContent {
+            workspace_id: workspace_id.to_string(),
             path,
             content: String::new(),
             size: metadata.len(),
@@ -519,6 +568,7 @@ fn read_workspace_file(base: &std::path::Path, path: String) -> Result<FileConte
         }),
         None if metadata.len() <= MAX_TEXT_BYTES => match String::from_utf8(bytes) {
             Ok(content) => Ok(FileContent {
+                workspace_id: workspace_id.to_string(),
                 language: detect_language(&path),
                 path,
                 content,
@@ -528,14 +578,30 @@ fn read_workspace_file(base: &std::path::Path, path: String) -> Result<FileConte
                 data_url: None,
                 revision,
             }),
-            Err(_) => Ok(binary_file_content(path, metadata.len(), revision)),
+            Err(_) => Ok(binary_file_content(
+                workspace_id,
+                path,
+                metadata.len(),
+                revision,
+            )),
         },
-        None => Ok(binary_file_content(path, metadata.len(), revision)),
+        None => Ok(binary_file_content(
+            workspace_id,
+            path,
+            metadata.len(),
+            revision,
+        )),
     }
 }
 
-fn binary_file_content(path: String, size: u64, revision: String) -> FileContent {
+fn binary_file_content(
+    workspace_id: &str,
+    path: String,
+    size: u64,
+    revision: String,
+) -> FileContent {
     FileContent {
+        workspace_id: workspace_id.to_string(),
         path,
         content: String::new(),
         size,
@@ -704,18 +770,54 @@ mod tests {
         let target = base.join(&path);
         std::fs::write(&target, "first")?;
 
-        let initial = read_workspace_file(&base, path.clone())
+        let initial = read_workspace_file(&base, "workspace:a", path.clone())
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-        let saved =
-            write_workspace_file(&base, path.clone(), "second".to_string(), initial.revision)
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let saved = write_workspace_file(
+            &base,
+            "workspace:a",
+            path.clone(),
+            "second".to_string(),
+            initial.workspace_id,
+            initial.revision,
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
         assert_eq!(saved.content, "second");
 
         std::fs::write(&target, "external")?;
-        let stale_save = write_workspace_file(&base, path, "third".to_string(), saved.revision);
+        let stale_save = write_workspace_file(
+            &base,
+            "workspace:a",
+            path,
+            "third".to_string(),
+            saved.workspace_id,
+            saved.revision,
+        );
         assert!(matches!(stale_save, Err(IpcError::Validation(_))));
         assert_eq!(std::fs::read_to_string(&target)?, "external");
 
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn refuses_to_write_a_draft_from_another_workspace() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join(format!("eko-file-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base)?;
+        let target = base.join("same.txt");
+        std::fs::write(&target, "same bytes")?;
+        let revision = file_revision(b"same bytes");
+
+        let result = write_workspace_file(
+            &base,
+            "workspace:b",
+            "same.txt".to_string(),
+            "wrong workspace".to_string(),
+            "workspace:a".to_string(),
+            revision,
+        );
+
+        assert!(matches!(result, Err(IpcError::Validation(_))));
+        assert_eq!(std::fs::read_to_string(&target)?, "same bytes");
         std::fs::remove_dir_all(base)?;
         Ok(())
     }

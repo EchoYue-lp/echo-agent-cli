@@ -430,6 +430,22 @@ export const conversationApi = {
           messages: data.messages,
         })
       : put<{ success: boolean }>(`/conversations/${id}`, data),
+  branch: (id: string, userTurnIndex: number) =>
+    isTauri()
+      ? apiInvoke<{
+          success: boolean;
+          id: string;
+          source_id: string;
+          message_count: number;
+          target_content: string;
+        }>('branch_conversation', { id, userTurnIndex, user_turn_index: userTurnIndex })
+      : post<{
+          success: boolean;
+          id: string;
+          source_id: string;
+          message_count: number;
+          target_content: string;
+        }>(`/conversations/${id}/branch`, { user_turn_index: userTurnIndex }),
   delete: (id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('delete_conversation', { id })
@@ -759,6 +775,7 @@ export interface FileTreeNode {
 }
 
 export interface FileContent {
+  workspace_id: string;
   path: string;
   content: string;
   size: number;
@@ -805,11 +822,17 @@ export const filesApi = {
     isTauri()
       ? apiInvoke<FileContent>('read_file', { path })
       : get<FileContent>(`/files/read?path=${encodeURIComponent(path)}`),
-  write: (path: string, content: string, expectedRevision: string) =>
+  write: (path: string, content: string, expectedWorkspaceId: string, expectedRevision: string) =>
     isTauri()
-      ? apiInvoke<FileContent>('write_file', { path, content, expectedRevision })
+      ? apiInvoke<FileContent>('write_file', {
+          path,
+          content,
+          expectedWorkspaceId,
+          expectedRevision,
+        })
       : put<FileContent>(`/files/write?path=${encodeURIComponent(path)}`, {
           content,
+          expected_workspace_id: expectedWorkspaceId,
           expected_revision: expectedRevision,
         }),
   diff: (path: string, gitRef = 'HEAD') =>
@@ -968,10 +991,6 @@ export const terminalApi = {
     isTauri()
       ? apiInvoke<TerminalSession>('create_terminal', { id: `term-${Date.now()}`, cwd })
       : post<TerminalSession>('/terminal', { cwd }),
-  confirmConsent: (id: string) =>
-    isTauri()
-      ? apiInvoke<{ success: boolean; consented: boolean }>('confirm_terminal_consent', { id })
-      : Promise.resolve({ success: true, consented: true }),
   close: (id: string) =>
     isTauri()
       ? apiInvoke<{ closed: string }>('close_terminal', { id })
@@ -1421,6 +1440,10 @@ export const workspaceApi = {
     isTauri()
       ? apiInvoke<{ success: boolean; workspace: Workspace }>('switch_workspace', { id })
       : post<{ success: boolean; workspace: Workspace }>(`/workspaces/${id}/switch`, {}),
+  exit: () =>
+    isTauri()
+      ? apiInvoke<{ success: boolean }>('exit_workspace')
+      : post<{ success: boolean }>('/workspaces/exit', {}),
   delete: (id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('delete_workspace', { id })

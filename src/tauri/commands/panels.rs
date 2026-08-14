@@ -122,12 +122,34 @@ pub async fn add_permission_rule(
         source: source.unwrap_or_else(|| "manual".to_string()),
     };
 
+    let framework_rule = rule.to_framework_rule().map_err(IpcError::Validation)?;
+    let permission_service = state
+        .app_state
+        .connection
+        .agent
+        .read(|agent| agent.permission_service().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("Permission service not available".to_string()))?;
+
     let mut rules = state.app_state.config.permission_rules.write().await;
-    if let Some(existing) = rules.iter_mut().find(|r| r.matcher == matcher) {
+    let previous = rules
+        .iter()
+        .find(|candidate| candidate.matcher == matcher)
+        .cloned();
+    if let Some(existing) = rules
+        .iter_mut()
+        .find(|candidate| candidate.matcher == matcher)
+    {
         *existing = rule;
     } else {
         rules.push(rule);
     }
+    drop(rules);
+    if let Some(previous) = previous {
+        let previous = previous.to_framework_rule().map_err(IpcError::Validation)?;
+        permission_service.remove_rule(&previous).await;
+    }
+    permission_service.add_rule(framework_rule).await;
 
     Ok(serde_json::json!({"success": true}))
 }
@@ -137,7 +159,15 @@ pub async fn remove_permission_rule(
     state: tauri::State<'_, TauriState>,
     matcher: String,
 ) -> Result<serde_json::Value, IpcError> {
+    let permission_service = state
+        .app_state
+        .connection
+        .agent
+        .read(|agent| agent.permission_service().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("Permission service not available".to_string()))?;
     let mut rules = state.app_state.config.permission_rules.write().await;
+    let removed_rule = rules.iter().find(|rule| rule.matcher == matcher).cloned();
     let before = rules.len();
     rules.retain(|r| r.matcher != matcher);
     let removed = before - rules.len();
@@ -148,6 +178,12 @@ pub async fn remove_permission_rule(
             matcher
         )));
     }
+    drop(rules);
+    let framework_rule = removed_rule
+        .ok_or_else(|| IpcError::NotFound(format!("Permission rule '{}' not found", matcher)))?
+        .to_framework_rule()
+        .map_err(IpcError::Validation)?;
+    permission_service.remove_rule(&framework_rule).await;
 
     Ok(serde_json::json!({"success": true, "removed": removed}))
 }

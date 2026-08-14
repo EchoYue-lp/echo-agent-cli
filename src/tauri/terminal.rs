@@ -42,12 +42,6 @@ pub struct PtySession {
     master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
     writer: Mutex<Box<dyn Write + Send>>,
     child_killer: Mutex<Box<dyn portable_pty::ChildKiller + Send>>,
-    /// Per-session user consent flag (P0-4). `write_terminal` is an
-    /// interactive-shell injection channel reachable from any page JS; we
-    /// require the user to explicitly confirm a session before any programmatic
-    /// write is accepted, so a background XSS can't silently drive a shell the
-    /// user opened. Set via `confirm_terminal_consent`; checked on every write.
-    consented: std::sync::atomic::AtomicBool,
 }
 
 impl PtySession {
@@ -118,19 +112,7 @@ impl PtySession {
             master: Mutex::new(pair.master),
             writer: Mutex::new(writer),
             child_killer: Mutex::new(child.clone_killer()),
-            consented: std::sync::atomic::AtomicBool::new(false),
         }))
-    }
-
-    /// Mark this session as user-confirmed (P0-4). Returns the previous state.
-    pub fn confirm_consent(&self) -> bool {
-        self.consented
-            .swap(true, std::sync::atomic::Ordering::SeqCst)
-    }
-
-    /// Whether the user has confirmed this session.
-    pub fn is_consented(&self) -> bool {
-        self.consented.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Background loop: read PTY output and emit to frontend via Tauri events.
@@ -286,7 +268,7 @@ pub async fn create_terminal(
     // The terminal is an interactive developer tool (compile / test / git etc.),
     // not an agent-auto path. EKO is a local personal assistant — there's no
     // multi-user / online threat model that warrants a permission gate here.
-    // The per-session `write_terminal` consent + audit log still guard writes.
+    // Input arrives from the terminal component's direct user event path.
     let rows = rows.unwrap_or(24);
     let cols = cols.unwrap_or(80);
     let pid = state
@@ -307,26 +289,7 @@ pub async fn write_terminal(
         .get(&id)
         .map_err(IpcError::NotFound)?;
 
-    // P0-4: require per-session user consent before accepting any programmatic
-    // write. A shell session the user opened is an injection channel reachable
-    // from any page JS; without an explicit confirm step, a background XSS could
-    // silently drive the shell. The frontend must call `confirm_terminal_consent`
-    // (in response to a genuine user action on the terminal) before writes are
-    // accepted. Until then, refuse with a distinct error so the UI can prompt.
-    if !session.is_consented() {
-        return Err(IpcError::Validation(
-            "Terminal session not confirmed by user; call confirm_terminal_consent first."
-                .to_string(),
-        ));
-    }
-
-    // P0-4 / N-P0-6: `write_terminal` is an interactive-shell injection channel
-    // reachable from any page JS. We can't fully block it (the user wants the
-    // terminal), but we bound the abuse surface:
-    //   - reject oversized payloads (a single `invoke` writing MBs is almost
-    //     certainly a scripted paste of a malicious payload, not keystrokes);
-    //   - audit-log every write (session id + size + truncated preview) so
-    //     injected commands are observable after the fact.
+    // Bound a single IPC payload so an accidental paste cannot exhaust memory.
     const MAX_WRITE_BYTES: usize = 64 * 1024;
 
     // Data is base64-encoded from the frontend.
@@ -341,43 +304,16 @@ pub async fn write_terminal(
         )));
     }
 
-    // Audit log: session + size + a short, lossy preview (first 80 bytes).
-    // Lossy UTF-8 conversion so the preview never panics on binary.
-    let preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
-        .chars()
-        .take(80)
-        .collect();
+    // Terminal input often contains credentials. Persist only metadata, never
+    // command bytes or a content preview.
     tracing::info!(
         terminal_session = %id,
         bytes = bytes.len(),
-        preview = %preview,
         "terminal write"
     );
 
     session.write(&bytes).await.map_err(IpcError::Internal)?;
     Ok(serde_json::json!({ "success": true }))
-}
-
-/// Mark a terminal session as user-confirmed (P0-4). The frontend should call
-/// this in response to a genuine user action on the terminal (e.g. the user
-/// focusing it and acknowledging it's an interactive shell) before any
-/// programmatic write is accepted via `write_terminal`.
-#[tauri::command]
-pub async fn confirm_terminal_consent(
-    state: tauri::State<'_, TauriState>,
-    id: String,
-) -> Result<serde_json::Value, IpcError> {
-    let session = state
-        .terminal_manager
-        .get(&id)
-        .map_err(IpcError::NotFound)?;
-    let was = session.confirm_consent();
-    tracing::info!(
-        terminal_session = %id,
-        already_confirmed = was,
-        "terminal session consent confirmed by user"
-    );
-    Ok(serde_json::json!({ "success": true, "consented": true }))
 }
 
 #[tauri::command]

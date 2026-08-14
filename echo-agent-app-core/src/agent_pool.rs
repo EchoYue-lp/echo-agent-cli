@@ -204,6 +204,8 @@ pub struct AgentPool {
     /// current workspace's memory store (not the stale shared.store captured
     /// at bootstrap). `None` means "use shared.store" (pre-switch behavior).
     memory_store_override: RwLock<Option<Arc<dyn echo_agent::memory::Store>>>,
+    /// Workspace-scoped conversation store used by existing and future agents.
+    conversation_store_override: RwLock<Option<Arc<dyn echo_agent::memory::ConversationStore>>>,
     /// Product-owned complete tool-output artifact policy for existing and
     /// future pooled agents. Updated together with workspace routing.
     tool_output_artifacts: RwLock<echo_agent::tools::artifact::ToolOutputArtifactConfig>,
@@ -250,6 +252,7 @@ impl AgentPool {
             skill_descriptors: RwLock::new(skill_descriptors),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            conversation_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(tool_output_artifacts),
             workspace_kind: RwLock::new(WorkspaceKind::General),
         };
@@ -588,6 +591,27 @@ impl AgentPool {
         tracing::info!(?kind, pooled_agents, "AgentPool: workspace routing applied");
     }
 
+    /// Rebind existing and future pooled agents to the active conversation store.
+    pub async fn apply_conversation_store(
+        &self,
+        store: Arc<dyn echo_agent::memory::ConversationStore>,
+    ) {
+        *self.conversation_store_override.write().await = Some(store.clone());
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect();
+        for handle in agents {
+            let store = store.clone();
+            handle
+                .write(|agent| agent.set_conversation_store(store))
+                .await;
+        }
+    }
+
     /// Rebind all pooled agents to a workspace-scoped memory store.
     ///
     /// Called after `switch_workspace` so that pooled agents (background +
@@ -845,6 +869,30 @@ impl AgentPool {
         tracing::info!(agents_cleared = count, "AgentPool: shutdown complete");
     }
 
+    /// Clear cached conversations before publishing another workspace generation.
+    pub async fn reset_for_workspace_transition(&self) -> anyhow::Result<()> {
+        let mut agents = self.agents.write().await;
+        for (conversation_id, pooled) in agents.iter() {
+            let Ok(agent) = pooled.handle.inner().try_read() else {
+                anyhow::bail!(
+                    "Cannot change workspace while pooled conversation {conversation_id} is busy"
+                );
+            };
+            if agent.execution_mutex().try_lock().is_err() {
+                anyhow::bail!(
+                    "Cannot change workspace while pooled conversation {conversation_id} is executing"
+                );
+            }
+        }
+        let count = agents.len();
+        agents.clear();
+        tracing::info!(
+            agents_cleared = count,
+            "AgentPool: cleared for workspace transition"
+        );
+        Ok(())
+    }
+
     /// Internal: create a new agent with shared resources injected.
     ///
     /// `conversation_id` is used both as the pool key and as the
@@ -929,7 +977,13 @@ impl AgentPool {
         if let Some(ref tep) = self.shared.tool_execution_pipeline {
             agent.set_tool_execution_pipeline(tep.clone());
         }
-        if let Some(ref cs) = self.shared.conversation_store {
+        let conversation_store = self
+            .conversation_store_override
+            .read()
+            .await
+            .clone()
+            .or_else(|| self.shared.conversation_store.clone());
+        if let Some(ref cs) = conversation_store {
             agent.set_conversation_store(cs.clone());
         }
         // Prefer the workspace-scoped override (set by apply_memory_store after
@@ -1313,6 +1367,7 @@ mod tests {
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            conversation_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
         })
@@ -1349,6 +1404,7 @@ mod tests {
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            conversation_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
         })

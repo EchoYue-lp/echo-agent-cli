@@ -15,6 +15,7 @@ vi.mock('../api/endpoints', () => ({
 import { useFileStore } from './fileStore';
 
 const initialFile = {
+  workspace_id: 'workspace:a',
   path: 'src/main.ts',
   content: 'const value = 1;\n',
   size: 17,
@@ -39,6 +40,7 @@ describe('fileStore', () => {
       saving: false,
       error: null,
       viewMode: 'content',
+      generation: 0,
     });
     mocks.read.mockResolvedValue(initialFile);
     mocks.tree.mockResolvedValue([]);
@@ -66,7 +68,12 @@ describe('fileStore', () => {
     useFileStore.getState().updateDraft('const value = 2;\n');
 
     expect(await useFileStore.getState().saveSelected()).toBe(true);
-    expect(mocks.write).toHaveBeenCalledWith(initialFile.path, 'const value = 2;\n', 'revision-1');
+    expect(mocks.write).toHaveBeenCalledWith(
+      initialFile.path,
+      'const value = 2;\n',
+      'workspace:a',
+      'revision-1'
+    );
     expect(useFileStore.getState().documents[initialFile.path]?.file.revision).toBe('revision-2');
   });
 
@@ -138,5 +145,35 @@ describe('fileStore', () => {
     const document = useFileStore.getState().documents[initialFile.path];
     expect(document?.draft).toBe('typed during refresh\n');
     expect(document?.conflict).toBe(true);
+  });
+
+  it('keeps a dirty draft stale and refuses to save after a workspace switch', async () => {
+    await useFileStore.getState().selectFile(initialFile.path);
+    useFileStore.getState().setViewMode('edit');
+    useFileStore.getState().updateDraft('workspace A draft\n');
+
+    useFileStore.getState().markWorkspaceChanged();
+
+    expect(await useFileStore.getState().saveSelected()).toBe(false);
+    const document = useFileStore.getState().documents[initialFile.path];
+    expect(document?.draft).toBe('workspace A draft\n');
+    expect(document?.stale).toBe(true);
+    expect(mocks.write).not.toHaveBeenCalled();
+  });
+
+  it('drops a late read result from the previous workspace generation', async () => {
+    let resolveRead: ((value: typeof initialFile) => void) | undefined;
+    mocks.read.mockReturnValue(
+      new Promise<typeof initialFile>((resolve) => {
+        resolveRead = resolve;
+      })
+    );
+
+    const select = useFileStore.getState().selectFile(initialFile.path);
+    useFileStore.getState().markWorkspaceChanged();
+    resolveRead?.(initialFile);
+    await select;
+
+    expect(useFileStore.getState().documents[initialFile.path]).toBeUndefined();
   });
 });

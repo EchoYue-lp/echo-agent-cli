@@ -2,6 +2,8 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use echo_agent::agent::Agent;
+use echo_agent::llm::types::{Message, Role};
 use echo_agent::memory::{NewConversation, StoredMessage};
 use echo_agent_app_core::persistence::{AttachmentsPayload, SavedMessage};
 use std::collections::BTreeMap;
@@ -149,6 +151,78 @@ fn project_saved_messages(
         .collect()
 }
 
+fn branch_prefix(
+    stored: &[StoredMessage],
+    user_turn_index: usize,
+    conversation_id: &str,
+) -> Result<Vec<StoredMessage>, IpcError> {
+    let mut current_user_index = 0usize;
+    let boundary = stored.iter().position(|message| {
+        if message.role != "user" {
+            return false;
+        }
+        if current_user_index == user_turn_index {
+            return true;
+        }
+        current_user_index = current_user_index.saturating_add(1);
+        false
+    });
+    let boundary = boundary.ok_or_else(|| {
+        IpcError::Validation(format!(
+            "user turn index {user_turn_index} is outside the canonical transcript"
+        ))
+    })?;
+    Ok(stored
+        .iter()
+        .take(boundary)
+        .cloned()
+        .map(|mut message| {
+            message.id = None;
+            message.conversation_id = conversation_id.to_string();
+            message.attachments_json = strip_branch_ui_references(message.attachments_json);
+            message
+        })
+        .collect())
+}
+
+fn strip_branch_ui_references(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Some(raw);
+    };
+    let Some(object) = value.as_object_mut() else {
+        return Some(raw);
+    };
+    // Tool execution details and message ids are scoped to the source
+    // conversation. Canonical framework projection fields remain untouched.
+    object.remove("message_id");
+    object.remove("execution_steps");
+    object.remove("execution_rounds");
+    serde_json::to_string(&value).ok().or(Some(raw))
+}
+
+async fn load_agent_transcript(
+    state: &TauriState,
+    conversation_id: &str,
+    stored: &[StoredMessage],
+) -> Result<usize, IpcError> {
+    let agent = state.app_state.connection.agent_for(conversation_id).await;
+    let mut messages = echo_agent::memory::restore_messages(stored)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let system_prompt = agent.read(|agent| agent.system_prompt().to_string()).await;
+    if !messages
+        .first()
+        .is_some_and(|message| message.role == Role::System)
+    {
+        messages.insert(0, Message::system(system_prompt));
+    }
+    let message_count = messages.len().saturating_sub(1);
+    agent
+        .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
+        .await;
+    Ok(message_count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,6 +240,84 @@ mod tests {
             execution_rounds: None,
             attachments: None,
         }
+    }
+
+    #[test]
+    fn branch_prefix_keeps_canonical_tool_history_and_rekeys_messages() -> anyhow::Result<()> {
+        let stored = [
+            ("user", "first"),
+            ("assistant", "tool call"),
+            ("tool", "result"),
+            ("assistant", "answer"),
+            ("user", "second"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, (role, content))| StoredMessage {
+            id: i64::try_from(index).ok(),
+            conversation_id: "source".to_string(),
+            role: role.to_string(),
+            content: Some(content.to_string()),
+            attachments_json: None,
+            tool_calls_json: (index == 1).then(|| "[]".to_string()),
+            tool_result_json: (role == "tool").then(|| "{}".to_string()),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        })
+        .collect::<Vec<_>>();
+
+        let prefix = branch_prefix(&stored, 1, "branch")?;
+        assert_eq!(prefix.len(), 4);
+        assert!(prefix.iter().any(|message| message.role == "tool"));
+        assert!(
+            prefix
+                .iter()
+                .all(|message| { message.id.is_none() && message.conversation_id == "branch" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_prefix_removes_source_scoped_ui_references() -> anyhow::Result<()> {
+        let stored = [StoredMessage {
+            id: Some(1),
+            conversation_id: "source".to_string(),
+            role: "assistant".to_string(),
+            content: Some("answer".to_string()),
+            attachments_json: Some(
+                serde_json::json!({
+                    "_echo_message_version": 1,
+                    "content": {"Text": "canonical"},
+                    "message_id": "source-message",
+                    "execution_steps": [{"type": "tool", "call_id": "call-1"}],
+                    "execution_rounds": [{"tool_call_ids": ["call-1"]}],
+                    "thinking_segments": ["kept"]
+                })
+                .to_string(),
+            ),
+            tool_calls_json: None,
+            tool_result_json: None,
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+
+        let raw = strip_branch_ui_references(
+            stored
+                .first()
+                .and_then(|message| message.attachments_json.clone()),
+        )
+        .ok_or_else(|| anyhow::anyhow!("branch projection missing"))?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        assert_eq!(
+            value.get("_echo_message_version"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            value.get("thinking_segments"),
+            Some(&serde_json::json!(["kept"]))
+        );
+        assert!(value.get("message_id").is_none());
+        assert!(value.get("execution_steps").is_none());
+        assert!(value.get("execution_rounds").is_none());
+        Ok(())
     }
 
     #[test]
@@ -410,6 +562,12 @@ pub async fn save_conversation(
     // Check if conversation exists
     let existing = store.get_conversation(&id).await.ok().flatten();
 
+    let is_new = existing.is_none();
+    if !is_new && !messages.is_empty() {
+        return Err(IpcError::Validation(
+            "conversation transcripts are owned by the Agent runtime".to_string(),
+        ));
+    }
     let conversation_id = if let Some(conv) = existing {
         store
             .update_conversation(&conv.conversation_id, Some(&title), None, None)
@@ -430,13 +588,11 @@ pub async fn save_conversation(
         conv.conversation_id
     };
 
-    let existing_messages = store
-        .get_messages(&conversation_id)
-        .await
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-    let stored = project_saved_messages(&conversation_id, messages, &existing_messages);
-
-    if !stored.is_empty() {
+    // Bootstrap messages are accepted only while creating a new conversation.
+    // Once it exists, the Agent runtime is the sole transcript writer; a GUI
+    // autosave must never replace a canonical tool/multimodal transcript.
+    if is_new && !messages.is_empty() {
+        let stored = project_saved_messages(&conversation_id, messages, &[]);
         store
             .save_messages(&conversation_id, &stored)
             .await
@@ -558,28 +714,105 @@ pub async fn update_conversation(
         .map_err(|e| IpcError::Internal(e.to_string()))?
         .ok_or_else(|| IpcError::NotFound(format!("Conversation '{}' not found", id)))?;
 
+    if messages.is_some() {
+        return Err(IpcError::Validation(
+            "conversation transcripts are owned by the Agent runtime".to_string(),
+        ));
+    }
+
     store
         .update_conversation(&conv.conversation_id, title.as_deref(), None, None)
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
 
-    if let Some(msgs) = messages {
-        let existing_messages = store
-            .get_messages(&conv.conversation_id)
-            .await
-            .map_err(|e| IpcError::Internal(e.to_string()))?;
-        let stored = if msgs.is_empty() {
-            Vec::new()
-        } else {
-            project_saved_messages(&conv.conversation_id, msgs, &existing_messages)
-        };
-        store
-            .save_messages(&conv.conversation_id, &stored)
-            .await
-            .map_err(|e| IpcError::Internal(e.to_string()))?;
+    Ok(serde_json::json!({"success": true}))
+}
+
+/// Create an immutable branch immediately before one persisted user turn.
+///
+/// Edit/regenerate callers resend that user turn against the returned
+/// conversation. The source transcript remains untouched and the new pooled
+/// Agent receives the exact canonical prefix, including prior tool messages.
+#[tauri::command]
+pub async fn branch_conversation(
+    state: tauri::State<'_, TauriState>,
+    id: String,
+    user_turn_index: usize,
+) -> Result<serde_json::Value, IpcError> {
+    if state.app_state.session.active_chat_turns.contains_key(&id) {
+        return Err(IpcError::Validation(
+            "cannot branch a conversation while its turn is active".to_string(),
+        ));
+    }
+    let store = state
+        .app_state
+        .storage
+        .conversation_store
+        .read()
+        .await
+        .clone()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let source = store
+        .get_conversation(&id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .ok_or_else(|| IpcError::NotFound(format!("Conversation '{id}' not found")))?;
+    let stored = store
+        .get_messages(&source.conversation_id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let target = stored
+        .iter()
+        .filter(|message| message.role == "user")
+        .nth(user_turn_index)
+        .ok_or_else(|| {
+            IpcError::Validation(format!(
+                "user turn index {user_turn_index} is outside the canonical transcript"
+            ))
+        })?;
+    let target_content = target
+        .attachments_json
+        .as_deref()
+        .and_then(AttachmentsPayload::parse)
+        .and_then(|payload| payload.display_content)
+        .or_else(|| target.content.clone())
+        .ok_or_else(|| {
+            IpcError::Validation(format!(
+                "user turn index {user_turn_index} has no text content"
+            ))
+        })?;
+    let branch_id = format!("conv-{}", uuid::Uuid::new_v4());
+    let prefix = branch_prefix(&stored, user_turn_index, &branch_id)?;
+    let title = source
+        .title
+        .as_deref()
+        .map(|title| format!("{title} (branch)"))
+        .unwrap_or_else(|| "Conversation branch".to_string());
+    store
+        .create_conversation(NewConversation {
+            conversation_id: branch_id.clone(),
+            user_id: source.user_id,
+            agent_type: source.agent_type,
+            title: Some(title),
+        })
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if let Err(error) = store.save_messages(&branch_id, &prefix).await {
+        let _ = store.delete_conversation(&branch_id).await;
+        return Err(IpcError::Internal(error.to_string()));
+    }
+    if let Err(error) = load_agent_transcript(&state, &branch_id, &prefix).await {
+        let _ = store.delete_conversation(&branch_id).await;
+        return Err(error);
     }
 
-    Ok(serde_json::json!({"success": true}))
+    Ok(serde_json::json!({
+        "success": true,
+        "id": branch_id,
+        "source_id": id,
+        "message_count": prefix.len(),
+        "target_content": target_content,
+    }))
 }
 
 #[tauri::command]
@@ -697,24 +930,7 @@ pub async fn restore_conversation(
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
 
-    let message_count = stored.len();
-
-    if !stored.is_empty() {
-        let messages = echo_agent::memory::restore_messages(&stored)
-            .map_err(|error| IpcError::Internal(error.to_string()))?;
-
-        if !messages.is_empty() {
-            // Route to pool agent for this conversation if pool is active
-            let agent = state.app_state.connection.agent_for(&id).await;
-            agent
-                .read_async(|a| {
-                    Box::pin(async move {
-                        a.load_messages(messages).await;
-                    })
-                })
-                .await;
-        }
-    }
+    let message_count = load_agent_transcript(&state, &id, &stored).await?;
 
     Ok(serde_json::json!({
         "success": true,

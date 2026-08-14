@@ -1365,9 +1365,9 @@ async fn dispatch_turn(
     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx));
     let mode_hint_str = turn.interaction_mode.prompt_hint().to_string();
-    // TUI has no workspace concept (same as its uploads dir at line ~2494), so
-    // long pastes spill to the global user-input artifact dir.
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
+    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
+        app.workspace_root.as_deref(),
+    );
     let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &turn.text,
@@ -1525,7 +1525,10 @@ fn handle_pasted_text(app: &mut TuiApp, text: &str) {
         size: u64::try_from(text.len()).unwrap_or(u64::MAX),
         source: AttachmentSource::Paste,
     };
-    match echo_agent_app_core::attachments::stage_attachment_data(&data, None) {
+    match echo_agent_app_core::attachments::stage_attachment_data(
+        &data,
+        app.workspace_root.as_deref(),
+    ) {
         Ok(reference) => {
             app.pending_attachments.push(reference);
             app.status_msg = format!(
@@ -1574,9 +1577,13 @@ fn paste_clipboard(app: &mut TuiApp) {
             image::ImageFormat::Png,
         );
         match saved.and_then(|()| {
-            stage_attachment(&mut app.pending_attachments, &path)
-                .map(|_| ())
-                .map_err(image::ImageError::IoError)
+            stage_attachment(
+                &mut app.pending_attachments,
+                &path,
+                app.workspace_root.as_deref(),
+            )
+            .map(|_| ())
+            .map_err(image::ImageError::IoError)
         }) {
             Ok(()) => {
                 app.status_msg = format!(
@@ -2522,15 +2529,16 @@ fn short_identifier(value: &str) -> String {
 /// Stage a local file as an attachment for the next TUI message (B5.3).
 ///
 /// Reads `path`, infers a MIME type from the extension, copies the file into
-/// the global uploads dir (`~/.eko/uploads/`, since the TUI has no
-/// workspace concept), and appends an [`AttachmentRef`] to `out`. The caller
+/// the active workspace uploads dir (or the global fallback), and appends an
+/// [`AttachmentRef`] to `out`. The caller
 /// (`handle_enter`) rebuilds a multimodal `Message` from the refs and passes it
 /// to `drive_chat`. Returns the display name + inferred MIME on success.
 fn stage_attachment(
     out: &mut Vec<echo_agent_app_core::attachments::AttachmentRef>,
     path: &std::path::Path,
+    workspace_root: Option<&std::path::Path>,
 ) -> std::io::Result<(String, String)> {
-    use echo_agent_app_core::attachments::{AttachmentRef, resolve_uploads_dir};
+    use echo_agent_app_core::attachments::stage_local_attachment;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -2538,41 +2546,10 @@ fn stage_attachment(
         .ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no filename")
         })?;
-    let bytes = std::fs::read(path)?;
-    let mime = infer_mime(&name);
-    // Persist under the global uploads dir so the ref's path stays valid for
-    // subagents that re-read it later (matches the GUI's per-workspace uploads,
-    // just global here).
-    let uploads_dir = resolve_uploads_dir(None);
-    std::fs::create_dir_all(&uploads_dir)?;
-    let file_name = format!("{}_{}", uuid::Uuid::new_v4(), name);
-    let dest = uploads_dir.join(file_name);
-    std::fs::write(&dest, &bytes)?;
-    out.push(AttachmentRef {
-        path: dest,
-        name: name.clone(),
-        mime_type: mime.clone(),
-        source: echo_agent_app_core::types::AttachmentSource::Upload,
-    });
+    let reference = stage_local_attachment(path, workspace_root).map_err(std::io::Error::other)?;
+    let mime = reference.mime_type.clone();
+    out.push(reference);
     Ok((name, mime))
-}
-
-/// Infer a MIME type from a filename extension (B5.3 TUI /attach). Defaults to
-/// `application/octet-stream` for unknown extensions. Image MIMEs route to
-/// `ContentPart::ImageUrl`; everything else to `ContentPart::File`.
-fn infer_mime(name: &str) -> String {
-    let ext = name.rsplit('.').next().map(|e| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("png") => "image/png".to_string(),
-        Some("jpg") | Some("jpeg") => "image/jpeg".to_string(),
-        Some("gif") => "image/gif".to_string(),
-        Some("webp") => "image/webp".to_string(),
-        Some("svg") => "image/svg+xml".to_string(),
-        Some("pdf") => "application/pdf".to_string(),
-        Some("txt") | Some("md") | Some("rs") | Some("py") | Some("ts") | Some("js")
-        | Some("json") | Some("toml") | Some("yaml") | Some("yml") => "text/plain".to_string(),
-        _ => "application/octet-stream".to_string(),
-    }
 }
 
 fn open_artifact_path(path: &std::path::Path) -> Result<(), String> {
@@ -2607,6 +2584,37 @@ fn push_system_message(app: &mut TuiApp, content: String) {
         role: MessageRole::System,
         content,
     });
+}
+
+async fn refresh_workspace_generation(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    state: &echo_agent_app_core::state::AppState,
+) {
+    app.pending_attachments.clear();
+    app.queued_turns.clear();
+    app.task_runtime_view = None;
+    app.subagent_runs.clear();
+    app.workspace_root = state
+        .current_workspace()
+        .await
+        .map(|workspace| workspace.root);
+    app.conversation_store = state.storage.conversation_store.read().await.clone();
+    app.conversation_id = agent
+        .read(|value| value.conversation_id().map(str::to_string))
+        .await;
+    app.messages.clear();
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: "Workspace generation changed; started a new conversation.".to_string(),
+    });
+    app.project_files = super::collect_project_files(
+        app.workspace_root
+            .as_deref()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+        10_000,
+    );
+    app.rebuild_message_groups();
 }
 
 async fn handle_slash_command(
@@ -3265,11 +3273,10 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::Attach) => {
             // B5.3: stage a file (image/document) for the next message. Reads
-            // the file, persists it under the global uploads dir, and pushes an
+            // the file, persists it under the active workspace uploads dir, and pushes an
             // AttachmentRef onto pending_attachments. The next Enter sends it
             // alongside the typed text via drive_chat(multimodal=Some), then
-            // drains the buffer. TUI has no workspace concept, so use the
-            // global ~/.eko/uploads/ dir.
+            // drains the buffer. Global mode uses the shared global fallback.
             if args.is_empty() {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
@@ -3278,7 +3285,11 @@ async fn handle_slash_command(
                 });
             } else {
                 let path = std::path::PathBuf::from(args.trim());
-                match stage_attachment(&mut app.pending_attachments, &path) {
+                match stage_attachment(
+                    &mut app.pending_attachments,
+                    &path,
+                    app.workspace_root.as_deref(),
+                ) {
                     Ok((name, mime)) => {
                         app.messages.push(ChatMessage {
                             role: MessageRole::System,
@@ -4101,6 +4112,25 @@ async fn handle_slash_command(
                 ),
             });
         }
+        Some(SlashCommand::Workspace) => {
+            let command_args = args.split_whitespace().collect::<Vec<_>>();
+            let Some(app_state) = app.app_state.clone() else {
+                push_system_message(
+                    app,
+                    "Workspace management is unavailable in this runtime.".to_string(),
+                );
+                return;
+            };
+            let result = crate::cli::cmd_impls::workspace::execute_workspace_command(
+                Some(app_state.as_ref()),
+                &command_args,
+            )
+            .await;
+            if result.generation_changed {
+                refresh_workspace_generation(app, agent, app_state.as_ref()).await;
+            }
+            push_system_message(app, result.output);
+        }
         Some(SlashCommand::Cost) => {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -4252,7 +4282,9 @@ async fn handle_slash_command(
                 return;
             }
             let attachments = std::mem::take(&mut app.pending_attachments);
-            let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
+            let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
+                app.workspace_root.as_deref(),
+            );
             let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
                 echo_agent_app_core::prepared_turn::UserTurnInput {
                     text: instruction,

@@ -44,6 +44,42 @@ pub enum ChatDriverEvent {
     },
 }
 
+/// Runtime-owned terminal result for one interactive turn.
+///
+/// The framework event envelope guarantees exactly one terminal Agent event;
+/// this value carries that same fact back to the entry point so callers never
+/// infer success from "the stream returned Ok".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
+    Failed(echo_agent::error::AgentFailure),
+}
+
+impl TurnOutcome {
+    pub fn status(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Cancelled => "cancelled",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    fn from_agent_event(event: &AgentEvent) -> Option<Self> {
+        match event {
+            AgentEvent::FinalAnswer(_) => Some(Self::Completed),
+            AgentEvent::Cancelled => Some(Self::Cancelled),
+            AgentEvent::Error { failure, .. }
+                if failure.terminal_kind == echo_agent::error::AgentTerminalKind::Cancelled =>
+            {
+                Some(Self::Cancelled)
+            }
+            AgentEvent::Error { failure, .. } => Some(Self::Failed(failure.clone())),
+            _ => None,
+        }
+    }
+}
+
 /// Per-mode event consumer for the shared chat driver.
 ///
 /// Each mode provides one exhaustive product-event entry point:
@@ -203,7 +239,7 @@ pub async fn drive_chat(
     agent: &AgentHandle,
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
-) -> Result<(), String> {
+) -> Result<TurnOutcome, String> {
     // Scope a per-turn run_id so task tools (task_create /
     // task_execute / create_complex_task) can read it via require_run_id().
     // Use root_message_id (unique per turn, set by all 3 callers); fall back to
@@ -428,7 +464,7 @@ async fn drive_chat_inner(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     turn_id: String,
-) -> Result<(), String> {
+) -> Result<TurnOutcome, String> {
     // Single authoritative merge: the turn already folded the mode hint into its
     // instruction (and spilled long text to an artifact reference). `to_message`
     // collapses instruction + inline resources into one framework Message,
@@ -545,9 +581,14 @@ async fn drive_chat_inner(
         };
         let mut stream = envelope_event_stream(raw_stream, event_identity);
         async {
+            let mut terminal_outcome = None;
             while let Some(event_result) = stream.next().await {
                 match event_result {
                     Ok(event) => {
+                        let event_outcome = TurnOutcome::from_agent_event(&event.payload);
+                        if event_outcome.is_some() {
+                            terminal_outcome = event_outcome;
+                        }
                         webhook_observer.observe(&event.payload);
                         if !sink.on_event(ChatDriverEvent::Agent(Box::new(event))) {
                             break;
@@ -569,7 +610,12 @@ async fn drive_chat_inner(
                 }
             }
             webhook_observer.finish();
-            Ok::<(), String>(())
+            Ok::<TurnOutcome, String>(terminal_outcome.unwrap_or_else(|| {
+                TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                    "chat_driver",
+                    "chat event consumer closed before the terminal event",
+                ))
+            }))
         }
         .await
     })
@@ -876,9 +922,10 @@ mod tests {
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
             layer_manager: None,
         });
-        drive_chat(&agent, &make_turn("hi", None), res)
+        let outcome = drive_chat(&agent, &make_turn("hi", None), res)
             .await
             .expect("drive_chat should succeed");
+        assert_eq!(outcome, TurnOutcome::Completed);
         // The agent's FinalAnswer is streamed through the sink.
         assert!(
             chat_sink.has_final_answer(),
@@ -900,6 +947,74 @@ mod tests {
             !chat_sink.has_run_identity(),
             "ordinary Auto chat events must not claim a nonexistent TaskRun"
         );
+    }
+
+    #[tokio::test]
+    async fn drive_chat_returns_failed_terminal_after_partial_stream_error() -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use echo_agent::llm::types::DeltaMessage;
+        use echo_agent::testing::StreamChunk;
+        use std::sync::Arc;
+
+        let mock = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("t")
+                .with_stream_script(vec![
+                    StreamChunk::Delta(DeltaMessage {
+                        role: Some("assistant".to_string()),
+                        content: Some("partial answer".to_string()),
+                        ..DeltaMessage::default()
+                    }),
+                    StreamChunk::Err(echo_agent::error::ReactError::Other(
+                        "provider disconnected".to_string(),
+                    )),
+                ]),
+        );
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("t")
+                .llm_client(mock)
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let chat_sink = Arc::new(MockChatSink::default());
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            pool: None,
+            store: None,
+            sink: chat_sink.clone(),
+            webhook_emitter: None,
+            conv_id: Some("failure-conversation".to_string()),
+            root_message_id: "failure-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            mode_hint: None,
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            layer_manager: None,
+        });
+
+        let outcome = drive_chat(&agent, &make_turn("start", None), resources).await?;
+        let TurnOutcome::Failed(failure) = outcome else {
+            return Err(format!("expected failed turn, got {outcome:?}"));
+        };
+        assert!(failure.message.contains("provider disconnected"));
+
+        let events = chat_sink
+            .events
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let partial_output = events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                AgentEvent::Token(token) => Some(token.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(partial_output, "partial answer");
+        assert!(matches!(
+            events.last().map(|event| &event.payload),
+            Some(AgentEvent::Error { .. })
+        ));
+        Ok(())
     }
 
     #[tokio::test]

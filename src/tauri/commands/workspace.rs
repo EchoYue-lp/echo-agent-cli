@@ -101,6 +101,18 @@ pub async fn get_workspace(
 }
 
 #[tauri::command]
+pub async fn exit_workspace(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    state
+        .app_state
+        .exit_workspace()
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    Ok(serde_json::json!({ "success": true }))
+}
+
+#[tauri::command]
 pub async fn delete_workspace(
     state: tauri::State<'_, TauriState>,
     id: String,
@@ -110,7 +122,11 @@ pub async fn delete_workspace(
     if let Some(ref current) = state.app_state.current_workspace().await
         && current.id == ws_id
     {
-        state.app_state.exit_workspace().await;
+        state
+            .app_state
+            .exit_workspace()
+            .await
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
     }
 
     match state.app_state.workspace.registry.delete(&ws_id) {

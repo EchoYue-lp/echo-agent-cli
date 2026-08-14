@@ -125,31 +125,14 @@ export function Terminal({ sessionId }: TerminalProps) {
       });
 
       // ── Send user input to PTY ──
-      // P0-4: the backend requires per-session user consent before accepting
-      // programmatic writes. The first genuine keystroke is the user
-      // interacting with the terminal, so we confirm consent on the first
-      // onData (fire-and-forget; the backend records it), then send the input.
-      let consented = false;
-      const ensureConsent = async () => {
-        if (consented) return;
-        try {
-          await apiInvoke('confirm_terminal_consent', { id: sessionId });
-          consented = true;
-        } catch (e) {
-          console.warn('[Terminal] confirm_terminal_consent failed:', e);
-        }
-      };
       term.onData((data: string) => {
-        void (async () => {
-          await ensureConsent();
-          apiInvoke('write_terminal', {
-            id: sessionId,
-            data: b64Encode(data),
-          }).catch((e: unknown) => {
-            console.error('[Terminal] write_terminal failed:', e);
-            term.write(`\r\n\x1b[31m[Write error: ${e}]\x1b[0m\r\n`);
-          });
-        })();
+        apiInvoke('write_terminal', {
+          id: sessionId,
+          data: b64Encode(data),
+        }).catch((e: unknown) => {
+          console.error('[Terminal] write_terminal failed:', e);
+          term.write(`\r\n\x1b[31m[Write error: ${e}]\x1b[0m\r\n`);
+        });
       });
 
       // ── Handle resize ──

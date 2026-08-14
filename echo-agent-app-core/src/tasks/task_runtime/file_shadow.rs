@@ -134,6 +134,7 @@ impl FileTaskShadow {
 
         let dir = self.run_dir(run_id);
         std::fs::create_dir_all(&dir).map_err(|e| ShadowError::Io(e.to_string()))?;
+        repair_torn_tail(&self.events_path(run_id))?;
 
         // seq = last assigned + 1 (1-based). Cached in memory per run to avoid
         // re-reading events.jsonl on every append; seeded from the file's line
@@ -366,17 +367,61 @@ impl FileTaskShadow {
         }
         let text = std::fs::read_to_string(&path).map_err(|e| ShadowError::Io(e.to_string()))?;
         let mut out = Vec::new();
-        for (i, line) in text.lines().enumerate() {
+        let has_terminal_newline = text.ends_with('\n');
+        let lines: Vec<&str> = text.split('\n').collect();
+        let line_count = lines.len();
+        for (i, line) in lines.into_iter().enumerate() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            let ev: RuntimeTaskEvent = serde_json::from_str(line)
-                .map_err(|e| ShadowError::Decode(format!("line {}: {}", i + 1, e)))?;
+            let ev: RuntimeTaskEvent = match serde_json::from_str(line) {
+                Ok(event) => event,
+                Err(_) if !has_terminal_newline && i.saturating_add(1) == line_count => break,
+                Err(error) => {
+                    return Err(ShadowError::Decode(format!(
+                        "line {}: {}",
+                        i.saturating_add(1),
+                        error
+                    )));
+                }
+            };
             out.push(ev);
         }
         Ok(out)
     }
+}
+
+fn repair_torn_tail(path: &Path) -> Result<(), ShadowError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ShadowError::Io(error.to_string())),
+    };
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let tail_start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position.saturating_add(1));
+    let tail = bytes
+        .get(tail_start..)
+        .ok_or_else(|| ShadowError::Decode("failed to inspect final event segment".to_string()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| ShadowError::Io(error.to_string()))?;
+    if serde_json::from_slice::<RuntimeTaskEvent>(tail).is_ok() {
+        use std::io::Write;
+        file.write_all(b"\n")
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+    } else {
+        file.set_len(u64::try_from(tail_start).unwrap_or(u64::MAX))
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+    }
+    file.sync_all()
+        .map_err(|error| ShadowError::Io(error.to_string()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -917,6 +962,73 @@ mod tests {
         handle
             .join()
             .map_err(|_| "rewrite thread panicked".to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn torn_tail_is_ignored_then_repaired_before_append() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        shadow
+            .append_event_line(
+                "torn-run",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": "g",
+                    "domain_profile": "general",
+                    "workspace_id": "ws",
+                    "conversation_id": "c1",
+                    "root_message_id": "m1",
+                    "route": "",
+                    "created_at": "2026-08-14T00:00:00Z",
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+        let path = shadow.events_path("torn-run");
+        append_line(&path, b"{\"seq\":2").map_err(|error| error.to_string())?;
+
+        assert_eq!(
+            shadow
+                .read_events("torn-run")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        let appended = shadow
+            .append_event_line(
+                "torn-run",
+                Some("t1"),
+                None,
+                RuntimeEventKind::TaskStarted,
+                serde_json::json!({"status": "running"}),
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(appended.seq, 2);
+        assert_eq!(
+            shadow
+                .read_events("torn-run")
+                .map_err(|error| error.to_string())?
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn corruption_before_the_tail_still_fails_closed() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        let path = shadow.events_path("corrupt-run");
+        let parent = path.parent().ok_or_else(|| "missing parent".to_string())?;
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        std::fs::write(&path, b"not-json\n{\"seq\":2").map_err(|error| error.to_string())?;
+
+        assert!(matches!(
+            shadow.read_events("corrupt-run"),
+            Err(ShadowError::Decode(_))
+        ));
         Ok(())
     }
 

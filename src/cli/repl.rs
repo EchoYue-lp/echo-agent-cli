@@ -425,16 +425,22 @@ async fn chat_with_agent(
     let sink: Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         Arc::new(echo_agent_app_core::chat_driver::ChannelChatSink::new(tx));
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let conversation_id = if config.conversation_id.trim().is_empty() {
-        uuid::Uuid::new_v4().to_string()
-    } else {
-        config.conversation_id.clone()
+    let conversation_id = agent
+        .read(|value| value.conversation_id().map(str::to_string))
+        .await
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| config.conversation_id.clone());
+    let workspace_root = match config.app_state.as_ref() {
+        Some(state) => state
+            .current_workspace()
+            .await
+            .map(|workspace| workspace.root),
+        None => config
+            .project
+            .as_deref()
+            .map(std::path::Path::new)
+            .and_then(|path| path.canonicalize().ok()),
     };
-    let workspace_root = config
-        .project
-        .as_deref()
-        .map(std::path::Path::new)
-        .and_then(|p| p.canonicalize().ok());
     let spill_dir =
         echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(workspace_root.as_deref());
     let mode_hint_str = interaction_mode.prompt_hint().to_string();
@@ -772,7 +778,15 @@ async fn chat_with_agent(
     }
 
     match drive_task.await {
-        Ok(Ok(())) => {}
+        Ok(Ok(outcome)) => {
+            if let echo_agent_app_core::chat_driver::TurnOutcome::Failed(failure) = outcome {
+                tracing::warn!(
+                    code = %failure.code,
+                    message = %failure.message,
+                    "CLI shared chat turn failed"
+                );
+            }
+        }
         Ok(Err(error)) => {
             tracing::warn!(%error, "CLI shared chat driver returned an error");
         }

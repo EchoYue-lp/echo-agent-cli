@@ -76,6 +76,7 @@ pub fn build_tauri_app(
             commands::workspace::get_workspace,
             commands::workspace::delete_workspace,
             commands::workspace::switch_workspace,
+            commands::workspace::exit_workspace,
             commands::workspace::link_project,
             commands::workspace::audit_migration,
             commands::workspace::execute_migration,
@@ -184,6 +185,7 @@ pub fn build_tauri_app(
             commands::conversations::save_conversation,
             commands::conversations::get_conversation,
             commands::conversations::update_conversation,
+            commands::conversations::branch_conversation,
             commands::conversations::delete_conversation,
             commands::conversations::export_conversation,
             commands::conversations::restore_conversation,
@@ -274,7 +276,6 @@ pub fn build_tauri_app(
             // Terminal (PTY)
             terminal::create_terminal,
             terminal::write_terminal,
-            terminal::confirm_terminal_consent,
             terminal::resize_terminal,
             terminal::close_terminal,
             terminal::list_terminal_sessions,

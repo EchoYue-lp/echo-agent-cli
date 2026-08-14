@@ -162,6 +162,7 @@ pub async fn upsert_configured_model(
     let runtime;
     {
         let mut cfg = state.app_state.config.app_config.write().await;
+        let original = cfg.clone();
         let provider_config = cfg
             .model_providers
             .entry(req.provider.clone())
@@ -201,8 +202,11 @@ pub async fn upsert_configured_model(
         } else {
             runtime = model_config::resolve_runtime_model(&cfg, Some(&model_id));
         }
-        if let Err(e) = echo_agent::config::save_config(&cfg) {
-            tracing::warn!("Failed to persist configured model: {e}");
+        if let Err(error) = state.app_state.save_app_config(&cfg) {
+            *cfg = original;
+            return Err(IpcError::Internal(format!(
+                "Failed to persist configured model: {error}"
+            )));
         }
     }
 
@@ -224,9 +228,13 @@ pub async fn delete_configured_model(
 ) -> Result<serde_json::Value, IpcError> {
     {
         let mut cfg = state.app_state.config.app_config.write().await;
+        let original = cfg.clone();
         model_config::delete_configured_model(&mut cfg, &model_id).map_err(IpcError::Validation)?;
-        if let Err(e) = echo_agent::config::save_config(&cfg) {
-            tracing::warn!("Failed to persist configured model deletion: {e}");
+        if let Err(error) = state.app_state.save_app_config(&cfg) {
+            *cfg = original;
+            return Err(IpcError::Internal(format!(
+                "Failed to persist configured model deletion: {error}"
+            )));
         }
     }
     Ok(serde_json::json!({ "success": true }))
@@ -240,10 +248,14 @@ pub async fn set_default_model(
     let runtime;
     {
         let mut cfg = state.app_state.config.app_config.write().await;
+        let original = cfg.clone();
         runtime =
             model_config::set_default_model(&mut cfg, &model_id).map_err(IpcError::Validation)?;
-        if let Err(e) = echo_agent::config::save_config(&cfg) {
-            tracing::warn!("Failed to persist default model: {e}");
+        if let Err(error) = state.app_state.save_app_config(&cfg) {
+            *cfg = original;
+            return Err(IpcError::Internal(format!(
+                "Failed to persist default model: {error}"
+            )));
         }
     }
 

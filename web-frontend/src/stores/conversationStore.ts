@@ -35,6 +35,8 @@ interface ConversationState {
   saveCurrent: (messages: ChatMessage[]) => Promise<void>;
   /** Load a conversation and display it */
   loadConversation: (id: string) => Promise<void>;
+  /** Branch the canonical transcript immediately before one user turn. */
+  branchCurrent: (userTurnIndex: number) => Promise<{ id: string; targetContent: string }>;
   /** Delete a conversation */
   deleteConversation: (id: string) => void;
   /** Rename a conversation */
@@ -230,21 +232,10 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
   saveCurrent: async (messages: ChatMessage[]) => {
     const activeId = get().activeId;
-    if (messages.length === 0) {
-      if (activeId) {
-        try {
-          await conversationApi.update(activeId, { messages: [] });
-        } catch (e) {
-          console.error('[saveCurrent] failed to clear persisted messages:', e);
-        }
-      }
-      return;
-    }
+    if (messages.length === 0) return;
 
     const firstUserMsg = messages.find((m) => m.role === 'user');
     const title = firstUserMsg?.content?.slice(0, 50) || 'New Chat';
-    const savedMessages = chatMessagesToSaved(messages);
-
     if (import.meta.env.DEV)
       console.debug('[saveCurrent] activeId:', activeId, 'msgCount:', messages.length);
 
@@ -253,7 +244,6 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         // Update existing
         const res = await conversationApi.update(activeId, {
           title,
-          messages: savedMessages,
         });
         if (import.meta.env.DEV) console.debug('[saveCurrent] update result:', res);
       } else {
@@ -262,7 +252,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         const res = await conversationApi.save({
           id: newId,
           title,
-          messages: savedMessages,
+          // The Agent backend is the sole transcript writer. Creating the
+          // conversation before dispatch only establishes its stable identity.
+          messages: [],
         });
         if (import.meta.env.DEV) console.debug('[saveCurrent] save result:', res, 'newId:', newId);
         set({ activeId: newId });
@@ -385,6 +377,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         set({ isLoading: false });
       }
     }
+  },
+
+  branchCurrent: async (userTurnIndex: number) => {
+    const activeId = get().activeId;
+    if (!activeId) throw new Error('No active conversation to branch');
+    const result = await conversationApi.branch(activeId, userTurnIndex);
+    set({ activeId: result.id, isLoading: false });
+    await get().init();
+    return { id: result.id, targetContent: result.target_content };
   },
 
   deleteConversation: async (id: string) => {

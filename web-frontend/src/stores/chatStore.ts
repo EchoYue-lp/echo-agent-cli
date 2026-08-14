@@ -73,6 +73,7 @@ interface ChatState {
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
+  failAssistantMessage: (id: string, error: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
   /** Insert a non-streaming assistant note (e.g. background subagent finished). */
   appendLocalAssistantNote: (content: string) => void;
@@ -87,10 +88,6 @@ interface ChatState {
   clearMessages: () => void;
   replaceMessages: (messages: ChatMessage[]) => void;
   setHistoryView: (v: boolean) => void;
-  /** Delete last assistant message, return last user message content for resend */
-  prepareRegenerate: () => string | null;
-  /** Edit a user message, delete all messages after it, return new content for resend */
-  prepareEditAndResend: (messageId: string, newContent: string) => string | null;
   /** 更新上下文窗口占用快照（由 llm_usage 事件驱动，仅 usageReported=true）。 */
   setContextWindow: (usage: ContextWindowUsage) => void;
   /** 压缩边界：只清 Snapshot，保留 Accumulator。 */
@@ -116,7 +113,9 @@ const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
 
 /** Auto-save to conversationStore after state changes that add messages. */
 function autoSave() {
-  const msgs = useChatStore.getState().messages;
+  const state = useChatStore.getState();
+  if (state.isStreaming) return;
+  const msgs = state.messages;
   if (msgs.length > 0) {
     void useConversationStore.getState().saveCurrent(msgs);
   }
@@ -361,6 +360,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
     scheduleAutoSave();
   },
 
+  failAssistantMessage: (id, error) => {
+    set((s) => ({
+      isStreaming: false,
+      isThinking: false,
+      runStatus: 'failed',
+      messages: s.messages.map((message) => {
+        if (message.id !== id) return message;
+        const errorNote = `[Error] ${error}`;
+        return {
+          ...message,
+          content: message.content ? `${message.content}\n\n${errorNote}` : errorNote,
+          isStreaming: false,
+        };
+      }),
+    }));
+    scheduleAutoSave();
+  },
+
   handoffToTaskRuntime: (id, content, isRunning) => {
     set((s) => ({
       isStreaming: false,
@@ -412,7 +429,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
           : m
       ),
     }));
-    scheduleAutoSave();
   },
 
   setApprovalRequest: (r) =>
@@ -474,54 +490,4 @@ export const useChatStore = create<ChatState>((set, get) => ({
         totalCached: s.usageAccumulator.totalCached + cached,
       },
     })),
-
-  prepareRegenerate: () => {
-    const { messages } = get();
-    if (messages.length < 2) return null;
-    // Find the last assistant message and remove it
-    let lastAssistantIdx = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'assistant' && !messages[i].isStreaming) {
-        lastAssistantIdx = i;
-        break;
-      }
-    }
-    if (lastAssistantIdx === -1) return null;
-
-    // Find the last user message before this assistant message
-    let lastUserIdx = -1;
-    for (let i = lastAssistantIdx - 1; i >= 0; i--) {
-      if (messages[i].role === 'user') {
-        lastUserIdx = i;
-        break;
-      }
-    }
-    if (lastUserIdx === -1) return null;
-
-    const userContent = messages[lastUserIdx].content;
-
-    // Remove everything from the last user message onwards
-    set({ messages: messages.slice(0, lastUserIdx) });
-    // P1-11: 这两个 prepare* 方法改了 messages 后未保存, 刷新/崩溃会丢失修改。
-    scheduleAutoSave();
-    return userContent;
-  },
-
-  prepareEditAndResend: (messageId: string, newContent: string) => {
-    const { messages } = get();
-    const idx = messages.findIndex((m) => m.id === messageId);
-    if (idx === -1) return null;
-
-    // Update the message content and remove all messages after it
-    const updated = messages.slice(0, idx);
-    updated.push({
-      ...messages[idx],
-      content: newContent,
-      timestamp: Date.now(),
-    });
-    set({ messages: updated });
-    // P1-11: 同 prepareRegenerate, 改完要保存。
-    scheduleAutoSave();
-    return newContent;
-  },
 }));

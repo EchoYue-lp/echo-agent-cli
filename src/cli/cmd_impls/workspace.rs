@@ -1,35 +1,64 @@
 //! Workspace slash commands — new, list, switch, link, migrate, info.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
+use echo_agent::agent::Agent;
+use echo_agent_app_core::state::AppState;
 use echo_agent_app_core::workspace::WorkspaceKind;
 use echo_agent_app_core::workspace::migration::LegacyMigrator;
-use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
+
+pub struct WorkspaceCommandResult {
+    pub output: String,
+    pub generation_changed: bool,
+}
 
 // ── WorkspaceCommand ────────────────────────────────────────────────
 
 async fn cmd_workspace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    match args.first().copied() {
-        Some("new") => ws_new(args.get(1..).unwrap_or(&[])),
-        Some("list") | Some("ls") => ws_list(),
-        Some("switch") | Some("sw") => ws_switch(ctx, args.get(1).copied()).await,
-        Some("link") => ws_link(args.get(1).copied()),
-        Some("migrate") => ws_migrate(args.get(1).copied().unwrap_or("")),
-        Some("info") | None => ws_info(),
-        Some(other) => {
-            println!("Unknown workspace subcommand: {other}");
-            println!("Usage: /workspace [new|list|switch|link|migrate|info]");
-        }
+    let result = execute_workspace_command(ctx.app_state.as_deref(), args).await;
+    if result.generation_changed {
+        ctx.staged_attachments.lock().await.clear();
     }
+    println!("{}", result.output);
     CommandOutcome::Continue
 }
 
+pub async fn execute_workspace_command(
+    app_state: Option<&AppState>,
+    args: &[&str],
+) -> WorkspaceCommandResult {
+    let Some(state) = app_state else {
+        return WorkspaceCommandResult {
+            output: "Workspace management is unavailable in this runtime.".to_string(),
+            generation_changed: false,
+        };
+    };
+    match args.first().copied() {
+        Some("new") => unchanged(ws_new(state, args.get(1..).unwrap_or(&[]))),
+        Some("list") | Some("ls") => unchanged(ws_list(state).await),
+        Some("switch") | Some("sw") => ws_switch(state, args.get(1).copied()).await,
+        Some("exit") => ws_exit(state).await,
+        Some("link") => unchanged(ws_link(state, args.get(1).copied()).await),
+        Some("migrate") => unchanged(ws_migrate(state, args.get(1).copied().unwrap_or(""))),
+        Some("info") | None => unchanged(ws_info(state).await),
+        Some(other) => unchanged(format!(
+            "Unknown workspace subcommand: {other}\nUsage: /workspace [new|list|switch|exit|link|migrate|info]"
+        )),
+    }
+}
+
+fn unchanged(output: String) -> WorkspaceCommandResult {
+    WorkspaceCommandResult {
+        output,
+        generation_changed: false,
+    }
+}
+
 /// `/workspace new <name> [--kind code|data|research]`
-fn ws_new(args: &[&str]) {
+fn ws_new(state: &AppState, args: &[&str]) -> String {
     let name = match args.first() {
         Some(n) => *n,
         None => {
-            println!("Usage: /workspace new <name> [--kind code|data|research]");
-            return;
+            return "Usage: /workspace new <name> [--kind code|data|research]".to_string();
         }
     };
 
@@ -42,281 +71,219 @@ fn ws_new(args: &[&str]) {
         WorkspaceKind::default()
     };
 
-    let registry = match WorkspaceRegistry::new() {
-        Ok(r) => r,
-        Err(e) => {
-            println!("Failed to open workspace registry: {e}");
-            return;
-        }
-    };
-
-    match registry.create(name, kind) {
-        Ok(ws) => {
-            println!("Created workspace '{}' ({})", ws.name, ws.id);
-            println!("  Root: {}", ws.root.display());
-            println!("  Kind: {}", ws.kind.display_name());
-        }
-        Err(e) => {
-            println!("Failed to create workspace: {e}");
-        }
+    match state.workspace.registry.create(name, kind) {
+        Ok(ws) => format!(
+            "Created workspace '{}' ({})\n  Root: {}\n  Kind: {}",
+            ws.name,
+            ws.id,
+            ws.root.display(),
+            ws.kind.display_name()
+        ),
+        Err(error) => format!("Failed to create workspace: {error}"),
     }
 }
 
 /// `/workspace list`
-fn ws_list() {
-    let registry = match WorkspaceRegistry::new() {
-        Ok(r) => r,
-        Err(e) => {
-            println!("Failed to open workspace registry: {e}");
-            return;
-        }
-    };
-
-    match registry.list() {
+async fn ws_list(state: &AppState) -> String {
+    let current_id = state
+        .current_workspace()
+        .await
+        .map(|workspace| workspace.id);
+    match state.workspace.registry.list() {
         Ok(workspaces) => {
             if workspaces.is_empty() {
-                println!("No workspaces found.");
-                println!("Create one with: /workspace new <name>");
-                return;
+                return "No workspaces found.\nCreate one with: /workspace new <name>".to_string();
             }
-            println!("\n  Workspaces ({}):", workspaces.len());
-            println!("  {:-<60}", "");
+            let mut output = format!("Workspaces ({}):\n", workspaces.len());
             for ws in &workspaces {
-                let icon = ws.kind.icon();
-                let kind = ws.kind.display_name();
                 let project = ws
                     .project_root
                     .as_ref()
                     .map(|p| format!(" -> {}", p.display()))
                     .unwrap_or_default();
-                println!(
-                    "  {} {:<20} [{}]{}{}",
-                    icon,
+                output.push_str(&format!(
+                    "  {} [{}]{}{}\n",
                     ws.name,
-                    kind,
+                    ws.kind.display_name(),
                     project,
-                    if ws.id.as_str() == "default" {
+                    if current_id.as_ref() == Some(&ws.id) {
                         " (active)"
                     } else {
                         ""
                     }
-                );
+                ));
             }
-            println!();
+            output.trim_end().to_string()
         }
-        Err(e) => {
-            println!("Failed to list workspaces: {e}");
-        }
+        Err(error) => format!("Failed to list workspaces: {error}"),
     }
 }
 
 /// `/workspace switch <name>`
-async fn ws_switch(ctx: &CommandContext, name: Option<&str>) {
+async fn ws_switch(state: &AppState, name: Option<&str>) -> WorkspaceCommandResult {
     let name = match name {
         Some(n) => n,
         None => {
-            println!("Usage: /workspace switch <name>");
-            return;
+            return unchanged("Usage: /workspace switch <name>".to_string());
         }
     };
-
-    let registry = match WorkspaceRegistry::new() {
-        Ok(r) => r,
-        Err(e) => {
-            println!("Failed to open workspace registry: {e}");
-            return;
-        }
-    };
-
-    match registry.open_by_name(name) {
+    match state.workspace.registry.open_by_name(name) {
         Ok(ws) => {
-            let Some(app_state) = ctx.app_state.as_ref() else {
-                println!("Workspace switching is unavailable in this runtime.");
-                return;
-            };
-            if let Err(error) = app_state.switch_workspace(ws.clone()).await {
-                println!("Failed to switch workspace: {error}");
-                return;
+            if let Err(error) = state.switch_workspace(ws.clone()).await {
+                return unchanged(format!("Failed to switch workspace: {error}"));
             }
-            println!("Switched to workspace: {} ({})", ws.name, ws.id);
-            println!("  Root: {}", ws.root.display());
-            println!("  Kind: {}", ws.kind.display_name());
-            if let Some(ref p) = ws.project_root {
-                println!("  Project: {}", p.display());
+            reset_workspace_conversation(state).await;
+            WorkspaceCommandResult {
+                output: format!(
+                    "Switched to workspace: {} ({})\n  Root: {}\n  Kind: {}{}",
+                    ws.name,
+                    ws.id,
+                    ws.root.display(),
+                    ws.kind.display_name(),
+                    ws.project_root
+                        .as_ref()
+                        .map(|path| format!("\n  Project: {}", path.display()))
+                        .unwrap_or_default()
+                ),
+                generation_changed: true,
             }
         }
-        Err(e) => {
-            println!("Failed to switch workspace: {e}");
-            println!("Available workspaces:");
-            ws_list();
-        }
+        Err(error) => unchanged(format!("Failed to switch workspace: {error}")),
     }
 }
 
+async fn ws_exit(state: &AppState) -> WorkspaceCommandResult {
+    if let Err(error) = state.exit_workspace().await {
+        return unchanged(format!("Failed to exit workspace: {error}"));
+    }
+    reset_workspace_conversation(state).await;
+    WorkspaceCommandResult {
+        output: "Exited workspace; using global paths.".to_string(),
+        generation_changed: true,
+    }
+}
+
+async fn reset_workspace_conversation(state: &AppState) {
+    let conversation_id = uuid::Uuid::new_v4().to_string();
+    state
+        .connection
+        .agent
+        .write_async(|agent| {
+            Box::pin(async move {
+                agent.reset().await;
+                agent.set_conversation_id(conversation_id);
+            })
+        })
+        .await;
+}
+
 /// `/workspace link <path>`
-fn ws_link(path: Option<&str>) {
+async fn ws_link(state: &AppState, path: Option<&str>) -> String {
     let path = match path {
         Some(p) => p,
         None => {
-            println!("Usage: /workspace link <path>");
-            println!("Links a project directory to the current workspace.");
-            return;
+            return "Usage: /workspace link <path>\nLinks a project directory to the current workspace."
+                .to_string();
         }
     };
 
     let project_path = std::path::PathBuf::from(path);
     if !project_path.exists() {
-        println!("Path does not exist: {path}");
-        return;
+        return format!("Path does not exist: {path}");
     }
-
-    // For now, link to "default" workspace — in the future this will use
-    // the currently active workspace from CommandContext.
-    let registry = match WorkspaceRegistry::new() {
-        Ok(r) => r,
-        Err(e) => {
-            println!("Failed to open workspace registry: {e}");
-            return;
-        }
+    let Some(current) = state.current_workspace().await else {
+        return "No active workspace. Switch to one before linking a project.".to_string();
     };
-
-    // Find the most recently active workspace, or create "default"
-    let ws_id = match registry.list() {
-        Ok(workspaces) if !workspaces.is_empty() => workspaces[0].id.clone(),
-        _ => {
-            // Auto-create default workspace
-            match registry.create("default", WorkspaceKind::General) {
-                Ok(ws) => ws.id.clone(),
-                Err(e) => {
-                    println!("Failed to create default workspace: {e}");
-                    return;
-                }
-            }
-        }
-    };
-
-    match registry.link_project(&ws_id, project_path) {
+    match state
+        .workspace
+        .registry
+        .link_project(&current.id, project_path)
+    {
         Ok(ws) => {
-            println!(
+            *state.workspace.current.write().await = Some(ws.clone());
+            format!(
                 "Linked project to workspace '{}': {}",
                 ws.name,
                 ws.project_root
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default()
-            );
+            )
         }
-        Err(e) => {
-            println!("Failed to link project: {e}");
-        }
+        Err(error) => format!("Failed to link project: {error}"),
     }
 }
 
 /// `/workspace migrate [--dry-run]`
-fn ws_migrate(sub: &str) {
+fn ws_migrate(state: &AppState, sub: &str) -> String {
     let migrator = LegacyMigrator::new();
 
     if !migrator.has_legacy_data() {
-        println!("No legacy data found to migrate.");
-        return;
+        return "No legacy data found to migrate.".to_string();
     }
 
     match migrator.audit() {
         Ok(plan) => {
-            println!("\n  Migration Plan:");
-            println!("  {:-<40}", "");
-            println!(
-                "  Workspaces to create: {}",
-                plan.workspaces_to_create.len()
-            );
-            println!("  Sessions to migrate:  {}", plan.ungrouped_sessions.len());
-            println!("  Conversations:        {}", plan.conversation_count);
-            println!(
-                "  Estimated size:       {} KB",
+            let mut output = format!(
+                "Migration plan:\n  Workspaces to create: {}\n  Sessions to migrate: {}\n  Conversations: {}\n  Estimated size: {} KB",
+                plan.workspaces_to_create.len(),
+                plan.ungrouped_sessions.len(),
+                plan.conversation_count,
                 plan.estimated_size_bytes / 1024
             );
-
             for ws_plan in &plan.workspaces_to_create {
-                println!(
-                    "    - '{}' ({} sessions, {} conversations)",
+                output.push_str(&format!(
+                    "\n  - '{}' ({} sessions, {} conversations)",
                     ws_plan.name,
                     ws_plan.session_files.len(),
                     ws_plan.conversation_files.len()
-                );
+                ));
             }
 
             if sub == "--dry-run" || sub == "-n" {
-                println!("\n  Dry run — no changes made.");
-                println!("  Run /workspace migrate to execute.");
-                return;
+                output.push_str("\nDry run; no changes made. Run /workspace migrate to execute.");
+                return output;
             }
-
-            let registry = match WorkspaceRegistry::new() {
-                Ok(r) => r,
-                Err(e) => {
-                    println!("Failed to open workspace registry: {e}");
-                    return;
-                }
-            };
-
-            match migrator.execute(&plan, &registry) {
+            match migrator.execute(&plan, state.workspace.registry.as_ref()) {
                 Ok(report) => {
-                    println!("\n  Migration complete:");
-                    println!(
-                        "    Workspaces created: {}",
-                        report.workspaces_created.len()
-                    );
-                    println!("    Sessions migrated:  {}", report.sessions_migrated);
-                    println!("    Conversations:      {}", report.conversations_migrated);
+                    output.push_str(&format!(
+                        "\nMigration complete:\n  Workspaces created: {}\n  Sessions migrated: {}\n  Conversations: {}",
+                        report.workspaces_created.len(),
+                        report.sessions_migrated,
+                        report.conversations_migrated
+                    ));
                     if !report.errors.is_empty() {
-                        println!("    Errors ({}):", report.errors.len());
+                        output.push_str(&format!("\n  Errors ({}):", report.errors.len()));
                         for err in &report.errors {
-                            println!("      - {err}");
+                            output.push_str(&format!("\n    - {err}"));
                         }
                     }
+                    output
                 }
-                Err(e) => {
-                    println!("Migration failed: {e}");
-                }
+                Err(error) => format!("Migration failed: {error}"),
             }
         }
-        Err(e) => {
-            println!("Failed to audit legacy data: {e}");
-        }
+        Err(error) => format!("Failed to audit legacy data: {error}"),
     }
 }
 
 /// `/workspace` or `/workspace info` — show current workspace info
-fn ws_info() {
-    let registry = match WorkspaceRegistry::new() {
-        Ok(r) => r,
-        Err(e) => {
-            println!("Failed to open workspace registry: {e}");
-            return;
-        }
-    };
-
-    // Show the most recently active workspace as "current"
-    match registry.list() {
-        Ok(workspaces) if !workspaces.is_empty() => {
-            let ws = &workspaces[0];
-            println!("\n  Current Workspace:");
-            println!("  {:-<40}", "");
-            println!("  Name:    {}", ws.name);
-            println!("  ID:      {}", ws.id);
-            println!("  Kind:    {} {}", ws.kind.icon(), ws.kind.display_name());
-            println!("  Root:    {}", ws.root.display());
-            if let Some(ref p) = ws.project_root {
-                println!("  Project: {}", p.display());
-            }
-            println!("  Created: {}", ws.created_at.format("%Y-%m-%d %H:%M"));
-            println!("  Active:  {}", ws.last_active.format("%Y-%m-%d %H:%M"));
-            println!();
-        }
-        _ => {
-            println!("No active workspace.");
-            println!("Create one with: /workspace new <name>");
-        }
+async fn ws_info(state: &AppState) -> String {
+    match state.current_workspace().await {
+        Some(ws) => format!(
+            "Current workspace:\n  Name: {}\n  ID: {}\n  Kind: {}\n  Root: {}{}\n  Created: {}\n  Active: {}",
+            ws.name,
+            ws.id,
+            ws.kind.display_name(),
+            ws.root.display(),
+            ws.project_root
+                .as_ref()
+                .map(|path| format!("\n  Project: {}", path.display()))
+                .unwrap_or_default(),
+            ws.created_at.format("%Y-%m-%d %H:%M"),
+            ws.last_active.format("%Y-%m-%d %H:%M")
+        ),
+        None => "No active workspace.\nCreate one with: /workspace new <name>".to_string(),
     }
 }
 
@@ -325,7 +292,7 @@ cmd!(
     "workspace",
     ["ws"],
     CommandCategory::Session,
-    "Manage workspaces (new/list/switch/link/migrate)",
+    "Manage workspaces (new/list/switch/exit/link/migrate)",
     cmd_workspace
 );
 

@@ -30,15 +30,21 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
     }
 }
 
+pub struct HeadlessServiceResources {
+    pub pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
+    pub task_runtime_store:
+        Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    pub webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
+    pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
+    pub review_integration:
+        Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+}
+
 pub async fn start_headless_services(
     agent: AgentHandle,
     hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
     app_config: &AppConfig,
-    pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
-    task_runtime_store: Option<
-        std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-    >,
-    webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
+    resources: HeadlessServiceResources,
 ) -> Result<(
     Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
@@ -56,10 +62,16 @@ pub async fn start_headless_services(
         }
     };
     use crate::state::AppState;
-    let mut state = AppState::from_shared(agent, hitl_dispatcher, None, app_config.clone());
-    state.webhook.emitter = webhook_emitter;
-    state.connection.pool = Some(pool);
-    state.tasks.runtime = task_runtime_store;
+    let mut state = AppState::from_shared(
+        agent,
+        hitl_dispatcher,
+        resources.conversation_store,
+        app_config.clone(),
+    )
+    .with_review_integration(resources.review_integration);
+    state.webhook.emitter = resources.webhook_emitter;
+    state.connection.pool = Some(resources.pool);
+    state.tasks.runtime = resources.task_runtime_store;
     state.start_task_service().await;
     state
         .start_scheduler_with_store(Some(scheduler_store))
@@ -85,14 +97,19 @@ pub async fn run_cli_mode(
     conversation_id: String,
     webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
 ) -> Result<()> {
     let (task_service, scheduler_runner, app_state) = start_headless_services(
         agent.clone(),
         hitl_dispatcher,
         app_config,
-        pool.clone(),
-        task_runtime_store.clone(),
-        webhook_emitter.clone(),
+        HeadlessServiceResources {
+            pool: pool.clone(),
+            task_runtime_store: task_runtime_store.clone(),
+            webhook_emitter: webhook_emitter.clone(),
+            conversation_store,
+            review_integration: review_integration.clone(),
+        },
     )
     .await?;
     if let Some(scheduler) = scheduler_runner.as_ref()

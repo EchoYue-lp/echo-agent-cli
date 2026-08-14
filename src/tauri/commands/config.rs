@@ -167,6 +167,7 @@ pub async fn update_full_config(
 ) -> Result<FullConfigResponse, IpcError> {
     {
         let mut cfg = state.app_state.config.app_config.write().await;
+        let original = cfg.clone();
 
         if let Some(m) = req.model {
             cfg.model.max_tokens = m.max_tokens.or(cfg.model.max_tokens);
@@ -265,13 +266,11 @@ pub async fn update_full_config(
         {
             cfg.logging.level = v;
         }
-    }
-
-    // Persist to YAML file
-    {
-        let cfg = state.app_state.config.app_config.read().await;
-        if let Err(e) = echo_agent::config::save_config(&cfg) {
-            tracing::warn!("Failed to persist config to file: {e}");
+        if let Err(error) = state.app_state.save_app_config(&cfg) {
+            *cfg = original;
+            return Err(IpcError::Internal(format!(
+                "Failed to persist config: {error}"
+            )));
         }
     }
 

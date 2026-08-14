@@ -18,5 +18,5 @@ pub mod repl;
 pub use args::Args;
 #[cfg(feature = "channels")]
 pub use modes::run_channels_mode;
-pub use modes::{run_cli_mode, start_headless_services};
+pub use modes::{HeadlessServiceResources, run_cli_mode, start_headless_services};
 pub use repl::{ReplConfig, run_repl};

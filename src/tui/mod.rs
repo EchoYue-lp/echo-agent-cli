@@ -397,6 +397,10 @@ pub struct TuiApp {
     pub conversation_id: Option<String>,
     /// File-backed conversation projection shared with GUI and headless entry.
     pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
+    /// Shared application authority for workspace transitions and scoped stores.
+    pub app_state: Option<std::sync::Arc<echo_agent_app_core::state::AppState>>,
+    /// Active workspace root used by attachments, long-input artifacts and file views.
+    pub workspace_root: Option<std::path::PathBuf>,
     /// Runtime-ready configured models exposed by the product configuration.
     pub configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
     /// Static prompt-module report captured during runtime bootstrap.
@@ -854,6 +858,8 @@ impl TuiApp {
             review_integration: None,
             conversation_id: None,
             conversation_store: None,
+            app_state: None,
+            workspace_root: None,
             configured_models: Vec::new(),
             prompt_assembly: None,
             inline_mode: false,
@@ -1672,7 +1678,7 @@ fn visual_col_to_char_idx(text: &str, visual_col: usize) -> usize {
     text.len()
 }
 
-fn collect_project_files(root: &std::path::Path, limit: usize) -> Vec<String> {
+pub(crate) fn collect_project_files(root: &std::path::Path, limit: usize) -> Vec<String> {
     fn visit(root: &std::path::Path, dir: &std::path::Path, limit: usize, out: &mut Vec<String>) {
         if out.len() >= limit {
             return;
@@ -1899,6 +1905,7 @@ pub async fn run_tui(
     browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
     prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
     plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
     inline_mode: bool,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
@@ -1958,12 +1965,21 @@ pub async fn run_tui(
     // binds this session's chat turns + TaskRuntime runs + transcript projection.
     app.conversation_id = Some(conversation_id.clone());
     app.conversation_store = conversation_store;
+    app.app_state = Some(app_state.clone());
+    app.workspace_root = app_state
+        .current_workspace()
+        .await
+        .map(|workspace| workspace.root);
     app.configured_models = configured_models;
     app.prompt_assembly = Some(prompt_assembly);
     app.plugin_runtime = Some(plugin_runtime);
     app.browser_runtime = Some(browser_runtime);
     app.inline_mode = inline_mode;
-    app.project_files = collect_project_files(std::path::Path::new("."), 10_000);
+    let project_root = app
+        .workspace_root
+        .as_deref()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    app.project_files = collect_project_files(project_root, 10_000);
     if let Some(store) = app.conversation_store.as_ref()
         && let Ok(stored) = store.get_messages(&conversation_id).await
         && !stored.is_empty()

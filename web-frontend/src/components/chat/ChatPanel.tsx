@@ -7,6 +7,7 @@ import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
+import { useToastStore } from '../../stores/toastStore';
 import { subagentRunStoreKey, useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -16,6 +17,7 @@ import { CornerUpLeft, GripVertical, PanelRightOpen, X } from 'lucide-react';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
+import { useToolExecutionStore } from '../../stores/toolExecutionStore';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -76,22 +78,71 @@ export function ChatPanel() {
     closeSubagentDetail();
   }, [cancel, clearQueuedMessages, closeSubagentDetail]);
 
-  const handleRegenerate = () => {
-    // Cancel any in-flight run before regenerating — otherwise late-arriving
-    // token events from the old run land on a deleted message (orphan).
+  const branchAndResend = async (messageId: string, newContent?: string) => {
     clearQueuedMessages();
-    cancel();
-    const store = useChatStore.getState();
-    const content = store.prepareRegenerate();
-    if (content) sendMessage(content);
+    await cancel();
+    const chatStore = useChatStore.getState();
+    const messageIndex = chatStore.messages.findIndex((message) => message.id === messageId);
+    if (messageIndex < 0) return;
+    const userMessageIndex = newContent
+      ? messageIndex
+      : chatStore.messages
+          .slice(0, messageIndex)
+          .findLastIndex((message) => message.role === 'user');
+    if (userMessageIndex < 0 || chatStore.messages[userMessageIndex]?.role !== 'user') return;
+    const userTurnIndex = chatStore.messages
+      .slice(0, userMessageIndex)
+      .filter((message) => message.role === 'user').length;
+    const userMessage = chatStore.messages[userMessageIndex];
+    if (!userMessage) return;
+    const content = newContent ?? userMessage.content;
+    const attachments = userMessage.attachments;
+    const hasUnavailableAttachment = attachments?.some(
+      (attachment) => !attachment.url.includes(';base64,')
+    );
+    if (hasUnavailableAttachment) {
+      useToastStore.getState().addToast('error', '该历史消息的附件已转为文件引用，无法自动重建');
+      return;
+    }
+    try {
+      const branch = await useConversationStore.getState().branchCurrent(userTurnIndex);
+      const prefix = chatStore.messages.slice(0, userMessageIndex).map((message, index) => ({
+        ...message,
+        id: `loaded-${branch.id}-${index}`,
+        executionSteps: undefined,
+        executionRounds: undefined,
+      }));
+      chatStore.replaceMessages(prefix);
+      useToolExecutionStore.getState().clear();
+      useTaskRuntimeStore.getState().reset();
+      useSubagentRunStore.getState().clear();
+      const resendAttachments = attachments?.flatMap((attachment) => {
+        const marker = ';base64,';
+        const markerIndex = attachment.url.indexOf(marker);
+        if (markerIndex < 0) return [];
+        return [
+          {
+            name: attachment.name,
+            mime_type: attachment.mime_type,
+            data: attachment.url.slice(markerIndex + marker.length),
+            size: attachment.size,
+            source: attachment.source,
+          } satisfies Attachment,
+        ];
+      });
+      await sendMessage(newContent ? content : branch.targetContent, resendAttachments);
+    } catch (error) {
+      console.error('Failed to branch conversation:', error);
+      useToastStore.getState().addToast('error', '创建会话分支失败，请重试');
+    }
+  };
+
+  const handleRegenerate = (messageId: string) => {
+    void branchAndResend(messageId);
   };
 
   const handleEditAndResend = (messageId: string, newContent: string) => {
-    clearQueuedMessages();
-    cancel();
-    const store = useChatStore.getState();
-    const content = store.prepareEditAndResend(messageId, newContent);
-    if (content) sendMessage(content);
+    void branchAndResend(messageId, newContent);
   };
 
   const handleScroll = useCallback(() => {
