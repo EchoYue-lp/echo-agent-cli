@@ -41,6 +41,7 @@ describe('useTauriChat foreground turn recovery', () => {
       }
     );
     useConversationStore.setState({ activeId: null });
+    useChatStore.setState({ pendingHitlRequests: [] });
     useChatStore.getState().setRunStatus('running');
     useToastStore.getState().clearAll();
     mocks.apiInvoke.mockImplementation(async (command: string) => {
@@ -177,6 +178,45 @@ describe('useTauriChat foreground turn recovery', () => {
     expect(useChatStore.getState().runStatus).toBe('running');
     expect(useChatStore.getState().isCancelled).toBe(false);
     consoleError.mockRestore();
+    hook.unmount();
+  });
+
+  it('removes only the acknowledged HITL request and keeps the next one waiting', async () => {
+    useChatStore.getState().enqueueHitlRequest({
+      kind: 'approval',
+      requestId: 'approval-first',
+      toolName: 'write_file',
+      args: { path: 'first.txt' },
+    });
+    useChatStore.getState().enqueueHitlRequest({
+      kind: 'approval',
+      requestId: 'approval-second',
+      toolName: 'write_file',
+      args: { path: 'second.txt' },
+    });
+    const hook = renderHook(() => useTauriChat());
+
+    await act(async () => {
+      await hook.result.current.sendApproval('approval-first', true);
+    });
+
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('send_approval_response', {
+      requestId: 'approval-first',
+      request_id: 'approval-first',
+      approved: true,
+      reason: undefined,
+      scope: undefined,
+    });
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([
+      expect.objectContaining({ requestId: 'approval-second' }),
+    ]);
+    expect(useChatStore.getState().runStatus).toBe('waiting_approval');
+
+    await act(async () => {
+      await hook.result.current.sendApproval('approval-second', false, 'not now');
+    });
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
+    expect(useChatStore.getState().runStatus).toBe('running');
     hook.unmount();
   });
 });

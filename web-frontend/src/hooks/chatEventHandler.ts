@@ -96,6 +96,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'final_answer': {
       if (ctx.isCancelledRef.current) break;
+      store.clearHitlRequests();
       ctx.isCancelledRef.current = false;
       ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
@@ -110,7 +111,8 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     case 'approval_request': {
       if (ctx.isCancelledRef.current) break;
       // P2-5: 用精确 union 后无需强转, 字段名直接可查。
-      store.setApprovalRequest({
+      store.enqueueHitlRequest({
+        kind: 'approval',
         requestId: event.request_id,
         toolName: event.tool_name,
         args: event.args,
@@ -120,7 +122,8 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'input_request': {
       if (ctx.isCancelledRef.current) break;
-      store.setInputRequest({
+      store.enqueueHitlRequest({
+        kind: 'input',
         requestId: event.request_id,
         prompt: event.prompt,
       });
@@ -128,7 +131,8 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'selection_request': {
       if (ctx.isCancelledRef.current) break;
-      store.setSelectionRequest({
+      store.enqueueHitlRequest({
+        kind: 'selection',
         requestId: event.request_id,
         prompt: event.prompt,
         options: event.options,
@@ -205,6 +209,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       break;
     }
     case 'done': {
+      store.clearHitlRequests();
       if (ctx.assistantIdRef.current && !ctx.isCancelledRef.current) {
         store.finalizeAssistantMessage(ctx.assistantIdRef.current, '');
       }

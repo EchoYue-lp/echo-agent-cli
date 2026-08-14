@@ -6,7 +6,7 @@ import { handleChatEvent } from './chatEventHandler';
 
 describe('chat and TaskRuntime lifecycle separation', () => {
   beforeEach(() => {
-    useChatStore.setState({ runStatus: 'idle', messages: [] });
+    useChatStore.setState({ runStatus: 'idle', messages: [], pendingHitlRequests: [] });
     useTaskRuntimeStore.getState().reset();
   });
 
@@ -129,5 +129,80 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     expect(state.messages.at(-1)?.content).toContain('partial answer');
     expect(state.messages.at(-1)?.content).toContain('[Error] provider disconnected');
     expect(state.messages.at(-1)?.isStreaming).toBe(false);
+  });
+
+  it('queues concurrent HITL requests and removes only the exact request id', () => {
+    const context = {
+      assistantIdRef: { current: null as string | null },
+      currentMessageKeyRef: { current: 'turn' as string | null },
+      currentMessageIdRef: { current: 'message' as string | null },
+      isCancelledRef: { current: false },
+      currentThinkingIdRef: { current: null as string | null },
+    };
+
+    handleChatEvent(
+      {
+        type: 'approval_request',
+        request_id: 'approval-1',
+        tool_name: 'write_file',
+        args: { path: 'first.txt' },
+        prompt: 'Approve the first write',
+      },
+      context
+    );
+    handleChatEvent(
+      {
+        type: 'input_request',
+        request_id: 'input-2',
+        prompt: 'Describe the second change',
+      },
+      context
+    );
+    handleChatEvent(
+      {
+        type: 'approval_request',
+        request_id: 'approval-1',
+        tool_name: 'write_file',
+        args: { path: 'duplicate.txt' },
+        prompt: 'Duplicate delivery',
+      },
+      context
+    );
+
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([
+      expect.objectContaining({ kind: 'approval', requestId: 'approval-1' }),
+      expect.objectContaining({ kind: 'input', requestId: 'input-2' }),
+    ]);
+    expect(useChatStore.getState().runStatus).toBe('waiting_approval');
+
+    useChatStore.getState().removeHitlRequest('input-2');
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([
+      expect.objectContaining({ kind: 'approval', requestId: 'approval-1' }),
+    ]);
+    expect(useChatStore.getState().runStatus).toBe('waiting_approval');
+
+    useChatStore.getState().removeHitlRequest('approval-1');
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
+    expect(useChatStore.getState().runStatus).toBe('running');
+  });
+
+  it('clears every projected HITL request only on a real terminal event', () => {
+    useChatStore.getState().enqueueHitlRequest({
+      kind: 'input',
+      requestId: 'input-terminal',
+      prompt: 'Still pending',
+    });
+    const context = {
+      assistantIdRef: { current: null as string | null },
+      currentMessageKeyRef: { current: 'turn' as string | null },
+      currentMessageIdRef: { current: 'message' as string | null },
+      isCancelledRef: { current: false },
+      currentThinkingIdRef: { current: null as string | null },
+    };
+
+    handleChatEvent({ type: 'cancelled' }, context);
+
+    expect(useChatStore.getState().pendingHitlRequests).toEqual([]);
+    expect(useChatStore.getState().runStatus).toBe('cancelled');
   });
 });

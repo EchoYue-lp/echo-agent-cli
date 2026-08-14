@@ -28,6 +28,23 @@ export interface ContextUsageAccumulator {
   totalCached: number;
 }
 
+export type PendingHitlRequest =
+  | ({ kind: 'approval' } & ApprovalRequest)
+  | { kind: 'input'; requestId: string; prompt?: string }
+  | {
+      kind: 'selection';
+      requestId: string;
+      prompt: string;
+      options: string[];
+      taskId?: string;
+      context?: unknown;
+      phase?: string;
+    };
+
+function waitingStatus(request: PendingHitlRequest): ChatRunStatus {
+  return request.kind === 'approval' ? 'waiting_approval' : 'waiting_input';
+}
+
 export function cacheHitRate(acc: ContextUsageAccumulator): number | null {
   if (acc.totalInput <= 0) return null;
   return acc.totalCached / acc.totalInput;
@@ -39,16 +56,7 @@ interface ChatState {
   isCancelled: boolean;
   isThinking: boolean;
   runStatus: ChatRunStatus;
-  approvalRequest: ApprovalRequest | null;
-  inputRequest: { requestId: string; prompt?: string } | null;
-  selectionRequest: {
-    requestId: string;
-    prompt: string;
-    options: string[];
-    taskId?: string;
-    context?: unknown;
-    phase?: string;
-  } | null;
+  pendingHitlRequests: PendingHitlRequest[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
   /** Current round being built during streaming */
@@ -81,9 +89,9 @@ interface ChatState {
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
   markCancelled: () => void;
-  setApprovalRequest: (r: ApprovalRequest | null) => void;
-  setInputRequest: (r: { requestId: string; prompt?: string } | null) => void;
-  setSelectionRequest: (r: ChatState['selectionRequest']) => void;
+  enqueueHitlRequest: (request: PendingHitlRequest) => void;
+  removeHitlRequest: (requestId: string) => void;
+  clearHitlRequests: () => void;
   addChartMessage: (spec: unknown) => void;
   clearMessages: () => void;
   replaceMessages: (messages: ChatMessage[]) => void;
@@ -136,9 +144,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isCancelled: false,
   isThinking: false,
   runStatus: 'idle',
-  approvalRequest: null,
-  inputRequest: null,
-  selectionRequest: null,
+  pendingHitlRequests: [],
   isHistoryView: false,
   currentRound: null,
   contextWindow: null,
@@ -355,6 +361,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isThinking: false,
       runStatus: 'completed',
+      pendingHitlRequests: [],
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
     }));
     scheduleAutoSave();
@@ -365,6 +372,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isThinking: false,
       runStatus: 'failed',
+      pendingHitlRequests: [],
       messages: s.messages.map((message) => {
         if (message.id !== id) return message;
         const errorNote = `[Error] ${error}`;
@@ -406,12 +414,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setStreaming: (v) => set({ isStreaming: v }),
   setRunStatus: (status) =>
-    set({
+    set((state) => ({
       runStatus: status,
       isStreaming: !['idle', 'completed', 'failed', 'cancelled'].includes(status),
       isCancelled: status === 'cancelled',
       isThinking: status === 'thinking',
-    }),
+      pendingHitlRequests: ['completed', 'failed', 'cancelled'].includes(status)
+        ? []
+        : state.pendingHitlRequests,
+    })),
 
   markCancelled: () => {
     set((s) => ({
@@ -419,6 +430,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isCancelled: true,
       isThinking: false,
       runStatus: 'cancelled',
+      pendingHitlRequests: [],
       messages: s.messages.map((m) =>
         m.isStreaming
           ? {
@@ -431,12 +443,33 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
   },
 
-  setApprovalRequest: (r) =>
-    set({ approvalRequest: r, runStatus: r ? 'waiting_approval' : get().runStatus }),
-  setInputRequest: (r) =>
-    set({ inputRequest: r, runStatus: r ? 'waiting_input' : get().runStatus }),
-  setSelectionRequest: (r) =>
-    set({ selectionRequest: r, runStatus: r ? 'waiting_input' : get().runStatus }),
+  enqueueHitlRequest: (request) =>
+    set((state) => {
+      if (state.pendingHitlRequests.some((pending) => pending.requestId === request.requestId)) {
+        return state;
+      }
+      const pendingHitlRequests = [...state.pendingHitlRequests, request];
+      const front = pendingHitlRequests.at(0);
+      return {
+        pendingHitlRequests,
+        runStatus: front ? waitingStatus(front) : state.runStatus,
+      };
+    }),
+  removeHitlRequest: (requestId) =>
+    set((state) => {
+      const pendingHitlRequests = state.pendingHitlRequests.filter(
+        (request) => request.requestId !== requestId
+      );
+      if (pendingHitlRequests.length === state.pendingHitlRequests.length) {
+        return state;
+      }
+      const front = pendingHitlRequests.at(0);
+      return {
+        pendingHitlRequests,
+        runStatus: front ? waitingStatus(front) : 'running',
+      };
+    }),
+  clearHitlRequests: () => set({ pendingHitlRequests: [] }),
 
   addChartMessage: (spec) => {
     set((s) => ({
@@ -453,9 +486,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isCancelled: false,
       isThinking: false,
       isHistoryView: false,
-      approvalRequest: null,
-      inputRequest: null,
-      selectionRequest: null,
+      pendingHitlRequests: [],
       currentRound: null,
       contextWindow: null,
       usageAccumulator: { totalInput: 0, totalCached: 0 },
@@ -468,9 +499,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isCancelled: false,
       isHistoryView: true,
-      approvalRequest: null,
-      inputRequest: null,
-      selectionRequest: null,
+      pendingHitlRequests: [],
       // 加载历史会话时清空实时上下文占用（历史视图无 live llm_usage，显示旧值会误导）。
       contextWindow: null,
       usageAccumulator: { totalInput: 0, totalCached: 0 },

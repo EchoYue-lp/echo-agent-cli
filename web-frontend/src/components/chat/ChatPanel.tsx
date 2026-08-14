@@ -28,9 +28,7 @@ function useChatTransport() {
 
 export function ChatPanel() {
   const messages = useChatStore((s) => s.messages);
-  const approvalRequest = useChatStore((s) => s.approvalRequest);
-  const inputRequest = useChatStore((s) => s.inputRequest);
-  const selectionRequest = useChatStore((s) => s.selectionRequest);
+  const pendingHitlRequest = useChatStore((s) => s.pendingHitlRequests.at(0) ?? null);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const isCancelled = useChatStore((s) => s.isCancelled);
   const runStatus = useChatStore((s) => s.runStatus);
@@ -156,7 +154,7 @@ export function ChatPanel() {
     if (isNearBottomRef.current && bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' });
     }
-  }, [messages, approvalRequest, inputRequest, selectionRequest, isStreaming]);
+  }, [messages, pendingHitlRequest, isStreaming]);
 
   const handleSuggestionClick = (text: string) => {
     sendMessage(text);
@@ -322,25 +320,25 @@ export function ChatPanel() {
                   </div>
                 )}
 
-                {inputRequest && (
+                {pendingHitlRequest?.kind === 'input' && (
                   <div className="py-2">
                     <InputCard
-                      prompt={inputRequest.prompt}
-                      onSubmit={(text) => sendInput(inputRequest.requestId, text)}
+                      prompt={pendingHitlRequest.prompt}
+                      onSubmit={(text) => sendInput(pendingHitlRequest.requestId, text)}
                     />
                   </div>
                 )}
 
-                {selectionRequest && (
+                {pendingHitlRequest?.kind === 'selection' && (
                   <div className="py-2">
                     <SelectionCard
-                      prompt={selectionRequest.prompt}
-                      options={selectionRequest.options}
-                      taskId={selectionRequest.taskId}
-                      phase={selectionRequest.phase}
-                      context={selectionRequest.context}
+                      prompt={pendingHitlRequest.prompt}
+                      options={pendingHitlRequest.options}
+                      taskId={pendingHitlRequest.taskId}
+                      phase={pendingHitlRequest.phase}
+                      context={pendingHitlRequest.context}
                       onSelect={(selection, instructions) =>
-                        sendSelection(selectionRequest.requestId, selection, instructions)
+                        sendSelection(pendingHitlRequest.requestId, selection, instructions)
                       }
                     />
                   </div>
@@ -360,17 +358,17 @@ export function ChatPanel() {
       )}
 
       <div className="shrink-0 bg-[linear-gradient(to_top,var(--bg-chat)_72%,transparent)]">
-        {approvalRequest && (
+        {pendingHitlRequest?.kind === 'approval' && (
           <div className="mx-auto w-full max-w-[980px] px-4 pb-2 sm:px-6 lg:px-8">
             <ApprovalCard
-              request={approvalRequest}
-              onApprove={() => sendApproval(approvalRequest.requestId, true)}
-              onReject={(reason) => sendApproval(approvalRequest.requestId, false, reason)}
+              request={pendingHitlRequest}
+              onApprove={() => sendApproval(pendingHitlRequest.requestId, true)}
+              onReject={(reason) => sendApproval(pendingHitlRequest.requestId, false, reason)}
               onModify={(feedback) =>
-                sendApproval(approvalRequest.requestId, false, `修改意见: ${feedback}`)
+                sendApproval(pendingHitlRequest.requestId, false, `修改意见: ${feedback}`)
               }
               onApproveAll={() =>
-                sendApproval(approvalRequest.requestId, true, undefined, 'session_tool')
+                sendApproval(pendingHitlRequest.requestId, true, undefined, 'session_tool')
               }
             />
           </div>

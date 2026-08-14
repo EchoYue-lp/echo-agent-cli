@@ -329,8 +329,7 @@ export function useTauriChat() {
           reason,
           scope,
         });
-        useChatStore.getState().setApprovalRequest(null);
-        useChatStore.getState().setRunStatus('running');
+        useChatStore.getState().removeHitlRequest(requestId);
       } catch (e) {
         console.error('[TauriChat] Failed to send approval:', e);
         throw e;
@@ -342,8 +341,7 @@ export function useTauriChat() {
   const sendInput = useCallback(async (requestId: string, text: string) => {
     try {
       await apiInvoke('send_input_response', { requestId, request_id: requestId, text });
-      useChatStore.getState().setInputRequest(null);
-      useChatStore.getState().setRunStatus('running');
+      useChatStore.getState().removeHitlRequest(requestId);
     } catch (e) {
       console.error('[TauriChat] Failed to send input:', e);
     }
@@ -358,8 +356,7 @@ export function useTauriChat() {
           selection,
           instructions,
         });
-        useChatStore.getState().setSelectionRequest(null);
-        useChatStore.getState().setRunStatus('running');
+        useChatStore.getState().removeHitlRequest(requestId);
       } catch (e) {
         console.error('[TauriChat] Failed to send selection:', e);
       }
