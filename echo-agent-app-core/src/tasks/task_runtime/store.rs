@@ -93,6 +93,13 @@ struct ShadowOperation<'a> {
     store: &'a TaskRuntimeStore,
 }
 
+/// Keeps one product operation bound to the current workspace generation.
+/// Rebinding waits until every lease from the previous generation is dropped.
+#[must_use]
+pub(crate) struct WorkspaceGenerationLease<'a> {
+    _operation: ShadowOperation<'a>,
+}
+
 struct ShadowFileStore<'a> {
     _operation: ShadowOperation<'a>,
     store: super::file_store::FileTaskStore,
@@ -128,6 +135,61 @@ pub struct RunCancellationRegistration {
     run_id: String,
     token: echo_agent::agent::CancellationToken,
     previous: Option<echo_agent::agent::CancellationToken>,
+}
+
+impl RunCancellationRegistration {
+    fn finalize_cancelled_run(&self) {
+        let run = match self.store.get_run(&self.run_id) {
+            Ok(Some(run)) => run,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %self.run_id,
+                    %error,
+                    "could not inspect cancelled run while releasing its driver"
+                );
+                return;
+            }
+        };
+        if !matches!(
+            run.status,
+            TaskRunStatus::Pending
+                | TaskRunStatus::Running
+                | TaskRunStatus::Paused
+                | TaskRunStatus::Failed
+        ) {
+            return;
+        }
+
+        if let Err(error) = self
+            .store
+            .transition_run(&self.run_id, TaskRunStatus::Cancelled)
+        {
+            // Another owner may have completed the run between the read and
+            // transition. Only report the failure if it remains non-terminal.
+            let remains_non_terminal =
+                self.store
+                    .get_run(&self.run_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|current| {
+                        matches!(
+                            current.status,
+                            TaskRunStatus::Pending
+                                | TaskRunStatus::Running
+                                | TaskRunStatus::Paused
+                                | TaskRunStatus::Failed
+                        )
+                    });
+            if remains_non_terminal {
+                tracing::warn!(
+                    run_id = %self.run_id,
+                    %error,
+                    "could not finalize cancelled run while releasing its driver"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -186,14 +248,27 @@ pub(crate) struct SubagentReleaseRecord<'a> {
 
 impl Drop for RunCancellationRegistration {
     fn drop(&mut self) {
-        if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
-            if self.token.is_cancelled() {
-                map.remove(&self.run_id);
-            } else if let Some(previous) = self.previous.take() {
-                map.insert(self.run_id.clone(), previous);
+        let cancelled = self.token.is_cancelled();
+        let owns_registration = if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
+            let is_current = map
+                .get(&self.run_id)
+                .is_some_and(|current| current == &self.token);
+            if is_current {
+                if let Some(previous) = self.previous.take() {
+                    map.insert(self.run_id.clone(), previous);
+                } else {
+                    map.remove(&self.run_id);
+                }
+                true
             } else {
-                map.remove(&self.run_id);
+                false
             }
+        } else {
+            false
+        };
+
+        if cancelled && owns_registration {
+            self.finalize_cancelled_run();
         }
     }
 }
@@ -346,6 +421,16 @@ impl TaskRuntimeStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         generation.active_operations = generation.active_operations.saturating_add(1);
         ShadowOperation { store: self }
+    }
+
+    /// Pin a multi-step application operation to one workspace generation.
+    /// Individual store calls already take short leases; cron and other
+    /// long-running adapters use this outer lease so a rebind cannot occur
+    /// between their run creation, execution, and settlement writes.
+    pub(crate) fn lease_active_workspace_generation(&self) -> WorkspaceGenerationLease<'_> {
+        WorkspaceGenerationLease {
+            _operation: self.shadow_operation(),
+        }
     }
 
     /// Atomically switch the file authority after all operations using the
@@ -2862,14 +2947,79 @@ mod tests {
         seed_plan(&store);
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
         let token = echo_agent::agent::CancellationToken::new();
-        let _registration = store.register_run_cancellation("r1", token.clone())?;
+        let registration = store.register_run_cancellation("r1", token.clone())?;
 
         assert!(store.request_pause("r1")?);
         assert!(token.is_cancelled());
+        drop(registration);
         let run = store
             .get_run("r1")?
             .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
         assert_eq!(run.status, TaskRunStatus::Paused);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_registration_drop_finalizes_running_run() -> Result<(), StoreError> {
+        let store = std::sync::Arc::new(fresh());
+        store.create_run(
+            "cancelled-driver",
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "cancel interrupted driver",
+            "",
+            AttendedMode::Unattended,
+        )?;
+        store.transition_run("cancelled-driver", TaskRunStatus::Running)?;
+        let token = echo_agent::agent::CancellationToken::new();
+        let registration = store.register_run_cancellation("cancelled-driver", token.clone())?;
+
+        token.cancel();
+        drop(registration);
+
+        let run = store
+            .get_run("cancelled-driver")?
+            .ok_or_else(|| StoreError::RunNotFound("cancelled-driver".to_string()))?;
+        assert_eq!(run.status, TaskRunStatus::Cancelled);
+        assert!(!store.is_run_active("cancelled-driver"));
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_nested_registration_restores_outer_driver() -> Result<(), StoreError> {
+        let store = std::sync::Arc::new(fresh());
+        store.create_run(
+            "nested-cancelled-driver",
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "cancel nested driver",
+            "",
+            AttendedMode::Unattended,
+        )?;
+        store.transition_run("nested-cancelled-driver", TaskRunStatus::Running)?;
+        let outer_token = echo_agent::agent::CancellationToken::new();
+        let outer_registration =
+            store.register_run_cancellation("nested-cancelled-driver", outer_token.clone())?;
+        let inner_token = outer_token.child_token();
+        let inner_registration =
+            store.register_run_cancellation("nested-cancelled-driver", inner_token.clone())?;
+
+        inner_token.cancel();
+        drop(inner_registration);
+
+        let run = store
+            .get_run("nested-cancelled-driver")?
+            .ok_or_else(|| StoreError::RunNotFound("nested-cancelled-driver".to_string()))?;
+        assert_eq!(run.status, TaskRunStatus::Cancelled);
+        assert!(store.is_run_active("nested-cancelled-driver"));
+        assert!(!outer_token.is_cancelled());
+
+        drop(outer_registration);
+        assert!(!store.is_run_active("nested-cancelled-driver"));
         Ok(())
     }
 
@@ -3647,7 +3797,7 @@ mod tests {
         let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
             &first_root,
         )?);
-        let operation = store.shadow_operation();
+        let operation = store.lease_active_workspace_generation();
         let (started_sender, started_receiver) = std::sync::mpsc::channel();
         let (sender, receiver) = std::sync::mpsc::channel();
         let rebinding_store = store.clone();

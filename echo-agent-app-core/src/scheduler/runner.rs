@@ -50,11 +50,28 @@ pub fn build_fire_fn(
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
 ) -> FireFn {
+    build_fire_fn_with_cancel(
+        agent,
+        task_runtime_store,
+        pool,
+        webhook_emitter,
+        CancellationToken::new(),
+    )
+}
+
+fn build_fire_fn_with_cancel(
+    agent: AgentHandle,
+    task_runtime_store: Option<Arc<TaskRuntimeStore>>,
+    pool: Option<Arc<AgentPool>>,
+    webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
+    scheduler_cancel: CancellationToken,
+) -> FireFn {
     Arc::new(move |task: CronTask| {
         let fallback_agent = agent.clone();
         let runtime_store = task_runtime_store.clone();
         let pool = pool.clone();
         let webhook_emitter = webhook_emitter.clone();
+        let scheduler_cancel = scheduler_cancel.clone();
         Box::pin(async move {
             let store = runtime_store.ok_or_else(|| {
                 echo_agent::error::ReactError::Other(
@@ -72,8 +89,13 @@ pub fn build_fire_fn(
                     "cron prompt is empty (after [plan] strip)".into(),
                 ));
             }
+            // Keep agent acquisition, TaskRun creation/execution, pool release,
+            // and the final result projection on one workspace generation.
+            // `switch_workspace`/`exit_workspace` can prepare concurrently but
+            // cannot rebind the TaskRuntime file authority until this drops.
+            let _generation_lease = store.lease_active_workspace_generation();
             let fire_id = uuid::Uuid::new_v4().to_string();
-            let cancel = CancellationToken::new();
+            let cancel = scheduler_cancel.child_token();
 
             // Phase C: acquire a per-run pool agent when available. The
             // run-scoped key means each cron run gets its OWN agent (never
@@ -169,7 +191,13 @@ pub async fn new_scheduler_runner(
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
 ) -> echo_agent::error::Result<SchedulerRunner> {
-    let fire_fn = build_fire_fn(agent, task_runtime_store, pool, webhook_emitter);
+    let fire_fn = build_fire_fn_with_cancel(
+        agent,
+        task_runtime_store,
+        pool,
+        webhook_emitter,
+        cancel.clone(),
+    );
     SchedulerRunner::new(store, cancel, fire_fn).await
 }
 
@@ -184,16 +212,19 @@ mod tests {
     /// 而非旧 `agent.chat`/`execute_direct`。mock LLM 返回纯文本(无 tool call),
     /// agent 直接作答,`launch_cron_run` 的 `_` 分支自动转 Completed。
     #[tokio::test]
-    async fn build_fire_fn_routes_non_plan_cron_to_launch_cron_run() {
+    async fn build_fire_fn_routes_non_plan_cron_to_launch_cron_run() -> Result<(), String> {
         let llm = MockLlmClient::new().with_response("ok");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
             .system_prompt("test")
             .build()
-            .expect("test agent should build");
+            .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
-        let store =
-            Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store should init"));
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
+        store
+            .rebind_shadow_root(workspace.path().join("tasks"), "cron-workspace")
+            .map_err(|error| error.to_string())?;
 
         // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
         // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → launch_cron_run。
@@ -205,26 +236,31 @@ mod tests {
 
         let completed = store
             .list_runs_in(&[TaskRunStatus::Completed])
-            .expect("list_runs_in should not error");
+            .map_err(|error| error.to_string())?;
         assert_eq!(
             completed.len(),
             1,
             "非-[plan] cron 应经 launch_cron_run 建恰好 1 个 Completed run"
         );
+        let completed_run = completed
+            .first()
+            .ok_or_else(|| "completed cron run is missing".to_string())?;
+        assert_eq!(completed_run.workspace_id, "cron-workspace");
+        Ok(())
     }
 
     /// `[plan]` 前缀仍经 launch_cron_run(marker strip,向后兼容)。
     #[tokio::test]
-    async fn build_fire_fn_strips_plan_marker_and_routes_to_launch_cron_run() {
+    async fn build_fire_fn_strips_plan_marker_and_routes_to_launch_cron_run() -> Result<(), String>
+    {
         let llm = MockLlmClient::new().with_response("ok");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
             .system_prompt("test")
             .build()
-            .expect("test agent should build");
+            .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
-        let store =
-            Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store should init"));
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
@@ -233,12 +269,13 @@ mod tests {
 
         let completed = store
             .list_runs_in(&[TaskRunStatus::Completed])
-            .expect("list_runs_in should not error");
+            .map_err(|error| error.to_string())?;
         assert_eq!(
             completed.len(),
             1,
             "[plan] cron 应 strip marker 后建 1 个 Completed run"
         );
+        Ok(())
     }
 
     #[tokio::test]
@@ -262,6 +299,35 @@ mod tests {
             .list_runs_in(&[TaskRunStatus::Failed])
             .map_err(|error| error.to_string())?;
         assert_eq!(failed.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduler_cancellation_reaches_the_cron_task_run() -> Result<(), String> {
+        let llm = MockLlmClient::new().with_response("should not complete");
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(llm))
+            .system_prompt("test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let scheduler_cancel = CancellationToken::new();
+        scheduler_cancel.cancel();
+        let fire_fn = build_fire_fn_with_cancel(
+            AgentHandle::new(agent),
+            Some(store.clone()),
+            None,
+            None,
+            scheduler_cancel,
+        );
+
+        let result = fire_fn(CronTask::new("cancelled", "*/5 * * * *", "do work")).await;
+
+        assert!(result.is_err());
+        let cancelled = store
+            .list_runs_in(&[TaskRunStatus::Cancelled])
+            .map_err(|error| error.to_string())?;
+        assert_eq!(cancelled.len(), 1);
         Ok(())
     }
 }

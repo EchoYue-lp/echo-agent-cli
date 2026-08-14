@@ -128,9 +128,16 @@ pub async fn run_cli_mode(
     repl_config.conversation_id = conversation_id;
     repl_config.webhook_emitter = Some(webhook_emitter);
     repl_config.plugin_runtime = Some(plugin_runtime);
-    repl_config.app_state = Some(app_state);
+    repl_config.app_state = Some(app_state.clone());
 
-    crate::cli::run_repl(agent, repl_config).await
+    let repl_result = crate::cli::run_repl(agent, repl_config).await;
+    if let Err(error) = app_state.shutdown_scheduler().await {
+        tracing::warn!(%error, "failed to shut down CLI scheduler");
+        if repl_result.is_ok() {
+            return Err(error.into());
+        }
+    }
+    repl_result
 }
 
 /// 运行 IM 通道模式（QQ Bot、飞书等）

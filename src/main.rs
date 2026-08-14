@@ -303,7 +303,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             runtime.browser_runtime.clone(),
             runtime.prompt_assembly.clone(),
             runtime.plugin_runtime.clone(),
-            tui_app_state,
+            tui_app_state.clone(),
             args.no_alt_screen,
         )
         .await;
@@ -331,6 +331,9 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             }
         }
 
+        if let Err(error) = tui_app_state.shutdown_scheduler().await {
+            tracing::warn!(%error, "failed to shut down TUI scheduler");
+        }
         if let Some(store) = task_runtime_store.as_ref()
             && let Err(error) = store.shutdown_hook_events().await
         {

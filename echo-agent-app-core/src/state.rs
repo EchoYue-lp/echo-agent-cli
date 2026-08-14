@@ -443,6 +443,19 @@ pub struct HistoryState {
 pub struct SchedulerState {
     pub runner: Option<Arc<crate::scheduler::SchedulerRunner>>,
     pub cancel_token: echo_agent::agent::CancellationToken,
+    /// Owned scheduler loop. Keeping the framework handle lets every EKO
+    /// surface cancel and await the same long-lived task during shutdown.
+    handle: Mutex<Option<echo_agent::scheduler::SchedulerHandle>>,
+}
+
+impl SchedulerState {
+    async fn shutdown(&self) -> echo_agent::error::Result<()> {
+        let handle = self.handle.lock().await.take();
+        if let Some(handle) = handle {
+            handle.shutdown().await?;
+        }
+        Ok(())
+    }
 }
 
 /// 后台任务状态
@@ -613,6 +626,7 @@ impl AppState {
             scheduler: SchedulerState {
                 runner: None,
                 cancel_token: echo_agent::agent::CancellationToken::new(),
+                handle: Mutex::new(None),
             },
             tasks: TaskState {
                 service: None,
@@ -760,10 +774,20 @@ impl AppState {
         )
         .await?;
         let runner = Arc::new(runner);
-        runner.clone().spawn();
+        let handle = runner.clone().spawn();
+        *self.scheduler.handle.get_mut() = Some(handle);
         self.scheduler.runner = Some(runner);
         tracing::info!("Scheduler runner started");
         Ok(())
+    }
+
+    /// Cancel the scheduler loop and await any in-flight cron fire.
+    ///
+    /// Repeated calls are harmless. The framework handle is process-scoped;
+    /// workspace changes rebind the shared TaskRuntime store instead of
+    /// starting another scheduler.
+    pub async fn shutdown_scheduler(&self) -> echo_agent::error::Result<()> {
+        self.scheduler.shutdown().await
     }
 
     /// 启动后台任务服务（所有模式都应调用）
@@ -1348,6 +1372,40 @@ fn ensure_no_running_task_runs(
 mod permission_rule_tests {
     use super::*;
     use echo_agent::tools::permission::{RuleBehavior, RuleMatcher, RuleSource, ToolPermission};
+
+    #[tokio::test]
+    async fn scheduler_shutdown_joins_owned_handle_and_is_idempotent()
+    -> std::result::Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = crate::scheduler::CronTaskStore::new()
+            .with_path(temp.path().join("scheduler-tasks.json"));
+        let cancel_token = echo_agent::agent::CancellationToken::new();
+        let fire_fn: echo_agent::scheduler::FireFn =
+            Arc::new(|_task| Box::pin(async { Ok("done".to_string()) }));
+        let runner = Arc::new(
+            crate::scheduler::SchedulerRunner::new(store, cancel_token.clone(), fire_fn)
+                .await
+                .map_err(|error| error.to_string())?,
+        );
+        let handle = runner.clone().spawn();
+        let scheduler = SchedulerState {
+            runner: Some(runner),
+            cancel_token,
+            handle: Mutex::new(Some(handle)),
+        };
+
+        scheduler
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        scheduler
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(scheduler.handle.lock().await.is_none());
+        Ok(())
+    }
 
     #[test]
     fn application_permission_rule_converts_without_losing_semantics()

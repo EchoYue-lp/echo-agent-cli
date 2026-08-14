@@ -271,6 +271,9 @@ async fn run_desktop() -> anyhow::Result<()> {
     cancel_token.cancel();
     bridge_supervisor.shutdown().await;
     terminal_manager.close_all().await;
+    if let Err(error) = state.shutdown_scheduler().await {
+        tracing::warn!(%error, "failed to shut down GUI scheduler");
+    }
     if let Some(store) = state.tasks.runtime.as_ref()
         && let Err(error) = store.shutdown_hook_events().await
     {
