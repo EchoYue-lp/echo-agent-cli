@@ -235,14 +235,13 @@ impl TerminalManager {
             .collect()
     }
 
-    pub fn close_all(&self) {
+    pub async fn close_all(&self) {
         let ids: Vec<String> = self.sessions.iter().map(|r| r.key().clone()).collect();
         for id in ids {
-            if let Some(session) = self.sessions.remove(&id).map(|(_, s)| s) {
-                // Best-effort kill
-                tokio::spawn(async move {
-                    let _ = session.kill().await;
-                });
+            if let Some(session) = self.sessions.remove(&id).map(|(_, s)| s)
+                && let Err(error) = session.kill().await
+            {
+                tracing::warn!(%error, terminal_id = %id, "Failed to close terminal session");
             }
         }
     }

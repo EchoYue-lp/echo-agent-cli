@@ -51,6 +51,7 @@ struct BrowserRuntimeInner {
     default_approval_provider: RwLock<Option<Arc<dyn HumanLoopProvider>>>,
     conversation_approval_providers: RwLock<HashMap<String, Arc<dyn HumanLoopProvider>>>,
     shutdown: CancellationToken,
+    prewarm: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -80,6 +81,7 @@ impl BrowserRuntime {
                 default_approval_provider: RwLock::new(None),
                 conversation_approval_providers: RwLock::new(HashMap::new()),
                 shutdown: CancellationToken::new(),
+                prewarm: Mutex::new(None),
             }),
         });
         if !runtime.inner.config.enabled {
@@ -87,8 +89,13 @@ impl BrowserRuntime {
             return runtime;
         }
         let prewarm = runtime.clone();
-        tokio::spawn(async move {
-            match prewarm.ensure_client(BrowserBackend::Managed).await {
+        let prewarm_cancel = runtime.inner.shutdown.clone();
+        let handle = tokio::spawn(async move {
+            let result = tokio::select! {
+                _ = prewarm_cancel.cancelled() => return,
+                result = prewarm.ensure_client(BrowserBackend::Managed) => result,
+            };
+            match result {
                 Ok(client) => tracing::info!(
                     tools = client.tools().len(),
                     "managed Playwright MCP runtime ready"
@@ -99,6 +106,7 @@ impl BrowserRuntime {
                 ),
             }
         });
+        *runtime.inner.prewarm.lock().await = Some(handle);
         runtime
     }
 
@@ -193,6 +201,11 @@ impl BrowserRuntime {
 
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
+        if let Some(handle) = self.inner.prewarm.lock().await.take()
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(%error, "browser prewarm task failed during shutdown");
+        }
         self.inner.sessions.close_all().await;
         for backend in [BrowserBackend::Managed, BrowserBackend::Chrome] {
             let client = self.client_slot(backend).write().await.take();

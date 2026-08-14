@@ -12,7 +12,7 @@ pub mod state;
 pub mod terminal;
 
 use echo_agent_app_core::{AppState, browser::BrowserRuntime};
-use state::TauriState;
+use state::{TauriBridgeSupervisor, TauriState};
 use std::sync::Arc;
 use tauri::Emitter;
 
@@ -29,6 +29,8 @@ fn task_id_from_subagent_execution_id(execution_id: &str, run_id: &str) -> Optio
 pub fn build_tauri_app(
     app_state: Arc<AppState>,
     browser_runtime: Arc<BrowserRuntime>,
+    terminal_manager: Arc<terminal::TerminalManager>,
+    bridge_supervisor: Arc<TauriBridgeSupervisor>,
 ) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -36,7 +38,12 @@ pub fn build_tauri_app(
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .manage(TauriState::new(app_state, browser_runtime))
+        .manage(TauriState::new(
+            app_state,
+            browser_runtime,
+            terminal_manager,
+            bridge_supervisor,
+        ))
         .invoke_handler(tauri::generate_handler![
             // Native IPC (existing)
             ipc::native_read_file,
@@ -292,9 +299,17 @@ pub fn build_tauri_app(
 
             let browser_app_handle = app.handle().clone();
             let mut browser_events = app.state::<TauriState>().browser_runtime.subscribe();
-            tokio::spawn(async move {
+            let browser_bridge_cancel = app
+                .state::<TauriState>()
+                .bridge_supervisor
+                .cancellation_token();
+            let browser_bridge = tokio::spawn(async move {
                 loop {
-                    match browser_events.recv().await {
+                    let event = tokio::select! {
+                        _ = browser_bridge_cancel.cancelled() => break,
+                        event = browser_events.recv() => event,
+                    };
+                    match event {
                         Ok(event) => {
                             let _ = browser_app_handle.emit("browser://event", event);
                         }
@@ -305,6 +320,9 @@ pub fn build_tauri_app(
                     }
                 }
             });
+            app.state::<TauriState>()
+                .bridge_supervisor
+                .track(browser_bridge);
 
             let handle = app.handle().clone();
             app.global_shortcut()
@@ -343,12 +361,16 @@ pub fn build_tauri_app(
                 let agent = state.app_state.connection.agent.clone();
                 let task_runtime_store = state.app_state.tasks.runtime.clone();
                 let tool_executions = state.app_state.storage.tool_executions.clone();
-                tokio::spawn(async move {
-                    let mut rx = agent
-                        .read_async(|a| {
-                            Box::pin(async move { a.subagent_registry().event_bus().subscribe() })
-                        })
-                        .await;
+                let supervisor = state.bridge_supervisor.clone();
+                let cancel = supervisor.cancellation_token();
+                let bridge = tokio::spawn(async move {
+                    let subscription = agent.read_async(|a| {
+                        Box::pin(async move { a.subagent_registry().event_bus().subscribe() })
+                    });
+                    let mut rx = tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        rx = subscription => rx,
+                    };
                     let mut usage_sequence_by_execution =
                         std::collections::HashMap::<String, u64>::new();
                     let mut subagent_context_by_execution =
@@ -358,7 +380,11 @@ pub fn build_tauri_app(
                         std::collections::HashSet<String>,
                     >::new();
                     loop {
-                        match rx.recv().await {
+                        let event = tokio::select! {
+                            _ = cancel.cancelled() => break,
+                            event = rx.recv() => event,
+                        };
+                        match event {
                             Ok(event) => {
                                 use echo_agent::agent::subagent::SubagentEvent;
                                 if let SubagentEvent::DispatchStarted {
@@ -759,6 +785,7 @@ pub fn build_tauri_app(
                         }
                     }
                 });
+                supervisor.track(bridge);
             }
 
             Ok(())

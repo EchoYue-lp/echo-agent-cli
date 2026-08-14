@@ -257,12 +257,20 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
 
     // ── Launch Tauri window ──
-    let tauri_result =
-        crate::tauri::build_tauri_app(state.clone(), runtime.browser_runtime.clone())
-            .run(tauri::generate_context!());
+    let terminal_manager = Arc::new(crate::tauri::terminal::TerminalManager::new());
+    let bridge_supervisor = Arc::new(crate::tauri::state::TauriBridgeSupervisor::new());
+    let tauri_result = crate::tauri::build_tauri_app(
+        state.clone(),
+        runtime.browser_runtime.clone(),
+        terminal_manager.clone(),
+        bridge_supervisor.clone(),
+    )
+    .run(tauri::generate_context!());
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
+    bridge_supervisor.shutdown().await;
+    terminal_manager.close_all().await;
     if let Some(store) = state.tasks.runtime.as_ref()
         && let Err(error) = store.shutdown_hook_events().await
     {
