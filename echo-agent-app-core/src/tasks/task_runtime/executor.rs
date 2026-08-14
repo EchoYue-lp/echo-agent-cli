@@ -3629,9 +3629,8 @@ pub async fn launch_unattended_run(
     let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
 
     // 1. Create the run in Pending, attended_mode = Unattended.
-    store.create_run(
+    store.create_run_for_active_workspace(
         &run_id,
-        "default",
         &conversation_id,
         "", // root_message_id — no chat message for unattended run
         DomainProfile::General,

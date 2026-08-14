@@ -15,7 +15,7 @@ use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTask
 /// append lock is per-run via the `events.jsonl` file handle being held briefly).
 #[derive(Clone)]
 pub struct FileTaskShadow {
-    root: PathBuf,
+    root: std::sync::Arc<std::sync::RwLock<PathBuf>>,
     /// In-memory seq cache (run_id → last assigned seq) to avoid re-reading
     /// the whole `events.jsonl` on every append (O(n) per write → O(n²) per
     /// run). Seeded lazily from the file's line count on first append per run,
@@ -54,7 +54,7 @@ impl FileTaskShadow {
     /// Create a shadow rooted at `root`. The directory is created lazily on first write.
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self {
-            root: root.into(),
+            root: std::sync::Arc::new(std::sync::RwLock::new(root.into())),
             seq_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_write_locks: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -84,8 +84,30 @@ impl FileTaskShadow {
         echo_agent::paths::user_data_path("tasks")
     }
 
+    pub(crate) fn root(&self) -> PathBuf {
+        self.root
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn rebind_root(&self, root: PathBuf) {
+        *self
+            .root
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = root;
+        self.seq_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        self.run_write_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+    }
+
     fn run_dir(&self, run_id: &str) -> PathBuf {
-        self.root.join(run_id)
+        self.root().join(run_id)
     }
 
     fn events_path(&self, run_id: &str) -> PathBuf {
@@ -305,7 +327,8 @@ impl FileTaskShadow {
     /// replaces SQL `SELECT ... FROM tr_runs WHERE ...`.
     pub fn list_run_ids(&self) -> Result<Vec<String>, ShadowError> {
         let mut ids = Vec::new();
-        let read_dir = match std::fs::read_dir(&self.root) {
+        let root = self.root();
+        let read_dir = match std::fs::read_dir(&root) {
             Ok(rd) => rd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(ShadowError::Io(e.to_string())),
@@ -328,12 +351,6 @@ impl FileTaskShadow {
             }
         }
         Ok(ids)
-    }
-
-    /// The root path this shadow writes under (used by FileTaskStore to share
-    /// the same root for enumeration).
-    pub fn root_path(&self) -> &Path {
-        &self.root
     }
 
     /// Read the shadow plan.json for parity comparison. Returns None if not yet written.

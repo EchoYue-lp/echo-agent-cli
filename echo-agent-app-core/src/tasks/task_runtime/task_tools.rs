@@ -954,9 +954,8 @@ impl CreateComplexTaskTool {
             .clone()
             .unwrap_or_else(|| format!("message:{run_id}"));
         let attended = super::types::AttendedMode::Attended;
-        if let Err(e) = store.create_run(
+        if let Err(e) = store.create_run_for_active_workspace(
             &run_id,
-            "default",
             &conv,
             &res.root_message_id,
             domain,

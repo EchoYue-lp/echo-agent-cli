@@ -942,8 +942,10 @@ impl AppState {
         let root = validated_workspace_root(&workspace.root)?;
         let state_dir = crate::workspace::layout::WorkspaceLayout::state_dir(&root);
         let sessions_dir = crate::workspace::layout::WorkspaceLayout::sessions(&root);
+        let tasks_dir = crate::workspace::layout::WorkspaceLayout::tasks(&root);
         std::fs::create_dir_all(&state_dir)?;
         std::fs::create_dir_all(&sessions_dir)?;
+        std::fs::create_dir_all(&tasks_dir)?;
         let conversation_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(
             echo_agent::memory::FileConversationStore::new(&state_dir).map_err(|error| {
                 anyhow::anyhow!("Failed to prepare workspace conversation store: {error}")
@@ -1098,6 +1100,10 @@ impl AppState {
         // 根据工作区类型配置 Agent（自动激活 Skills 和注入系统提示词）
         self.apply_workspace_routing(&workspace).await;
 
+        if let Some(runtime) = self.tasks.runtime.as_deref() {
+            runtime.rebind_shadow_root(tasks_dir, workspace.id.to_string())?;
+        }
+
         {
             let mut current = self.workspace.current.write().await;
             *current = Some(workspace.clone());
@@ -1141,6 +1147,9 @@ impl AppState {
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global runtime state store"))?;
         let memory_store = crate::infra::create_global_memory_store()
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global memory store"))?;
+        let global_tasks_dir =
+            crate::tasks::task_runtime::file_shadow::FileTaskShadow::default_root();
+        std::fs::create_dir_all(&global_tasks_dir)?;
         if let Some(pool) = &self.connection.pool {
             pool.reset_for_workspace_transition().await?;
         }
@@ -1277,6 +1286,10 @@ impl AppState {
                 .await;
         }
 
+        if let Some(runtime) = self.tasks.runtime.as_deref() {
+            runtime.rebind_shadow_root(global_tasks_dir, "global")?;
+        }
+
         {
             let mut current = self.workspace.current.write().await;
             *current = None;
@@ -1293,15 +1306,6 @@ impl AppState {
             crate::workspace::layout::WorkspaceLayout::sessions(&ws.root)
         } else {
             Persistence::base_dir()
-        }
-    }
-
-    /// 获取工作区感知的 tasks DB 路径。
-    pub async fn tasks_db_path(&self) -> std::path::PathBuf {
-        if let Some(ref ws) = *self.workspace.current.read().await {
-            crate::workspace::layout::WorkspaceLayout::tasks(&ws.root).join("tasks.db")
-        } else {
-            Persistence::base_dir().join("tasks.db")
         }
     }
 }

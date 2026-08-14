@@ -278,9 +278,8 @@ impl BackgroundTaskService {
         } else {
             request.description
         };
-        self.task_runtime_store.create_run(
+        self.task_runtime_store.create_run_for_active_workspace(
             &run_id,
-            "default",
             &conversation_id,
             "",
             request.domain_profile,
@@ -319,9 +318,8 @@ impl BackgroundTaskService {
             description
         };
         let task_kind = format!("bg:kind:{source_kind}_composite");
-        self.task_runtime_store.create_run(
+        self.task_runtime_store.create_run_for_active_workspace(
             &run_id,
-            "default",
             &conversation_id,
             "",
             DomainProfile::General,

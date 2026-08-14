@@ -71,6 +71,8 @@ pub struct TaskRuntimeStore {
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
     /// File-backed event authority and deterministic projections.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
+    shadow_generation: std::sync::Mutex<ShadowGeneration>,
+    shadow_generation_idle: std::sync::Condvar,
     /// Owns the bounded task/subagent hook consumer so shutdown can drain it.
     hook_event_dispatcher:
         std::sync::Mutex<Option<super::hook_event_dispatcher::HookEventDispatcher>>,
@@ -80,6 +82,42 @@ pub struct TaskRuntimeStore {
     /// "读事件 → 校验 → 追加 → 重建投影"事务, 必须按 run 串行化。
     /// Different runs keep independent locks.
     plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
+}
+
+struct ShadowGeneration {
+    active_operations: usize,
+    workspace_id: String,
+}
+
+struct ShadowOperation<'a> {
+    store: &'a TaskRuntimeStore,
+}
+
+struct ShadowFileStore<'a> {
+    _operation: ShadowOperation<'a>,
+    store: super::file_store::FileTaskStore,
+}
+
+impl std::ops::Deref for ShadowFileStore<'_> {
+    type Target = super::file_store::FileTaskStore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.store
+    }
+}
+
+impl Drop for ShadowOperation<'_> {
+    fn drop(&mut self) {
+        let mut generation = self
+            .store
+            .shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation.active_operations = generation.active_operations.saturating_sub(1);
+        if generation.active_operations == 0 {
+            self.store.shadow_generation_idle.notify_all();
+        }
+    }
 }
 
 /// RAII registration for one active TaskRun driver. Nested drivers for the
@@ -181,6 +219,11 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
+            shadow_generation: std::sync::Mutex::new(ShadowGeneration {
+                active_operations: 0,
+                workspace_id: "global".to_string(),
+            }),
+            shadow_generation_idle: std::sync::Condvar::new(),
             hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
         })
@@ -207,6 +250,11 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
+            shadow_generation: std::sync::Mutex::new(ShadowGeneration {
+                active_operations: 0,
+                workspace_id: "test".to_string(),
+            }),
+            shadow_generation_idle: std::sync::Condvar::new(),
             hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
         })
@@ -236,6 +284,7 @@ impl TaskRuntimeStore {
                     tracing::warn!(%error, "Failed to enqueue task hook event");
                 }
             });
+        let _operation = self.shadow_operation();
         if !self.shadow.try_attach_event_hook(hook) {
             return false;
         }
@@ -279,6 +328,7 @@ impl TaskRuntimeStore {
     /// 闭包体内是临界区。revision compare-and-commit / transition_run 用它包裹
     /// "读事件 → 校验 → 追加 → 重建投影"全程。
     fn with_run_lock<R, E>(&self, run_id: &str, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
+        let _operation = self.shadow_operation();
         let arc = self
             .plan_locks
             .entry(run_id.to_string())
@@ -289,9 +339,80 @@ impl TaskRuntimeStore {
         f()
     }
 
+    fn shadow_operation(&self) -> ShadowOperation<'_> {
+        let mut generation = self
+            .shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation.active_operations = generation.active_operations.saturating_add(1);
+        ShadowOperation { store: self }
+    }
+
+    /// Atomically switch the file authority after all operations using the
+    /// previous root have completed. The store Arc and event hook stay intact.
+    pub fn rebind_shadow_root(
+        &self,
+        root: impl Into<PathBuf>,
+        workspace_id: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)
+            .map_err(|error| super::file_shadow::ShadowError::Io(error.to_string()))?;
+        let mut generation = self
+            .shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while generation.active_operations != 0 {
+            generation = self
+                .shadow_generation_idle
+                .wait(generation)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        self.shadow.rebind_root(root);
+        generation.workspace_id = workspace_id.into();
+        Ok(())
+    }
+
+    pub fn active_workspace_id(&self) -> String {
+        self.shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .workspace_id
+            .clone()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_run_for_active_workspace(
+        &self,
+        run_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+    ) -> Result<TaskRun, StoreError> {
+        let _operation = self.shadow_operation();
+        let workspace_id = self.active_workspace_id();
+        self.create_run(
+            run_id,
+            &workspace_id,
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+        )
+    }
+
     /// Build a `FileTaskStore` over the shadow, for read delegation.
-    fn file_store(&self) -> super::file_store::FileTaskStore {
-        super::file_store::FileTaskStore::new((*self.shadow).clone())
+    fn file_store(&self) -> ShadowFileStore<'_> {
+        let operation = self.shadow_operation();
+        ShadowFileStore {
+            _operation: operation,
+            store: super::file_store::FileTaskStore::new((*self.shadow).clone()),
+        }
     }
 
     // ── Runs ────────────────────────────────────────────────────────────
@@ -432,6 +553,7 @@ impl TaskRuntimeStore {
     /// The caller (IPC layer) is responsible for re-launching the executor
     /// after this succeeds — the store only handles the state transition.
     pub fn resume_task_run(&self, run_id: &str) -> Result<TaskRun, StoreError> {
+        let _operation = self.shadow_operation();
         let blockers = self.list_recovery_blockers(run_id)?;
         if !blockers.is_empty() {
             let details = blockers
@@ -575,6 +697,7 @@ impl TaskRuntimeStore {
     /// the terminal transition. Runs without a driver may only be cancelled
     /// directly when they are not executing.
     pub fn request_cancel(&self, run_id: &str) -> Result<bool, StoreError> {
+        let _operation = self.shadow_operation();
         if self.cancel_active_run(run_id) {
             return Ok(true);
         }
@@ -596,6 +719,7 @@ impl TaskRuntimeStore {
     /// run-scoped token used for cancellation stops in-flight Subagents. The
     /// executor observes the durable Paused status and leaves the run resumable.
     pub fn request_pause(&self, run_id: &str) -> Result<bool, StoreError> {
+        let _operation = self.shadow_operation();
         let Some(run) = self.get_run(run_id)? else {
             return Ok(false);
         };
@@ -677,6 +801,7 @@ impl TaskRuntimeStore {
         &self,
         run_id: &str,
     ) -> Result<Option<echo_agent::tasks::RevisionedTaskGraph>, StoreError> {
+        let _operation = self.shadow_operation();
         let Some(plan) = self.shadow.read_plan(run_id)? else {
             return Ok(None);
         };
@@ -1602,6 +1727,7 @@ impl TaskRuntimeStore {
         tool_name: Option<&str>,
         reason: &str,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -1629,6 +1755,7 @@ impl TaskRuntimeStore {
     ///
     /// Safe to call on an empty/fresh store (no-op).
     pub fn recover_incomplete(&self) -> usize {
+        let _operation = self.shadow_operation();
         const INTERRUPTED: &[TaskRunStatus] = &[TaskRunStatus::Running];
         let zombies = match self.list_runs_in(INTERRUPTED) {
             Ok(z) => z,
@@ -1839,6 +1966,7 @@ impl TaskRuntimeStore {
         task_id: Option<&str>,
         message: &str,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         // U1c phase-0/0bc step-2: file authority. A plain Note{message} does
         // not affect plan.json (the rebuilder only mutates the plan for
         // Note{kind: fix_task_persisted | summary_persisted}), so we skip the
@@ -1864,6 +1992,7 @@ impl TaskRuntimeStore {
         priority: u8,
         dependencies: &[String],
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         self.shadow.append_event_line(
             run_id,
             None,
@@ -1887,6 +2016,7 @@ impl TaskRuntimeStore {
         requested_mode: &str,
         observed_path: &str,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         self.shadow.append_event_line(
             run_id,
             None,
@@ -1917,6 +2047,7 @@ impl TaskRuntimeStore {
         replay_safe: bool,
         dispatch_hook: bool,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -1940,6 +2071,7 @@ impl TaskRuntimeStore {
         &self,
         record: SubagentReleaseRecord<'_>,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         let SubagentReleaseRecord {
             run_id,
             task_id,
@@ -1987,6 +2119,7 @@ impl TaskRuntimeStore {
         tool_name: &str,
         replay_safe: bool,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -2016,6 +2149,7 @@ impl TaskRuntimeStore {
         result: &str,
         failure: Option<&echo_agent::tools::ToolFailure>,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         let event_type = if success {
             RuntimeEventKind::ToolCompleted
         } else {
@@ -2099,6 +2233,7 @@ impl TaskRuntimeStore {
 
     /// Current unresolved recovery barriers, folded from append-only events.
     pub fn list_recovery_blockers(&self, run_id: &str) -> Result<Vec<RecoveryBlocker>, StoreError> {
+        let _operation = self.shadow_operation();
         let mut blockers = std::collections::BTreeMap::<String, RecoveryBlocker>::new();
         for event in self.list_events(run_id, 0)? {
             match event.event_type {
@@ -2156,6 +2291,7 @@ impl TaskRuntimeStore {
         task_id: &str,
         decision: RecoveryDecision,
     ) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation();
         let blocker = self
             .list_recovery_blockers(run_id)?
             .into_iter()
@@ -3500,6 +3636,87 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StoreError::TaskNotFound(_)));
         assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+    }
+
+    #[test]
+    fn generation_rebind_waits_for_active_operation_and_isolates_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+            &first_root,
+        )?);
+        let operation = store.shadow_operation();
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let rebinding_store = store.clone();
+        let handle = std::thread::spawn(move || {
+            let _ignored = started_sender.send(());
+            let result = rebinding_store.rebind_shadow_root(&second_root, "workspace-b");
+            let _ignored = sender.send(result);
+        });
+
+        started_receiver.recv_timeout(std::time::Duration::from_secs(2))?;
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(operation);
+        receiver.recv_timeout(std::time::Duration::from_secs(2))??;
+        handle
+            .join()
+            .map_err(|_| std::io::Error::other("generation rebind thread panicked"))?;
+
+        store.create_run_for_active_workspace(
+            "run-b",
+            "conversation-b",
+            "message-b",
+            DomainProfile::General,
+            "generation isolation",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        assert!(!first_root.join("run-b").exists());
+        assert!(temp.path().join("second/run-b/events.jsonl").is_file());
+        assert_eq!(
+            store.get_run("run-b")?.map(|run| run.workspace_id),
+            Some("workspace-b".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_generation_rebind_keeps_previous_root_and_identity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let first_root = temp.path().join("first");
+        let invalid_root = temp.path().join("not-a-directory");
+        std::fs::write(&invalid_root, "file")?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&first_root)?;
+
+        assert!(
+            store
+                .rebind_shadow_root(&invalid_root, "workspace-b")
+                .is_err()
+        );
+        assert_eq!(store.active_workspace_id(), "test");
+        store.create_run_for_active_workspace(
+            "run-a",
+            "conversation-a",
+            "message-a",
+            DomainProfile::General,
+            "failed rebind",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        assert!(first_root.join("run-a/events.jsonl").is_file());
+        assert_eq!(
+            store.get_run("run-a")?.map(|run| run.workspace_id),
+            Some("test".to_string())
+        );
+        Ok(())
     }
 
     /// Helper: a minimal `PlanTask` body with the given id and sane defaults,

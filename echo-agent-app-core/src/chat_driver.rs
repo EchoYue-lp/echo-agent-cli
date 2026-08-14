@@ -336,9 +336,8 @@ fn ensure_task_mode_run(
 
     let store = store.ok_or_else(|| "Task mode requires TaskRuntimeStore".to_string())?;
     let run = store
-        .create_run(
+        .create_run_for_active_workspace(
             run_id,
-            "default",
             conversation_id.unwrap_or("message:task"),
             turn_id,
             DomainProfile::General,

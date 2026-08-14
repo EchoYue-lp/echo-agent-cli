@@ -1347,6 +1347,13 @@ mod tests {
         create_test_agent().map(AgentHandle::new)
     }
 
+    fn test_app_config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.model.provider = "test".to_string();
+        config.model.name = "test-model".to_string();
+        config
+    }
+
     async fn create_test_pool(max_agents: usize, enable_bg: bool) -> TestResult<AgentPool> {
         let agent = create_test_agent()?;
         let handle = AgentHandle::new(agent);
@@ -1360,7 +1367,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(1800),
                 enable_background_agent: enable_bg,
             },
-            app_config: RwLock::new(AppConfig::default()),
+            app_config: RwLock::new(test_app_config()),
             working_dir: RwLock::new(None),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
@@ -1397,7 +1404,7 @@ mod tests {
                 idle_timeout: Duration::from_secs(1800),
                 enable_background_agent: false,
             },
-            app_config: RwLock::new(AppConfig::default()),
+            app_config: RwLock::new(test_app_config()),
             working_dir: RwLock::new(None),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
