@@ -1278,7 +1278,14 @@ export interface CitationAuditReport {
 }
 
 export type ReviewExportFormat =
-  'markdown' | 'pdf' | 'docx' | 'json' | 'csv' | 'bibtex' | 'ris' | 'all';
+  | 'markdown'
+  | 'pdf'
+  | 'docx'
+  | 'json'
+  | 'csv'
+  | 'bibtex'
+  | 'ris'
+  | 'all';
 export interface ReviewExportArtifact {
   review_id: string;
   format: Exclude<ReviewExportFormat, 'all'>;

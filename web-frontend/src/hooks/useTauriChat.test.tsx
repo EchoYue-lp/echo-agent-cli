@@ -1,0 +1,182 @@
+// @vitest-environment jsdom
+import { act, renderHook, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { useConversationStore } from '../stores/conversationStore';
+import { useChatStore } from '../stores/chatStore';
+import { useToastStore } from '../stores/toastStore';
+import { useTauriChat } from './useTauriChat';
+
+const mocks = vi.hoisted(() => ({
+  apiInvoke: vi.fn(),
+  listen: vi.fn(),
+  listeners: new Map<string, (event: { payload: unknown }) => void>(),
+}));
+
+vi.mock('../lib/tauri-bridge', () => ({
+  apiInvoke: mocks.apiInvoke,
+  errorMessage: (error: unknown) => String(error),
+  isTauri: () => true,
+}));
+
+vi.mock('@tauri-apps/api/event', () => ({
+  listen: mocks.listen,
+}));
+
+describe('useTauriChat foreground turn recovery', () => {
+  const activeSnapshot = {
+    surface: 'gui',
+    conversation_id: 'message:turn-before-remount',
+    turn_id: 'turn-before-remount',
+    cancellation_requested: false,
+  };
+
+  beforeEach(() => {
+    mocks.apiInvoke.mockReset();
+    mocks.listen.mockReset();
+    mocks.listeners.clear();
+    mocks.listen.mockImplementation(
+      async (eventName: string, callback: (event: { payload: unknown }) => void) => {
+        mocks.listeners.set(eventName, callback);
+        return () => mocks.listeners.delete(eventName);
+      }
+    );
+    useConversationStore.setState({ activeId: null });
+    useChatStore.getState().setRunStatus('running');
+    useToastStore.getState().clearAll();
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') {
+        return activeSnapshot;
+      }
+      return { success: true, turn_id: activeSnapshot.turn_id, status: 'cancelled' };
+    });
+  });
+
+  it('restores the real message scope after remount and cancels that exact turn', async () => {
+    const first = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
+        conversationId: undefined,
+        conversation_id: undefined,
+      });
+    });
+    first.unmount();
+
+    mocks.apiInvoke.mockClear();
+    const remounted = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
+        conversationId: undefined,
+        conversation_id: undefined,
+      });
+    });
+    await act(async () => {
+      await remounted.result.current.cancel();
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      conversationId: 'message:turn-before-remount',
+      conversation_id: 'message:turn-before-remount',
+      messageKey: 'turn-before-remount',
+      message_key: 'turn-before-remount',
+    });
+    remounted.unmount();
+  });
+
+  it('resolves exact identity when Stop wins the mount-recovery race', async () => {
+    let resolveMountLookup: (value: typeof activeSnapshot) => void = () => {};
+    const pendingMountLookup = new Promise<typeof activeSnapshot>((resolve) => {
+      resolveMountLookup = resolve;
+    });
+    let lookupCount = 0;
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') {
+        lookupCount += 1;
+        if (lookupCount === 1) {
+          return pendingMountLookup;
+        }
+        return activeSnapshot;
+      }
+      return { success: true, turn_id: activeSnapshot.turn_id, status: 'cancelled' };
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(lookupCount).toBe(1);
+      expect(mocks.listeners.has('chat://event')).toBe(true);
+    });
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      conversationId: 'message:turn-before-remount',
+      conversation_id: 'message:turn-before-remount',
+      messageKey: 'turn-before-remount',
+      message_key: 'turn-before-remount',
+    });
+    expect(useChatStore.getState().runStatus).toBe('running');
+    await act(async () => {
+      resolveMountLookup(activeSnapshot);
+      await pendingMountLookup;
+    });
+    act(() => {
+      mocks.listeners.get('chat://event')?.({
+        payload: {
+          type: 'cancelled',
+          message_key: activeSnapshot.turn_id,
+          conversation_id: activeSnapshot.conversation_id,
+        },
+      });
+    });
+    expect(useChatStore.getState().runStatus).toBe('cancelled');
+
+    // The late mount response carried a now-settled snapshot. It must not
+    // restore stale refs that could target a later turn.
+    mocks.apiInvoke.mockClear();
+    mocks.apiInvoke.mockResolvedValue(null);
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('cancel_chat', expect.anything());
+    hook.unmount();
+  });
+
+  it('shows a user-visible error when exact identity cannot be recovered', async () => {
+    mocks.apiInvoke.mockResolvedValue(null);
+    const hook = renderHook(() => useTauriChat());
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    expect(useToastStore.getState().toasts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'error',
+          message: '无法定位正在运行的任务，请稍后重试',
+        }),
+      ])
+    );
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('cancel_chat', expect.anything());
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isCancelled).toBe(false);
+    hook.unmount();
+  });
+
+  it('keeps the running terminal projection when snapshot IPC fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    mocks.apiInvoke.mockRejectedValue(new Error('snapshot unavailable'));
+    const hook = renderHook(() => useTauriChat());
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+    expect(useToastStore.getState().toasts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: 'error',
+          message: '停止任务失败：Error: snapshot unavailable',
+        }),
+      ])
+    );
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isCancelled).toBe(false);
+    consoleError.mockRestore();
+    hook.unmount();
+  });
+});

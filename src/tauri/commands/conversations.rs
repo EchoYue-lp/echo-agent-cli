@@ -739,7 +739,12 @@ pub async fn branch_conversation(
     id: String,
     user_turn_index: usize,
 ) -> Result<serde_json::Value, IpcError> {
-    if state.app_state.session.active_chat_turns.contains_key(&id) {
+    if state
+        .app_state
+        .session
+        .foreground_turns
+        .has_active_conversation(&id)
+    {
         return Err(IpcError::Validation(
             "cannot branch a conversation while its turn is active".to_string(),
         ));

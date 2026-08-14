@@ -410,13 +410,13 @@ pub struct ConfigState {
     pub permission_rules: RwLock<Vec<PermissionRuleConfig>>,
 }
 
-/// 会话状态：工具状态 + 取消令牌
+/// 会话状态：工具状态、非聊天操作取消和前台 turn 控制。
 pub struct SessionState {
     pub tool_states: RwLock<HashMap<String, ToolState>>,
-    pub cancel_token: Arc<DashMap<String, CancellationToken>>,
-    /// One foreground chat turn per conversation. UI surfaces may queue
-    /// follow-up input, but must never start two turns against the same agent.
-    pub active_chat_turns: Arc<DashMap<String, String>>,
+    /// Cancellation registry for non-chat operations such as analysis jobs.
+    pub operation_cancel_tokens: Arc<DashMap<String, CancellationToken>>,
+    /// Application authority for foreground chat admission and cancellation.
+    pub foreground_turns: crate::foreground_turn::ForegroundTurnControl,
 }
 
 /// 插件状态：MCP 服务管理
@@ -569,8 +569,8 @@ impl AppState {
             },
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
-                cancel_token: Arc::new(DashMap::new()),
-                active_chat_turns: Arc::new(DashMap::new()),
+                operation_cancel_tokens: Arc::new(DashMap::new()),
+                foreground_turns: crate::foreground_turn::ForegroundTurnControl::default(),
             },
             plugins: PluginState {
                 mcp_config: RwLock::new(McpConfigFile::default()),
@@ -959,7 +959,7 @@ impl AppState {
     /// 这会重新初始化 persistence 和 session manager 以使用工作区路径。
     pub async fn switch_workspace(&self, workspace: Workspace) -> anyhow::Result<()> {
         let _transition = self.workspace.transition.lock().await;
-        if !self.session.active_chat_turns.is_empty() {
+        if self.session.foreground_turns.has_active_turns() {
             anyhow::bail!("Cannot switch workspace while a foreground chat turn is running");
         }
         ensure_no_running_task_runs(self.tasks.runtime.as_deref())?;
@@ -1158,7 +1158,7 @@ impl AppState {
     /// 退出工作区（回到全局默认路径）。
     pub async fn exit_workspace(&self) -> anyhow::Result<()> {
         let _transition = self.workspace.transition.lock().await;
-        if !self.session.active_chat_turns.is_empty() {
+        if self.session.foreground_turns.has_active_turns() {
             anyhow::bail!("Cannot exit workspace while a foreground chat turn is running");
         }
         ensure_no_running_task_runs(self.tasks.runtime.as_deref())?;

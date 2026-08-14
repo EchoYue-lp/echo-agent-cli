@@ -5,7 +5,6 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
 use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
@@ -536,34 +535,23 @@ pub async fn send_chat_message(
     let active_turn_key = conversation_id
         .clone()
         .unwrap_or_else(|| format!("message:{message_key}"));
-    match state
+    let foreground_lease = state
         .app_state
         .session
-        .active_chat_turns
-        .entry(active_turn_key.clone())
-    {
-        dashmap::mapref::entry::Entry::Occupied(entry) => {
-            return Err(IpcError::Validation(format!(
-                "chat_turn_busy:{}",
-                entry.get()
-            )));
-        }
-        dashmap::mapref::entry::Entry::Vacant(entry) => {
-            entry.insert(message_key.clone());
-        }
-    }
-
-    let cancel_token = CancellationToken::new();
-
-    // Register cancel token so `cancel_chat(message_key)` (the GUI "stop"
-    // button) can fire it for this chat turn. Background runs created by the
-    // agent via `create_complex_task` use an INDEPENDENT token (spec §5.5) —
-    // firing this one cancels the inline chat reply, not the background run.
-    state
-        .app_state
-        .session
-        .cancel_token
-        .insert(message_key.clone(), cancel_token.clone());
+        .foreground_turns
+        .begin(
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            active_turn_key.clone(),
+            message_key.clone(),
+        )
+        .map_err(|error| match error {
+            echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy {
+                active_turn_id,
+                ..
+            } => IpcError::Validation(format!("chat_turn_busy:{active_turn_id}")),
+            other => IpcError::Validation(other.to_string()),
+        })?;
+    let cancel_token = foreground_lease.cancellation_token();
 
     // Attach a Tauri HITL handler to this specific agent. This keeps concurrent
     // GUI conversations isolated instead of racing through the global dispatcher.
@@ -622,10 +610,6 @@ pub async fn send_chat_message(
     });
 
     let agent_handle_clone = agent_handle.clone();
-    let cleanup_tokens = state.app_state.session.cancel_token.clone();
-    let cleanup_key = message_key.clone();
-    let active_chat_turns = state.app_state.session.active_chat_turns.clone();
-    let active_turn_key_for_cleanup = active_turn_key.clone();
     // Build the prepared turn (instruction + input resources, mode hint folded
     // in, long pastes spilled to user-input artifacts). Replaces the old
     // (message, multimodal_message) pair handed to drive_chat.
@@ -645,13 +629,9 @@ pub async fn send_chat_message(
         Ok(turn) => turn,
         Err(e) => {
             tracing::warn!(error = %e, "failed to prepare user turn");
-            cleanup_tokens.remove(&cleanup_key);
-            if active_chat_turns
-                .get(&active_turn_key_for_cleanup)
-                .is_some_and(|entry| entry.value() == &cleanup_key)
-            {
-                active_chat_turns.remove(&active_turn_key_for_cleanup);
-            }
+            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("prepared_turn", e.to_string()),
+            ));
             let _ = sink.on_event(ChatDriverEvent::TurnStatus {
                 status: "failed".to_string(),
             });
@@ -665,7 +645,7 @@ pub async fn send_chat_message(
         store: state.app_state.tasks.runtime.clone(),
         sink: sink.clone(),
         webhook_emitter: Some(state.app_state.webhook.emitter.clone()),
-        conv_id: conversation_id.clone(),
+        conv_id: Some(active_turn_key.clone()),
         root_message_id: message_key.clone(),
         attachments: prepared_turn.inline_attachment_refs(),
         cancel: cancel_token.clone(),
@@ -683,22 +663,19 @@ pub async fn send_chat_message(
         // files re-read from disk via refs). Background runs created by
         // create_complex_task pick up attachments via ChatResources.attachments
         // (already bound above).
-        let outcome =
-            echo_agent_app_core::chat_driver::drive_chat(&agent_handle_clone, &prepared_turn, res)
-                .await;
+        let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat(
+            foreground_lease,
+            &agent_handle_clone,
+            &prepared_turn,
+            res,
+        )
+        .await;
         let terminal_status = match &outcome {
             Ok(outcome) => outcome.status(),
             Err(_) => "failed",
         };
         if let Err(e) = &outcome {
             tracing::warn!(error = %e, "drive_chat chat turn errored");
-        }
-        cleanup_tokens.remove(&cleanup_key);
-        if active_chat_turns
-            .get(&active_turn_key_for_cleanup)
-            .is_some_and(|entry| entry.value() == &cleanup_key)
-        {
-            active_chat_turns.remove(&active_turn_key_for_cleanup);
         }
         // Release all execution ownership before emitting Done. The frontend
         // may immediately dispatch the next queued turn when it receives it.
@@ -740,9 +717,12 @@ pub async fn steer_chat_message(
     let expected_turn_id = state
         .app_state
         .session
-        .active_chat_turns
-        .get(&conversation_id)
-        .map(|entry| entry.value().clone())
+        .foreground_turns
+        .snapshot(
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            &conversation_id,
+        )
+        .map(|snapshot| snapshot.turn_id)
         .ok_or_else(|| IpcError::Validation("no active chat turn".to_string()))?;
     let saved_attachments = attachments.unwrap_or_default();
     let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
@@ -798,28 +778,74 @@ pub async fn steer_chat_message(
     }
 }
 
+fn select_active_chat_turn(
+    control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    conversation_id: Option<&str>,
+) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
+    use echo_agent_app_core::foreground_turn::ForegroundTurnSurface;
+
+    if let Some(conversation_id) = conversation_id {
+        return Ok(control.snapshot(ForegroundTurnSurface::Gui, conversation_id));
+    }
+    let mut snapshots = control
+        .snapshots(ForegroundTurnSurface::Gui)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    match snapshots.len() {
+        0 => Ok(None),
+        1 => Ok(snapshots.pop()),
+        _ => Err(IpcError::Validation(
+            "active_chat_turn_ambiguous:conversation_id_required".to_string(),
+        )),
+    }
+}
+
+/// Restore the exact registry scope after a WebView/hook remount.
+///
+/// If no product conversation id exists yet, fallback is permitted only when
+/// there is exactly one active GUI turn. The returned `conversation_id` is the
+/// registry's real scope key and may therefore be `message:<turn_id>`.
+#[tauri::command]
+pub fn get_active_chat_turn(
+    state: tauri::State<'_, TauriState>,
+    conversation_id: Option<String>,
+) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
+    select_active_chat_turn(
+        &state.app_state.session.foreground_turns,
+        conversation_id.as_deref(),
+    )
+}
+
 /// Cancel an active chat stream.
 #[tauri::command]
 pub async fn cancel_chat(
     state: tauri::State<'_, TauriState>,
-    message_key: Option<String>,
+    conversation_id: String,
+    message_key: String,
 ) -> Result<serde_json::Value, IpcError> {
-    if let Some(ref key) = message_key {
-        if let Some((_, token)) = state.app_state.session.cancel_token.remove(key) {
-            token.cancel();
-        }
-    } else {
-        // Fallback for non-isolated callers.
-        for entry in state.app_state.session.cancel_token.iter() {
-            entry.value().cancel();
-        }
-        state.app_state.session.cancel_token.clear();
-    }
+    let waiter = state
+        .app_state
+        .session
+        .foreground_turns
+        .request_cancel(
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            &conversation_id,
+            &message_key,
+        )
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
 
-    // Reject pending HITL requests so parked futures unblock immediately.
-    cancel_pending_hitl(message_key.as_deref(), "cancelled by user").await;
+    // Reject pending HITL before waiting so parked execution can reach its
+    // terminal outcome. Ownership remains registered until that settlement.
+    cancel_pending_hitl(Some(&message_key), "cancelled by user").await;
+    let settlement = waiter
+        .wait()
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
 
-    Ok(serde_json::json!({"success": true}))
+    Ok(serde_json::json!({
+        "success": true,
+        "turn_id": settlement.turn_id,
+        "status": settlement.outcome.status(),
+    }))
 }
 
 /// Respond to an approval request.
@@ -1716,6 +1742,44 @@ mod execution_projector_tests {
             .find(|summary| summary.call_id == "call-2")
             .ok_or_else(|| "missing cancelled tool summary".to_string())?;
         assert_eq!(cancelled.status, ToolExecutionStatus::Cancelled);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod foreground_turn_command_tests {
+    use super::*;
+    use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+
+    #[test]
+    fn active_snapshot_returns_real_message_scope_without_product_conversation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin(ForegroundTurnSurface::Gui, "message:turn-1", "turn-1")?;
+        let snapshot = select_active_chat_turn(&control, None)?
+            .ok_or_else(|| "missing active snapshot".to_string())?;
+        assert_eq!(snapshot.conversation_id, "message:turn-1");
+        assert_eq!(snapshot.turn_id, "turn-1");
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn active_snapshot_requires_scope_when_multiple_gui_turns_exist()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let control = ForegroundTurnControl::default();
+        let first = control.begin(ForegroundTurnSurface::Gui, "conversation-1", "turn-1")?;
+        let second = control.begin(ForegroundTurnSurface::Gui, "conversation-2", "turn-2")?;
+        assert!(matches!(
+            select_active_chat_turn(&control, None),
+            Err(IpcError::Validation(message))
+                if message == "active_chat_turn_ambiguous:conversation_id_required"
+        ));
+        let snapshot = select_active_chat_turn(&control, Some("conversation-2"))?
+            .ok_or_else(|| "missing exact active snapshot".to_string())?;
+        assert_eq!(snapshot.turn_id, "turn-2");
+        first.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+        second.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
         Ok(())
     }
 }

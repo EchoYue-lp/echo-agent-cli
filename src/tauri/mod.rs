@@ -200,6 +200,7 @@ pub fn build_tauri_app(
             // Chat streaming
             commands::chat::send_chat_message,
             commands::chat::steer_chat_message,
+            commands::chat::get_active_chat_turn,
             commands::chat::cancel_chat,
             commands::chat::send_approval_response,
             commands::chat::send_input_response,

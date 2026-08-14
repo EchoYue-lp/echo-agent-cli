@@ -98,7 +98,7 @@ pub async fn run_analysis(
     match state
         .app_state
         .session
-        .cancel_token
+        .operation_cancel_tokens
         .entry(cancel_key.clone())
     {
         dashmap::mapref::entry::Entry::Occupied(_) => {
@@ -121,7 +121,11 @@ pub async fn run_analysis(
     )
     .await
     .map_err(ipc_error);
-    state.app_state.session.cancel_token.remove(&cancel_key);
+    state
+        .app_state
+        .session
+        .operation_cancel_tokens
+        .remove(&cancel_key);
     result
 }
 
@@ -134,7 +138,7 @@ pub async fn cancel_analysis(
     let cancelled = state
         .app_state
         .session
-        .cancel_token
+        .operation_cancel_tokens
         .get(&key)
         .map(|token| {
             token.cancel();

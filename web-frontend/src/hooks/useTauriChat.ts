@@ -12,6 +12,7 @@ import { useToolExecutionStore } from '../stores/toolExecutionStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
 import { reorderById } from './queuedChat';
+import type { ForegroundTurnSnapshot } from '../generated';
 import type { Attachment, ChatEvent, ToolExecution } from '../types/api';
 
 export type QueuedChatInput = {
@@ -20,17 +21,65 @@ export type QueuedChatInput = {
   attachments?: Attachment[];
 };
 
+type CancelChatResponse = {
+  success: boolean;
+  turn_id: string;
+  status: 'completed' | 'cancelled' | 'failed';
+};
+
 export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
   const currentMessageKeyRef = useRef<string | null>(null);
   const currentConversationIdRef = useRef<string | null>(null);
+  const identityGenerationRef = useRef(0);
   const thinkingIdRef = useRef<string | null>(null);
   const queuedInputsRef = useRef<QueuedChatInput[]>([]);
   const dispatchMessageRef = useRef<
     ((text: string, attachments: Attachment[] | undefined) => Promise<boolean>) | null
   >(null);
   const [queuedInputs, setQueuedInputs] = useState<QueuedChatInput[]>([]);
+
+  const getActiveTurnSnapshot = useCallback(async () => {
+    const conversationId = useConversationStore.getState().activeId;
+    return apiInvoke<ForegroundTurnSnapshot | null>('get_active_chat_turn', {
+      conversationId: conversationId ?? undefined,
+      conversation_id: conversationId ?? undefined,
+    });
+  }, []);
+
+  const restoreActiveTurnRefs = useCallback((snapshot: ForegroundTurnSnapshot | null) => {
+    if (snapshot && !currentMessageKeyRef.current) {
+      currentConversationIdRef.current = snapshot.conversation_id;
+      currentMessageKeyRef.current = snapshot.turn_id;
+    }
+  }, []);
+
+  // The Rust owner survives WebView and hook remounts. Restore its exact scope
+  // key so Stop never falls back to an unkeyed/global cancellation. When a
+  // conversation has not been persisted yet, the backend returns the sole
+  // active `message:<turn_id>` scope; it rejects an ambiguous global lookup.
+  useEffect(() => {
+    if (!isTauri()) return;
+    let aborted = false;
+    const identityGeneration = identityGenerationRef.current;
+    const restoreActiveTurn = async () => {
+      try {
+        const snapshot = await getActiveTurnSnapshot();
+        if (!aborted && identityGeneration === identityGenerationRef.current) {
+          restoreActiveTurnRefs(snapshot);
+        }
+      } catch (error) {
+        if (!aborted) {
+          console.warn('[TauriChat] Failed to restore active foreground turn:', error);
+        }
+      }
+    };
+    void restoreActiveTurn();
+    return () => {
+      aborted = true;
+    };
+  }, [getActiveTurnSnapshot, restoreActiveTurnRefs]);
 
   const replaceQueue = (next: QueuedChatInput[]) => {
     queuedInputsRef.current = next;
@@ -183,6 +232,7 @@ export function useTauriChat() {
       let pendingAssistantId: string | null = null;
 
       try {
+        identityGenerationRef.current += 1;
         isCancelledRef.current = false;
         thinkingIdRef.current = null;
         const message_key =
@@ -318,19 +368,41 @@ export function useTauriChat() {
   );
 
   const cancel = useCallback(async () => {
-    const messageKey = currentMessageKeyRef.current;
-    useChatStore.getState().markCancelled();
-    assistantIdRef.current = null;
-    isCancelledRef.current = true;
+    identityGenerationRef.current += 1;
+    let messageKey = currentMessageKeyRef.current;
+    let conversationId = currentConversationIdRef.current;
     try {
-      await apiInvoke('cancel_chat', {
-        messageKey: messageKey ?? undefined,
-        message_key: messageKey ?? undefined,
+      // Mount recovery is asynchronous. Stop must independently recover the
+      // exact registry identity when the effect has not populated refs yet.
+      if (!messageKey || !conversationId) {
+        const snapshot = await getActiveTurnSnapshot();
+        if (snapshot) {
+          restoreActiveTurnRefs(snapshot);
+          messageKey = snapshot.turn_id;
+          conversationId = snapshot.conversation_id;
+        }
+      }
+      if (!messageKey || !conversationId) {
+        useToastStore.getState().addToast('error', '无法定位正在运行的任务，请稍后重试');
+        return;
+      }
+      const settlement = await apiInvoke<CancelChatResponse>('cancel_chat', {
+        conversationId,
+        conversation_id: conversationId,
+        messageKey,
+        message_key: messageKey,
       });
+      if (!settlement.success) {
+        throw new Error(`取消请求未完成（${settlement.status}）`);
+      }
+      // The existing chat terminal event is the sole UI projection authority.
+      // Keep refs until that event arrives so the versioned event is accepted
+      // and queued input advances exactly once through `done`.
     } catch (e) {
       console.error('[TauriChat] Failed to cancel:', e);
+      useToastStore.getState().addToast('error', `停止任务失败：${errorMessage(e)}`);
     }
-  }, []);
+  }, [getActiveTurnSnapshot, restoreActiveTurnRefs]);
 
   const clearQueuedMessages = useCallback(() => {
     replaceQueue([]);

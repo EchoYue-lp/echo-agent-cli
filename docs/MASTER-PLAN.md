@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-29
+Last updated: 2026-08-14
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -73,6 +73,7 @@ evidence, and the next bounded step.
 | Plugin component runtime wiring (P1) | Complete | Framework Skills/Hooks/MCP plus application-owned Agent/LSP/monitor/theme/output-style adapters are loaded and exactly unloaded. GUI/TUI/CLI expose the same live catalogs and output-style selection. GUI and TUI immediately synchronize plugin Theme activation and fallback after reload/disable/uninstall; built-in GUI selection deactivates the plugin preference. Theme and output-style preferences survive restart. |
 | Hook execution closure | Complete | The main registry exposes 31 emitted events and 7 Action types. Failed tool results emit `PostToolUseFailure`; the canonical call-scoped `permission_mode_override` participates in approval without mutating global mode; all Hook sources share strict registration filtering. CLI/TUI/GUI Hook tests use the same matcher-aware dry-run, and the watcher reloads app config plus global/project `hooks.yaml` on create/modify/remove. Evolution writes, layer changes, candidate detection, and health checks emit their declared events. Plain HTTP supports loopback/private/link-local IPs, localhost, single-label hosts, `.local`, and `.lan`; remote hosts require HTTPS. User-configured MCP tools have no deny-list. |
 | Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
+| Foreground turn ownership convergence | In progress | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, and settlement. GUI uses it end to end; TUI/CLI/channel adapter migration remains bounded follow-up work. |
 
 ## Current Decisions
 
@@ -421,6 +422,25 @@ is idempotent. This matches Tokio's documented
 [bounded backpressure and clean-shutdown model](https://docs.rs/tokio/latest/tokio/sync/mpsc/index.html)
 while accommodating the store's synchronous append hook.
 
+### Foreground Turn Control
+
+Foreground turn ownership is EKO product policy and remains in app-core. The
+framework continues to own ReAct execution and same-turn steering; app-core
+wraps the existing `drive_chat` and `TurnOutcome` instead of adding another
+lifecycle state machine. The GUI path now acquires one exact
+`(surface, conversation, turn)` lease, uses the lease's cancellation token,
+keeps ownership until the driver settles, and exposes an exact active snapshot
+for WebView remount recovery. A downstream sink rejection cancels that same
+token; when no terminal event was accepted, the sole returned and registered
+outcome is `Failed` with code `downstream_disconnect`, not a synthetic user
+cancellation.
+
+The old GUI `active_chat_turns` and chat token maps are deleted. TUI, CLI, and
+channel entry points still own local cancellation tokens during this staged
+migration; they must be converted into thin `ForegroundTurnControl` adapters
+and their replaced local foreground ownership removed. Framework lifecycle and
+steering APIs must not be duplicated or changed for that follow-up.
+
 ## Next Step
 
 Tool context optimization Phase 0-6 is closed in
@@ -471,3 +491,10 @@ collapsed row remains responsive, expanded output advances by cursor while
 running, completed output loads only one page at a time, history reload restores
 summaries without eager detail reads, and conversation deletion returns before
 background detail cleanup finishes.
+
+Complete foreground-turn surface parity by routing TUI, CLI REPL, and channel
+entry points through the app-core lease while preserving their renderer-only
+differences. Add exact-id cancel/snapshot adapter tests for each surface, then
+delete their replaced local foreground token ownership. After all adapters use
+the owner, add one cross-surface integration gate covering independent scope,
+stale-id rejection, sink disconnect failure, and settlement-before-release.

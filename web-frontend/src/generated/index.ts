@@ -17,6 +17,8 @@ export * from './DomainProfile';
 export * from './ExecutionMode';
 export * from './FeishuConfigResponse';
 export * from './FeishuUpdate';
+export * from './ForegroundTurnSnapshot';
+export * from './ForegroundTurnSurface';
 export * from './FullConfigResponse';
 export * from './InteractionMode';
 export * from './IssueSeverity';
