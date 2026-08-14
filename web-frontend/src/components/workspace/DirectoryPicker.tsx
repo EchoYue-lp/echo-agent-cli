@@ -92,6 +92,8 @@ export default function DirectoryPicker({
           </h3>
         </div>
         <button
+          type="button"
+          aria-label="关闭文件夹选择器"
           onClick={onClose}
           className="rounded-md p-1 transition-colors hover:bg-[var(--bg-hover)]"
         >

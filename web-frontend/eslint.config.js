@@ -32,4 +32,12 @@ export default defineConfig([
       'jsx-a11y/no-autofocus': 'off',
     },
   },
+  {
+    files: ['vite.config.ts'],
+    extends: [js.configs.recommended, tseslint.configs.recommended],
+    languageOptions: {
+      ecmaVersion: 2020,
+      globals: globals.node,
+    },
+  },
 ]);

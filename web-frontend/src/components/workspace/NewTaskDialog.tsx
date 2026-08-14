@@ -177,6 +177,8 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
               </button>
             )}
             <button
+              type="button"
+              aria-label="关闭任务工作区"
               onClick={onClose}
               className="flex h-7 w-7 items-center justify-center rounded-lg transition-colors hover:opacity-80"
               style={{ color: 'var(--text-tertiary)' }}
@@ -273,40 +275,50 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                   </div>
                   <div className="space-y-1">
                     {workspaces.map((ws) => (
-                      <button
+                      <div
                         key={ws.id}
-                        onClick={() => handleSwitch(ws.id)}
-                        className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors
-                          ${current?.id === ws.id ? 'opacity-60 cursor-default' : 'hover:bg-[var(--bg-hover)]'}`}
-                        disabled={current?.id === ws.id}
+                        className={`flex w-full items-center rounded-lg transition-colors ${
+                          current?.id === ws.id
+                            ? 'cursor-default opacity-60'
+                            : 'hover:bg-[var(--bg-hover)]'
+                        }`}
                       >
-                        {kindIcon(ws.kind)}
-                        <div className="min-w-0 flex-1">
-                          <div
-                            className="text-sm truncate"
-                            style={{ color: 'var(--text-primary)' }}
-                          >
-                            {ws.name}
-                          </div>
-                          <div
-                            className="text-[11px] truncate"
-                            style={{ color: 'var(--text-tertiary)' }}
-                          >
-                            {ws.kind.type} · {ws.root}
-                          </div>
-                        </div>
-                        {current?.id !== ws.id && (
-                          <ArrowRight size={14} style={{ color: 'var(--text-tertiary)' }} />
-                        )}
                         <button
+                          type="button"
+                          onClick={() => handleSwitch(ws.id)}
+                          className="flex min-w-0 flex-1 items-center gap-3 px-3 py-2.5 text-left disabled:cursor-default"
+                          disabled={current?.id === ws.id}
+                        >
+                          {kindIcon(ws.kind)}
+                          <div className="min-w-0 flex-1">
+                            <div
+                              className="truncate text-sm"
+                              style={{ color: 'var(--text-primary)' }}
+                            >
+                              {ws.name}
+                            </div>
+                            <div
+                              className="truncate text-[11px]"
+                              style={{ color: 'var(--text-tertiary)' }}
+                            >
+                              {ws.kind.type} · {ws.root}
+                            </div>
+                          </div>
+                          {current?.id !== ws.id && (
+                            <ArrowRight size={14} style={{ color: 'var(--text-tertiary)' }} />
+                          )}
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`删除工作区 ${ws.name}`}
                           onClick={(e) => handleDelete(ws.id, e)}
-                          className="ml-1 rounded-md p-1 transition-colors hover:text-red-500"
+                          className="mr-2 rounded-md p-1 transition-colors hover:text-red-500"
                           style={{ color: 'var(--text-tertiary)' }}
                           title="删除"
                         >
                           <Trash2 size={13} />
                         </button>
-                      </button>
+                      </div>
                     ))}
                   </div>
                 </div>

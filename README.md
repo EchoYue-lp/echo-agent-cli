@@ -71,7 +71,7 @@ echo-agent-cli/
 ### 前置条件
 
 - **Rust** >= 1.95（使用 `rustup` 安装）
-- **Node.js** >= 18（仅 GUI 桌面应用需要，TUI 不需要）
+- **Node.js** 20.19+、22.13+ 或 24+（仅 GUI 桌面应用需要，TUI 不需要）
 - **Tauri CLI**（仅打包桌面安装包时需要）：`npm install -g @tauri-apps/cli`
 
 ### 安装依赖

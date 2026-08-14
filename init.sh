@@ -4,7 +4,7 @@
 #
 # 功能:
 #   1. 检查并安装 Rust 工具链 (cargo + rustc)
-#   2. 检查并安装 Node.js (>= 18)（仅 GUI 模式）
+#   2. 检查并安装受支持的 Node.js（仅 GUI 模式）
 #   3. 安装前端依赖（仅 GUI 模式）
 #   4. 编译 TUI 或 GUI 版本
 #
@@ -18,7 +18,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_NAME="echo-agent-cli"
-NODE_MIN_VERSION=18
+NODE_INSTALL_VERSION="20.19.0"
+NODE_SUPPORTED_VERSIONS="20.19+、22.13+ 或 24+"
 
 # ── 颜色定义 ────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -58,6 +59,23 @@ fi
 # ── 检查命令是否存在 ──────────────────────────────────────────
 command_exists() {
     command -v "$1" &>/dev/null
+}
+
+node_version_supported() {
+    local version="$1"
+    if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+        return 1
+    fi
+
+    local major_version=$((10#${BASH_REMATCH[1]}))
+    local minor_version=$((10#${BASH_REMATCH[2]}))
+    if (( major_version == 20 )); then
+        (( minor_version >= 19 ))
+    elif (( major_version == 22 )); then
+        (( minor_version >= 13 ))
+    else
+        (( major_version >= 24 ))
+    fi
 }
 
 # ── 检查并安装 Rust ───────────────────────────────────────────
@@ -104,13 +122,10 @@ setup_node() {
     if command_exists node; then
         local node_version
         node_version=$(node --version 2>/dev/null | sed 's/^v//')
-        local major_version
-        major_version=$(echo "$node_version" | cut -d. -f1)
-
-        if [[ "$major_version" -ge "$NODE_MIN_VERSION" ]]; then
+        if node_version_supported "$node_version"; then
             log_info "Node.js 已安装: v$node_version"
         else
-            log_warn "Node.js 版本过低 (v$node_version)，需要 >= v$NODE_MIN_VERSION"
+            log_warn "Node.js 版本不受支持 (v$node_version)，需要 $NODE_SUPPORTED_VERSIONS"
             install_node
         fi
     else
@@ -120,7 +135,7 @@ setup_node() {
 }
 
 install_node() {
-    log_step "正在安装 Node.js v${NODE_MIN_VERSION}.x (通过 nvm)..."
+    log_step "正在安装 Node.js v${NODE_INSTALL_VERSION} (通过 nvm)..."
 
     # 尝试安装 nvm
     if ! command_exists nvm; then
@@ -138,20 +153,20 @@ install_node() {
     fi
 
     if command_exists nvm; then
-        nvm install "$NODE_MIN_VERSION"
-        nvm use "$NODE_MIN_VERSION"
-        nvm alias default "$NODE_MIN_VERSION"
+        nvm install "$NODE_INSTALL_VERSION"
+        nvm use "$NODE_INSTALL_VERSION"
+        nvm alias default "$NODE_INSTALL_VERSION"
     else
         # 回退: 使用系统包管理器
         if [[ "$OS" == "macos" ]]; then
             if command_exists brew; then
-                brew install node@"$NODE_MIN_VERSION"
+                brew install node@20
             else
-                log_error "请先安装 Homebrew 或手动安装 Node.js >= v$NODE_MIN_VERSION"
+                log_error "请先安装 Homebrew 或手动安装 Node.js $NODE_SUPPORTED_VERSIONS"
                 exit 1
             fi
         else
-            log_error "请先安装 nvm 或手动安装 Node.js >= v$NODE_MIN_VERSION"
+            log_error "请先安装 nvm 或手动安装 Node.js $NODE_SUPPORTED_VERSIONS"
             log_info "推荐命令: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash"
             exit 1
         fi
@@ -159,7 +174,13 @@ install_node() {
 
     # 验证安装
     if command_exists node; then
-        log_info "Node.js 安装成功: $(node --version)"
+        local installed_version
+        installed_version=$(node --version 2>/dev/null | sed 's/^v//')
+        if ! node_version_supported "$installed_version"; then
+            log_error "Node.js 安装后版本仍不受支持 (v$installed_version)，需要 $NODE_SUPPORTED_VERSIONS"
+            exit 1
+        fi
+        log_info "Node.js 安装成功: v$installed_version"
         log_info "npm 版本: $(npm --version)"
     else
         log_error "Node.js 安装失败"

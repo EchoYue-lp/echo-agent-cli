@@ -55,8 +55,6 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
           filtered[selectedIndex].action();
           onClose();
         }
-      } else if (e.key === 'Escape') {
-        onClose();
       }
     },
     [filtered, selectedIndex, onClose]

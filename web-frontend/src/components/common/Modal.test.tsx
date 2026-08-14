@@ -1,8 +1,25 @@
 // @vitest-environment jsdom
 import { fireEvent, render } from '@testing-library/react';
-import { createRef } from 'react';
+import { createRef, useState } from 'react';
 import { describe, expect, it, vi } from 'vitest';
+import CommandPalette from './CommandPalette';
 import { Modal } from './Modal';
+
+function LayeredModalHarness() {
+  const [dialogOpen, setDialogOpen] = useState(true);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
+  return (
+    <>
+      {dialogOpen && (
+        <Modal onClose={() => setDialogOpen(false)} ariaLabel="Underlying dialog">
+          <button onClick={() => setPaletteOpen(true)}>Open command palette</button>
+        </Modal>
+      )}
+      <CommandPalette isOpen={paletteOpen} onClose={() => setPaletteOpen(false)} commands={[]} />
+    </>
+  );
+}
 
 describe('Modal', () => {
   it('announces itself, traps focus, closes with Escape, and restores focus', () => {
@@ -109,6 +126,33 @@ describe('Modal', () => {
     expect(document.activeElement).toBe(getByRole('button', { name: 'Underlying action' }));
 
     unmount();
+    opener.remove();
+  });
+
+  it('closes only the topmost palette and restores focus through the modal stack', () => {
+    const opener = document.createElement('button');
+    document.body.append(opener);
+    opener.focus();
+
+    const { getByRole, queryByRole } = render(<LayeredModalHarness />);
+    const underlyingDialog = getByRole('dialog', { name: 'Underlying dialog' });
+    const paletteButton = getByRole('button', { name: 'Open command palette' });
+    fireEvent.click(paletteButton);
+
+    expect(getByRole('dialog', { name: '命令面板' })).toBeTruthy();
+    expect(underlyingDialog.parentElement?.getAttribute('aria-hidden')).toBe('true');
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(queryByRole('dialog', { name: '命令面板' })).toBeNull();
+    expect(getByRole('dialog', { name: 'Underlying dialog' })).toBeTruthy();
+    expect(underlyingDialog.parentElement?.getAttribute('aria-hidden')).toBe('false');
+    expect(document.activeElement).toBe(paletteButton);
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+
+    expect(queryByRole('dialog', { name: 'Underlying dialog' })).toBeNull();
+    expect(document.activeElement).toBe(opener);
     opener.remove();
   });
 });
