@@ -614,12 +614,12 @@ export const taskRuntimeApi = {
       : post(`/task_runtime/runs/${runId}/resume`),
   retryBlockedTask: (runId: string, taskId: string) =>
     isTauri()
-      ? apiInvoke<{ kind: string; run_id: string; task_id: string; next_attempt: number }>(
+      ? apiInvoke<{ kind: string; run_id: string; task_id: string; next_attempt: number | null }>(
           'retry_blocked_task',
           { runId, taskId }
         )
       : post(`/task_runtime/runs/${runId}/tasks/${taskId}/retry`),
-  resolveRecoveryTask: (runId: string, taskId: string, decision: 'retry' | 'skip') =>
+  resolveRecoveryTask: (runId: string, taskId: string, decision: 'skip') =>
     isTauri()
       ? apiInvoke<void>('resolve_recovery_task', { runId, taskId, decision })
       : post(`/task_runtime/runs/${runId}/tasks/${taskId}/resolve_recovery`, { decision }),
@@ -1559,8 +1559,24 @@ export const evolutionApi = {
         }>('/evolution/curator', { action, skill_name: skillName }),
   dashboard: () =>
     isTauri()
-      ? apiInvoke<{ metrics: DashboardMetrics }>('get_evolution_dashboard')
-      : get<{ metrics: DashboardMetrics }>('/evolution/dashboard'),
+      ? apiInvoke<{
+          metrics: DashboardMetrics;
+          trigger_delivery?: {
+            pending: number;
+            failures: number;
+            rejected: number;
+            last_error?: string | null;
+          } | null;
+        }>('get_evolution_dashboard')
+      : get<{
+          metrics: DashboardMetrics;
+          trigger_delivery?: {
+            pending: number;
+            failures: number;
+            rejected: number;
+            last_error?: string | null;
+          } | null;
+        }>('/evolution/dashboard'),
   scanProposals: () =>
     isTauri()
       ? apiInvoke<{ proposals: RuleProposal[]; count: number }>('scan_rule_proposals')

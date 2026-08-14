@@ -106,18 +106,15 @@ pub async fn add_memory(
     } else {
         key.trim().to_string()
     };
-    let layer_manager = state
+    let integration = state
         .app_state
-        .connection
-        .agent
-        .read(|agent| agent.memory_layer_manager().cloned())
-        .await;
-    let Some(layer_manager) = layer_manager else {
-        return Ok(serde_json::json!({
-            "success": false,
-            "error": "Layered memory is not configured",
-        }));
-    };
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Layered memory is not configured".into()))?;
+    let memory_lease = integration
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let layer_manager = std::sync::Arc::new(memory_lease.create_layer_manager());
     let meta = MemoryMeta::new(
         MemoryType::ProjectFact,
         MemorySource::ExplicitSave,
@@ -200,18 +197,15 @@ pub async fn delete_memory(
             "error": format!("Unsupported memory namespace: {namespace}"),
         }));
     }
-    let layer_manager = state
+    let integration = state
         .app_state
-        .connection
-        .agent
-        .read(|agent| agent.memory_layer_manager().cloned())
-        .await;
-    let Some(layer_manager) = layer_manager else {
-        return Ok(serde_json::json!({
-            "success": false,
-            "error": "Layered memory is not configured",
-        }));
-    };
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Layered memory is not configured".into()))?;
+    let memory_lease = integration
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let layer_manager = std::sync::Arc::new(memory_lease.create_layer_manager());
     let layer = layer_manager
         .locate(key.trim())
         .await

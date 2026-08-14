@@ -31,19 +31,50 @@ fn current_evidence_store(ctx: &CommandContext) -> echo_agent_app_core::evolutio
         })
 }
 
+fn evolution_write_lease(
+    ctx: &CommandContext,
+) -> Result<echo_agent_app_core::evolution::ReviewGenerationLease, String> {
+    ctx.review_integration
+        .as_ref()
+        .ok_or_else(|| "Review integration is not configured".to_string())?
+        .lease_generation()
+        .map_err(|error| error.to_string())
+}
+
+fn evidence_write_binding(
+    ctx: &CommandContext,
+) -> Result<
+    (
+        echo_agent_app_core::evolution::EvidenceStore,
+        echo_agent_app_core::evolution::ReviewGenerationLease,
+    ),
+    String,
+> {
+    let lease = evolution_write_lease(ctx)?;
+    let store = lease.evidence_store();
+    Ok((store, lease))
+}
+
 // ── ReviewCommand ───────────────────────────────────────────────────
 
 async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    // Get the run store and LLM client from the agent
-    let (run_store, llm_client, memory_store) = ctx
+    let Some(review_integration) = ctx.review_integration.as_ref() else {
+        println!("Review integration is not configured.");
+        return CommandOutcome::Continue;
+    };
+    let review_lease = match review_integration.lease_generation() {
+        Ok(lease) => lease,
+        Err(error) => {
+            println!("Review unavailable during workspace transition: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    // Snapshot the run plumbing only after memory generation admission so a
+    // workspace transition cannot replace it midway through this review pass.
+    let (run_store, llm_client) = ctx
         .agent
-        .read(|a| {
-            (
-                a.run_store.clone(),
-                a.llm_client().cloned(),
-                a.store().cloned(),
-            )
-        })
+        .read(|a| (a.run_store.clone(), a.llm_client().cloned()))
         .await;
 
     let run_store = match run_store {
@@ -99,58 +130,48 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
     let reviewer = echo_agent::evolution::BackgroundReviewer::new(
         echo_agent::evolution::BackgroundReviewConfig::default(),
         llm_client,
-        memory_store.clone(),
+        Some(review_lease.memory_store()),
         Some(run_store),
     );
-    let reviewer = if let Some(review_integration) = ctx.review_integration.as_ref() {
-        reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
-    } else if let Some(store) = memory_store {
-        let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
-            echo_agent::evolution::ReviewConfig::default(),
-            current_echo_agent_dir(ctx),
-            store,
-        );
-        reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
-    } else {
-        reviewer
-    };
+    let reviewer = reviewer.with_layer_manager(Arc::new(review_lease.create_layer_manager()));
 
-    let evidence_store = current_evidence_store(ctx);
-    match reviewer.review(&run) {
-        Ok(handle) => match handle.await {
-            Ok(outcome) => {
-                if outcome.nothing_to_save {
-                    println!("Nothing to save.");
-                } else {
-                    println!("Review candidates:");
-                    for action in &outcome.actions {
-                        println!("  - {action}");
-                    }
-                    if let Some(candidate) = &outcome.candidate {
-                        println!("  Evidence: {}", candidate.evidence);
-                        println!("  Confidence: {:.2}", candidate.confidence);
-                    }
+    let handle = match reviewer.review(&run) {
+        Ok(handle) => handle,
+        Err(error) => {
+            println!("Review failed: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let settled = match review_lease.track_background_review(handle).await {
+        Ok(mut pass) => pass.settle().await,
+        Err(error) => Err(error),
+    };
+    match settled {
+        Ok(settlement) => {
+            let outcome = settlement.outcome;
+            if outcome.nothing_to_save {
+                println!("Nothing to save.");
+            } else {
+                println!("Review candidates:");
+                for action in &outcome.actions {
+                    println!("  - {action}");
                 }
-                match echo_agent_app_core::evolution::capture_review_outcome(
-                    &evidence_store,
-                    &outcome,
-                ) {
-                    Ok(Some(candidate)) => {
-                        println!(
-                            "  Inbox: {} ({:?})",
-                            candidate.candidate_id, candidate.status
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(error) => println!("Warning: failed to queue review candidate: {error}"),
-                }
-                if let Some(ref err) = outcome.error {
-                    println!("Warning: {err}");
+                if let Some(candidate) = &outcome.candidate {
+                    println!("  Evidence: {}", candidate.evidence);
+                    println!("  Confidence: {:.2}", candidate.confidence);
                 }
             }
-            Err(e) => println!("Review task panicked: {e}"),
-        },
-        Err(e) => println!("Review failed: {e}"),
+            if let Some(candidate) = settlement.evidence_candidate {
+                println!(
+                    "  Inbox: {} ({:?})",
+                    candidate.candidate_id, candidate.status
+                );
+            }
+            if let Some(ref err) = outcome.error {
+                println!("Warning: {err}");
+            }
+        }
+        Err(error) => println!("Review task failed: {error}"),
     }
 
     CommandOutcome::Continue
@@ -167,10 +188,10 @@ cmd!(
 
 async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("status");
-    let curator = current_curator(ctx);
 
     match sub {
         "status" => {
+            let curator = current_curator(ctx);
             let status = match curator.status() {
                 Ok(status) => status,
                 Err(error) => {
@@ -188,31 +209,51 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("  Last run:     {}", last.format("%Y-%m-%d %H:%M:%S"));
             }
         }
-        "run" => match curator.apply_transitions() {
-            Ok(transitions) if !transitions.is_empty() => {
-                ctx.agent
-                    .write_async(|agent| {
-                        Box::pin(async move {
-                            agent.reconcile_skill_load_policy().await;
-                        })
-                    })
-                    .await;
-                println!("Applied {} transition(s):", transitions.len());
-                for (name, from, to) in &transitions {
-                    println!("  {name}: {from:?} → {to:?}");
-                    echo_agent_app_core::evolution::fire_evolution_hook(
-                        &ctx.agent,
-                        echo_core::hooks::HookEvent::SkillLifecycleTransition,
-                        name,
-                    )
-                    .await;
+        "run" => {
+            let generation = match evolution_write_lease(ctx) {
+                Ok(generation) => generation,
+                Err(error) => {
+                    println!("Curator unavailable during workspace transition: {error}");
+                    return CommandOutcome::Continue;
                 }
+            };
+            let curator =
+                echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
+            match curator.apply_transitions() {
+                Ok(transitions) if !transitions.is_empty() => {
+                    ctx.agent
+                        .write_async(|agent| {
+                            Box::pin(async move {
+                                agent.reconcile_skill_load_policy().await;
+                            })
+                        })
+                        .await;
+                    println!("Applied {} transition(s):", transitions.len());
+                    for (name, from, to) in &transitions {
+                        println!("  {name}: {from:?} → {to:?}");
+                        echo_agent_app_core::evolution::fire_evolution_hook(
+                            &ctx.agent,
+                            echo_core::hooks::HookEvent::SkillLifecycleTransition,
+                            name,
+                        )
+                        .await;
+                    }
+                }
+                Ok(_) => println!("No transitions needed."),
+                Err(e) => println!("Error applying transitions: {e}"),
             }
-            Ok(_) => println!("No transitions needed."),
-            Err(e) => println!("Error applying transitions: {e}"),
-        },
+        }
         "pin" => {
             if let Some(name) = args.get(1) {
+                let generation = match evolution_write_lease(ctx) {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        println!("Curator unavailable during workspace transition: {error}");
+                        return CommandOutcome::Continue;
+                    }
+                };
+                let curator =
+                    echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
                 match curator.pin_skill(name) {
                     Ok(()) => println!("Pinned skill: {name}"),
                     Err(e) => println!("Error: {e}"),
@@ -223,6 +264,15 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "unpin" => {
             if let Some(name) = args.get(1) {
+                let generation = match evolution_write_lease(ctx) {
+                    Ok(generation) => generation,
+                    Err(error) => {
+                        println!("Curator unavailable during workspace transition: {error}");
+                        return CommandOutcome::Continue;
+                    }
+                };
+                let curator =
+                    echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
                 match curator.unpin_skill(name) {
                     Ok(()) => println!("Unpinned skill: {name}"),
                     Err(e) => println!("Error: {e}"),
@@ -419,7 +469,26 @@ cmd!(
 async fn cmd_profile(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("view");
 
-    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let writes_memory = matches!(sub, "refresh" | "set" | "reset");
+    let memory_generation = if writes_memory {
+        let Some(integration) = ctx.review_integration.as_ref() else {
+            println!("Review integration is not configured.");
+            return CommandOutcome::Continue;
+        };
+        match integration.lease_generation() {
+            Ok(generation) => Some(generation),
+            Err(error) => {
+                println!("Profile update unavailable during workspace transition: {error}");
+                return CommandOutcome::Continue;
+            }
+        }
+    } else {
+        None
+    };
+    let store = match memory_generation.as_ref() {
+        Some(generation) => Some(generation.memory_store()),
+        None => ctx.agent.read(|a| a.store().cloned()).await,
+    };
     let store = match store {
         Some(s) => s,
         None => {
@@ -428,7 +497,7 @@ async fn cmd_profile(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
     };
 
-    let profile_store = ProfileStore::new(store);
+    let profile_store = ProfileStore::new(store.clone());
 
     match sub {
         "view" | "" => {
@@ -513,14 +582,6 @@ async fn cmd_profile(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "refresh" => {
             // Refresh agent profile from telemetry
-            let store = ctx.agent.read(|a| a.store().cloned()).await;
-            let store = match store {
-                Some(s) => s,
-                None => {
-                    println!("No memory store configured. Cannot refresh profile.");
-                    return CommandOutcome::Continue;
-                }
-            };
             let telemetry_store = SkillTelemetryStore::new(store);
             match telemetry_store.list_all().await {
                 Ok(telemetry) if !telemetry.is_empty() => {
@@ -734,7 +795,15 @@ async fn cmd_skill_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcom
         }
     };
 
-    let curator = current_curator(ctx);
+    let generation = match evolution_write_lease(ctx) {
+        Ok(generation) => generation,
+        Err(error) => {
+            println!("Skill promotion unavailable during workspace transition: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
+    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
 
     // Check current lifecycle state.
     let state = match curator.load_state() {
@@ -747,7 +816,6 @@ async fn cmd_skill_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcom
     match state.skills.get(name) {
         Some(meta) => match meta.lifecycle {
             echo_agent::evolution::SkillLifecycle::Draft => {
-                let echo_agent_dir = current_echo_agent_dir(ctx);
                 let draft_path = echo_agent_dir
                     .join("skills")
                     .join("_drafts")
@@ -831,17 +899,6 @@ cmd!(
 async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = args.first().copied();
 
-    let store = ctx.agent.read(|a| a.store().cloned()).await;
-    let store = match store {
-        Some(s) => s,
-        None => {
-            println!("No memory store configured. Cannot create skill drafts.");
-            return CommandOutcome::Continue;
-        }
-    };
-
-    let echo_agent_dir = current_echo_agent_dir(ctx);
-
     // If no name given, list candidates.
     let name = match name {
         Some(n) => n.to_string(),
@@ -878,6 +935,17 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     };
 
+    let generation = match evolution_write_lease(ctx) {
+        Ok(generation) => generation,
+        Err(error) => {
+            println!("Skill draft generation unavailable during workspace transition: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
+    let store = generation.memory_store();
+    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
+
     // Generate draft from candidate.
     let typed_store = echo_agent::memory::TypedMemoryStore::new(store);
     let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
@@ -889,7 +957,7 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         echo_agent_dir,
         &change_log as &dyn echo_agent::evolution::ChangeLog,
     )
-    .with_curator(current_curator(ctx));
+    .with_curator(curator);
 
     match generator.generate(&name, &typed_store).await {
         Ok(result) => {
@@ -926,14 +994,25 @@ cmd!(
 // ── SkillMergeCommand ─────────────────────────────────────────────
 
 async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let store = ctx.agent.read(|a| a.store().cloned()).await;
-    let store = match store {
-        Some(s) => s,
-        None => {
-            println!("No memory store configured.");
+    if !args.is_empty() && args.len() != 2 {
+        println!("Usage:");
+        println!("  /skill-merge              Scan skills and show merge proposals");
+        println!("  /skill-merge <a> <b>      Execute merge of two skills");
+        return CommandOutcome::Continue;
+    }
+
+    // Similarity detection persists proposals, so both scan and execute are
+    // mutations and must use one pinned workspace binding through settlement.
+    let generation = match evolution_write_lease(ctx) {
+        Ok(generation) => generation,
+        Err(error) => {
+            println!("Skill merge unavailable during workspace transition: {error}");
             return CommandOutcome::Continue;
         }
     };
+    let store = generation.memory_store();
+    let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
+    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
 
     // If no args, run similarity detection and show proposals
     if args.is_empty() {
@@ -952,7 +1031,6 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             })
             .await;
 
-        let echo_agent_dir = current_echo_agent_dir(ctx);
         let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1054,14 +1132,12 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                     })
                     .await;
 
-                let echo_agent_dir = current_echo_agent_dir(ctx);
                 let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
                 if let Some(parent) = log_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
 
-                let curator = current_curator(ctx);
                 let merger = echo_agent::evolution::SkillMerger::new(curator);
 
                 let mut primary_desc_mut = primary_desc;
@@ -1109,10 +1185,6 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
 
         return CommandOutcome::Continue;
     }
-
-    println!("Usage:");
-    println!("  /skill-merge              Scan skills and show merge proposals");
-    println!("  /skill-merge <a> <b>      Execute merge of two skills");
 
     CommandOutcome::Continue
 }
@@ -1264,13 +1336,26 @@ cmd!(
 // ── SkillPatchCommand ─────────────────────────────────────────────
 
 async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let store = ctx.agent.read(|a| a.store().cloned()).await;
-    let store = match store {
-        Some(s) => s,
-        None => {
-            println!("No memory store configured.");
-            return CommandOutcome::Continue;
+    let memory_generation = if args.get(1).copied() == Some("apply") {
+        match evolution_write_lease(ctx) {
+            Ok(generation) => Some(generation),
+            Err(error) => {
+                println!("Skill patch unavailable during workspace transition: {error}");
+                return CommandOutcome::Continue;
+            }
         }
+    } else {
+        None
+    };
+    let store = match memory_generation.as_ref() {
+        Some(generation) => generation.memory_store(),
+        None => match ctx.agent.read(|a| a.store().cloned()).await {
+            Some(store) => store,
+            None => {
+                println!("No memory store configured.");
+                return CommandOutcome::Continue;
+            }
+        },
     };
 
     let patcher = echo_agent::evolution::SkillPatcher::new(store);
@@ -1346,7 +1431,10 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             return CommandOutcome::Continue;
         }
 
-        let patch = patches[idx - 1].clone();
+        let Some(patch) = patches.get(idx.saturating_sub(1)).cloned() else {
+            println!("Index {idx} is no longer available.");
+            return CommandOutcome::Continue;
+        };
 
         // Get the SkillDescriptor (provides .location = SKILL.md path).
         // Clone the full descriptor — we only need .location for apply_patch.
@@ -1364,7 +1452,11 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         };
 
         // Create change log.
-        let echo_agent_dir = current_echo_agent_dir(ctx);
+        let Some(memory_generation) = memory_generation.as_ref() else {
+            println!("Skill patch generation admission was lost.");
+            return CommandOutcome::Continue;
+        };
+        let echo_agent_dir = memory_generation.echo_agent_dir();
         let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1438,7 +1530,26 @@ cmd!(
 // ── RulePromoteCommand ────────────────────────────────────────────
 
 async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let writes_memory = !matches!(args.first().copied(), Some("scan") | None);
+    let memory_generation = if writes_memory {
+        let Some(integration) = ctx.review_integration.as_ref() else {
+            println!("Review integration is not configured.");
+            return CommandOutcome::Continue;
+        };
+        match integration.lease_generation() {
+            Ok(generation) => Some(generation),
+            Err(error) => {
+                println!("Rule promotion unavailable during workspace transition: {error}");
+                return CommandOutcome::Continue;
+            }
+        }
+    } else {
+        None
+    };
+    let store = match memory_generation.as_ref() {
+        Some(generation) => Some(generation.memory_store()),
+        None => ctx.agent.read(|a| a.store().cloned()).await,
+    };
     let store = match store {
         Some(s) => s,
         None => {
@@ -1447,7 +1558,11 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     };
 
-    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
+    let promoter = match memory_generation.as_ref() {
+        Some(generation) => echo_agent_app_core::evolution::RulePromoter::new(store)
+            .with_rules_path(generation.echo_agent_dir().join("learned-rules.md")),
+        None => echo_agent_app_core::evolution::RulePromoter::new(store),
+    };
 
     match args.first().copied() {
         Some("scan") | None => {
@@ -1487,10 +1602,12 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
 
             match proposal {
                 Some(prop) => {
+                    let echo_agent_dir = memory_generation
+                        .as_ref()
+                        .map(|generation| generation.echo_agent_dir().to_path_buf())
+                        .unwrap_or_else(|| current_echo_agent_dir(ctx));
                     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-                        current_echo_agent_dir(ctx)
-                            .join("evolution")
-                            .join("change-log.jsonl"),
+                        echo_agent_dir.join("evolution").join("change-log.jsonl"),
                     );
 
                     match promoter.promote_rule(prop, &change_log).await {
@@ -1507,7 +1624,7 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
                                 memory_key,
                             )
                             .await;
-                            let root = ctx.agent.read(|agent| agent.working_dir()).await;
+                            let root = echo_agent_dir.parent().map(std::path::Path::to_path_buf);
                             ctx.agent
                                 .write_async(|agent| {
                                     Box::pin(async move {
@@ -1576,6 +1693,18 @@ async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> Comman
     let output = echo_agent_app_core::evolution::Dashboard::format_metrics(&metrics);
 
     println!("{}", output);
+    if let Some(integration) = ctx.review_integration.as_ref() {
+        let delivery = integration.trigger_delivery_status();
+        if delivery.pending != 0 || delivery.failures != 0 || delivery.rejected != 0 {
+            println!(
+                "\nMemory trigger delivery: {} pending, {} failed attempt(s), {} rejected",
+                delivery.pending, delivery.failures, delivery.rejected
+            );
+            if let Some(error) = delivery.last_error {
+                println!("  Last delivery error: {error}");
+            }
+        }
+    }
 
     CommandOutcome::Continue
 }
@@ -1605,9 +1734,15 @@ async fn cmd_skill_register(ctx: &CommandContext, args: &[&str]) -> CommandOutco
         }
     };
 
-    let curator = current_curator(ctx);
-
-    let echo_agent_dir = current_echo_agent_dir(ctx);
+    let generation = match evolution_write_lease(ctx) {
+        Ok(generation) => generation,
+        Err(error) => {
+            println!("Skill registration unavailable during workspace transition: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let echo_agent_dir = generation.echo_agent_dir();
+    let curator = echo_agent_app_core::evolution::workspace_curator(echo_agent_dir);
     let skill_path = echo_agent_dir.join("skills").join(name).join("SKILL.md");
     let path = skill_path.exists().then_some(skill_path.as_path());
     match curator.touch_skill_at(name, path, false) {
@@ -1647,7 +1782,14 @@ async fn cmd_skill_pin(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
     };
 
-    let curator = current_curator(ctx);
+    let generation = match evolution_write_lease(ctx) {
+        Ok(generation) => generation,
+        Err(error) => {
+            println!("Skill pin unavailable during workspace transition: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let curator = echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
 
     match curator.pin_skill(name) {
         Ok(()) => println!("✓ Skill '{}' pinned — exempt from auto-transitions.", name),
@@ -1677,7 +1819,14 @@ async fn cmd_skill_unpin(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         }
     };
 
-    let curator = current_curator(ctx);
+    let generation = match evolution_write_lease(ctx) {
+        Ok(generation) => generation,
+        Err(error) => {
+            println!("Skill unpin unavailable during workspace transition: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let curator = echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
 
     match curator.unpin_skill(name) {
         Ok(()) => println!(
@@ -1786,6 +1935,13 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                 .get(2..)
                 .map(|parts| parts.join(" "))
                 .unwrap_or_default();
+            let (store, _memory_lease) = match evidence_write_binding(ctx) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    println!("Cannot edit evidence while the workspace is switching: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
             match store.edit(candidate_id, &content) {
                 Ok(candidate) => {
                     println!("Updated {}: {}", candidate.candidate_id, candidate.content)
@@ -1798,6 +1954,13 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                 println!("Usage: /evidence-inbox reject <candidate-id>");
                 return CommandOutcome::Continue;
             };
+            let (store, _memory_lease) = match evidence_write_binding(ctx) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    println!("Cannot reject evidence while the workspace is switching: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
             match store.reject(candidate_id) {
                 Ok(candidate) => println!("Rejected {}.", candidate.candidate_id),
                 Err(error) => println!("Failed to reject candidate: {error}"),
@@ -1808,14 +1971,14 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                 println!("Usage: /evidence-inbox {sub} <candidate-id>");
                 return CommandOutcome::Continue;
             };
-            let Some(layer_manager) = ctx
-                .agent
-                .read(|agent| agent.memory_layer_manager().cloned())
-                .await
-            else {
-                println!("No layered memory manager is available.");
-                return CommandOutcome::Continue;
+            let (store, memory_lease) = match evidence_write_binding(ctx) {
+                Ok(binding) => binding,
+                Err(error) => {
+                    println!("Cannot update evidence while the workspace is switching: {error}");
+                    return CommandOutcome::Continue;
+                }
             };
+            let layer_manager = Arc::new(memory_lease.create_layer_manager());
             let result = if sub == "accept" {
                 let edited = args
                     .get(2..)

@@ -5,7 +5,7 @@
 //! provides [`build_fire_fn`] which constructs one that launches TaskRuntime runs.
 //!
 //! Phase 3.1: ALL cron tasks route through the unified TaskRuntime executor
-//! (`launch_cron_run`). The legacy `[plan]` prefix is stripped for backward
+//! (`drive_existing_cron_run`). The legacy `[plan]` prefix is stripped for backward
 //! compatibility but no longer selects a separate path — simple prompts are
 //! answered directly by the agent (auto-Completed when task_execute isn't
 //! called); complex prompts drive task_create + task_execute.
@@ -25,12 +25,12 @@ pub type SchedulerRunner = FrameworkSchedulerRunner;
 
 /// Legacy plan-orchestration marker prefix. Phase 3.1: stripped for backward
 /// compatibility but no longer routes — all cron tasks go through
-/// `launch_cron_run` regardless.
+/// the canonical supervised cron driver regardless.
 const PLAN_MARKER: &str = "[plan]";
 
 /// Build a `FireFn` that dispatches cron task execution.
 ///
-/// Phase 3.1+: ALL cron prompts route through `launch_cron_run` (unified
+/// Phase 3.1+: ALL cron prompts route through the unified supervised
 /// TaskRuntime executor, `Unattended`). The `[plan]` prefix is stripped for
 /// backward compatibility. Simple prompts are answered directly by the agent
 /// (auto-Completed); complex prompts drive task_create + task_execute.
@@ -50,12 +50,14 @@ pub fn build_fire_fn(
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
 ) -> FireFn {
     build_fire_fn_with_cancel(
         agent,
         task_runtime_store,
         pool,
         webhook_emitter,
+        review_integration,
         CancellationToken::new(),
     )
 }
@@ -65,6 +67,7 @@ fn build_fire_fn_with_cancel(
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     scheduler_cancel: CancellationToken,
 ) -> FireFn {
     Arc::new(move |task: CronTask| {
@@ -72,6 +75,7 @@ fn build_fire_fn_with_cancel(
         let runtime_store = task_runtime_store.clone();
         let pool = pool.clone();
         let webhook_emitter = webhook_emitter.clone();
+        let review_integration = review_integration.clone();
         let scheduler_cancel = scheduler_cancel.clone();
         Box::pin(async move {
             let store = runtime_store.ok_or_else(|| {
@@ -90,82 +94,107 @@ fn build_fire_fn_with_cancel(
                     "cron prompt is empty (after [plan] strip)".into(),
                 ));
             }
-            // Keep agent acquisition, TaskRun creation/execution, pool release,
-            // and the final result projection on one workspace generation.
-            // `switch_workspace`/`exit_workspace` can prepare concurrently but
-            // cannot rebind the TaskRuntime file authority until this drops.
+            let fire_id = uuid::Uuid::new_v4().to_string();
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let cancel = scheduler_cancel.child_token();
+            let admission = store
+                .reserve_run_driver_admission(run_id.clone(), cancel.clone())
+                .map_err(|error| {
+                    echo_agent::error::ReactError::Other(format!(
+                        "cron TaskRun driver admission failed: {error}"
+                    ))
+                })?;
+            // Keep TaskRun creation/execution, memory and pool acquisition, and
+            // final projection on one workspace generation. The canonical
+            // driver reservation is acquired first so shutdown cannot overtake
+            // this accepted fire before it is registered with the supervisor.
             let generation_lease = store.lease_active_workspace_generation().map_err(|error| {
                 echo_agent::error::ReactError::Other(format!(
                     "task runtime generation admission failed: {error}"
                 ))
             })?;
-            let fire_id = uuid::Uuid::new_v4().to_string();
-            let run_id = uuid::Uuid::new_v4().to_string();
-            let cancel = scheduler_cancel.child_token();
-            create_unattended_run(&store, &run_id, "cron", &task.id, &fire_id, prompt).map_err(
-                |error| {
+            let mut registration = store
+                .register_run_driver::<String>(admission, generation_lease)
+                .map_err(|error| {
                     echo_agent::error::ReactError::Other(format!(
-                        "cron TaskRun creation failed: {error}"
+                        "cron TaskRun driver registration failed: {error}"
                     ))
-                },
-            )?;
+                })?;
+            registration.mark_preparation_started();
+            if let Err(error) =
+                create_unattended_run(&store, &run_id, "cron", &task.id, &fire_id, prompt)
+            {
+                registration.fail_preparation(error.to_string());
+                return Err(echo_agent::error::ReactError::Other(format!(
+                    "cron TaskRun creation failed: {error}"
+                )));
+            }
             let owned_store = store.clone();
             let owned_run_id = run_id.clone();
             let owned_task = task.clone();
             let owned_fire_id = fire_id.clone();
             let owned_prompt = prompt.to_string();
             let owned_cancel = cancel.clone();
-            let waiter = store
-                .spawn_run_driver(
-                    run_id.clone(),
-                    cancel,
-                    generation_lease,
-                    move |receipt_owner| async move {
-                        // Pool admission follows TaskRuntime generation admission.
-                        let run_agent = match &pool {
-                            Some(pool) => {
-                                let run_key = format!("__cron__:{}:{owned_fire_id}", owned_task.id);
-                                let acquired = pool.acquire(&run_key).await.map_err(|error| {
-                                    format!("cron pool acquire failed: {error}")
-                                })?;
-                                let agent = acquired.agent();
-                                receipt_owner
-                                    .retain(pool.retain_for_supervised_run(run_key, acquired));
-                                register_task_execute_on_agent(&agent, owned_store.clone()).await;
-                                agent
-                            }
-                            None => fallback_agent,
-                        };
-                        let result = drive_existing_cron_run(
-                            owned_store.clone(),
-                            run_agent,
-                            owned_run_id.clone(),
-                            &owned_task.id,
-                            &owned_fire_id,
-                            &owned_prompt,
-                            owned_cancel,
-                        )
-                        .await
-                        .map_err(|error| format!("cron run failed: {error}"));
-                        let settled_run_id = result?;
-                        if let Some(emitter) = webhook_emitter.as_ref() {
-                            emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
-                                task_id: owned_task.id.clone(),
-                                task_name: owned_task.name.clone(),
-                                result_summary: format!("cron run {settled_run_id} finished"),
-                            });
-                        }
-                        Ok(format!(
-                            "cron run {settled_run_id} finished for task {}",
-                            owned_task.id
-                        ))
-                    },
+            let waiter = registration.start(move |mut receipt_owner| async move {
+                // The exact driver owns memory settlement before pool
+                // admission. A configured integration never falls back
+                // to an unpinned manager while a rebind is in progress.
+                let memory_generation = review_integration
+                    .as_ref()
+                    .map(|integration| integration.lease_generation())
+                    .transpose()
+                    .map_err(|error| format!("cron memory generation unavailable: {error}"))?;
+                if let Some(generation) = memory_generation.as_ref() {
+                    receipt_owner.retain(generation.clone());
+                }
+                let layer_manager = memory_generation
+                    .as_ref()
+                    .map(|generation| Arc::new(generation.create_layer_manager()));
+
+                // Pool admission follows TaskRuntime and memory generation admission.
+                let run_agent = match &pool {
+                    Some(pool) => {
+                        let run_key = format!("__cron__:{}:{owned_fire_id}", owned_task.id);
+                        let acquired = pool
+                            .acquire(&run_key)
+                            .await
+                            .map_err(|error| format!("cron pool acquire failed: {error}"))?;
+                        let agent = acquired.agent();
+                        receipt_owner.retain(pool.retain_for_supervised_run(run_key, acquired));
+                        register_task_execute_on_agent(&agent, owned_store.clone()).await;
+                        agent
+                    }
+                    None => fallback_agent,
+                };
+                if let Some(layer_manager) = layer_manager {
+                    run_agent
+                        .write(|agent| agent.install_memory_layer_manager(layer_manager))
+                        .await;
+                }
+                let result = drive_existing_cron_run(
+                    owned_store.clone(),
+                    run_agent,
+                    owned_run_id.clone(),
+                    &owned_task.id,
+                    &owned_fire_id,
+                    &owned_prompt,
+                    owned_cancel,
                 )
-                .map_err(|error| {
-                    echo_agent::error::ReactError::Other(format!(
-                        "cron TaskRun driver admission failed: {error}"
-                    ))
-                })?;
+                .await
+                .map_err(|error| format!("cron run failed: {error}"));
+                let settled_run_id = result?;
+                if let Some(emitter) = webhook_emitter.as_ref() {
+                    emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
+                        task_id: owned_task.id.clone(),
+                        task_name: owned_task.name.clone(),
+                        result_summary: format!("cron run {settled_run_id} finished"),
+                    });
+                }
+                Ok(format!(
+                    "cron run {settled_run_id} finished for task {}",
+                    owned_task.id
+                ))
+            });
             match waiter.await {
                 Ok(Ok(result)) => Ok(result),
                 Ok(Err(error)) => Err(echo_agent::error::ReactError::Other(error)),
@@ -206,7 +235,7 @@ async fn register_task_execute_on_agent(agent_handle: &AgentHandle, store: Arc<T
 /// preferred wiring (agent + optional background task service).
 ///
 /// U1c phase-1 → Phase 3.1: `task_runtime_store` enables the unified
-/// cron→launch_cron_run path (all cron, not just `[plan]`).
+/// cron TaskRuntime path (all cron, not just `[plan]`).
 /// Phase C: `pool` enables per-run agent isolation (recommended when an
 /// `AgentPool` exists); falls back to the shared `agent` when `None`.
 pub async fn new_scheduler_runner(
@@ -216,12 +245,14 @@ pub async fn new_scheduler_runner(
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
     webhook_emitter: Option<Arc<crate::webhook::WebhookEmitter>>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
 ) -> echo_agent::error::Result<SchedulerRunner> {
     let fire_fn = build_fire_fn_with_cancel(
         agent,
         task_runtime_store,
         pool,
         webhook_emitter,
+        review_integration,
         cancel.clone(),
     );
     SchedulerRunner::new(store, cancel, fire_fn).await
@@ -234,11 +265,11 @@ mod tests {
     use echo_agent::agent::react::builder::ReactAgentBuilder;
     use echo_agent::testing::MockLlmClient;
 
-    /// Phase 3.1: 非 `[plan]` cron 必须经 `launch_cron_run`(在 store 建 run),
+    /// Phase 3.1: 非 `[plan]` cron 必须经 supervised TaskRuntime driver(在 store 建 run),
     /// 而非旧 `agent.chat`/`execute_direct`。mock LLM 返回纯文本(无 tool call),
-    /// agent 直接作答,`launch_cron_run` 的 `_` 分支自动转 Completed。
+    /// agent 直接作答,driver 的 direct 分支自动转 Completed。
     #[tokio::test]
-    async fn build_fire_fn_routes_non_plan_cron_to_launch_cron_run() -> Result<(), String> {
+    async fn build_fire_fn_routes_non_plan_cron_to_supervised_run() -> Result<(), String> {
         let llm = MockLlmClient::new().with_response("ok");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
@@ -254,8 +285,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
-        // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → launch_cron_run。
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None);
+        // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → supervised driver。
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("plain", "*/5 * * * *", "hello world");
         let result = fire_fn(task).await;
@@ -267,7 +298,7 @@ mod tests {
         assert_eq!(
             completed.len(),
             1,
-            "非-[plan] cron 应经 launch_cron_run 建恰好 1 个 Completed run"
+            "非-[plan] cron 应经 supervised driver 建恰好 1 个 Completed run"
         );
         let completed_run = completed
             .first()
@@ -276,10 +307,9 @@ mod tests {
         Ok(())
     }
 
-    /// `[plan]` 前缀仍经 launch_cron_run(marker strip,向后兼容)。
+    /// `[plan]` 前缀仍经 supervised driver(marker strip,向后兼容)。
     #[tokio::test]
-    async fn build_fire_fn_strips_plan_marker_and_routes_to_launch_cron_run() -> Result<(), String>
-    {
+    async fn build_fire_fn_strips_plan_marker_and_routes_to_supervised_run() -> Result<(), String> {
         let llm = MockLlmClient::new().with_response("ok");
         let agent = ReactAgentBuilder::new()
             .llm_client(Arc::new(llm))
@@ -288,7 +318,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
         let result = fire_fn(task).await;
@@ -317,7 +347,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None, None, None);
 
         let task = CronTask::new("failing", "*/5 * * * *", "run this");
         let result = fire_fn(task).await;
@@ -345,12 +375,81 @@ mod tests {
             Some(store.clone()),
             None,
             None,
+            None,
             scheduler_cancel,
         );
 
         let result = fire_fn(CronTask::new("cancelled", "*/5 * * * *", "do work")).await;
 
         assert!(result.is_err());
+        let cancelled = store
+            .list_runs_in(&[TaskRunStatus::Cancelled])
+            .map_err(|error| error.to_string())?;
+        assert_eq!(cancelled.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scheduler_reservation_is_drained_by_concurrent_runtime_shutdown() -> Result<(), String>
+    {
+        let llm = MockLlmClient::new().with_response("should be cancelled");
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(llm))
+            .system_prompt("test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let (reservation_started, release_reservation) =
+            store.park_next_run_driver_admission_for_test()?;
+        let fire_fn = build_fire_fn(
+            AgentHandle::new(agent),
+            Some(store.clone()),
+            None,
+            None,
+            None,
+        );
+        let fire = tokio::spawn(async move {
+            fire_fn(CronTask::new("shutdown-race", "*/5 * * * *", "do work")).await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || {
+                reservation_started.recv_timeout(std::time::Duration::from_secs(2))
+            }),
+        )
+        .await
+        .map_err(|_| "scheduler admission reservation was not observed".to_string())?
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.shutdown_run_drivers().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.wait_run_driver_shutdown_started(),
+        )
+        .await
+        .map_err(|_| "TaskRuntime shutdown did not close admission".to_string())?;
+        if shutdown.is_finished() {
+            return Err("shutdown overtook the scheduler's accepted reservation".to_string());
+        }
+        release_reservation
+            .send(())
+            .map_err(|_| "scheduler admission reservation stopped waiting".to_string())?;
+
+        let (fire_result, shutdown_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+                tokio::join!(fire, shutdown)
+            })
+            .await
+            .map_err(|_| "scheduler/runtime shutdown race did not settle".to_string())?;
+        let fire_result = fire_result.map_err(|error| error.to_string())?;
+        assert!(fire_result.is_err());
+        shutdown_result
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
         let cancelled = store
             .list_runs_in(&[TaskRunStatus::Cancelled])
             .map_err(|error| error.to_string())?;

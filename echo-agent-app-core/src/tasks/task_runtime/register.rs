@@ -144,7 +144,7 @@ pub async fn bind_task_execute_to_pool(
         ExecuteTaskTool::new(store, agent_handle.clone()).with_agent_pool(Arc::downgrade(pool));
     let added = agent_handle
         .write(|agent| {
-            agent.add_tool(Box::new(tool));
+            agent.replace_tool(Box::new(tool));
             true
         })
         .await;

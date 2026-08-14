@@ -526,6 +526,7 @@ export function TaskRuntimePanel() {
     cancel,
     pause,
     resumeTaskRun,
+    retryBlockedTask,
     resolveRecoveryTask,
   } = useTaskRuntimeStore();
 
@@ -655,7 +656,7 @@ export function TaskRuntimePanel() {
                 </div>
                 <div className="grid grid-cols-2 gap-1">
                   <button
-                    onClick={() => resolveRecoveryTask(blocker.task_id, 'retry')}
+                    onClick={() => retryBlockedTask(blocker.task_id)}
                     className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px]"
                     style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}
                     title="确认工作区状态后重新执行"

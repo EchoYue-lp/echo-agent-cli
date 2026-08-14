@@ -29,25 +29,16 @@ use super::types::*;
 /// guarantee that matches its UX:
 /// - `None` — never write (cron / DAG / task_execute tool: no recall closure
 ///   needed today; their results surface via other channels).
-/// - `FireAndForget` — write in a detached task, return immediately (interactive
-///   `resume_task_run`).
-/// - `Blocking` — `await` the write before returning, so the caller knows the
-///   memory is durable by the time it sees "completed" (`create_complex_task` /
-///   `drive_run_async`: eliminates the recall race — a run that returns
-///   Completed has its `taskrun:completed:{run_id}` memory landed before any
-///   follow-up question can fire).
+/// - `BestEffortSettled` — await the write inside the owned TaskRun driver.
+///   Write errors are logged and never replace the business terminal outcome,
+///   but no detached memory task can outlive driver settlement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum MemoryPolicy {
     /// Never write a memory candidate for this run.
     None,
-    /// (Default) Write in a detached `tokio::spawn`; the run returns before the
-    /// write is guaranteed durable. Matches pre-B5.1 behavior.
+    /// (Default) Await best-effort memory IO before the driver settles.
     #[default]
-    FireAndForget,
-    /// `await` the write inside `execute_run` so it is durable before the run
-    /// returns. Use for callers whose completion triggers a recall the user
-    /// might immediately act on.
-    Blocking,
+    BestEffortSettled,
 }
 
 impl MemoryPolicy {
@@ -82,42 +73,18 @@ pub enum MemoryEvent {
     },
 }
 
-/// Write a memory candidate through the canonical `MemoryLayerManager`.
-/// Fire-and-forget: writes the memory candidate in a detached task so a slow
-/// MemoryLayerManager (embedding, IO, network) does NOT block the run's
-/// completion path. No-op (logged) if `layer_manager` is `None`.
-pub fn write_memory_candidate(
+/// Await a memory candidate through the canonical `MemoryLayerManager` while
+/// the caller's generation receipt remains alive. This is best-effort: write
+/// failures are logged and swallowed, so memory cannot replace the TaskRun's
+/// business terminal outcome.
+pub async fn write_memory_candidate_settled(
     layer_manager: Option<&Arc<MemoryLayerManager>>,
+    memory_generation: Option<&crate::evolution::ReviewGenerationLease>,
     store: &Arc<TaskRuntimeStore>,
     event: MemoryEvent,
 ) {
-    let Some(lm) = layer_manager else {
-        tracing::debug!(event = ?event, "memory layer manager unavailable; skipping memory write");
-        return;
-    };
-    let lm = lm.clone();
-    let store = store.clone();
-    tokio::spawn(async move {
-        write_memory_candidate_inner(&lm, &store, event).await;
-    });
-}
-
-/// Blocking variant of [`write_memory_candidate`] (B5.1): `await`s the write so
-/// the caller knows the memory is durable by the time it returns. Used by
-/// `MemoryPolicy::Blocking` callers (`create_complex_task` /
-/// `drive_run_async`) to eliminate the recall race — a Completed run has its
-/// memory landed before any follow-up question can fire.
-///
-/// No-op (logged) if `layer_manager` is `None`, matching the fire-and-forget
-/// variant. Best-effort: a write failure is logged and swallowed (a memory
-/// failure must never break a run).
-pub async fn write_memory_candidate_blocking(
-    layer_manager: Option<&Arc<MemoryLayerManager>>,
-    store: &Arc<TaskRuntimeStore>,
-    event: MemoryEvent,
-) {
-    let Some(lm) = layer_manager else {
-        tracing::debug!(event = ?event, "memory layer manager unavailable; skipping blocking memory write");
+    let (Some(lm), Some(_memory_generation)) = (layer_manager, memory_generation) else {
+        tracing::debug!(event = ?event, "generation-bound memory manager unavailable; skipping settled memory write");
         return;
     };
     write_memory_candidate_inner(lm, store, event).await;
@@ -127,25 +94,21 @@ pub async fn write_memory_candidate_blocking(
 /// Used by `execute_run`'s terminal branches so each caller's delivery
 /// guarantee is honored from one place:
 /// - `None` → no write (return immediately).
-/// - `FireAndForget` → spawn + return (the original `write_memory_candidate`).
-/// - `Blocking` → `await` (`write_memory_candidate_blocking`).
+/// - `BestEffortSettled` → await IO, while swallowing/logging memory errors.
 ///
-/// `layer_manager == None` short-circuits to a no-op regardless of policy (a
-/// caller without a memory layer can't write — e.g. the autonomous path before
-/// B5.1 wired `layer_manager` into `RunPayload`).
+/// A missing manager or generation lease short-circuits to a no-op regardless
+/// of policy. The pair is one controlled resource and must never be split.
 pub async fn write_memory_candidate_dispatch(
     policy: MemoryPolicy,
     layer_manager: Option<&Arc<MemoryLayerManager>>,
+    memory_generation: Option<&crate::evolution::ReviewGenerationLease>,
     store: &Arc<TaskRuntimeStore>,
     event: MemoryEvent,
 ) {
     match policy {
         MemoryPolicy::None => {}
-        MemoryPolicy::FireAndForget => {
-            write_memory_candidate(layer_manager, store, event);
-        }
-        MemoryPolicy::Blocking => {
-            write_memory_candidate_blocking(layer_manager, store, event).await;
+        MemoryPolicy::BestEffortSettled => {
+            write_memory_candidate_settled(layer_manager, memory_generation, store, event).await;
         }
     }
 }
@@ -389,15 +352,17 @@ mod tests {
     #[tokio::test]
     async fn write_memory_candidate_is_a_noop_without_layer_manager() {
         let store = seeded_store();
-        // None for layer_manager → no panic, no error. Now sync (fire-and-forget).
-        write_memory_candidate(
+        // None for layer_manager → no panic, no error.
+        write_memory_candidate_settled(
+            None,
             None,
             &store,
             MemoryEvent::RunCompleted {
                 run_id: "r1".into(),
                 goal: "x".into(),
             },
-        );
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -405,8 +370,7 @@ mod tests {
         // B5.1: writes() is the quick guard callers can use to skip building an
         // event entirely when the policy is None.
         assert!(!MemoryPolicy::None.writes());
-        assert!(MemoryPolicy::FireAndForget.writes());
-        assert!(MemoryPolicy::Blocking.writes());
+        assert!(MemoryPolicy::BestEffortSettled.writes());
     }
 
     #[tokio::test]
@@ -417,23 +381,6 @@ mod tests {
         write_memory_candidate_dispatch(
             MemoryPolicy::None,
             None,
-            &store,
-            MemoryEvent::RunCompleted {
-                run_id: "r1".into(),
-                goal: "x".into(),
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn dispatch_blocking_with_no_layer_manager_returns_without_panic() {
-        // B5.1: Blocking + None layer manager → no-op (a caller without a memory
-        // subsystem can't write). Must NOT block forever or panic — this is the
-        // autonomous path's fallback when no layer manager is wired (TUI/channel).
-        let store = seeded_store();
-        write_memory_candidate_dispatch(
-            MemoryPolicy::Blocking,
             None,
             &store,
             MemoryEvent::RunCompleted {
@@ -444,66 +391,60 @@ mod tests {
         .await;
     }
 
-    /// Minimal no-op ChangeLog for the recall-closure test (echo-agent's
-    /// `NullChangeLog` is #[cfg(test)]-private there, so we declare our own).
-    struct NullChangeLog;
-    impl echo_agent::evolution::audit::ChangeLog for NullChangeLog {
-        fn record(
-            &self,
-            _entry: echo_agent::evolution::audit::ChangeEntry,
-        ) -> echo_agent::error::Result<()> {
-            Ok(())
-        }
-        fn query(
-            &self,
-            _filter: &echo_agent::evolution::audit::ChangeFilter,
-        ) -> echo_agent::error::Result<Vec<echo_agent::evolution::audit::ChangeEntry>> {
-            Ok(Vec::new())
-        }
-        fn latest_for(
-            &self,
-            _entity_type: echo_agent::evolution::audit::EntityType,
-            _entity_key: &str,
-        ) -> echo_agent::error::Result<Option<echo_agent::evolution::audit::ChangeEntry>> {
-            Ok(None)
-        }
-        fn len(&self) -> usize {
-            0
-        }
+    #[tokio::test]
+    async fn dispatch_settled_with_no_layer_manager_returns_without_panic() {
+        // BestEffortSettled + None layer manager → no-op (a caller without a memory
+        // subsystem can't write). Must NOT block forever or panic — this is the
+        // autonomous path's fallback when no layer manager is wired (TUI/channel).
+        let store = seeded_store();
+        write_memory_candidate_dispatch(
+            MemoryPolicy::BestEffortSettled,
+            None,
+            None,
+            &store,
+            MemoryEvent::RunCompleted {
+                run_id: "r1".into(),
+                goal: "x".into(),
+            },
+        )
+        .await;
     }
 
     /// B5.5 recall-closure e2e: a Completed run's memory (written via the
-    /// Blocking path that `drive_run_async` uses) is durable + findable by
+    /// settled path that `drive_run_async` uses) is durable + findable by
     /// recall BEFORE the run returns — so a follow-up question can hit it.
     ///
-    /// This is the closure that B5.1's `MemoryPolicy::Blocking` guarantees. It
+    /// This is the closure that `MemoryPolicy::BestEffortSettled` guarantees. It
     /// exercises the real MemoryLayerManager + InMemoryStore (no LLM, no
     /// Postgres, no embeddings — the write path only serializes+stores, and
     /// recall falls back to keyword search). The precondition: the run must
     /// have ≥1 Completed todo (else build_candidates returns nothing).
     #[tokio::test]
-    async fn completed_run_memory_is_recallable_blocking() {
-        use echo_agent::evolution::{MemoryLayerManager, MemoryRecaller};
+    async fn completed_run_memory_is_recallable_after_settlement() -> Result<(), String> {
+        use echo_agent::evolution::{MemoryRecaller, ReviewConfig};
         use echo_agent::workspace::state::memory::store::InMemoryStore;
         use echo_core::memory::store::Store;
 
         // Real backing store; keep a clone for direct recall.
         let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-        let dir = tempfile::tempdir().unwrap().keep();
-        let lm = Arc::new(MemoryLayerManager::new(
-            dir,
-            store.clone(),
-            Box::new(NullChangeLog),
-        ));
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let dir = temp.path().to_path_buf();
+        let integration =
+            crate::evolution::ReviewIntegration::new(ReviewConfig::default(), dir, store.clone());
+        let memory_generation = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let lm = Arc::new(memory_generation.create_layer_manager());
 
         // Seeded TaskRuntimeStore: run "r1", goal "Review runtime", one
         // Completed todo ("Review chat.rs" / "found gap").
         let rt_store = seeded_store();
 
-        // The write the Blocking policy performs on Completion (the path
+        // The write the settled policy performs on Completion (the path
         // drive_run_async → execute_run → write_memory_candidate_dispatch uses).
-        write_memory_candidate_blocking(
+        write_memory_candidate_settled(
             Some(&lm),
+            Some(&memory_generation),
             &rt_store,
             MemoryEvent::RunCompleted {
                 run_id: "r1".into(),
@@ -519,7 +460,7 @@ mod tests {
             located.is_some(),
             "RunCompleted memory must be located by exact key"
         );
-        let (_, entry) = located.unwrap();
+        let (_, entry) = located.ok_or_else(|| "completed memory was not located".to_string())?;
         assert!(
             entry.content.contains("Review runtime"),
             "memory content must carry the goal; got: {}",
@@ -533,7 +474,10 @@ mod tests {
 
         // (2) Keyword recall via the manager (exercises the layered search path
         // the frontend/agent recall would use).
-        let hits = lm.search_layered("Review", 10).await.unwrap();
+        let hits = lm
+            .search_layered("Review", 10)
+            .await
+            .map_err(|error| error.to_string())?;
         assert!(
             hits.iter()
                 .any(|(_, e)| e.content.contains("Review runtime")),
@@ -546,10 +490,11 @@ mod tests {
         let recalled = MemoryRecaller::new(store.clone())
             .recall("Review", 5)
             .await
-            .unwrap();
+            .map_err(|error| error.to_string())?;
         assert!(
             recalled.iter().any(|i| i.key == "taskrun:completed:r1"),
             "MemoryRecaller (the real follow-up-question path) must find the completed-run memory"
         );
+        Ok(())
     }
 }

@@ -113,7 +113,7 @@ export interface TaskRuntimeState {
   reorderTasks: (newOrder: string[]) => Promise<void>;
   resumeTaskRun: () => Promise<void>;
   retryBlockedTask: (taskId: string) => Promise<void>;
-  resolveRecoveryTask: (taskId: string, decision: 'retry' | 'skip') => Promise<void>;
+  resolveRecoveryTask: (taskId: string, decision: 'skip') => Promise<void>;
   reset: () => void;
 }
 

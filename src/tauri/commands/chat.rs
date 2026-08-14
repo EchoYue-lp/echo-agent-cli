@@ -661,11 +661,9 @@ pub async fn send_chat_message(
         cancel: cancel_token.clone(),
         mode_hint,
         interaction_mode,
-        layer_manager: state
-            .app_state
-            .review_integration
-            .as_ref()
-            .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
+        review_integration: state.app_state.review_integration.clone(),
+        layer_manager: None,
+        memory_generation: None,
     });
     tokio::spawn(async move {
         let start = std::time::Instant::now();

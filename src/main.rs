@@ -380,6 +380,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         if let Err(error) = tui_app_state.session.foreground_turns.shutdown().await {
             tracing::warn!(%error, "failed to settle TUI foreground turns");
         }
+        if let Some(integration) = runtime.review_integration.as_ref()
+            && let Err(error) = integration.shutdown_background_reviews().await
+        {
+            tracing::warn!(%error, "failed to settle TUI background reviews");
+        }
         if let Err(error) = tui_app_state.shutdown_workspace_transition().await {
             tracing::warn!(%error, "failed to settle TUI workspace transition");
         }
@@ -469,6 +474,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 if let Err(error) = foreground_turns.shutdown().await {
                     tracing::warn!(%error, "failed to settle channel foreground turns");
                 }
+                if let Some(integration) = runtime.review_integration.as_ref()
+                    && let Err(error) = integration.shutdown_background_reviews().await
+                {
+                    tracing::warn!(%error, "failed to settle channel background reviews");
+                }
                 if let Some(store) = task_runtime_store.as_ref()
                     && let Err(error) = store.shutdown_run_drivers().await
                 {
@@ -533,6 +543,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     }
 
     // Keep runtime alive until shutdown
+    if let Some(integration) = runtime.review_integration.as_ref()
+        && let Err(error) = integration.shutdown_background_reviews().await
+    {
+        tracing::warn!(%error, "failed to settle background reviews");
+    }
     if let Some(store) = task_runtime_store.as_ref()
         && let Err(error) = store.shutdown_run_drivers().await
     {

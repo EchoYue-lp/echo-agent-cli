@@ -35,6 +35,10 @@ use crate::agent_handle::AgentHandle;
 
 tokio::task_local! {
     static CURRENT_EXECUTION_CONVERSATION_ID: Option<String>;
+    /// Exact TaskRuntime driver context copied from `ToolContext`. This scope
+    /// starts inside the framework-spawned tool task, so the identity crossed
+    /// the stream-channel boundary by value rather than task-local inheritance.
+    static CURRENT_EXECUTION_DRIVER_CONTEXT: Option<String>;
 }
 
 /// One active execute_run driver per run_id.
@@ -173,7 +177,10 @@ impl ExecuteTaskTool {
         self
     }
 
-    async fn execution_agent(&self) -> Result<TaskExecutionAgent, crate::agent_pool::PoolError> {
+    async fn execution_agent(
+        &self,
+        run_id: &str,
+    ) -> Result<TaskExecutionAgent, crate::agent_pool::PoolError> {
         let conversation_id = CURRENT_EXECUTION_CONVERSATION_ID
             .try_with(Clone::clone)
             .ok()
@@ -183,14 +190,27 @@ impl ExecuteTaskTool {
             conversation_id,
         ) && let Some(pool_execution) = pool.lease_existing(&conversation_id).await?
         {
+            let agent = pool_execution.agent();
+            let pool_receipt = pool.retain_for_supervised_run(conversation_id, pool_execution);
+            let driver_context = CURRENT_EXECUTION_DRIVER_CONTEXT
+                .try_with(Clone::clone)
+                .ok()
+                .flatten();
+            let pool_receipt = match driver_context {
+                Some(driver_context) => self
+                    .store
+                    .retain_run_driver_receipt_from_context(run_id, &driver_context, pool_receipt)
+                    .err(),
+                None => Some(pool_receipt),
+            };
             return Ok(TaskExecutionAgent {
-                agent: pool_execution.agent(),
-                _pool_execution: Some(pool_execution),
+                agent,
+                pool_receipt,
             });
         }
         Ok(TaskExecutionAgent {
             agent: self.primary_agent.clone(),
-            _pool_execution: None,
+            pool_receipt: None,
         })
     }
 
@@ -200,7 +220,7 @@ impl ExecuteTaskTool {
         conversation_id: Option<String>,
     ) -> Result<AgentHandle, crate::agent_pool::PoolError> {
         CURRENT_EXECUTION_CONVERSATION_ID
-            .scope(conversation_id, self.execution_agent())
+            .scope(conversation_id, self.execution_agent("test-run"))
             .await
             .map(|execution| execution.agent)
     }
@@ -208,7 +228,7 @@ impl ExecuteTaskTool {
 
 struct TaskExecutionAgent {
     agent: AgentHandle,
-    _pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    pool_receipt: Option<crate::agent_pool::OwnedRunPoolReceipt>,
 }
 
 impl Tool for ExecuteTaskTool {
@@ -274,9 +294,9 @@ impl Tool for ExecuteTaskTool {
             let materialized_plan = match self.store.get_plan(&run_id) {
                 Ok(Some(plan)) if !plan.tasks.is_empty() => plan,
                 Ok(_) => {
-                    return Ok(ToolResult::error(
-                        "task_execute requires at least one persisted task. Call task_create, then refresh with task_list.",
-                    ));
+                    return Ok(ToolResult::error(format!(
+                        "task_execute requires at least one persisted task for run {run_id}. Call task_create, then refresh with task_list."
+                    )));
                 }
                 Err(error) => {
                     return Ok(ToolResult::error(format!(
@@ -381,7 +401,7 @@ impl Tool for ExecuteTaskTool {
             // None. execute_run uses it to persist trace Run records (token
             // usage, status). Without it, the task_execute path silently drops
             // trace persistence (event-wiring #1残留).
-            let execution_agent = match self.execution_agent().await {
+            let mut execution_agent = match self.execution_agent(&run_id).await {
                 Ok(execution_agent) => execution_agent,
                 Err(error) => {
                     return Ok(ToolResult::error(format!(
@@ -394,17 +414,6 @@ impl Tool for ExecuteTaskTool {
             // preflight in `execute_task` (inside execute_run's EKO controller)
             // can read it without threading the mode through every signature.
             let write_mode = self.write_mode;
-            let _cancel_registration = match self
-                .store
-                .register_run_cancellation(&run_id, cancel.clone())
-            {
-                Ok(registration) => registration,
-                Err(error) => {
-                    return Ok(ToolResult::error(format!(
-                        "Failed to register run cancellation: {error}"
-                    )));
-                }
-            };
             // Wire the reviewer LLM from the conversation's execution agent.
             // Without this the
             // review gate falls through to Skipped, which (per M7) must NOT
@@ -422,6 +431,7 @@ impl Tool for ExecuteTaskTool {
                         Some(execution_agent.agent.clone()),
                         reviewer_llm,
                         None, // layer_manager — 暂时 None
+                        None, // memory generation — outer run owns settlement
                         run_store,
                         trace_sink,
                         &run_id,
@@ -434,6 +444,9 @@ impl Tool for ExecuteTaskTool {
                     .await
                 })
                 .await;
+            if let Some(pool_receipt) = execution_agent.pool_receipt.take() {
+                super::store::RunDriverExecutionReceipt::release(Box::new(pool_receipt)).await;
+            }
 
             match outcome {
                 Ok(RunOutcome::Completed) => {
@@ -512,8 +525,12 @@ impl Tool for ExecuteTaskTool {
     ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
             let conversation_id = ctx.conversation_id.clone();
+            let driver_context = ctx.execution_id.clone();
             let result = super::task_tools::scoped_with_ctx_run_id(ctx, || {
-                CURRENT_EXECUTION_CONVERSATION_ID.scope(conversation_id, self.execute(params))
+                CURRENT_EXECUTION_CONVERSATION_ID.scope(
+                    conversation_id,
+                    CURRENT_EXECUTION_DRIVER_CONTEXT.scope(driver_context, self.execute(params)),
+                )
             })
             .await?;
             compact_completed_task_result(ctx, result)

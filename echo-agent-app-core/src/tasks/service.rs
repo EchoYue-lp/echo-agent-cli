@@ -14,8 +14,8 @@ use echo_agent::tasks::progress::TaskProgress;
 use super::background::BackgroundTaskKind;
 use super::task_runtime::{
     AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanTask,
-    RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRun, TaskRunStatus, TaskRuntimeStore,
-    TodoStatus, UnattendedWriteMode,
+    RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun, TaskRunStatus,
+    TaskRuntimeStore, TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 
@@ -137,6 +137,7 @@ pub struct BackgroundTaskService {
     task_runtime_store: Arc<TaskRuntimeStore>,
     agent_provider: Arc<dyn TaskAgentProvider>,
     run_semaphore: Arc<tokio::sync::Semaphore>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
 }
 
 impl BackgroundTaskService {
@@ -185,7 +186,16 @@ impl BackgroundTaskService {
             config,
             task_runtime_store,
             agent_provider,
+            review_integration: None,
         })
+    }
+
+    pub fn with_review_integration(
+        mut self,
+        review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    ) -> Self {
+        self.review_integration = review_integration;
+        self
     }
 
     pub async fn submit(
@@ -243,38 +253,55 @@ impl BackgroundTaskService {
     }
 
     async fn submit_prompt_run(&self, request: PromptRunRequest<'_>) -> anyhow::Result<String> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let cancel = self.cancel.child_token();
+        let admission = self
+            .task_runtime_store
+            .reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
         let generation_lease = self
             .task_runtime_store
             .lease_active_workspace_generation()?;
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut registration = self
+            .task_runtime_store
+            .register_run_driver::<()>(admission, generation_lease)?;
         let conversation_id = format!("background:{}:{}", request.source, uuid::Uuid::new_v4());
         let goal = if request.description.trim().is_empty() {
             request.prompt
         } else {
             request.description
         };
-        self.task_runtime_store.create_run_for_active_workspace(
-            &run_id,
-            &conversation_id,
-            "",
-            request.domain_profile,
-            goal,
-            request.task_kind,
-            AttendedMode::Unattended,
-        )?;
-        self.task_runtime_store.record_trigger_metadata(
-            &run_id,
-            request.source,
-            request.task_kind,
-            request.prompt,
-            request.priority,
-            &request.dependencies,
-        )?;
+        registration.mark_preparation_started();
+        let preparation = self
+            .task_runtime_store
+            .create_run_for_active_workspace(
+                &run_id,
+                &conversation_id,
+                "",
+                request.domain_profile,
+                goal,
+                request.task_kind,
+                AttendedMode::Unattended,
+            )
+            .and_then(|_| {
+                self.task_runtime_store.record_trigger_metadata(
+                    &run_id,
+                    request.source,
+                    request.task_kind,
+                    request.prompt,
+                    request.priority,
+                    &request.dependencies,
+                )
+            });
+        if let Err(error) = preparation {
+            registration.fail_preparation(error.to_string());
+            return Err(error.into());
+        }
         self.start_run_driver(
             run_id.clone(),
             request.prompt.to_string(),
             request.dependencies,
-            generation_lease,
+            registration,
+            cancel,
         )?;
         Ok(run_id)
     }
@@ -286,10 +313,17 @@ impl BackgroundTaskService {
         source_kind: &str,
         source_id: &str,
     ) -> anyhow::Result<String> {
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let cancel = self.cancel.child_token();
+        let admission = self
+            .task_runtime_store
+            .reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
         let generation_lease = self
             .task_runtime_store
             .lease_active_workspace_generation()?;
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let mut registration = self
+            .task_runtime_store
+            .register_run_driver::<()>(admission, generation_lease)?;
         let conversation_id = format!("background:{source_id}:{}", uuid::Uuid::new_v4());
         let goal = if description.trim().is_empty() {
             "composite"
@@ -297,7 +331,8 @@ impl BackgroundTaskService {
             description
         };
         let task_kind = format!("bg:kind:{source_kind}_composite");
-        self.task_runtime_store.create_run_for_active_workspace(
+        registration.mark_preparation_started();
+        if let Err(error) = self.task_runtime_store.create_run_for_active_workspace(
             &run_id,
             &conversation_id,
             "",
@@ -305,8 +340,11 @@ impl BackgroundTaskService {
             goal,
             &task_kind,
             AttendedMode::Unattended,
-        )?;
-        super::task_runtime::commit_eko_task_plan(
+        ) {
+            registration.fail_preparation(error.to_string());
+            return Err(error.into());
+        }
+        if let Err(error) = super::task_runtime::commit_eko_task_plan(
             self.task_runtime_store.clone(),
             TaskPlan {
                 plan_id: uuid::Uuid::new_v4().to_string(),
@@ -320,20 +358,28 @@ impl BackgroundTaskService {
                 tasks: plan_tasks,
             },
         )
-        .await?;
-        self.task_runtime_store.record_trigger_metadata(
+        .await
+        {
+            registration.fail_preparation(error.to_string());
+            return Err(error.into());
+        }
+        if let Err(error) = self.task_runtime_store.record_trigger_metadata(
             &run_id,
             source_id,
             &task_kind,
             goal,
             5,
             &[],
-        )?;
+        ) {
+            registration.fail_preparation(error.to_string());
+            return Err(error.into());
+        }
         self.start_run_driver(
             run_id.clone(),
             goal.to_string(),
             Vec::new(),
-            generation_lease,
+            registration,
+            cancel,
         )?;
         Ok(run_id)
     }
@@ -343,116 +389,26 @@ impl BackgroundTaskService {
         run_id: String,
         prompt: String,
         dependencies: Vec<String>,
-        generation_lease: super::task_runtime::store::WorkspaceGenerationLease,
+        registration: super::task_runtime::store::RegisteredRunDriver<()>,
+        cancel: echo_agent::agent::CancellationToken,
     ) -> anyhow::Result<()> {
         let store = self.task_runtime_store.clone();
-        let cancel = self.cancel.child_token();
         let agent_provider = self.agent_provider.clone();
+        let review_integration = self.review_integration.clone();
         let run_semaphore = self.run_semaphore.clone();
-        let result_waiter = store.clone().spawn_run_driver(
-            run_id.clone(),
-            cancel.clone(),
-            generation_lease,
-            move |receipt_owner| async move {
-                // Admission was acquired before any run mutation and is retained
-                // through terminal settlement of this background run.
-                let _cancel_registration = store
-                    .register_run_cancellation(&run_id, cancel.clone())
-                    .map_err(|error| format!("register run cancellation: {error}"))?;
-                if let Err(error) = wait_for_dependencies(&store, &dependencies, &cancel).await {
-                    finish_pre_execution_failure(&store, &run_id, &error, cancel.is_cancelled())?;
-                    if cancel.is_cancelled() {
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-                if cancel.is_cancelled() {
-                    finish_pre_execution_failure(&store, &run_id, "run cancelled", true)?;
-                    return Ok(());
-                }
-                let _run_permit = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        finish_pre_execution_failure(
-                            &store,
-                            &run_id,
-                            "run cancelled",
-                            true,
-                        )?;
-                        return Ok(());
-                    }
-                    permit = run_semaphore.acquire_owned() => match permit {
-                        Ok(permit) => permit,
-                        Err(error) => {
-                            let message = format!("background concurrency closed: {error}");
-                            finish_pre_execution_failure(
-                                &store,
-                                &run_id,
-                                &message,
-                                false,
-                            )?;
-                            return Err(message);
-                        }
-                    }
-                };
-                if let Err(error) = transition_to_running(&store, &run_id) {
-                    finish_pre_execution_failure(&store, &run_id, &error, false)?;
-                    return Err(error);
-                }
-                let lease = match agent_provider.acquire_for_task(&run_id).await {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        let message = format!("acquire agent: {error}");
-                        finish_running_failure(&store, &run_id, &message)?;
-                        return Err(message);
-                    }
-                };
-                let agent = lease.agent();
-                receipt_owner.retain(lease);
-                // Wire reviewer LLM from the background agent. Implementation/
-                // Debugging tasks (and any task with acceptance_criteria) now
-                // require a review pass; without a reviewer the Skipped branch
-                // would otherwise Paused the run forever (M7 forbids auto-pass).
-                let reviewer_llm = agent.read(|a| a.llm_client().cloned()).await;
-                let result = match store.get_plan(&run_id) {
-                    Ok(Some(_)) => super::task_runtime::execute_run(
-                        store.clone(),
-                        Some(agent),
-                        reviewer_llm,
-                        None,
-                        None,
-                        None,
-                        &run_id,
-                        cancel,
-                        MemoryPolicy::None,
-                    )
-                    .await
-                    .map(|_| run_id.clone()),
-                    Ok(None) => {
-                        register_task_execute(&agent, store.clone()).await;
-                        super::task_runtime::drive_unattended_run(
-                            store.clone(),
-                            agent,
-                            &run_id,
-                            "background",
-                            &run_id,
-                            &prompt,
-                            cancel,
-                            UnattendedWriteMode::default(),
-                        )
-                        .await
-                    }
-                    Err(error) => Err(super::task_runtime::ExecError::Other(format!(
-                        "read plan before background execution: {error}"
-                    ))),
-                };
-                if let Err(error) = result {
-                    let message = error.to_string();
-                    finish_running_failure(&store, &run_id, &message)?;
-                    return Err(message);
-                }
-                Ok(())
-            },
-        )?;
+        let result_waiter = registration.start(move |receipt_owner| {
+            drive_background_run(
+                store,
+                agent_provider,
+                review_integration,
+                run_semaphore,
+                run_id,
+                prompt,
+                dependencies,
+                cancel,
+                receipt_owner,
+            )
+        });
         drop(result_waiter);
         Ok(())
     }
@@ -470,9 +426,16 @@ impl BackgroundTaskService {
     }
 
     pub fn resume(&self, id: &str) -> anyhow::Result<()> {
+        let cancel = self.cancel.child_token();
+        let admission = self
+            .task_runtime_store
+            .reserve_run_driver_admission(id.to_string(), cancel.clone())?;
         let generation_lease = self
             .task_runtime_store
             .lease_active_workspace_generation()?;
+        let mut registration = self
+            .task_runtime_store
+            .register_run_driver::<()>(admission, generation_lease)?;
         let run = self
             .task_runtime_store
             .get_run(id)?
@@ -484,12 +447,17 @@ impl BackgroundTaskService {
         }
         let metadata = trigger_metadata(&self.task_runtime_store, id);
         let prompt = metadata.prompt.unwrap_or(run.goal);
-        self.task_runtime_store.resume_task_run(id)?;
+        registration.mark_preparation_started();
+        if let Err(error) = self.task_runtime_store.resume_task_run(id) {
+            registration.fail_preparation(error.to_string());
+            return Err(error.into());
+        }
         self.start_run_driver(
             id.to_string(),
             prompt,
             metadata.dependencies,
-            generation_lease,
+            registration,
+            cancel,
         )?;
         Ok(())
     }
@@ -514,31 +482,53 @@ impl BackgroundTaskService {
     /// Atomically retry a Blocked/Failed task on a Paused/Failed run. Mirrors
     /// the Tauri `retry_blocked_task` command and the GUI retry button so
     /// CLI/TUI users get the same acceptance-retry semantics.
-    pub fn retry_blocked_task(&self, run_id: &str, task_id: &str) -> anyhow::Result<u32> {
-        let generation_lease = self
-            .task_runtime_store
-            .lease_active_workspace_generation()?;
-        let run = self
-            .task_runtime_store
-            .get_run(run_id)?
-            .ok_or_else(|| anyhow::anyhow!("task run not found: {run_id}"))?;
-        if !run.conversation_id.starts_with("background:") {
-            return Err(anyhow::anyhow!(
-                "task run is not owned by the background service: {run_id}"
-            ));
-        }
-        let metadata = trigger_metadata(&self.task_runtime_store, run_id);
-        let prompt = metadata.prompt.unwrap_or(run.goal);
-        let next = self
-            .task_runtime_store
-            .retry_blocked_task(run_id, task_id)?;
-        self.start_run_driver(
+    pub fn retry_blocked_task(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> anyhow::Result<TaskRetryPreparation> {
+        let cancel = self.cancel.child_token();
+        let store = self.task_runtime_store.clone();
+        let preflight_store = store.clone();
+        let preflight_run_id = run_id.to_string();
+        let agent_provider = self.agent_provider.clone();
+        let review_integration = self.review_integration.clone();
+        let run_semaphore = self.run_semaphore.clone();
+        let driver_store = store.clone();
+        let driver_run_id = run_id.to_string();
+        let driver_cancel = cancel.clone();
+        let (preparation, result_waiter) = store.spawn_supervised_task_retry(
             run_id.to_string(),
-            prompt,
-            metadata.dependencies,
-            generation_lease,
+            task_id.to_string(),
+            cancel,
+            move || {
+                let run = preflight_store.get_run(&preflight_run_id)?.ok_or_else(|| {
+                    super::task_runtime::StoreError::RunNotFound(preflight_run_id.clone())
+                })?;
+                if !run.conversation_id.starts_with("background:") {
+                    return Err(super::task_runtime::StoreError::InvalidPlan(format!(
+                        "task run is not owned by the background service: {preflight_run_id}"
+                    )));
+                }
+                let metadata = trigger_metadata(&preflight_store, &preflight_run_id);
+                Ok((metadata.prompt.unwrap_or(run.goal), metadata.dependencies))
+            },
+            move |(prompt, dependencies), receipt_owner| {
+                drive_background_run(
+                    driver_store,
+                    agent_provider,
+                    review_integration,
+                    run_semaphore,
+                    driver_run_id,
+                    prompt,
+                    dependencies,
+                    driver_cancel,
+                    receipt_owner,
+                )
+            },
         )?;
-        Ok(next)
+        drop(result_waiter);
+        Ok(preparation)
     }
 
     pub fn list_unified(&self, status_filter: Option<&str>) -> Vec<UnifiedTaskInfo> {
@@ -574,13 +564,24 @@ impl BackgroundTaskService {
                     || was_recovered_at_boot(&self.task_runtime_store, &run.run_id)
             })
         {
+            let cancel = self.cancel.child_token();
+            let admission = self
+                .task_runtime_store
+                .reserve_run_driver_admission(run.run_id.clone(), cancel.clone())?;
             let generation_lease = self
                 .task_runtime_store
                 .lease_active_workspace_generation()?;
+            let mut registration = self
+                .task_runtime_store
+                .register_run_driver::<()>(admission, generation_lease)?;
             let blockers = self
                 .task_runtime_store
                 .list_recovery_blockers(&run.run_id)?;
             if !blockers.is_empty() {
+                registration.reject(format!(
+                    "background run {} requires a recovery decision",
+                    run.run_id
+                ));
                 tracing::warn!(
                     run_id = %run.run_id,
                     blocker_count = blockers.len(),
@@ -590,10 +591,20 @@ impl BackgroundTaskService {
             }
             let metadata = trigger_metadata(&self.task_runtime_store, &run.run_id);
             let prompt = metadata.prompt.unwrap_or(run.goal);
-            if run.status == TaskRunStatus::Paused {
-                self.task_runtime_store.resume_task_run(&run.run_id)?;
+            registration.mark_preparation_started();
+            if run.status == TaskRunStatus::Paused
+                && let Err(error) = self.task_runtime_store.resume_task_run(&run.run_id)
+            {
+                registration.fail_preparation(error.to_string());
+                return Err(error.into());
             }
-            self.start_run_driver(run.run_id, prompt, metadata.dependencies, generation_lease)?;
+            self.start_run_driver(
+                run.run_id,
+                prompt,
+                metadata.dependencies,
+                registration,
+                cancel,
+            )?;
             resumed = resumed.saturating_add(1);
         }
         Ok(resumed)
@@ -651,6 +662,116 @@ impl BackgroundTaskService {
     pub fn config(&self) -> &BackgroundTaskServiceConfig {
         &self.config
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_background_run(
+    store: Arc<TaskRuntimeStore>,
+    agent_provider: Arc<dyn TaskAgentProvider>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    run_semaphore: Arc<tokio::sync::Semaphore>,
+    run_id: String,
+    prompt: String,
+    dependencies: Vec<String>,
+    cancel: CancellationToken,
+    mut receipt_owner: super::task_runtime::store::RunDriverReceiptOwner,
+) -> Result<(), String> {
+    if let Err(error) = wait_for_dependencies(&store, &dependencies, &cancel).await {
+        finish_pre_execution_failure(&store, &run_id, &error, cancel.is_cancelled())?;
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if cancel.is_cancelled() {
+        finish_pre_execution_failure(&store, &run_id, "run cancelled", true)?;
+        return Ok(());
+    }
+    let _run_permit = tokio::select! {
+        _ = cancel.cancelled() => {
+            finish_pre_execution_failure(&store, &run_id, "run cancelled", true)?;
+            return Ok(());
+        }
+        permit = run_semaphore.acquire_owned() => match permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                let message = format!("background concurrency closed: {error}");
+                finish_pre_execution_failure(&store, &run_id, &message, false)?;
+                return Err(message);
+            }
+        }
+    };
+    if let Err(error) = transition_to_running(&store, &run_id) {
+        finish_pre_execution_failure(&store, &run_id, &error, false)?;
+        return Err(error);
+    }
+    let memory_generation = review_integration
+        .as_ref()
+        .map(|integration| integration.lease_generation())
+        .transpose()
+        .map_err(|error| format!("memory generation unavailable: {error}"))?;
+    if let Some(generation) = memory_generation.as_ref() {
+        receipt_owner.retain(generation.clone());
+    }
+    let layer_manager = memory_generation
+        .as_ref()
+        .map(|generation| Arc::new(generation.create_layer_manager()));
+    let lease = match agent_provider.acquire_for_task(&run_id).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            let message = format!("acquire agent: {error}");
+            finish_running_failure(&store, &run_id, &message)?;
+            return Err(message);
+        }
+    };
+    let agent = lease.agent();
+    receipt_owner.retain(lease);
+    if let Some(manager) = layer_manager.as_ref() {
+        let manager = manager.clone();
+        agent
+            .write(|value| value.install_memory_layer_manager(manager))
+            .await;
+    }
+    let reviewer_llm = agent.read(|agent| agent.llm_client().cloned()).await;
+    let result = match store.get_plan(&run_id) {
+        Ok(Some(_)) => super::task_runtime::execute_run(
+            store.clone(),
+            Some(agent),
+            reviewer_llm,
+            layer_manager,
+            memory_generation,
+            None,
+            None,
+            &run_id,
+            cancel,
+            MemoryPolicy::None,
+        )
+        .await
+        .map(|_| run_id.clone()),
+        Ok(None) => {
+            register_task_execute(&agent, store.clone()).await;
+            super::task_runtime::drive_unattended_run(
+                store.clone(),
+                agent,
+                &run_id,
+                "background",
+                &run_id,
+                &prompt,
+                cancel,
+                UnattendedWriteMode::default(),
+            )
+            .await
+        }
+        Err(error) => Err(super::task_runtime::ExecError::Other(format!(
+            "read plan before background execution: {error}"
+        ))),
+    };
+    if let Err(error) = result {
+        let message = error.to_string();
+        finish_running_failure(&store, &run_id, &message)?;
+        return Err(message);
+    }
+    Ok(())
 }
 
 fn was_recovered_at_boot(store: &TaskRuntimeStore, run_id: &str) -> bool {
@@ -888,6 +1009,102 @@ mod tests {
             .map_err(|error| error.to_string())
     }
 
+    fn prepare_background_retry_run(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+        task_id: &str,
+        recovery: bool,
+    ) -> Result<(), String> {
+        store
+            .create_run(
+                run_id,
+                "default",
+                &format!("background:test:{run_id}"),
+                "",
+                DomainProfile::General,
+                "retry run",
+                "bg:kind:test",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: format!("{run_id}-plan"),
+                run_id: run_id.to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal: "retry run".to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: task_id.to_string(),
+                    title: "Retry task".to_string(),
+                    kind: PlanTaskKind::Investigation,
+                    agent_role: "researcher".to_string(),
+                    max_retries: 2,
+                    ..PlanTask::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let (task_status, summary, run_status) = if recovery {
+            (
+                TodoStatus::Blocked,
+                "mutating side effect is indeterminate after restart",
+                TaskRunStatus::Paused,
+            )
+        } else {
+            (
+                TodoStatus::Failed,
+                "execution failed",
+                TaskRunStatus::Failed,
+            )
+        };
+        store
+            .set_task_status(
+                run_id,
+                task_id,
+                task_status,
+                Some("researcher"),
+                Some(summary),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, run_status)
+            .map_err(|error| error.to_string())?;
+        store
+            .record_trigger_metadata(run_id, "test", "research", "retry run", 5, &[])
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn retry_snapshot(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<(TaskRunStatus, TodoStatus, u32, usize), String> {
+        let run = store
+            .get_run(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("run missing: {run_id}"))?;
+        let task = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|plan| plan.tasks.into_iter().next())
+            .ok_or_else(|| format!("task missing: {run_id}"))?;
+        Ok((
+            run.status,
+            task.status,
+            task.retry_count,
+            store
+                .list_events(run_id, 0)
+                .map_err(|error| error.to_string())?
+                .len(),
+        ))
+    }
+
     #[tokio::test]
     async fn pipeline_submission_creates_only_task_runtime_run() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
@@ -1053,13 +1270,90 @@ mod tests {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let attempt = service
+        let preparation = service
             .retry_blocked_task("retry-run", "retry-task")
             .map_err(|error| error.to_string())?;
-        assert_eq!(attempt, 1);
+        assert_eq!(
+            preparation,
+            TaskRetryPreparation::Acceptance { next_attempt: 1 }
+        );
         assert_eq!(store.active_run_driver_count()?, 1);
-        store.shutdown_run_drivers().await?;
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(store.active_run_driver_count()?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_retry_selects_recovery_without_acceptance_mutation() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        prepare_background_retry_run(&store, "recovery-run", "recovery-task", true)?;
+        let service = BackgroundTaskService::new(
+            test_agent()?,
+            CancellationToken::new(),
+            Some(store.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let preparation = service
+            .retry_blocked_task("recovery-run", "recovery-task")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(preparation, TaskRetryPreparation::Recovery);
+        assert!(
+            store
+                .list_recovery_blockers("recovery-run")
+                .map_err(|error| error.to_string())?
+                .is_empty()
+        );
+        let plan = store
+            .get_plan("recovery-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "recovery plan missing".to_string())?;
+        assert_eq!(
+            plan.tasks.first().map(|task| task.retry_count),
+            Some(0),
+            "recovery retry must not run the acceptance retry mutation"
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_retry_admission_and_registration_failures_do_not_mutate_runtime()
+    -> Result<(), String> {
+        for failure in ["closed-admission", "registration"] {
+            let store =
+                Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+            let run_id = format!("{failure}-run");
+            prepare_background_retry_run(&store, &run_id, "retry-task", false)?;
+            let service = BackgroundTaskService::new(
+                test_agent()?,
+                CancellationToken::new(),
+                Some(store.clone()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            let before = retry_snapshot(&store, &run_id)?;
+            if failure == "closed-admission" {
+                store
+                    .shutdown_run_drivers()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            } else {
+                store.fail_next_run_driver_registration_for_test();
+            }
+
+            if service.retry_blocked_task(&run_id, "retry-task").is_ok() {
+                return Err(format!("{failure} retry unexpectedly succeeded"));
+            }
+            assert_eq!(before, retry_snapshot(&store, &run_id)?);
+        }
         Ok(())
     }
 

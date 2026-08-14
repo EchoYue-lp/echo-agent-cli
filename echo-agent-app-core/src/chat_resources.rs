@@ -1,7 +1,6 @@
-//! Per-turn chat resources scoped into a tokio task_local so agent tools —
-//! chiefly `create_complex_task` (Phase B3) — can reach the pool/store/sink
-//! during a chat turn without them being threaded through the framework's tool
-//! plumbing.
+//! Per-turn chat resources scoped into a tokio task-local for app-owned work
+//! on the current async task. Framework-spawned tool execution instead uses
+//! value-carried `ToolContext`; Tokio task-locals do not cross that boundary.
 //!
 //! `drive_chat` scopes an `Arc<ChatResources>` per turn; tools read it via
 //! [`current_chat_resources`]. `pool`/`store` are `Option` because some
@@ -41,18 +40,24 @@ pub struct ChatResources {
     /// directly"; Task → "lean towards create_complex_task for complex work".
     /// None (Auto) adds nothing. Pure prompt — NO code route branch.
     pub mode_hint: Option<String>,
-    /// The interaction mode for this turn (Chat/Task/Auto). P1.1: when this is
-    /// `Chat`, `drive_chat` hides task-management tools through the invocation
-    /// context so the model physically cannot call them — not just a prompt
-    /// hint. Default `Auto` for callers that don't set it.
+    /// The interaction mode for this turn (Chat/Task/Auto). All modes retain
+    /// the canonical task graph API; mode-specific policy controls other
+    /// delegation tools and prompt guidance. Default is `Auto`.
     pub interaction_mode: crate::tasks::task_runtime::InteractionMode,
+    /// Canonical source for workspace-bound memory admission. Product
+    /// surfaces pass this Arc through unchanged; `drive_chat` acquires the
+    /// generation only after foreground admission succeeds.
+    pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     /// Memory layer manager for durable write-back of completed runs
     /// (B5.1): `create_complex_task` forwards this into the background Run's
-    /// payload so `execute_run` (Blocking policy) lands the
+    /// payload so `execute_run` (settled best-effort policy) lands the
     /// `taskrun:completed:{run_id}` memory before returning. `None` when the
     /// caller has no review/memory subsystem wired (minimal tests/embedders) — the
     /// write becomes a no-op.
     pub layer_manager: Option<Arc<MemoryLayerManager>>,
+    /// Pins every memory/evidence write initiated by this turn to the same
+    /// workspace generation as `layer_manager`.
+    pub memory_generation: Option<crate::evolution::ReviewGenerationLease>,
 }
 
 tokio::task_local! {

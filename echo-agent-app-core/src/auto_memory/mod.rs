@@ -13,16 +13,6 @@ pub use echo_agent::evolution::auto_memory::{
     format_observations_for_memory,
 };
 
-/// Run auto-memory extraction and queue candidates for review.
-pub fn run_auto_memory_extraction(
-    messages: &[(String, String)],
-    config: &AutoMemoryConfig,
-) -> Result<Vec<EvidenceCandidate>, String> {
-    let observations = extract_observations(messages, config);
-    let store = EvidenceStore::new(crate::evolution::discover_echo_agent_dir());
-    queue_observations(&store, &observations, messages)
-}
-
 /// Queue inferred observations in the unified workspace inbox.
 pub fn queue_observations(
     store: &EvidenceStore,

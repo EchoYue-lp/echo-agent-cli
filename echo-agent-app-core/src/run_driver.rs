@@ -42,6 +42,7 @@ pub struct RunPayload {
     /// token, but using an independent one keeps the logic uniform.
     pub cancel: CancellationToken,
     pub layer_manager: Option<Arc<MemoryLayerManager>>,
+    pub memory_generation: Option<crate::evolution::ReviewGenerationLease>,
     /// Execution-flow sink forwarded into the independent Agent so its
     /// thinking/tool/token events reach the frontend's `execution://event`
     /// channel. `Some` for foreground (inline streaming to the chat sink);
@@ -60,6 +61,7 @@ struct RunExecutionPayload {
     store: Arc<TaskRuntimeStore>,
     cancel: CancellationToken,
     layer_manager: Option<Arc<MemoryLayerManager>>,
+    memory_generation: Option<crate::evolution::ReviewGenerationLease>,
     trace_sink: Option<ExecSink>,
     prompt: String,
     plan_policy: RunPlanPolicy,
@@ -76,11 +78,15 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         store,
         cancel,
         layer_manager,
+        memory_generation,
         trace_sink,
         prompt,
         plan_policy,
-        receipt_owner,
+        mut receipt_owner,
     } = payload;
+    if let Some(generation) = memory_generation.as_ref() {
+        receipt_owner.retain(generation.clone());
+    }
     let settlement_store = store.clone();
     let settlement_run_id = run_id.clone();
     let settlement_cancel = cancel.clone();
@@ -107,6 +113,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
             store,
             cancel,
             layer_manager,
+            memory_generation,
             trace_sink,
             prompt,
             plan_policy,
@@ -131,10 +138,6 @@ async fn drive_run_async_inner(
     payload: RunExecutionPayload,
     pool_agent: crate::agent_handle::AgentHandle,
 ) -> Result<RunOutcome, String> {
-    let _cancel_registration = payload
-        .store
-        .register_run_cancellation(&payload.run_id, payload.cancel.clone())
-        .map_err(|error| format!("register run cancellation failed: {error}"))?;
     let drive_result = drive_agent_run(
         payload.store.clone(),
         pool_agent,
@@ -193,8 +196,9 @@ async fn drive_run_async_inner(
     };
     if let Some(event) = memory_event {
         crate::tasks::task_runtime::memory_bridge::write_memory_candidate_dispatch(
-            MemoryPolicy::Blocking,
+            MemoryPolicy::BestEffortSettled,
             payload.layer_manager.as_ref(),
+            payload.memory_generation.as_ref(),
             &payload.store,
             event,
         )

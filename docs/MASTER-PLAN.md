@@ -254,7 +254,13 @@ context is now a replaceable projection instead of a boot-only system-prompt
 suffix. Bootstrap, workspace switch/exit, Dreaming promotion, explicit hot
 memory mutation, and rule promotion refresh the primary Agent immediately;
 pooled Agents refresh too, and future pooled Agents inherit the current working
-directory. GUI, TUI, and CLI run the same Dreaming schedule.
+directory. GUI and TUI own and settle their Dreaming schedules today. TUI
+normal Chat still needs its foreground JoinHandle moved under the shared
+foreground owner, while standalone channel mode does not yet start Dreaming.
+Their foreground/channel follow-up branches must close those exact surface
+lifecycle gaps and await settlement before workspace transition teardown. The
+memory-generation branch deliberately does not add a second Dreaming owner
+while those surface lifecycles are being unified.
 
 EKO product writes use one `MemoryLayerManager` path and the unified
 `agent/memories` namespace. Raw Store tools and the optional cold tier remain

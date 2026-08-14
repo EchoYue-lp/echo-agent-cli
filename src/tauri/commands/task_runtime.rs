@@ -158,7 +158,8 @@ pub async fn list_recovery_blockers(
 }
 
 /// Resolve an indeterminate side effect after the user inspected the
-/// workspace. Supported decisions are `retry` and `skip`.
+/// workspace. Retry must use `retry_blocked_task` so driver admission,
+/// generation pinning, and blocker classification remain one transaction.
 #[tauri::command]
 pub async fn resolve_recovery_task(
     state: tauri::State<'_, TauriState>,
@@ -167,11 +168,10 @@ pub async fn resolve_recovery_task(
     decision: String,
 ) -> Result<(), IpcError> {
     let decision = match decision.as_str() {
-        "retry" => RecoveryDecision::Retry,
         "skip" => RecoveryDecision::Skip,
         _ => {
             return Err(IpcError::Validation(
-                "recovery decision must be 'retry' or 'skip'".to_string(),
+                "recovery decision must be 'skip'; use retry_blocked_task for retry".to_string(),
             ));
         }
     };
@@ -224,17 +224,7 @@ pub async fn resume_task_run(
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
     let primary_agent = state.app_state.connection.primary_agent();
-    let store_for_task = store.clone();
-    let primary_agent_for_task = primary_agent.clone();
-    let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
-    // (stage4 P4.1) cache_user_id read from single source by execute_run/review
-    // internally — only the reviewer_llm is needed here.
-    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
-    let layer_manager = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
+    let review_integration = state.app_state.review_integration.clone();
     let cancel = echo_agent::agent::CancellationToken::new();
     let supervisor_cancel = cancel.clone();
     let execution_projector = Arc::new(TauriExecutionProjector::new(
@@ -245,52 +235,69 @@ pub async fn resume_task_run(
     let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);
     });
-    let run_id_for_task = run_id.clone();
-
-    let driver = async move {
-        let _cancel_registration = store_for_task
-            .register_run_cancellation(&run_id_for_task, cancel.clone())
-            .map_err(|error| format!("register run cancellation: {error}"))?;
-        let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
-            store_for_task.clone(),
-            Some(primary_agent_for_task),
-            reviewer_llm,
-            layer_manager,
-            run_store_for_task,
-            Some(trace_sink),
-            &run_id_for_task,
-            cancel,
-            // GUI resume keeps the interactive asynchronous memory projection.
-            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
-        )
-        .await;
-        match outcome {
-            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
-                tracing::info!(run_id = %run_id_for_task, "resumed run completed");
-            }
-            Ok(other) => {
-                tracing::warn!(run_id = %run_id_for_task, ?other, "resumed run ended non-completed");
-            }
-            Err(e) => {
-                tracing::error!(run_id = %run_id_for_task, error = %e, "resumed run executor error");
-                return Err(e.to_string());
-            }
-        }
-        Ok(())
-    };
+    let validation_store = store.clone();
+    let validation_run_id = run_id.clone();
     let preparation_store = store.clone();
     let preparation_run_id = run_id.clone();
     store
         .spawn_supervised_run_driver(run_id.clone(), supervisor_cancel, move || {
-            if preparation_store.get_plan(&preparation_run_id)?.is_none() {
+            let memory_generation = review_integration
+                .as_ref()
+                .map(|integration| integration.lease_generation())
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "memory generation unavailable: {error}"
+                    ))
+                })?;
+            let layer_manager = memory_generation
+                .as_ref()
+                .map(|generation| Arc::new(generation.create_layer_manager()));
+            if validation_store.get_plan(&validation_run_id)?.is_none() {
                 return Err(
                     echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "run {preparation_run_id} has no persisted plan to resume"
+                        "run {validation_run_id} has no persisted plan to resume"
                     )),
                 );
             }
+            Ok((memory_generation, layer_manager))
+        }, move |(memory_generation, layer_manager)| {
             preparation_store.resume_task_run(&preparation_run_id)?;
-            Ok(((), driver))
+            Ok(((), move |mut receipt_owner: echo_agent_app_core::tasks::task_runtime::RunDriverReceiptOwner| async move {
+                if let Some(generation) = memory_generation.as_ref() {
+                    receipt_owner.retain(generation.clone());
+                }
+                let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
+                let reviewer_llm = primary_agent
+                    .read(|agent| agent.llm_client().cloned())
+                    .await;
+                let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
+                    preparation_store.clone(),
+                    Some(primary_agent),
+                    reviewer_llm,
+                    layer_manager,
+                    memory_generation,
+                    run_store,
+                    Some(trace_sink),
+                    &preparation_run_id,
+                    cancel,
+                    echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+                )
+                .await;
+                match outcome {
+                    Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                        tracing::info!(run_id = %preparation_run_id, "resumed run completed");
+                    }
+                    Ok(other) => {
+                        tracing::warn!(run_id = %preparation_run_id, ?other, "resumed run ended non-completed");
+                    }
+                    Err(error) => {
+                        tracing::error!(run_id = %preparation_run_id, %error, "resumed run executor error");
+                        return Err(error.to_string());
+                    }
+                }
+                Ok(())
+            }))
         })
         .map_err(internal)?;
     tracing::info!(run_id = %run_id, "task run resumed -> Running");
@@ -320,22 +327,11 @@ pub async fn retry_blocked_task(
     task_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
-    // Resume the run via the standard execute_run path (mirrors resume_task_run).
     let primary_agent = state.app_state.connection.primary_agent();
-    let store_for_task = store.clone();
-    let primary_agent_for_task = primary_agent.clone();
-    let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
-    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
-    let layer_manager = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
+    let review_integration = state.app_state.review_integration.clone();
     let cancel = echo_agent::agent::CancellationToken::new();
-    let supervisor_cancel = cancel.clone();
-    // Run was already transitioned to Running inside retry_blocked_task's
-    // atomic section. Skip resume_task_run here — it would re-attempt the
-    // Paused → Running transition and fail with IllegalTransition.
+    // The pinned retry facade selects recovery or acceptance and mutates the
+    // run only after exact driver registration has completed.
     let execution_projector = Arc::new(TauriExecutionProjector::new(
         app,
         state.app_state.storage.tool_executions.clone(),
@@ -344,63 +340,110 @@ pub async fn retry_blocked_task(
     let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);
     });
-    let run_id_for_task = run_id.clone();
-
-    let driver = async move {
-        let _cancel_registration = store_for_task
-            .register_run_cancellation(&run_id_for_task, cancel.clone())
-            .map_err(|error| format!("register run cancellation: {error}"))?;
-        let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
-            store_for_task.clone(),
-            Some(primary_agent_for_task),
-            reviewer_llm,
-            layer_manager,
-            run_store_for_task,
-            Some(trace_sink),
-            &run_id_for_task,
-            cancel,
-            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
-        )
-        .await;
-        match outcome {
-            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
-                tracing::info!(run_id = %run_id_for_task, "retried run completed");
-            }
-            Ok(other) => {
-                tracing::warn!(run_id = %run_id_for_task, ?other, "retried run ended non-completed");
-            }
-            Err(e) => {
-                tracing::error!(run_id = %run_id_for_task, error = %e, "retried run executor error");
-                return Err(e.to_string());
-            }
+    let preparation = spawn_tauri_task_retry(
+        store,
+        primary_agent,
+        review_integration,
+        trace_sink,
+        cancel,
+        run_id.clone(),
+        task_id.clone(),
+    )
+    .map_err(|error| match error {
+        echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(message) => {
+            IpcError::Validation(message)
         }
-        Ok(())
+        other => internal(other),
+    })?;
+    let (kind, next_attempt) = match preparation {
+        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Acceptance {
+            next_attempt,
+        } => ("retry_scheduled", Some(next_attempt)),
+        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Recovery => {
+            ("recovery_retry_recorded", None)
+        }
     };
-    let preparation_store = store.clone();
-    let preparation_run_id = run_id.clone();
-    let preparation_task_id = task_id.clone();
-    let (next_retry, _) = store
-        .spawn_supervised_run_driver(run_id.clone(), supervisor_cancel, move || {
-            // Single atomic per-run transaction: validate run/task and
-            // transition to Running while generation admission is held.
-            let next_retry =
-                preparation_store.retry_blocked_task(&preparation_run_id, &preparation_task_id)?;
-            Ok((next_retry, driver))
-        })
-        .map_err(|error| match error {
-            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(message) => {
-                IpcError::Validation(message)
-            }
-            other => internal(other),
-        })?;
-    tracing::info!(run_id = %run_id, task_id = %task_id, attempt = next_retry, "blocked task retried atomically -> run Running");
-
+    tracing::info!(run_id = %run_id, task_id = %task_id, ?preparation, "task retry prepared atomically");
     Ok(serde_json::json!({
-        "kind": "retry_scheduled",
+        "kind": kind,
         "run_id": run_id,
         "task_id": task_id,
-        "next_attempt": next_retry,
+        "next_attempt": next_attempt,
     }))
+}
+
+fn spawn_tauri_task_retry(
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    primary_agent: echo_agent_app_core::agent_handle::AgentHandle,
+    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink,
+    cancel: echo_agent::agent::CancellationToken,
+    run_id: String,
+    task_id: String,
+) -> Result<
+    echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation,
+    echo_agent_app_core::tasks::task_runtime::StoreError,
+> {
+    let driver_store = store.clone();
+    let driver_run_id = run_id.clone();
+    let supervisor_cancel = cancel.clone();
+    let (preparation, result_waiter) = store.spawn_supervised_task_retry(
+        run_id,
+        task_id,
+        supervisor_cancel,
+        move || {
+            let memory_generation = review_integration
+                .as_ref()
+                .map(|integration| integration.lease_generation())
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "memory generation unavailable: {error}"
+                    ))
+                })?;
+            let layer_manager = memory_generation
+                .as_ref()
+                .map(|generation| Arc::new(generation.create_layer_manager()));
+            Ok((memory_generation, layer_manager))
+        },
+        move |(memory_generation, layer_manager), mut receipt_owner| async move {
+            if let Some(generation) = memory_generation.as_ref() {
+                receipt_owner.retain(generation.clone());
+            }
+            let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
+            let reviewer_llm = primary_agent
+                .read(|agent| agent.llm_client().cloned())
+                .await;
+            let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
+                driver_store.clone(),
+                Some(primary_agent),
+                reviewer_llm,
+                layer_manager,
+                memory_generation,
+                run_store,
+                Some(trace_sink),
+                &driver_run_id,
+                cancel,
+                echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+            )
+            .await;
+            match outcome {
+                Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                    tracing::info!(run_id = %driver_run_id, "retried run completed");
+                }
+                Ok(other) => {
+                    tracing::warn!(run_id = %driver_run_id, ?other, "retried run ended non-completed");
+                }
+                Err(error) => {
+                    tracing::error!(run_id = %driver_run_id, %error, "retried run executor error");
+                    return Err(error.to_string());
+                }
+            }
+            Ok(())
+        },
+    )?;
+    drop(result_waiter);
+    Ok(preparation)
 }
 
 /// Atomically update tasks and their relations against an expected revision.
@@ -494,4 +537,265 @@ pub async fn get_progress_ledger(
     let base = std::env::current_dir().ok();
     echo_agent_app_core::tasks::task_runtime::write_progress(&store, &run_id, base.as_deref())
         .map_err(internal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use echo_agent::error::Result as ReactResult;
+    use echo_agent::llm::types::{ChatCompletionResponse, DeltaMessage, Message};
+    use echo_agent::llm::{ChatChunk, ChatRequest, ChatResponse, LlmClient};
+    use futures::future::BoxFuture;
+    use futures::stream::{self, BoxStream};
+
+    struct TestLlmClient;
+
+    impl LlmClient for TestLlmClient {
+        fn chat(&self, _request: ChatRequest) -> BoxFuture<'_, ReactResult<ChatResponse>> {
+            Box::pin(async {
+                Ok(ChatResponse {
+                    message: Message::assistant("done".to_string()),
+                    finish_reason: Some("stop".to_string()),
+                    usage: None,
+                    raw: ChatCompletionResponse::default(),
+                })
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            _request: ChatRequest,
+        ) -> BoxFuture<'_, ReactResult<BoxStream<'static, ReactResult<ChatChunk>>>> {
+            Box::pin(async {
+                let chunks = vec![
+                    Ok(ChatChunk {
+                        delta: DeltaMessage {
+                            content: Some("done".to_string()),
+                            ..DeltaMessage::default()
+                        },
+                        finish_reason: None,
+                        usage: None,
+                    }),
+                    Ok(ChatChunk {
+                        delta: DeltaMessage::default(),
+                        finish_reason: Some("stop".to_string()),
+                        usage: None,
+                    }),
+                ];
+                Ok(Box::pin(stream::iter(chunks)) as BoxStream<'static, ReactResult<ChatChunk>>)
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn test_agent() -> Result<echo_agent_app_core::agent_handle::AgentHandle, String> {
+        echo_agent::agent::ReactAgentBuilder::new()
+            .model("test")
+            .llm_client(Arc::new(TestLlmClient))
+            .build()
+            .map(echo_agent_app_core::agent_handle::AgentHandle::new)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn prepare_retry_run(
+        store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+        run_id: &str,
+        task_id: &str,
+        recovery: bool,
+    ) -> Result<(), String> {
+        store
+            .create_run(
+                run_id,
+                "default",
+                "tauri:test",
+                "",
+                DomainProfile::General,
+                "retry from GUI",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        echo_agent_app_core::tasks::task_runtime::commit_eko_task_plan(
+            store.clone(),
+            TaskPlan {
+                plan_id: format!("{run_id}-plan"),
+                run_id: run_id.to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal: "retry from GUI".to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: task_id.to_string(),
+                    title: "Retry task".to_string(),
+                    max_retries: 2,
+                    ..PlanTask::default()
+                }],
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let (task_status, summary, run_status) = if recovery {
+            (
+                TodoStatus::Blocked,
+                "mutating side effect is indeterminate after restart",
+                TaskRunStatus::Paused,
+            )
+        } else {
+            (
+                TodoStatus::Failed,
+                "acceptance failed",
+                TaskRunStatus::Failed,
+            )
+        };
+        store
+            .set_task_status(run_id, task_id, task_status, None, Some(summary))
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, run_status)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    type RetryRuntimeSnapshot = (TaskRunStatus, Option<(TodoStatus, u32)>, usize);
+
+    fn snapshot(
+        store: &echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<RetryRuntimeSnapshot, String> {
+        let run = store
+            .get_run(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("run missing: {run_id}"))?;
+        let task = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|plan| {
+                plan.tasks
+                    .first()
+                    .map(|task| (task.status, task.retry_count))
+            });
+        let event_count = store
+            .list_events(run_id, 0)
+            .map_err(|error| error.to_string())?
+            .len();
+        Ok((run.status, task, event_count))
+    }
+
+    fn trace_sink() -> echo_agent_app_core::tasks::task_runtime::ExecSink {
+        Arc::new(|_| {})
+    }
+
+    #[tokio::test]
+    async fn gui_retry_selects_acceptance_and_recovery_with_one_pinned_facade() -> Result<(), String>
+    {
+        for (run_id, recovery, expected) in [
+            (
+                "gui-acceptance",
+                false,
+                echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Acceptance {
+                    next_attempt: 1,
+                },
+            ),
+            (
+                "gui-recovery",
+                true,
+                echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Recovery,
+            ),
+        ] {
+            let store = Arc::new(
+                echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                    .map_err(|error| error.to_string())?,
+            );
+            prepare_retry_run(store.clone(), run_id, "retry-task", recovery).await?;
+            let preparation = spawn_tauri_task_retry(
+                store.clone(),
+                test_agent()?,
+                None,
+                trace_sink(),
+                echo_agent::agent::CancellationToken::new(),
+                run_id.to_string(),
+                "retry-task".to_string(),
+            )
+            .map_err(|error| error.to_string())?;
+            assert_eq!(preparation, expected);
+            store
+                .shutdown_run_drivers()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn gui_recovery_retry_closed_admission_does_not_mutate_runtime() -> Result<(), String> {
+        let store = Arc::new(
+            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        prepare_retry_run(store.clone(), "gui-closed", "retry-task", true).await?;
+        let before = snapshot(&store, "gui-closed")?;
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = spawn_tauri_task_retry(
+            store.clone(),
+            test_agent()?,
+            None,
+            trace_sink(),
+            echo_agent::agent::CancellationToken::new(),
+            "gui-closed".to_string(),
+            "retry-task".to_string(),
+        );
+        assert!(result.is_err());
+        assert_eq!(before, snapshot(&store, "gui-closed")?);
+        Ok(())
+    }
+
+    #[test]
+    fn gui_retry_registration_infrastructure_failure_does_not_mutate_runtime() -> Result<(), String>
+    {
+        let store = Arc::new(
+            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?;
+        runtime.block_on(prepare_retry_run(
+            store.clone(),
+            "gui-registration",
+            "retry-task",
+            false,
+        ))?;
+        drop(runtime);
+        let before = snapshot(&store, "gui-registration")?;
+        let error = spawn_tauri_task_retry(
+            store.clone(),
+            test_agent()?,
+            None,
+            trace_sink(),
+            echo_agent::agent::CancellationToken::new(),
+            "gui-registration".to_string(),
+            "retry-task".to_string(),
+        )
+        .err()
+        .ok_or_else(|| "GUI retry registration unexpectedly succeeded".to_string())?;
+        assert!(
+            error
+                .to_string()
+                .contains("requires an active Tokio runtime")
+        );
+        assert_eq!(before, snapshot(&store, "gui-registration")?);
+        Ok(())
+    }
 }

@@ -242,7 +242,7 @@ pub async fn drive_chat(
 ) -> Result<TurnOutcome, String> {
     // Scope a per-turn run_id so task tools (task_create /
     // task_execute / create_complex_task) can read it via require_run_id().
-    // Use root_message_id (unique per turn, set by all 3 callers); fall back to
+    // Use root_message_id (unique per turn, set by all callers); fall back to
     // a fresh uuid if a caller forgot to set it (defensive, never panics).
     let turn_id = if res.root_message_id.trim().is_empty() {
         tracing::warn!("drive_chat: root_message_id empty — using fallback uuid as turn_id");
@@ -250,20 +250,99 @@ pub async fn drive_chat(
     } else {
         res.root_message_id.clone()
     };
-
+    let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+    // Every turn that can reach task_create/task_execute is registered before
+    // memory admission. Task mode requires a run; Chat/Auto permit an ordinary
+    // run-less turn but supervise any lazily-created TaskRun with this token.
+    let mut task_driver_registration = match res.store.as_ref() {
+        Some(store) => {
+            let admission = store
+                .reserve_run_driver_admission(formal_run_id.clone(), res.cancel.clone())
+                .map_err(|error| format!("chat driver admission failed: {error}"))?;
+            let generation = store
+                .lease_active_workspace_generation()
+                .map_err(|error| format!("task runtime generation admission failed: {error}"))?;
+            let registration =
+                if res.interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
+                    store.register_run_driver::<TurnOutcome>(admission, generation)
+                } else {
+                    store.register_optional_run_driver::<TurnOutcome>(admission, generation)
+                }
+                .map_err(|error| format!("chat driver registration failed: {error}"))?;
+            Some(registration)
+        }
+        None if res.interaction_mode == crate::tasks::task_runtime::InteractionMode::Task => {
+            return Err("Task mode requires TaskRuntimeStore".to_string());
+        }
+        None => None,
+    };
+    let memory_generation = match resolve_turn_memory_generation(&res) {
+        Ok(generation) => generation,
+        Err(error) => {
+            let message = format!("chat memory generation unavailable: {error}");
+            let failure =
+                echo_agent::error::AgentFailure::message("memory_generation", message.clone());
+            match EventIdentity::for_chat(
+                res.conv_id.clone(),
+                turn_id.clone(),
+                turn_id.clone(),
+                None,
+            )
+            .and_then(|identity| {
+                EventEnvelope::new(
+                    &identity,
+                    1,
+                    None,
+                    AgentEvent::Error {
+                        source: "memory_generation".to_string(),
+                        message: message.clone(),
+                        failure: failure.clone(),
+                    },
+                )
+            }) {
+                Ok(event) => {
+                    let _delivered = res.sink.on_event(ChatDriverEvent::Agent(Box::new(event)));
+                }
+                Err(envelope_error) => {
+                    tracing::error!(%envelope_error, "failed to report memory admission failure");
+                }
+            }
+            return Ok(TurnOutcome::Failed(failure));
+        }
+    };
+    let layer_manager = memory_generation
+        .as_ref()
+        .map(|lease| std::sync::Arc::new(lease.create_layer_manager()))
+        .or_else(|| res.layer_manager.clone());
+    let res = std::sync::Arc::new(crate::chat_resources::ChatResources {
+        pool: res.pool.clone(),
+        store: res.store.clone(),
+        sink: res.sink.clone(),
+        webhook_emitter: res.webhook_emitter.clone(),
+        conv_id: res.conv_id.clone(),
+        root_message_id: res.root_message_id.clone(),
+        attachments: res.attachments.clone(),
+        cancel: res.cancel.clone(),
+        mode_hint: res.mode_hint.clone(),
+        interaction_mode: res.interaction_mode,
+        review_integration: res.review_integration.clone(),
+        layer_manager,
+        memory_generation,
+    });
     let cancel = res.cancel.clone();
-    let turn_cancel = cancel.clone();
     let sink = res.sink.clone();
     let trace_sink = subagent_trace_sink_for(&sink);
-    let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
     let interaction_mode = res.interaction_mode;
     let store = res.store.clone();
     if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
+        if let Some(registration) = task_driver_registration.as_mut() {
+            registration.mark_preparation_started();
+        }
         // The turn's instruction is the goal (mode_hint already folded in; for
         // spilled long text it is the reference block, which is a better task
         // goal than the full paste). Attachments still come from ChatResources
         // so the TaskRun/subagent propagation chain is unchanged.
-        ensure_task_mode_run(
+        if let Err(error) = ensure_task_mode_run(
             store.as_ref(),
             &formal_run_id,
             res.conv_id.as_deref(),
@@ -271,42 +350,74 @@ pub async fn drive_chat(
             &turn.instruction,
             &res.attachments,
             Some(&trace_sink),
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    let _cancel_registration =
-        if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
-            match store.as_ref() {
-                Some(store) => Some(
-                    store
-                        .register_run_cancellation(&formal_run_id, cancel.clone())
-                        .map_err(|error| error.to_string())?,
-                ),
-                None => None,
+        ) {
+            if let Some(registration) = task_driver_registration.take() {
+                registration.fail_preparation(error.clone());
             }
-        } else {
-            None
-        };
-    let turn_id_for_inner = turn_id.clone();
-    let _projection_registration = res.store.as_ref().map(|store| {
-        crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
-            .register(formal_run_id.clone(), std::sync::Arc::clone(store))
-    });
-    let result = crate::tasks::task_runtime::task_tools::with_run_context(
-        formal_run_id.clone(),
-        cancel,
-        Some(trace_sink.clone()),
-        drive_chat_inner(agent, turn, res, turn_id_for_inner),
-    )
-    .await;
-    if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
-        finalize_task_mode_run(
-            store.as_ref(),
-            &formal_run_id,
-            turn_cancel.is_cancelled(),
-            Some(&trace_sink),
-        );
+            return Err(error);
+        }
     }
+    let result = if let Some(registration) = task_driver_registration.take() {
+        let driver_store = store
+            .as_ref()
+            .ok_or_else(|| "chat driver registration lost TaskRuntimeStore".to_string())?
+            .clone();
+        let owned_agent = agent.clone();
+        let owned_turn = turn.clone();
+        let owned_resources = res.clone();
+        let owned_run_id = formal_run_id.clone();
+        let owned_turn_id = turn_id.clone();
+        let owned_cancel = cancel.clone();
+        let owned_trace_sink = trace_sink.clone();
+        let waiter = registration.start(move |receipt_owner| async move {
+            let driver_execution_context = receipt_owner.execution_context_id();
+            let mut receipt_owner = receipt_owner;
+            if let Some(generation) = owned_resources.memory_generation.as_ref() {
+                receipt_owner.retain(generation.clone());
+            }
+            let _projection_registration =
+                crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+                    .register(owned_run_id.clone(), driver_store.clone());
+            let result = crate::tasks::task_runtime::task_tools::with_run_context(
+                owned_run_id.clone(),
+                owned_cancel.clone(),
+                Some(owned_trace_sink.clone()),
+                drive_chat_inner(
+                    &owned_agent,
+                    &owned_turn,
+                    owned_resources,
+                    owned_turn_id,
+                    Some(driver_execution_context),
+                ),
+            )
+            .await;
+            if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
+                finalize_task_mode_run(
+                    Some(&driver_store),
+                    &owned_run_id,
+                    owned_cancel.is_cancelled(),
+                    Some(&owned_trace_sink),
+                );
+            }
+            result
+        });
+        waiter
+            .await
+            .map_err(|error| format!("chat driver result waiter failed: {error}"))?
+    } else {
+        let turn_id_for_inner = turn_id.clone();
+        let _projection_registration = res.store.as_ref().map(|store| {
+            crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+                .register(formal_run_id.clone(), std::sync::Arc::clone(store))
+        });
+        crate::tasks::task_runtime::task_tools::with_run_context(
+            formal_run_id.clone(),
+            cancel,
+            Some(trace_sink.clone()),
+            drive_chat_inner(agent, turn, res, turn_id_for_inner, None),
+        )
+        .await
+    };
     let requested_mode = interaction_mode.as_str();
     let observed_path =
         observe_execution_path(store.as_ref(), &formal_run_id, &turn_id, requested_mode);
@@ -321,6 +432,20 @@ pub async fn drive_chat(
         "chat execution path observed"
     );
     result
+}
+
+fn resolve_turn_memory_generation(
+    resources: &crate::chat_resources::ChatResources,
+) -> Result<Option<crate::evolution::ReviewGenerationLease>, crate::evolution::ReviewGenerationError>
+{
+    if let Some(generation) = resources.memory_generation.clone() {
+        return Ok(Some(generation));
+    }
+    resources
+        .review_integration
+        .as_ref()
+        .map(|integration| integration.lease_generation())
+        .transpose()
 }
 
 fn ensure_task_mode_run(
@@ -463,6 +588,7 @@ async fn drive_chat_inner(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     turn_id: String,
+    driver_execution_context: Option<String>,
 ) -> Result<TurnOutcome, String> {
     // Single authoritative merge: the turn already folded the mode hint into its
     // instruction (and spilled long text to an artifact reference). `to_message`
@@ -532,7 +658,7 @@ async fn drive_chat_inner(
                 // scope from turn_id and create it only when invoked.
                 run_id: active_run_id,
                 turn_id: Some(turn_id.clone()),
-                execution_id: None,
+                execution_id: driver_execution_context,
                 isolation_id: None,
                 message_id: Some(turn_id),
                 cancel: Some(std::sync::Arc::new(cancel.clone())),
@@ -808,6 +934,86 @@ mod tests {
         }
     }
 
+    #[test]
+    fn pinned_memory_generation_precedes_live_rebind_admission() -> Result<(), String> {
+        use echo_agent::evolution::ReviewConfig;
+        use echo_agent::memory::{InMemoryStore, Store};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let pinned_root = temp.path().join("pinned/.eko");
+        let pinned_integration = crate::evolution::ReviewIntegration::new(
+            ReviewConfig::default(),
+            pinned_root.clone(),
+            std::sync::Arc::new(InMemoryStore::new()) as std::sync::Arc<dyn Store>,
+        );
+        let pinned = pinned_integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+
+        let live_integration = std::sync::Arc::new(crate::evolution::ReviewIntegration::new(
+            ReviewConfig::default(),
+            temp.path().join("live/.eko"),
+            std::sync::Arc::new(InMemoryStore::new()) as std::sync::Arc<dyn Store>,
+        ));
+        let _rebind = live_integration
+            .prepare_rebind(
+                temp.path().join("next/.eko"),
+                std::sync::Arc::new(InMemoryStore::new()) as std::sync::Arc<dyn Store>,
+            )
+            .map_err(|error| error.to_string())?;
+        let resources = crate::chat_resources::ChatResources {
+            pool: None,
+            store: None,
+            sink: std::sync::Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("pinned-memory-conversation".to_string()),
+            root_message_id: "pinned-memory-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            mode_hint: None,
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: Some(live_integration),
+            layer_manager: None,
+            memory_generation: Some(pinned),
+        };
+
+        let resolved = resolve_turn_memory_generation(&resources)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "pinned memory generation was discarded".to_string())?;
+        assert_eq!(resolved.echo_agent_dir(), pinned_root);
+        Ok(())
+    }
+
+    struct TaskExecuteReceiptBarrierSink {
+        reached: std::sync::mpsc::SyncSender<()>,
+        release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        parked: std::sync::atomic::AtomicBool,
+    }
+
+    impl ChatSink for TaskExecuteReceiptBarrierSink {
+        fn on_event(&self, event: ChatDriverEvent) -> bool {
+            let should_park = matches!(
+                event,
+                ChatDriverEvent::Agent(ref envelope)
+                    if matches!(
+                        &envelope.payload,
+                        AgentEvent::ToolResult { name, .. } if name == "task_execute"
+                    )
+            ) && !self.parked.swap(true, std::sync::atomic::Ordering::SeqCst);
+            if !should_park {
+                return true;
+            }
+            if self.reached.send(()).is_err() {
+                return false;
+            }
+            self.release
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok()
+        }
+    }
+
     #[tokio::test]
     async fn task_mode_creates_formal_run_and_rejects_direct_fallback() -> Result<(), String> {
         use echo_agent::agent::CancellationToken;
@@ -845,7 +1051,9 @@ mod tests {
                     .to_string(),
             ),
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Task,
+            review_integration: None,
             layer_manager: None,
+            memory_generation: None,
         });
 
         drive_chat(
@@ -885,6 +1093,364 @@ mod tests {
         Ok(())
     }
 
+    async fn drive_scripted_task_graph(
+        mode: crate::tasks::task_runtime::InteractionMode,
+        turn_id: &str,
+    ) -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use echo_agent::agent::subagent::SubagentDefinition;
+        use std::sync::Arc;
+
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("task-path")
+                .then_tool_call(
+                    "create-plan",
+                    "task_create",
+                    serde_json::json!({
+                        "tasks": [{
+                            "id": "inspect",
+                            "title": "Inspect runtime",
+                            "description": "Inspect the runtime and report evidence",
+                            "kind": "read_only_review",
+                            "subagent": "explorer"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .then_tool_call("execute-plan", "task_execute", r#"{"revision":1}"#)
+                .with_response("task graph finished"),
+        );
+        let mut react_agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("task-path")
+            .llm_client(llm.clone())
+            .build()
+            .map_err(|error| error.to_string())?;
+        react_agent.register_subagent_with_definition(
+            SubagentDefinition::new("explorer", "Inspect runtime evidence"),
+            Box::new(echo_agent::testing::MockAgent::new("explorer").with_response("inspected")),
+        );
+        let agent = AgentHandle::new(react_agent);
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        crate::tasks::task_runtime::register_task_tools_on_agent(&agent, store.clone()).await;
+        let sink: Arc<dyn ChatSink> = Arc::new(MockChatSink::default());
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            pool: None,
+            store: Some(store.clone()),
+            sink,
+            webhook_emitter: None,
+            conv_id: Some(format!("{turn_id}-conversation")),
+            root_message_id: turn_id.to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            mode_hint: None,
+            interaction_mode: mode,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+        });
+        let outcome = drive_chat(&agent, &make_turn("run the task graph", None), resources).await?;
+        if outcome != TurnOutcome::Completed {
+            return Err(format!("task graph turn ended {outcome:?}"));
+        }
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| {
+                let observed_runs = store
+                    .list_runs_in(&[
+                        crate::tasks::task_runtime::TaskRunStatus::Pending,
+                        crate::tasks::task_runtime::TaskRunStatus::Running,
+                        crate::tasks::task_runtime::TaskRunStatus::Paused,
+                        crate::tasks::task_runtime::TaskRunStatus::Cancelled,
+                        crate::tasks::task_runtime::TaskRunStatus::Failed,
+                        crate::tasks::task_runtime::TaskRunStatus::Completed,
+                    ])
+                    .map(|runs| {
+                        runs.into_iter()
+                            .map(|run| run.run_id)
+                            .collect::<Vec<_>>()
+                    });
+                format!(
+                    "{mode:?} task_create did not create TaskRun {run_id} after {} LLM calls; observed runs: {observed_runs:?}; last request: {:?}",
+                    llm.call_count(),
+                    llm.last_messages()
+                )
+            })?;
+        assert_eq!(run.run_id, run_id);
+        if !matches!(
+            run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Completed
+                | crate::tasks::task_runtime::TaskRunStatus::Failed
+                | crate::tasks::task_runtime::TaskRunStatus::Paused
+                | crate::tasks::task_runtime::TaskRunStatus::Cancelled
+        ) {
+            return Err(format!("{mode:?} task_execute left run {:?}", run.status));
+        }
+        let plan = store
+            .get_plan(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("{mode:?} task_create did not persist a plan"))?;
+        assert_eq!(plan.run_id, run_id);
+        assert_eq!(plan.tasks.len(), 1);
+        let task_status = plan.tasks.first().map(|task| task.status);
+        assert_ne!(
+            task_status,
+            Some(crate::tasks::task_runtime::TodoStatus::Pending),
+            "{mode:?} task_execute must advance the task created under outer run {run_id}"
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(store.active_run_driver_count()?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_task_create_and_execute_use_the_canonical_turn_driver() -> Result<(), String> {
+        drive_scripted_task_graph(
+            crate::tasks::task_runtime::InteractionMode::Chat,
+            "chat-task-graph",
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn auto_task_create_and_execute_use_the_canonical_turn_driver() -> Result<(), String> {
+        drive_scripted_task_graph(
+            crate::tasks::task_runtime::InteractionMode::Auto,
+            "auto-task-graph",
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawned_task_execute_retains_pool_receipt_until_outer_driver_settles()
+    -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use echo_agent::agent::subagent::SubagentDefinition;
+        use std::sync::Arc;
+
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("task-pool-path")
+                .then_tool_call(
+                    "create-plan",
+                    "task_create",
+                    serde_json::json!({
+                        "tasks": [{
+                            "id": "inspect",
+                            "title": "Inspect pooled runtime",
+                            "description": "Inspect the pooled runtime",
+                            "kind": "read_only_review",
+                            "subagent": "explorer"
+                        }]
+                    })
+                    .to_string(),
+                )
+                .then_tool_call("execute-plan", "task_execute", r#"{"revision":1}"#)
+                .with_response("pooled task graph finished"),
+        );
+        let mut react_agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("task-pool-path")
+            .llm_client(llm.clone())
+            .build()
+            .map_err(|error| error.to_string())?;
+        react_agent.register_subagent_with_definition(
+            SubagentDefinition::new("explorer", "Inspect pooled runtime evidence"),
+            Box::new(echo_agent::testing::MockAgent::new("explorer").with_response("inspected")),
+        );
+        let primary_agent = AgentHandle::new(react_agent);
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        crate::tasks::task_runtime::register_task_tools_on_agent(&primary_agent, store.clone())
+            .await;
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(primary_agent.clone(), None, None, 3, false)
+                .await,
+        );
+        crate::tasks::task_runtime::bind_task_execute_to_pool(&primary_agent, store.clone(), &pool)
+            .await;
+        let foreground_execution = pool
+            .acquire("pool-conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let pooled_agent = foreground_execution.agent();
+        pooled_agent
+            .write(|agent| {
+                agent.register_subagent_with_definition(
+                    SubagentDefinition::new("explorer", "Inspect pooled runtime evidence"),
+                    Box::new(
+                        echo_agent::testing::MockAgent::new("explorer")
+                            .with_response("pooled inspection completed"),
+                    ),
+                );
+            })
+            .await;
+        let pooled_tools = pooled_agent.read(|agent| agent.tool_names()).await;
+        for required in ["task_create", "task_execute"] {
+            assert!(
+                pooled_tools.iter().any(|tool| tool == required),
+                "pooled agent is missing required tool {required}"
+            );
+        }
+
+        let (reached_tx, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let sink: Arc<dyn ChatSink> = Arc::new(TaskExecuteReceiptBarrierSink {
+            reached: reached_tx,
+            release: std::sync::Mutex::new(release_rx),
+            parked: std::sync::atomic::AtomicBool::new(false),
+        });
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            pool: Some(pool.clone()),
+            store: Some(store.clone()),
+            sink,
+            webhook_emitter: None,
+            conv_id: Some("pool-conversation".to_string()),
+            root_message_id: "pool-task-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            mode_hint: None,
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+        });
+        let drive = tokio::spawn(async move {
+            drive_chat(
+                &pooled_agent,
+                &make_turn("run the pooled task graph", None),
+                resources,
+            )
+            .await
+        });
+        let barrier_result = tokio::task::spawn_blocking(move || {
+            reached_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| format!("task_execute result barrier was not reached: {error}"))
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+        if let Err(error) = barrier_result {
+            let early_outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+                .await
+                .map_err(|_| {
+                    "pooled chat driver did not settle after closing the barrier".to_string()
+                })?
+                .map_err(|error| error.to_string())?;
+            return Err(format!(
+                "{error}; outer driver settled as {early_outcome:?} after {} LLM calls",
+                llm.call_count()
+            ));
+        }
+        assert_eq!(
+            store.active_run_driver_receipt_count()?,
+            1,
+            "the framework-spawned task_execute pool receipt must belong to the outer driver"
+        );
+        release_tx
+            .send(())
+            .map_err(|_| "task_execute result barrier receiver closed".to_string())?;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), drive)
+            .await
+            .map_err(|_| "pooled chat driver did not settle".to_string())?
+            .map_err(|error| error.to_string())??;
+        assert_eq!(outcome, TurnOutcome::Completed);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(foreground_execution);
+        tokio::time::timeout(std::time::Duration::from_secs(5), pool.shutdown())
+            .await
+            .map_err(|_| "pool shutdown timed out after outer settlement".to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chat_and_auto_admission_rejection_leave_taskruntime_unmodified() -> Result<(), String>
+    {
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+
+        for (mode, workspace_transition) in [
+            (crate::tasks::task_runtime::InteractionMode::Chat, false),
+            (crate::tasks::task_runtime::InteractionMode::Auto, true),
+        ] {
+            let store = Arc::new(
+                crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                    .map_err(|error| error.to_string())?,
+            );
+            let workspace_transition_guard = if workspace_transition {
+                Some(
+                    store
+                        .begin_workspace_transition()
+                        .await
+                        .map_err(|error| error.to_string())?,
+                )
+            } else {
+                store
+                    .shutdown_run_drivers()
+                    .await
+                    .map_err(|error| error.to_string())?;
+                None
+            };
+            let agent = AgentHandle::new(
+                echo_agent::agent::ReactAgentBuilder::new()
+                    .llm_client(Arc::new(
+                        echo_agent::testing::MockLlmClient::new().with_response("unused"),
+                    ))
+                    .build()
+                    .map_err(|error| error.to_string())?,
+            );
+            let turn_id = format!("{}-rejected", mode.as_str());
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                pool: None,
+                store: Some(store.clone()),
+                sink: Arc::new(MockChatSink::default()),
+                webhook_emitter: None,
+                conv_id: None,
+                root_message_id: turn_id.clone(),
+                attachments: Vec::new(),
+                cancel: CancellationToken::new(),
+                mode_hint: None,
+                interaction_mode: mode,
+                review_integration: None,
+                layer_manager: None,
+                memory_generation: None,
+            });
+            assert!(
+                drive_chat(&agent, &make_turn("must not execute", None), resources)
+                    .await
+                    .is_err()
+            );
+            drop(workspace_transition_guard);
+            let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+            assert!(
+                store
+                    .get_run(&run_id)
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            );
+            assert!(
+                store
+                    .get_plan(&run_id)
+                    .map_err(|error| error.to_string())?
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn drive_chat_streams_agent_events_via_sink() {
         use echo_agent::agent::CancellationToken;
@@ -919,7 +1485,9 @@ mod tests {
             cancel,
             mode_hint: None,
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: None,
             layer_manager: None,
+            memory_generation: None,
         });
         let outcome = drive_chat(&agent, &make_turn("hi", None), res)
             .await
@@ -946,6 +1514,12 @@ mod tests {
             !chat_sink.has_run_identity(),
             "ordinary Auto chat events must not claim a nonexistent TaskRun"
         );
+        let shutdown_result = store.shutdown_run_drivers().await;
+        assert!(
+            shutdown_result.is_ok(),
+            "optional no-run driver should settle normally: {shutdown_result:?}"
+        );
+        assert_eq!(store.active_run_driver_count().unwrap_or_default(), 0);
     }
 
     #[tokio::test]
@@ -988,7 +1562,9 @@ mod tests {
             cancel: CancellationToken::new(),
             mode_hint: None,
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: None,
             layer_manager: None,
+            memory_generation: None,
         });
 
         let outcome = drive_chat(&agent, &make_turn("start", None), resources).await?;
@@ -1091,10 +1667,33 @@ mod tests {
             cancel: CancellationToken::new(),
             mode_hint: None,
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: None,
             layer_manager: None,
+            memory_generation: None,
         });
 
-        drive_chat(&agent, &make_turn("continue", None), res).await?;
+        let driver_error = drive_chat(&agent, &make_turn("continue", None), res)
+            .await
+            .err()
+            .ok_or_else(|| {
+                "projection fixture left a Pending TaskRun but the driver reported success"
+                    .to_string()
+            })?;
+        if !driver_error.contains("non-terminal status pending") {
+            return Err(format!(
+                "projection fixture returned an unexpected driver error: {driver_error}"
+            ));
+        }
+        let settled_run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "projection fixture run disappeared during settlement".to_string())?;
+        if settled_run.status != crate::tasks::task_runtime::TaskRunStatus::Failed {
+            return Err(format!(
+                "projection fixture did not durably fail its abandoned run: {:?}",
+                settled_run.status
+            ));
+        }
 
         let messages = mock
             .last_messages()
@@ -1154,7 +1753,9 @@ mod tests {
             cancel,
             mode_hint: Some("Chat — do not spawn tasks".to_string()),
             interaction_mode: crate::tasks::task_runtime::InteractionMode::Chat,
+            review_integration: None,
             layer_manager: None,
+            memory_generation: None,
         });
         let turn = make_turn("hi there", Some("Chat — do not spawn tasks"));
         drive_chat(&agent, &turn, res)
@@ -1232,7 +1833,9 @@ mod tests {
                 cancel: CancellationToken::new(),
                 mode_hint: None,
                 interaction_mode,
+                review_integration: None,
                 layer_manager: None,
+                memory_generation: None,
             });
             drive_chat(&agent, &make_turn("run", None), resources).await?;
         }

@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({
   pauseRun: vi.fn(),
   resumeRun: vi.fn(),
+  retryBlockedTask: vi.fn(),
   resolveRecoveryTask: vi.fn(),
   updateTasks: vi.fn(),
   latestRunForConversation: vi.fn(),
@@ -59,6 +60,7 @@ describe('taskRuntimeStore recovery controls', () => {
     vi.clearAllMocks();
     mocks.pauseRun.mockResolvedValue({ success: true, run_id: 'run-1' });
     mocks.resumeRun.mockResolvedValue({ kind: 'resumed', run_id: 'run-1' });
+    mocks.retryBlockedTask.mockResolvedValue({ kind: 'recovery_retry_recorded' });
     mocks.resolveRecoveryTask.mockResolvedValue(undefined);
     mocks.updateTasks.mockResolvedValue({ run_id: 'run-1', revision: 4 });
     useTaskRuntimeStore.getState().reset();
@@ -89,11 +91,28 @@ describe('taskRuntimeStore recovery controls', () => {
     expect(refresh).not.toHaveBeenCalled();
   });
 
-  it('records retry or skip decisions before refreshing', async () => {
-    await useTaskRuntimeStore.getState().resolveRecoveryTask('task-1', 'retry');
+  it('routes recovery retry through the supervised retry facade', async () => {
+    await useTaskRuntimeStore.getState().retryBlockedTask('task-1');
 
-    expect(mocks.resolveRecoveryTask).toHaveBeenCalledWith('run-1', 'task-1', 'retry');
+    expect(mocks.retryBlockedTask).toHaveBeenCalledWith('run-1', 'task-1');
+    expect(mocks.resolveRecoveryTask).not.toHaveBeenCalled();
     expect(refresh).toHaveBeenCalledWith('run-1');
+  });
+
+  it('keeps skip as an explicit recovery decision', async () => {
+    await useTaskRuntimeStore.getState().resolveRecoveryTask('task-1', 'skip');
+
+    expect(mocks.resolveRecoveryTask).toHaveBeenCalledWith('run-1', 'task-1', 'skip');
+    expect(refresh).toHaveBeenCalledWith('run-1');
+  });
+
+  it('surfaces rejected supervised recovery retry without refreshing', async () => {
+    mocks.retryBlockedTask.mockRejectedValueOnce(new Error('TaskRuntime admission is closed'));
+
+    await useTaskRuntimeStore.getState().retryBlockedTask('task-1');
+
+    expect(useTaskRuntimeStore.getState().error).toBe('TaskRuntime admission is closed');
+    expect(refresh).not.toHaveBeenCalled();
   });
 
   it('updates a task through one revisioned plan patch', async () => {

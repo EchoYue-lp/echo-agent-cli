@@ -535,6 +535,25 @@ impl WorkspaceTransitionReceipt {
     }
 }
 
+fn memory_rebind_degradation(
+    target_root: std::path::PathBuf,
+    receipt: &crate::evolution::MemoryRebindReceipt,
+) -> WorkspaceSubsystemTransition {
+    let detail = receipt
+        .delivery_error
+        .clone()
+        .unwrap_or_else(|| "old-root trigger delivery remains pending".to_string());
+    WorkspaceSubsystemTransition {
+        subsystem: "memory_evolution".to_string(),
+        target_root,
+        stale_roots: receipt.pending_roots.clone(),
+        error: format!(
+            "{detail}; {} trigger(s) remain owned for retry",
+            receipt.pending_old
+        ),
+    }
+}
+
 enum WorkspaceTransitionRequest {
     Switch(Workspace),
     Exit,
@@ -864,6 +883,7 @@ impl AppState {
             // CronTaskCompleted on the same endpoint set as chat. `emit`
             // cheaply no-ops when no endpoints are registered.
             Some(self.webhook.emitter.clone()),
+            self.review_integration.clone(),
         )
         .await?;
         let runner = Arc::new(runner);
@@ -927,7 +947,8 @@ impl AppState {
 
         match service_result {
             Ok(service) => {
-                let service = Arc::new(service);
+                let service =
+                    Arc::new(service.with_review_integration(self.review_integration.clone()));
                 service.clone().spawn();
                 self.tasks.service = Some(service);
                 tracing::info!("BackgroundTaskService started");
@@ -1134,10 +1155,6 @@ impl AppState {
             None => None,
         };
         ensure_no_running_task_runs(task_transition.as_ref())?;
-        let mut pool_transition = match self.connection.pool.as_ref() {
-            Some(pool) => Some(pool.preflight_workspace_transition().await?),
-            None => None,
-        };
         let root = validated_workspace_root(&workspace.root)?;
         let previous_workspace = self.workspace.current.read().await.clone();
         let previous_workspace_id = previous_workspace
@@ -1164,6 +1181,19 @@ impl AppState {
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace runtime state store"))?;
         let memory_store = crate::infra::create_memory_store_for_workspace(&root)
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace memory store"))?;
+        // Reserve the memory/evolution generation before the process cwd or
+        // any runtime projection crosses the workspace commit boundary. A
+        // running review/Dreaming pass returns a deterministic Busy error.
+        let mut memory_rebind_permit = self
+            .review_integration
+            .as_ref()
+            .map(|integration| integration.prepare_rebind(state_dir.clone(), memory_store.clone()))
+            .transpose()
+            .map_err(anyhow::Error::from)?;
+        let mut pool_transition = match self.connection.pool.as_ref() {
+            Some(pool) => Some(pool.preflight_workspace_transition().await?),
+            None => None,
+        };
         let mut workspace = workspace;
         workspace.root = root;
 
@@ -1175,6 +1205,12 @@ impl AppState {
                 workspace.root.display()
             )
         })?;
+        // The process cwd is the canonical commit boundary. Memory binding
+        // publication is infallible after this point; incomplete old-root
+        // trigger settlement is carried into the workspace receipt.
+        let memory_rebind_receipt = memory_rebind_permit
+            .as_mut()
+            .map(crate::evolution::ReviewRebindPermit::commit);
         if let Some(pool_transition) = pool_transition.as_mut() {
             pool_transition.commit().await;
         }
@@ -1231,8 +1267,19 @@ impl AppState {
         {
             let store = memory_store;
             let echo_agent_dir = crate::workspace::layout::WorkspaceLayout::state_dir(&mem_root); // {root}/.eko
-            if let Some(ref ri) = self.review_integration {
-                ri.rebind(echo_agent_dir.clone(), store.clone());
+            if let Some(receipt) = memory_rebind_receipt.as_ref() {
+                let generation = receipt.generation;
+                if receipt.is_degraded() {
+                    tracing::warn!(
+                        pending_old = receipt.pending_old,
+                        delivery_error = ?receipt.delivery_error,
+                        "Workspace memory generation published with pending old-root triggers"
+                    );
+                }
+                tracing::info!(
+                    generation,
+                    "Published workspace memory evolution generation"
+                );
             }
             // (a) 主 agent：替换 warm 层 store（重新注册 remember/recall/search_memory/
             //     forget 工具）+ 重建 hot 层 MemoryLayerManager。
@@ -1310,6 +1357,11 @@ impl AppState {
         self.apply_workspace_routing(&workspace).await;
 
         let mut degraded_subsystems = Vec::new();
+        if let Some(receipt) = memory_rebind_receipt.as_ref()
+            && receipt.is_degraded()
+        {
+            degraded_subsystems.push(memory_rebind_degradation(state_dir.clone(), receipt));
+        }
         if let Some(task_transition) = task_transition.as_ref()
             && let Err(error) =
                 task_transition.rebind_shadow_root(tasks_dir.clone(), workspace.id.to_string())
@@ -1385,6 +1437,7 @@ impl AppState {
         );
         *self.workspace.last_transition.write().await = Some(receipt.clone());
         drop(pool_transition);
+        drop(memory_rebind_permit);
         drop(task_transition);
         drop(foreground_transition);
 
@@ -1418,10 +1471,6 @@ impl AppState {
             None => None,
         };
         ensure_no_running_task_runs(task_transition.as_ref())?;
-        let mut pool_transition = match self.connection.pool.as_ref() {
-            Some(pool) => Some(pool.preflight_workspace_transition().await?),
-            None => None,
-        };
         let global_cwd = self.workspace.global_cwd.canonicalize().map_err(|error| {
             anyhow::anyhow!("Failed to resolve the global working directory: {error}")
         })?;
@@ -1443,12 +1492,28 @@ impl AppState {
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global runtime state store"))?;
         let memory_store = crate::infra::create_global_memory_store()
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global memory store"))?;
+        let (_, prepared_global_echo_dir) = crate::infra::global_memory_paths();
+        let mut memory_rebind_permit = self
+            .review_integration
+            .as_ref()
+            .map(|integration| {
+                integration.prepare_rebind(prepared_global_echo_dir.clone(), memory_store.clone())
+            })
+            .transpose()
+            .map_err(anyhow::Error::from)?;
+        let mut pool_transition = match self.connection.pool.as_ref() {
+            Some(pool) => Some(pool.preflight_workspace_transition().await?),
+            None => None,
+        };
         let global_tasks_dir =
             crate::tasks::task_runtime::file_shadow::FileTaskShadow::default_root();
         std::fs::create_dir_all(&global_tasks_dir)?;
         std::env::set_current_dir(&global_cwd).map_err(|error| {
             anyhow::anyhow!("Failed to restore process directory after workspace exit: {error}")
         })?;
+        let memory_rebind_receipt = memory_rebind_permit
+            .as_mut()
+            .map(crate::evolution::ReviewRebindPermit::commit);
         if let Some(pool_transition) = pool_transition.as_mut() {
             pool_transition.commit().await;
         }
@@ -1499,8 +1564,16 @@ impl AppState {
         {
             let store = memory_store;
             let (global_store_path, global_echo_dir) = crate::infra::global_memory_paths();
-            if let Some(ref ri) = self.review_integration {
-                ri.rebind(global_echo_dir.clone(), store.clone());
+            if let Some(receipt) = memory_rebind_receipt.as_ref() {
+                let generation = receipt.generation;
+                if receipt.is_degraded() {
+                    tracing::warn!(
+                        pending_old = receipt.pending_old,
+                        delivery_error = ?receipt.delivery_error,
+                        "Global memory generation published with pending workspace triggers"
+                    );
+                }
+                tracing::info!(generation, "Published global memory evolution generation");
             }
             // 主 agent：替换 store + 重建 layer manager。
             let store_for_mgr = store.clone();
@@ -1583,6 +1656,11 @@ impl AppState {
         }
 
         let mut degraded_subsystems = Vec::new();
+        if let Some(receipt) = memory_rebind_receipt.as_ref()
+            && receipt.is_degraded()
+        {
+            degraded_subsystems.push(memory_rebind_degradation(prepared_global_echo_dir, receipt));
+        }
         if let Some(task_transition) = task_transition.as_ref()
             && let Err(error) =
                 task_transition.rebind_shadow_root(global_tasks_dir.clone(), "global")
@@ -1653,6 +1731,7 @@ impl AppState {
         );
         *self.workspace.last_transition.write().await = Some(receipt.clone());
         drop(pool_transition);
+        drop(memory_rebind_permit);
         drop(task_transition);
         drop(foreground_transition);
 
@@ -1738,6 +1817,206 @@ mod workspace_transition_tests {
                 .map(Vec::len),
             Some(0)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn memory_rebind_degradation_preserves_owned_stale_roots() {
+        let target = std::path::PathBuf::from("/workspace-b/.eko");
+        let stale = std::path::PathBuf::from("/workspace-a/.eko");
+        let receipt = crate::evolution::MemoryRebindReceipt {
+            generation: 2,
+            pending_old: 1,
+            pending_roots: vec![stale.clone()],
+            delivery_error: Some("injected evidence write failure".to_string()),
+        };
+
+        let subsystem = memory_rebind_degradation(target.clone(), &receipt);
+
+        assert_eq!(subsystem.subsystem, "memory_evolution");
+        assert_eq!(subsystem.target_root, target);
+        assert_eq!(subsystem.stale_roots, vec![stale]);
+        assert!(
+            subsystem
+                .error
+                .contains("1 trigger(s) remain owned for retry")
+        );
+        assert!(subsystem.error.contains("injected evidence write failure"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn app_state_workspace_transition_publishes_degraded_memory_receipt_and_binding()
+    -> std::result::Result<(), String> {
+        const CHILD_PROCESS: &str = "EKO_MEMORY_WORKSPACE_TRANSITION_TEST";
+        if std::env::var_os(CHILD_PROCESS).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().map_err(|error| error.to_string())?,
+            )
+            .arg("app_state_workspace_transition_publishes_degraded_memory_receipt_and_binding")
+            .arg("--test-threads=1")
+            .env(CHILD_PROCESS, "1")
+            .output()
+            .map_err(|error| error.to_string())?;
+            if output.status.success() {
+                return Ok(());
+            }
+            return Err(format!(
+                "isolated memory workspace transition test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+
+        let _serial = CWD_TEST_LOCK.lock().await;
+        let original_cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        let _restore = RestoreCwd(original_cwd);
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let canonical_root_a = root_a.canonicalize().map_err(|error| error.to_string())?;
+        let canonical_root_b = root_b.canonicalize().map_err(|error| error.to_string())?;
+
+        let agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .model("test-model")
+                .llm_client(Arc::new(MockLlmClient::new().with_model_name("test-model")))
+                .system_prompt("memory workspace transition test")
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let initial_store = Arc::new(echo_agent::memory::InMemoryStore::new())
+            as Arc<dyn echo_agent::memory::Store>;
+        let integration = Arc::new(crate::evolution::ReviewIntegration::new(
+            echo_agent::evolution::ReviewConfig::default(),
+            temp.path().join("initial/.eko"),
+            initial_store.clone(),
+        ));
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(
+                agent.clone(),
+                Some(integration.clone()),
+                Some(initial_store),
+                2,
+                false,
+            )
+            .await,
+        );
+        let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let mut state = AppState::from_shared(
+            agent,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            Default::default(),
+            mcp_runtime,
+        )
+        .with_review_integration(Some(integration.clone()));
+        state.tasks.runtime = None;
+        state.set_pool(pool.clone());
+        let state = Arc::new(state);
+
+        state
+            .switch_workspace(workspace("a", canonical_root_a.clone()))
+            .await
+            .map_err(|error| error.to_string())?;
+        let blocked_evolution = canonical_root_a.join(".eko/evolution");
+        if blocked_evolution.is_dir() {
+            std::fs::remove_dir_all(&blocked_evolution).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(&blocked_evolution, b"blocks evidence directory creation")
+            .map_err(|error| error.to_string())?;
+
+        // The pool lease holds transition settlement after memory prepare, so
+        // the trigger deterministically arrives inside the rebind admission.
+        let pool_execution = pool
+            .acquire("memory-transition-parking-run")
+            .await
+            .map_err(|error| error.to_string())?;
+        let switch_state = state.clone();
+        let switch_root = canonical_root_b.clone();
+        let switch = tokio::spawn(async move {
+            switch_state
+                .switch_workspace(workspace("b", switch_root))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                match integration.lease_generation() {
+                    Err(crate::evolution::ReviewGenerationError::Busy {
+                        rebind_in_progress: true,
+                        ..
+                    }) => return Ok(()),
+                    Ok(lease) => drop(lease),
+                    Err(error) => return Err(error.to_string()),
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "memory transition did not enter rebind admission".to_string())??;
+
+        let trigger = echo_agent::evolution::TriggerMatch {
+            content: "workspace A uses a pinned memory root".to_string(),
+            memory_type: echo_agent::memory::MemoryType::ProjectFact,
+            source: echo_agent::memory::MemorySource::ExplicitSave,
+            confidence: 1.0,
+            topic: "workspace-memory".to_string(),
+            trust_level: echo_agent::evolution::InputTrustLevel::Trusted,
+            suggested_key: "workspace-a-memory-root".to_string(),
+            evidence: vec![echo_agent::evolution::TriggerEvidence {
+                source_role: "user".to_string(),
+                quote: "workspace A uses a pinned memory root".to_string(),
+            }],
+        };
+        let disposition =
+            echo_agent::evolution::MemoryTriggerSink::on_trigger(integration.as_ref(), &trigger)
+                .await?;
+        assert_eq!(
+            disposition,
+            echo_agent::evolution::MemoryTriggerDisposition::Captured
+        );
+        drop(pool_execution);
+
+        let receipt = switch
+            .await
+            .map_err(|error| format!("workspace transition failed to join: {error}"))?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(receipt.status, WorkspaceTransitionStatus::Degraded);
+        let memory = receipt
+            .degraded_subsystems
+            .iter()
+            .find(|subsystem| subsystem.subsystem == "memory_evolution")
+            .ok_or_else(|| "missing memory_evolution degradation".to_string())?;
+        let target_state_dir = canonical_root_b.join(".eko");
+        let stale_state_dir = canonical_root_a.join(".eko");
+        assert_eq!(memory.target_root, target_state_dir);
+        assert_eq!(memory.stale_roots, vec![stale_state_dir.clone()]);
+        assert!(memory.error.contains("1 trigger(s) remain owned for retry"));
+        assert_eq!(integration.trigger_delivery_status().pending, 1);
+        let published = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(published.echo_agent_dir(), target_state_dir);
+        drop(published);
+
+        std::fs::remove_file(&blocked_evolution).map_err(|error| error.to_string())?;
+        let retried = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(integration.trigger_delivery_status().pending, 0);
+        assert_eq!(
+            crate::evolution::EvidenceStore::new(stale_state_dir)
+                .list()?
+                .len(),
+            1
+        );
+        drop(retried);
+        integration.shutdown_background_reviews().await?;
+        pool.shutdown().await?;
         Ok(())
     }
 

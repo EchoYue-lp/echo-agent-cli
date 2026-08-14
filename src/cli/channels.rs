@@ -255,8 +255,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let agent_owned = agent.clone();
         let pool = self.pool.clone();
         let store = self.store.clone();
-        let review_integration = self.review_integration.clone();
         let webhook_emitter = self.webhook_emitter.clone();
+        let review_integration = self.review_integration.clone();
         let mut prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
         tokio::spawn(async move {
@@ -280,9 +280,9 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 cancel,
                 mode_hint: Some(mode_hint_str),
                 interaction_mode,
-                layer_manager: review_integration
-                    .as_ref()
-                    .map(|integration| Arc::new(integration.create_layer_manager())),
+                review_integration,
+                layer_manager: None,
+                memory_generation: None,
             });
             if let Err(e) = echo_agent_app_core::foreground_turn::drive_foreground_chat(
                 foreground_lease,

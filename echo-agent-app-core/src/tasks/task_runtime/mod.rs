@@ -47,15 +47,14 @@ pub mod task_tools;
 pub mod types;
 pub mod worktree;
 
+pub(crate) use executor::drive_unattended_run;
 pub use executor::{
-    EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, RunOutcome, drive_unattended_run,
-    execute_run, launch_cron_run, launch_unattended_run, preflight_unattended_plan,
-    preflight_unattended_task,
+    EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, RunOutcome, execute_run,
+    preflight_unattended_plan, preflight_unattended_task,
 };
 pub use ledger::{export_path, render_progress, write_progress};
 pub use memory_bridge::{
-    MemoryEvent, MemoryPolicy, write_memory_candidate, write_memory_candidate_blocking,
-    write_memory_candidate_dispatch,
+    MemoryEvent, MemoryPolicy, write_memory_candidate_dispatch, write_memory_candidate_settled,
 };
 pub use planner::{
     FileOverlapPair, OwnershipReport, analyze_file_ownership, has_writer_file_overlap,
@@ -71,6 +70,9 @@ pub use review::{
 pub use revisioned_adapter::{
     apply_eko_task_update, build_eko_task_revision_service, commit_eko_task_plan,
 };
-pub use store::{StoreError, TaskRuntimeStore};
+pub use store::{
+    AbandonedRunSettlement, RunDriverReceiptOwner, StoreError, TaskRetryPreparation,
+    TaskRunDriverShutdownError, TaskRuntimeStore,
+};
 pub use task_execute_tool::ExecuteTaskTool;
 pub use types::*;

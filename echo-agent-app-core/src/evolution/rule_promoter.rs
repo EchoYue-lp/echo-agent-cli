@@ -93,8 +93,8 @@ impl RulePromoter {
         }
     }
 
-    #[cfg(test)]
-    fn with_rules_path(mut self, rules_path: PathBuf) -> Self {
+    /// Bind rule publication to an explicitly admitted workspace root.
+    pub fn with_rules_path(mut self, rules_path: PathBuf) -> Self {
         self.rules_path = rules_path;
         self
     }

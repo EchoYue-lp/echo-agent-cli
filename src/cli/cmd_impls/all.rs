@@ -109,39 +109,43 @@ async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("Usage: /remember <fact>");
         return CommandOutcome::Continue;
     }
-    let layer_manager = ctx
-        .agent
-        .read(|agent| agent.memory_layer_manager().cloned())
-        .await;
-    let key = uuid::Uuid::new_v4().to_string();
-    if let Some(layer_manager) = layer_manager {
-        let meta = echo_agent::memory::MemoryMeta::new(
-            echo_agent::memory::MemoryType::ProjectFact,
-            echo_agent::memory::MemorySource::ExplicitSave,
-            "explicit",
-        );
-        match layer_manager.write_memory(&key, content.trim(), meta).await {
-            Ok(promotion) => {
-                if promotion.is_some() {
-                    let root = ctx.agent.read(|agent| agent.working_dir()).await;
-                    ctx.agent
-                        .write_async(|agent| {
-                            Box::pin(async move {
-                                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                    agent,
-                                    root.as_deref(),
-                                )
-                                .await;
-                            })
-                        })
-                        .await;
-                }
-                println!("Memory saved with key: {key}");
-            }
-            Err(error) => println!("Failed to save memory: {error}"),
-        }
-    } else {
+    let Some(integration) = ctx.review_integration.as_ref() else {
         println!("Layered memory is not configured for this agent.");
+        return CommandOutcome::Continue;
+    };
+    let memory_lease = match integration.lease_generation() {
+        Ok(lease) => lease,
+        Err(error) => {
+            println!("Cannot save memory while the workspace is switching: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let layer_manager = Arc::new(memory_lease.create_layer_manager());
+    let key = uuid::Uuid::new_v4().to_string();
+    let meta = echo_agent::memory::MemoryMeta::new(
+        echo_agent::memory::MemoryType::ProjectFact,
+        echo_agent::memory::MemorySource::ExplicitSave,
+        "explicit",
+    );
+    match layer_manager.write_memory(&key, content.trim(), meta).await {
+        Ok(promotion) => {
+            if promotion.is_some() {
+                let root = ctx.agent.read(|agent| agent.working_dir()).await;
+                ctx.agent
+                    .write_async(|agent| {
+                        Box::pin(async move {
+                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
+                                agent,
+                                root.as_deref(),
+                            )
+                            .await;
+                        })
+                    })
+                    .await;
+            }
+            println!("Memory saved with key: {key}");
+        }
+        Err(error) => println!("Failed to save memory: {error}"),
     }
     CommandOutcome::Continue
 }
@@ -161,62 +165,66 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("Usage: /forget <key-or-query>");
         return CommandOutcome::Continue;
     }
-    let layer_manager = ctx
-        .agent
-        .read(|agent| agent.memory_layer_manager().cloned())
-        .await;
-    if let Some(layer_manager) = layer_manager {
-        let key = if layer_manager.locate(query.trim()).await.is_some() {
-            Some(query.trim().to_string())
-        } else {
-            match layer_manager.search_layered(query.trim(), 20).await {
-                Ok(matches) if matches.len() == 1 => {
-                    matches.into_iter().next().map(|(_, entry)| entry.key)
-                }
-                Ok(matches) if matches.len() > 1 => {
-                    let keys = matches
-                        .iter()
-                        .map(|(_, entry)| entry.key.chars().take(8).collect::<String>())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("Multiple memories match; use a full key or prefix: {keys}");
-                    None
-                }
-                Ok(_) => None,
-                Err(error) => {
-                    println!("Failed to search memory: {error}");
-                    None
-                }
+    let Some(integration) = ctx.review_integration.as_ref() else {
+        println!("Layered memory is not configured for this agent.");
+        return CommandOutcome::Continue;
+    };
+    let memory_lease = match integration.lease_generation() {
+        Ok(lease) => lease,
+        Err(error) => {
+            println!("Cannot remove memory while the workspace is switching: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let layer_manager = Arc::new(memory_lease.create_layer_manager());
+    let key = if layer_manager.locate(query.trim()).await.is_some() {
+        Some(query.trim().to_string())
+    } else {
+        match layer_manager.search_layered(query.trim(), 20).await {
+            Ok(matches) if matches.len() == 1 => {
+                matches.into_iter().next().map(|(_, entry)| entry.key)
             }
-        };
-        if let Some(key) = key {
-            let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
-            match layer_manager.delete_memory(&key).await {
-                Ok(true) => {
-                    if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
-                        let root = ctx.agent.read(|agent| agent.working_dir()).await;
-                        ctx.agent
-                            .write_async(|agent| {
-                                Box::pin(async move {
-                                    echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                        agent,
-                                        root.as_deref(),
-                                    )
-                                    .await;
-                                })
+            Ok(matches) if matches.len() > 1 => {
+                let keys = matches
+                    .iter()
+                    .map(|(_, entry)| entry.key.chars().take(8).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("Multiple memories match; use a full key or prefix: {keys}");
+                None
+            }
+            Ok(_) => None,
+            Err(error) => {
+                println!("Failed to search memory: {error}");
+                None
+            }
+        }
+    };
+    if let Some(key) = key {
+        let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
+        match layer_manager.delete_memory(&key).await {
+            Ok(true) => {
+                if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
+                    let root = ctx.agent.read(|agent| agent.working_dir()).await;
+                    ctx.agent
+                        .write_async(|agent| {
+                            Box::pin(async move {
+                                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
+                                    agent,
+                                    root.as_deref(),
+                                )
+                                .await;
                             })
-                            .await;
-                    }
-                    println!("Removed memory: {key}");
+                        })
+                        .await;
                 }
-                Ok(false) => println!("No matching memory found."),
-                Err(error) => println!("Failed to remove memory: {error}"),
+                println!("Removed memory: {key}");
             }
-        } else {
-            println!("No unambiguous matching memory found.");
+            Ok(false) => println!("No matching memory found."),
+            Err(error) => println!("Failed to remove memory: {error}"),
         }
     } else {
-        println!("Layered memory is not configured for this agent.");
+        println!("No unambiguous matching memory found.");
     }
     CommandOutcome::Continue
 }
@@ -386,6 +394,18 @@ cmd!(
 async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("🪞 Generating reflection...");
 
+    let Some(integration) = ctx.review_integration.as_ref() else {
+        println!("⚠️  Review integration is not configured.");
+        return CommandOutcome::Continue;
+    };
+    let memory_generation = match integration.lease_generation() {
+        Ok(generation) => generation,
+        Err(error) => {
+            println!("⚠️  Reflection unavailable during workspace transition: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+
     // Get LLM client from agent
     let llm_client = ctx.agent.read(|a| a.llm_client().cloned()).await;
 
@@ -417,12 +437,12 @@ async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
         }
     };
 
-    // Write to .eko/memory/PROJECT.md
-    let memory_dir = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".eko")
-        .join("memory");
-    let _ = std::fs::create_dir_all(&memory_dir);
+    // Write to the `.eko` root pinned before the LLM call.
+    let memory_dir = memory_generation.echo_agent_dir().join("memory");
+    if let Err(error) = std::fs::create_dir_all(&memory_dir) {
+        println!("⚠️  Failed to create reflection memory directory: {error}");
+        return CommandOutcome::Continue;
+    }
     let memory_file = memory_dir.join("PROJECT.md");
 
     let entry = format!(
@@ -438,8 +458,10 @@ async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     {
         Ok(mut file) => {
             use std::io::Write;
-            let _ = file.write_all(entry.as_bytes());
-            println!("✅ Reflection saved to {}", memory_file.display());
+            match file.write_all(entry.as_bytes()) {
+                Ok(()) => println!("✅ Reflection saved to {}", memory_file.display()),
+                Err(error) => println!("⚠️  Failed to write reflection: {error}"),
+            }
         }
         Err(e) => {
             println!("⚠️  Failed to write reflection: {e}");
@@ -479,6 +501,19 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         }
         "extract" => {
             println!("Extracting observations from current session...");
+            let Some(integration) = ctx.review_integration.as_ref() else {
+                println!("Review integration is not configured.");
+                return CommandOutcome::Continue;
+            };
+            let evidence_lease = match integration.lease_generation() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    println!(
+                        "Cannot queue memory candidates while the workspace is switching: {error}"
+                    );
+                    return CommandOutcome::Continue;
+                }
+            };
             let handle = ctx.agent.clone();
             let messages: Vec<(String, String)> = handle
                 .read_async(|a| {
@@ -505,15 +540,7 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 return CommandOutcome::Continue;
             }
 
-            let store = ctx
-                .review_integration
-                .as_ref()
-                .map(|integration| integration.evidence_store())
-                .unwrap_or_else(|| {
-                    echo_agent_app_core::evolution::EvidenceStore::new(
-                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                    )
-                });
+            let store = evidence_lease.evidence_store();
             match queue_observations(&store, &observations, &messages) {
                 Ok(candidates) => println!(
                     "Extracted {} observation(s); {} candidate(s) are in Review Inbox.",

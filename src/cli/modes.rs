@@ -220,6 +220,18 @@ pub async fn run_cli_mode(
                     }),
                 },
                 CliShutdownStep {
+                    name: "memory review",
+                    future: Box::pin(async {
+                        if let Some(integration) = review_integration.as_ref() {
+                            integration
+                                .shutdown_background_reviews()
+                                .await
+                                .map_err(anyhow::Error::msg)?;
+                        }
+                        Ok(())
+                    }),
+                },
+                CliShutdownStep {
                     name: "TaskRun drivers",
                     future: Box::pin(async {
                         if let Some(store) = task_runtime_store.as_ref() {
@@ -279,6 +291,18 @@ pub async fn run_cli_mode(
                     .shutdown()
                     .await
                     .map_err(|error| anyhow::anyhow!(error))
+            }),
+        },
+        CliShutdownStep {
+            name: "memory review",
+            future: Box::pin(async {
+                if let Some(integration) = app_state.review_integration.as_ref() {
+                    integration
+                        .shutdown_background_reviews()
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Ok(())
             }),
         },
         CliShutdownStep {
@@ -494,6 +518,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let steps = vec![
             recorded_shutdown_step(Arc::clone(&calls), "foreground", true),
+            recorded_shutdown_step(Arc::clone(&calls), "memory", false),
             recorded_shutdown_step(Arc::clone(&calls), "workspace", true),
             recorded_shutdown_step(Arc::clone(&calls), "scheduler", false),
             recorded_shutdown_step(Arc::clone(&calls), "drivers", false),
@@ -514,6 +539,7 @@ mod tests {
             observed,
             [
                 "foreground",
+                "memory",
                 "workspace",
                 "scheduler",
                 "drivers",

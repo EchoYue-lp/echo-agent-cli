@@ -37,6 +37,12 @@ export function EvolutionPanel() {
 
   // ── Dashboard state(进化概览:分层记忆统计 + 技能健康 + 变更活动)
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
+  const [triggerDelivery, setTriggerDelivery] = useState<{
+    pending: number;
+    failures: number;
+    rejected: number;
+    last_error?: string | null;
+  } | null>(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
 
   // ── Rule proposals state(规则候选:用户审阅 → 采纳才写 learned-rules.md)
@@ -87,6 +93,7 @@ export function EvolutionPanel() {
     try {
       const data = await evolutionApi.dashboard();
       setDashboard(data.metrics);
+      setTriggerDelivery(data.trigger_delivery ?? null);
     } catch (e) {
       console.error('Failed to load evolution dashboard:', e);
     }
@@ -279,6 +286,30 @@ export function EvolutionPanel() {
                 icon={<Database size={10} />}
               />
             </div>
+
+            {triggerDelivery &&
+              (triggerDelivery.pending > 0 ||
+                triggerDelivery.failures > 0 ||
+                triggerDelivery.rejected > 0) && (
+                <div
+                  className="mb-3 flex items-start gap-1.5 rounded-md border px-2.5 py-2 text-[10px]"
+                  style={{
+                    borderColor: 'var(--color-warning, orange)',
+                    color: 'var(--text-secondary)',
+                  }}
+                >
+                  <AlertTriangle
+                    size={10}
+                    className="mt-0.5 shrink-0"
+                    style={{ color: 'var(--color-warning, orange)' }}
+                  />
+                  <span>
+                    记忆候选投递: {triggerDelivery.pending} 条待处理，
+                    {triggerDelivery.failures} 次失败，{triggerDelivery.rejected} 条未接管
+                    {triggerDelivery.last_error ? `。最近错误: ${triggerDelivery.last_error}` : ''}
+                  </span>
+                </div>
+              )}
 
             {dashboard.tool_diagnostics.repeated_failures.length > 0 && (
               <div

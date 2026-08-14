@@ -272,17 +272,17 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
     let state = Arc::new(state_inner);
 
-    infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
+    let health_task = infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
 
     // (stage4 F1) Dreaming runs once after boot and then daily in every mode.
-    if let Some(ri) = state.review_integration.clone() {
+    let dreaming_task = state.review_integration.clone().map(|ri| {
         infra::spawn_dreaming_task(
             ri,
             agent_handle.clone(),
             state.connection.pool.clone(),
             cancel_token.clone(),
-        );
-    }
+        )
+    });
 
     // ── Launch Tauri window ──
     let terminal_manager = Arc::new(crate::tauri::terminal::TerminalManager::new());
@@ -297,10 +297,18 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
-    bridge_supervisor.shutdown().await;
-    terminal_manager.close_all().await;
     if let Err(error) = state.session.foreground_turns.shutdown().await {
         tracing::warn!(%error, "failed to settle GUI foreground turns");
+    }
+    if let Some(task) = dreaming_task
+        && let Err(error) = task.await
+    {
+        tracing::warn!(%error, "failed to join GUI Dreaming task");
+    }
+    if let Some(integration) = runtime.review_integration.as_ref()
+        && let Err(error) = integration.shutdown_background_reviews().await
+    {
+        tracing::warn!(%error, "failed to settle GUI background reviews");
     }
     if let Err(error) = state.shutdown_workspace_transition().await {
         tracing::warn!(%error, "failed to settle GUI workspace transition");
@@ -324,8 +332,13 @@ async fn run_desktop() -> anyhow::Result<()> {
     if let Err(error) = config_watcher.shutdown().await {
         tracing::warn!(%error, "failed to shut down GUI config watcher");
     }
+    if let Err(error) = health_task.await {
+        tracing::warn!(%error, "failed to join GUI MCP health check task");
+    }
     runtime.mcp_config_runtime.shutdown().await;
     runtime.browser_runtime.shutdown().await;
+    bridge_supervisor.shutdown().await;
+    terminal_manager.close_all().await;
     if let Some(store) = state.tasks.runtime.as_ref()
         && let Err(error) = store.shutdown_hook_events().await
     {

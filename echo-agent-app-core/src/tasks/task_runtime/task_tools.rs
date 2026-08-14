@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use crate::subagent_loader::SubagentCatalogSnapshot;
 
-use super::executor::{ExecEvent, RunPlanPolicy};
+use super::executor::{ExecEvent, RunOutcome, RunPlanPolicy};
 use super::profiles::ProfileTemplate;
 use super::types::DomainProfile;
 
@@ -954,6 +954,19 @@ impl CreateComplexTaskTool {
             .clone()
             .unwrap_or_else(|| format!("message:{run_id}"));
         let attended = super::types::AttendedMode::Attended;
+        // Independent cancel token: background runs must not reuse the chat
+        // turn's token. Reserve the canonical driver before any TaskRuntime or
+        // memory mutation so shutdown cannot overtake this accepted run.
+        let run_cancel = echo_agent::agent::CancellationToken::new();
+        let admission = match store.reserve_run_driver_admission(run_id.clone(), run_cancel.clone())
+        {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Task runtime driver admission failed: {error}"
+                )));
+            }
+        };
         let generation_lease = match store.lease_active_workspace_generation() {
             Ok(lease) => lease,
             Err(error) => {
@@ -962,6 +975,34 @@ impl CreateComplexTaskTool {
                 )));
             }
         };
+        let mut registration =
+            match store.register_run_driver::<RunOutcome>(admission, generation_lease) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Task runtime driver registration failed: {error}"
+                    )));
+                }
+            };
+        let memory_generation = match res
+            .review_integration
+            .as_ref()
+            .map(|integration| integration.lease_generation())
+            .transpose()
+        {
+            Ok(generation) => generation.or_else(|| res.memory_generation.clone()),
+            Err(error) => {
+                registration.reject(error.to_string());
+                return Ok(ToolResult::error(format!(
+                    "Memory unavailable during workspace transition: {error}"
+                )));
+            }
+        };
+        let layer_manager = memory_generation
+            .as_ref()
+            .map(|generation| Arc::new(generation.create_layer_manager()))
+            .or_else(|| res.layer_manager.clone());
+        registration.mark_preparation_started();
         if let Err(e) = store.create_run_for_active_workspace(
             &run_id,
             &conv,
@@ -971,6 +1012,7 @@ impl CreateComplexTaskTool {
             "agent_autonomous",
             attended,
         ) {
+            registration.fail_preparation(e.to_string());
             return Ok(ToolResult::error(format!("Failed to create run: {e}")));
         }
         #[allow(clippy::collapsible_if)]
@@ -981,61 +1023,36 @@ impl CreateComplexTaskTool {
             }
         }
         if let Err(e) = store.transition_run(&run_id, super::types::TaskRunStatus::Running) {
+            registration.fail_preparation(e.to_string());
             return Ok(ToolResult::error(format!(
                 "Failed to transition run to Running: {e}"
             )));
         }
-        // Independent cancel token: background runs must not reuse the chat
-        // turn's token. `drive_run_async` registers it in the single runtime
-        // cancellation registry before acquiring the isolated agent.
-        let run_cancel = echo_agent::agent::CancellationToken::new();
-
         let trace_sink = if priority == "foreground" {
             Some(crate::chat_driver::subagent_trace_sink_for(&res.sink))
         } else {
             None
         };
-        let supervisor_cancel = run_cancel.clone();
         let payload_run_id = run_id.clone();
         let payload_store = store.clone();
-        let layer_manager = res.layer_manager.clone();
-        let result_waiter = match store.spawn_run_driver(
-            run_id.clone(),
-            supervisor_cancel,
-            generation_lease,
-            move |receipt_owner| {
-                crate::run_driver::drive_run_async(crate::run_driver::RunPayload {
-                    run_id: payload_run_id,
-                    pool,
-                    store: payload_store,
-                    cancel: run_cancel,
-                    // B5.1: forward the chat turn's memory layer so the run's Blocking
-                    // memory write (drive_run_async → execute_run) actually lands the
-                    // taskrun:completed:{run_id} memory. None when no memory subsystem
-                    // is wired (then the Blocking write is a no-op).
-                    layer_manager,
-                    trace_sink,
-                    prompt: run_prompt,
-                    plan_policy,
-                    receipt_owner,
-                })
-            },
-        ) {
-            Ok(waiter) => waiter,
-            Err(error) => {
-                let message = format!("TaskRun driver admission failed: {error}");
-                return match store.finalize_run(
-                    &run_id,
-                    super::types::TaskRunStatus::Failed,
-                    Some(&message),
-                ) {
-                    Ok(_) => Ok(ToolResult::error(message)),
-                    Err(settlement_error) => Ok(ToolResult::error(format!(
-                        "{message}; terminal settlement failed: {settlement_error}"
-                    ))),
-                };
-            }
-        };
+        let result_waiter = registration.start(move |receipt_owner| {
+            crate::run_driver::drive_run_async(crate::run_driver::RunPayload {
+                run_id: payload_run_id,
+                pool,
+                store: payload_store,
+                cancel: run_cancel,
+                // B5.1: forward the chat turn's memory layer so the run's settled
+                // memory write (drive_run_async → execute_run) actually lands the
+                // taskrun:completed:{run_id} memory. None when no memory subsystem
+                // best-effort write is wired (otherwise the write is a no-op).
+                layer_manager,
+                memory_generation,
+                trace_sink,
+                prompt: run_prompt,
+                plan_policy,
+                receipt_owner,
+            })
+        });
 
         if priority == "foreground" {
             // Block the turn: drive_run_async streams subagent events to the chat

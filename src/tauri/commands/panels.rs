@@ -23,6 +23,18 @@ fn current_echo_agent_dir(state: &TauriState) -> PathBuf {
         .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir)
 }
 
+fn evolution_write_lease(
+    state: &TauriState,
+) -> Result<echo_agent_app_core::evolution::ReviewGenerationLease, IpcError> {
+    state
+        .app_state
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Permissions
 // ════════════════════════════════════════════════════════════════════════════
@@ -334,10 +346,17 @@ pub async fn extract_auto_memory(
         }));
     }
 
+    let integration = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
+    let evidence_lease = integration
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     let messages = current_agent_messages(&state).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
-    let root = workspace_project_root(&state).await?;
-    let store = echo_agent_app_core::evolution::EvidenceStore::new(root.join(".eko"));
+    let store = evidence_lease.evidence_store();
     let candidates =
         echo_agent_app_core::auto_memory::queue_observations(&store, &observations, &messages)
             .map_err(IpcError::Internal)?;
@@ -1236,15 +1255,19 @@ pub async fn review_run(
     state: tauri::State<'_, TauriState>,
     run_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    let review_integration = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Validation("Review integration is not configured".into()))?;
+    let review_lease = review_integration.lease_generation().map_err(|error| {
+        IpcError::Validation(format!(
+            "Review unavailable during workspace transition: {error}"
+        ))
+    })?;
     let agent = state.app_state.connection.primary_agent();
-    let (llm_client, memory_store, run_store) = agent
-        .read(|a| {
-            (
-                a.llm_client().cloned(),
-                a.store().cloned(),
-                a.run_store().cloned(),
-            )
-        })
+    let (llm_client, run_store) = agent
+        .read(|a| (a.llm_client().cloned(), a.run_store().cloned()))
         .await;
 
     let llm_client = llm_client
@@ -1268,45 +1291,21 @@ pub async fn review_run(
     let reviewer = echo_agent::evolution::BackgroundReviewer::new(
         echo_agent::evolution::BackgroundReviewConfig::default(),
         llm_client,
-        memory_store.clone(),
+        Some(review_lease.memory_store()),
         Some(run_store),
     );
-    let reviewer = if let Some(store) = memory_store {
-        let review_integration = state
-            .app_state
-            .review_integration
-            .clone()
-            .unwrap_or_else(|| {
-                std::sync::Arc::new(echo_agent_app_core::evolution::ReviewIntegration::new(
-                    echo_agent::evolution::ReviewConfig::default(),
-                    current_echo_agent_dir(state.inner()),
-                    store,
-                ))
-            });
-        reviewer.with_layer_manager(std::sync::Arc::new(
-            review_integration.create_layer_manager(),
-        ))
-    } else {
-        reviewer
-    };
+    let reviewer =
+        reviewer.with_layer_manager(std::sync::Arc::new(review_lease.create_layer_manager()));
     let handle = reviewer
         .review_by_run_id(&run_id)
         .map_err(|e| IpcError::Internal(e.to_string()))?;
-    let outcome = handle
+    let mut pass = review_lease
+        .track_background_review(handle)
         .await
-        .map_err(|e| IpcError::Internal(format!("Background review task failed to join: {e}")))?;
-    let evidence_candidate = match state.app_state.review_integration.as_ref() {
-        Some(integration) => integration
-            .capture_review_outcome(&outcome)
-            .map_err(IpcError::Internal)?,
-        None => echo_agent_app_core::evolution::capture_review_outcome(
-            &echo_agent_app_core::evolution::EvidenceStore::new(current_echo_agent_dir(
-                state.inner(),
-            )),
-            &outcome,
-        )
-        .map_err(IpcError::Internal)?,
-    };
+        .map_err(IpcError::Internal)?;
+    let settlement = pass.settle().await.map_err(IpcError::Internal)?;
+    let outcome = settlement.outcome;
+    let evidence_candidate = settlement.evidence_candidate;
     Ok(json!({
         "success": outcome.error.is_none(),
         "run_id": outcome.run_id,
@@ -1368,20 +1367,22 @@ pub async fn evidence_candidate_action(
     candidate_id: String,
     content: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = evidence_store_for_state(&state).await?;
+    let integration = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
+    let evidence_lease = integration
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let store = evidence_lease.evidence_store();
     let candidate = match action.as_str() {
         "edit" => store
             .edit(&candidate_id, content.as_deref().unwrap_or_default())
             .map_err(IpcError::Internal)?,
         "reject" => store.reject(&candidate_id).map_err(IpcError::Internal)?,
         "accept" | "undo" => {
-            let layer_manager = state
-                .app_state
-                .connection
-                .primary_agent()
-                .read(|agent| agent.memory_layer_manager().cloned())
-                .await
-                .ok_or_else(|| IpcError::Internal("No layered memory manager available".into()))?;
+            let layer_manager = std::sync::Arc::new(evidence_lease.create_layer_manager());
             if action == "accept" {
                 store
                     .accept(&candidate_id, content.as_deref(), &layer_manager)
@@ -1409,23 +1410,27 @@ pub async fn curator_action(
     action: String,
     skill_name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let curator = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|integration| integration.curator())
-        .unwrap_or_else(|| {
-            echo_agent_app_core::evolution::workspace_curator(&current_echo_agent_dir(
-                state.inner(),
-            ))
-        });
-
     match action.as_str() {
-        "status" => Ok(json!({
-            "success": true,
-            "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?),
-        })),
+        "status" => {
+            let curator = state
+                .app_state
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.curator())
+                .unwrap_or_else(|| {
+                    echo_agent_app_core::evolution::workspace_curator(&current_echo_agent_dir(
+                        state.inner(),
+                    ))
+                });
+            Ok(json!({
+                "success": true,
+                "status": curator_status_json(curator.status().map_err(|e| IpcError::Internal(e.to_string()))?),
+            }))
+        }
         "run" => {
+            let generation = evolution_write_lease(state.inner())?;
+            let curator =
+                echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
             let transitions = curator
                 .apply_transitions()
                 .map_err(|e| IpcError::Internal(e.to_string()))?;
@@ -1457,6 +1462,9 @@ pub async fn curator_action(
             }))
         }
         "pin" => {
+            let generation = evolution_write_lease(state.inner())?;
+            let curator =
+                echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
             let name = skill_name
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| IpcError::Validation("skill_name is required for pin".into()))?;
@@ -1468,6 +1476,9 @@ pub async fn curator_action(
             )
         }
         "unpin" => {
+            let generation = evolution_write_lease(state.inner())?;
+            let curator =
+                echo_agent_app_core::evolution::workspace_curator(generation.echo_agent_dir());
             let name = skill_name
                 .filter(|s| !s.trim().is_empty())
                 .ok_or_else(|| IpcError::Validation("skill_name is required for unpin".into()))?;
@@ -1516,8 +1527,16 @@ pub async fn get_evolution_dashboard(
     let dashboard =
         echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
     let metrics = dashboard.generate_metrics().await;
+    let trigger_delivery = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|integration| integration.trigger_delivery_status());
 
-    Ok(json!({ "metrics": metrics }))
+    Ok(json!({
+        "metrics": metrics,
+        "trigger_delivery": trigger_delivery,
+    }))
 }
 
 /// 返回「记忆 → AGENTS.md 规则」的晋升候选列表(高置信 + 满足 age/type 门槛)。
@@ -1552,13 +1571,19 @@ pub async fn promote_rule(
     state: tauri::State<'_, TauriState>,
     memory_key: String,
 ) -> Result<serde_json::Value, IpcError> {
+    let integration = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
+    let memory_generation = integration
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     let agent = state.app_state.connection.primary_agent();
-    let store = agent
-        .read(|a| a.store().cloned())
-        .await
-        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
-
-    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
+    let echo_agent_dir = memory_generation.echo_agent_dir().to_path_buf();
+    let promoter =
+        echo_agent_app_core::evolution::RulePromoter::new(memory_generation.memory_store())
+            .with_rules_path(echo_agent_dir.join("learned-rules.md"));
 
     // 找到对应候选(scan 已过置信度/age/type 门槛)
     let proposal = promoter
@@ -1573,9 +1598,7 @@ pub async fn promote_rule(
         })?;
 
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        current_echo_agent_dir(state.inner())
-            .join("evolution")
-            .join("change-log.jsonl"),
+        echo_agent_dir.join("evolution").join("change-log.jsonl"),
     );
 
     promoter
@@ -1590,7 +1613,7 @@ pub async fn promote_rule(
         &memory_key,
     )
     .await;
-    let root = agent.read(|value| value.working_dir()).await;
+    let root = echo_agent_dir.parent().map(std::path::Path::to_path_buf);
     agent
         .write_async(|value| {
             Box::pin(async move {
@@ -1701,24 +1724,16 @@ pub async fn generate_skill_draft(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
+    let generation = evolution_write_lease(state.inner())?;
     let agent = state.app_state.connection.primary_agent();
-    let store = agent
-        .read(|a| a.store().cloned())
-        .await
-        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
-
-    let echo_agent_dir = current_echo_agent_dir(state.inner());
+    let store = generation.memory_store();
+    let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
         echo_agent_dir.join("evolution").join("change-log.jsonl"),
     );
     let typed = echo_agent::memory::TypedMemoryStore::new(store);
 
-    let curator = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|integration| integration.curator())
-        .unwrap_or_else(|| echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir));
+    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
     let generator = echo_agent::evolution::SkillDraftGenerator::new(echo_agent_dir, &change_log)
         .with_curator(curator);
     let result = generator
@@ -1748,8 +1763,9 @@ pub async fn activate_skill_draft(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
+    let generation = evolution_write_lease(state.inner())?;
     let agent = state.app_state.connection.primary_agent();
-    let echo_agent_dir = current_echo_agent_dir(state.inner());
+    let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
     let draft_dir = echo_agent_dir.join("skills").join("_drafts").join(&name);
     let target_dir = echo_agent_dir.join("skills").join(&name);
 
@@ -1768,12 +1784,7 @@ pub async fn activate_skill_draft(
         .map_err(|e| IpcError::Internal(format!("Failed to copy draft SKILL.md: {e}")))?;
 
     // curator 状态 Draft→Active。
-    let curator = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|integration| integration.curator())
-        .unwrap_or_else(|| echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir));
+    let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);
     let active_skill_path = target_dir.join("SKILL.md");
     match curator.promote_to_active_at(&name, Some(&active_skill_path)) {
         Ok(true) => {}

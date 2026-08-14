@@ -458,6 +458,18 @@ impl AgentRuntime {
     /// This is a lightweight, non-blocking reflection that runs after a skill
     /// successfully completes. It uses ~200 tokens to summarize key learnings.
     pub async fn checkpoint_reflection(&self, skill_name: &str, task_summary: &str, result: &str) {
+        let Some(review_integration) = self.review_integration.as_ref() else {
+            tracing::warn!("Review integration unavailable; skipping checkpoint reflection");
+            return;
+        };
+        let memory_generation = match review_integration.lease_generation() {
+            Ok(generation) => generation,
+            Err(error) => {
+                tracing::warn!(%error, "Checkpoint reflection unavailable during workspace transition");
+                return;
+            }
+        };
+
         // Build a concise prompt for the LLM
         let prompt = format!(
             "Reflect on the following completed task and summarize key learnings \
@@ -504,12 +516,12 @@ impl AgentRuntime {
             }
         };
 
-        // Write to project memory
-        let memory_dir = std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".eko")
-            .join("memory");
-        let _ = std::fs::create_dir_all(&memory_dir);
+        // Write to the workspace root pinned before the LLM call.
+        let memory_dir = memory_generation.echo_agent_dir().join("memory");
+        if let Err(error) = std::fs::create_dir_all(&memory_dir) {
+            tracing::warn!(path = %memory_dir.display(), %error, "Failed to create project memory directory");
+            return;
+        }
         let memory_file = memory_dir.join("PROJECT.md");
 
         let entry = format!("\n## [{skill_name}] {task_summary}\n{reflection}\n");

@@ -1423,14 +1423,9 @@ async fn dispatch_turn(
         cancel,
         mode_hint: Some(mode_hint_str),
         interaction_mode: turn.interaction_mode,
-        // B5.1 (TUI/GUI parity): build a layer_manager per turn from
-        // review_integration so autonomous runs block-write their
-        // completion memory (`taskrun:completed`). None = no review/memory
-        // subsystem (writes become no-ops).
-        layer_manager: app
-            .review_integration
-            .as_ref()
-            .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
+        review_integration: app.review_integration.clone(),
+        layer_manager: None,
+        memory_generation: None,
     });
     send_to_agent(agent, prepared, res).await;
 }
@@ -2837,21 +2832,113 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::Remember) => {
-            let layer_manager = agent
-                .read(|value| value.memory_layer_manager().cloned())
-                .await;
-            let content = match layer_manager {
-                _ if args.trim().is_empty() => "Usage: /remember <fact>".to_string(),
-                Some(layer_manager) => {
-                    let key = uuid::Uuid::new_v4().to_string();
-                    let meta = echo_agent::memory::MemoryMeta::new(
-                        echo_agent::memory::MemoryType::ProjectFact,
-                        echo_agent::memory::MemorySource::ExplicitSave,
-                        "explicit",
+            if args.trim().is_empty() {
+                return push_system_message(app, "Usage: /remember <fact>".to_string());
+            }
+            let Some(integration) = app.review_integration.as_ref() else {
+                return push_system_message(
+                    app,
+                    "Layered memory is not configured for this agent.".to_string(),
+                );
+            };
+            let memory_generation = match integration.lease_generation() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return push_system_message(
+                        app,
+                        format!("Cannot save memory while the workspace is switching: {error}"),
                     );
-                    match layer_manager.write_memory(&key, args.trim(), meta).await {
-                        Ok(promotion) => {
-                            if promotion.is_some() {
+                }
+            };
+            let layer_manager = Arc::new(memory_generation.create_layer_manager());
+            let key = uuid::Uuid::new_v4().to_string();
+            let meta = echo_agent::memory::MemoryMeta::new(
+                echo_agent::memory::MemoryType::ProjectFact,
+                echo_agent::memory::MemorySource::ExplicitSave,
+                "explicit",
+            );
+            let content = match layer_manager.write_memory(&key, args.trim(), meta).await {
+                Ok(promotion) => {
+                    if promotion.is_some() {
+                        let root = agent.read(|value| value.working_dir()).await;
+                        agent
+                            .write_async(|value| {
+                                Box::pin(async move {
+                                    echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
+                                        value,
+                                        root.as_deref(),
+                                    )
+                                    .await;
+                                })
+                            })
+                            .await;
+                        if let Some(pool) = &app.pool {
+                            pool.refresh_hot_memory_context().await;
+                        }
+                    }
+                    format!("Memory saved with key: {key}")
+                }
+                Err(error) => format!("Failed to save memory: {error}"),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::Forget) => {
+            if args.trim().is_empty() {
+                return push_system_message(app, "Usage: /forget <key-or-query>".to_string());
+            }
+            let Some(integration) = app.review_integration.as_ref() else {
+                return push_system_message(
+                    app,
+                    "Layered memory is not configured for this agent.".to_string(),
+                );
+            };
+            let memory_generation = match integration.lease_generation() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    return push_system_message(
+                        app,
+                        format!("Cannot remove memory while the workspace is switching: {error}"),
+                    );
+                }
+            };
+            let layer_manager = Arc::new(memory_generation.create_layer_manager());
+            let query = args.trim();
+            let key = if layer_manager.locate(query).await.is_some() {
+                Some(query.to_string())
+            } else {
+                match layer_manager.search_layered(query, 20).await {
+                    Ok(matches) if matches.len() == 1 => {
+                        matches.into_iter().next().map(|(_, entry)| entry.key)
+                    }
+                    Ok(matches) if matches.len() > 1 => {
+                        let keys = matches
+                            .iter()
+                            .map(|(_, entry)| entry.key.chars().take(8).collect::<String>())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return push_system_message(
+                            app,
+                            format!("Multiple memories match; use a full key or prefix: {keys}"),
+                        );
+                    }
+                    Ok(_) => None,
+                    Err(error) => {
+                        return push_system_message(
+                            app,
+                            format!("Failed to search memory: {error}"),
+                        );
+                    }
+                }
+            };
+            let content = match key {
+                Some(key) => {
+                    let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
+                    match layer_manager.delete_memory(&key).await {
+                        Ok(true) => {
+                            if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
                                 let root = agent.read(|value| value.working_dir()).await;
                                 agent
                                     .write_async(|value| {
@@ -2868,87 +2955,13 @@ async fn handle_slash_command(
                                     pool.refresh_hot_memory_context().await;
                                 }
                             }
-                            format!("Memory saved with key: {key}")
+                            format!("Removed memory: {key}")
                         }
-                        Err(error) => format!("Failed to save memory: {error}"),
+                        Ok(false) => "No matching memory found.".to_string(),
+                        Err(error) => format!("Failed to remove memory: {error}"),
                     }
                 }
-                None => "Layered memory is not configured for this agent.".to_string(),
-            };
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content,
-            });
-        }
-        Some(SlashCommand::Forget) => {
-            let layer_manager = agent
-                .read(|value| value.memory_layer_manager().cloned())
-                .await;
-            let content = match layer_manager {
-                _ if args.trim().is_empty() => "Usage: /forget <key-or-query>".to_string(),
-                Some(layer_manager) => {
-                    let query = args.trim();
-                    let key = if layer_manager.locate(query).await.is_some() {
-                        Some(query.to_string())
-                    } else {
-                        match layer_manager.search_layered(query, 20).await {
-                            Ok(matches) if matches.len() == 1 => {
-                                matches.into_iter().next().map(|(_, entry)| entry.key)
-                            }
-                            Ok(matches) if matches.len() > 1 => {
-                                let keys = matches
-                                    .iter()
-                                    .map(|(_, entry)| entry.key.chars().take(8).collect::<String>())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                return push_system_message(
-                                    app,
-                                    format!(
-                                        "Multiple memories match; use a full key or prefix: {keys}"
-                                    ),
-                                );
-                            }
-                            Ok(_) => None,
-                            Err(error) => {
-                                return push_system_message(
-                                    app,
-                                    format!("Failed to search memory: {error}"),
-                                );
-                            }
-                        }
-                    };
-                    match key {
-                        Some(key) => {
-                            let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
-                            match layer_manager.delete_memory(&key).await {
-                                Ok(true) => {
-                                    if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
-                                        let root = agent.read(|value| value.working_dir()).await;
-                                        agent
-                                        .write_async(|value| {
-                                            Box::pin(async move {
-                                                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                                    value,
-                                                    root.as_deref(),
-                                                )
-                                                .await;
-                                            })
-                                        })
-                                        .await;
-                                        if let Some(pool) = &app.pool {
-                                            pool.refresh_hot_memory_context().await;
-                                        }
-                                    }
-                                    format!("Removed memory: {key}")
-                                }
-                                Ok(false) => "No matching memory found.".to_string(),
-                                Err(error) => format!("Failed to remove memory: {error}"),
-                            }
-                        }
-                        None => "No unambiguous matching memory found.".to_string(),
-                    }
-                }
-                None => "Layered memory is not configured for this agent.".to_string(),
+                None => "No unambiguous matching memory found.".to_string(),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -3656,6 +3669,27 @@ async fn handle_slash_command(
                     "Auto-memory disabled.".to_string()
                 }
                 "extract" | "show" => {
+                    let evidence_generation = if sub == "extract" {
+                        let Some(integration) = app.review_integration.as_ref() else {
+                            return push_system_message(
+                                app,
+                                "Review integration is not configured.".to_string(),
+                            );
+                        };
+                        match integration.lease_generation() {
+                            Ok(lease) => Some(lease),
+                            Err(error) => {
+                                return push_system_message(
+                                    app,
+                                    format!(
+                                        "Cannot queue memory candidates while the workspace is switching: {error}"
+                                    ),
+                                );
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let messages: Vec<(String, String)> = agent
                         .read_async(|value| {
                             Box::pin(async move {
@@ -3686,15 +3720,13 @@ async fn handle_slash_command(
                             format_observations_for_memory(&observations)
                         }
                     } else {
-                        let store = app
-                            .review_integration
-                            .as_ref()
-                            .map(|integration| integration.evidence_store())
-                            .unwrap_or_else(|| {
-                                echo_agent_app_core::evolution::EvidenceStore::new(
-                                    echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                                )
-                            });
+                        let Some(evidence_generation) = evidence_generation.as_ref() else {
+                            return push_system_message(
+                                app,
+                                "Review generation is not available.".to_string(),
+                            );
+                        };
+                        let store = evidence_generation.evidence_store();
                         match queue_observations(&store, &observations, &messages) {
                             Ok(candidates) => format!(
                                 "Queued {} auto-memory candidate(s) in Review Inbox.",
@@ -3723,14 +3755,27 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::RunReview) => {
-            let (run_store, llm_client, memory_store) = agent
-                .read(|value| {
-                    (
-                        value.run_store.clone(),
-                        value.llm_client().cloned(),
-                        value.store().cloned(),
-                    )
-                })
+            let Some(review_integration) = app.review_integration.as_ref() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Review integration is not configured.".to_string(),
+                });
+                return;
+            };
+            let review_lease = match review_integration.lease_generation() {
+                Ok(lease) => lease,
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!(
+                            "Run review unavailable during workspace transition: {error}"
+                        ),
+                    });
+                    return;
+                }
+            };
+            let (run_store, llm_client) = agent
+                .read(|value| (value.run_store.clone(), value.llm_client().cloned()))
                 .await;
 
             let Some(run_store) = run_store else {
@@ -3769,21 +3814,11 @@ async fn handle_slash_command(
             let reviewer = echo_agent::evolution::BackgroundReviewer::new(
                 echo_agent::evolution::BackgroundReviewConfig::default(),
                 llm_client,
-                memory_store.clone(),
+                Some(review_lease.memory_store()),
                 Some(run_store),
             );
-            let reviewer = if let Some(review_integration) = app.review_integration.as_ref() {
-                reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
-            } else if let Some(store) = memory_store {
-                let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
-                    echo_agent::evolution::ReviewConfig::default(),
-                    echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                    store,
-                );
-                reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
-            } else {
-                reviewer
-            };
+            let reviewer =
+                reviewer.with_layer_manager(Arc::new(review_lease.create_layer_manager()));
 
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -3802,8 +3837,13 @@ async fn handle_slash_command(
                     return;
                 }
             };
-            match handle.await {
-                Ok(outcome) if outcome.nothing_to_save => {
+            let settled = match review_lease.track_background_review(handle).await {
+                Ok(mut pass) => pass.settle().await,
+                Err(error) => Err(error),
+            };
+            match settled {
+                Ok(settlement) if settlement.outcome.nothing_to_save => {
+                    let outcome = settlement.outcome;
                     let content = outcome
                         .error
                         .map(|error| format!("Run review produced no candidate: {error}"))
@@ -3813,20 +3853,8 @@ async fn handle_slash_command(
                         content,
                     });
                 }
-                Ok(outcome) => {
-                    let evidence_store = app
-                        .review_integration
-                        .as_ref()
-                        .map(|integration| integration.evidence_store())
-                        .unwrap_or_else(|| {
-                            echo_agent_app_core::evolution::EvidenceStore::new(
-                                echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                            )
-                        });
-                    let queued = echo_agent_app_core::evolution::capture_review_outcome(
-                        &evidence_store,
-                        &outcome,
-                    );
+                Ok(settlement) => {
+                    let outcome = settlement.outcome;
                     let content = match outcome.candidate {
                         Some(candidate) => format!(
                             "Candidate ({:?}, confidence {:.2}): {}\nEvidence: {}\n{}",
@@ -3834,12 +3862,11 @@ async fn handle_slash_command(
                             candidate.confidence,
                             candidate.content,
                             candidate.evidence,
-                            match queued {
-                                Ok(Some(stored)) => {
+                            match settlement.evidence_candidate {
+                                Some(stored) => {
                                     format!("Queued in Review Inbox as {}.", stored.candidate_id)
                                 }
-                                Ok(None) => "No inbox candidate was produced.".to_string(),
-                                Err(error) => format!("Failed to queue candidate: {error}"),
+                                None => "No inbox candidate was produced.".to_string(),
                             }
                         ),
                         None => outcome.actions.join("\n"),
@@ -3860,15 +3887,6 @@ async fn handle_slash_command(
         Some(SlashCommand::EvidenceInbox) => {
             use echo_agent_app_core::evolution::EvidenceReviewFilter;
 
-            let store = app
-                .review_integration
-                .as_ref()
-                .map(|integration| integration.evidence_store())
-                .unwrap_or_else(|| {
-                    echo_agent_app_core::evolution::EvidenceStore::new(
-                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                    )
-                });
             let mut parts = args.trim().splitn(3, ' ');
             let sub = parts
                 .next()
@@ -3876,6 +3894,43 @@ async fn handle_slash_command(
                 .unwrap_or("list");
             let candidate_id = parts.next();
             let content = parts.next();
+            let writes_evidence = matches!(sub, "edit" | "reject" | "accept" | "undo");
+            let memory_generation = if writes_evidence {
+                match app.review_integration.as_ref() {
+                    Some(integration) => match integration.lease_generation() {
+                        Ok(lease) => Some(lease),
+                        Err(error) => {
+                            return push_system_message(
+                                app,
+                                format!(
+                                    "Cannot update Review Inbox while the workspace is switching: {error}"
+                                ),
+                            );
+                        }
+                    },
+                    None => {
+                        return push_system_message(
+                            app,
+                            "Review integration is not configured.".to_string(),
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            let store = memory_generation
+                .as_ref()
+                .map(|lease| lease.evidence_store())
+                .or_else(|| {
+                    app.review_integration
+                        .as_ref()
+                        .map(|integration| integration.evidence_store())
+                })
+                .unwrap_or_else(|| {
+                    echo_agent_app_core::evolution::EvidenceStore::new(
+                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    )
+                });
             let result = match sub {
                 "list" | "ls" | "pending" | "expired" | "stale" | "applied"
                 | "undoable" => {
@@ -3969,11 +4024,9 @@ async fn handle_slash_command(
                     None => "Usage: /evidence-inbox reject <candidate-id>".to_string(),
                 },
                 "accept" | "undo" => match candidate_id {
-                    Some(id) => match agent
-                        .read(|value| value.memory_layer_manager().cloned())
-                        .await
-                    {
-                        Some(layer_manager) => {
+                    Some(id) => match memory_generation.as_ref() {
+                        Some(lease) => {
+                            let layer_manager = Arc::new(lease.create_layer_manager());
                             let action = if sub == "accept" {
                                 store.accept(id, content, &layer_manager).await
                             } else {
@@ -3986,7 +4039,7 @@ async fn handle_slash_command(
                                 Err(error) => format!("Review Inbox action failed: {error}"),
                             }
                         }
-                        None => "No layered memory manager is available.".to_string(),
+                        None => "Review generation is not available.".to_string(),
                     },
                     None => format!("Usage: /evidence-inbox {sub} <candidate-id>"),
                 },
@@ -4387,10 +4440,6 @@ async fn handle_slash_command(
                 });
                 return;
             };
-            let layer_manager = app
-                .review_integration
-                .as_ref()
-                .map(|integration| Arc::new(integration.create_layer_manager()));
             let result = match action {
                 SlashCommand::TaskCancel => store
                     .request_cancel(&run_id)
@@ -4409,8 +4458,13 @@ async fn handle_slash_command(
                             .ok_or_else(|| "run is not actively pausable".to_string())
                     }),
                 SlashCommand::TaskResume => {
-                    resume_tui_task_run(store.clone(), agent.clone(), run_id.clone(), layer_manager)
-                        .await
+                    resume_tui_task_run(
+                        store.clone(),
+                        agent.clone(),
+                        run_id.clone(),
+                        app.review_integration.clone(),
+                    )
+                    .await
                 }
                 _ => Err("unsupported task action".to_string()),
             };
@@ -4497,54 +4551,16 @@ async fn handle_slash_command(
                 });
                 return;
             };
-            // For TaskSkip we always go through RecoveryBlocker resolution
-            // (skipping only makes sense for crash-recovery blockers).
-            // For TaskRetry we first try the new acceptance-retry path: it
-            // handles Blocked/Failed tasks on Paused/Failed runs (the states
-            // left by acceptance/review failure) atomically. If that guard
-            // rejects (no such task in a retryable state), fall back to the
-            // legacy RecoveryBlocker path so process-restart blockers still
-            // work. This keeps TUI on par with the GUI retry button.
             let result = if action == SlashCommand::TaskRetry {
-                let layer_manager = app
-                    .review_integration
-                    .as_ref()
-                    .map(|integration| Arc::new(integration.create_layer_manager()));
-                let preparation_store = store.clone();
-                let preparation_run_id = run_id.clone();
-                let preparation_task_id = task_id.to_string();
-                match start_tui_task_run_driver(
+                retry_tui_task(
                     store.clone(),
                     agent.clone(),
                     run_id.clone(),
-                    layer_manager,
-                    move || {
-                        preparation_store
-                            .retry_blocked_task(&preparation_run_id, &preparation_task_id)
-                    },
+                    task_id.to_string(),
+                    app.review_integration.clone(),
                 )
                 .await
-                {
-                    Ok(next_attempt) => Ok(format!(
-                        "Task {task_id} retried as attempt {next_attempt} on run {run_id}; executor started."
-                    )),
-                    Err(retry_err) => {
-                        // Fall back to legacy RecoveryBlocker resolution.
-                        match store.resolve_recovery_task(
-                            &run_id,
-                            task_id,
-                            echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Retry,
-                        ) {
-                            Ok(()) => Ok(format!(
-                                "Recovery decision recorded for {run_id}/{task_id}: retry."
-                            )),
-                            Err(resolve_err) => Err(format!(
-                                "retry_blocked_task failed ({retry_err}); \
-                                 resolve_recovery_task also failed ({resolve_err})"
-                            )),
-                        }
-                    }
-                }
+                .map_err(|error| error.to_string())
             } else {
                 store
                     .resolve_recovery_task(
@@ -4755,67 +4771,172 @@ async fn resume_tui_task_run(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
     run_id: String,
-    layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
+    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 ) -> Result<&'static str, String> {
     let preparation_store = store.clone();
     let preparation_run_id = run_id.clone();
-    start_tui_task_run_driver(store, agent, run_id, layer_manager, move || {
-        if preparation_store.get_plan(&preparation_run_id)?.is_none() {
-            return Err(
-                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
-                    "run has no persisted plan to resume".to_string(),
-                ),
-            );
-        }
+    start_tui_task_run_driver(store, agent, run_id, review_integration, move || {
         preparation_store.resume_task_run(&preparation_run_id)
     })
-    .await?;
+    .await
+    .map_err(|error| error.to_string())?;
     Ok("resumed")
+}
+
+async fn retry_tui_task(
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    agent: AgentHandle,
+    run_id: String,
+    task_id: String,
+    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+) -> Result<String, echo_agent_app_core::tasks::task_runtime::StoreError> {
+    let preparation = start_tui_task_retry_driver(
+        store,
+        agent,
+        run_id.clone(),
+        task_id.clone(),
+        review_integration,
+    )
+    .await?;
+    match preparation {
+        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Acceptance {
+            next_attempt,
+        } => Ok(format!(
+            "Task {task_id} retried as attempt {next_attempt} on run {run_id}; executor started."
+        )),
+        echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Recovery => Ok(format!(
+            "Recovery decision recorded for {run_id}/{task_id}: retry."
+        )),
+    }
+}
+
+async fn start_tui_task_retry_driver(
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    agent: AgentHandle,
+    run_id: String,
+    task_id: String,
+    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+) -> Result<
+    echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation,
+    echo_agent_app_core::tasks::task_runtime::StoreError,
+> {
+    let cancel = echo_agent::agent::CancellationToken::new();
+    let preparation_store = store.clone();
+    let preparation_run_id = run_id.clone();
+    let (preparation, _) = store.spawn_supervised_task_retry(
+        run_id,
+        task_id,
+        cancel.clone(),
+        move || {
+            let memory_generation = review_integration
+                .as_ref()
+                .map(|integration| integration.lease_generation())
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "memory generation unavailable: {error}"
+                    ))
+                })?;
+            let layer_manager = memory_generation
+                .as_ref()
+                .map(|generation| Arc::new(generation.create_layer_manager()));
+            Ok((memory_generation, layer_manager))
+        },
+        move |(memory_generation, layer_manager), mut receipt_owner| async move {
+            if let Some(generation) = memory_generation.as_ref() {
+                receipt_owner.retain(generation.clone());
+            }
+            let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
+            let run_store = agent.read(|value| value.run_store().cloned()).await;
+            let result = echo_agent_app_core::tasks::task_runtime::execute_run(
+                preparation_store,
+                Some(agent),
+                reviewer_llm,
+                layer_manager,
+                memory_generation,
+                run_store,
+                None,
+                &preparation_run_id,
+                cancel,
+                echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+            )
+            .await;
+            if let Err(error) = result {
+                tracing::error!(run_id = %preparation_run_id, %error, "TUI task retry driver failed");
+                return Err(error.to_string());
+            }
+            Ok(())
+        },
+    )?;
+    Ok(preparation)
 }
 
 async fn start_tui_task_run_driver<Prepared, Prepare>(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
     run_id: String,
-    layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
+    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     prepare: Prepare,
-) -> Result<Prepared, String>
+) -> Result<Prepared, echo_agent_app_core::tasks::task_runtime::StoreError>
 where
     Prepare: FnOnce() -> Result<Prepared, echo_agent_app_core::tasks::task_runtime::StoreError>,
 {
     let cancel = echo_agent::agent::CancellationToken::new();
     let supervisor_cancel = cancel.clone();
-    let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
-    let run_store = agent.read(|value| value.run_store().cloned()).await;
-    let store_for_driver = store.clone();
-    let run_id_for_driver = run_id.clone();
-    let driver = async move {
-        let _cancel_registration = store_for_driver
-            .register_run_cancellation(&run_id_for_driver, cancel.clone())
-            .map_err(|error| format!("register run cancellation: {error}"))?;
-        let result = echo_agent_app_core::tasks::task_runtime::execute_run(
-            store_for_driver,
-            Some(agent),
-            reviewer_llm,
-            layer_manager,
-            run_store,
-            None,
-            &run_id_for_driver,
-            cancel,
-            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
-        )
-        .await;
-        if let Err(error) = result {
-            tracing::error!(run_id = %run_id_for_driver, %error, "TUI task run driver failed");
-            return Err(error.to_string());
-        }
-        Ok(())
-    };
+    let validation_store = store.clone();
+    let validation_run_id = run_id.clone();
+    let preparation_store = store.clone();
+    let preparation_run_id = run_id.clone();
     let (prepared, _) = store
         .spawn_supervised_run_driver(run_id, supervisor_cancel, move || {
-            prepare().map(|prepared| (prepared, driver))
-        })
-        .map_err(|error| error.to_string())?;
+            let memory_generation = review_integration
+                .as_ref()
+                .map(|integration| integration.lease_generation())
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "memory generation unavailable: {error}"
+                    ))
+                })?;
+            let layer_manager = memory_generation
+                .as_ref()
+                .map(|generation| Arc::new(generation.create_layer_manager()));
+            if validation_store.get_plan(&validation_run_id)?.is_none() {
+                return Err(
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                        "run has no persisted plan to resume".to_string(),
+                    ),
+                );
+            }
+            Ok((memory_generation, layer_manager))
+        }, move |(memory_generation, layer_manager)| {
+            let prepared = prepare()?;
+            Ok((prepared, move |mut receipt_owner: echo_agent_app_core::tasks::task_runtime::RunDriverReceiptOwner| async move {
+                if let Some(generation) = memory_generation.as_ref() {
+                    receipt_owner.retain(generation.clone());
+                }
+                let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
+                let run_store = agent.read(|value| value.run_store().cloned()).await;
+                let result = echo_agent_app_core::tasks::task_runtime::execute_run(
+                    preparation_store,
+                    Some(agent),
+                    reviewer_llm,
+                    layer_manager,
+                    memory_generation,
+                    run_store,
+                    None,
+                    &preparation_run_id,
+                    cancel,
+                    echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+                )
+                .await;
+                if let Err(error) = result {
+                    tracing::error!(run_id = %preparation_run_id, %error, "TUI task run driver failed");
+                    return Err(error.to_string());
+                }
+                Ok(())
+            }))
+        })?;
     Ok(prepared)
 }
 
@@ -5558,16 +5679,151 @@ mod tests {
     use super::{
         complete_file_reference, delete_previous_word, format_task_runtime_view,
         format_unattended_worktrees, handle_esc, move_cursor_vertical, parse_interaction_mode,
-        resolve_tui_workspace_file, reverse_history_search, slash_command_allowed_while_busy,
-        update_subagent_runs,
+        resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
+        slash_command_allowed_while_busy, update_subagent_runs,
     };
     use crate::tui::{TaskRuntimeTaskView, TaskRuntimeView, Theme, TuiApp};
-    use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
+    use echo_agent_app_core::tasks::task_runtime::{
+        AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanTask, TaskPlan,
+        TaskRunStatus, TaskRuntimeStore, TodoStatus, commit_eko_task_plan,
+    };
+    use std::sync::Arc;
 
     fn app() -> TuiApp {
         let theme =
             Theme::from_color_theme(&echo_agent_app_core::output::theme::ColorTheme::dark());
         TuiApp::new("test-model".to_string(), "test".to_string(), theme)
+    }
+
+    fn task_test_agent() -> Result<echo_agent::agent::AgentHandle, String> {
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("test-model")
+                .with_response("done"),
+        );
+        echo_agent::agent::ReactAgentBuilder::new()
+            .model("test-model")
+            .llm_client(llm)
+            .build()
+            .map(echo_agent::agent::AgentHandle::new)
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn task_retry_keeps_runtime_unchanged_when_driver_admission_is_closed()
+    -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        store
+            .create_run(
+                "tui-retry-closed",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "preserve retry state",
+                "",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        commit_eko_task_plan(
+            store.clone(),
+            TaskPlan {
+                plan_id: "tui-retry-plan".to_string(),
+                run_id: "tui-retry-closed".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal: "preserve retry state".to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "retry-task".to_string(),
+                    title: "Retry task".to_string(),
+                    max_retries: 2,
+                    ..PlanTask::default()
+                }],
+            },
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        store
+            .transition_run("tui-retry-closed", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_task_status(
+                "tui-retry-closed",
+                "retry-task",
+                TodoStatus::Failed,
+                None,
+                Some("acceptance failed"),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("tui-retry-closed", TaskRunStatus::Failed)
+            .map_err(|error| error.to_string())?;
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let events_before = serde_json::to_value(
+            store
+                .list_events("tui-retry-closed", 0)
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let run_before = serde_json::to_value(
+            store
+                .get_run("tui-retry-closed")
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let plan_before = serde_json::to_value(
+            store
+                .get_plan("tui-retry-closed")
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+
+        let error = retry_tui_task(
+            store.clone(),
+            task_test_agent()?,
+            "tui-retry-closed".to_string(),
+            "retry-task".to_string(),
+            None,
+        )
+        .await
+        .err()
+        .ok_or_else(|| "TUI retry unexpectedly bypassed closed admission".to_string())?;
+        assert!(error.to_string().contains("task runtime is shutting down"));
+        assert_eq!(
+            events_before,
+            serde_json::to_value(
+                store
+                    .list_events("tui-retry-closed", 0)
+                    .map_err(|error| error.to_string())?
+            )
+            .map_err(|error| error.to_string())?
+        );
+        assert_eq!(
+            run_before,
+            serde_json::to_value(
+                store
+                    .get_run("tui-retry-closed")
+                    .map_err(|error| error.to_string())?
+            )
+            .map_err(|error| error.to_string())?
+        );
+        assert_eq!(
+            plan_before,
+            serde_json::to_value(
+                store
+                    .get_plan("tui-retry-closed")
+                    .map_err(|error| error.to_string())?
+            )
+            .map_err(|error| error.to_string())?
+        );
+        Ok(())
     }
 
     #[test]

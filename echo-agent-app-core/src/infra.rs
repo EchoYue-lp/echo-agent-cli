@@ -473,17 +473,24 @@ pub async fn create_agent_with_diagnostics(
     // Inject LlmCritic for self-verification. The critic scores the agent's
     // final_answer; if below threshold (7.0), feedback is injected and the
     // agent retries (up to verifier_max_retries=2).
-    // LlmCritic uses llm::chat → Config::get_model, the same config source
-    // as the main agent, so it reuses the already-configured model.
+    // Reuse the exact client prepared by the builder for the parent Agent.
+    // This keeps critic transport/protocol identity aligned without adding a
+    // second application-side provider resolver.
     // Fail-open on errors (verify.rs:91-93) ensures the main flow is never
     // blocked if the critic LLM call fails.
-    agent.set_critic(std::sync::Arc::new(
-        echo_agent::agent::critic::LlmCritic::new(model)
-            .with_pass_threshold(7.0)
-            .with_cache_user_id(cache_user_id.clone()),
-    ));
-    agent.config_mut().set_verifier_enabled(true);
-    tracing::info!("main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)");
+    if let Some(critic_client) = agent.llm_client().cloned() {
+        agent.set_critic(std::sync::Arc::new(
+            echo_agent::agent::critic::LlmCritic::new(critic_client)
+                .with_pass_threshold(7.0)
+                .with_cache_user_id(cache_user_id.clone()),
+        ));
+        agent.config_mut().set_verifier_enabled(true);
+        tracing::info!(
+            "main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)"
+        );
+    } else {
+        tracing::debug!("main agent: Critic self-verification skipped without an LLM client");
+    }
 
     tracing::info!(
         has_llm_config = injected_llm_config.is_some(),
@@ -1082,10 +1089,16 @@ fn register_default_hooks(agent: &mut ReactAgent) {
 pub fn spawn_mcp_health_check(
     state: Arc<crate::state::AppState>,
     cancel: echo_agent::agent::CancellationToken,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // 首次检查延迟 5 秒，等待 MCP 连接初始化完成
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("MCP health check task stopped before first pass");
+                return;
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
+        }
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -1097,7 +1110,7 @@ pub fn spawn_mcp_health_check(
                 }
             }
         }
-    });
+    })
 }
 
 /// Spawn Dreaming after boot settles, then repeat it on a daily cadence.
@@ -1116,7 +1129,7 @@ pub fn spawn_dreaming_task(
     primary_agent: crate::agent_handle::AgentHandle,
     pool: Option<Arc<crate::agent_pool::AgentPool>>,
     cancel: echo_agent::agent::CancellationToken,
-) {
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Initial delay so boot-time activity isn't interrupted.
         tokio::select! {
@@ -1134,7 +1147,20 @@ pub fn spawn_dreaming_task(
                     break;
                 }
                 _ = interval.tick() => {
-                    match run_dreaming_pass(&review_integration).await {
+                    let pass = run_dreaming_pass(
+                        &review_integration,
+                        &primary_agent,
+                        pool.as_ref(),
+                    );
+                    tokio::pin!(pass);
+                    let result = tokio::select! {
+                        _ = cancel.cancelled() => {
+                            tracing::info!("Dreaming task stopped during active pass");
+                            break;
+                        }
+                        result = &mut pass => result,
+                    };
+                    match result {
                         Ok(report) => {
                             tracing::info!(
                                 scanned = report.scanned,
@@ -1143,43 +1169,47 @@ pub fn spawn_dreaming_task(
                                 demoted = report.demoted,
                                 "Dreaming pass completed"
                             );
-                            if report.promoted > 0 {
-                                let root = primary_agent
-                                    .read(|agent| agent.working_dir())
-                                    .await;
-                                primary_agent
-                                    .write_async(|agent| {
-                                        Box::pin(async move {
-                                            crate::unified_memory::refresh_hot_memory_projection(
-                                                agent,
-                                                root.as_deref(),
-                                            )
-                                            .await;
-                                        })
-                                    })
-                                    .await;
-                                if let Some(ref agent_pool) = pool {
-                                    agent_pool.refresh_hot_memory_context().await;
-                                }
-                            }
                         }
                         Err(e) => tracing::warn!(error = %e, "Dreaming pass failed"),
                     }
                 }
             }
         }
-    });
+    })
 }
 
 async fn run_dreaming_pass(
     review_integration: &crate::evolution::ReviewIntegration,
+    primary_agent: &crate::agent_handle::AgentHandle,
+    pool: Option<&Arc<crate::agent_pool::AgentPool>>,
 ) -> anyhow::Result<echo_agent::evolution::DreamingReport> {
-    let layer_manager = std::sync::Arc::new(review_integration.create_layer_manager());
+    // The lease covers both framework writes and EKO's replaceable projection
+    // refresh. A workspace transition therefore either observes the complete
+    // old generation or returns Busy before publishing the new generation.
+    let generation_lease = review_integration
+        .lease_generation()
+        .map_err(anyhow::Error::from)?;
+    let layer_manager = std::sync::Arc::new(generation_lease.create_layer_manager());
     let dreaming = echo_agent::evolution::Dreaming::new(
         layer_manager,
         echo_agent::evolution::DreamingConfig::default(),
     );
-    dreaming.run().await.map_err(anyhow::Error::from)
+    let report = dreaming.run().await.map_err(anyhow::Error::from)?;
+    if report.promoted > 0 {
+        let root = primary_agent.read(|agent| agent.working_dir()).await;
+        primary_agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    crate::unified_memory::refresh_hot_memory_projection(agent, root.as_deref())
+                        .await;
+                })
+            })
+            .await;
+        if let Some(agent_pool) = pool {
+            agent_pool.refresh_hot_memory_context().await;
+        }
+    }
+    Ok(report)
 }
 
 /// 创建对话持久化 Store（文件），失败时返回 None（禁用持久化）

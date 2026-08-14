@@ -53,7 +53,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "task and cron commands",
             "task and cron commands",
             "shared background tools",
-            "SchedulerRunner to launch_cron_run",
+            "SchedulerRunner to supervised TaskRuntime cron driver",
         ],
     },
     CapabilityRow {

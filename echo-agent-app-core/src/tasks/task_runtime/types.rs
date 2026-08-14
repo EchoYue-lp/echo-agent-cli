@@ -103,7 +103,7 @@ impl ExecutionMode {
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "InteractionMode")]
 pub enum InteractionMode {
-    /// Force normal chat — never enter TaskRuntime even for complex input.
+    /// Prefer direct chat while retaining the explicit TaskRuntime graph tools.
     Chat,
     /// Create a formal TaskRuntime run and require a reviewable plan lifecycle.
     Task,

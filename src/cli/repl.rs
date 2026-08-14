@@ -106,14 +106,14 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     // be feature-equivalent with GUI). Cancelled on session exit.
     let dreaming_cancel = config.review_integration.as_ref().map(|ri| {
         let cancel = tokio_util::sync::CancellationToken::new();
-        echo_agent_app_core::infra::spawn_dreaming_task(
+        let task = echo_agent_app_core::infra::spawn_dreaming_task(
             ri.clone(),
             agent.clone(),
             config.pool.clone(),
             cancel.clone(),
         );
         tracing::info!("Dreaming task spawned for CLI session");
-        cancel
+        (cancel, task)
     });
 
     let model_name = agent.read(|a| a.model_name().to_string()).await;
@@ -253,16 +253,19 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         }
     }
 
+    // Stop and join Dreaming before final memory/evolution settlement.
+    if let Some((cancel, task)) = dreaming_cancel {
+        cancel.cancel();
+        if let Err(error) = task.await {
+            tracing::warn!(%error, "failed to join CLI Dreaming task");
+        }
+    }
+
     // ── Auto-memory: extract observations on session end ────────────
     run_auto_memory_on_exit(&agent, &config.review_integration).await;
 
     // ── Memory review: staleness scoring, conflict detection, GC ────
-    run_memory_review_on_exit(&agent, &config.review_integration).await;
-
-    // ── Stop Dreaming background task ──────────────────────────────
-    if let Some(cancel) = dreaming_cancel {
-        cancel.cancel();
-    }
+    run_memory_review_on_exit(&config.review_integration).await;
 
     Ok(())
 }
@@ -285,6 +288,18 @@ async fn run_auto_memory_on_exit(
     if !enabled {
         return;
     }
+
+    let Some(integration) = review_integration.as_ref() else {
+        println!("  Auto-memory: Review integration is not configured.");
+        return;
+    };
+    let evidence_lease = match integration.lease_generation() {
+        Ok(lease) => lease,
+        Err(error) => {
+            println!("  Auto-memory: workspace is switching; candidates were not queued ({error})");
+            return;
+        }
+    };
 
     // Extract messages from the agent context
     let messages: Vec<(String, String)> = agent
@@ -316,14 +331,7 @@ async fn run_auto_memory_on_exit(
         return;
     }
 
-    let store = review_integration
-        .as_ref()
-        .map(|integration| integration.evidence_store())
-        .unwrap_or_else(|| {
-            echo_agent_app_core::evolution::EvidenceStore::new(
-                echo_agent_app_core::evolution::discover_echo_agent_dir(),
-            )
-        });
+    let store = evidence_lease.evidence_store();
     match queue_observations(&store, &observations, &messages) {
         Ok(candidates) => println!(
             "  Auto-memory: queued {} observation candidate(s) for review.",
@@ -339,51 +347,14 @@ async fn run_auto_memory_on_exit(
 /// memories, then queues actionable proposals in the Review Inbox. Non-blocking:
 /// errors are reported without disrupting exit flow.
 ///
-/// When `shared_ri` is provided, reuses the bootstrap-time ReviewIntegration
-/// (same shared store + layer manager as Dreaming). Otherwise falls back to
-/// building a temporary instance from the agent's store (legacy behavior).
 async fn run_memory_review_on_exit(
-    agent: &AgentHandle,
     shared_ri: &Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 ) {
-    // Prefer the shared ReviewIntegration (same store Dreaming uses).
-    if let Some(ri) = shared_ri {
-        if let Some(review_result) = ri.on_session_end().await {
-            match review_result {
-                Ok(report) => {
-                    let count = report.total_scanned;
-                    if count > 0 {
-                        println!(
-                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} proposals queued",
-                            count,
-                            report.stale_count,
-                            report.conflict_groups,
-                            report.conflict_proposals.len()
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  ⚠ Memory review failed: {e}");
-                }
-            }
-        }
-        return;
-    }
-
-    // Fallback: build a temporary ReviewIntegration from the agent's store.
-    let store = agent.read(|a| a.store().cloned()).await;
-    let Some(store) = store else {
+    let Some(ri) = shared_ri else {
+        tracing::debug!("session-end memory review skipped: ReviewIntegration is not configured");
         return;
     };
-
-    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
-    let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
-        echo_agent::evolution::ReviewConfig::default(),
-        echo_agent_dir,
-        store,
-    );
-
-    if let Some(review_result) = review_integration.on_session_end().await {
+    if let Some(review_result) = ri.on_session_end().await {
         match review_result {
             Ok(report) => {
                 let count = report.total_scanned;
@@ -471,10 +442,9 @@ async fn chat_with_agent(
         cancel: echo_agent::agent::CancellationToken::new(),
         mode_hint: Some(mode_hint_str),
         interaction_mode,
-        layer_manager: config
-            .review_integration
-            .as_ref()
-            .map(|integration| Arc::new(integration.create_layer_manager())),
+        review_integration: config.review_integration.clone(),
+        layer_manager: None,
+        memory_generation: None,
     });
     let agent_owned = agent.clone();
     let drive_task = tokio::spawn(async move {

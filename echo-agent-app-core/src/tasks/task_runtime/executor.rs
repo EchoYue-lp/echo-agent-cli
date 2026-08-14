@@ -323,6 +323,7 @@ pub async fn execute_run(
     primary_agent: Option<crate::agent_handle::AgentHandle>,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
+    memory_generation: Option<crate::evolution::ReviewGenerationLease>,
     run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
     trace_sink: Option<ExecSink>,
     run_id: &str,
@@ -457,6 +458,7 @@ pub async fn execute_run(
             super::memory_bridge::write_memory_candidate_dispatch(
                 memory_policy,
                 layer_manager.as_ref(),
+                memory_generation.as_ref(),
                 &store,
                 super::memory_bridge::MemoryEvent::RunCompleted {
                     run_id: run_id.to_string(),
@@ -517,6 +519,7 @@ pub async fn execute_run(
             super::memory_bridge::write_memory_candidate_dispatch(
                 memory_policy,
                 layer_manager.as_ref(),
+                memory_generation.as_ref(),
                 &store,
                 super::memory_bridge::MemoryEvent::RunCancelledByUser {
                     run_id: run_id.to_string(),
@@ -3616,7 +3619,8 @@ fn save_trace(
 /// The run is created with `attended_mode = Unattended` so the configured
 /// write preflight applies inside `task_execute` / `execute_task`.
 #[allow(clippy::too_many_arguments)] // run identity + Agent + cancellation + write policy form the driver boundary
-pub async fn launch_unattended_run(
+#[cfg(test)]
+async fn launch_unattended_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
     source_kind: &str,
@@ -3669,7 +3673,7 @@ pub(crate) fn create_unattended_run(
 }
 
 #[allow(clippy::too_many_arguments)] // retained compatibility wrapper around drive_agent_run
-pub async fn drive_unattended_run(
+pub(crate) async fn drive_unattended_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
     run_id: &str,
@@ -3969,30 +3973,6 @@ pub async fn drive_agent_run(
     }
 
     Ok(run_id.to_string())
-}
-
-/// Cron-specific thin wrapper: routes through `launch_unattended_run` with
-/// the `ParallelReadonlyDelegation` route (legacy `[plan]` behavior, Phase 3.1).
-pub async fn launch_cron_run(
-    store: Arc<TaskRuntimeStore>,
-    primary_agent: crate::agent_handle::AgentHandle,
-    cron_task_id: &str,
-    fire_id: &str,
-    prompt: &str,
-    parent_cancel: CancellationToken,
-) -> Result<String, ExecError> {
-    let run_id = uuid::Uuid::new_v4().to_string();
-    create_unattended_run(&store, &run_id, "cron", cron_task_id, fire_id, prompt)?;
-    drive_existing_cron_run(
-        store,
-        primary_agent,
-        run_id,
-        cron_task_id,
-        fire_id,
-        prompt,
-        parent_cancel,
-    )
-    .await
 }
 
 pub(crate) async fn drive_existing_cron_run(

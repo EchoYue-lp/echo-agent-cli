@@ -59,6 +59,14 @@ pub enum ClaimWriteOutcome {
     Superseded,
 }
 
+/// Canonical result of preparing a user-requested task retry while one
+/// TaskRuntime generation is pinned by the accepted driver registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRetryPreparation {
+    Acceptance { next_attempt: u32 },
+    Recovery,
+}
+
 /// File-backed TaskRuntime store. One instance per process; cheap to clone
 /// behind `Arc`. The event stream is authoritative; plan and execution files
 /// are deterministic read projections.
@@ -76,6 +84,20 @@ pub struct TaskRuntimeStore {
     /// Accepted TaskRun driver tasks. The store is the existing runtime owner,
     /// so dropping an individual surface waiter never drops the actual driver.
     run_driver_supervisor: std::sync::Mutex<RunDriverSupervisor>,
+    /// Wakes the store-owned shutdown settlement after the last pre-shutdown
+    /// driver admission reservation either registers a driver or is released.
+    run_driver_admission_idle: tokio::sync::Notify,
+    #[cfg(test)]
+    run_driver_shutdown_started: tokio::sync::Notify,
+    #[cfg(test)]
+    abort_next_run_driver_shutdown_reporter: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    run_driver_admission_test_barrier: std::sync::Mutex<Option<RunDriverAdmissionTestBarrier>>,
+    #[cfg(test)]
+    run_driver_registration_test_barrier:
+        std::sync::Mutex<Option<RunDriverRegistrationTestBarrier>>,
+    #[cfg(test)]
+    fail_next_run_driver_registration: std::sync::atomic::AtomicBool,
     /// File-backed event authority and deterministic projections.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     shadow_generation: std::sync::Mutex<ShadowGeneration>,
@@ -109,27 +131,176 @@ pub(crate) struct WorkspaceGenerationLease {
 
 struct RunDriverSupervisor {
     accepting: bool,
+    pending_admissions: usize,
     driver_cancels: std::collections::HashMap<u64, echo_agent::agent::CancellationToken>,
+    /// Opaque capability and exact run identity for every live driver token.
+    /// Framework-spawned tool calls must match both before transferring a
+    /// receipt here; sequential internal tokens are never exposed as authority.
+    driver_contexts: std::collections::HashMap<String, RunDriverExecutionContext>,
     driver_settlements: tokio::task::JoinSet<(u64, Result<(), String>)>,
     settlement_debts: Vec<RunSettlementDebt>,
     next_driver_token: u64,
     execution_receipts: std::collections::HashMap<u64, Vec<Box<dyn RunDriverExecutionReceipt>>>,
+    shutdown_result_sender:
+        Option<tokio::sync::watch::Sender<Option<Result<(), TaskRunDriverShutdownError>>>>,
+    shutdown_result:
+        Option<tokio::sync::watch::Receiver<Option<Result<(), TaskRunDriverShutdownError>>>>,
+    shutdown_owner: Option<std::sync::Arc<tokio::sync::Mutex<RunDriverShutdownOwner>>>,
+    /// Canonical store-owned reporter. Polling its JoinHandle through this
+    /// shared mutex is cancellation-safe: a dropped waiter never takes it.
+    shutdown_reporter: Option<std::sync::Arc<tokio::sync::Mutex<RunDriverShutdownReporter>>>,
+    shutdown_reporter_errors: Vec<String>,
 }
 
-pub(crate) trait RunDriverExecutionReceipt: Send {
+struct RunDriverExecutionContext {
+    driver_token: u64,
+    run_id: String,
+}
+
+enum RunDriverShutdownReporter {
+    Running(tokio::task::JoinHandle<()>),
+    Completed,
+}
+
+enum RunDriverShutdownOwner {
+    Running(tokio::task::JoinHandle<Result<(), TaskRunDriverShutdownError>>),
+    Completed(Result<(), TaskRunDriverShutdownError>),
+}
+
+#[cfg(test)]
+struct RunDriverAdmissionTestBarrier {
+    reserved: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+struct RunDriverRegistrationTestBarrier {
+    registered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+/// Durable TaskRun terminal state that could not be written during the final
+/// shutdown retry. The on-disk run remains authoritative; this diagnostic
+/// records the uncommitted target and why execution resources were abandoned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbandonedRunSettlement {
+    pub run_id: String,
+    pub driver_token: Option<u64>,
+    pub root: PathBuf,
+    pub target: TaskRunStatus,
+    pub error: String,
+}
+
+impl std::fmt::Display for AbandonedRunSettlement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let driver_token = self
+            .driver_token
+            .map(|token| token.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        write!(
+            formatter,
+            "run={} driver_token={} root={} target={} error={}",
+            self.run_id,
+            driver_token,
+            self.root.display(),
+            self.target.as_str(),
+            self.error
+        )
+    }
+}
+
+/// Aggregated shutdown degradation. Accepted drivers are fully drained and
+/// all exact execution receipts are released before this error is returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunDriverShutdownError {
+    pub driver_errors: Vec<String>,
+    pub abandoned_settlements: Vec<AbandonedRunSettlement>,
+}
+
+impl std::fmt::Display for TaskRunDriverShutdownError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut details = self.driver_errors.clone();
+        details.extend(self.abandoned_settlements.iter().map(ToString::to_string));
+        write!(
+            formatter,
+            "TaskRun driver shutdown degraded: {}",
+            details.join("; ")
+        )
+    }
+}
+
+impl std::error::Error for TaskRunDriverShutdownError {}
+
+fn add_shutdown_driver_error(
+    result: &mut Result<(), TaskRunDriverShutdownError>,
+    driver_error: String,
+) {
+    match result {
+        Ok(()) => {
+            *result = Err(TaskRunDriverShutdownError {
+                driver_errors: vec![driver_error],
+                abandoned_settlements: Vec::new(),
+            });
+        }
+        Err(error) => error.driver_errors.push(driver_error),
+    }
+}
+
+/// One execution resource retained by the canonical TaskRun driver until its
+/// durable terminal state (or settlement debt) has completed.
+pub trait RunDriverExecutionReceipt: Send {
+    /// Release the resource after later-acquired receipts have settled.
     fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()>;
 }
 
 /// Capability handed only to an accepted TaskRun driver. Pool-backed adapters
 /// transfer their execution receipt here immediately after acquisition so it
 /// survives inner future errors and panics until durable run settlement.
-pub(crate) struct RunDriverReceiptOwner {
+pub struct RunDriverReceiptOwner {
     store: std::sync::Arc<TaskRuntimeStore>,
     driver_token: u64,
+    execution_context_id: String,
+}
+
+type BoxRunDriverFuture<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, String>> + Send + 'static>>;
+
+enum RunDriverStart<T> {
+    Execute(BoxRunDriverFuture<T>),
+    PreparationFailed(String),
+    Reject(String),
+}
+
+/// Exact driver registration completed before callers mutate TaskRuntime.
+/// Dropping an unstarted registration wakes the canonical owner as a rejected
+/// preparation, so shutdown never waits forever for an accepted slot.
+#[must_use]
+pub(crate) struct RegisteredRunDriver<T: Send + 'static> {
+    start_sender: Option<tokio::sync::oneshot::Sender<RunDriverStart<T>>>,
+    result_receiver: Option<tokio::sync::oneshot::Receiver<Result<T, String>>>,
+    receipt_owner: Option<RunDriverReceiptOwner>,
+    preparation_started: bool,
+    active: bool,
+}
+
+/// Exact pre-execution admission owned by the canonical TaskRuntime
+/// supervisor. It is acquired before any run mutation or workspace-bound
+/// memory/pool admission and consumed only when the driver is registered.
+#[must_use]
+pub(crate) struct RunDriverAdmissionReservation {
+    store: std::sync::Arc<TaskRuntimeStore>,
+    run_id: String,
+    cancel: echo_agent::agent::CancellationToken,
+    active: bool,
 }
 
 impl RunDriverReceiptOwner {
-    pub(crate) fn retain<Receipt>(self, receipt: Receipt)
+    const EXECUTION_CONTEXT_PREFIX: &'static str = "eko-task-driver:";
+
+    /// Retain one driver resource. Factories passed to `spawn_run_driver` must
+    /// call this from the returned future, not while constructing that future,
+    /// because driver admission is serialized by the supervisor lock.
+    pub fn retain<Receipt>(&mut self, receipt: Receipt)
     where
         Receipt: RunDriverExecutionReceipt + 'static,
     {
@@ -142,12 +313,100 @@ impl RunDriverReceiptOwner {
             .or_default()
             .push(Box::new(receipt));
     }
+
+    /// Opaque value-carried identity for framework-spawned tool execution.
+    /// The canonical store validates it against this exact live driver.
+    pub(crate) fn execution_context_id(&self) -> String {
+        self.execution_context_id.clone()
+    }
+}
+
+impl<T: Send + 'static> RegisteredRunDriver<T> {
+    pub(crate) fn mark_preparation_started(&mut self) {
+        self.preparation_started = true;
+    }
+
+    pub(crate) fn start<F, Factory>(
+        mut self,
+        factory: Factory,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, String>>
+    where
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+        Factory: FnOnce(RunDriverReceiptOwner) -> F,
+    {
+        let receiver = self.result_receiver.take().unwrap_or_else(|| {
+            let (_sender, receiver) = tokio::sync::oneshot::channel();
+            receiver
+        });
+        let start = self
+            .receipt_owner
+            .take()
+            .map(|owner| RunDriverStart::Execute(Box::pin(factory(owner))));
+        if let (Some(sender), Some(start)) = (self.start_sender.take(), start) {
+            let _start_delivered = sender.send(start);
+        }
+        self.active = false;
+        receiver
+    }
+
+    pub(crate) fn reject(mut self, error: impl Into<String>) {
+        if let Some(sender) = self.start_sender.take() {
+            let _start_delivered = sender.send(RunDriverStart::Reject(error.into()));
+        }
+        self.active = false;
+    }
+
+    pub(crate) fn fail_preparation(mut self, error: impl Into<String>) {
+        if let Some(sender) = self.start_sender.take() {
+            let _start_delivered = sender.send(RunDriverStart::PreparationFailed(error.into()));
+        }
+        self.active = false;
+    }
+}
+
+impl<T: Send + 'static> Drop for RegisteredRunDriver<T> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Some(sender) = self.start_sender.take() {
+            let message =
+                "TaskRun driver registration dropped before preparation completed".to_string();
+            let start = if self.preparation_started {
+                RunDriverStart::PreparationFailed(message)
+            } else {
+                RunDriverStart::Reject(message)
+            };
+            let _start_delivered = sender.send(start);
+        }
+    }
+}
+
+impl Drop for RunDriverAdmissionReservation {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let became_idle = {
+            let mut supervisor = self
+                .store
+                .run_driver_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            supervisor.pending_admissions = supervisor.pending_admissions.saturating_sub(1);
+            supervisor.pending_admissions == 0
+        };
+        if became_idle {
+            self.store.run_driver_admission_idle.notify_one();
+        }
+    }
 }
 
 struct RunSettlementDebt {
     generation_lease: WorkspaceGenerationLease,
     driver_token: Option<u64>,
     run_id: String,
+    root: PathBuf,
     target: TaskRunStatus,
     note: Option<String>,
     last_error: String,
@@ -157,11 +416,18 @@ impl Default for RunDriverSupervisor {
     fn default() -> Self {
         Self {
             accepting: true,
+            pending_admissions: 0,
             driver_cancels: std::collections::HashMap::new(),
+            driver_contexts: std::collections::HashMap::new(),
             driver_settlements: tokio::task::JoinSet::new(),
             settlement_debts: Vec::new(),
             next_driver_token: 0,
             execution_receipts: std::collections::HashMap::new(),
+            shutdown_result_sender: None,
+            shutdown_result: None,
+            shutdown_owner: None,
+            shutdown_reporter: None,
+            shutdown_reporter_errors: Vec::new(),
         }
     }
 }
@@ -270,6 +536,13 @@ pub struct RunCancellationRegistration {
     run_id: String,
     token: echo_agent::agent::CancellationToken,
     previous: Option<echo_agent::agent::CancellationToken>,
+    terminalize_on_cancel: bool,
+}
+
+impl RunCancellationRegistration {
+    fn arm_terminal_settlement(&mut self) {
+        self.terminalize_on_cancel = true;
+    }
 }
 
 impl RunCancellationRegistration {
@@ -402,7 +675,7 @@ impl Drop for RunCancellationRegistration {
             false
         };
 
-        if cancelled && owns_registration {
+        if cancelled && owns_registration && self.terminalize_on_cancel {
             self.finalize_cancelled_run();
         }
     }
@@ -429,6 +702,17 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
+            run_driver_admission_idle: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            run_driver_shutdown_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            abort_next_run_driver_shutdown_reporter: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            run_driver_admission_test_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            run_driver_registration_test_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_run_driver_registration: std::sync::atomic::AtomicBool::new(false),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
@@ -461,6 +745,17 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
+            run_driver_admission_idle: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            run_driver_shutdown_started: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            abort_next_run_driver_shutdown_reporter: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            run_driver_admission_test_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            run_driver_registration_test_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_next_run_driver_registration: std::sync::atomic::AtomicBool::new(false),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
@@ -534,39 +829,255 @@ impl TaskRuntimeStore {
 
     /// Stop accepting TaskRun drivers, cancel every accepted driver, and await
     /// their owned settlement before the store's hook consumer is torn down.
-    pub async fn shutdown_run_drivers(&self) -> Result<(), String> {
-        let (driver_cancels, mut driver_settlements) = {
-            let mut supervisor = self
-                .run_driver_supervisor
-                .lock()
-                .map_err(|_| "TaskRun driver supervisor lock is poisoned".to_string())?;
-            supervisor.accepting = false;
-            (
-                std::mem::take(&mut supervisor.driver_cancels),
-                std::mem::take(&mut supervisor.driver_settlements),
-            )
+    pub async fn shutdown_run_drivers(
+        self: &std::sync::Arc<Self>,
+    ) -> Result<(), TaskRunDriverShutdownError> {
+        let (mut shutdown_result, shutdown_sender, shutdown_reporter) = {
+            let mut supervisor =
+                self.run_driver_supervisor
+                    .lock()
+                    .map_err(|_| TaskRunDriverShutdownError {
+                        driver_errors: vec![
+                            "TaskRun driver supervisor lock is poisoned".to_string(),
+                        ],
+                        abandoned_settlements: Vec::new(),
+                    })?;
+            if let (Some(sender), Some(result), Some(reporter)) = (
+                supervisor.shutdown_result_sender.as_ref(),
+                supervisor.shutdown_result.as_ref(),
+                supervisor.shutdown_reporter.as_ref(),
+            ) {
+                (result.clone(), sender.clone(), reporter.clone())
+            } else {
+                supervisor.accepting = false;
+                #[cfg(test)]
+                self.run_driver_shutdown_started.notify_one();
+                for cancel in supervisor.driver_cancels.values() {
+                    cancel.cancel();
+                }
+                let (result_sender, result_receiver) = tokio::sync::watch::channel(None);
+                supervisor.shutdown_result_sender = Some(result_sender.clone());
+                supervisor.shutdown_result = Some(result_receiver.clone());
+                let settlement_store = std::sync::Arc::clone(self);
+                let owner = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    RunDriverShutdownOwner::Running(tokio::spawn(async move {
+                        settlement_store.settle_run_driver_shutdown().await
+                    })),
+                ));
+                supervisor.shutdown_owner = Some(owner.clone());
+                let reporter = std::sync::Arc::new(tokio::sync::Mutex::new(
+                    RunDriverShutdownReporter::Running(
+                        self.spawn_run_driver_shutdown_reporter(owner, result_sender.clone()),
+                    ),
+                ));
+                supervisor.shutdown_reporter = Some(reporter.clone());
+                (result_receiver, result_sender, reporter)
+            }
         };
-        for cancel in driver_cancels.values() {
-            cancel.cancel();
+
+        loop {
+            let observed_result = shutdown_result.borrow().clone();
+            if let Some(result) = observed_result {
+                return result;
+            }
+            tokio::select! {
+                changed = shutdown_result.changed() => {
+                    if changed.is_err() {
+                        self.restart_run_driver_shutdown_reporter(
+                            &shutdown_reporter,
+                            &shutdown_sender,
+                            "TaskRun driver shutdown result channel closed before publication"
+                                .to_string(),
+                        )
+                        .await;
+                    }
+                }
+                () = self.observe_run_driver_shutdown_reporter(
+                    &shutdown_reporter,
+                    &shutdown_sender,
+                ) => {}
+            }
         }
-        let mut errors = Vec::new();
+    }
+
+    fn spawn_run_driver_shutdown_reporter(
+        self: &std::sync::Arc<Self>,
+        owner: std::sync::Arc<tokio::sync::Mutex<RunDriverShutdownOwner>>,
+        result_sender: tokio::sync::watch::Sender<Option<Result<(), TaskRunDriverShutdownError>>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let reporter_store = std::sync::Arc::clone(self);
+        #[cfg(test)]
+        let abort_reporter = self
+            .abort_next_run_driver_shutdown_reporter
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let abort_reporter = false;
+        let reporter = tokio::spawn(async move {
+            if abort_reporter {
+                futures::future::pending::<()>().await;
+            }
+            let mut result = {
+                let mut owner_state = owner.lock().await;
+                match &mut *owner_state {
+                    RunDriverShutdownOwner::Completed(result) => result.clone(),
+                    RunDriverShutdownOwner::Running(owner_handle) => {
+                        let result = match owner_handle.await {
+                            Ok(result) => result,
+                            Err(error) => Err(TaskRunDriverShutdownError {
+                                driver_errors: vec![format!(
+                                    "TaskRun driver shutdown settlement owner failed: {error}"
+                                )],
+                                abandoned_settlements: Vec::new(),
+                            }),
+                        };
+                        *owner_state = RunDriverShutdownOwner::Completed(result.clone());
+                        result
+                    }
+                }
+            };
+            let reporter_errors = {
+                let mut supervisor = reporter_store
+                    .run_driver_supervisor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::mem::take(&mut supervisor.shutdown_reporter_errors)
+            };
+            for error in reporter_errors {
+                add_shutdown_driver_error(&mut result, error);
+            }
+            result_sender.send_replace(Some(result));
+        });
+        if abort_reporter {
+            reporter.abort();
+        }
+        reporter
+    }
+
+    async fn observe_run_driver_shutdown_reporter(
+        self: &std::sync::Arc<Self>,
+        reporter: &std::sync::Arc<tokio::sync::Mutex<RunDriverShutdownReporter>>,
+        result_sender: &tokio::sync::watch::Sender<Option<Result<(), TaskRunDriverShutdownError>>>,
+    ) {
+        let mut reporter_state = reporter.lock().await;
+        let RunDriverShutdownReporter::Running(reporter_handle) = &mut *reporter_state else {
+            return;
+        };
+        match reporter_handle.await {
+            Ok(()) => {
+                *reporter_state = RunDriverShutdownReporter::Completed;
+            }
+            Err(error) => {
+                let reporter_error = format!("TaskRun driver shutdown reporter failed: {error}");
+                self.run_driver_supervisor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .shutdown_reporter_errors
+                    .push(reporter_error);
+                let owner = self
+                    .run_driver_supervisor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .shutdown_owner
+                    .clone();
+                let Some(owner) = owner else {
+                    return;
+                };
+                *reporter_state = RunDriverShutdownReporter::Running(
+                    self.spawn_run_driver_shutdown_reporter(owner, result_sender.clone()),
+                );
+            }
+        }
+    }
+
+    async fn restart_run_driver_shutdown_reporter(
+        self: &std::sync::Arc<Self>,
+        reporter: &std::sync::Arc<tokio::sync::Mutex<RunDriverShutdownReporter>>,
+        result_sender: &tokio::sync::watch::Sender<Option<Result<(), TaskRunDriverShutdownError>>>,
+        error: String,
+    ) {
+        let mut reporter_state = reporter.lock().await;
+        self.run_driver_supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown_reporter_errors
+            .push(error);
+        let owner = self
+            .run_driver_supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .shutdown_owner
+            .clone();
+        let Some(owner) = owner else {
+            return;
+        };
+        *reporter_state = RunDriverShutdownReporter::Running(
+            self.spawn_run_driver_shutdown_reporter(owner, result_sender.clone()),
+        );
+    }
+
+    async fn settle_run_driver_shutdown(&self) -> Result<(), TaskRunDriverShutdownError> {
+        let mut driver_settlements = loop {
+            let admission_released = self.run_driver_admission_idle.notified();
+            let settlements = {
+                let mut supervisor = self
+                    .run_driver_supervisor
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for cancel in supervisor.driver_cancels.values() {
+                    cancel.cancel();
+                }
+                if supervisor.pending_admissions == 0 {
+                    Some(std::mem::take(&mut supervisor.driver_settlements))
+                } else {
+                    None
+                }
+            };
+            if let Some(settlements) = settlements {
+                break settlements;
+            }
+            admission_released.await;
+        };
+        let mut driver_errors = Vec::new();
         while let Some(driver) = driver_settlements.join_next().await {
             match driver {
                 Ok((_, Ok(()))) => {}
-                Ok((_, Err(error))) => errors.push(error),
-                Err(error) => errors.push(error.to_string()),
+                Ok((_, Err(error))) => driver_errors.push(error),
+                Err(error) => driver_errors.push(error.to_string()),
             }
         }
-        if let Err(error) = self.retry_run_settlement_debts().await {
-            errors.push(error.to_string());
+        let retry_error = self.retry_run_settlement_debts().await.err();
+        let abandoned_settlements = if retry_error.is_some() {
+            self.abandon_run_settlement_debts().await
+        } else {
+            Vec::new()
+        };
+        if let Some(error) = retry_error
+            && abandoned_settlements.is_empty()
+        {
+            driver_errors.push(error.to_string());
         }
-        if errors.is_empty() {
+        let remaining_receipts = {
+            let mut supervisor = self
+                .run_driver_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            supervisor.driver_cancels.clear();
+            supervisor
+                .execution_receipts
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        for driver_token in remaining_receipts {
+            self.release_run_driver_receipts(driver_token).await;
+        }
+        if driver_errors.is_empty() && abandoned_settlements.is_empty() {
             Ok(())
         } else {
-            Err(format!(
-                "TaskRun driver settlement failed: {}",
-                errors.join("; ")
-            ))
+            Err(TaskRunDriverShutdownError {
+                driver_errors,
+                abandoned_settlements,
+            })
         }
     }
 
@@ -578,9 +1089,124 @@ impl TaskRuntimeStore {
                 supervisor
                     .driver_cancels
                     .len()
+                    .saturating_add(supervisor.pending_admissions)
                     .saturating_add(supervisor.settlement_debts.len())
             })
             .map_err(|_| "TaskRuntime run driver supervisor is unavailable".to_string())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_run_driver_shutdown_started(&self) {
+        self.run_driver_shutdown_started.notified().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abort_next_run_driver_shutdown_reporter_for_test(&self) {
+        self.abort_next_run_driver_shutdown_reporter
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn park_next_run_driver_admission_for_test(
+        &self,
+    ) -> Result<
+        (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ),
+        String,
+    > {
+        let (reserved_tx, reserved_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut barrier = self
+            .run_driver_admission_test_barrier
+            .lock()
+            .map_err(|_| "TaskRuntime admission test barrier lock is poisoned".to_string())?;
+        if barrier.is_some() {
+            return Err("TaskRuntime admission test barrier is already installed".to_string());
+        }
+        *barrier = Some(RunDriverAdmissionTestBarrier {
+            reserved: reserved_tx,
+            release: release_rx,
+        });
+        Ok((reserved_rx, release_tx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn park_next_run_driver_registration_for_test(
+        &self,
+    ) -> Result<
+        (
+            std::sync::mpsc::Receiver<()>,
+            std::sync::mpsc::SyncSender<()>,
+        ),
+        String,
+    > {
+        let (registered_tx, registered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let mut barrier = self
+            .run_driver_registration_test_barrier
+            .lock()
+            .map_err(|_| "TaskRuntime registration test barrier lock is poisoned".to_string())?;
+        if barrier.is_some() {
+            return Err("TaskRuntime registration test barrier is already installed".to_string());
+        }
+        *barrier = Some(RunDriverRegistrationTestBarrier {
+            registered: registered_tx,
+            release: release_rx,
+        });
+        Ok((registered_rx, release_tx))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_run_driver_registration_for_test(&self) {
+        self.fail_next_run_driver_registration
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_run_driver_receipt_count(&self) -> Result<usize, String> {
+        self.run_driver_supervisor
+            .lock()
+            .map(|supervisor| supervisor.execution_receipts.values().map(Vec::len).sum())
+            .map_err(|_| "TaskRuntime run driver supervisor is unavailable".to_string())
+    }
+
+    /// Transfer a resource acquired inside a framework-spawned tool task to
+    /// the exact canonical driver. Unknown, stale, or mismatched context is
+    /// rejected by returning ownership to the caller.
+    pub(crate) fn retain_run_driver_receipt_from_context<Receipt>(
+        &self,
+        run_id: &str,
+        execution_context_id: &str,
+        receipt: Receipt,
+    ) -> Result<(), Receipt>
+    where
+        Receipt: RunDriverExecutionReceipt + 'static,
+    {
+        if !execution_context_id.starts_with(RunDriverReceiptOwner::EXECUTION_CONTEXT_PREFIX) {
+            return Err(receipt);
+        }
+        let mut supervisor = self
+            .run_driver_supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(context) = supervisor.driver_contexts.get(execution_context_id) else {
+            return Err(receipt);
+        };
+        let token = context.driver_token;
+        if context.run_id != run_id {
+            return Err(receipt);
+        }
+        if !supervisor.driver_cancels.contains_key(&token) {
+            return Err(receipt);
+        }
+        supervisor
+            .execution_receipts
+            .entry(token)
+            .or_default()
+            .push(Box::new(receipt));
+        Ok(())
     }
 
     /// Retry durable terminal writes that previously failed while retaining
@@ -627,6 +1253,34 @@ impl TaskRuntimeStore {
         )))
     }
 
+    /// Final shutdown settlement for debts that remained after the last
+    /// durable retry. Preserve typed diagnostics, release each exact driver's
+    /// receipts in LIFO order, then release its workspace generation lease.
+    async fn abandon_run_settlement_debts(&self) -> Vec<AbandonedRunSettlement> {
+        let debts = {
+            let mut supervisor = self
+                .run_driver_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut supervisor.settlement_debts)
+        };
+        let mut abandoned = Vec::with_capacity(debts.len());
+        for debt in debts {
+            abandoned.push(AbandonedRunSettlement {
+                run_id: debt.run_id.clone(),
+                driver_token: debt.driver_token,
+                root: debt.root.clone(),
+                target: debt.target,
+                error: debt.last_error.clone(),
+            });
+            if let Some(driver_token) = debt.driver_token {
+                self.release_run_driver_receipts(driver_token).await;
+            }
+            drop(debt.generation_lease);
+        }
+        abandoned
+    }
+
     /// Finalize a run or quarantine the supplied generation receipt for a
     /// later retry. The receipt is never dropped on an unverified write.
     pub(crate) fn finalize_run_with_lease(
@@ -649,6 +1303,7 @@ impl TaskRuntimeStore {
                             generation_lease,
                             driver_token,
                             run_id: run_id.to_string(),
+                            root: self.shadow.root(),
                             target,
                             note: note.map(str::to_string),
                             last_error: error.to_string(),
@@ -659,42 +1314,128 @@ impl TaskRuntimeStore {
         }
     }
 
-    /// Accept an owned TaskRun driver. The caller receives only a result
-    /// waiter; cancellation of that waiter does not cancel the retained task.
-    pub(crate) fn spawn_run_driver<T, F, Factory>(
+    /// Reserve canonical driver admission before any run mutation or secondary
+    /// workspace-bound resource is acquired. Shutdown waits for every accepted
+    /// reservation to register an exact driver or be dropped.
+    pub(crate) fn reserve_run_driver_admission(
         self: &std::sync::Arc<Self>,
         run_id: String,
         cancel: echo_agent::agent::CancellationToken,
-        generation_lease: WorkspaceGenerationLease,
-        factory: Factory,
-    ) -> Result<tokio::sync::oneshot::Receiver<Result<T, String>>, StoreError>
-    where
-        T: Send + 'static,
-        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
-        Factory: FnOnce(RunDriverReceiptOwner) -> F,
-    {
-        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
-        let mut generation_lease = Some(generation_lease);
+    ) -> Result<RunDriverAdmissionReservation, StoreError> {
         let mut supervisor = self
             .run_driver_supervisor
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?;
         if !supervisor.accepting {
-            drop(supervisor);
-            let message = "task runtime is shutting down";
-            return match self.finalize_run_with_lease(
-                &mut generation_lease,
-                None,
-                &run_id,
-                TaskRunStatus::Failed,
-                Some(message),
-            ) {
-                Ok(_) => Err(StoreError::InvalidPlan(message.to_string())),
-                Err(error) => Err(StoreError::InvalidPlan(format!(
-                    "{message}; terminal settlement failed: {error}"
-                ))),
-            };
+            return Err(StoreError::InvalidPlan(
+                "task runtime is shutting down".to_string(),
+            ));
         }
+        supervisor.pending_admissions =
+            supervisor
+                .pending_admissions
+                .checked_add(1)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan(
+                        "TaskRun driver admission reservation capacity exhausted".to_string(),
+                    )
+                })?;
+        drop(supervisor);
+        let reservation = RunDriverAdmissionReservation {
+            store: std::sync::Arc::clone(self),
+            run_id,
+            cancel,
+            active: true,
+        };
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .run_driver_admission_test_barrier
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?
+            .take()
+        {
+            barrier.reserved.send(()).map_err(|_| {
+                StoreError::InvalidPlan(
+                    "TaskRuntime admission test observer stopped before reservation".to_string(),
+                )
+            })?;
+            barrier
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| {
+                    StoreError::InvalidPlan(format!(
+                        "TaskRuntime admission test barrier was not released: {error}"
+                    ))
+                })?;
+        }
+        Ok(reservation)
+    }
+
+    /// Register the exact owned driver before its caller performs any
+    /// workspace-bound preparation or TaskRuntime mutation.
+    pub(crate) fn register_run_driver<T>(
+        self: &std::sync::Arc<Self>,
+        admission: RunDriverAdmissionReservation,
+        generation_lease: WorkspaceGenerationLease,
+    ) -> Result<RegisteredRunDriver<T>, StoreError>
+    where
+        T: Send + 'static,
+    {
+        self.register_run_driver_with_requirement(admission, generation_lease, true)
+    }
+
+    /// Register a turn driver whose TaskRun is created lazily by `task_create`.
+    /// A Chat/Auto turn that never creates a run settles successfully, while a
+    /// lazily-created run remains subject to the same durable terminal contract.
+    pub(crate) fn register_optional_run_driver<T>(
+        self: &std::sync::Arc<Self>,
+        admission: RunDriverAdmissionReservation,
+        generation_lease: WorkspaceGenerationLease,
+    ) -> Result<RegisteredRunDriver<T>, StoreError>
+    where
+        T: Send + 'static,
+    {
+        self.register_run_driver_with_requirement(admission, generation_lease, false)
+    }
+
+    fn register_run_driver_with_requirement<T>(
+        self: &std::sync::Arc<Self>,
+        mut admission: RunDriverAdmissionReservation,
+        generation_lease: WorkspaceGenerationLease,
+        run_required: bool,
+    ) -> Result<RegisteredRunDriver<T>, StoreError>
+    where
+        T: Send + 'static,
+    {
+        #[cfg(test)]
+        if self
+            .fail_next_run_driver_registration
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::InvalidPlan(
+                "injected TaskRun driver registration failure".to_string(),
+            ));
+        }
+        if !std::sync::Arc::ptr_eq(self, &admission.store) {
+            return Err(StoreError::InvalidPlan(
+                "TaskRun driver admission belongs to another runtime store".to_string(),
+            ));
+        }
+        let runtime_handle = tokio::runtime::Handle::try_current().map_err(|error| {
+            StoreError::InvalidPlan(format!(
+                "TaskRun driver registration requires an active Tokio runtime: {error}"
+            ))
+        })?;
+        let run_id = admission.run_id.clone();
+        let cancel = admission.cancel.clone();
+        let cancellation_registration =
+            self.register_run_cancellation_internal(&run_id, cancel.clone(), false)?;
+        let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let mut supervisor = self
+            .run_driver_supervisor
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
         let driver_token = supervisor.next_driver_token.checked_add(1).ok_or_else(|| {
             StoreError::InvalidPlan("TaskRun driver token capacity exhausted".to_string())
         })?;
@@ -715,77 +1456,127 @@ impl TaskRuntimeStore {
         }
         let settlement_store = std::sync::Arc::clone(self);
         let driver_cancel = cancel.clone();
+        let execution_context_id = loop {
+            let candidate = format!(
+                "{}{}",
+                RunDriverReceiptOwner::EXECUTION_CONTEXT_PREFIX,
+                uuid::Uuid::new_v4()
+            );
+            if !supervisor.driver_contexts.contains_key(&candidate) {
+                break candidate;
+            }
+        };
         let receipt_owner = RunDriverReceiptOwner {
             store: std::sync::Arc::clone(self),
             driver_token,
+            execution_context_id: execution_context_id.clone(),
         };
-        let future = factory(receipt_owner);
-        let Some(generation_lease) = generation_lease.take() else {
-            drop(supervisor);
-            return Err(StoreError::InvalidPlan(
-                "TaskRun generation admission receipt was lost".to_string(),
-            ));
-        };
-        supervisor.driver_cancels.insert(driver_token, cancel);
-        supervisor.driver_settlements.spawn(async move {
+        admission.active = false;
+        supervisor.pending_admissions = supervisor.pending_admissions.saturating_sub(1);
+        let reservations_idle = supervisor.pending_admissions == 0;
+        if !supervisor.accepting {
+            cancel.cancel();
+        }
+        supervisor
+            .driver_cancels
+            .insert(driver_token, cancel.clone());
+        supervisor.driver_contexts.insert(
+            execution_context_id.clone(),
+            RunDriverExecutionContext {
+                driver_token,
+                run_id: run_id.clone(),
+            },
+        );
+        supervisor.driver_settlements.spawn_on(async move {
             let mut generation_lease = Some(generation_lease);
-            let mut result = match tokio::spawn(future).await {
-                Ok(result) => result,
-                Err(error) => {
-                    let message = format!("TaskRun driver task failed: {error}");
-                    Err(message)
-                }
-            };
-            let settlement = match &result {
-                Ok(_) => settlement_store.confirm_run_settled(&run_id),
-                Err(error) => {
-                    let target = if driver_cancel.is_cancelled() {
-                        TaskRunStatus::Cancelled
-                    } else {
-                        TaskRunStatus::Failed
+            let mut cancellation_registration = cancellation_registration;
+            let start = start_receiver.await;
+            let (mut result, should_settle) = match start {
+                Ok(RunDriverStart::Execute(future)) => {
+                    cancellation_registration.arm_terminal_settlement();
+                    let result = match tokio::spawn(future).await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            let message = format!("TaskRun driver task failed: {error}");
+                            Err(message)
+                        }
                     };
-                    settlement_store
-                        .finalize_run_with_lease(
+                    (result, true)
+                }
+                Ok(RunDriverStart::PreparationFailed(error)) => {
+                    cancellation_registration.arm_terminal_settlement();
+                    (Err(error), true)
+                }
+                Ok(RunDriverStart::Reject(error)) => (Err(error), false),
+                Err(error) => (
+                    Err(format!(
+                        "TaskRun driver preparation channel closed before start: {error}"
+                    )),
+                    false,
+                ),
+            };
+            if should_settle {
+                let settlement = match &result {
+                    Ok(_) => settlement_store.confirm_run_settled(&run_id, run_required),
+                    Err(error) => {
+                        match settlement_store.get_run(&run_id) {
+                            Ok(None) if !run_required => Ok(()),
+                            Ok(_) => {
+                                let target = if driver_cancel.is_cancelled() {
+                                    TaskRunStatus::Cancelled
+                                } else {
+                                    TaskRunStatus::Failed
+                                };
+                                settlement_store
+                                    .finalize_run_with_lease(
+                                        &mut generation_lease,
+                                        Some(driver_token),
+                                        &run_id,
+                                        target,
+                                        Some(error),
+                                    )
+                                    .map(|_| ())
+                            }
+                            Err(read_error) => Err(read_error),
+                        }
+                    }
+                };
+                if let Err(settlement_error) = settlement {
+                    let original = result.as_ref().err().cloned().unwrap_or_else(|| {
+                        "TaskRun driver returned before durable settlement".to_string()
+                    });
+                    if generation_lease.is_some() {
+                        match settlement_store.finalize_run_with_lease(
                             &mut generation_lease,
                             Some(driver_token),
                             &run_id,
-                            target,
-                            Some(error),
-                        )
-                        .map(|_| ())
-                }
-            };
-            if let Err(settlement_error) = settlement {
-                let original = result.as_ref().err().cloned().unwrap_or_else(|| {
-                    "TaskRun driver returned before durable settlement".to_string()
-                });
-                if generation_lease.is_some() {
-                    match settlement_store.finalize_run_with_lease(
-                        &mut generation_lease,
-                        Some(driver_token),
-                        &run_id,
-                        TaskRunStatus::Failed,
-                        Some(&original),
-                    ) {
-                        Ok(_) => {
-                            settlement_store
-                                .release_run_driver_receipts(driver_token)
-                                .await;
-                            result = Err(format!(
-                                "{original}; recovered non-terminal driver result after: {settlement_error}"
-                            ));
+                            TaskRunStatus::Failed,
+                            Some(&original),
+                        ) {
+                            Ok(_) => {
+                                settlement_store
+                                    .release_run_driver_receipts(driver_token)
+                                    .await;
+                                result = Err(format!(
+                                    "{original}; recovered non-terminal driver result after: {settlement_error}"
+                                ));
+                            }
+                            Err(recovery_error) => {
+                                let combined = format!(
+                                    "{original}; terminal settlement failed: {settlement_error}; fallback terminal settlement failed: {recovery_error}"
+                                );
+                                result = Err(combined);
+                            }
                         }
-                        Err(recovery_error) => {
-                            let combined = format!(
-                                "{original}; terminal settlement failed: {settlement_error}; fallback terminal settlement failed: {recovery_error}"
-                            );
-                            result = Err(combined);
-                        }
+                    } else {
+                        let combined =
+                            format!("{original}; terminal settlement failed: {settlement_error}");
+                        result = Err(combined);
                     }
                 } else {
-                    let combined =
-                        format!("{original}; terminal settlement failed: {settlement_error}");
-                    result = Err(combined);
+                    settlement_store
+                        .release_run_driver_receipts(driver_token)
+                        .await;
                 }
             } else {
                 settlement_store
@@ -805,19 +1596,85 @@ impl TaskRuntimeStore {
             // workspace transition retry that canonical debt and report only
             // if it remains unsettled.
             (driver_token, Ok(()))
-        });
-        Ok(result_receiver)
+        }, &runtime_handle);
+        drop(supervisor);
+        if reservations_idle {
+            self.run_driver_admission_idle.notify_one();
+        }
+        #[cfg(test)]
+        if let Some(barrier) = self
+            .run_driver_registration_test_barrier
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?
+            .take()
+        {
+            barrier.registered.send(()).map_err(|_| {
+                StoreError::InvalidPlan(
+                    "TaskRuntime registration test observer stopped before registration"
+                        .to_string(),
+                )
+            })?;
+            barrier
+                .release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| {
+                    StoreError::InvalidPlan(format!(
+                        "TaskRuntime registration test barrier was not released: {error}"
+                    ))
+                })?;
+        }
+        Ok(RegisteredRunDriver {
+            start_sender: Some(start_sender),
+            result_receiver: Some(result_receiver),
+            receipt_owner: Some(receipt_owner),
+            preparation_started: false,
+            active: true,
+        })
+    }
+
+    /// Accept an owned TaskRun driver. The caller receives only a result
+    /// waiter; cancellation of that waiter does not cancel the retained task.
+    #[cfg(test)]
+    pub(crate) fn spawn_run_driver<T, F, Factory>(
+        self: &std::sync::Arc<Self>,
+        admission: RunDriverAdmissionReservation,
+        generation_lease: WorkspaceGenerationLease,
+        factory: Factory,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<T, String>>, StoreError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+        Factory: FnOnce(RunDriverReceiptOwner) -> F,
+    {
+        let registration = self.register_run_driver(admission, generation_lease)?;
+        Ok(registration.start(factory))
     }
 
     async fn release_run_driver_receipts(&self, driver_token: u64) {
-        let receipts = self
-            .run_driver_supervisor
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .execution_receipts
-            .remove(&driver_token)
-            .unwrap_or_default();
-        for receipt in receipts {
+        let receipts = {
+            let mut supervisor = self
+                .run_driver_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(context_id) =
+                supervisor
+                    .driver_contexts
+                    .iter()
+                    .find_map(|(context_id, context)| {
+                        (context.driver_token == driver_token).then(|| context_id.clone())
+                    })
+            {
+                supervisor.driver_contexts.remove(&context_id);
+            }
+            supervisor
+                .execution_receipts
+                .remove(&driver_token)
+                .unwrap_or_default()
+        };
+        // Receipts are acquired TaskRuntime -> memory -> pool. Release in the
+        // inverse order so asynchronous pool settlement completes before the
+        // workspace-bound memory generation can be rebound.
+        for receipt in receipts.into_iter().rev() {
             receipt.release().await;
         }
     }
@@ -825,27 +1682,125 @@ impl TaskRuntimeStore {
     /// Atomically admit a binary/UI TaskRun driver, run its synchronous
     /// preparation while the current workspace generation is pinned, and
     /// transfer that pin to the canonical owned driver supervisor.
-    pub fn spawn_supervised_run_driver<T, Prepared, F, Prepare>(
+    pub fn spawn_supervised_run_driver<T, Prepared, Context, F, Factory, Preflight, Prepare>(
         self: &std::sync::Arc<Self>,
         run_id: String,
         cancel: echo_agent::agent::CancellationToken,
+        preflight: Preflight,
         prepare: Prepare,
     ) -> Result<(Prepared, tokio::sync::oneshot::Receiver<Result<T, String>>), StoreError>
     where
         T: Send + 'static,
+        Context: Send + 'static,
         F: std::future::Future<Output = Result<T, String>> + Send + 'static,
-        Prepare: FnOnce() -> Result<(Prepared, F), StoreError>,
+        Factory: FnOnce(RunDriverReceiptOwner) -> F,
+        Preflight: FnOnce() -> Result<Context, StoreError>,
+        Prepare: FnOnce(Context) -> Result<(Prepared, Factory), StoreError>,
     {
+        let admission = self.reserve_run_driver_admission(run_id, cancel)?;
         let generation_lease = self.lease_active_workspace_generation()?;
-        let (prepared, future) = prepare()?;
-        let waiter = self.spawn_run_driver(run_id, cancel, generation_lease, move |_| future)?;
+        let mut registration = self.register_run_driver(admission, generation_lease)?;
+        let context = match preflight() {
+            Ok(context) => context,
+            Err(error) => {
+                registration.reject(error.to_string());
+                return Err(error);
+            }
+        };
+        registration.mark_preparation_started();
+        let (prepared, factory) = match prepare(context) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                registration.fail_preparation(error.to_string());
+                return Err(error);
+            }
+        };
+        let waiter = registration.start(factory);
         Ok((prepared, waiter))
     }
 
-    fn confirm_run_settled(&self, run_id: &str) -> Result<(), StoreError> {
-        let run = self
-            .get_run(run_id)?
-            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+    /// Choose between acceptance retry and durable process-recovery retry while
+    /// the caller's exact driver registration pins one TaskRuntime generation.
+    fn prepare_task_retry(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        has_recovery_blocker: bool,
+    ) -> Result<TaskRetryPreparation, StoreError> {
+        if has_recovery_blocker {
+            self.resolve_recovery_task(run_id, task_id, RecoveryDecision::Retry)?;
+            Ok(TaskRetryPreparation::Recovery)
+        } else {
+            self.retry_blocked_task(run_id, task_id)
+                .map(|next_attempt| TaskRetryPreparation::Acceptance { next_attempt })
+        }
+    }
+
+    /// TUI/CLI retry facade. Exact supervisor registration and generation
+    /// admission complete before resource preflight and before the canonical
+    /// recovery-vs-acceptance mutation is selected.
+    pub fn spawn_supervised_task_retry<Context, F, Factory, Preflight>(
+        self: &std::sync::Arc<Self>,
+        run_id: String,
+        task_id: String,
+        cancel: echo_agent::agent::CancellationToken,
+        preflight: Preflight,
+        factory: Factory,
+    ) -> Result<
+        (
+            TaskRetryPreparation,
+            tokio::sync::oneshot::Receiver<Result<(), String>>,
+        ),
+        StoreError,
+    >
+    where
+        Context: Send + 'static,
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+        Factory: FnOnce(Context, RunDriverReceiptOwner) -> F,
+        Preflight: FnOnce() -> Result<Context, StoreError>,
+    {
+        let admission = self.reserve_run_driver_admission(run_id.clone(), cancel)?;
+        let generation_lease = self.lease_active_workspace_generation()?;
+        let mut registration = self.register_run_driver::<()>(admission, generation_lease)?;
+        let context = match preflight() {
+            Ok(context) => context,
+            Err(error) => {
+                registration.reject(error.to_string());
+                return Err(error);
+            }
+        };
+        let has_recovery_blocker = match self.list_recovery_blockers(&run_id) {
+            Ok(blockers) => blockers.iter().any(|blocker| blocker.task_id == task_id),
+            Err(error) => {
+                registration.reject(error.to_string());
+                return Err(error);
+            }
+        };
+        registration.mark_preparation_started();
+        let preparation = match self.prepare_task_retry(&run_id, &task_id, has_recovery_blocker) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                registration.fail_preparation(error.to_string());
+                return Err(error);
+            }
+        };
+        let waiter = match preparation {
+            TaskRetryPreparation::Acceptance { .. } => {
+                registration.start(move |owner| factory(context, owner))
+            }
+            TaskRetryPreparation::Recovery => registration.start(|_| async { Ok(()) }),
+        };
+        Ok((preparation, waiter))
+    }
+
+    fn confirm_run_settled(&self, run_id: &str, run_required: bool) -> Result<(), StoreError> {
+        let Some(run) = self.get_run(run_id)? else {
+            return if run_required {
+                Err(StoreError::RunNotFound(run_id.to_string()))
+            } else {
+                Ok(())
+            };
+        };
         if matches!(
             run.status,
             TaskRunStatus::Completed
@@ -1300,6 +2255,15 @@ impl TaskRuntimeStore {
         run_id: &str,
         token: echo_agent::agent::CancellationToken,
     ) -> Result<RunCancellationRegistration, StoreError> {
+        self.register_run_cancellation_internal(run_id, token, true)
+    }
+
+    fn register_run_cancellation_internal(
+        self: &std::sync::Arc<Self>,
+        run_id: &str,
+        token: echo_agent::agent::CancellationToken,
+        terminalize_on_cancel: bool,
+    ) -> Result<RunCancellationRegistration, StoreError> {
         let previous = self
             .run_cancel_tokens
             .lock()
@@ -1310,6 +2274,7 @@ impl TaskRuntimeStore {
             run_id: run_id.to_string(),
             token,
             previous,
+            terminalize_on_cancel,
         })
     }
 
@@ -3023,8 +3988,186 @@ mod tests {
         }
     }
 
+    struct ReleaseOrder(
+        std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+        &'static str,
+    );
+
+    impl RunDriverExecutionReceipt for ReleaseOrder {
+        fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                if let Ok(mut order) = self.0.lock() {
+                    order.push(self.1);
+                }
+            })
+        }
+    }
+
     fn fresh() -> TaskRuntimeStore {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    }
+
+    fn test_driver_admission(
+        store: &std::sync::Arc<TaskRuntimeStore>,
+        run_id: &str,
+    ) -> Result<RunDriverAdmissionReservation, String> {
+        store
+            .reserve_run_driver_admission(
+                run_id.to_string(),
+                echo_agent::agent::CancellationToken::new(),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    fn prepare_retryable_run(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<(), StoreError> {
+        store.create_run(
+            run_id,
+            "workspace-a",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "retry through the TUI facade",
+            "",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: format!("{run_id}-plan"),
+            run_id: run_id.to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal: "retry through the TUI facade".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: task_id.to_string(),
+                title: "Retry task".to_string(),
+                max_retries: 2,
+                ..PlanTask::default()
+            }],
+        })?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
+        store.set_task_status(
+            run_id,
+            task_id,
+            TodoStatus::Failed,
+            None,
+            Some("acceptance failed"),
+        )?;
+        store.transition_run(run_id, TaskRunStatus::Failed)?;
+        Ok(())
+    }
+
+    fn retry_state_snapshot(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<(serde_json::Value, serde_json::Value, serde_json::Value), String> {
+        Ok((
+            serde_json::to_value(
+                store
+                    .list_events(run_id, 0)
+                    .map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?,
+            serde_json::to_value(store.get_run(run_id).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?,
+            serde_json::to_value(store.get_plan(run_id).map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?,
+        ))
+    }
+
+    #[test]
+    fn tui_retry_registration_failure_leaves_events_run_and_plan_unchanged() -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        prepare_retryable_run(&store, "registration-failure", "retry-task")
+            .map_err(|error| error.to_string())?;
+        let before = retry_state_snapshot(&store, "registration-failure")?;
+        store.fail_next_run_driver_registration_for_test();
+
+        let error = store
+            .spawn_supervised_task_retry(
+                "registration-failure".to_string(),
+                "retry-task".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+                || Ok(()),
+                |(), _receipt_owner| async { Ok(()) },
+            )
+            .err()
+            .ok_or_else(|| "injected driver registration unexpectedly succeeded".to_string())?;
+        assert!(
+            error
+                .to_string()
+                .contains("injected TaskRun driver registration failure")
+        );
+        assert_eq!(
+            before,
+            retry_state_snapshot(&store, "registration-failure")?
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tui_retry_registration_pins_generation_before_recovery_classification()
+    -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        prepare_retryable_run(&store, "generation-race", "retry-task")
+            .map_err(|error| error.to_string())?;
+        let before = retry_state_snapshot(&store, "generation-race")?;
+        let (registered, release) = store.park_next_run_driver_registration_for_test()?;
+        let retry_store = std::sync::Arc::clone(&store);
+        let retry = tokio::spawn(async move {
+            retry_store.spawn_supervised_task_retry(
+                "generation-race".to_string(),
+                "retry-task".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+                || Ok(()),
+                |(), _receipt_owner| async { Ok(()) },
+            )
+        });
+        tokio::task::spawn_blocking(move || {
+            registered
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(|error| format!("retry registration was not parked: {error}"))
+        })
+        .await
+        .map_err(|error| error.to_string())??;
+
+        let transition_error = store
+            .begin_workspace_transition()
+            .await
+            .err()
+            .ok_or_else(|| "workspace transition overtook registered TUI retry".to_string())?;
+        assert!(matches!(
+            transition_error,
+            StoreError::WorkspaceTransitionBusy { .. }
+        ));
+        assert_eq!(before, retry_state_snapshot(&store, "generation-race")?);
+
+        release
+            .send(())
+            .map_err(|_| "retry registration release receiver closed".to_string())?;
+        let (preparation, waiter) = retry
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            preparation,
+            TaskRetryPreparation::Acceptance { next_attempt: 1 }
+        );
+        let _driver_result = waiter.await.map_err(|error| error.to_string())?;
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     #[tokio::test]
@@ -3056,12 +4199,12 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dropped_for_driver = std::sync::Arc::clone(&dropped);
+        let admission = test_driver_admission(&store, "receipt-debt")?;
         let waiter = store
             .spawn_run_driver(
-                "receipt-debt".to_string(),
-                echo_agent::agent::CancellationToken::new(),
+                admission,
                 generation_lease,
-                move |receipt_owner| async move {
+                move |mut receipt_owner| async move {
                     receipt_owner.retain(DropFlag(dropped_for_driver));
                     std::fs::rename(&root, &blocked_root)
                         .map_err(|error| format!("block task root: {error}"))?;
@@ -3093,7 +4236,10 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         drop(transition);
-        store.shutdown_run_drivers().await
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[tokio::test]
@@ -3122,14 +4268,16 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let cancel = echo_agent::agent::CancellationToken::new();
         let driver_cancel = cancel.clone();
+        let admission = store
+            .reserve_run_driver_admission("dropped-waiter".to_string(), cancel)
+            .map_err(|error| error.to_string())?;
         let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dropped_for_driver = std::sync::Arc::clone(&dropped);
         let waiter = store
             .spawn_run_driver(
-                "dropped-waiter".to_string(),
-                cancel,
+                admission,
                 generation_lease,
-                move |receipt_owner| async move {
+                move |mut receipt_owner| async move {
                     receipt_owner.retain(DropFlag(dropped_for_driver));
                     driver_cancel.cancelled().await;
                     Err::<(), String>("driver cancelled during shutdown".to_string())
@@ -3143,13 +4291,190 @@ mod tests {
             store.shutdown_run_drivers(),
         )
         .await
-        .map_err(|_| "TaskRun driver shutdown timed out".to_string())??;
+        .map_err(|_| "TaskRun driver shutdown timed out".to_string())?
+        .map_err(|error| error.to_string())?;
         let run = store
             .get_run("dropped-waiter")
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "settled run disappeared".to_string())?;
         assert_eq!(run.status, TaskRunStatus::Cancelled);
         assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_reporter_failure_is_published_once_to_all_waiters() -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        store.abort_next_run_driver_shutdown_reporter_for_test();
+
+        let first_store = std::sync::Arc::clone(&store);
+        let second_store = std::sync::Arc::clone(&store);
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+            tokio::join!(
+                first_store.shutdown_run_drivers(),
+                second_store.shutdown_run_drivers()
+            )
+        })
+        .await
+        .map_err(|_| "concurrent TaskRun shutdown waiters timed out".to_string())?;
+        let first = first.err().ok_or_else(|| {
+            "first shutdown waiter did not observe the reporter failure".to_string()
+        })?;
+        let second = second.err().ok_or_else(|| {
+            "second shutdown waiter did not observe the reporter failure".to_string()
+        })?;
+        assert_eq!(first, second);
+        assert!(
+            first
+                .driver_errors
+                .iter()
+                .any(|error| error.contains("shutdown reporter failed"))
+        );
+
+        let repeated = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.shutdown_run_drivers(),
+        )
+        .await
+        .map_err(|_| "repeated TaskRun shutdown waiter timed out".to_string())?
+        .err()
+        .ok_or_else(|| "repeated shutdown waiter lost the reporter failure".to_string())?;
+        assert_eq!(first, repeated);
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_waits_for_parked_prepare_and_reports_its_permanent_debt() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let blocked_root = temp.path().join("tasks-blocked");
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "parked-prepare",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "settle an accepted preparation",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("parked-prepare", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("parked-prepare", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+
+        let (prepare_started_tx, prepare_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (continue_prepare_tx, continue_prepare_rx) = std::sync::mpsc::channel::<()>();
+        let preparation_store = std::sync::Arc::clone(&store);
+        let run_store = std::sync::Arc::clone(&store);
+        let root_for_driver = root.clone();
+        let blocked_root_for_driver = blocked_root.clone();
+        let preparation = tokio::task::spawn_blocking(move || {
+            preparation_store.spawn_supervised_run_driver(
+                "parked-prepare".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+                || Ok(()),
+                move |()| {
+                    prepare_started_tx.send(()).map_err(|_| {
+                        StoreError::InvalidPlan(
+                            "shutdown test stopped before prepare admission".to_string(),
+                        )
+                    })?;
+                    continue_prepare_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(|error| {
+                            StoreError::InvalidPlan(format!(
+                                "parked prepare was not released: {error}"
+                            ))
+                        })?;
+                    run_store.resume_task_run("parked-prepare")?;
+                    Ok(((), move |_receipt_owner| async move {
+                        std::fs::rename(&root_for_driver, &blocked_root_for_driver)
+                            .map_err(|error| format!("block task root: {error}"))?;
+                        std::fs::write(&root_for_driver, b"block directory recreation")
+                            .map_err(|error| format!("replace task root: {error}"))?;
+                        Err::<(), String>("injected prepared driver failure".to_string())
+                    }))
+                },
+            )
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), prepare_started_rx)
+            .await
+            .map_err(|_| "parked prepare did not start".to_string())?
+            .map_err(|_| "parked prepare start sender closed".to_string())?;
+
+        let shutdown_store = std::sync::Arc::clone(&store);
+        let shutdown = tokio::spawn(async move { shutdown_store.shutdown_run_drivers().await });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.wait_run_driver_shutdown_started(),
+        )
+        .await
+        .map_err(|_| "TaskRun shutdown did not close driver admission".to_string())?;
+        if store
+            .reserve_run_driver_admission(
+                "late-after-shutdown".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+            )
+            .is_ok()
+        {
+            return Err("TaskRun shutdown accepted a late driver reservation".to_string());
+        }
+        if shutdown.is_finished() {
+            return Err("shutdown overtook an accepted parked preparation".to_string());
+        }
+
+        continue_prepare_tx
+            .send(())
+            .map_err(|_| "parked prepare receiver closed".to_string())?;
+        let (_, result_waiter) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), preparation)
+                .await
+                .map_err(|_| "parked prepare did not register its driver".to_string())?
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?;
+        drop(result_waiter);
+
+        let shutdown_error = tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
+            .await
+            .map_err(|_| "TaskRun shutdown did not settle parked preparation".to_string())?
+            .map_err(|error| error.to_string())?
+            .err()
+            .ok_or_else(|| "permanent prepared driver debt was not reported".to_string())?;
+        assert_eq!(shutdown_error.abandoned_settlements.len(), 1);
+        let abandoned = shutdown_error
+            .abandoned_settlements
+            .first()
+            .ok_or_else(|| "prepared driver abandonment is missing".to_string())?;
+        assert_eq!(abandoned.run_id, "parked-prepare");
+        assert_eq!(abandoned.target, TaskRunStatus::Cancelled);
+        assert_eq!(abandoned.root, root);
+        assert!(abandoned.driver_token.is_some());
+        assert!(!abandoned.error.is_empty());
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+
+        std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
+        std::fs::rename(blocked_root, temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run("parked-prepare")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "parked prepared run disappeared".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Running);
         Ok(())
     }
 
@@ -3183,28 +4508,28 @@ mod tests {
         let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
         let (second_tx, second_rx) = tokio::sync::oneshot::channel::<()>();
         let first_flag = std::sync::Arc::clone(&first_dropped);
+        let first_admission = test_driver_admission(&store, "overlap")?;
         let first_waiter = store
             .spawn_run_driver(
-                "overlap".to_string(),
-                echo_agent::agent::CancellationToken::new(),
+                first_admission,
                 store
                     .lease_active_workspace_generation()
                     .map_err(|error| error.to_string())?,
-                move |receipt_owner| async move {
+                move |mut receipt_owner| async move {
                     receipt_owner.retain(DropFlag(first_flag));
                     first_rx.await.map_err(|error| error.to_string())
                 },
             )
             .map_err(|error| error.to_string())?;
         let second_flag = std::sync::Arc::clone(&second_dropped);
+        let second_admission = test_driver_admission(&store, "overlap")?;
         let second_waiter = store
             .spawn_run_driver(
-                "overlap".to_string(),
-                echo_agent::agent::CancellationToken::new(),
+                second_admission,
                 store
                     .lease_active_workspace_generation()
                     .map_err(|error| error.to_string())?,
-                move |receipt_owner| async move {
+                move |mut receipt_owner| async move {
                     receipt_owner.retain(DropFlag(second_flag));
                     second_rx.await.map_err(|error| error.to_string())
                 },
@@ -3223,7 +4548,367 @@ mod tests {
             .map_err(|_| "second driver receiver closed".to_string())?;
         second_waiter.await.map_err(|error| error.to_string())??;
         assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
-        store.shutdown_run_drivers().await
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn opaque_driver_context_rejects_forged_wrong_stale_and_cross_run_receipts()
+    -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        for run_id in ["context-overlap", "context-other"] {
+            store
+                .create_run(
+                    run_id,
+                    "workspace-a",
+                    "conversation",
+                    "message",
+                    DomainProfile::General,
+                    "opaque driver execution context",
+                    "",
+                    AttendedMode::Unattended,
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .transition_run(run_id, TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?;
+        }
+
+        let (first_context_tx, first_context_rx) = std::sync::mpsc::sync_channel(1);
+        let (finish_first_tx, finish_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_store = std::sync::Arc::clone(&store);
+        let first_waiter = store
+            .spawn_run_driver(
+                test_driver_admission(&store, "context-overlap")?,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |receipt_owner| {
+                    let context_sent = first_context_tx
+                        .send(receipt_owner.execution_context_id())
+                        .map_err(|_| "first context receiver closed".to_string());
+                    async move {
+                        context_sent?;
+                        finish_first_rx.await.map_err(|error| error.to_string())?;
+                        first_store
+                            .finalize_run("context-overlap", TaskRunStatus::Completed, None)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let first_context = first_context_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| format!("first driver context was not published: {error}"))?;
+
+        let (second_context_tx, second_context_rx) = std::sync::mpsc::sync_channel(1);
+        let (finish_second_tx, finish_second_rx) = tokio::sync::oneshot::channel::<()>();
+        let second_waiter = store
+            .spawn_run_driver(
+                test_driver_admission(&store, "context-overlap")?,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |receipt_owner| {
+                    let context_sent = second_context_tx
+                        .send(receipt_owner.execution_context_id())
+                        .map_err(|_| "second context receiver closed".to_string());
+                    async move {
+                        context_sent?;
+                        finish_second_rx.await.map_err(|error| error.to_string())
+                    }
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let second_context = second_context_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| format!("second driver context was not published: {error}"))?;
+        assert_ne!(first_context, second_context);
+
+        let (other_context_tx, other_context_rx) = std::sync::mpsc::sync_channel(1);
+        let (finish_other_tx, finish_other_rx) = tokio::sync::oneshot::channel::<()>();
+        let other_store = std::sync::Arc::clone(&store);
+        let other_waiter = store
+            .spawn_run_driver(
+                test_driver_admission(&store, "context-other")?,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |receipt_owner| {
+                    let context_sent = other_context_tx
+                        .send(receipt_owner.execution_context_id())
+                        .map_err(|_| "other context receiver closed".to_string());
+                    async move {
+                        context_sent?;
+                        finish_other_rx.await.map_err(|error| error.to_string())?;
+                        other_store
+                            .finalize_run("context-other", TaskRunStatus::Completed, None)
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let other_context = other_context_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| format!("other driver context was not published: {error}"))?;
+
+        let first_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store
+            .retain_run_driver_receipt_from_context(
+                "context-overlap",
+                &first_context,
+                DropFlag(std::sync::Arc::clone(&first_released)),
+            )
+            .map_err(|_| "first exact context was rejected".to_string())?;
+        let second_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        store
+            .retain_run_driver_receipt_from_context(
+                "context-overlap",
+                &second_context,
+                DropFlag(std::sync::Arc::clone(&second_released)),
+            )
+            .map_err(|_| "second exact context was rejected".to_string())?;
+
+        for (label, run_id, context_id) in [
+            (
+                "forged sequential token",
+                "context-overlap",
+                "eko-task-driver:2".to_string(),
+            ),
+            (
+                "wrong nonce",
+                "context-overlap",
+                format!("{first_context}-wrong"),
+            ),
+            (
+                "cross-run context",
+                "context-overlap",
+                other_context.clone(),
+            ),
+        ] {
+            let rejected_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let rejected = store
+                .retain_run_driver_receipt_from_context(
+                    run_id,
+                    &context_id,
+                    DropFlag(std::sync::Arc::clone(&rejected_released)),
+                )
+                .err()
+                .ok_or_else(|| format!("{label} unexpectedly retained a receipt"))?;
+            drop(rejected);
+            assert!(rejected_released.load(std::sync::atomic::Ordering::SeqCst));
+        }
+        assert_eq!(store.active_run_driver_receipt_count()?, 2);
+
+        finish_first_tx
+            .send(())
+            .map_err(|_| "first driver receiver closed".to_string())?;
+        first_waiter.await.map_err(|error| error.to_string())??;
+        assert!(first_released.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!second_released.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.active_run_driver_receipt_count()?, 1);
+
+        let stale_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stale = store
+            .retain_run_driver_receipt_from_context(
+                "context-overlap",
+                &first_context,
+                DropFlag(std::sync::Arc::clone(&stale_released)),
+            )
+            .err()
+            .ok_or_else(|| "stale driver context unexpectedly retained a receipt".to_string())?;
+        drop(stale);
+        assert!(stale_released.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!second_released.load(std::sync::atomic::Ordering::SeqCst));
+
+        finish_second_tx
+            .send(())
+            .map_err(|_| "second driver receiver closed".to_string())?;
+        second_waiter.await.map_err(|error| error.to_string())??;
+        assert!(second_released.load(std::sync::atomic::Ordering::SeqCst));
+
+        finish_other_tx
+            .send(())
+            .map_err(|_| "other driver receiver closed".to_string())?;
+        other_waiter.await.map_err(|error| error.to_string())??;
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[tokio::test]
+    async fn abandoned_same_run_driver_releases_only_its_exact_receipt() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let blocked_root = temp.path().join("tasks-blocked");
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "overlap-abandon",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "exact abandoned driver receipt",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("overlap-abandon", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+
+        let first_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (finish_first_tx, finish_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_flag = std::sync::Arc::clone(&first_dropped);
+        let first_admission = test_driver_admission(&store, "overlap-abandon")?;
+        let first_waiter = store
+            .spawn_run_driver(
+                first_admission,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |mut receipt_owner| async move {
+                    receipt_owner.retain(DropFlag(first_flag));
+                    first_started_tx
+                        .send(())
+                        .map_err(|_| "first driver start receiver closed".to_string())?;
+                    finish_first_rx.await.map_err(|error| error.to_string())?;
+                    std::fs::rename(&root, &blocked_root)
+                        .map_err(|error| format!("block task root: {error}"))?;
+                    std::fs::write(&root, b"block directory recreation")
+                        .map_err(|error| format!("replace task root: {error}"))?;
+                    Err::<(), String>("injected first driver failure".to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        first_started_rx.await.map_err(|error| error.to_string())?;
+
+        let second_flag = std::sync::Arc::clone(&second_dropped);
+        let store_for_second = std::sync::Arc::clone(&store);
+        let second_admission = test_driver_admission(&store, "overlap-abandon")?;
+        let second_waiter = store
+            .spawn_run_driver(
+                second_admission,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |mut receipt_owner| async move {
+                    receipt_owner.retain(DropFlag(second_flag));
+                    store_for_second
+                        .finalize_run("overlap-abandon", TaskRunStatus::Completed, None)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        second_waiter.await.map_err(|error| error.to_string())??;
+        assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!first_dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        finish_first_tx
+            .send(())
+            .map_err(|_| "first driver receiver closed".to_string())?;
+        let first_error = first_waiter
+            .await
+            .map_err(|error| error.to_string())?
+            .err()
+            .ok_or_else(|| "first driver failure was not reported".to_string())?;
+        assert!(first_error.contains("terminal settlement failed"));
+        assert_eq!(store.active_run_driver_receipt_count()?, 1);
+
+        let shutdown_error = store
+            .shutdown_run_drivers()
+            .await
+            .err()
+            .ok_or_else(|| "abandoned first driver debt was not reported".to_string())?;
+        assert_eq!(shutdown_error.abandoned_settlements.len(), 1);
+        let diagnostic = shutdown_error
+            .abandoned_settlements
+            .first()
+            .ok_or_else(|| "first driver abandonment diagnostic is missing".to_string())?;
+        assert_eq!(diagnostic.run_id, "overlap-abandon");
+        assert_eq!(diagnostic.driver_token, Some(1));
+        assert!(first_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+
+        std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
+        std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run("overlap-abandon")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "overlap run disappeared".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_driver_releases_pool_before_memory_generation() -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "lifo-receipts",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "release pool before memory",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("lifo-receipts", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("lifo-receipts", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+
+        let release_order = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let memory_order = std::sync::Arc::clone(&release_order);
+        let pool_order = std::sync::Arc::clone(&release_order);
+        let admission = test_driver_admission(&store, "lifo-receipts")?;
+        let waiter = store
+            .spawn_run_driver(
+                admission,
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |mut receipt_owner| async move {
+                    receipt_owner.retain(ReleaseOrder(memory_order, "memory"));
+                    receipt_owner.retain(ReleaseOrder(pool_order, "pool"));
+                    Ok::<(), String>(())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        waiter.await.map_err(|error| error.to_string())??;
+        let observed = release_order
+            .lock()
+            .map_err(|_| "release order lock is poisoned".to_string())?
+            .clone();
+        assert_eq!(observed, ["pool", "memory"]);
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())
     }
 
     #[test]

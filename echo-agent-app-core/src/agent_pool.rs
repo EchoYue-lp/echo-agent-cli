@@ -487,19 +487,57 @@ impl AgentPool {
         pool
     }
 
-    /// Acquire an agent for a given conversation ID.
-    ///
-    /// If an agent already exists for this ID, it is returned (with updated
-    /// `last_used` timestamp). Otherwise, a new agent is created and added
-    /// to the pool.
-    ///
-    /// Pool 容量计数 (`max_agents`) 只计**对话 agent**, 不计 task subagent
-    /// (`__task__:` 前缀) 和 `__background__` (P1-13 修复)。否则后台任务多了
-    /// 会挤占用户交互 agent 的并发槽位, 导致用户发消息被拒。
+    #[cfg(test)]
+    pub(crate) async fn new_for_test(
+        agent: AgentHandle,
+        review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+        store: Option<Arc<dyn echo_agent::memory::Store>>,
+        max_agents: usize,
+        enable_background_agent: bool,
+    ) -> Self {
+        let mut shared = SharedResources::extract_from(&agent, review_integration).await;
+        if let Some(store) = store {
+            shared.store = Some(store);
+        }
+        let mut app_config = AppConfig::default();
+        app_config.model.provider = "test".to_string();
+        app_config.model.name = "test-model".to_string();
+        Self {
+            shared,
+            agents: RwLock::new(HashMap::new()),
+            workspace_transitioning: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            admission: Arc::new(AgentPoolAdmission::default()),
+            config: PoolConfig {
+                max_agents,
+                idle_timeout: Duration::from_secs(1800),
+                enable_background_agent,
+            },
+            app_config: RwLock::new(app_config),
+            working_dir: RwLock::new(None),
+            runtime_llm_config: RwLock::new(None),
+            permission_mode: RwLock::new("default".to_string()),
+            skill_descriptors: RwLock::new(Vec::new()),
+            cleanup_cancel: CancellationToken::new(),
+            cleanup_handle: Mutex::new(None),
+            memory_store_override: RwLock::new(None),
+            conversation_store_override: RwLock::new(None),
+            tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
+            workspace_kind: RwLock::new(WorkspaceKind::General),
+        }
+    }
+
+    /// Whether this key consumes one user-conversation capacity slot.
     fn is_conversation_agent(key: &str) -> bool {
         key != "__background__" && !key.starts_with("__task__:")
     }
 
+    /// Acquire an agent for a given conversation ID.
+    ///
+    /// If an agent already exists for this ID, it is returned (with updated
+    /// `last_used` timestamp). Otherwise, a new agent is created and added
+    /// to the pool. Pool capacity counts conversation agents only; task
+    /// subagents and the background agent have separate product ownership.
     ///
     /// The write lock is held across the entire operation (including async
     /// agent creation) to prevent TOCTOU races between concurrent acquirers.
@@ -1379,6 +1417,28 @@ mod tests {
 
     type TestResult<T = ()> = Result<T, String>;
 
+    struct MemoryReleaseProbe {
+        pool: Arc<AgentPool>,
+        released_after_pool: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for MemoryReleaseProbe {
+        fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                let pool_is_idle = self
+                    .pool
+                    .admission
+                    .active
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .total
+                    == 0;
+                self.released_after_pool
+                    .store(pool_is_idle, Ordering::SeqCst);
+            })
+        }
+    }
+
     #[test]
     fn test_pool_config_default() {
         let config = PoolConfig::default();
@@ -1681,41 +1741,10 @@ mod tests {
         create_test_agent().map(AgentHandle::new)
     }
 
-    fn test_app_config() -> AppConfig {
-        let mut config = AppConfig::default();
-        config.model.provider = "test".to_string();
-        config.model.name = "test-model".to_string();
-        config
-    }
-
     async fn create_test_pool(max_agents: usize, enable_bg: bool) -> TestResult<AgentPool> {
         let agent = create_test_agent()?;
         let handle = AgentHandle::new(agent);
-        let shared = SharedResources::extract_from(&handle, None).await;
-
-        Ok(AgentPool {
-            shared,
-            agents: RwLock::new(HashMap::new()),
-            workspace_transitioning: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
-            admission: Arc::new(AgentPoolAdmission::default()),
-            config: PoolConfig {
-                max_agents,
-                idle_timeout: Duration::from_secs(1800),
-                enable_background_agent: enable_bg,
-            },
-            app_config: RwLock::new(test_app_config()),
-            working_dir: RwLock::new(None),
-            runtime_llm_config: RwLock::new(None),
-            permission_mode: RwLock::new("default".to_string()),
-            skill_descriptors: RwLock::new(vec![]),
-            cleanup_cancel: CancellationToken::new(),
-            cleanup_handle: Mutex::new(None),
-            memory_store_override: RwLock::new(None),
-            conversation_store_override: RwLock::new(None),
-            tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
-            workspace_kind: RwLock::new(WorkspaceKind::General),
-        })
+        Ok(AgentPool::new_for_test(handle, None, None, max_agents, enable_bg).await)
     }
 
     async fn create_test_pool_with_review_integration() -> TestResult<AgentPool> {
@@ -1731,32 +1760,7 @@ mod tests {
             echo_agent_dir,
             store.clone(),
         ));
-        let mut shared = SharedResources::extract_from(&handle, Some(review_integration)).await;
-        shared.store = Some(store);
-
-        Ok(AgentPool {
-            shared,
-            agents: RwLock::new(HashMap::new()),
-            workspace_transitioning: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
-            admission: Arc::new(AgentPoolAdmission::default()),
-            config: PoolConfig {
-                max_agents: 3,
-                idle_timeout: Duration::from_secs(1800),
-                enable_background_agent: false,
-            },
-            app_config: RwLock::new(test_app_config()),
-            working_dir: RwLock::new(None),
-            runtime_llm_config: RwLock::new(None),
-            permission_mode: RwLock::new("default".to_string()),
-            skill_descriptors: RwLock::new(vec![]),
-            cleanup_cancel: CancellationToken::new(),
-            cleanup_handle: Mutex::new(None),
-            memory_store_override: RwLock::new(None),
-            conversation_store_override: RwLock::new(None),
-            tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
-            workspace_kind: RwLock::new(WorkspaceKind::General),
-        })
+        Ok(AgentPool::new_for_test(handle, Some(review_integration), Some(store), 3, false).await)
     }
 
     #[tokio::test]
@@ -2130,6 +2134,262 @@ mod tests {
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         assert_eq!(pool.pool_size().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permanent_terminal_debt_reports_abandonment_and_unblocks_pool_shutdown() -> TestResult
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let blocked_root = temp.path().join("tasks-blocked");
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(
+                root.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "permanent-terminal-debt",
+                "workspace-a",
+                "conversation",
+                "message",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "preserve non-terminal disk truth",
+                "",
+                crate::tasks::task_runtime::AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(
+                "permanent-terminal-debt",
+                crate::tasks::task_runtime::TaskRunStatus::Running,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let pool = Arc::new(create_test_pool(2, false).await?);
+        let pool_execution = pool
+            .acquire("permanent-terminal-debt")
+            .await
+            .map_err(|error| error.to_string())?;
+        let pool_for_driver = Arc::clone(&pool);
+        let released_after_pool = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_probe = Arc::clone(&released_after_pool);
+        let admission = store
+            .reserve_run_driver_admission(
+                "permanent-terminal-debt".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+            )
+            .map_err(|error| error.to_string())?;
+        let generation_lease = store
+            .lease_active_workspace_generation()
+            .map_err(|error| error.to_string())?;
+        let waiter = store
+            .spawn_run_driver(
+                admission,
+                generation_lease,
+                move |mut receipt_owner| async move {
+                    receipt_owner.retain(MemoryReleaseProbe {
+                        pool: Arc::clone(&pool_for_driver),
+                        released_after_pool: release_probe,
+                    });
+                    receipt_owner.retain(pool_for_driver.retain_for_supervised_run(
+                        "permanent-terminal-debt".to_string(),
+                        pool_execution,
+                    ));
+                    std::fs::rename(&root, &blocked_root)
+                        .map_err(|error| format!("block task root: {error}"))?;
+                    std::fs::write(&root, b"block directory recreation")
+                        .map_err(|error| format!("replace task root: {error}"))?;
+                    Err::<(), String>("injected permanent driver failure".to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let driver_error = waiter
+            .await
+            .map_err(|error| error.to_string())?
+            .err()
+            .ok_or_else(|| "permanent driver failure was not reported".to_string())?;
+        assert!(driver_error.contains("terminal settlement failed"));
+
+        let shutdown_error =
+            tokio::time::timeout(Duration::from_secs(2), store.shutdown_run_drivers())
+                .await
+                .map_err(|_| "TaskRun driver shutdown timed out on permanent debt".to_string())?
+                .err()
+                .ok_or_else(|| "permanent settlement debt was not reported".to_string())?;
+        assert_eq!(shutdown_error.abandoned_settlements.len(), 1);
+        let diagnostic = shutdown_error
+            .abandoned_settlements
+            .first()
+            .ok_or_else(|| "abandoned settlement diagnostic is missing".to_string())?;
+        let driver_token = diagnostic
+            .driver_token
+            .ok_or_else(|| "abandoned settlement driver token is missing".to_string())?;
+        assert_eq!(diagnostic.run_id, "permanent-terminal-debt");
+        assert_eq!(diagnostic.root, temp.path().join("tasks"));
+        assert!(!diagnostic.error.is_empty());
+        let shutdown_text = shutdown_error.to_string();
+        assert!(shutdown_text.contains("run=permanent-terminal-debt"));
+        assert!(shutdown_text.contains(&format!("driver_token={driver_token}")));
+        assert!(shutdown_text.contains(&diagnostic.root.display().to_string()));
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        assert!(released_after_pool.load(Ordering::SeqCst));
+        let transition = store
+            .begin_workspace_transition()
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(transition);
+
+        tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
+            .await
+            .map_err(|_| "AgentPool shutdown remained blocked by abandoned debt".to_string())??;
+        std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
+        std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run("permanent-terminal-debt")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "non-terminal run disappeared from disk".to_string())?;
+        assert_eq!(
+            run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Running
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_reporter_and_waiter_do_not_abort_owned_driver_settlement() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let blocked_root = temp.path().join("tasks-blocked");
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(
+                root.clone(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "aborted-shutdown-waiter",
+                "workspace-a",
+                "conversation",
+                "message",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "retain settlement ownership after waiter abort",
+                "",
+                crate::tasks::task_runtime::AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(
+                "aborted-shutdown-waiter",
+                crate::tasks::task_runtime::TaskRunStatus::Running,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let pool = Arc::new(create_test_pool(2, false).await?);
+        let execution = pool
+            .acquire("aborted-shutdown-waiter")
+            .await
+            .map_err(|error| error.to_string())?;
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let driver_cancel = cancel.clone();
+        let admission = store
+            .reserve_run_driver_admission("aborted-shutdown-waiter".to_string(), cancel)
+            .map_err(|error| error.to_string())?;
+        let generation_lease = store
+            .lease_active_workspace_generation()
+            .map_err(|error| error.to_string())?;
+        let (cancel_observed_tx, cancel_observed_rx) = tokio::sync::oneshot::channel::<()>();
+        let (continue_driver_tx, continue_driver_rx) = tokio::sync::oneshot::channel::<()>();
+        let pool_for_driver = Arc::clone(&pool);
+        let waiter = store
+            .spawn_run_driver(
+                admission,
+                generation_lease,
+                move |mut receipt_owner| async move {
+                    receipt_owner.retain(pool_for_driver.retain_for_supervised_run(
+                        "aborted-shutdown-waiter".to_string(),
+                        execution,
+                    ));
+                    driver_cancel.cancelled().await;
+                    cancel_observed_tx
+                        .send(())
+                        .map_err(|_| "shutdown cancel observer closed".to_string())?;
+                    continue_driver_rx
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    std::fs::rename(&root, &blocked_root)
+                        .map_err(|error| format!("block task root: {error}"))?;
+                    std::fs::write(&root, b"block directory recreation")
+                        .map_err(|error| format!("replace task root: {error}"))?;
+                    Err::<(), String>("injected failure after shutdown waiter abort".to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        drop(waiter);
+
+        store.abort_next_run_driver_shutdown_reporter_for_test();
+        let first_shutdown_store = Arc::clone(&store);
+        let first_shutdown =
+            tokio::spawn(async move { first_shutdown_store.shutdown_run_drivers().await });
+        tokio::time::timeout(Duration::from_secs(2), cancel_observed_rx)
+            .await
+            .map_err(|_| "owned shutdown did not cancel the driver".to_string())?
+            .map_err(|_| "driver cancel observer closed".to_string())?;
+        first_shutdown.abort();
+        if first_shutdown.await.is_ok() {
+            return Err("first shutdown waiter was not aborted".to_string());
+        }
+        continue_driver_tx
+            .send(())
+            .map_err(|_| "parked driver receiver closed".to_string())?;
+
+        let shutdown_error =
+            tokio::time::timeout(Duration::from_secs(2), store.shutdown_run_drivers())
+                .await
+                .map_err(|_| "second shutdown waiter did not observe owned settlement".to_string())?
+                .err()
+                .ok_or_else(|| "permanent debt was hidden after waiter abort".to_string())?;
+        assert_eq!(shutdown_error.abandoned_settlements.len(), 1);
+        assert!(
+            shutdown_error
+                .driver_errors
+                .iter()
+                .any(|error| error.contains("shutdown reporter failed"))
+        );
+        let diagnostic = shutdown_error
+            .abandoned_settlements
+            .first()
+            .ok_or_else(|| "abandoned settlement diagnostic is missing".to_string())?;
+        assert_eq!(diagnostic.run_id, "aborted-shutdown-waiter");
+        assert!(diagnostic.driver_token.is_some());
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        let repeated_error = store
+            .shutdown_run_drivers()
+            .await
+            .err()
+            .ok_or_else(|| "repeated shutdown lost its typed degradation".to_string())?;
+        assert_eq!(repeated_error, shutdown_error);
+        tokio::time::timeout(Duration::from_secs(2), pool.shutdown())
+            .await
+            .map_err(|_| "pool shutdown remained blocked after waiter abort".to_string())??;
+
+        std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
+        std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run("aborted-shutdown-waiter")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "abandoned run disappeared".to_string())?;
+        assert_eq!(
+            run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Running
+        );
         Ok(())
     }
 }
