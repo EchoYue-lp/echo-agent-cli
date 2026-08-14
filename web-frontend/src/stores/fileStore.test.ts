@@ -176,4 +176,65 @@ describe('fileStore', () => {
 
     expect(useFileStore.getState().documents[initialFile.path]).toBeUndefined();
   });
+
+  it('reloads the current workspace version after explicitly discarding a stale draft', async () => {
+    await useFileStore.getState().selectFile(initialFile.path);
+    useFileStore.getState().setViewMode('edit');
+    useFileStore.getState().updateDraft('workspace A draft\n');
+    useFileStore.getState().markWorkspaceChanged();
+    mocks.read.mockResolvedValue({
+      ...initialFile,
+      workspace_id: 'workspace:b',
+      content: 'workspace B content\n',
+      revision: 'revision-b',
+    });
+
+    await useFileStore.getState().discardSelected();
+
+    const document = useFileStore.getState().documents[initialFile.path];
+    expect(document?.file.workspace_id).toBe('workspace:b');
+    expect(document?.draft).toBe('workspace B content\n');
+    expect(document?.stale).toBe(false);
+  });
+
+  it('keeps a draft stale when its save completes after switching workspaces', async () => {
+    let resolveWrite: ((value: typeof initialFile) => void) | undefined;
+    mocks.write.mockReturnValue(
+      new Promise<typeof initialFile>((resolve) => {
+        resolveWrite = resolve;
+      })
+    );
+    await useFileStore.getState().selectFile(initialFile.path);
+    useFileStore.getState().setViewMode('edit');
+    useFileStore.getState().updateDraft('workspace A draft\n');
+
+    const save = useFileStore.getState().saveSelected();
+    useFileStore.getState().markWorkspaceChanged();
+    resolveWrite?.({ ...initialFile, content: 'workspace A draft\n', revision: 'revision-2' });
+
+    expect(await save).toBe(false);
+    const document = useFileStore.getState().documents[initialFile.path];
+    expect(document?.stale).toBe(true);
+    expect(document?.draft).toBe('workspace A draft\n');
+  });
+
+  it('ignores a late save error from the previous workspace generation', async () => {
+    let rejectWrite: ((reason: Error) => void) | undefined;
+    mocks.write.mockReturnValue(
+      new Promise<typeof initialFile>((_resolve, reject) => {
+        rejectWrite = reject;
+      })
+    );
+    await useFileStore.getState().selectFile(initialFile.path);
+    useFileStore.getState().setViewMode('edit');
+    useFileStore.getState().updateDraft('workspace A draft\n');
+
+    const save = useFileStore.getState().saveSelected();
+    useFileStore.getState().markWorkspaceChanged();
+    const workspaceError = useFileStore.getState().error;
+    rejectWrite?.(new Error('old workspace save failed'));
+
+    expect(await save).toBe(false);
+    expect(useFileStore.getState().error).toBe(workspaceError);
+  });
 });

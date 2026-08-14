@@ -201,16 +201,20 @@ export function FileBrowser() {
                   <button
                     type="button"
                     onClick={() => void store.discardSelected()}
-                    disabled={!selectedDocument.dirty && !selectedDocument.conflict}
+                    disabled={
+                      !selectedDocument.dirty &&
+                      !selectedDocument.conflict &&
+                      !selectedDocument.stale
+                    }
                     className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] disabled:opacity-30"
-                    title="恢复磁盘版本"
+                    title={selectedDocument.stale ? '从当前工作区重新加载' : '恢复磁盘版本'}
                   >
                     <RotateCcw size={12} />
                   </button>
                   <button
                     type="button"
                     onClick={() => void store.saveSelected()}
-                    disabled={!selectedDocument.dirty || store.saving}
+                    disabled={!selectedDocument.dirty || selectedDocument.stale || store.saving}
                     className="flex h-6 w-6 items-center justify-center rounded-md text-[var(--accent)] hover:bg-[var(--bg-hover)] disabled:opacity-30"
                     title="保存"
                   >
@@ -227,7 +231,9 @@ export function FileBrowser() {
             {selectedDocument?.conflict && (
               <div className="flex items-center gap-2 border-b border-[var(--color-warning)]/30 bg-[var(--color-warning)]/8 px-3 py-2 text-xs text-[var(--color-warning)]">
                 <AlertTriangle size={13} />
-                磁盘内容已变化。恢复磁盘版本后再编辑，或复制当前草稿后处理冲突。
+                {selectedDocument.stale
+                  ? '工作区已切换。此草稿属于旧工作区，不能保存；请从当前工作区重新加载。'
+                  : '磁盘内容已变化。恢复磁盘版本后再编辑，或复制当前草稿后处理冲突。'}
               </div>
             )}
 

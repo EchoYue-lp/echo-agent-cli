@@ -59,7 +59,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           (res as any).debug_conversation_count
         );
       set({ current: res.workspace });
-      useFileStore.getState().markWorkspaceChanged();
+      const fileStore = useFileStore.getState();
+      fileStore.markWorkspaceChanged();
+      void fileStore.loadTree(4);
+      void fileStore.loadChanges();
 
       // Clear current chat
       useChatStore.getState().clearMessages();

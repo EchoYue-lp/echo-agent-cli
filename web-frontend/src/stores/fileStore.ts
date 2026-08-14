@@ -236,6 +236,7 @@ export const useFileStore = create<FileStore>((set, get) => ({
       void get().loadChanges();
       return true;
     } catch (error) {
+      if (get().generation !== generation) return false;
       const message = errorMessage(error);
       set((state) => ({
         saving: false,
