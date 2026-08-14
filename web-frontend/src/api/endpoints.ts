@@ -55,6 +55,13 @@ import type {
   ReviewResult,
   TaskExecutionSummary,
   RecoveryBlocker,
+  WorkspaceTransitionReceipt,
+} from '../generated';
+
+export type {
+  WorkspaceSubsystemTransition,
+  WorkspaceTransitionReceipt,
+  WorkspaceTransitionStatus,
 } from '../generated';
 
 type LoadSkillsResponse = {
@@ -1442,12 +1449,20 @@ export const workspaceApi = {
       : get<Workspace>(`/workspaces/${id}`),
   switch: (id: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; workspace: Workspace }>('switch_workspace', { id })
-      : post<{ success: boolean; workspace: Workspace }>(`/workspaces/${id}/switch`, {}),
+      ? apiInvoke<{
+          success: boolean;
+          workspace: Workspace;
+          transition: WorkspaceTransitionReceipt;
+        }>('switch_workspace', { id })
+      : post<{
+          success: boolean;
+          workspace: Workspace;
+          transition: WorkspaceTransitionReceipt;
+        }>(`/workspaces/${id}/switch`, {}),
   exit: () =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('exit_workspace')
-      : post<{ success: boolean }>('/workspaces/exit', {}),
+      ? apiInvoke<{ success: boolean; transition: WorkspaceTransitionReceipt }>('exit_workspace')
+      : post<{ success: boolean; transition: WorkspaceTransitionReceipt }>('/workspaces/exit', {}),
   delete: (id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('delete_workspace', { id })

@@ -33,6 +33,10 @@ pub enum StoreError {
     },
     #[error("lock poisoned")]
     LockPoisoned,
+    #[error(
+        "task runtime workspace transition admission is busy ({active_operations} active operations)"
+    )]
+    WorkspaceTransitionBusy { active_operations: usize },
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("invalid plan: {0}")]
@@ -69,10 +73,12 @@ pub struct TaskRuntimeStore {
     /// and cancel target the real executor instead of a surface-local map.
     run_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
+    /// Accepted TaskRun driver tasks. The store is the existing runtime owner,
+    /// so dropping an individual surface waiter never drops the actual driver.
+    run_driver_supervisor: std::sync::Mutex<RunDriverSupervisor>,
     /// File-backed event authority and deterministic projections.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     shadow_generation: std::sync::Mutex<ShadowGeneration>,
-    shadow_generation_idle: std::sync::Condvar,
     /// Owns the bounded task/subagent hook consumer so shutdown can drain it.
     hook_event_dispatcher:
         std::sync::Mutex<Option<super::hook_event_dispatcher::HookEventDispatcher>>,
@@ -87,6 +93,7 @@ pub struct TaskRuntimeStore {
 struct ShadowGeneration {
     active_operations: usize,
     workspace_id: String,
+    transitioning: bool,
 }
 
 struct ShadowOperation<'a> {
@@ -94,10 +101,130 @@ struct ShadowOperation<'a> {
 }
 
 /// Keeps one product operation bound to the current workspace generation.
-/// Rebinding waits until every lease from the previous generation is dropped.
+/// Rebinding returns Busy until every lease from the previous generation drops.
 #[must_use]
-pub(crate) struct WorkspaceGenerationLease<'a> {
-    _operation: ShadowOperation<'a>,
+pub(crate) struct WorkspaceGenerationLease {
+    store: std::sync::Arc<TaskRuntimeStore>,
+}
+
+struct RunDriverSupervisor {
+    accepting: bool,
+    driver_cancels: std::collections::HashMap<u64, echo_agent::agent::CancellationToken>,
+    driver_settlements: tokio::task::JoinSet<(u64, Result<(), String>)>,
+    settlement_debts: Vec<RunSettlementDebt>,
+    next_driver_token: u64,
+    execution_receipts: std::collections::HashMap<u64, Vec<Box<dyn RunDriverExecutionReceipt>>>,
+}
+
+pub(crate) trait RunDriverExecutionReceipt: Send {
+    fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()>;
+}
+
+/// Capability handed only to an accepted TaskRun driver. Pool-backed adapters
+/// transfer their execution receipt here immediately after acquisition so it
+/// survives inner future errors and panics until durable run settlement.
+pub(crate) struct RunDriverReceiptOwner {
+    store: std::sync::Arc<TaskRuntimeStore>,
+    driver_token: u64,
+}
+
+impl RunDriverReceiptOwner {
+    pub(crate) fn retain<Receipt>(self, receipt: Receipt)
+    where
+        Receipt: RunDriverExecutionReceipt + 'static,
+    {
+        self.store
+            .run_driver_supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .execution_receipts
+            .entry(self.driver_token)
+            .or_default()
+            .push(Box::new(receipt));
+    }
+}
+
+struct RunSettlementDebt {
+    generation_lease: WorkspaceGenerationLease,
+    driver_token: Option<u64>,
+    run_id: String,
+    target: TaskRunStatus,
+    note: Option<String>,
+    last_error: String,
+}
+
+impl Default for RunDriverSupervisor {
+    fn default() -> Self {
+        Self {
+            accepting: true,
+            driver_cancels: std::collections::HashMap::new(),
+            driver_settlements: tokio::task::JoinSet::new(),
+            settlement_debts: Vec::new(),
+            next_driver_token: 0,
+            execution_receipts: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// Exclusive workspace-generation transition. New operations receive a typed
+/// busy error until this guard is dropped.
+#[must_use]
+pub(crate) struct TaskRuntimeWorkspaceTransition<'a> {
+    store: &'a TaskRuntimeStore,
+    active: bool,
+}
+
+impl TaskRuntimeWorkspaceTransition<'_> {
+    pub(crate) fn active_shadow_root(&self) -> PathBuf {
+        self.store.shadow.root()
+    }
+
+    pub(crate) fn list_runs_in(
+        &self,
+        statuses: &[TaskRunStatus],
+    ) -> Result<Vec<TaskRun>, StoreError> {
+        super::file_store::FileTaskStore::from_root(self.store.shadow.root())
+            .list_runs_in(statuses)
+            .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))
+    }
+
+    pub(crate) fn rebind_shadow_root(
+        &self,
+        root: impl Into<PathBuf>,
+        workspace_id: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)
+            .map_err(|error| super::file_shadow::ShadowError::Io(error.to_string()))?;
+        let mut generation = self
+            .store
+            .shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !generation.transitioning || generation.active_operations != 0 {
+            return Err(StoreError::InvalidPlan(
+                "task runtime workspace transition lost exclusive admission".to_string(),
+            ));
+        }
+        self.store.shadow.rebind_root(root);
+        generation.workspace_id = workspace_id.into();
+        Ok(())
+    }
+}
+
+impl Drop for TaskRuntimeWorkspaceTransition<'_> {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut generation = self
+            .store
+            .shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation.transitioning = false;
+        self.active = false;
+    }
 }
 
 struct ShadowFileStore<'a> {
@@ -121,9 +248,17 @@ impl Drop for ShadowOperation<'_> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         generation.active_operations = generation.active_operations.saturating_sub(1);
-        if generation.active_operations == 0 {
-            self.store.shadow_generation_idle.notify_all();
-        }
+    }
+}
+
+impl Drop for WorkspaceGenerationLease {
+    fn drop(&mut self) {
+        let mut generation = self
+            .store
+            .shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        generation.active_operations = generation.active_operations.saturating_sub(1);
     }
 }
 
@@ -293,12 +428,13 @@ impl TaskRuntimeStore {
         Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
                 workspace_id: "global".to_string(),
+                transitioning: false,
             }),
-            shadow_generation_idle: std::sync::Condvar::new(),
             hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
         })
@@ -324,12 +460,13 @@ impl TaskRuntimeStore {
         Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
                 workspace_id: "test".to_string(),
+                transitioning: false,
             }),
-            shadow_generation_idle: std::sync::Condvar::new(),
             hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
         })
@@ -344,13 +481,13 @@ impl TaskRuntimeStore {
     pub fn attach_hook_event_dispatcher(
         &self,
         dispatcher: super::hook_event_dispatcher::HookEventDispatcher,
-    ) -> bool {
+    ) -> Result<bool, StoreError> {
         let Ok(mut owned_dispatcher) = self.hook_event_dispatcher.lock() else {
             tracing::warn!("HookEventDispatcher ownership lock is poisoned");
-            return false;
+            return Err(StoreError::LockPoisoned);
         };
         if owned_dispatcher.is_some() {
-            return false;
+            return Ok(false);
         }
         let event_dispatcher = dispatcher.clone();
         let hook: std::sync::Arc<dyn Fn(&super::types::RuntimeTaskEvent) + Send + Sync> =
@@ -359,12 +496,12 @@ impl TaskRuntimeStore {
                     tracing::warn!(%error, "Failed to enqueue task hook event");
                 }
             });
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         if !self.shadow.try_attach_event_hook(hook) {
-            return false;
+            return Ok(false);
         }
         *owned_dispatcher = Some(dispatcher);
-        true
+        Ok(true)
     }
 
     /// Wait for every persisted task/subagent hook event to finish firing.
@@ -395,6 +532,336 @@ impl TaskRuntimeStore {
         }
     }
 
+    /// Stop accepting TaskRun drivers, cancel every accepted driver, and await
+    /// their owned settlement before the store's hook consumer is torn down.
+    pub async fn shutdown_run_drivers(&self) -> Result<(), String> {
+        let (driver_cancels, mut driver_settlements) = {
+            let mut supervisor = self
+                .run_driver_supervisor
+                .lock()
+                .map_err(|_| "TaskRun driver supervisor lock is poisoned".to_string())?;
+            supervisor.accepting = false;
+            (
+                std::mem::take(&mut supervisor.driver_cancels),
+                std::mem::take(&mut supervisor.driver_settlements),
+            )
+        };
+        for cancel in driver_cancels.values() {
+            cancel.cancel();
+        }
+        let mut errors = Vec::new();
+        while let Some(driver) = driver_settlements.join_next().await {
+            match driver {
+                Ok((_, Ok(()))) => {}
+                Ok((_, Err(error))) => errors.push(error),
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        if let Err(error) = self.retry_run_settlement_debts().await {
+            errors.push(error.to_string());
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "TaskRun driver settlement failed: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_run_driver_count(&self) -> Result<usize, String> {
+        self.run_driver_supervisor
+            .lock()
+            .map(|supervisor| {
+                supervisor
+                    .driver_cancels
+                    .len()
+                    .saturating_add(supervisor.settlement_debts.len())
+            })
+            .map_err(|_| "TaskRuntime run driver supervisor is unavailable".to_string())
+    }
+
+    /// Retry durable terminal writes that previously failed while retaining
+    /// their generation lease. A workspace transition remains Busy until the
+    /// debt is settled or the application reports shutdown degradation.
+    pub(crate) async fn retry_run_settlement_debts(&self) -> Result<(), StoreError> {
+        let debts = {
+            let mut supervisor = self
+                .run_driver_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut supervisor.settlement_debts)
+        };
+        let mut remaining = Vec::new();
+        for mut debt in debts {
+            match self.finalize_run(&debt.run_id, debt.target, debt.note.as_deref()) {
+                Ok(_) => {
+                    if let Some(driver_token) = debt.driver_token {
+                        self.release_run_driver_receipts(driver_token).await;
+                    }
+                    drop(debt.generation_lease);
+                }
+                Err(error) => {
+                    debt.last_error = error.to_string();
+                    remaining.push(debt);
+                }
+            }
+        }
+        if remaining.is_empty() {
+            return Ok(());
+        }
+        let details = remaining
+            .iter()
+            .map(|debt| format!("{}: {}", debt.run_id, debt.last_error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.run_driver_supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .settlement_debts
+            .extend(remaining);
+        Err(StoreError::InvalidPlan(format!(
+            "unsettled TaskRun terminal writes: {details}"
+        )))
+    }
+
+    /// Finalize a run or quarantine the supplied generation receipt for a
+    /// later retry. The receipt is never dropped on an unverified write.
+    pub(crate) fn finalize_run_with_lease(
+        &self,
+        generation_lease: &mut Option<WorkspaceGenerationLease>,
+        driver_token: Option<u64>,
+        run_id: &str,
+        target: TaskRunStatus,
+        note: Option<&str>,
+    ) -> Result<TaskRun, StoreError> {
+        match self.finalize_run(run_id, target, note) {
+            Ok(run) => Ok(run),
+            Err(error) => {
+                if let Some(generation_lease) = generation_lease.take() {
+                    self.run_driver_supervisor
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .settlement_debts
+                        .push(RunSettlementDebt {
+                            generation_lease,
+                            driver_token,
+                            run_id: run_id.to_string(),
+                            target,
+                            note: note.map(str::to_string),
+                            last_error: error.to_string(),
+                        });
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Accept an owned TaskRun driver. The caller receives only a result
+    /// waiter; cancellation of that waiter does not cancel the retained task.
+    pub(crate) fn spawn_run_driver<T, F, Factory>(
+        self: &std::sync::Arc<Self>,
+        run_id: String,
+        cancel: echo_agent::agent::CancellationToken,
+        generation_lease: WorkspaceGenerationLease,
+        factory: Factory,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<T, String>>, StoreError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+        Factory: FnOnce(RunDriverReceiptOwner) -> F,
+    {
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let mut generation_lease = Some(generation_lease);
+        let mut supervisor = self
+            .run_driver_supervisor
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        if !supervisor.accepting {
+            drop(supervisor);
+            let message = "task runtime is shutting down";
+            return match self.finalize_run_with_lease(
+                &mut generation_lease,
+                None,
+                &run_id,
+                TaskRunStatus::Failed,
+                Some(message),
+            ) {
+                Ok(_) => Err(StoreError::InvalidPlan(message.to_string())),
+                Err(error) => Err(StoreError::InvalidPlan(format!(
+                    "{message}; terminal settlement failed: {error}"
+                ))),
+            };
+        }
+        let driver_token = supervisor.next_driver_token.checked_add(1).ok_or_else(|| {
+            StoreError::InvalidPlan("TaskRun driver token capacity exhausted".to_string())
+        })?;
+        supervisor.next_driver_token = driver_token;
+        while let Some(result) = supervisor.driver_settlements.try_join_next() {
+            match result {
+                Ok((completed_token, Ok(()))) => {
+                    supervisor.driver_cancels.remove(&completed_token);
+                }
+                Ok((completed_token, Err(error))) => {
+                    supervisor.driver_cancels.remove(&completed_token);
+                    tracing::warn!(%error, "completed TaskRun driver owner reported an error");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "completed TaskRun driver owner failed");
+                }
+            }
+        }
+        let settlement_store = std::sync::Arc::clone(self);
+        let driver_cancel = cancel.clone();
+        let receipt_owner = RunDriverReceiptOwner {
+            store: std::sync::Arc::clone(self),
+            driver_token,
+        };
+        let future = factory(receipt_owner);
+        let Some(generation_lease) = generation_lease.take() else {
+            drop(supervisor);
+            return Err(StoreError::InvalidPlan(
+                "TaskRun generation admission receipt was lost".to_string(),
+            ));
+        };
+        supervisor.driver_cancels.insert(driver_token, cancel);
+        supervisor.driver_settlements.spawn(async move {
+            let mut generation_lease = Some(generation_lease);
+            let mut result = match tokio::spawn(future).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let message = format!("TaskRun driver task failed: {error}");
+                    Err(message)
+                }
+            };
+            let settlement = match &result {
+                Ok(_) => settlement_store.confirm_run_settled(&run_id),
+                Err(error) => {
+                    let target = if driver_cancel.is_cancelled() {
+                        TaskRunStatus::Cancelled
+                    } else {
+                        TaskRunStatus::Failed
+                    };
+                    settlement_store
+                        .finalize_run_with_lease(
+                            &mut generation_lease,
+                            Some(driver_token),
+                            &run_id,
+                            target,
+                            Some(error),
+                        )
+                        .map(|_| ())
+                }
+            };
+            if let Err(settlement_error) = settlement {
+                let original = result.as_ref().err().cloned().unwrap_or_else(|| {
+                    "TaskRun driver returned before durable settlement".to_string()
+                });
+                if generation_lease.is_some() {
+                    match settlement_store.finalize_run_with_lease(
+                        &mut generation_lease,
+                        Some(driver_token),
+                        &run_id,
+                        TaskRunStatus::Failed,
+                        Some(&original),
+                    ) {
+                        Ok(_) => {
+                            settlement_store
+                                .release_run_driver_receipts(driver_token)
+                                .await;
+                            result = Err(format!(
+                                "{original}; recovered non-terminal driver result after: {settlement_error}"
+                            ));
+                        }
+                        Err(recovery_error) => {
+                            let combined = format!(
+                                "{original}; terminal settlement failed: {settlement_error}; fallback terminal settlement failed: {recovery_error}"
+                            );
+                            result = Err(combined);
+                        }
+                    }
+                } else {
+                    let combined =
+                        format!("{original}; terminal settlement failed: {settlement_error}");
+                    result = Err(combined);
+                }
+            } else {
+                settlement_store
+                    .release_run_driver_receipts(driver_token)
+                    .await;
+            }
+            match result {
+                Ok(value) => {
+                    let _ = result_sender.send(Ok(value));
+                }
+                Err(error) => {
+                    let _ = result_sender.send(Err(error.clone()));
+                }
+            }
+            // A terminal write failure is owned by settlement_debts together
+            // with the exact generation and execution receipts. Shutdown and
+            // workspace transition retry that canonical debt and report only
+            // if it remains unsettled.
+            (driver_token, Ok(()))
+        });
+        Ok(result_receiver)
+    }
+
+    async fn release_run_driver_receipts(&self, driver_token: u64) {
+        let receipts = self
+            .run_driver_supervisor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .execution_receipts
+            .remove(&driver_token)
+            .unwrap_or_default();
+        for receipt in receipts {
+            receipt.release().await;
+        }
+    }
+
+    /// Atomically admit a binary/UI TaskRun driver, run its synchronous
+    /// preparation while the current workspace generation is pinned, and
+    /// transfer that pin to the canonical owned driver supervisor.
+    pub fn spawn_supervised_run_driver<T, Prepared, F, Prepare>(
+        self: &std::sync::Arc<Self>,
+        run_id: String,
+        cancel: echo_agent::agent::CancellationToken,
+        prepare: Prepare,
+    ) -> Result<(Prepared, tokio::sync::oneshot::Receiver<Result<T, String>>), StoreError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+        Prepare: FnOnce() -> Result<(Prepared, F), StoreError>,
+    {
+        let generation_lease = self.lease_active_workspace_generation()?;
+        let (prepared, future) = prepare()?;
+        let waiter = self.spawn_run_driver(run_id, cancel, generation_lease, move |_| future)?;
+        Ok((prepared, waiter))
+    }
+
+    fn confirm_run_settled(&self, run_id: &str) -> Result<(), StoreError> {
+        let run = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        if matches!(
+            run.status,
+            TaskRunStatus::Completed
+                | TaskRunStatus::Failed
+                | TaskRunStatus::Cancelled
+                | TaskRunStatus::Paused
+        ) {
+            Ok(())
+        } else {
+            Err(StoreError::InvalidPlan(format!(
+                "TaskRun driver returned with non-terminal status {} for {run_id}",
+                run.status.as_str()
+            )))
+        }
+    }
+
     /// 在持有某 run 的 plan/state 写锁期间执行闭包 (F2-1 / F3-3 / F3-4)。
     ///
     /// 用 closure 模式而非返回 Guard: std::sync::MutexGuard 借自 &Mutex, 而
@@ -402,8 +869,12 @@ impl TaskRuntimeStore {
     /// struct 在 Rust 里无法直接表达)。closure 把锁的获取与释放封装在内部,
     /// 闭包体内是临界区。revision compare-and-commit / transition_run 用它包裹
     /// "读事件 → 校验 → 追加 → 重建投影"全程。
-    fn with_run_lock<R, E>(&self, run_id: &str, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
-        let _operation = self.shadow_operation();
+    fn with_run_lock<R>(
+        &self,
+        run_id: &str,
+        f: impl FnOnce() -> Result<R, StoreError>,
+    ) -> Result<R, StoreError> {
+        let _operation = self.shadow_operation()?;
         let arc = self
             .plan_locks
             .entry(run_id.to_string())
@@ -414,48 +885,81 @@ impl TaskRuntimeStore {
         f()
     }
 
-    fn shadow_operation(&self) -> ShadowOperation<'_> {
+    fn shadow_operation(&self) -> Result<ShadowOperation<'_>, StoreError> {
         let mut generation = self
             .shadow_generation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation.transitioning {
+            return Err(StoreError::WorkspaceTransitionBusy {
+                active_operations: generation.active_operations,
+            });
+        }
         generation.active_operations = generation.active_operations.saturating_add(1);
-        ShadowOperation { store: self }
+        Ok(ShadowOperation { store: self })
+    }
+
+    /// Atomically close generation admission when no operation is active.
+    /// Workspace IPC gets an observable Busy error instead of blocking a Tokio
+    /// runtime thread.
+    pub(crate) async fn begin_workspace_transition(
+        &self,
+    ) -> Result<TaskRuntimeWorkspaceTransition<'_>, StoreError> {
+        self.retry_run_settlement_debts().await?;
+        let mut generation = self
+            .shadow_generation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation.transitioning {
+            return Err(StoreError::WorkspaceTransitionBusy {
+                active_operations: generation.active_operations,
+            });
+        }
+        generation.transitioning = true;
+        let active_operations = generation.active_operations;
+        drop(generation);
+        let transition = TaskRuntimeWorkspaceTransition {
+            store: self,
+            active: true,
+        };
+        if active_operations != 0 {
+            return Err(StoreError::WorkspaceTransitionBusy { active_operations });
+        }
+        Ok(transition)
     }
 
     /// Pin a multi-step application operation to one workspace generation.
     /// Individual store calls already take short leases; cron and other
     /// long-running adapters use this outer lease so a rebind cannot occur
     /// between their run creation, execution, and settlement writes.
-    pub(crate) fn lease_active_workspace_generation(&self) -> WorkspaceGenerationLease<'_> {
-        WorkspaceGenerationLease {
-            _operation: self.shadow_operation(),
-        }
-    }
-
-    /// Atomically switch the file authority after all operations using the
-    /// previous root have completed. The store Arc and event hook stay intact.
-    pub fn rebind_shadow_root(
-        &self,
-        root: impl Into<PathBuf>,
-        workspace_id: impl Into<String>,
-    ) -> Result<(), StoreError> {
-        let root = root.into();
-        std::fs::create_dir_all(&root)
-            .map_err(|error| super::file_shadow::ShadowError::Io(error.to_string()))?;
+    pub(crate) fn lease_active_workspace_generation(
+        self: &std::sync::Arc<Self>,
+    ) -> Result<WorkspaceGenerationLease, StoreError> {
         let mut generation = self
             .shadow_generation
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while generation.active_operations != 0 {
-            generation = self
-                .shadow_generation_idle
-                .wait(generation)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if generation.transitioning {
+            return Err(StoreError::WorkspaceTransitionBusy {
+                active_operations: generation.active_operations,
+            });
         }
-        self.shadow.rebind_root(root);
-        generation.workspace_id = workspace_id.into();
-        Ok(())
+        generation.active_operations = generation.active_operations.saturating_add(1);
+        drop(generation);
+        Ok(WorkspaceGenerationLease {
+            store: std::sync::Arc::clone(self),
+        })
+    }
+
+    /// Atomically switch the file authority after all operations using the
+    /// previous root have completed. The store Arc and event hook stay intact.
+    pub async fn rebind_shadow_root(
+        &self,
+        root: impl Into<PathBuf>,
+        workspace_id: impl Into<String>,
+    ) -> Result<(), StoreError> {
+        let transition = self.begin_workspace_transition().await?;
+        transition.rebind_shadow_root(root, workspace_id)
     }
 
     pub fn active_workspace_id(&self) -> String {
@@ -464,6 +968,11 @@ impl TaskRuntimeStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .workspace_id
             .clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_shadow_root(&self) -> PathBuf {
+        self.shadow.root()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -477,7 +986,7 @@ impl TaskRuntimeStore {
         route: &str,
         attended_mode: AttendedMode,
     ) -> Result<TaskRun, StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let workspace_id = self.active_workspace_id();
         self.create_run(
             run_id,
@@ -492,12 +1001,12 @@ impl TaskRuntimeStore {
     }
 
     /// Build a `FileTaskStore` over the shadow, for read delegation.
-    fn file_store(&self) -> ShadowFileStore<'_> {
-        let operation = self.shadow_operation();
-        ShadowFileStore {
+    fn file_store(&self) -> Result<ShadowFileStore<'_>, StoreError> {
+        let operation = self.shadow_operation()?;
+        Ok(ShadowFileStore {
             _operation: operation,
             store: super::file_store::FileTaskStore::new((*self.shadow).clone()),
-        }
+        })
     }
 
     // ── Runs ────────────────────────────────────────────────────────────
@@ -633,12 +1142,62 @@ impl TaskRuntimeStore {
         })
     }
 
+    /// Persist and verify a terminal TaskRun status before execution receipts
+    /// may be released. Existing completed/cancelled truth wins over a late
+    /// driver failure.
+    pub(crate) fn finalize_run(
+        &self,
+        run_id: &str,
+        target: TaskRunStatus,
+        note: Option<&str>,
+    ) -> Result<TaskRun, StoreError> {
+        if !matches!(
+            target,
+            TaskRunStatus::Completed | TaskRunStatus::Failed | TaskRunStatus::Cancelled
+        ) {
+            return Err(StoreError::InvalidPlan(format!(
+                "finalize_run requires a terminal status, got {}",
+                target.as_str()
+            )));
+        }
+        if let Some(note) = note {
+            self.note(run_id, None, note)?;
+        }
+        let mut current = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        if matches!(
+            current.status,
+            TaskRunStatus::Completed | TaskRunStatus::Cancelled
+        ) || current.status == target
+        {
+            return Ok(current);
+        }
+        if target != TaskRunStatus::Cancelled && current.status != TaskRunStatus::Running {
+            current = self.transition_run(run_id, TaskRunStatus::Running)?;
+        }
+        if current.status != target {
+            self.transition_run(run_id, target)?;
+        }
+        let settled = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        if settled.status != target {
+            return Err(StoreError::InvalidPlan(format!(
+                "run {run_id} terminal write was not durable: expected {}, read back {}",
+                target.as_str(),
+                settled.status.as_str()
+            )));
+        }
+        Ok(settled)
+    }
+
     /// Resume a paused run: `Paused → Running`.
     ///
     /// The caller (IPC layer) is responsible for re-launching the executor
     /// after this succeeds — the store only handles the state transition.
     pub fn resume_task_run(&self, run_id: &str) -> Result<TaskRun, StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let blockers = self.list_recovery_blockers(run_id)?;
         if !blockers.is_empty() {
             let details = blockers
@@ -782,7 +1341,7 @@ impl TaskRuntimeStore {
     /// the terminal transition. Runs without a driver may only be cancelled
     /// directly when they are not executing.
     pub fn request_cancel(&self, run_id: &str) -> Result<bool, StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         if self.cancel_active_run(run_id) {
             return Ok(true);
         }
@@ -804,7 +1363,7 @@ impl TaskRuntimeStore {
     /// run-scoped token used for cancellation stops in-flight Subagents. The
     /// executor observes the durable Paused status and leaves the run resumable.
     pub fn request_pause(&self, run_id: &str) -> Result<bool, StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let Some(run) = self.get_run(run_id)? else {
             return Ok(false);
         };
@@ -886,7 +1445,7 @@ impl TaskRuntimeStore {
         &self,
         run_id: &str,
     ) -> Result<Option<echo_agent::tasks::RevisionedTaskGraph>, StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let Some(plan) = self.shadow.read_plan(run_id)? else {
             return Ok(None);
         };
@@ -1691,7 +2250,7 @@ impl TaskRuntimeStore {
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, StoreError> {
         // U1c phase-0/0bc step-2: read delegates to the file store (file authority).
-        self.file_store()
+        self.file_store()?
             .get_run(run_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
@@ -1700,7 +2259,7 @@ impl TaskRuntimeStore {
     /// run does not exist.
     pub fn get_run_route(&self, run_id: &str) -> Result<Option<String>, StoreError> {
         // U1c phase-0/0bc step-2: delegate to file store, project the route field.
-        self.file_store()
+        self.file_store()?
             .get_run(run_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
             .map(|r| r.map(|r| r.route))
@@ -1711,7 +2270,7 @@ impl TaskRuntimeStore {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .latest_run_for_conversation(conversation_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
@@ -1724,13 +2283,13 @@ impl TaskRuntimeStore {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .find_in_progress_run_by_conversation(conversation_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_runs_in(&self, statuses: &[TaskRunStatus]) -> Result<Vec<TaskRun>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .list_runs_in(statuses)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
@@ -1812,7 +2371,7 @@ impl TaskRuntimeStore {
         tool_name: Option<&str>,
         reason: &str,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -1839,14 +2398,14 @@ impl TaskRuntimeStore {
     /// Returns the number of runs recovered.
     ///
     /// Safe to call on an empty/fresh store (no-op).
-    pub fn recover_incomplete(&self) -> usize {
-        let _operation = self.shadow_operation();
+    pub fn recover_incomplete(&self) -> Result<usize, StoreError> {
+        let _operation = self.shadow_operation()?;
         const INTERRUPTED: &[TaskRunStatus] = &[TaskRunStatus::Running];
         let zombies = match self.list_runs_in(INTERRUPTED) {
             Ok(z) => z,
             Err(e) => {
                 tracing::warn!(error = %e, "recover_incomplete: failed to list interrupted runs");
-                return 0;
+                return Ok(0);
             }
         };
         let count = zombies.len();
@@ -1990,17 +2549,17 @@ impl TaskRuntimeStore {
                 ),
             }
         }
-        count
+        Ok(count)
     }
 
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .get_plan(run_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .list_todos(run_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
@@ -2010,13 +2569,13 @@ impl TaskRuntimeStore {
         run_id: &str,
         since_seq: i64,
     ) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .list_events(run_id, since_seq)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .list_artifacts(run_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
@@ -2028,7 +2587,7 @@ impl TaskRuntimeStore {
     ) -> Result<Vec<ReviewResult>, StoreError> {
         // FileTaskStore.list_reviews returns all reviews for a run; filter
         // by task_id to match the SQL signature.
-        self.file_store()
+        self.file_store()?
             .list_reviews(run_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
             .map(|rs| rs.into_iter().filter(|r| r.task_id == task_id).collect())
@@ -2039,7 +2598,7 @@ impl TaskRuntimeStore {
         run_id: &str,
         task_id: &str,
     ) -> Result<Option<TaskExecutionSummary>, StoreError> {
-        self.file_store()
+        self.file_store()?
             .get_summary(run_id, task_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
@@ -2051,7 +2610,7 @@ impl TaskRuntimeStore {
         task_id: Option<&str>,
         message: &str,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         // U1c phase-0/0bc step-2: file authority. A plain Note{message} does
         // not affect plan.json (the rebuilder only mutates the plan for
         // Note{kind: fix_task_persisted | summary_persisted}), so we skip the
@@ -2077,7 +2636,7 @@ impl TaskRuntimeStore {
         priority: u8,
         dependencies: &[String],
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         self.shadow.append_event_line(
             run_id,
             None,
@@ -2101,7 +2660,7 @@ impl TaskRuntimeStore {
         requested_mode: &str,
         observed_path: &str,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         self.shadow.append_event_line(
             run_id,
             None,
@@ -2132,7 +2691,7 @@ impl TaskRuntimeStore {
         replay_safe: bool,
         dispatch_hook: bool,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -2156,7 +2715,7 @@ impl TaskRuntimeStore {
         &self,
         record: SubagentReleaseRecord<'_>,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let SubagentReleaseRecord {
             run_id,
             task_id,
@@ -2204,7 +2763,7 @@ impl TaskRuntimeStore {
         tool_name: &str,
         replay_safe: bool,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -2234,7 +2793,7 @@ impl TaskRuntimeStore {
         result: &str,
         failure: Option<&echo_agent::tools::ToolFailure>,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let event_type = if success {
             RuntimeEventKind::ToolCompleted
         } else {
@@ -2318,7 +2877,7 @@ impl TaskRuntimeStore {
 
     /// Current unresolved recovery barriers, folded from append-only events.
     pub fn list_recovery_blockers(&self, run_id: &str) -> Result<Vec<RecoveryBlocker>, StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let mut blockers = std::collections::BTreeMap::<String, RecoveryBlocker>::new();
         for event in self.list_events(run_id, 0)? {
             match event.event_type {
@@ -2376,7 +2935,7 @@ impl TaskRuntimeStore {
         task_id: &str,
         decision: RecoveryDecision,
     ) -> Result<(), StoreError> {
-        let _operation = self.shadow_operation();
+        let _operation = self.shadow_operation()?;
         let blocker = self
             .list_recovery_blockers(run_id)?
             .into_iter()
@@ -2448,8 +3007,223 @@ fn bounded_event_text(value: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
 
+    struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl RunDriverExecutionReceipt for DropFlag {
+        fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async move {
+                drop(self);
+            })
+        }
+    }
+
     fn fresh() -> TaskRuntimeStore {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    }
+
+    #[tokio::test]
+    async fn terminal_write_debt_retains_execution_receipt_until_retry() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let blocked_root = temp.path().join("tasks-blocked");
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "receipt-debt",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "retain execution receipt",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("receipt-debt", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let generation_lease = store
+            .lease_active_workspace_generation()
+            .map_err(|error| error.to_string())?;
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_for_driver = std::sync::Arc::clone(&dropped);
+        let waiter = store
+            .spawn_run_driver(
+                "receipt-debt".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+                generation_lease,
+                move |receipt_owner| async move {
+                    receipt_owner.retain(DropFlag(dropped_for_driver));
+                    std::fs::rename(&root, &blocked_root)
+                        .map_err(|error| format!("block task root: {error}"))?;
+                    std::fs::write(&root, b"block directory recreation")
+                        .map_err(|error| format!("replace task root: {error}"))?;
+                    Err::<(), String>("injected driver failure".to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let driver_error = waiter
+            .await
+            .map_err(|error| error.to_string())?
+            .err()
+            .ok_or_else(|| "driver failure was not reported".to_string())?;
+        assert!(driver_error.contains("terminal settlement failed"));
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(store.begin_workspace_transition().await.is_err());
+
+        std::fs::remove_file(temp.path().join("tasks")).map_err(|error| error.to_string())?;
+        std::fs::rename(temp.path().join("tasks-blocked"), temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        store
+            .retry_run_settlement_debts()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        let transition = store
+            .begin_workspace_transition()
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(transition);
+        store.shutdown_run_drivers().await
+    }
+
+    #[tokio::test]
+    async fn dropped_waiter_shutdown_settles_run_and_releases_execution_receipt()
+    -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "dropped-waiter",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "settle dropped waiter",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("dropped-waiter", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let generation_lease = store
+            .lease_active_workspace_generation()
+            .map_err(|error| error.to_string())?;
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let driver_cancel = cancel.clone();
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dropped_for_driver = std::sync::Arc::clone(&dropped);
+        let waiter = store
+            .spawn_run_driver(
+                "dropped-waiter".to_string(),
+                cancel,
+                generation_lease,
+                move |receipt_owner| async move {
+                    receipt_owner.retain(DropFlag(dropped_for_driver));
+                    driver_cancel.cancelled().await;
+                    Err::<(), String>("driver cancelled during shutdown".to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        drop(waiter);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            store.shutdown_run_drivers(),
+        )
+        .await
+        .map_err(|_| "TaskRun driver shutdown timed out".to_string())??;
+        let run = store
+            .get_run("dropped-waiter")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "settled run disappeared".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Cancelled);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overlapping_same_run_drivers_release_only_their_exact_receipts() -> Result<(), String>
+    {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "overlap",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "exact driver receipt",
+                "",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("overlap", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("overlap", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+
+        let first_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel::<()>();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_flag = std::sync::Arc::clone(&first_dropped);
+        let first_waiter = store
+            .spawn_run_driver(
+                "overlap".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |receipt_owner| async move {
+                    receipt_owner.retain(DropFlag(first_flag));
+                    first_rx.await.map_err(|error| error.to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let second_flag = std::sync::Arc::clone(&second_dropped);
+        let second_waiter = store
+            .spawn_run_driver(
+                "overlap".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+                store
+                    .lease_active_workspace_generation()
+                    .map_err(|error| error.to_string())?,
+                move |receipt_owner| async move {
+                    receipt_owner.retain(DropFlag(second_flag));
+                    second_rx.await.map_err(|error| error.to_string())
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        first_tx
+            .send(())
+            .map_err(|_| "first driver receiver closed".to_string())?;
+        first_waiter.await.map_err(|error| error.to_string())??;
+        assert!(first_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!second_dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        second_tx
+            .send(())
+            .map_err(|_| "second driver receiver closed".to_string())?;
+        second_waiter.await.map_err(|error| error.to_string())??;
+        assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        store.shutdown_run_drivers().await
     }
 
     #[test]
@@ -2926,7 +3700,7 @@ mod tests {
             Some("verified"),
         )?;
 
-        assert_eq!(s.recover_incomplete(), 1);
+        assert_eq!(s.recover_incomplete()?, 1);
         let run = s
             .get_run("r1")?
             .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
@@ -3029,7 +3803,7 @@ mod tests {
         seed_plan(&store);
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
 
-        assert_eq!(store.recover_incomplete(), 1);
+        assert_eq!(store.recover_incomplete()?, 1);
         let todo = store
             .list_todos("r1")?
             .into_iter()
@@ -3090,7 +3864,7 @@ mod tests {
             dispatch_hook: true,
         })?;
 
-        assert_eq!(store.recover_incomplete(), 1);
+        assert_eq!(store.recover_incomplete()?, 1);
         assert_eq!(
             store.recoverable_subagent_result_for_attempt(
                 "r1",
@@ -3141,7 +3915,7 @@ mod tests {
         )?;
         store.record_tool_started("r1", "t1", "t1:1", "call-write", "write_file", false)?;
 
-        assert_eq!(store.recover_incomplete(), 1);
+        assert_eq!(store.recover_incomplete()?, 1);
         let blockers = store.list_recovery_blockers("r1")?;
         assert_eq!(blockers.len(), 1);
         assert_eq!(
@@ -3233,7 +4007,7 @@ mod tests {
         store.record_subagent_assigned(
             "r1", "t1", "t1:1", "subagent", "Task 1", 1, 1, false, true,
         )?;
-        assert_eq!(store.recover_incomplete(), 1);
+        assert_eq!(store.recover_incomplete()?, 1);
 
         // Simulate a process stop after RecoveryResolved was appended but
         // before resolve_recovery_task changed the durable Blocked Todo.
@@ -3788,8 +4562,8 @@ mod tests {
         assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
     }
 
-    #[test]
-    fn generation_rebind_waits_for_active_operation_and_isolates_roots()
+    #[tokio::test]
+    async fn generation_rebind_rejects_active_operation_then_isolates_roots()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let first_root = temp.path().join("first");
@@ -3797,27 +4571,20 @@ mod tests {
         let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
             &first_root,
         )?);
-        let operation = store.lease_active_workspace_generation();
-        let (started_sender, started_receiver) = std::sync::mpsc::channel();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let rebinding_store = store.clone();
-        let handle = std::thread::spawn(move || {
-            let _ignored = started_sender.send(());
-            let result = rebinding_store.rebind_shadow_root(&second_root, "workspace-b");
-            let _ignored = sender.send(result);
-        });
-
-        started_receiver.recv_timeout(std::time::Duration::from_secs(2))?;
+        let operation = store.lease_active_workspace_generation()?;
         assert!(
-            receiver
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err()
+            matches!(
+                store.rebind_shadow_root(&second_root, "workspace-b").await,
+                Err(StoreError::WorkspaceTransitionBusy {
+                    active_operations: 1
+                })
+            ),
+            "workspace transition must fail fast while a generation lease is active"
         );
         drop(operation);
-        receiver.recv_timeout(std::time::Duration::from_secs(2))??;
-        handle
-            .join()
-            .map_err(|_| std::io::Error::other("generation rebind thread panicked"))?;
+        store
+            .rebind_shadow_root(&second_root, "workspace-b")
+            .await?;
 
         store.create_run_for_active_workspace(
             "run-b",
@@ -3837,8 +4604,100 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn failed_generation_rebind_keeps_previous_root_and_identity()
+    #[tokio::test(flavor = "current_thread")]
+    async fn workspace_transition_rejects_operations_without_blocking_single_thread_runtime()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let first_root = temp.path().join("first");
+        let second_root = temp.path().join("second");
+        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+            &first_root,
+        )?);
+        let transition = store.begin_workspace_transition().await?;
+
+        assert!(matches!(
+            store.create_run_for_active_workspace(
+                "run-b",
+                "conversation-b",
+                "message-b",
+                DomainProfile::General,
+                "generation admission",
+                "task",
+                AttendedMode::Attended,
+            ),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        assert!(matches!(
+            store.transition_run("run-b", TaskRunStatus::Running),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        assert!(matches!(
+            store.set_task_status("run-b", "task-b", TodoStatus::Running, None, None),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        assert!(matches!(
+            store.note("run-b", None, "must not reach the old root"),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        assert!(matches!(
+            store.record_subagent_assigned(
+                "run-b",
+                "task-b",
+                "execution-b",
+                "subagent-b",
+                "Task B",
+                1,
+                1,
+                true,
+                true,
+            ),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        assert!(matches!(
+            store.record_tool_started(
+                "run-b",
+                "task-b",
+                "execution-b",
+                "call-b",
+                "read_file",
+                true,
+            ),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        assert!(matches!(
+            store.get_run("run-b"),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        assert!(matches!(
+            store.lease_active_workspace_generation(),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+
+        transition.rebind_shadow_root(&second_root, "workspace-b")?;
+        assert!(matches!(
+            store.note("run-b", None, "must wait for generation publication"),
+            Err(StoreError::WorkspaceTransitionBusy { .. })
+        ));
+        drop(transition);
+
+        store.create_run_for_active_workspace(
+            "run-b",
+            "conversation-b",
+            "message-b",
+            DomainProfile::General,
+            "generation admission",
+            "task",
+            AttendedMode::Attended,
+        )?;
+
+        assert!(!first_root.join("run-b").exists());
+        assert!(second_root.join("run-b/events.jsonl").is_file());
+        assert_eq!(store.active_workspace_id(), "workspace-b");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_generation_rebind_keeps_previous_root_and_identity()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let first_root = temp.path().join("first");
@@ -3849,6 +4708,7 @@ mod tests {
         assert!(
             store
                 .rebind_shadow_root(&invalid_root, "workspace-b")
+                .await
                 .is_err()
         );
         assert_eq!(store.active_workspace_id(), "test");

@@ -122,6 +122,11 @@ pub(crate) fn prepare_application_components(
                 continue;
             }
         };
+        if let Some(path) = resolved.hooks_file.as_ref()
+            && let Err(error) = validate_hooks_with_variables(&plugin, path, Some(&variables))
+        {
+            errors.push(error);
+        }
         for path in resolved.agent_files {
             match read_plugin_agent_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(agent) => {
@@ -231,6 +236,11 @@ pub(crate) fn validate_application_component_files(
             errors.push(error);
         }
     }
+    if let Some(path) = &resolved.hooks_file
+        && let Err(error) = validate_hooks_with_variables(plugin, path, None)
+    {
+        errors.push(error);
+    }
     if let Some(path) = &resolved.lsp_config_file
         && let Err(error) = LspConfig::from_file(path)
     {
@@ -279,6 +289,18 @@ fn read_plugin_agent_with_variables(
         plugin: plugin.to_string(),
         definition,
     })
+}
+
+fn validate_hooks_with_variables(
+    plugin: &str,
+    path: &Path,
+    variables: Option<&PluginVariables>,
+) -> Result<(), String> {
+    let content = read_component_text(path, variables)
+        .map_err(|error| format!("Plugin '{plugin}' hooks file '{}': {error}", path.display()))?;
+    serde_yaml::from_str::<echo_agent::prelude::HooksDefinition>(&content)
+        .map(|_| ())
+        .map_err(|error| format!("Plugin '{plugin}' hooks YAML parse: {error}"))
 }
 
 fn read_monitors(plugin: &str, path: &Path) -> Result<Vec<CronTask>, String> {

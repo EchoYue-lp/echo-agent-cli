@@ -104,12 +104,12 @@ pub async fn get_workspace(
 pub async fn exit_workspace(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    state
+    let transition = state
         .app_state
         .exit_workspace()
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
-    Ok(serde_json::json!({ "success": true }))
+    Ok(serde_json::json!({ "success": true, "transition": transition }))
 }
 
 #[tauri::command]
@@ -151,7 +151,7 @@ pub async fn switch_workspace(
     let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id.clone());
     match state.app_state.workspace.registry.open(&ws_id) {
         Ok(ws) => match state.app_state.switch_workspace(ws.clone()).await {
-            Ok(()) => {
+            Ok(transition) => {
                 tracing::info!(workspace = %id, "Switched workspace via IPC");
 
                 // Immediately verify conversation store by listing conversations
@@ -184,6 +184,7 @@ pub async fn switch_workspace(
                 Ok(serde_json::json!({
                     "success": true,
                     "workspace": ws,
+                    "transition": transition,
                     "debug_conversation_count": conv_count,
                 }))
             }

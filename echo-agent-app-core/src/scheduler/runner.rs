@@ -12,7 +12,8 @@
 
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
-use crate::tasks::task_runtime::{TaskRuntimeStore, launch_cron_run};
+use crate::tasks::task_runtime::TaskRuntimeStore;
+use crate::tasks::task_runtime::executor::{create_unattended_run, drive_existing_cron_run};
 use echo_agent::agent::CancellationToken;
 use echo_agent::scheduler::{
     CronTask, CronTaskStore, FireFn, SchedulerRunner as FrameworkSchedulerRunner,
@@ -93,58 +94,83 @@ fn build_fire_fn_with_cancel(
             // and the final result projection on one workspace generation.
             // `switch_workspace`/`exit_workspace` can prepare concurrently but
             // cannot rebind the TaskRuntime file authority until this drops.
-            let _generation_lease = store.lease_active_workspace_generation();
+            let generation_lease = store.lease_active_workspace_generation().map_err(|error| {
+                echo_agent::error::ReactError::Other(format!(
+                    "task runtime generation admission failed: {error}"
+                ))
+            })?;
             let fire_id = uuid::Uuid::new_v4().to_string();
+            let run_id = uuid::Uuid::new_v4().to_string();
             let cancel = scheduler_cancel.child_token();
-
-            // Phase C: acquire a per-run pool agent when available. The
-            // run-scoped key means each cron run gets its OWN agent (never
-            // reused), so the worktree working_dir binding in
-            // drive_unattended_run is per-run and can't be clobbered by an
-            // overlapping run. A cron run's pool agent plays the primary role
-            // (drives task_create + task_execute), not a formal Subagent role.
-            // The fallback registration only covers standalone pools that do
-            // not already expose the shared conversation-aware tool.
-            let run_agent: AgentHandle = match &pool {
-                Some(pool) => {
-                    let run_key = format!("__cron__:{}:{fire_id}", task.id);
-                    let acquired = pool.acquire(&run_key).await.map_err(|e| {
-                        echo_agent::error::ReactError::Other(format!(
-                            "cron pool acquire failed: {e}"
+            create_unattended_run(&store, &run_id, "cron", &task.id, &fire_id, prompt).map_err(
+                |error| {
+                    echo_agent::error::ReactError::Other(format!(
+                        "cron TaskRun creation failed: {error}"
+                    ))
+                },
+            )?;
+            let owned_store = store.clone();
+            let owned_run_id = run_id.clone();
+            let owned_task = task.clone();
+            let owned_fire_id = fire_id.clone();
+            let owned_prompt = prompt.to_string();
+            let owned_cancel = cancel.clone();
+            let waiter = store
+                .spawn_run_driver(
+                    run_id.clone(),
+                    cancel,
+                    generation_lease,
+                    move |receipt_owner| async move {
+                        // Pool admission follows TaskRuntime generation admission.
+                        let run_agent = match &pool {
+                            Some(pool) => {
+                                let run_key = format!("__cron__:{}:{owned_fire_id}", owned_task.id);
+                                let acquired = pool.acquire(&run_key).await.map_err(|error| {
+                                    format!("cron pool acquire failed: {error}")
+                                })?;
+                                let agent = acquired.agent();
+                                receipt_owner
+                                    .retain(pool.retain_for_supervised_run(run_key, acquired));
+                                register_task_execute_on_agent(&agent, owned_store.clone()).await;
+                                agent
+                            }
+                            None => fallback_agent,
+                        };
+                        let result = drive_existing_cron_run(
+                            owned_store.clone(),
+                            run_agent,
+                            owned_run_id.clone(),
+                            &owned_task.id,
+                            &owned_fire_id,
+                            &owned_prompt,
+                            owned_cancel,
+                        )
+                        .await
+                        .map_err(|error| format!("cron run failed: {error}"));
+                        let settled_run_id = result?;
+                        if let Some(emitter) = webhook_emitter.as_ref() {
+                            emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
+                                task_id: owned_task.id.clone(),
+                                task_name: owned_task.name.clone(),
+                                result_summary: format!("cron run {settled_run_id} finished"),
+                            });
+                        }
+                        Ok(format!(
+                            "cron run {settled_run_id} finished for task {}",
+                            owned_task.id
                         ))
-                    })?;
-                    register_task_execute_on_agent(&acquired, store.clone()).await;
-                    acquired
-                }
-                None => fallback_agent.clone(),
-            };
-
-            let result =
-                launch_cron_run(store.clone(), run_agent, &task.id, &fire_id, prompt, cancel).await;
-
-            // Release the per-run pool entry so it doesn't linger until the
-            // 5-min idle evictor reaps it (drive_run_async notably does NOT
-            // release — a pre-existing minor leak we don't repeat here).
-            if let Some(pool) = &pool {
-                pool.release(&format!("__cron__:{}:{fire_id}", task.id))
-                    .await;
-            }
-
-            match result {
-                Ok(run_id) => {
-                    // Best-effort webhook: fire CronTaskCompleted when an emitter
-                    // with endpoints exists. Failure to emit never blocks the run.
-                    if let Some(emitter) = webhook_emitter.as_ref() {
-                        emitter.emit(crate::webhook::WebhookEvent::CronTaskCompleted {
-                            task_id: task.id.clone(),
-                            task_name: task.name.clone(),
-                            result_summary: format!("cron run {run_id} finished"),
-                        });
-                    }
-                    Ok(format!("cron run {run_id} finished for task {}", task.id))
-                }
-                Err(e) => Err(echo_agent::error::ReactError::Other(format!(
-                    "cron run failed: {e}"
+                    },
+                )
+                .map_err(|error| {
+                    echo_agent::error::ReactError::Other(format!(
+                        "cron TaskRun driver admission failed: {error}"
+                    ))
+                })?;
+            match waiter.await {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(error)) => Err(echo_agent::error::ReactError::Other(error)),
+                Err(error) => Err(echo_agent::error::ReactError::Other(format!(
+                    "cron TaskRun result waiter failed: {error}"
                 ))),
             }
         }) as futures::future::BoxFuture<'static, echo_agent::error::Result<String>>
@@ -224,6 +250,7 @@ mod tests {
         let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
         store
             .rebind_shadow_root(workspace.path().join("tasks"), "cron-workspace")
+            .await
             .map_err(|error| error.to_string())?;
 
         // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;

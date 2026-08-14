@@ -92,6 +92,12 @@ pub enum ForegroundTurnError {
         expected_turn_id: String,
         actual_turn_id: String,
     },
+    #[error("foreground turn admission is suspended for a workspace transition")]
+    AdmissionSuspended,
+    #[error("foreground turn control is shutting down")]
+    ShuttingDown,
+    #[error("a foreground turn is active; workspace transition admission cannot be suspended")]
+    ActiveTurns,
     #[error("foreground turn control state is unavailable")]
     StateUnavailable,
 }
@@ -115,14 +121,48 @@ impl ActiveForegroundTurn {
 }
 
 #[derive(Default)]
+struct ForegroundTurnState {
+    active: HashMap<ForegroundTurnKey, Arc<ActiveForegroundTurn>>,
+    admission_suspended: bool,
+    shutting_down: bool,
+}
+
+#[derive(Default)]
 struct ForegroundTurnControlInner {
-    active: Mutex<HashMap<ForegroundTurnKey, Arc<ActiveForegroundTurn>>>,
+    state: Mutex<ForegroundTurnState>,
 }
 
 /// Single application authority for foreground turn identity and cancellation.
 #[derive(Clone, Default)]
 pub struct ForegroundTurnControl {
     inner: Arc<ForegroundTurnControlInner>,
+}
+
+/// Pauses new foreground turns while an application workspace transition is
+/// settling. The active-turn check and suspension bit share one mutex, closing
+/// the gap where a turn could enter after a read-only idle snapshot.
+#[must_use]
+pub(crate) struct ForegroundAdmissionSuspension {
+    control: ForegroundTurnControl,
+    active: bool,
+}
+
+impl Drop for ForegroundAdmissionSuspension {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .control
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.shutting_down {
+            state.admission_suspended = false;
+        }
+        self.active = false;
+    }
 }
 
 impl ForegroundTurnControl {
@@ -145,12 +185,18 @@ impl ForegroundTurnControl {
             surface,
             conversation_id,
         };
-        let mut active = self
+        let mut state = self
             .inner
-            .active
+            .state
             .lock()
             .map_err(|_| ForegroundTurnError::StateUnavailable)?;
-        if let Some(existing) = active.get(&key) {
+        if state.shutting_down {
+            return Err(ForegroundTurnError::ShuttingDown);
+        }
+        if state.admission_suspended {
+            return Err(ForegroundTurnError::AdmissionSuspended);
+        }
+        if let Some(existing) = state.active.get(&key) {
             return Err(ForegroundTurnError::Busy {
                 surface,
                 conversation_id: key.conversation_id.clone(),
@@ -165,7 +211,7 @@ impl ForegroundTurnControl {
             cancel,
             settlement_tx,
         });
-        active.insert(key, Arc::clone(&entry));
+        state.active.insert(key, Arc::clone(&entry));
         Ok(ForegroundTurnLease {
             control: self.clone(),
             entry,
@@ -179,8 +225,9 @@ impl ForegroundTurnControl {
         surface: ForegroundTurnSurface,
         conversation_id: &str,
     ) -> Option<ForegroundTurnSnapshot> {
-        let active = self.inner.active.lock().ok()?;
-        active
+        let state = self.inner.state.lock().ok()?;
+        state
+            .active
             .get(&ForegroundTurnKey {
                 surface,
                 conversation_id: conversation_id.to_string(),
@@ -193,12 +240,13 @@ impl ForegroundTurnControl {
         &self,
         surface: ForegroundTurnSurface,
     ) -> Result<Vec<ForegroundTurnSnapshot>, ForegroundTurnError> {
-        let active = self
+        let state = self
             .inner
-            .active
+            .state
             .lock()
             .map_err(|_| ForegroundTurnError::StateUnavailable)?;
-        let mut snapshots = active
+        let mut snapshots = state
+            .active
             .values()
             .filter(|entry| entry.key.surface == surface)
             .map(|entry| entry.snapshot())
@@ -213,8 +261,9 @@ impl ForegroundTurnControl {
 
     /// True when any surface owns a turn for this conversation.
     pub fn has_active_conversation(&self, conversation_id: &str) -> bool {
-        match self.inner.active.lock() {
-            Ok(active) => active
+        match self.inner.state.lock() {
+            Ok(state) => state
+                .active
                 .keys()
                 .any(|key| key.conversation_id == conversation_id),
             Err(_) => true,
@@ -222,10 +271,35 @@ impl ForegroundTurnControl {
     }
 
     pub fn has_active_turns(&self) -> bool {
-        match self.inner.active.lock() {
-            Ok(active) => !active.is_empty(),
+        match self.inner.state.lock() {
+            Ok(state) => !state.active.is_empty(),
             Err(_) => true,
         }
+    }
+
+    /// Atomically verify idleness and suspend new foreground admission.
+    pub(crate) fn suspend_admission_if_idle(
+        &self,
+    ) -> Result<ForegroundAdmissionSuspension, ForegroundTurnError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+        if state.shutting_down {
+            return Err(ForegroundTurnError::ShuttingDown);
+        }
+        if state.admission_suspended {
+            return Err(ForegroundTurnError::AdmissionSuspended);
+        }
+        if !state.active.is_empty() {
+            return Err(ForegroundTurnError::ActiveTurns);
+        }
+        state.admission_suspended = true;
+        Ok(ForegroundAdmissionSuspension {
+            control: self.clone(),
+            active: true,
+        })
     }
 
     /// Request cancellation only when the caller's turn id is still current.
@@ -242,20 +316,20 @@ impl ForegroundTurnControl {
             surface,
             conversation_id: conversation_id.to_string(),
         };
-        let entry = {
-            let active = self
-                .inner
-                .active
-                .lock()
-                .map_err(|_| ForegroundTurnError::StateUnavailable)?;
-            active
-                .get(&key)
-                .cloned()
-                .ok_or_else(|| ForegroundTurnError::NoActiveTurn {
-                    surface,
-                    conversation_id: conversation_id.to_string(),
+        let entry =
+            {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+                state.active.get(&key).cloned().ok_or_else(|| {
+                    ForegroundTurnError::NoActiveTurn {
+                        surface,
+                        conversation_id: conversation_id.to_string(),
+                    }
                 })?
-        };
+            };
         if entry.turn_id != expected_turn_id {
             return Err(ForegroundTurnError::TurnMismatch {
                 surface,
@@ -281,6 +355,33 @@ impl ForegroundTurnControl {
             .await
     }
 
+    /// Permanently close foreground admission, cancel every exact active turn,
+    /// and wait for their existing driver leases to publish settlement.
+    pub async fn shutdown(&self) -> Result<(), ForegroundTurnError> {
+        let waiters = {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+            state.shutting_down = true;
+            state.admission_suspended = true;
+            state
+                .active
+                .values()
+                .map(|entry| {
+                    let settlement_rx = entry.settlement_tx.subscribe();
+                    entry.cancel.cancel();
+                    ForegroundTurnSettlementWaiter { settlement_rx }
+                })
+                .collect::<Vec<_>>()
+        };
+        for waiter in waiters {
+            waiter.wait().await?;
+        }
+        Ok(())
+    }
+
     fn settle(&self, entry: &Arc<ActiveForegroundTurn>, outcome: TurnOutcome) {
         let settlement = ForegroundTurnSettlement {
             surface: entry.key.surface,
@@ -288,12 +389,13 @@ impl ForegroundTurnControl {
             turn_id: entry.turn_id.clone(),
             outcome,
         };
-        if let Ok(mut active) = self.inner.active.lock()
-            && active
+        if let Ok(mut state) = self.inner.state.lock()
+            && state
+                .active
                 .get(&entry.key)
                 .is_some_and(|current| Arc::ptr_eq(current, entry))
         {
-            active.remove(&entry.key);
+            state.active.remove(&entry.key);
         }
         entry.settlement_tx.send_replace(Some(settlement));
     }
@@ -539,6 +641,29 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn workspace_transition_suspension_is_atomic_and_reopens_admission()
+    -> Result<(), ForegroundTurnError> {
+        let control = ForegroundTurnControl::default();
+        let active = control.begin(ForegroundTurnSurface::Gui, "conversation", "active")?;
+        assert!(matches!(
+            control.suspend_admission_if_idle(),
+            Err(ForegroundTurnError::ActiveTurns)
+        ));
+        active.settle(TurnOutcome::Completed);
+
+        let transition = control.suspend_admission_if_idle()?;
+        assert!(matches!(
+            control.begin(ForegroundTurnSurface::Tui, "blocked", "turn"),
+            Err(ForegroundTurnError::AdmissionSuspended)
+        ));
+        drop(transition);
+
+        let reopened = control.begin(ForegroundTurnSurface::Tui, "reopened", "turn")?;
+        reopened.settle(TurnOutcome::Completed);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn exact_cancel_rejects_stale_and_cross_conversation_ids()
     -> Result<(), ForegroundTurnError> {
@@ -634,6 +759,26 @@ mod tests {
         assert_eq!(settlement.outcome, TurnOutcome::Cancelled);
         assert!(!control.has_active_turns());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_admission_and_waits_for_exact_settlement()
+    -> Result<(), ForegroundTurnError> {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin(ForegroundTurnSurface::Gui, "conversation", "turn")?;
+        let token = lease.cancellation_token();
+        let shutdown = control.shutdown();
+        let settlement = async move {
+            token.cancelled().await;
+            lease.settle(TurnOutcome::Cancelled);
+        };
+        let (shutdown_result, ()) = tokio::join!(shutdown, settlement);
+        shutdown_result?;
+        assert!(matches!(
+            control.begin(ForegroundTurnSurface::Gui, "conversation", "next"),
+            Err(ForegroundTurnError::ShuttingDown)
+        ));
+        control.shutdown().await
     }
 
     #[tokio::test]

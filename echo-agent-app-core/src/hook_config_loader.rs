@@ -88,6 +88,18 @@ impl HookConfigLoader {
     /// `clear_user_hooks()` + `register_user_hooks(merged)`,不要
     /// 再单独 register 内嵌或文件 hooks(那是旧 bug 的根源)。
     pub fn load_merged(app_config: &AppConfig) -> HooksLoadResult {
+        let project_root = std::env::current_dir().ok();
+        Self::load_merged_for_workspace(app_config, project_root.as_deref())
+    }
+
+    /// Load all user hook sources for an explicit workspace generation.
+    ///
+    /// Passing the workspace root explicitly avoids consulting process cwd
+    /// while a workspace switch is in flight.
+    pub fn load_merged_for_workspace(
+        app_config: &AppConfig,
+        project_root: Option<&Path>,
+    ) -> HooksLoadResult {
         let mut definition = HooksDefinition::default();
         let mut loaded_from = Vec::new();
         let mut errors = Vec::new();
@@ -105,7 +117,7 @@ impl HookConfigLoader {
         }
 
         // 2 & 3. 两个 hooks.yaml 文件(全局 + 项目级)
-        Self::merge_file_sources(&mut definition, &mut loaded_from, &mut errors);
+        Self::merge_file_sources(&mut definition, &mut loaded_from, &mut errors, project_root);
 
         HooksLoadResult {
             definition,
@@ -126,6 +138,15 @@ impl HookConfigLoader {
 
     /// Reload from an explicitly selected app config plus both hooks files.
     pub fn load_merged_from_disk_at(config_path: Option<&Path>) -> HooksLoadResult {
+        let project_root = std::env::current_dir().ok();
+        Self::load_merged_from_disk_for_workspace(config_path, project_root.as_deref())
+    }
+
+    /// Reload from disk for an explicit workspace generation.
+    pub fn load_merged_from_disk_for_workspace(
+        config_path: Option<&Path>,
+        project_root: Option<&Path>,
+    ) -> HooksLoadResult {
         let mut config_errors = Vec::new();
         let mut app_config = AppConfig::default();
         let search_paths = config_path
@@ -147,7 +168,7 @@ impl HookConfigLoader {
             }
         }
 
-        let mut result = Self::load_merged(&app_config);
+        let mut result = Self::load_merged_for_workspace(&app_config, project_root);
         result.errors.splice(0..0, config_errors);
         result
     }
@@ -162,6 +183,7 @@ impl HookConfigLoader {
         definition: &mut HooksDefinition,
         loaded_from: &mut Vec<PathBuf>,
         errors: &mut Vec<String>,
+        project_root: Option<&Path>,
     ) {
         // 2. 全局 hooks: ~/.eko/hooks.yaml
         let global_path = echo_agent::paths::user_data_path("hooks.yaml");
@@ -180,9 +202,9 @@ impl HookConfigLoader {
             Err(error) => errors.push(error),
         }
 
-        // 3. 项目级 hooks: .eko/hooks.yaml(相对 cwd)
-        if let Ok(cwd) = std::env::current_dir() {
-            let project_path = cwd.join(".eko").join("hooks.yaml");
+        // 3. 项目级 hooks: <workspace>/.eko/hooks.yaml
+        if let Some(project_root) = project_root {
+            let project_path = project_root.join(".eko").join("hooks.yaml");
             match try_load_yaml(&project_path) {
                 Ok(Some(def)) => {
                     let count: usize = def.rules.values().map(Vec::len).sum();
@@ -307,6 +329,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn explicit_workspace_root_selects_project_hooks() -> Result<(), String> {
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let hooks_dir = workspace.path().join(".eko");
+        std::fs::create_dir_all(&hooks_dir).map_err(|error| error.to_string())?;
+        let hooks_path = hooks_dir.join("hooks.yaml");
+        std::fs::write(
+            &hooks_path,
+            "SessionStart:\n  - matcher: \"explicit-workspace-marker\"\n    hooks:\n      - type: prompt\n        prompt: \"workspace hook\"\n",
+        )
+        .map_err(|error| error.to_string())?;
+
+        let result = HookConfigLoader::load_merged_for_workspace(
+            &AppConfig::default(),
+            Some(workspace.path()),
+        );
+        assert!(result.errors.is_empty());
+        assert!(result.loaded_from.contains(&hooks_path));
+        assert!(
+            result
+                .definition
+                .rules_for(HookEvent::SessionStart)
+                .iter()
+                .any(|rule| rule.matcher == "explicit-workspace-marker")
+        );
+        Ok(())
+    }
+
     // ── 文件加载测试 ─────────────────────────────────────────────
 
     #[test]
@@ -316,7 +366,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_load_yaml_parses_valid_file() {
+    fn test_try_load_yaml_parses_valid_file() -> Result<(), String> {
         // 写一个临时 YAML 文件,验证能解析出 HooksDefinition。
         let dir = std::env::temp_dir();
         let fname = format!("eko_hook_loader_test_{}.yaml", std::process::id());
@@ -330,7 +380,7 @@ SessionStart:
       - type: prompt
         prompt: "hello from file"
 "#;
-        std::fs::write(&path, yaml).expect("write temp yaml");
+        std::fs::write(&path, yaml).map_err(|error| error.to_string())?;
 
         let def = try_load_yaml(&path);
         // 清理临时文件
@@ -340,6 +390,7 @@ SessionStart:
         let rules = def.rules_for(HookEvent::SessionStart);
         assert_eq!(rules.len(), 1, "one SessionStart rule expected");
         // 不再访问 matcher/hook 内部细节,只验证数量足够(避免耦合字段)。
+        Ok(())
     }
 
     #[test]

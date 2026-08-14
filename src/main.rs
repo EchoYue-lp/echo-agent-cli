@@ -49,9 +49,12 @@ fn build_task_runtime_store_for_headless()
             }
         }
     };
-    let recovered = store.recover_incomplete();
-    if recovered > 0 {
-        tracing::info!(recovered, "recovered incomplete task_runtime runs");
+    match store.recover_incomplete() {
+        Ok(recovered) if recovered > 0 => {
+            tracing::info!(recovered, "recovered incomplete task_runtime runs");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to recover incomplete task_runtime runs"),
     }
     Some(std::sync::Arc::new(store))
 }
@@ -218,9 +221,9 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             )
             .await;
         }
-        pool.spawn_cleanup_monitor().await;
         pool
     };
+    let foreground_turns = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
 
     if requested_conversation_id.is_some() {
         let store = conversation_store
@@ -251,12 +254,12 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     // Spawn config watcher (reloads hooks + webhook endpoints on change).
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let config_path = echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref());
-    echo_agent_cli::config_watcher::spawn_config_watcher(
+    let config_watcher = std::sync::Arc::new(echo_agent_cli::config_watcher::spawn_config_watcher(
         config_path,
         agent_handle.clone(),
         Some(webhook_emitter.clone()),
         cancel_token.clone(),
-    );
+    ));
 
     // ── User-facing TUI mode (default) ─────────────────────────────────
     #[cfg(feature = "tui")]
@@ -277,7 +280,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tracing::info!("HITL: REPL provider swapped for TUI provider");
             pending
         };
-        let (_, tui_scheduler, tui_app_state) = cli::start_headless_services(
+        let tui_services = cli::start_headless_services(
             agent_handle.clone(),
             runtime.hitl_dispatcher.clone(),
             &app_config,
@@ -288,9 +291,29 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 conversation_store: conversation_store.clone(),
                 review_integration: runtime.review_integration.clone(),
                 mcp_config_runtime: runtime.mcp_config_runtime.clone(),
+                plugin_runtime: runtime.plugin_runtime.clone(),
+                config_watcher: config_watcher.clone(),
+                foreground_turns: foreground_turns.clone(),
             },
         )
-        .await?;
+        .await;
+        let (_, tui_scheduler, tui_app_state) = match tui_services {
+            Ok(services) => services,
+            Err(error) => {
+                let error = infra::settle_service_bootstrap_failure(
+                    anyhow::anyhow!(error),
+                    task_runtime_store.as_ref(),
+                    Some(&pool),
+                    &runtime.plugin_runtime,
+                    &config_watcher,
+                    &runtime.mcp_config_runtime,
+                    &runtime.browser_runtime,
+                )
+                .await;
+                cancel_token.cancel();
+                return Err(error);
+            }
+        };
         if let Some(scheduler) = tui_scheduler.as_ref()
             && let Err(error) = runtime
                 .plugin_runtime
@@ -354,16 +377,36 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             }
         }
 
+        if let Err(error) = tui_app_state.session.foreground_turns.shutdown().await {
+            tracing::warn!(%error, "failed to settle TUI foreground turns");
+        }
+        if let Err(error) = tui_app_state.shutdown_workspace_transition().await {
+            tracing::warn!(%error, "failed to settle TUI workspace transition");
+        }
         if let Err(error) = tui_app_state.shutdown_scheduler().await {
             tracing::warn!(%error, "failed to shut down TUI scheduler");
         }
+        if let Some(store) = task_runtime_store.as_ref()
+            && let Err(error) = store.shutdown_run_drivers().await
+        {
+            tracing::warn!(%error, "failed to settle TUI TaskRun drivers");
+        }
+        if let Err(error) = pool.shutdown().await {
+            tracing::warn!(%error, "failed to shut down TUI agent pool");
+        }
+        if let Err(error) = runtime.plugin_runtime.shutdown().await {
+            tracing::warn!(%error, "failed to shut down TUI plugin runtime");
+        }
+        if let Err(error) = config_watcher.shutdown().await {
+            tracing::warn!(%error, "failed to shut down TUI config watcher");
+        }
+        runtime.mcp_config_runtime.shutdown().await;
+        runtime.browser_runtime.shutdown().await;
         if let Some(store) = task_runtime_store.as_ref()
             && let Err(error) = store.shutdown_hook_events().await
         {
             tracing::warn!(%error, "failed to shut down task hook dispatcher");
         }
-        runtime.mcp_config_runtime.shutdown().await;
-        runtime.browser_runtime.shutdown().await;
         drop(runtime);
         cancel_token.cancel();
 
@@ -382,16 +425,22 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 pool_size = pool.pool_size().await,
                 "AgentPool initialized for channels (IM per-sender agents)"
             );
+            pool.spawn_cleanup_monitor().await;
 
+            let channels_cancel = echo_agent::agent::CancellationToken::new();
             let channels_handle = tokio::spawn(cli::run_channels_mode(
                 pool.clone(),
                 app_config.clone(),
                 task_runtime_store.clone(),
                 runtime.review_integration.clone(),
                 webhook_emitter.clone(),
+                foreground_turns.clone(),
+                channels_cancel.clone(),
             ));
 
             if run_cli {
+                let companion_shutdown =
+                    cli::CompanionModeShutdown::new("channels", channels_cancel, channels_handle);
                 if let Err(error) = cli::run_cli_mode(
                     agent_handle,
                     runtime.hitl_dispatcher.clone(),
@@ -405,7 +454,10 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     webhook_emitter.clone(),
                     runtime.plugin_runtime.clone(),
                     runtime.mcp_config_runtime.clone(),
+                    config_watcher.clone(),
                     conversation_store.clone(),
+                    foreground_turns.clone(),
+                    Some(companion_shutdown),
                 )
                 .await
                 {
@@ -414,18 +466,34 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             } else {
                 // 仅 channels 模式，等待 channels 或 Ctrl+C
                 let channels_result = channels_handle.await;
+                if let Err(error) = foreground_turns.shutdown().await {
+                    tracing::warn!(%error, "failed to settle channel foreground turns");
+                }
+                if let Some(store) = task_runtime_store.as_ref()
+                    && let Err(error) = store.shutdown_run_drivers().await
+                {
+                    tracing::warn!(%error, "failed to settle channel TaskRun drivers");
+                }
+                if let Err(error) = pool.shutdown().await {
+                    tracing::warn!(%error, "failed to shut down channels agent pool");
+                }
+                if let Err(error) = runtime.plugin_runtime.shutdown().await {
+                    tracing::warn!(%error, "failed to shut down channels plugin runtime");
+                }
+                if let Err(error) = config_watcher.shutdown().await {
+                    tracing::warn!(%error, "failed to shut down channels config watcher");
+                }
+                runtime.mcp_config_runtime.shutdown().await;
+                runtime.browser_runtime.shutdown().await;
                 if let Some(store) = task_runtime_store.as_ref()
                     && let Err(error) = store.shutdown_hook_events().await
                 {
                     tracing::warn!(%error, "failed to shut down task hook dispatcher");
                 }
-                runtime.mcp_config_runtime.shutdown().await;
-                runtime.browser_runtime.shutdown().await;
                 cancel_token.cancel();
                 channels_result??;
                 return Ok(());
             }
-            // channels 会在后台运行，主模式退出后自动结束
         }
         #[cfg(not(feature = "channels"))]
         {
@@ -442,13 +510,16 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &app_config,
             runtime.review_integration.clone(),
             runtime.prompt_assembly.clone(),
-            pool,
+            pool.clone(),
             task_runtime_store.clone(),
             conversation_id,
             webhook_emitter,
             runtime.plugin_runtime.clone(),
             runtime.mcp_config_runtime.clone(),
+            config_watcher.clone(),
             conversation_store.clone(),
+            foreground_turns,
+            None,
         )
         .await
         {
@@ -463,12 +534,26 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
     // Keep runtime alive until shutdown
     if let Some(store) = task_runtime_store.as_ref()
+        && let Err(error) = store.shutdown_run_drivers().await
+    {
+        tracing::warn!(%error, "failed to settle TaskRun drivers");
+    }
+    if let Err(error) = pool.shutdown().await {
+        tracing::warn!(%error, "failed to shut down agent pool");
+    }
+    if let Err(error) = runtime.plugin_runtime.shutdown().await {
+        tracing::warn!(%error, "failed to shut down plugin runtime");
+    }
+    if let Err(error) = config_watcher.shutdown().await {
+        tracing::warn!(%error, "failed to shut down config watcher");
+    }
+    runtime.mcp_config_runtime.shutdown().await;
+    runtime.browser_runtime.shutdown().await;
+    if let Some(store) = task_runtime_store.as_ref()
         && let Err(error) = store.shutdown_hook_events().await
     {
         tracing::warn!(%error, "failed to shut down task hook dispatcher");
     }
-    runtime.mcp_config_runtime.shutdown().await;
-    runtime.browser_runtime.shutdown().await;
     drop(runtime);
     cancel_token.cancel();
 

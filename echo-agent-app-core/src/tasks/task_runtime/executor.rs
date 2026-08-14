@@ -436,6 +436,7 @@ pub async fn execute_run(
     // Run record when a RunStore is available.
     match &outcome {
         Ok(RunOutcome::Completed) => {
+            store.finalize_run(run_id, TaskRunStatus::Completed, None)?;
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
@@ -486,8 +487,8 @@ pub async fn execute_run(
             } else {
                 Some(failed_task_id.as_str())
             };
-            let _ = store.note(run_id, tid, &format!("run failed: {error}"));
-            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+            store.note(run_id, tid, &format!("run failed: {error}"))?;
+            store.finalize_run(run_id, TaskRunStatus::Failed, None)?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -505,7 +506,7 @@ pub async fn execute_run(
                     serde_json::json!({ "status": "cancelled" }),
                 ),
             );
-            finalize_cancelled_run_state(&store, run_id);
+            finalize_cancelled_run_state(&store, run_id)?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -543,22 +544,21 @@ pub async fn execute_run(
             // The runtime adapter or control path already transitioned Running → Paused.
             // Any Subagent that was in flight no longer exists after cancellation,
             // so make it pending again for the resume drain.
-            if let Ok(todos) = store.list_todos(run_id) {
-                for todo in todos
-                    .into_iter()
-                    .filter(|todo| todo.status == TodoStatus::Running)
-                {
-                    let _ = store.set_task_status(
-                        run_id,
-                        &todo.task_id,
-                        TodoStatus::Pending,
-                        None,
-                        Some("paused; pending resume"),
-                    );
-                }
+            for todo in store
+                .list_todos(run_id)?
+                .into_iter()
+                .filter(|todo| todo.status == TodoStatus::Running)
+            {
+                store.set_task_status(
+                    run_id,
+                    &todo.task_id,
+                    TodoStatus::Pending,
+                    None,
+                    Some("paused; pending resume"),
+                )?;
             }
             let task_id = (!failed_task_id.starts_with('<')).then_some(failed_task_id.as_str());
-            let _ = store.note(run_id, task_id, &format!("run paused: {error}"));
+            store.note(run_id, task_id, &format!("run paused: {error}"))?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -576,9 +576,11 @@ pub async fn execute_run(
                     serde_json::json!({ "error": e.to_string() }),
                 ),
             );
-            let _ = store.note(run_id, None, &format!("executor error: {e}"));
-            // Running → Failed is legal even if some tasks were mid-flight.
-            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+            store.finalize_run(
+                run_id,
+                TaskRunStatus::Failed,
+                Some(&format!("executor error: {e}")),
+            )?;
         }
     }
     outcome
@@ -640,24 +642,23 @@ fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String
     blockers
 }
 
-fn finalize_cancelled_run_state(store: &TaskRuntimeStore, run_id: &str) {
-    if let Ok(todos) = store.list_todos(run_id) {
-        for todo in todos.into_iter().filter(|todo| {
-            matches!(
-                todo.status,
-                TodoStatus::Pending | TodoStatus::Running | TodoStatus::Blocked
-            )
-        }) {
-            let _ = store.set_task_status(
-                run_id,
-                &todo.task_id,
-                TodoStatus::Cancelled,
-                None,
-                Some("cancelled with parent run"),
-            );
-        }
+fn finalize_cancelled_run_state(store: &TaskRuntimeStore, run_id: &str) -> Result<(), StoreError> {
+    for todo in store.list_todos(run_id)?.into_iter().filter(|todo| {
+        matches!(
+            todo.status,
+            TodoStatus::Pending | TodoStatus::Running | TodoStatus::Blocked
+        )
+    }) {
+        store.set_task_status(
+            run_id,
+            &todo.task_id,
+            TodoStatus::Cancelled,
+            None,
+            Some("cancelled with parent run"),
+        )?;
     }
-    let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
+    store.finalize_run(run_id, TaskRunStatus::Cancelled, None)?;
+    Ok(())
 }
 
 /// Structured completion assessment. Separates "real execution failure"
@@ -3626,25 +3627,8 @@ pub async fn launch_unattended_run(
     write_mode: UnattendedWriteMode,
 ) -> Result<String, ExecError> {
     let run_id = uuid::Uuid::new_v4().to_string();
-    let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
+    create_unattended_run(&store, &run_id, source_kind, source_id, fire_id, prompt)?;
 
-    // 1. Create the run in Pending, attended_mode = Unattended.
-    store.create_run_for_active_workspace(
-        &run_id,
-        &conversation_id,
-        "", // root_message_id — no chat message for unattended run
-        DomainProfile::General,
-        prompt,
-        "parallel_readonly_delegation",
-        AttendedMode::Unattended,
-    )?;
-
-    // 2. Transition Pending → Running.
-    store.transition_run(&run_id, TaskRunStatus::Running)?;
-
-    // 3. Drive the agent's ReAct loop + finalize status. Extracted so callers
-    //    that own the run_id (e.g. submit_run in Phase 3.4) can drive a run
-    //    they created themselves without re-generating the id.
     drive_unattended_run(
         store.clone(),
         primary_agent,
@@ -3656,6 +3640,32 @@ pub async fn launch_unattended_run(
         write_mode,
     )
     .await
+}
+
+pub(crate) fn create_unattended_run(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+    source_kind: &str,
+    source_id: &str,
+    fire_id: &str,
+    prompt: &str,
+) -> Result<(), ExecError> {
+    let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
+
+    // 1. Create the run in Pending, attended_mode = Unattended.
+    store.create_run_for_active_workspace(
+        run_id,
+        &conversation_id,
+        "", // root_message_id — no chat message for unattended run
+        DomainProfile::General,
+        prompt,
+        "parallel_readonly_delegation",
+        AttendedMode::Unattended,
+    )?;
+
+    // 2. Transition Pending → Running.
+    store.transition_run(run_id, TaskRunStatus::Running)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // retained compatibility wrapper around drive_agent_run
@@ -3853,20 +3863,17 @@ pub async fn drive_agent_run(
         && !child_cancel.is_cancelled()
     {
         let message = format!("run agent stream failed: {error}");
-        let _ = store.note(run_id, None, &message);
-        if store
-            .get_run(run_id)
-            .ok()
-            .flatten()
-            .is_some_and(|run| run.status == TaskRunStatus::Running)
-        {
-            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-        }
+        store.finalize_run(run_id, TaskRunStatus::Failed, Some(&message))?;
     }
 
     // Determine final outcome from the store (task_execute/execute_run
     // may have already transitioned the run to a terminal state).
-    let final_status = store.get_run(run_id).ok().flatten().map(|r| r.status);
+    let final_status = Some(
+        store
+            .get_run(run_id)?
+            .ok_or_else(|| ExecError::RunNotFound(run_id.to_string()))?
+            .status,
+    );
 
     match final_status {
         Some(TaskRunStatus::Completed) => {
@@ -3911,12 +3918,10 @@ pub async fn drive_agent_run(
             // Still Running or unknown — the agent stream ending is not proof
             // that the plan satisfied its result contract.
             if child_cancel.is_cancelled() {
-                let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
+                store.finalize_run(run_id, TaskRunStatus::Cancelled, None)?;
             } else {
                 let has_materialized_plan = store
-                    .get_plan(run_id)
-                    .ok()
-                    .flatten()
+                    .get_plan(run_id)?
                     .is_some_and(|plan| !plan.tasks.is_empty());
                 let blockers =
                     if plan_policy == RunPlanPolicy::AllowDirect && !has_materialized_plan {
@@ -3925,17 +3930,16 @@ pub async fn drive_agent_run(
                         run_completion_blockers(&store, run_id)
                     };
                 if blockers.is_empty() {
-                    let _ = store.transition_run(run_id, TaskRunStatus::Completed);
+                    store.finalize_run(run_id, TaskRunStatus::Completed, None)?;
                 } else {
-                    let _ = store.note(
+                    store.finalize_run(
                         run_id,
-                        None,
-                        &format!(
+                        TaskRunStatus::Failed,
+                        Some(&format!(
                             "completion gate rejected agent-driven run: {}",
                             blockers.join("; ")
-                        ),
-                    );
-                    let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+                        )),
+                    )?;
                 }
             }
             tracing::info!(
@@ -3946,6 +3950,22 @@ pub async fn drive_agent_run(
                 "Agent-driven run stream finished; transitioned to terminal"
             );
         }
+    }
+
+    let settled = store
+        .get_run(run_id)?
+        .ok_or_else(|| ExecError::RunNotFound(run_id.to_string()))?;
+    if !matches!(
+        settled.status,
+        TaskRunStatus::Completed
+            | TaskRunStatus::Failed
+            | TaskRunStatus::Cancelled
+            | TaskRunStatus::Paused
+    ) {
+        return Err(ExecError::Other(format!(
+            "run {run_id} did not reach a durable terminal or paused state; read back {}",
+            settled.status.as_str()
+        )));
     }
 
     Ok(run_id.to_string())
@@ -3961,15 +3981,38 @@ pub async fn launch_cron_run(
     prompt: &str,
     parent_cancel: CancellationToken,
 ) -> Result<String, ExecError> {
-    let run_id = launch_unattended_run(
-        store.clone(),
+    let run_id = uuid::Uuid::new_v4().to_string();
+    create_unattended_run(&store, &run_id, "cron", cron_task_id, fire_id, prompt)?;
+    drive_existing_cron_run(
+        store,
         primary_agent,
-        "cron",
+        run_id,
         cron_task_id,
         fire_id,
         prompt,
         parent_cancel,
-        UnattendedWriteMode::default(), // D7 stage 2: Worktree (safe default)
+    )
+    .await
+}
+
+pub(crate) async fn drive_existing_cron_run(
+    store: Arc<TaskRuntimeStore>,
+    primary_agent: crate::agent_handle::AgentHandle,
+    run_id: String,
+    cron_task_id: &str,
+    fire_id: &str,
+    prompt: &str,
+    parent_cancel: CancellationToken,
+) -> Result<String, ExecError> {
+    drive_unattended_run(
+        store.clone(),
+        primary_agent,
+        &run_id,
+        cron_task_id,
+        fire_id,
+        prompt,
+        parent_cancel,
+        UnattendedWriteMode::default(),
     )
     .await?;
     let status = store
@@ -5489,7 +5532,7 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?;
         assert!(matches!(outcome, RunOutcome::Cancelled));
 
-        finalize_cancelled_run_state(&store, &run_id);
+        finalize_cancelled_run_state(&store, &run_id).map_err(|error| error.to_string())?;
         let todos = store
             .list_todos(&run_id)
             .map_err(|error| error.to_string())?;

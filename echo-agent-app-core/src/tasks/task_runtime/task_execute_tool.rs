@@ -173,7 +173,7 @@ impl ExecuteTaskTool {
         self
     }
 
-    async fn execution_agent(&self) -> AgentHandle {
+    async fn execution_agent(&self) -> Result<TaskExecutionAgent, crate::agent_pool::PoolError> {
         let conversation_id = CURRENT_EXECUTION_CONVERSATION_ID
             .try_with(Clone::clone)
             .ok()
@@ -181,22 +181,34 @@ impl ExecuteTaskTool {
         if let (Some(pool), Some(conversation_id)) = (
             self.agent_pool.as_ref().and_then(std::sync::Weak::upgrade),
             conversation_id,
-        ) && let Some(agent) = pool.get(&conversation_id).await
+        ) && let Some(pool_execution) = pool.lease_existing(&conversation_id).await?
         {
-            return agent;
+            return Ok(TaskExecutionAgent {
+                agent: pool_execution.agent(),
+                _pool_execution: Some(pool_execution),
+            });
         }
-        self.primary_agent.clone()
+        Ok(TaskExecutionAgent {
+            agent: self.primary_agent.clone(),
+            _pool_execution: None,
+        })
     }
 
     #[cfg(test)]
     pub(crate) async fn execution_agent_for_test(
         &self,
         conversation_id: Option<String>,
-    ) -> AgentHandle {
+    ) -> Result<AgentHandle, crate::agent_pool::PoolError> {
         CURRENT_EXECUTION_CONVERSATION_ID
             .scope(conversation_id, self.execution_agent())
             .await
+            .map(|execution| execution.agent)
     }
+}
+
+struct TaskExecutionAgent {
+    agent: AgentHandle,
+    _pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
 }
 
 impl Tool for ExecuteTaskTool {
@@ -244,8 +256,6 @@ impl Tool for ExecuteTaskTool {
                 param_keys = ?params.keys().cloned().collect::<Vec<_>>(),
                 "task_execute: start"
             );
-            let execution_agent = self.execution_agent().await;
-
             if params.contains_key("task") {
                 return Ok(ToolResult::error(
                     "task_execute accepts only a committed revision; call task_create first.",
@@ -371,7 +381,15 @@ impl Tool for ExecuteTaskTool {
             // None. execute_run uses it to persist trace Run records (token
             // usage, status). Without it, the task_execute path silently drops
             // trace persistence (event-wiring #1残留).
-            let run_store = execution_agent.read(|a| a.run_store.clone()).await;
+            let execution_agent = match self.execution_agent().await {
+                Ok(execution_agent) => execution_agent,
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Task execution agent is unavailable during workspace transition: {error}"
+                    )));
+                }
+            };
+            let run_store = execution_agent.agent.read(|a| a.run_store.clone()).await;
             // D7 stage 2: scope the write mode into a task-local so CP B
             // preflight in `execute_task` (inside execute_run's EKO controller)
             // can read it without threading the mode through every signature.
@@ -394,13 +412,14 @@ impl Tool for ExecuteTaskTool {
             // Review calls are sequential per task and bounded by
             // max_parallel_llm_calls.
             let reviewer_llm = execution_agent
+                .agent
                 .read(|agent| agent.llm_client().cloned())
                 .await;
             let outcome = super::task_tools::CURRENT_UNATTENDED_WRITE_MODE
                 .scope(write_mode, async {
                     execute_run(
                         self.store.clone(),
-                        Some(execution_agent),
+                        Some(execution_agent.agent.clone()),
                         reviewer_llm,
                         None, // layer_manager — 暂时 None
                         run_store,

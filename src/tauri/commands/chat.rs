@@ -481,31 +481,7 @@ pub async fn send_chat_message(
         );
     }
 
-    // Route to pool agent if conversation_id is provided and pool is active.
-    // First-turn messages can arrive before the GUI has an active conversation;
-    // TaskRuntime routing must still be allowed in that case.
-    let agent_handle = if let Some(ref conv_id) = conversation_id {
-        state.app_state.connection.agent_for(conv_id).await
-    } else {
-        state.app_state.connection.primary_agent()
-    };
     let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
-
-    // Ensure stable cache_user_id for KVCache isolation (DeepSeek requires this
-    // for prompt cache reuse across requests; without it, cache hit rate drops
-    // to <1% because every request is treated as from a different user).
-    //
-    // Persisted to ~/.eko/cache_user_id — generated once, reused forever.
-    {
-        let cache_id = echo_agent_app_core::infra::load_or_create_cache_user_id();
-        agent_handle
-            .write_async(|a| {
-                Box::pin(async move {
-                    a.config_mut().set_cache_user_id(&cache_id);
-                })
-            })
-            .await;
-    }
 
     // ── Interrupt detection ─────────────────────────────────────────────
     // If the same conversation already has an in-progress (Running/Paused)
@@ -552,6 +528,40 @@ pub async fn send_chat_message(
             other => IpcError::Validation(other.to_string()),
         })?;
     let cancel_token = foreground_lease.cancellation_token();
+
+    // Foreground admission must precede pool admission. Retain the pool
+    // receipt in the spawned turn until the shared driver and HITL reset have
+    // both settled, so workspace publication cannot race an issued handle.
+    let pool_execution = match conversation_id.as_deref() {
+        Some(conversation_id) => Some(
+            state
+                .app_state
+                .connection
+                .agent_for(conversation_id)
+                .await
+                .map_err(|error| IpcError::Validation(error.to_string()))?,
+        ),
+        None => None,
+    };
+    let agent_handle = pool_execution
+        .as_ref()
+        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .unwrap_or_else(|| state.app_state.connection.primary_agent());
+
+    // Ensure stable cache_user_id for KVCache isolation (DeepSeek requires this
+    // for prompt cache reuse across requests; without it, cache hit rate drops
+    // to <1% because every request is treated as from a different user).
+    // Persisted to ~/.eko/cache_user_id — generated once, reused forever.
+    {
+        let cache_id = echo_agent_app_core::infra::load_or_create_cache_user_id();
+        agent_handle
+            .write_async(|a| {
+                Box::pin(async move {
+                    a.config_mut().set_cache_user_id(&cache_id);
+                })
+            })
+            .await;
+    }
 
     // Attach a Tauri HITL handler to this specific agent. This keeps concurrent
     // GUI conversations isolated instead of racing through the global dispatcher.
@@ -690,6 +700,7 @@ pub async fn send_chat_message(
                 })
             })
             .await;
+        drop(pool_execution);
         tracing::info!(
             elapsed_ms = start.elapsed().as_millis() as u64,
             status = %terminal_status,
@@ -751,7 +762,13 @@ pub async fn steer_chat_message(
     let steer_message = prepared
         .to_message()
         .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let agent = state.app_state.connection.agent_for(&conversation_id).await;
+    let agent_execution = state
+        .app_state
+        .connection
+        .agent_for(&conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let agent = agent_execution.agent();
     match agent
         .steer_input(Some(&expected_turn_id), steer_message)
         .await

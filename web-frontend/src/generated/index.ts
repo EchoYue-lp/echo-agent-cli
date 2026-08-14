@@ -80,3 +80,6 @@ export * from './ToolSource';
 export * from './UnattendedWriteMode';
 export * from './UpdateConfigRequest';
 export * from './UpdateFullConfigRequest';
+export * from './WorkspaceSubsystemTransition';
+export * from './WorkspaceTransitionReceipt';
+export * from './WorkspaceTransitionStatus';

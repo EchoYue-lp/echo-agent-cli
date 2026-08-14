@@ -38,6 +38,7 @@ pub struct AppChannelMessageHandler {
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     hitl: Arc<ChannelHumanLoopProvider>,
+    foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
     interaction_mode:
         tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
 }
@@ -49,6 +50,7 @@ impl AppChannelMessageHandler {
         store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
         review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
         webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
+        foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
     ) -> Self {
         Self {
             pool,
@@ -56,6 +58,7 @@ impl AppChannelMessageHandler {
             review_integration,
             webhook_emitter,
             hitl: Arc::new(ChannelHumanLoopProvider::new()),
+            foreground_turns,
             interaction_mode: tokio::sync::RwLock::new(
                 echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             ),
@@ -130,13 +133,24 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
 
         let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id());
         let cache_id = Self::cache_user_id(&msg.channel_id, msg.conversation_id());
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let foreground_lease = self
+            .foreground_turns
+            .begin(
+                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Channel,
+                conv.clone(),
+                turn_id.clone(),
+            )
+            .map_err(|error| ChannelError::SendError(error.to_string()))?;
 
-        // 1. pool 取/复用 per-sender agent（bootstrap 等价全套已注入）
-        let agent = self
+        // Foreground admission precedes pool admission, matching the workspace
+        // transition lock order. The receipt is moved into the spawned driver.
+        let pool_execution = self
             .pool
             .acquire(&conv)
             .await
             .map_err(|e| ChannelError::SendError(format!("AgentPool acquire failed: {e}")))?;
+        let agent = pool_execution.agent();
 
         // 2. 设 per-sender cache_user_id（写锁短暂）
         agent
@@ -151,6 +165,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             })
             .await;
         if let Some(message) = channel_trace_response(&agent, &msg.text).await {
+            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+            drop(pool_execution);
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
                 msg.reply_target(),
@@ -160,6 +176,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
         }
         if let Some(message) = channel_analysis_response(&agent, &msg.text).await {
+            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+            drop(pool_execution);
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
                 msg.reply_target(),
@@ -169,6 +187,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
         }
         if let Some(message) = channel_papers_response(&agent, &msg.text).await {
+            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+            drop(pool_execution);
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
                 msg.reply_target(),
@@ -178,6 +198,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
         }
         if let Some(message) = channel_skills_response(&agent, &msg.text).await {
+            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+            drop(pool_execution);
             let outbound = echo_agent::channels::OutboundMessage::new(
                 &msg.channel_id,
                 msg.reply_target(),
@@ -199,7 +221,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         // Persist IM attachments into the same durable reference contract as
         // GUI/TUI so TaskRuntime subagents can reconstruct the same message.
         let attachment_refs = stage_channel_attachments(&msg.attachments);
-        let turn_id = uuid::Uuid::new_v4().to_string();
         // Channels have no workspace root; long pastes spill to the global
         // user-input artifact dir (~/.eko/artifacts/user-input/).
         let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
@@ -218,6 +239,10 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             Ok(turn) => turn,
             Err(error) => {
                 tracing::warn!(%error, conv = %conv, "channel user-turn preparation failed");
+                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("prepared_turn", error.to_string()),
+                ));
+                drop(pool_execution);
                 let outbound = echo_agent::channels::OutboundMessage::new(
                     &msg.channel_id,
                     msg.reply_target(),
@@ -235,13 +260,13 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let mut prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
         tokio::spawn(async move {
-            use echo_agent_app_core::chat_driver::{ChannelChatSink, drive_chat};
+            use echo_agent_app_core::chat_driver::ChannelChatSink;
 
             // 极简入口(Phase B1/B3):channel 不预判 normal/complex——agent 自主
             // 决定是否建后台 Run(create_complex_task,B3b)。ChatResources 经
             // drive_chat scope 进 task_local 供工具读。B5.4: multimodal 透传
             // IM 附件(图片/文件,与 GUI/TUI 同路径)。
-            let cancel = echo_agent::agent::CancellationToken::new();
+            let cancel = foreground_lease.cancellation_token();
             let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
                 std::sync::Arc::new(ChannelChatSink::new(tx));
             let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
@@ -259,9 +284,17 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     .as_ref()
                     .map(|integration| Arc::new(integration.create_layer_manager())),
             });
-            if let Err(e) = drive_chat(&agent_owned, &turn, res).await {
+            if let Err(e) = echo_agent_app_core::foreground_turn::drive_foreground_chat(
+                foreground_lease,
+                &agent_owned,
+                &turn,
+                res,
+            )
+            .await
+            {
                 tracing::warn!(error = %e, conv = %conv_owned, "channel drive_chat failed");
             }
+            drop(pool_execution);
         });
         // Project the complete shared product stream into channel text.
         let event_stream = async_stream::stream! {

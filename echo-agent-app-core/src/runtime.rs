@@ -304,9 +304,12 @@ impl AgentRuntime {
         // ── 10. Plugins ──
         // Discovery, initial wiring, and later live mutations all go through
         // one runtime owner. This avoids bootstrap/reload double registration.
-        let plugin_runtime =
-            crate::plugin_runtime::PluginRuntimeService::new(agent_handle.clone(), lsp_runtime)
-                .await;
+        let plugin_runtime = crate::plugin_runtime::PluginRuntimeService::new(
+            agent_handle.clone(),
+            lsp_runtime,
+            mcp_config_runtime.ownership(),
+        )
+        .await;
 
         // ── 11. File-backed research library ──
         agent_handle
@@ -437,9 +440,7 @@ impl AgentRuntime {
     ) -> Arc<crate::agent_pool::AgentPool> {
         let pool =
             crate::agent_pool::AgentPool::from_runtime(self, config, task_runtime_store).await;
-        let pool = Arc::new(pool);
-        pool.spawn_cleanup_monitor().await;
-        pool
+        Arc::new(pool)
     }
 
     /// Trigger reflection on a completed task or session.

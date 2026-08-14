@@ -206,7 +206,13 @@ async fn load_agent_transcript(
     conversation_id: &str,
     stored: &[StoredMessage],
 ) -> Result<usize, IpcError> {
-    let agent = state.app_state.connection.agent_for(conversation_id).await;
+    let agent_execution = state
+        .app_state
+        .connection
+        .agent_for(conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let agent = agent_execution.agent();
     let mut messages = echo_agent::memory::restore_messages(stored)
         .map_err(|error| IpcError::Internal(error.to_string()))?;
     let system_prompt = agent.read(|agent| agent.system_prompt().to_string()).await;

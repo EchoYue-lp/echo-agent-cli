@@ -5,14 +5,14 @@
 //! owns the application policy around source selection, atomic commits, and
 //! keeping user-configured servers separate from plugin-owned servers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use echo_agent::config::AppConfig;
 use echo_agent::mcp::{McpConfigFile, McpServerEntry};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_handle::AgentHandle;
@@ -42,6 +42,8 @@ pub enum McpConfigRuntimeError {
     },
     #[error("MCP config writer task failed: {0}")]
     WriterTask(String),
+    #[error("MCP config mutation settlement task failed: {0}")]
+    MutationTask(String),
     #[error("MCP server '{0}' is not present in the user config")]
     ServerNotFound(String),
     #[error("MCP configuration runtime is shutting down")]
@@ -128,6 +130,184 @@ struct ReconcileTask {
     handle: tokio::task::JoinHandle<()>,
 }
 
+struct McpRuntimeSupervisor {
+    accepting_mutations: bool,
+    mutation_tasks: Vec<tokio::task::JoinHandle<()>>,
+    reconcile_tasks: Vec<ReconcileTask>,
+}
+
+impl Default for McpRuntimeSupervisor {
+    fn default() -> Self {
+        Self {
+            accepting_mutations: true,
+            mutation_tasks: Vec::new(),
+            reconcile_tasks: Vec::new(),
+        }
+    }
+}
+
+#[cfg(test)]
+struct WriterTestGate {
+    started: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PluginMcpOwnershipToken(u64);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum McpNameOwner {
+    User,
+    Plugin {
+        plugin_id: String,
+        token: PluginMcpOwnershipToken,
+    },
+}
+
+#[derive(Default)]
+struct McpNameOwnershipState {
+    owners: BTreeMap<String, McpNameOwner>,
+    next_token: u64,
+}
+
+/// Application-layer namespace authority shared by durable user MCP config and
+/// plugin receipts. It does not own clients; it only prevents a stale plugin
+/// receipt from disconnecting a name that user configuration has taken over.
+pub(crate) struct McpNameOwnershipRegistry {
+    state: Arc<Mutex<McpNameOwnershipState>>,
+}
+
+impl McpNameOwnershipRegistry {
+    pub(crate) fn new(user_names: impl IntoIterator<Item = String>) -> Arc<Self> {
+        let owners = user_names
+            .into_iter()
+            .map(|name| (name, McpNameOwner::User))
+            .collect();
+        Arc::new(Self {
+            state: Arc::new(Mutex::new(McpNameOwnershipState {
+                owners,
+                next_token: 0,
+            })),
+        })
+    }
+
+    pub(crate) async fn lock(self: &Arc<Self>) -> McpNameOwnershipGuard {
+        McpNameOwnershipGuard {
+            state: Arc::clone(&self.state).lock_owned().await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn claim_user_names(&self, names: impl IntoIterator<Item = String>) {
+        let mut state = self.state.lock().await;
+        for name in names {
+            state.owners.insert(name, McpNameOwner::User);
+        }
+    }
+
+    async fn settle_user_names(&self, current_names: &BTreeSet<String>) {
+        let mut state = self.state.lock().await;
+        state.owners.retain(|name, owner| {
+            !matches!(owner, McpNameOwner::User) || current_names.contains(name)
+        });
+        for name in current_names {
+            state.owners.insert(name.clone(), McpNameOwner::User);
+        }
+    }
+
+    #[cfg(test)]
+    async fn owner(&self, name: &str) -> Option<McpNameOwner> {
+        self.state.lock().await.owners.get(name).cloned()
+    }
+}
+
+pub(crate) struct McpNameOwnershipGuard {
+    state: OwnedMutexGuard<McpNameOwnershipState>,
+}
+
+impl McpNameOwnershipGuard {
+    pub(crate) fn claim_user_names(&mut self, names: impl IntoIterator<Item = String>) {
+        for name in names {
+            self.state.owners.insert(name, McpNameOwner::User);
+        }
+    }
+
+    pub(crate) fn validate_plugin_claim(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        previous_token: Option<PluginMcpOwnershipToken>,
+    ) -> Result<(), String> {
+        match self.state.owners.get(name) {
+            None => Ok(()),
+            Some(McpNameOwner::Plugin {
+                plugin_id: owner,
+                token,
+            }) if owner == plugin_id && Some(*token) == previous_token => Ok(()),
+            Some(McpNameOwner::User) => Err(format!(
+                "Plugin '{plugin_id}' MCP server name '{name}' is owned by user configuration"
+            )),
+            Some(McpNameOwner::Plugin {
+                plugin_id: owner, ..
+            }) => Err(format!(
+                "Plugin '{plugin_id}' MCP server name '{name}' is owned by plugin '{owner}'"
+            )),
+        }
+    }
+
+    pub(crate) fn claim_plugin(
+        &mut self,
+        plugin_id: &str,
+        name: &str,
+    ) -> Result<PluginMcpOwnershipToken, String> {
+        if let Some(owner) = self.state.owners.get(name) {
+            let owner = match owner {
+                McpNameOwner::User => "user configuration".to_string(),
+                McpNameOwner::Plugin { plugin_id, .. } => format!("plugin '{plugin_id}'"),
+            };
+            return Err(format!(
+                "Plugin '{plugin_id}' MCP server name '{name}' is owned by {owner}"
+            ));
+        }
+        self.state.next_token = self.state.next_token.saturating_add(1);
+        let token = PluginMcpOwnershipToken(self.state.next_token);
+        self.state.owners.insert(
+            name.to_string(),
+            McpNameOwner::Plugin {
+                plugin_id: plugin_id.to_string(),
+                token,
+            },
+        );
+        Ok(token)
+    }
+
+    pub(crate) fn owns_plugin(
+        &self,
+        plugin_id: &str,
+        name: &str,
+        token: PluginMcpOwnershipToken,
+    ) -> bool {
+        matches!(
+            self.state.owners.get(name),
+            Some(McpNameOwner::Plugin {
+                plugin_id: owner,
+                token: owner_token,
+            }) if owner == plugin_id && *owner_token == token
+        )
+    }
+
+    pub(crate) fn release_plugin(
+        &mut self,
+        plugin_id: &str,
+        name: &str,
+        token: PluginMcpOwnershipToken,
+    ) {
+        if self.owns_plugin(plugin_id, name, token) {
+            self.state.owners.remove(name);
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ReconcilePlan {
     disconnect: Vec<String>,
@@ -173,22 +353,29 @@ pub struct McpConfigRuntime {
     snapshot: RwLock<McpConfigFile>,
     mutation_lock: Mutex<()>,
     generation: AtomicU64,
-    reconcile_tasks: Mutex<Vec<ReconcileTask>>,
+    supervisor: Mutex<McpRuntimeSupervisor>,
     unreconciled_user_names: Mutex<BTreeSet<String>>,
+    ownership: Arc<McpNameOwnershipRegistry>,
     shutdown: CancellationToken,
+    #[cfg(test)]
+    writer_gate: Mutex<Option<WriterTestGate>>,
 }
 
 impl McpConfigRuntime {
     pub(crate) fn new(path: PathBuf, snapshot: McpConfigFile) -> Self {
         let unreconciled_user_names = snapshot.mcp_servers.keys().cloned().collect();
+        let ownership = McpNameOwnershipRegistry::new(snapshot.mcp_servers.keys().cloned());
         Self {
             path,
             snapshot: RwLock::new(snapshot),
             mutation_lock: Mutex::new(()),
             generation: AtomicU64::new(0),
-            reconcile_tasks: Mutex::new(Vec::new()),
+            supervisor: Mutex::new(McpRuntimeSupervisor::default()),
             unreconciled_user_names: Mutex::new(unreconciled_user_names),
+            ownership,
             shutdown: CancellationToken::new(),
+            #[cfg(test)]
+            writer_gate: Mutex::new(None),
         }
     }
 
@@ -206,11 +393,62 @@ impl McpConfigRuntime {
         self.snapshot.read().await.clone()
     }
 
+    pub(crate) fn ownership(&self) -> Arc<McpNameOwnershipRegistry> {
+        Arc::clone(&self.ownership)
+    }
+
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
 
+    async fn run_owned_mutation<T, F, Fut>(
+        self: &Arc<Self>,
+        operation: F,
+    ) -> Result<T, McpConfigRuntimeError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<Self>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, McpConfigRuntimeError>> + Send + 'static,
+    {
+        let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+        let mut supervisor = self.supervisor.lock().await;
+        if !supervisor.accepting_mutations || self.shutdown.is_cancelled() {
+            return Err(McpConfigRuntimeError::Closed);
+        }
+        let mut completed = Vec::new();
+        let mut pending = Vec::new();
+        for task in std::mem::take(&mut supervisor.mutation_tasks) {
+            if task.is_finished() {
+                completed.push(task);
+            } else {
+                pending.push(task);
+            }
+        }
+        let runtime = Arc::clone(self);
+        pending.push(tokio::spawn(async move {
+            let result = operation(runtime).await;
+            let _ = result_sender.send(result);
+        }));
+        supervisor.mutation_tasks = pending;
+        drop(supervisor);
+        Self::await_mutation_tasks(completed, "replacement").await;
+        result_receiver
+            .await
+            .map_err(|error| McpConfigRuntimeError::MutationTask(error.to_string()))?
+    }
+
     pub async fn replace_and_reconcile(
+        self: &Arc<Self>,
+        agent: AgentHandle,
+        candidate: McpConfigFile,
+    ) -> Result<u64, McpConfigRuntimeError> {
+        self.run_owned_mutation(move |runtime| async move {
+            runtime.replace_and_reconcile_inner(agent, candidate).await
+        })
+        .await
+    }
+
+    async fn replace_and_reconcile_inner(
         self: &Arc<Self>,
         agent: AgentHandle,
         candidate: McpConfigFile,
@@ -224,6 +462,18 @@ impl McpConfigRuntime {
     }
 
     pub async fn upsert_and_reconcile(
+        self: &Arc<Self>,
+        agent: AgentHandle,
+        name: String,
+        entry: McpServerEntry,
+    ) -> Result<u64, McpConfigRuntimeError> {
+        self.run_owned_mutation(move |runtime| async move {
+            runtime.upsert_and_reconcile_inner(agent, name, entry).await
+        })
+        .await
+    }
+
+    async fn upsert_and_reconcile_inner(
         self: &Arc<Self>,
         agent: AgentHandle,
         name: String,
@@ -243,6 +493,21 @@ impl McpConfigRuntime {
         name: &str,
         enabled: bool,
     ) -> Result<u64, McpConfigRuntimeError> {
+        let name = name.to_string();
+        self.run_owned_mutation(move |runtime| async move {
+            runtime
+                .set_enabled_and_reconcile_inner(agent, &name, enabled)
+                .await
+        })
+        .await
+    }
+
+    async fn set_enabled_and_reconcile_inner(
+        self: &Arc<Self>,
+        agent: AgentHandle,
+        name: &str,
+        enabled: bool,
+    ) -> Result<u64, McpConfigRuntimeError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         self.ensure_open()?;
         let commit = self.commit_toggle_locked(name, enabled).await?;
@@ -252,6 +517,18 @@ impl McpConfigRuntime {
     }
 
     pub async fn remove_and_reconcile(
+        self: &Arc<Self>,
+        agent: AgentHandle,
+        name: &str,
+    ) -> Result<u64, McpConfigRuntimeError> {
+        let name = name.to_string();
+        self.run_owned_mutation(move |runtime| async move {
+            runtime.remove_and_reconcile_inner(agent, &name).await
+        })
+        .await
+    }
+
+    async fn remove_and_reconcile_inner(
         self: &Arc<Self>,
         agent: AgentHandle,
         name: &str,
@@ -303,20 +580,48 @@ impl McpConfigRuntime {
         &self,
         mut candidate: McpConfigFile,
     ) -> Result<McpConfigCommit, McpConfigRuntimeError> {
-        let previous = self.snapshot().await;
+        let mut snapshot = self.snapshot.write().await;
+        let previous = snapshot.clone();
         restore_redacted_values(&mut candidate, &previous);
         validate_mcp_config(&candidate)?;
         let bytes = serde_json::to_vec_pretty(&candidate)?;
         let path = self.path.clone();
         let write_path = path.clone();
+
+        // Reserve the shared namespace before the durable write starts. The
+        // snapshot and ownership guards stay held through writer settlement,
+        // so a successful write is promoted without another cancellation
+        // point or a plugin takeover window.
+        let mut ownership = self.ownership.lock().await;
+        #[cfg(test)]
+        let writer_gate = self.writer_gate.lock().await.take();
         tokio::task::spawn_blocking(move || {
+            #[cfg(test)]
+            if let Some(gate) = writer_gate {
+                gate.started.send(()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "MCP writer test observer was dropped",
+                    )
+                })?;
+                gate.release.recv().map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "MCP writer test release was dropped",
+                    )
+                })?;
+            }
             echo_core::utils::fs::atomic_write(&write_path, &bytes)
         })
         .await
         .map_err(|error| McpConfigRuntimeError::WriterTask(error.to_string()))?
         .map_err(|source| McpConfigRuntimeError::Write { path, source })?;
 
-        *self.snapshot.write().await = candidate.clone();
+        // The durable user source wins the shared ReactAgent namespace. Claim
+        // before reconcile so a plugin cannot wire the same name between the
+        // successful commit and the user connection replacement.
+        ownership.claim_user_names(candidate.mcp_servers.keys().cloned());
+        *snapshot = candidate.clone();
         let previous_generation = self
             .generation
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -353,7 +658,7 @@ impl McpConfigRuntime {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let completed = {
-            let mut tasks = self.reconcile_tasks.lock().await;
+            let mut supervisor = self.supervisor.lock().await;
             if self.shutdown.is_cancelled() {
                 cancel.cancel();
                 return 0;
@@ -361,7 +666,7 @@ impl McpConfigRuntime {
 
             let mut completed = Vec::new();
             let mut pending = Vec::new();
-            for task in std::mem::take(&mut *tasks) {
+            for task in std::mem::take(&mut supervisor.reconcile_tasks) {
                 task.cancel.cancel();
                 if task.handle.is_finished() {
                     completed.push(task);
@@ -371,7 +676,7 @@ impl McpConfigRuntime {
             }
             let handle = tokio::spawn(reconcile);
             pending.push(ReconcileTask { cancel, handle });
-            *tasks = pending;
+            supervisor.reconcile_tasks = pending;
             completed
         };
         Self::await_reconcile_tasks(completed, "replacement").await
@@ -380,20 +685,39 @@ impl McpConfigRuntime {
     /// Cancel and await every connection reconciliation started by this owner.
     /// Calling this more than once is safe.
     pub async fn shutdown(&self) {
-        let _mutation_guard = self.mutation_lock.lock().await;
-        // Linearize shutdown after any mutation that already owns the lock.
-        // Such a mutation must be allowed to register its reconcile handle so
-        // the shutdown drain can cancel and await it. Later mutations acquire
-        // the lock after cancellation and fail `ensure_open`.
+        let mutations = {
+            let mut supervisor = self.supervisor.lock().await;
+            supervisor.accepting_mutations = false;
+            std::mem::take(&mut supervisor.mutation_tasks)
+        };
+        Self::await_mutation_tasks(mutations, "shutdown").await;
+
+        // Every accepted mutation has now durably settled and handed its
+        // connection work to the same supervisor. Close the runtime only after
+        // that handoff, then cancel and drain all reconciliation receipts.
         self.shutdown.cancel();
         let tasks = {
-            let mut tasks = self.reconcile_tasks.lock().await;
-            for task in tasks.iter() {
+            let mut supervisor = self.supervisor.lock().await;
+            for task in &supervisor.reconcile_tasks {
                 task.cancel.cancel();
             }
-            std::mem::take(&mut *tasks)
+            std::mem::take(&mut supervisor.reconcile_tasks)
         };
         Self::await_reconcile_tasks(tasks, "shutdown").await;
+    }
+
+    async fn await_mutation_tasks(
+        tasks: Vec<tokio::task::JoinHandle<()>>,
+        phase: &'static str,
+    ) -> usize {
+        let mut failures = 0usize;
+        for task in tasks {
+            if let Err(error) = task.await {
+                failures = failures.saturating_add(1);
+                tracing::warn!(%error, phase, "MCP mutation settlement task failed");
+            }
+        }
+        failures
     }
 
     async fn await_reconcile_tasks(tasks: Vec<ReconcileTask>, phase: &'static str) -> usize {
@@ -482,6 +806,7 @@ impl McpConfigRuntime {
             let mut names = self.unreconciled_user_names.lock().await;
             if self.generation() == generation {
                 *names = current_names;
+                self.ownership.settle_user_names(&names).await;
             }
         }
     }
@@ -493,6 +818,24 @@ impl McpConfigRuntime {
     ) -> Result<McpConfigCommit, McpConfigRuntimeError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         self.commit_candidate_locked(candidate).await
+    }
+
+    #[cfg(test)]
+    async fn commit_candidate_owned(
+        self: &Arc<Self>,
+        candidate: McpConfigFile,
+    ) -> Result<u64, McpConfigRuntimeError> {
+        self.run_owned_mutation(move |runtime| async move {
+            let _mutation_guard = runtime.mutation_lock.lock().await;
+            runtime.ensure_open()?;
+            let commit = runtime.commit_candidate_locked(candidate).await?;
+            let generation = commit.generation;
+            runtime
+                .start_tracked_reconcile(commit.cancel, async {})
+                .await;
+            Ok(generation)
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -593,6 +936,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_removal_releases_name_only_after_reconcile_settles() -> anyhow::Result<()> {
+        let ownership = McpNameOwnershipRegistry::new(["shared".to_string()]);
+        {
+            let mut guard = ownership.lock().await;
+            assert!(guard.claim_plugin("fixture", "shared").is_err());
+        }
+
+        ownership.settle_user_names(&BTreeSet::new()).await;
+        let mut guard = ownership.lock().await;
+        assert!(guard.claim_plugin("fixture", "shared").is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn save_survives_runtime_restart() -> anyhow::Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("mcp.json");
@@ -620,6 +977,55 @@ mod tests {
         assert!(result.is_err());
         assert!(runtime.snapshot().await.mcp_servers.is_empty());
         assert_eq!(runtime.generation(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_waiter_after_writer_start_still_settles_owned_commit() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("mcp.json");
+        let runtime = Arc::new(McpConfigRuntime::empty(path.clone()));
+        let candidate = config_with("accepted", stdio_entry("node", false));
+        let (started_sender, started_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        *runtime.writer_gate.lock().await = Some(WriterTestGate {
+            started: started_sender,
+            release: release_receiver,
+        });
+
+        let runtime_for_waiter = Arc::clone(&runtime);
+        let candidate_for_waiter = candidate.clone();
+        let waiter = tokio::spawn(async move {
+            runtime_for_waiter
+                .commit_candidate_owned(candidate_for_waiter)
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            started_receiver.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))??;
+        waiter.abort();
+        let waiter_error = waiter
+            .await
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("aborted MCP waiter unexpectedly completed"))?;
+        assert!(waiter_error.is_cancelled());
+
+        release_sender.send(())?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), runtime.shutdown()).await?;
+
+        let durable = load_mcp_config_snapshot(&path)?;
+        assert!(configs_equal(&candidate, &durable)?);
+        assert!(configs_equal(&candidate, &runtime.snapshot().await)?);
+        assert_eq!(runtime.generation(), 1);
+        assert_eq!(
+            runtime.ownership.owner("accepted").await,
+            Some(McpNameOwner::User)
+        );
+        let supervisor = runtime.supervisor.lock().await;
+        assert!(supervisor.mutation_tasks.is_empty());
+        assert!(supervisor.reconcile_tasks.is_empty());
         Ok(())
     }
 
@@ -762,17 +1168,18 @@ mod tests {
             })
             .await;
         {
-            let tasks = runtime.reconcile_tasks.lock().await;
-            if let Some(task) = tasks.first() {
+            let supervisor = runtime.supervisor.lock().await;
+            if let Some(task) = supervisor.reconcile_tasks.first() {
                 task.handle.abort();
             }
         }
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 let finished = runtime
-                    .reconcile_tasks
+                    .supervisor
                     .lock()
                     .await
+                    .reconcile_tasks
                     .first()
                     .is_some_and(|task| task.handle.is_finished());
                 if finished {
@@ -791,7 +1198,7 @@ mod tests {
             })
             .await;
         assert_eq!(join_failures, 1);
-        assert_eq!(runtime.reconcile_tasks.lock().await.len(), 1);
+        assert_eq!(runtime.supervisor.lock().await.reconcile_tasks.len(), 1);
         runtime.shutdown().await;
         Ok(())
     }
@@ -801,15 +1208,35 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let runtime = Arc::new(McpConfigRuntime::empty(temp.path().join("mcp.json")));
         let mutation_guard = runtime.mutation_lock.lock().await;
+        let mutation_runtime = Arc::clone(&runtime);
+        let mutation = tokio::spawn(async move {
+            mutation_runtime
+                .commit_candidate_owned(McpConfigFile::default())
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !runtime.supervisor.lock().await.mutation_tasks.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
         let shutdown_runtime = Arc::clone(&runtime);
-        let shutdown = tokio::spawn(async move {
+        let mut shutdown = tokio::spawn(async move {
             shutdown_runtime.shutdown().await;
         });
 
-        tokio::task::yield_now().await;
-        assert!(!shutdown.is_finished());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown returned before the accepted mutation settled"
+        );
         assert!(!runtime.shutdown.is_cancelled());
         drop(mutation_guard);
+        mutation.await??;
         shutdown.await?;
         assert!(runtime.shutdown.is_cancelled());
         assert!(matches!(
@@ -851,7 +1278,7 @@ mod tests {
         assert!(second_cancel.is_cancelled());
         assert!(first_finished.load(Ordering::Acquire));
         assert!(second_finished.load(Ordering::Acquire));
-        assert!(runtime.reconcile_tasks.lock().await.is_empty());
+        assert!(runtime.supervisor.lock().await.reconcile_tasks.is_empty());
         assert!(matches!(
             runtime.ensure_open(),
             Err(McpConfigRuntimeError::Closed)

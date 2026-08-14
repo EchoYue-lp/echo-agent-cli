@@ -4134,7 +4134,7 @@ async fn handle_slash_command(
                 return;
             };
             let result = crate::cli::cmd_impls::workspace::execute_workspace_command(
-                Some(app_state.as_ref()),
+                Some(&app_state),
                 &command_args,
             )
             .await;
@@ -4506,28 +4506,28 @@ async fn handle_slash_command(
             // legacy RecoveryBlocker path so process-restart blockers still
             // work. This keeps TUI on par with the GUI retry button.
             let result = if action == SlashCommand::TaskRetry {
-                match store.retry_blocked_task(&run_id, task_id) {
-                    Ok(next_attempt) => {
-                        let layer_manager = app
-                            .review_integration
-                            .as_ref()
-                            .map(|integration| Arc::new(integration.create_layer_manager()));
-                        match start_tui_task_run_driver(
-                            store.clone(),
-                            agent.clone(),
-                            run_id.clone(),
-                            layer_manager,
-                        )
-                        .await
-                        {
-                            Ok(()) => Ok(format!(
-                                "Task {task_id} retried as attempt {next_attempt} on run {run_id}; executor started."
-                            )),
-                            Err(error) => Err(format!(
-                                "retry state was recorded but the executor could not start; run returned to Paused: {error}"
-                            )),
-                        }
-                    }
+                let layer_manager = app
+                    .review_integration
+                    .as_ref()
+                    .map(|integration| Arc::new(integration.create_layer_manager()));
+                let preparation_store = store.clone();
+                let preparation_run_id = run_id.clone();
+                let preparation_task_id = task_id.to_string();
+                match start_tui_task_run_driver(
+                    store.clone(),
+                    agent.clone(),
+                    run_id.clone(),
+                    layer_manager,
+                    move || {
+                        preparation_store
+                            .retry_blocked_task(&preparation_run_id, &preparation_task_id)
+                    },
+                )
+                .await
+                {
+                    Ok(next_attempt) => Ok(format!(
+                        "Task {task_id} retried as attempt {next_attempt} on run {run_id}; executor started."
+                    )),
                     Err(retry_err) => {
                         // Fall back to legacy RecoveryBlocker resolution.
                         match store.resolve_recovery_task(
@@ -4757,58 +4757,66 @@ async fn resume_tui_task_run(
     run_id: String,
     layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
 ) -> Result<&'static str, String> {
-    if store
-        .get_plan(&run_id)
-        .map_err(|error| error.to_string())?
-        .is_none()
-    {
-        return Err("run has no persisted plan to resume".to_string());
-    }
-    store
-        .resume_task_run(&run_id)
-        .map_err(|error| error.to_string())?;
-    start_tui_task_run_driver(store, agent, run_id, layer_manager).await?;
+    let preparation_store = store.clone();
+    let preparation_run_id = run_id.clone();
+    start_tui_task_run_driver(store, agent, run_id, layer_manager, move || {
+        if preparation_store.get_plan(&preparation_run_id)?.is_none() {
+            return Err(
+                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                    "run has no persisted plan to resume".to_string(),
+                ),
+            );
+        }
+        preparation_store.resume_task_run(&preparation_run_id)
+    })
+    .await?;
     Ok("resumed")
 }
 
-async fn start_tui_task_run_driver(
+async fn start_tui_task_run_driver<Prepared, Prepare>(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
     run_id: String,
     layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
-) -> Result<(), String> {
+    prepare: Prepare,
+) -> Result<Prepared, String>
+where
+    Prepare: FnOnce() -> Result<Prepared, echo_agent_app_core::tasks::task_runtime::StoreError>,
+{
     let cancel = echo_agent::agent::CancellationToken::new();
-    let cancel_registration = match store.register_run_cancellation(&run_id, cancel.clone()) {
-        Ok(registration) => registration,
-        Err(error) => {
-            let _ = store.transition_run(
-                &run_id,
-                echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused,
-            );
-            return Err(error.to_string());
-        }
-    };
+    let supervisor_cancel = cancel.clone();
     let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
     let run_store = agent.read(|value| value.run_store().cloned()).await;
-    tokio::spawn(async move {
-        let _cancel_registration = cancel_registration;
+    let store_for_driver = store.clone();
+    let run_id_for_driver = run_id.clone();
+    let driver = async move {
+        let _cancel_registration = store_for_driver
+            .register_run_cancellation(&run_id_for_driver, cancel.clone())
+            .map_err(|error| format!("register run cancellation: {error}"))?;
         let result = echo_agent_app_core::tasks::task_runtime::execute_run(
-            store,
+            store_for_driver,
             Some(agent),
             reviewer_llm,
             layer_manager,
             run_store,
             None,
-            &run_id,
+            &run_id_for_driver,
             cancel,
             echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
         )
         .await;
         if let Err(error) = result {
-            tracing::error!(%run_id, %error, "TUI task run driver failed");
+            tracing::error!(run_id = %run_id_for_driver, %error, "TUI task run driver failed");
+            return Err(error.to_string());
         }
-    });
-    Ok(())
+        Ok(())
+    };
+    let (prepared, _) = store
+        .spawn_supervised_run_driver(run_id, supervisor_cancel, move || {
+            prepare().map(|prepared| (prepared, driver))
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(prepared)
 }
 
 fn resolve_tui_workspace_file(value: &str) -> anyhow::Result<std::path::PathBuf> {

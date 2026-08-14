@@ -14,7 +14,7 @@ pub struct WorkspaceCommandResult {
 // ── WorkspaceCommand ────────────────────────────────────────────────
 
 async fn cmd_workspace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let result = execute_workspace_command(ctx.app_state.as_deref(), args).await;
+    let result = execute_workspace_command(ctx.app_state.as_ref(), args).await;
     if result.generation_changed {
         ctx.staged_attachments.lock().await.clear();
     }
@@ -23,7 +23,7 @@ async fn cmd_workspace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 }
 
 pub async fn execute_workspace_command(
-    app_state: Option<&AppState>,
+    app_state: Option<&std::sync::Arc<AppState>>,
     args: &[&str],
 ) -> WorkspaceCommandResult {
     let Some(state) = app_state else {
@@ -120,7 +120,7 @@ async fn ws_list(state: &AppState) -> String {
 }
 
 /// `/workspace switch <name>`
-async fn ws_switch(state: &AppState, name: Option<&str>) -> WorkspaceCommandResult {
+async fn ws_switch(state: &std::sync::Arc<AppState>, name: Option<&str>) -> WorkspaceCommandResult {
     let name = match name {
         Some(n) => n,
         None => {
@@ -129,13 +129,14 @@ async fn ws_switch(state: &AppState, name: Option<&str>) -> WorkspaceCommandResu
     };
     match state.workspace.registry.open_by_name(name) {
         Ok(ws) => {
-            if let Err(error) = state.switch_workspace(ws.clone()).await {
-                return unchanged(format!("Failed to switch workspace: {error}"));
-            }
+            let transition = match state.switch_workspace(ws.clone()).await {
+                Ok(transition) => transition,
+                Err(error) => return unchanged(format!("Failed to switch workspace: {error}")),
+            };
             reset_workspace_conversation(state).await;
             WorkspaceCommandResult {
                 output: format!(
-                    "Switched to workspace: {} ({})\n  Root: {}\n  Kind: {}{}",
+                    "Switched to workspace: {} ({})\n  Root: {}\n  Kind: {}{}{}",
                     ws.name,
                     ws.id,
                     ws.root.display(),
@@ -143,7 +144,8 @@ async fn ws_switch(state: &AppState, name: Option<&str>) -> WorkspaceCommandResu
                     ws.project_root
                         .as_ref()
                         .map(|path| format!("\n  Project: {}", path.display()))
-                        .unwrap_or_default()
+                        .unwrap_or_default(),
+                    transition_warning(&transition),
                 ),
                 generation_changed: true,
             }
@@ -152,15 +154,34 @@ async fn ws_switch(state: &AppState, name: Option<&str>) -> WorkspaceCommandResu
     }
 }
 
-async fn ws_exit(state: &AppState) -> WorkspaceCommandResult {
-    if let Err(error) = state.exit_workspace().await {
-        return unchanged(format!("Failed to exit workspace: {error}"));
-    }
+async fn ws_exit(state: &std::sync::Arc<AppState>) -> WorkspaceCommandResult {
+    let transition = match state.exit_workspace().await {
+        Ok(transition) => transition,
+        Err(error) => return unchanged(format!("Failed to exit workspace: {error}")),
+    };
     reset_workspace_conversation(state).await;
     WorkspaceCommandResult {
-        output: "Exited workspace; using global paths.".to_string(),
+        output: format!(
+            "Exited workspace; using global paths.{}",
+            transition_warning(&transition)
+        ),
         generation_changed: true,
     }
+}
+
+fn transition_warning(
+    transition: &echo_agent_app_core::state::WorkspaceTransitionReceipt,
+) -> String {
+    if transition.status != echo_agent_app_core::state::WorkspaceTransitionStatus::Degraded {
+        return String::new();
+    }
+    let details = transition
+        .degraded_subsystems
+        .iter()
+        .map(|subsystem| format!("{}: {}", subsystem.subsystem, subsystem.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("\n  Warning: workspace committed with degraded subsystems: {details}")
 }
 
 async fn reset_workspace_conversation(state: &AppState) {

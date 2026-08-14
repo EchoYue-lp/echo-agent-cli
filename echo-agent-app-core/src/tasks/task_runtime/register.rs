@@ -124,8 +124,10 @@ pub async fn register_task_tools_on_agent(
             return;
         }
     };
-    if store.attach_hook_event_dispatcher(dispatcher) {
-        tracing::info!("HookEventDispatcher attached to TaskRuntimeStore");
+    match store.attach_hook_event_dispatcher(dispatcher) {
+        Ok(true) => tracing::info!("HookEventDispatcher attached to TaskRuntimeStore"),
+        Ok(false) => {}
+        Err(error) => tracing::warn!(%error, "HookEventDispatcher was not attached"),
     }
 }
 

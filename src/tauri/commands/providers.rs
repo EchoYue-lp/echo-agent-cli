@@ -189,6 +189,7 @@ pub async fn upsert_configured_model(
             display_name: req.display_name.unwrap_or_default(),
             provider: req.provider,
             model: req.model,
+            api_protocol: None,
             enabled: req.enabled.unwrap_or(true),
             max_tokens: req.max_tokens,
             temperature: req.temperature,

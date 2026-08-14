@@ -26,18 +26,20 @@
 //! let pool = AgentPool::from_runtime(&runtime, PoolConfig::default(), None).await;
 //!
 //! // Acquire an agent for a conversation:
-//! let agent = pool.acquire("conv-001").await?;
-//! agent.chat_stream("Hello").await;  // Executes in parallel with other agents
+//! let lease = pool.acquire("conv-001").await?;
+//! let agent = lease.agent();
+//! agent.chat_stream("Hello").await;  // Keep `lease` until execution settles.
 //! ```
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use echo_agent::agent::AgentHandle;
 use echo_agent::agent::CancellationToken;
 use echo_agent::llm::LlmClient;
-use tokio::sync::RwLock;
+use tokio::sync::{Notify, RwLock};
 
 use crate::infra;
 use crate::model_config::ModelRuntimeConfig;
@@ -72,6 +74,12 @@ pub enum PoolError {
     PoolFull { max: usize },
     /// Failed to create a new agent.
     AgentCreation(String),
+    /// Workspace transition owns the pool admission boundary.
+    WorkspaceTransition,
+    /// Application shutdown permanently closed pool admission.
+    ShuttingDown,
+    /// The in-process execution lease counter cannot admit another owner.
+    ExecutionLeaseCapacity,
 }
 
 impl std::fmt::Display for PoolError {
@@ -82,6 +90,18 @@ impl std::fmt::Display for PoolError {
             }
             PoolError::AgentCreation(msg) => {
                 write!(f, "Failed to create pool agent: {}", msg)
+            }
+            PoolError::WorkspaceTransition => {
+                write!(
+                    f,
+                    "Agent pool admission is suspended for a workspace transition"
+                )
+            }
+            PoolError::ShuttingDown => {
+                write!(f, "Agent pool is shutting down")
+            }
+            PoolError::ExecutionLeaseCapacity => {
+                write!(f, "Agent pool execution lease capacity exhausted")
             }
         }
     }
@@ -168,6 +188,145 @@ struct PooledAgent {
     last_used: Instant,
 }
 
+#[derive(Default)]
+struct AgentPoolAdmission {
+    active: Mutex<AgentPoolAdmissionState>,
+    idle: Notify,
+}
+
+#[derive(Default)]
+struct AgentPoolAdmissionState {
+    total: usize,
+    by_key: HashMap<String, usize>,
+}
+
+impl AgentPoolAdmission {
+    fn issue(
+        self: &Arc<Self>,
+        key: &str,
+        agent: AgentHandle,
+    ) -> Result<AgentPoolExecutionLease, PoolError> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let total = active
+            .total
+            .checked_add(1)
+            .ok_or(PoolError::ExecutionLeaseCapacity)?;
+        let key_count = active
+            .by_key
+            .get(key)
+            .copied()
+            .unwrap_or_default()
+            .checked_add(1)
+            .ok_or(PoolError::ExecutionLeaseCapacity)?;
+        active.total = total;
+        active.by_key.insert(key.to_string(), key_count);
+        drop(active);
+        Ok(AgentPoolExecutionLease {
+            agent,
+            admission: Some((Arc::clone(self), key.to_string())),
+        })
+    }
+
+    fn is_active(&self, key: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .by_key
+            .get(key)
+            .is_some_and(|count| *count != 0)
+    }
+
+    async fn wait_until_idle(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self
+                .active
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .total
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Application execution receipt for one pooled agent generation.
+///
+/// The lease is intentionally not cloneable. Callers may clone the contained
+/// framework handle for APIs that require ownership, but must retain this
+/// receipt until the corresponding chat/run has reached its terminal state.
+/// Workspace transition closes pool admission and waits for every issued
+/// receipt to drop before clearing or rebinding pooled agents.
+#[must_use]
+pub struct AgentPoolExecutionLease {
+    agent: AgentHandle,
+    admission: Option<(Arc<AgentPoolAdmission>, String)>,
+}
+
+impl AgentPoolExecutionLease {
+    pub fn agent(&self) -> AgentHandle {
+        self.agent.clone()
+    }
+
+    pub(crate) fn unpooled(agent: AgentHandle) -> Self {
+        Self {
+            agent,
+            admission: None,
+        }
+    }
+}
+
+impl Drop for AgentPoolExecutionLease {
+    fn drop(&mut self) {
+        let Some((admission, key)) = self.admission.take() else {
+            return;
+        };
+        let mut active = admission
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        active.total = active.total.saturating_sub(1);
+        if let Some(count) = active.by_key.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                active.by_key.remove(&key);
+            }
+        }
+        let released_last = active.total == 0;
+        drop(active);
+        if released_last {
+            admission.idle.notify_waiters();
+        }
+    }
+}
+
+/// TaskRuntime-owned pool receipt. The canonical RunDriver supervisor awaits
+/// release after durable run settlement while this value retains execution
+/// admission through task-specific pool removal.
+pub(crate) struct OwnedRunPoolReceipt {
+    pool: Arc<AgentPool>,
+    key: String,
+    execution: Option<AgentPoolExecutionLease>,
+}
+
+impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for OwnedRunPoolReceipt {
+    fn release(mut self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            if let Some(execution) = self.execution.take() {
+                self.pool
+                    .release_supervised_execution(&self.key, execution)
+                    .await;
+            }
+        })
+    }
+}
+
 impl PooledAgent {
     fn new(handle: AgentHandle, conversation_id: String) -> Self {
         let now = Instant::now();
@@ -188,6 +347,9 @@ impl PooledAgent {
 pub struct AgentPool {
     shared: SharedResources,
     agents: RwLock<HashMap<String, PooledAgent>>,
+    workspace_transitioning: AtomicBool,
+    shutting_down: AtomicBool,
+    admission: Arc<AgentPoolAdmission>,
     config: PoolConfig,
     app_config: RwLock<AppConfig>,
     /// Working directory applied to existing and future pooled agents.
@@ -199,6 +361,9 @@ pub struct AgentPool {
     skill_descriptors: RwLock<Vec<echo_agent::skills::external::SkillDescriptor>>,
     /// Cancellation token for the cleanup monitor task.
     cleanup_cancel: CancellationToken,
+    /// Sole owned cleanup monitor settlement handle. The monitor holds only a
+    /// weak pool reference so a failed bootstrap cannot keep the pool alive.
+    cleanup_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Workspace-scoped memory store override. Set by `apply_memory_store`
     /// on workspace switch so newly-created pool agents also bind to the
     /// current workspace's memory store (not the stale shared.store captured
@@ -213,7 +378,48 @@ pub struct AgentPool {
     workspace_kind: RwLock<WorkspaceKind>,
 }
 
+pub(crate) struct AgentPoolWorkspaceTransition<'a> {
+    pool: &'a AgentPool,
+    committed: bool,
+}
+
+impl AgentPoolWorkspaceTransition<'_> {
+    pub(crate) async fn commit(&mut self) {
+        if self.committed {
+            return;
+        }
+        let mut agents = self.pool.agents.write().await;
+        let count = agents.len();
+        agents.clear();
+        self.committed = true;
+        tracing::info!(
+            agents_cleared = count,
+            "AgentPool: cleared for workspace transition"
+        );
+    }
+}
+
+impl Drop for AgentPoolWorkspaceTransition<'_> {
+    fn drop(&mut self) {
+        self.pool
+            .workspace_transitioning
+            .store(false, Ordering::Release);
+    }
+}
+
 impl AgentPool {
+    pub(crate) fn retain_for_supervised_run(
+        self: &Arc<Self>,
+        key: String,
+        execution: AgentPoolExecutionLease,
+    ) -> OwnedRunPoolReceipt {
+        OwnedRunPoolReceipt {
+            pool: Arc::clone(self),
+            key,
+            execution: Some(execution),
+        }
+    }
+
     /// Create a pool from an already-bootstrapped `AgentRuntime`.
     ///
     /// Extracts shared resources from the runtime's primary agent and
@@ -244,6 +450,9 @@ impl AgentPool {
         let pool = Self {
             shared,
             agents: RwLock::new(HashMap::new()),
+            workspace_transitioning: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            admission: Arc::new(AgentPoolAdmission::default()),
             config,
             app_config: RwLock::new(runtime.app_config.clone()),
             working_dir: RwLock::new(working_dir),
@@ -251,6 +460,7 @@ impl AgentPool {
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(skill_descriptors),
             cleanup_cancel: CancellationToken::new(),
+            cleanup_handle: Mutex::new(None),
             memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(tool_output_artifacts),
@@ -293,13 +503,24 @@ impl AgentPool {
     ///
     /// The write lock is held across the entire operation (including async
     /// agent creation) to prevent TOCTOU races between concurrent acquirers.
-    pub async fn acquire(&self, conversation_id: &str) -> Result<AgentHandle, PoolError> {
+    pub async fn acquire(
+        &self,
+        conversation_id: &str,
+    ) -> Result<AgentPoolExecutionLease, PoolError> {
         let mut agents = self.agents.write().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(PoolError::ShuttingDown);
+        }
+        if self.workspace_transitioning.load(Ordering::Acquire) {
+            return Err(PoolError::WorkspaceTransition);
+        }
 
         // Fast path: reuse existing agent
         if let Some(existing) = agents.get_mut(conversation_id) {
             existing.last_used = Instant::now();
-            return Ok(existing.handle.clone());
+            return self
+                .admission
+                .issue(conversation_id, existing.handle.clone());
         }
 
         // Enforce pool limit — evict oldest idle agent that is NOT executing
@@ -312,7 +533,7 @@ impl AgentPool {
             // Find oldest non-background, non-executing conversation agent
             let mut candidates: Vec<(String, Instant)> = agents
                 .iter()
-                .filter(|(id, _)| Self::is_conversation_agent(id))
+                .filter(|(id, _)| Self::is_conversation_agent(id) && !self.admission.is_active(id))
                 .map(|(id, agent)| (id.clone(), agent.last_used))
                 .collect();
             candidates.sort_by_key(|(_, ts)| *ts);
@@ -363,15 +584,27 @@ impl AgentPool {
             "AgentPool: new agent created"
         );
 
-        Ok(handle)
+        self.admission.issue(conversation_id, handle)
     }
 
-    /// Get an agent handle without creating a new one.
+    /// Lease an existing agent without creating a new one.
     ///
     /// Returns `None` if no agent is allocated for this conversation ID.
-    pub async fn get(&self, conversation_id: &str) -> Option<AgentHandle> {
-        let agents = self.agents.read().await;
-        agents.get(conversation_id).map(|pa| pa.handle.clone())
+    pub async fn lease_existing(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<AgentPoolExecutionLease>, PoolError> {
+        let agents = self.agents.write().await;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(PoolError::ShuttingDown);
+        }
+        if self.workspace_transitioning.load(Ordering::Acquire) {
+            return Err(PoolError::WorkspaceTransition);
+        }
+        agents
+            .get(conversation_id)
+            .map(|pooled| self.admission.issue(conversation_id, pooled.handle.clone()))
+            .transpose()
     }
 
     /// Release an agent from the pool (marks for cleanup).
@@ -386,10 +619,31 @@ impl AgentPool {
         }
     }
 
-    /// Get the dedicated background task agent.
-    ///
-    /// Falls back to the primary agent if no background agent was created.
-    pub async fn background_agent(&self) -> Option<AgentHandle> {
+    /// Release one exact supervised execution receipt. Dropping the receipt
+    /// and deciding whether to remove the cached agent happen under the same
+    /// agents lock used by acquire, so overlapping drivers for one key cannot
+    /// remove each other's live agent.
+    async fn release_supervised_execution(
+        &self,
+        conversation_id: &str,
+        execution: AgentPoolExecutionLease,
+    ) {
+        let mut agents = self.agents.write().await;
+        drop(execution);
+        if self.admission.is_active(conversation_id) {
+            return;
+        }
+        if let Some(agent) = agents.remove(conversation_id) {
+            tracing::info!(
+                conv_id = %conversation_id,
+                age_secs = agent.created_at.elapsed().as_secs(),
+                "AgentPool: supervised agent released"
+            );
+        }
+    }
+
+    #[cfg(test)]
+    async fn background_agent(&self) -> Option<AgentHandle> {
         let agents = self.agents.read().await;
         agents.get("__background__").map(|pa| pa.handle.clone())
     }
@@ -802,9 +1056,17 @@ impl AgentPool {
     /// idle longer than `config.idle_timeout`. The `__background__` agent
     /// is never evicted. Call `shutdown()` to stop the monitor.
     pub async fn spawn_cleanup_monitor(self: &Arc<Self>) {
-        let pool = self.clone();
-        let cancel = pool.cleanup_cancel.clone();
-        tokio::spawn(async move {
+        let mut cleanup_handle = self
+            .cleanup_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shutting_down.load(Ordering::Acquire) || cleanup_handle.is_some() {
+            return;
+        }
+
+        let pool = Arc::downgrade(self);
+        let cancel = self.cleanup_cancel.clone();
+        *cleanup_handle = Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 min
             loop {
                 tokio::select! {
@@ -815,6 +1077,9 @@ impl AgentPool {
                     _ = interval.tick() => {}
                 }
 
+                let Some(pool) = pool.upgrade() else {
+                    return;
+                };
                 let idle_timeout = pool.config.idle_timeout;
                 let mut agents = pool.agents.write().await;
                 // First pass: find agents that exceed idle timeout (except background).
@@ -832,6 +1097,9 @@ impl AgentPool {
                 let to_remove: Vec<String> = timed_out
                     .into_iter()
                     .filter(|id| {
+                        if pool.admission.is_active(id) {
+                            return false;
+                        }
                         let is_idle = agents
                             .get(id)
                             .and_then(|pa| pa.handle.inner().try_read().ok())
@@ -857,21 +1125,60 @@ impl AgentPool {
                     }
                 }
             }
-        });
+        }));
     }
 
     /// Stop the cleanup monitor and release all pool agents.
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let agents = self.agents.write().await;
+        self.shutting_down.store(true, Ordering::Release);
+        drop(agents);
         self.cleanup_cancel.cancel();
+        let cleanup_handle = self
+            .cleanup_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let monitor_error = if let Some(cleanup_handle) = cleanup_handle {
+            cleanup_handle
+                .await
+                .err()
+                .map(|error| format!("AgentPool cleanup monitor failed: {error}"))
+        } else {
+            None
+        };
+        self.admission.wait_until_idle().await;
         let mut agents = self.agents.write().await;
         let count = agents.len();
         agents.clear();
         tracing::info!(agents_cleared = count, "AgentPool: shutdown complete");
+        match monitor_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
-    /// Clear cached conversations before publishing another workspace generation.
-    pub async fn reset_for_workspace_transition(&self) -> anyhow::Result<()> {
-        let mut agents = self.agents.write().await;
+    /// Verify that cached conversations can be retired without mutating them.
+    pub(crate) async fn preflight_workspace_transition(
+        &self,
+    ) -> anyhow::Result<AgentPoolWorkspaceTransition<'_>> {
+        let agents = self.agents.write().await;
+        if self.workspace_transitioning.swap(true, Ordering::AcqRel) {
+            anyhow::bail!("Agent pool workspace transition is already in progress");
+        }
+        drop(agents);
+        let transition = AgentPoolWorkspaceTransition {
+            pool: self,
+            committed: false,
+        };
+
+        // An issued handle is execution ownership even before its framework
+        // execution mutex is locked. Closing admission under the agents write
+        // lock above makes the counter stable in the downward direction; wait
+        // for every existing receipt to reach its real settlement.
+        self.admission.wait_until_idle().await;
+
+        let agents = self.agents.write().await;
         for (conversation_id, pooled) in agents.iter() {
             let Ok(agent) = pooled.handle.inner().try_read() else {
                 anyhow::bail!(
@@ -884,13 +1191,8 @@ impl AgentPool {
                 );
             }
         }
-        let count = agents.len();
-        agents.clear();
-        tracing::info!(
-            agents_cleared = count,
-            "AgentPool: cleared for workspace transition"
-        );
-        Ok(())
+        drop(agents);
+        Ok(transition)
     }
 
     /// Internal: create a new agent with shared resources injected.
@@ -1063,6 +1365,12 @@ impl AgentPool {
     }
 }
 
+impl Drop for AgentPool {
+    fn drop(&mut self) {
+        self.cleanup_cancel.cancel();
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1195,17 +1503,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pool_get_returns_none_for_unknown() -> TestResult {
+    async fn test_pool_lease_existing_returns_none_for_unknown() -> TestResult {
         let pool = create_test_pool(5, false).await?;
-        assert!(pool.get("unknown").await.is_none());
+        assert!(
+            pool.lease_existing("unknown")
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_get_returns_some_for_known() -> TestResult {
+    async fn test_pool_lease_existing_returns_some_for_known() -> TestResult {
         let pool = create_test_pool(5, false).await?;
         let _h = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
-        assert!(pool.get("conv-1").await.is_some());
+        assert!(
+            pool.lease_existing("conv-1")
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
         Ok(())
     }
 
@@ -1226,29 +1544,45 @@ mod tests {
 
         let resolved = tool
             .execution_agent_for_test(Some("conv-1".to_string()))
-            .await;
-        assert!(Arc::ptr_eq(resolved.inner(), pooled.inner()));
+            .await
+            .map_err(|error| error.to_string())?;
+        let pooled_agent = pooled.agent();
+        assert!(Arc::ptr_eq(resolved.inner(), pooled_agent.inner()));
 
         let unresolved = tool
             .execution_agent_for_test(Some("missing".to_string()))
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
         assert!(Arc::ptr_eq(unresolved.inner(), fallback.inner()));
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_evicts_idle_on_overflow() -> TestResult {
+    async fn test_pool_rejects_overflow_while_all_receipts_are_active() -> TestResult {
         let pool = create_test_pool(2, false).await?;
 
         let _h1 = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
         let _h2 = pool.acquire("conv-2").await.map_err(|e| e.to_string())?;
         assert_eq!(pool.pool_size().await, 2);
 
-        // Pool is full — acquiring a 3rd should evict the oldest
-        let h3 = pool.acquire("conv-3").await;
-        assert!(h3.is_ok());
-        // Pool should still be at max capacity
-        assert!(pool.pool_size().await <= 3);
+        assert!(matches!(
+            pool.acquire("conv-3").await,
+            Err(PoolError::PoolFull { max: 2 })
+        ));
+        assert_eq!(pool.pool_size().await, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pool_evicts_idle_after_execution_receipts_drop() -> TestResult {
+        let pool = create_test_pool(2, false).await?;
+        let h1 = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
+        let h2 = pool.acquire("conv-2").await.map_err(|e| e.to_string())?;
+        drop(h1);
+        drop(h2);
+
+        let _h3 = pool.acquire("conv-3").await.map_err(|e| e.to_string())?;
+        assert_eq!(pool.pool_size().await, 2);
         Ok(())
     }
 
@@ -1362,6 +1696,9 @@ mod tests {
         Ok(AgentPool {
             shared,
             agents: RwLock::new(HashMap::new()),
+            workspace_transitioning: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            admission: Arc::new(AgentPoolAdmission::default()),
             config: PoolConfig {
                 max_agents,
                 idle_timeout: Duration::from_secs(1800),
@@ -1373,6 +1710,7 @@ mod tests {
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
+            cleanup_handle: Mutex::new(None),
             memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
@@ -1399,6 +1737,9 @@ mod tests {
         Ok(AgentPool {
             shared,
             agents: RwLock::new(HashMap::new()),
+            workspace_transitioning: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            admission: Arc::new(AgentPoolAdmission::default()),
             config: PoolConfig {
                 max_agents: 3,
                 idle_timeout: Duration::from_secs(1800),
@@ -1410,11 +1751,128 @@ mod tests {
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
+            cleanup_handle: Mutex::new(None),
             memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
         })
+    }
+
+    #[tokio::test]
+    async fn workspace_transition_gate_rejects_acquire_until_publication_finishes() -> TestResult {
+        let pool = create_test_pool(4, false).await?;
+        let mut transition = pool
+            .preflight_workspace_transition()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            pool.acquire("blocked-before-commit").await,
+            Err(PoolError::WorkspaceTransition)
+        ));
+        transition.commit().await;
+        assert!(matches!(
+            pool.acquire("blocked-after-commit").await,
+            Err(PoolError::WorkspaceTransition)
+        ));
+        drop(transition);
+
+        let published = pool
+            .acquire("published")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(published);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_pool_preflight_reopens_admission() -> TestResult {
+        let pool = create_test_pool(4, false).await?;
+        let active_lease = pool
+            .acquire("active")
+            .await
+            .map_err(|error| error.to_string())?;
+        let active = active_lease.agent();
+        drop(active_lease);
+        let execution = active.read(|agent| agent.execution_mutex().clone()).await;
+        let execution_guard = execution.lock().await;
+        let error = pool
+            .preflight_workspace_transition()
+            .await
+            .err()
+            .ok_or_else(|| "busy pool transition unexpectedly succeeded".to_string())?;
+        assert!(error.to_string().contains("executing"));
+        drop(execution_guard);
+
+        let reopened = pool
+            .acquire("reopened")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(reopened);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn issued_lease_blocks_transition_even_before_execution_mutex_is_locked() -> TestResult {
+        let pool = create_test_pool(4, false).await?;
+        let issued = pool
+            .acquire("issued-before-execution")
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut transition = Box::pin(pool.preflight_workspace_transition());
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut transition)
+                .await
+                .is_err(),
+            "transition must wait for the issued execution receipt"
+        );
+        assert!(matches!(
+            pool.acquire("blocked-while-draining").await,
+            Err(PoolError::WorkspaceTransition)
+        ));
+
+        drop(issued);
+        let mut transition = tokio::time::timeout(Duration::from_secs(1), transition)
+            .await
+            .map_err(|_| "transition did not observe the released lease".to_string())?
+            .map_err(|error| error.to_string())?;
+        transition.commit().await;
+        drop(transition);
+
+        let new_generation = pool
+            .acquire("new-generation")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(new_generation);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_preflight_wait_reopens_pool_admission() -> TestResult {
+        let pool = create_test_pool(4, false).await?;
+        let issued = pool
+            .acquire("issued-before-cancel")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                pool.preflight_workspace_transition(),
+            )
+            .await
+            .is_err(),
+            "preflight should still be draining the issued lease"
+        );
+        let admitted_after_cancel = pool
+            .acquire("admitted-after-cancel")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        drop(admitted_after_cancel);
+        drop(issued);
+        Ok(())
     }
 
     #[tokio::test]
@@ -1427,7 +1885,7 @@ mod tests {
 
         pool.apply_workspace_routing(WorkspaceKind::DataAnalysis { datasets: vec![] })
             .await;
-        let existing_context = existing.read(|agent| agent.context().clone()).await;
+        let existing_context = existing.agent().read(|agent| agent.context().clone()).await;
         assert!(
             existing_context
                 .lock()
@@ -1439,7 +1897,7 @@ mod tests {
             .acquire("future")
             .await
             .map_err(|error| error.to_string())?;
-        let future_context = future.read(|agent| agent.context().clone()).await;
+        let future_context = future.agent().read(|agent| agent.context().clone()).await;
         assert!(
             future_context
                 .lock()
@@ -1460,7 +1918,7 @@ mod tests {
 
         pool.apply_working_dir(Some(root.clone())).await;
         assert_eq!(
-            existing.read(|agent| agent.working_dir()).await,
+            existing.agent().read(|agent| agent.working_dir()).await,
             Some(root.clone())
         );
 
@@ -1468,7 +1926,10 @@ mod tests {
             .acquire("future-working-dir")
             .await
             .map_err(|error| error.to_string())?;
-        assert_eq!(future.read(|agent| agent.working_dir()).await, Some(root));
+        assert_eq!(
+            future.agent().read(|agent| agent.working_dir()).await,
+            Some(root)
+        );
         Ok(())
     }
 
@@ -1480,7 +1941,10 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
 
-        let has_layer_manager = handle.read(|agent| agent.has_memory_layer_manager()).await;
+        let has_layer_manager = handle
+            .agent()
+            .read(|agent| agent.has_memory_layer_manager())
+            .await;
         assert!(
             has_layer_manager,
             "pooled agents must install MemoryLayerManager so TriggerDetector writes real memory"
@@ -1502,12 +1966,18 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         assert!(
-            !Arc::ptr_eq(task_a.inner(), task_b.inner()),
+            !Arc::ptr_eq(task_a.agent().inner(), task_b.agent().inner()),
             "parallel background tasks must use distinct subagent instances"
         );
 
-        let task_a_has_memory = task_a.read(|agent| agent.has_memory_layer_manager()).await;
-        let task_b_has_memory = task_b.read(|agent| agent.has_memory_layer_manager()).await;
+        let task_a_has_memory = task_a
+            .agent()
+            .read(|agent| agent.has_memory_layer_manager())
+            .await;
+        let task_b_has_memory = task_b
+            .agent()
+            .read(|agent| agent.has_memory_layer_manager())
+            .await;
         assert!(task_a_has_memory);
         assert!(task_b_has_memory);
         Ok(())
@@ -1546,6 +2016,7 @@ mod tests {
         pool.apply_permission_mode("full-auto".to_string()).await;
 
         let first_mode = first
+            .agent()
             .read(|agent| agent.get_permission_mode().to_string())
             .await;
         assert_eq!(first_mode, "full-auto");
@@ -1555,9 +2026,110 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         let second_mode = second
+            .agent()
             .read(|agent| agent.get_permission_mode().to_string())
             .await;
         assert_eq!(second_mode, "full-auto");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cleanup_monitor_start_is_idempotent_and_shutdown_awaits_exit() -> TestResult {
+        let pool = Arc::new(create_test_pool(2, false).await?);
+        pool.spawn_cleanup_monitor().await;
+        let first_id = pool
+            .cleanup_handle
+            .lock()
+            .map_err(|_| "cleanup monitor handle is unavailable".to_string())?
+            .as_ref()
+            .map(tokio::task::JoinHandle::id);
+
+        pool.spawn_cleanup_monitor().await;
+        let second_id = pool
+            .cleanup_handle
+            .lock()
+            .map_err(|_| "cleanup monitor handle is unavailable".to_string())?
+            .as_ref()
+            .map(tokio::task::JoinHandle::id);
+        assert!(first_id.is_some());
+        assert_eq!(second_id, first_id);
+
+        pool.shutdown().await?;
+        assert!(pool.cleanup_cancel.is_cancelled());
+        assert!(
+            pool.cleanup_handle
+                .lock()
+                .map_err(|_| "cleanup monitor handle is unavailable".to_string())?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn supervised_release_keeps_overlapping_same_key_agent_until_last_receipt() -> TestResult
+    {
+        let pool = Arc::new(create_test_pool(2, false).await?);
+        let first = pool
+            .acquire("shared-run")
+            .await
+            .map_err(|error| error.to_string())?;
+        let first_receipt = pool.retain_for_supervised_run("shared-run".to_string(), first);
+        let second = pool
+            .acquire("shared-run")
+            .await
+            .map_err(|error| error.to_string())?;
+        let second_agent = second.agent();
+        let second_receipt = pool.retain_for_supervised_run("shared-run".to_string(), second);
+
+        crate::tasks::task_runtime::store::RunDriverExecutionReceipt::release(Box::new(
+            first_receipt,
+        ))
+        .await;
+        assert_eq!(pool.pool_size().await, 1);
+
+        let third = pool
+            .acquire("shared-run")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(Arc::ptr_eq(second_agent.inner(), third.agent().inner()));
+        drop(third);
+
+        crate::tasks::task_runtime::store::RunDriverExecutionReceipt::release(Box::new(
+            second_receipt,
+        ))
+        .await;
+        assert_eq!(pool.pool_size().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_active_receipts_and_rejects_later_acquire() -> TestResult {
+        let pool = Arc::new(create_test_pool(2, false).await?);
+        let active = pool
+            .acquire("active-during-shutdown")
+            .await
+            .map_err(|error| error.to_string())?;
+        let shutdown_pool = Arc::clone(&pool);
+        let shutdown = tokio::spawn(async move { shutdown_pool.shutdown().await });
+
+        while !pool.shutting_down.load(Ordering::Acquire) {
+            if shutdown.is_finished() {
+                return Err("pool shutdown finished while an execution receipt was active".into());
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!shutdown.is_finished());
+        assert!(matches!(
+            pool.acquire("after-shutdown").await,
+            Err(PoolError::ShuttingDown)
+        ));
+
+        drop(active);
+        shutdown
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(pool.pool_size().await, 0);
         Ok(())
     }
 }

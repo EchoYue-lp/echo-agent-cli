@@ -954,6 +954,14 @@ impl CreateComplexTaskTool {
             .clone()
             .unwrap_or_else(|| format!("message:{run_id}"));
         let attended = super::types::AttendedMode::Attended;
+        let generation_lease = match store.lease_active_workspace_generation() {
+            Ok(lease) => lease,
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Task runtime workspace admission failed: {error}"
+                )));
+            }
+        };
         if let Err(e) = store.create_run_for_active_workspace(
             &run_id,
             &conv,
@@ -987,27 +995,54 @@ impl CreateComplexTaskTool {
         } else {
             None
         };
-        let payload = crate::run_driver::RunPayload {
-            run_id: run_id.clone(),
-            pool,
-            store: store.clone(),
-            cancel: run_cancel,
-            // B5.1: forward the chat turn's memory layer so the run's Blocking
-            // memory write (drive_run_async → execute_run) actually lands the
-            // taskrun:completed:{run_id} memory. None when no memory subsystem
-            // is wired (then the Blocking write is a no-op).
-            layer_manager: res.layer_manager.clone(),
-            trace_sink,
-            prompt: run_prompt,
-            plan_policy,
+        let supervisor_cancel = run_cancel.clone();
+        let payload_run_id = run_id.clone();
+        let payload_store = store.clone();
+        let layer_manager = res.layer_manager.clone();
+        let result_waiter = match store.spawn_run_driver(
+            run_id.clone(),
+            supervisor_cancel,
+            generation_lease,
+            move |receipt_owner| {
+                crate::run_driver::drive_run_async(crate::run_driver::RunPayload {
+                    run_id: payload_run_id,
+                    pool,
+                    store: payload_store,
+                    cancel: run_cancel,
+                    // B5.1: forward the chat turn's memory layer so the run's Blocking
+                    // memory write (drive_run_async → execute_run) actually lands the
+                    // taskrun:completed:{run_id} memory. None when no memory subsystem
+                    // is wired (then the Blocking write is a no-op).
+                    layer_manager,
+                    trace_sink,
+                    prompt: run_prompt,
+                    plan_policy,
+                    receipt_owner,
+                })
+            },
+        ) {
+            Ok(waiter) => waiter,
+            Err(error) => {
+                let message = format!("TaskRun driver admission failed: {error}");
+                return match store.finalize_run(
+                    &run_id,
+                    super::types::TaskRunStatus::Failed,
+                    Some(&message),
+                ) {
+                    Ok(_) => Ok(ToolResult::error(message)),
+                    Err(settlement_error) => Ok(ToolResult::error(format!(
+                        "{message}; terminal settlement failed: {settlement_error}"
+                    ))),
+                };
+            }
         };
 
         if priority == "foreground" {
             // Block the turn: drive_run_async streams subagent events to the chat
             // sink (via trace_sink), returns the terminal RunOutcome so the
             // agent can use the result in-turn (Claude Code Task style).
-            match crate::run_driver::drive_run_async(payload).await {
-                Ok(outcome) => {
+            match result_waiter.await {
+                Ok(Ok(outcome)) => {
                     use super::executor::RunOutcome;
                     let terminal = match outcome {
                         RunOutcome::Completed => "completed",
@@ -1020,11 +1055,15 @@ impl CreateComplexTaskTool {
                             .to_string(),
                     ))
                 }
-                Err(e) => Ok(ToolResult::error(format!("Run failed: {e}"))),
+                Ok(Err(error)) => Ok(ToolResult::error(format!("Run failed: {error}"))),
+                Err(error) => Ok(ToolResult::error(format!(
+                    "Run driver settlement was lost: {error}"
+                ))),
             }
         } else {
-            // Background: spawn + return immediately (decoupled, spec §6).
-            tokio::spawn(crate::run_driver::drive_run_async(payload));
+            // Background: the canonical TaskRuntime owner retains the driver;
+            // this surface drops only its result waiter.
+            drop(result_waiter);
             Ok(ToolResult::success(
                 serde_json::json!({"status":"accepted","run_id":run_id}).to_string(),
             ))

@@ -8,10 +8,9 @@
 //! Concurrency-safety (spec §5.6, verified against current code):
 //! - `RunPayload` is fully owned + `Arc`'d ⇒ `Send + 'static`, so it can be
 //!   `move`d into `tokio::spawn` for background runs (no borrowed refs).
-//! - `AgentPool::acquire` returns an **owned** `AgentHandle` (not a guard);
-//!   the pool's write-lock is held only during `create_agent` and released
-//!   before the ReAct loop runs, so no pool lock spans model/tool execution. No
-//!   deadlock. (Current `agent_pool.rs:264` already does this; preserved.)
+//! - `AgentPool::acquire` returns an application execution receipt. The pool's
+//!   map lock is released before the ReAct loop, while the receipt pins the
+//!   workspace generation until the run reaches a terminal state.
 //! - Background runs MUST use an independent `CancellationToken` (spec §5.5),
 //!   never the chat turn's token — the caller (`create_complex_task`) supplies
 //!   it via `RunPayload.cancel`.
@@ -53,6 +52,17 @@ pub struct RunPayload {
     pub prompt: String,
     /// Whether this Run must materialize a formal plan before completion.
     pub plan_policy: RunPlanPolicy,
+    pub(crate) receipt_owner: crate::tasks::task_runtime::store::RunDriverReceiptOwner,
+}
+
+struct RunExecutionPayload {
+    run_id: String,
+    store: Arc<TaskRuntimeStore>,
+    cancel: CancellationToken,
+    layer_manager: Option<Arc<MemoryLayerManager>>,
+    trace_sink: Option<ExecSink>,
+    prompt: String,
+    plan_policy: RunPlanPolicy,
 }
 
 /// Drive an already-created TaskRuntime run to completion on an isolated pool
@@ -60,25 +70,71 @@ pub struct RunPayload {
 /// plan through `task_create` + `task_execute`, or complete directly when the
 /// Run policy allows it.
 pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> {
-    let _cancel_registration = payload
-        .store
-        .register_run_cancellation(&payload.run_id, payload.cancel.clone())
-        .map_err(|error| format!("register run cancellation failed: {error}"))?;
-    // acquire returns an owned AgentHandle; the pool lock is released before
-    // the long-running ReAct loop begins.
-    let pool_agent = payload
-        .pool
-        .acquire(&payload.run_id)
-        .await
-        .map_err(|e| format!("pool acquire failed for run {}: {e}", payload.run_id))?;
+    let RunPayload {
+        run_id,
+        pool,
+        store,
+        cancel,
+        layer_manager,
+        trace_sink,
+        prompt,
+        plan_policy,
+        receipt_owner,
+    } = payload;
+    let settlement_store = store.clone();
+    let settlement_run_id = run_id.clone();
+    let settlement_cancel = cancel.clone();
+    let pool_lease = match pool.acquire(&run_id).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            let message = format!("pool acquire failed for run {run_id}: {error}");
+            settle_driver_error(&store, &run_id, &message, cancel.is_cancelled())?;
+            return Err(message);
+        }
+    };
+    let pool_agent = pool_lease.agent();
+    receipt_owner.retain(pool.retain_for_supervised_run(run_id.clone(), pool_lease));
     let execute_plan =
-        crate::tasks::task_runtime::ExecuteTaskTool::new(payload.store.clone(), pool_agent.clone());
+        crate::tasks::task_runtime::ExecuteTaskTool::new(store.clone(), pool_agent.clone());
     pool_agent
         .write(|agent| {
             agent.add_tool(Box::new(execute_plan));
         })
         .await;
+    let result = drive_run_async_inner(
+        RunExecutionPayload {
+            run_id,
+            store,
+            cancel,
+            layer_manager,
+            trace_sink,
+            prompt,
+            plan_policy,
+        },
+        pool_agent,
+    )
+    .await;
+    if let Err(error) = &result {
+        settle_driver_error(
+            &settlement_store,
+            &settlement_run_id,
+            error,
+            settlement_cancel.is_cancelled(),
+        )?;
+    }
+    // The TaskRuntime supervisor releases the pool receipt only after its own
+    // durable terminal readback (or after settlement debt retry succeeds).
+    result
+}
 
+async fn drive_run_async_inner(
+    payload: RunExecutionPayload,
+    pool_agent: crate::agent_handle::AgentHandle,
+) -> Result<RunOutcome, String> {
+    let _cancel_registration = payload
+        .store
+        .register_run_cancellation(&payload.run_id, payload.cancel.clone())
+        .map_err(|error| format!("register run cancellation failed: {error}"))?;
     let drive_result = drive_agent_run(
         payload.store.clone(),
         pool_agent,
@@ -92,12 +148,6 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         payload.trace_sink.clone(),
     )
     .await;
-    // Phase C: release the per-run pool entry so it doesn't linger until the
-    // 5-min idle evictor reaps it (a pre-existing minor leak this driver had
-    // since B2). `acquire(run_id)` always creates a fresh entry (run_id is a
-    // fresh UUID per run, never reused), so release here is the defensive
-    // choice — matches the cron path. No-op semantics if already evicted.
-    payload.pool.release(&payload.run_id).await;
     drive_result.map_err(|error| {
         format!(
             "agent-driven run failed for run {}: {error}",
@@ -151,6 +201,23 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         .await;
     }
     Ok(outcome)
+}
+
+fn settle_driver_error(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+    error: &str,
+    cancelled: bool,
+) -> Result<(), String> {
+    let target = if cancelled {
+        TaskRunStatus::Cancelled
+    } else {
+        TaskRunStatus::Failed
+    };
+    store
+        .finalize_run(run_id, target, Some(error))
+        .map(|_| ())
+        .map_err(|settlement_error| settlement_error.to_string())
 }
 
 #[cfg(test)]

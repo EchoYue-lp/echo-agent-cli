@@ -111,6 +111,7 @@ pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
             display_name: display_name_from_model(&config.model.name),
             provider: config.model.provider.clone(),
             model: config.model.name.clone(),
+            api_protocol: config.model.api_protocol,
             enabled: true,
             max_tokens: config.model.max_tokens,
             temperature: config.model.temperature,

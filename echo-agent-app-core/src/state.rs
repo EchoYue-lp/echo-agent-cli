@@ -369,19 +369,19 @@ impl ConnectionState {
     /// Get the agent for a given conversation ID.
     ///
     /// If a pool is active, acquires (or reuses) a pool agent for the ID.
-    /// Falls back to the primary `agent` if pool is disabled or acquire fails.
-    pub async fn agent_for(&self, conversation_id: &str) -> AgentHandle {
+    /// Pool admission failures are observable; in particular, a workspace
+    /// transition must not silently fall back to the old primary generation.
+    pub async fn agent_for(
+        &self,
+        conversation_id: &str,
+    ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
+    {
         if let Some(ref pool) = self.pool {
-            pool.acquire(conversation_id).await.unwrap_or_else(|e| {
-                tracing::warn!(
-                    conv_id = %conversation_id,
-                    error = %e,
-                    "AgentPool::acquire failed, falling back to primary agent"
-                );
-                self.agent.clone()
-            })
+            pool.acquire(conversation_id).await
         } else {
-            self.agent.clone()
+            Ok(crate::agent_pool::AgentPoolExecutionLease::unpooled(
+                self.agent.clone(),
+            ))
         }
     }
 
@@ -485,6 +485,64 @@ pub struct ObservabilityState {
 }
 
 /// 工作区状态
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "WorkspaceTransitionStatus")]
+pub enum WorkspaceTransitionStatus {
+    Committed,
+    Degraded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, rename = "WorkspaceSubsystemTransition")]
+pub struct WorkspaceSubsystemTransition {
+    pub subsystem: String,
+    pub target_root: std::path::PathBuf,
+    #[serde(default)]
+    pub stale_roots: Vec<std::path::PathBuf>,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, rename = "WorkspaceTransitionReceipt")]
+pub struct WorkspaceTransitionReceipt {
+    pub status: WorkspaceTransitionStatus,
+    pub previous_workspace_id: Option<String>,
+    pub target_workspace_id: Option<String>,
+    pub target_root: std::path::PathBuf,
+    pub degraded_subsystems: Vec<WorkspaceSubsystemTransition>,
+}
+
+impl WorkspaceTransitionReceipt {
+    fn committed(
+        previous_workspace_id: Option<String>,
+        target_workspace_id: Option<String>,
+        target_root: std::path::PathBuf,
+        degraded_subsystems: Vec<WorkspaceSubsystemTransition>,
+    ) -> Self {
+        let status = if degraded_subsystems.is_empty() {
+            WorkspaceTransitionStatus::Committed
+        } else {
+            WorkspaceTransitionStatus::Degraded
+        };
+        Self {
+            status,
+            previous_workspace_id,
+            target_workspace_id,
+            target_root,
+            degraded_subsystems,
+        }
+    }
+}
+
+enum WorkspaceTransitionRequest {
+    Switch(Workspace),
+    Exit,
+}
+
+type WorkspaceSettlementHandle =
+    tokio::task::JoinHandle<anyhow::Result<WorkspaceTransitionReceipt>>;
+
 pub struct WorkspaceState {
     /// 当前活跃工作区（None 表示使用全局默认路径）。
     pub current: RwLock<Option<Workspace>>,
@@ -495,6 +553,12 @@ pub struct WorkspaceState {
     /// Serializes generation changes so two UI or automation requests cannot
     /// interleave primary/pool/store rebinding.
     pub transition: Mutex<()>,
+    /// Owned non-abortable settlement after a transition request is accepted.
+    /// Dropping an IPC/CLI waiter detaches only that waiter; the application
+    /// retains this handle until publication or shutdown has awaited it.
+    settlement: Mutex<Option<WorkspaceSettlementHandle>>,
+    /// Last committed transition, including degraded subsystem settlement.
+    pub last_transition: RwLock<Option<WorkspaceTransitionReceipt>>,
 }
 
 /// 全局应用状态
@@ -531,6 +595,8 @@ pub struct AppState {
     /// completes the primary agent; populated via
     /// [`Self::with_plugin_runtime`].
     pub plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
+    /// Sole acknowledged hook/config watcher lifecycle handle.
+    pub config_watcher: Option<Arc<crate::config_watcher::ConfigWatcherHandle>>,
 }
 
 impl AppState {
@@ -641,12 +707,18 @@ impl AppState {
                     store.ok().map(|store| {
                         // P1-8: proactively recover runs interrupted by a previous
                         // process crash into resumable Paused runs.
-                        let recovered = store.recover_incomplete();
-                        if recovered > 0 {
-                            tracing::info!(
-                                count = recovered,
-                                "Recovered interrupted task-runtime runs at boot"
-                            );
+                        match store.recover_incomplete() {
+                            Ok(recovered) if recovered > 0 => {
+                                tracing::info!(
+                                    count = recovered,
+                                    "Recovered interrupted task-runtime runs at boot"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => tracing::warn!(
+                                %error,
+                                "Failed to recover interrupted task-runtime runs at boot"
+                            ),
                         }
                         Arc::new(store)
                     })
@@ -662,6 +734,8 @@ impl AppState {
             workspace: WorkspaceState {
                 current: RwLock::new(None),
                 transition: Mutex::new(()),
+                settlement: Mutex::new(None),
+                last_transition: RwLock::new(None),
                 global_cwd: std::env::current_dir()
                     .unwrap_or_else(|_| std::path::PathBuf::from(".")),
                 registry: Arc::new(WorkspaceRegistry::new().unwrap_or_else(|e| {
@@ -682,6 +756,7 @@ impl AppState {
             skills_hub: Arc::new(RwLock::new(crate::skills_hub::SkillsHub::new())),
             review_integration: None,
             plugin_runtime: None,
+            config_watcher: None,
         }
     }
 
@@ -727,6 +802,24 @@ impl AppState {
         plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
     ) -> Self {
         self.plugin_runtime = plugin_runtime;
+        self
+    }
+
+    pub fn with_config_watcher(
+        mut self,
+        config_watcher: Option<Arc<crate::config_watcher::ConfigWatcherHandle>>,
+    ) -> Self {
+        self.config_watcher = config_watcher;
+        self
+    }
+
+    /// Share one foreground admission authority across concurrently active
+    /// headless surfaces such as CLI and channels.
+    pub fn with_foreground_turns(
+        mut self,
+        foreground_turns: crate::foreground_turn::ForegroundTurnControl,
+    ) -> Self {
+        self.session.foreground_turns = foreground_turns;
         self
     }
 
@@ -788,6 +881,20 @@ impl AppState {
     /// starting another scheduler.
     pub async fn shutdown_scheduler(&self) -> echo_agent::error::Result<()> {
         self.scheduler.shutdown().await
+    }
+
+    /// Start the fallible scheduler before admitting background TaskRun
+    /// recovery, then start the pool monitor only after both owners exist.
+    pub async fn start_scheduler_and_task_service(
+        &mut self,
+        backend: Option<Arc<dyn echo_agent::memory::Store>>,
+    ) -> echo_agent::error::Result<()> {
+        self.start_scheduler_with_store(backend).await?;
+        self.start_task_service().await;
+        if let Some(pool) = self.connection.pool.as_ref() {
+            pool.spawn_cleanup_monitor().await;
+        }
+        Ok(())
     }
 
     /// 启动后台任务服务（所有模式都应调用）
@@ -957,13 +1064,91 @@ impl AppState {
     /// 切换到指定工作区。
     ///
     /// 这会重新初始化 persistence 和 session manager 以使用工作区路径。
-    pub async fn switch_workspace(&self, workspace: Workspace) -> anyhow::Result<()> {
-        let _transition = self.workspace.transition.lock().await;
-        if self.session.foreground_turns.has_active_turns() {
-            anyhow::bail!("Cannot switch workspace while a foreground chat turn is running");
+    pub async fn switch_workspace(
+        self: &Arc<Self>,
+        workspace: Workspace,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        self.run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(workspace))
+            .await
+    }
+
+    pub async fn exit_workspace(self: &Arc<Self>) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        self.run_owned_workspace_transition(WorkspaceTransitionRequest::Exit)
+            .await
+    }
+
+    async fn run_owned_workspace_transition(
+        self: &Arc<Self>,
+        request: WorkspaceTransitionRequest,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        let mut settlement = self.workspace.settlement.lock().await;
+        if let Some(previous) = settlement.as_mut() {
+            if let Err(error) = await_workspace_settlement(previous).await {
+                tracing::warn!(
+                    %error,
+                    "previous detached workspace transition settled with an error"
+                );
+            }
+            settlement.take();
         }
-        ensure_no_running_task_runs(self.tasks.runtime.as_deref())?;
+
+        let state = Arc::clone(self);
+        *settlement = Some(tokio::spawn(async move {
+            match request {
+                WorkspaceTransitionRequest::Switch(workspace) => {
+                    state.switch_workspace_inner(workspace).await
+                }
+                WorkspaceTransitionRequest::Exit => state.exit_workspace_inner().await,
+            }
+        }));
+        let result = match settlement.as_mut() {
+            Some(handle) => await_workspace_settlement(handle).await,
+            None => Err(anyhow::anyhow!(
+                "workspace settlement owner lost the accepted transition"
+            )),
+        };
+        settlement.take();
+        result
+    }
+
+    /// Await a detached workspace settlement before tearing down plugin,
+    /// scheduler, watcher, MCP, or browser owners.
+    pub async fn shutdown_workspace_transition(&self) -> anyhow::Result<()> {
+        let mut settlement = self.workspace.settlement.lock().await;
+        let result = match settlement.as_mut() {
+            Some(handle) => await_workspace_settlement(handle).await.map(|_| ()),
+            None => Ok(()),
+        };
+        settlement.take();
+        result
+    }
+
+    async fn switch_workspace_inner(
+        &self,
+        workspace: Workspace,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        let _transition = self.workspace.transition.lock().await;
+        let foreground_transition = self.session.foreground_turns.suspend_admission_if_idle()?;
+        let task_transition = match self.tasks.runtime.as_deref() {
+            Some(runtime) => Some(runtime.begin_workspace_transition().await?),
+            None => None,
+        };
+        ensure_no_running_task_runs(task_transition.as_ref())?;
+        let mut pool_transition = match self.connection.pool.as_ref() {
+            Some(pool) => Some(pool.preflight_workspace_transition().await?),
+            None => None,
+        };
         let root = validated_workspace_root(&workspace.root)?;
+        let previous_workspace = self.workspace.current.read().await.clone();
+        let previous_workspace_id = previous_workspace
+            .as_ref()
+            .map(|workspace| workspace.id.to_string());
+        if let Some(plugin_runtime) = self.plugin_runtime.as_ref() {
+            plugin_runtime.preflight_workspace(root.clone()).await?;
+        }
+        if let Some(config_watcher) = self.config_watcher.as_ref() {
+            config_watcher.preflight_workspace(&root)?;
+        }
         let state_dir = crate::workspace::layout::WorkspaceLayout::state_dir(&root);
         let sessions_dir = crate::workspace::layout::WorkspaceLayout::sessions(&root);
         let tasks_dir = crate::workspace::layout::WorkspaceLayout::tasks(&root);
@@ -979,9 +1164,6 @@ impl AppState {
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace runtime state store"))?;
         let memory_store = crate::infra::create_memory_store_for_workspace(&root)
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace memory store"))?;
-        if let Some(pool) = &self.connection.pool {
-            pool.reset_for_workspace_transition().await?;
-        }
         let mut workspace = workspace;
         workspace.root = root;
 
@@ -993,6 +1175,9 @@ impl AppState {
                 workspace.root.display()
             )
         })?;
+        if let Some(pool_transition) = pool_transition.as_mut() {
+            pool_transition.commit().await;
+        }
 
         // 更新 agent 的 working_dir 配置（影响 project rules 注入等）
         let new_wd = Some(workspace.root.clone());
@@ -1124,17 +1309,86 @@ impl AppState {
         // 根据工作区类型配置 Agent（自动激活 Skills 和注入系统提示词）
         self.apply_workspace_routing(&workspace).await;
 
-        if let Some(runtime) = self.tasks.runtime.as_deref() {
-            runtime.rebind_shadow_root(tasks_dir, workspace.id.to_string())?;
+        let mut degraded_subsystems = Vec::new();
+        if let Some(task_transition) = task_transition.as_ref()
+            && let Err(error) =
+                task_transition.rebind_shadow_root(tasks_dir.clone(), workspace.id.to_string())
+        {
+            let settled_root = task_transition.active_shadow_root();
+            degraded_subsystems.push(WorkspaceSubsystemTransition {
+                subsystem: "task_runtime".to_string(),
+                target_root: tasks_dir.clone(),
+                stale_roots: (settled_root != tasks_dir)
+                    .then_some(settled_root)
+                    .into_iter()
+                    .collect(),
+                error: error.to_string(),
+            });
+        }
+        if let Some(plugin_runtime) = self.plugin_runtime.as_ref()
+            && let Err(error) = plugin_runtime
+                .rebind_workspace(workspace.root.clone())
+                .await
+        {
+            let settled_root = plugin_runtime.workspace_root().await;
+            let mut stale_roots = plugin_runtime.cleanup_debt_roots().await;
+            if settled_root != workspace.root {
+                stale_roots.push(settled_root);
+            }
+            stale_roots.sort();
+            stale_roots.dedup();
+            degraded_subsystems.push(WorkspaceSubsystemTransition {
+                subsystem: "plugin_runtime".to_string(),
+                target_root: workspace.root.clone(),
+                stale_roots,
+                error: error.to_string(),
+            });
+        }
+        if let Some(config_watcher) = self.config_watcher.as_ref() {
+            match config_watcher
+                .rebind_workspace(workspace.root.clone())
+                .await
+            {
+                Ok(watcher_receipt) if !watcher_receipt.errors.is_empty() => {
+                    degraded_subsystems.push(WorkspaceSubsystemTransition {
+                        subsystem: "config_watcher".to_string(),
+                        target_root: watcher_receipt.settled_root,
+                        stale_roots: watcher_receipt.stale_watch_roots,
+                        error: watcher_receipt.errors.join("; "),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let settled_root = config_watcher.settled_root().await;
+                    degraded_subsystems.push(WorkspaceSubsystemTransition {
+                        subsystem: "config_watcher".to_string(),
+                        target_root: workspace.root.clone(),
+                        stale_roots: (settled_root != workspace.root)
+                            .then_some(settled_root)
+                            .into_iter()
+                            .collect(),
+                        error: error.to_string(),
+                    });
+                }
+            }
         }
 
         {
             let mut current = self.workspace.current.write().await;
             *current = Some(workspace.clone());
         }
-        crate::config_watcher::notify_config_watcher_workspace(workspace.root.clone());
+        let receipt = WorkspaceTransitionReceipt::committed(
+            previous_workspace_id,
+            Some(workspace.id.to_string()),
+            workspace.root.clone(),
+            degraded_subsystems,
+        );
+        *self.workspace.last_transition.write().await = Some(receipt.clone());
+        drop(pool_transition);
+        drop(task_transition);
+        drop(foreground_transition);
 
-        Ok(())
+        Ok(receipt)
     }
 
     /// 应用工作区路由配置（根据 WorkspaceKind 激活 Skills 和注入系统提示词）
@@ -1156,15 +1410,33 @@ impl AppState {
     }
 
     /// 退出工作区（回到全局默认路径）。
-    pub async fn exit_workspace(&self) -> anyhow::Result<()> {
+    async fn exit_workspace_inner(&self) -> anyhow::Result<WorkspaceTransitionReceipt> {
         let _transition = self.workspace.transition.lock().await;
-        if self.session.foreground_turns.has_active_turns() {
-            anyhow::bail!("Cannot exit workspace while a foreground chat turn is running");
-        }
-        ensure_no_running_task_runs(self.tasks.runtime.as_deref())?;
+        let foreground_transition = self.session.foreground_turns.suspend_admission_if_idle()?;
+        let task_transition = match self.tasks.runtime.as_deref() {
+            Some(runtime) => Some(runtime.begin_workspace_transition().await?),
+            None => None,
+        };
+        ensure_no_running_task_runs(task_transition.as_ref())?;
+        let mut pool_transition = match self.connection.pool.as_ref() {
+            Some(pool) => Some(pool.preflight_workspace_transition().await?),
+            None => None,
+        };
         let global_cwd = self.workspace.global_cwd.canonicalize().map_err(|error| {
             anyhow::anyhow!("Failed to resolve the global working directory: {error}")
         })?;
+        let previous_workspace = self.workspace.current.read().await.clone();
+        let previous_workspace_id = previous_workspace
+            .as_ref()
+            .map(|workspace| workspace.id.to_string());
+        if let Some(plugin_runtime) = self.plugin_runtime.as_ref() {
+            plugin_runtime
+                .preflight_workspace(global_cwd.clone())
+                .await?;
+        }
+        if let Some(config_watcher) = self.config_watcher.as_ref() {
+            config_watcher.preflight_workspace(&global_cwd)?;
+        }
         let conversation_store = crate::infra::create_conversation_store()
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global conversation store"))?;
         let runtime_store = crate::infra::create_runtime_state_store()
@@ -1174,12 +1446,12 @@ impl AppState {
         let global_tasks_dir =
             crate::tasks::task_runtime::file_shadow::FileTaskShadow::default_root();
         std::fs::create_dir_all(&global_tasks_dir)?;
-        if let Some(pool) = &self.connection.pool {
-            pool.reset_for_workspace_transition().await?;
-        }
         std::env::set_current_dir(&global_cwd).map_err(|error| {
             anyhow::anyhow!("Failed to restore process directory after workspace exit: {error}")
         })?;
+        if let Some(pool_transition) = pool_transition.as_mut() {
+            pool_transition.commit().await;
+        }
 
         // 重置 persistence 到全局默认路径
         let global_persistence = Persistence::new();
@@ -1310,18 +1582,82 @@ impl AppState {
                 .await;
         }
 
-        if let Some(runtime) = self.tasks.runtime.as_deref() {
-            runtime.rebind_shadow_root(global_tasks_dir, "global")?;
+        let mut degraded_subsystems = Vec::new();
+        if let Some(task_transition) = task_transition.as_ref()
+            && let Err(error) =
+                task_transition.rebind_shadow_root(global_tasks_dir.clone(), "global")
+        {
+            let settled_root = task_transition.active_shadow_root();
+            degraded_subsystems.push(WorkspaceSubsystemTransition {
+                subsystem: "task_runtime".to_string(),
+                target_root: global_tasks_dir.clone(),
+                stale_roots: (settled_root != global_tasks_dir)
+                    .then_some(settled_root)
+                    .into_iter()
+                    .collect(),
+                error: error.to_string(),
+            });
+        }
+        if let Some(plugin_runtime) = self.plugin_runtime.as_ref()
+            && let Err(error) = plugin_runtime.rebind_workspace(global_cwd.clone()).await
+        {
+            let settled_root = plugin_runtime.workspace_root().await;
+            let mut stale_roots = plugin_runtime.cleanup_debt_roots().await;
+            if settled_root != global_cwd {
+                stale_roots.push(settled_root);
+            }
+            stale_roots.sort();
+            stale_roots.dedup();
+            degraded_subsystems.push(WorkspaceSubsystemTransition {
+                subsystem: "plugin_runtime".to_string(),
+                target_root: global_cwd.clone(),
+                stale_roots,
+                error: error.to_string(),
+            });
+        }
+        if let Some(config_watcher) = self.config_watcher.as_ref() {
+            match config_watcher.rebind_workspace(global_cwd.clone()).await {
+                Ok(watcher_receipt) if !watcher_receipt.errors.is_empty() => {
+                    degraded_subsystems.push(WorkspaceSubsystemTransition {
+                        subsystem: "config_watcher".to_string(),
+                        target_root: watcher_receipt.settled_root,
+                        stale_roots: watcher_receipt.stale_watch_roots,
+                        error: watcher_receipt.errors.join("; "),
+                    });
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    let settled_root = config_watcher.settled_root().await;
+                    degraded_subsystems.push(WorkspaceSubsystemTransition {
+                        subsystem: "config_watcher".to_string(),
+                        target_root: global_cwd.clone(),
+                        stale_roots: (settled_root != global_cwd)
+                            .then_some(settled_root)
+                            .into_iter()
+                            .collect(),
+                        error: error.to_string(),
+                    });
+                }
+            }
         }
 
         {
             let mut current = self.workspace.current.write().await;
             *current = None;
         }
-        crate::config_watcher::notify_config_watcher_workspace(global_cwd);
+        let receipt = WorkspaceTransitionReceipt::committed(
+            previous_workspace_id,
+            None,
+            global_cwd,
+            degraded_subsystems,
+        );
+        *self.workspace.last_transition.write().await = Some(receipt.clone());
+        drop(pool_transition);
+        drop(task_transition);
+        drop(foreground_transition);
 
         tracing::info!("Exited workspace, using global default paths");
-        Ok(())
+        Ok(receipt)
     }
 
     /// 获取工作区感知的 sessions 目录。
@@ -1332,6 +1668,425 @@ impl AppState {
             Persistence::base_dir()
         }
     }
+}
+
+#[cfg(test)]
+mod workspace_transition_tests {
+    use super::*;
+    use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::testing::MockLlmClient;
+
+    static CWD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct RestoreCwd(std::path::PathBuf);
+
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn workspace(name: &str, root: std::path::PathBuf) -> Workspace {
+        Workspace {
+            id: crate::workspace::WorkspaceId::from_name(name),
+            name: name.to_string(),
+            root,
+            project_root: None,
+            kind: crate::workspace::WorkspaceKind::General,
+            metadata: crate::workspace::WorkspaceMetadata::default(),
+            created_at: Utc::now(),
+            last_active: Utc::now(),
+        }
+    }
+
+    fn write_hook(root: &std::path::Path, content: &str) -> std::result::Result<(), String> {
+        let directory = root.join(".eko");
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        std::fs::write(directory.join("hooks.yaml"), content).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn workspace_transition_receipt_serializes_generated_typescript_contract()
+    -> std::result::Result<(), String> {
+        let receipt = WorkspaceTransitionReceipt::committed(
+            Some("workspace-a".to_string()),
+            Some("workspace-b".to_string()),
+            std::path::PathBuf::from("/workspace-b"),
+            vec![WorkspaceSubsystemTransition {
+                subsystem: "config_watcher".to_string(),
+                target_root: std::path::PathBuf::from("/workspace-b"),
+                stale_roots: Vec::new(),
+                error: "watch settled with degraded cleanup".to_string(),
+            }],
+        );
+        let serialized = serde_json::to_value(receipt).map_err(|error| error.to_string())?;
+
+        assert_eq!(
+            serialized.get("status").and_then(serde_json::Value::as_str),
+            Some("degraded")
+        );
+        assert_eq!(
+            serialized
+                .get("target_root")
+                .and_then(serde_json::Value::as_str),
+            Some("/workspace-b")
+        );
+        assert_eq!(
+            serialized
+                .pointer("/degraded_subsystems/0/stale_roots")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn post_boundary_abort_settles_owned_transition_and_preserves_preboundary_atomicity()
+    -> std::result::Result<(), String> {
+        const CHILD_PROCESS: &str = "EKO_WORKSPACE_TRANSITION_CWD_TEST";
+        if std::env::var_os(CHILD_PROCESS).is_none() {
+            let output = std::process::Command::new(
+                std::env::current_exe().map_err(|error| error.to_string())?,
+            )
+            .arg("post_boundary_abort_settles_owned_transition_and_preserves_preboundary_atomicity")
+            .arg("--test-threads=1")
+            .env(CHILD_PROCESS, "1")
+            .output()
+            .map_err(|error| error.to_string())?;
+            if output.status.success() {
+                return Ok(());
+            }
+            return Err(format!(
+                "isolated workspace transition test failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let _serial = CWD_TEST_LOCK.lock().await;
+        let original_cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+        let _restore = RestoreCwd(original_cwd.clone());
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
+        let canonical_root_a = root_a.canonicalize().map_err(|error| error.to_string())?;
+        let canonical_root_b = root_b.canonicalize().map_err(|error| error.to_string())?;
+        write_hook(&root_a, "{}\n")?;
+        write_hook(&root_b, "SessionStart: [not-a-hook-rule]\n")?;
+
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("workspace transition test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let agent = AgentHandle::new(agent);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let watcher = Arc::new(crate::config_watcher::spawn_config_watcher(
+            None,
+            agent.clone(),
+            None,
+            cancel,
+        ));
+        let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let plugin_runtime = crate::plugin_runtime::PluginRuntimeService::new_for_test(
+            agent.clone(),
+            original_cwd.clone(),
+            temp.path().join("plugin-registry.json"),
+            temp.path().join("plugin-data"),
+        )
+        .await;
+        let mut state = AppState::from_shared(
+            agent,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            Default::default(),
+            mcp_runtime,
+        )
+        .with_config_watcher(Some(watcher.clone()))
+        .with_plugin_runtime(Some(plugin_runtime.clone()));
+        let initial_shadow = temp.path().join("initial-tasks");
+        state.tasks.runtime = Some(Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(
+                &initial_shadow,
+            )
+            .map_err(|error| error.to_string())?,
+        ));
+        let state = Arc::new(state);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.switch_workspace(workspace("a", root_a.clone())),
+        )
+        .await
+        .map_err(|_| "initial workspace transition timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        let before_boundary = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.switch_workspace(workspace("b", root_b.clone())),
+        )
+        .await
+        .map_err(|_| "pre-boundary workspace transition timed out".to_string())?;
+        assert!(before_boundary.is_err());
+        assert_eq!(std::env::current_dir().ok(), Some(canonical_root_a.clone()));
+        assert_eq!(
+            state.current_workspace().await.map(|current| current.root),
+            Some(canonical_root_a.clone())
+        );
+        assert_eq!(
+            state
+                .tasks
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.active_shadow_root()),
+            Some(crate::workspace::layout::WorkspaceLayout::tasks(
+                &canonical_root_a
+            ))
+        );
+        assert_eq!(watcher.settled_root().await, canonical_root_a.clone());
+        assert_eq!(
+            plugin_runtime.workspace_root().await,
+            canonical_root_a.clone()
+        );
+        let reopened = state
+            .session
+            .foreground_turns
+            .begin(
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                "after-preboundary",
+                "turn",
+            )
+            .map_err(|error| error.to_string())?;
+        reopened.settle(crate::chat_driver::TurnOutcome::Completed);
+        let task_runtime = state
+            .tasks
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "missing task runtime".to_string())?;
+        task_runtime
+            .create_run_for_active_workspace(
+                "after-preboundary",
+                "conversation-a",
+                "message-a",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "pre-boundary admission reopened",
+                "task",
+                crate::tasks::task_runtime::AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(
+            crate::workspace::layout::WorkspaceLayout::tasks(&root_a)
+                .join("after-preboundary/events.jsonl")
+                .is_file()
+        );
+
+        write_hook(&root_b, "{}\n")?;
+        watcher
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        let persistence_write = state.storage.persistence.write().await;
+        let detached_state = Arc::clone(&state);
+        let detached_root = root_b.clone();
+        let caller = tokio::spawn(async move {
+            detached_state
+                .switch_workspace(workspace("b", detached_root))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if std::env::current_dir().ok().as_ref() == Some(&canonical_root_b) {
+                    return Ok(());
+                }
+                if caller.is_finished() {
+                    return Err(
+                        "transition finished before the post-boundary abort point".to_string()
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "workspace transition did not reach its commit boundary".to_string())??;
+        caller.abort();
+        let caller_result = caller.await;
+        assert!(caller_result.is_err_and(|error| error.is_cancelled()));
+        drop(persistence_write);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.shutdown_workspace_transition(),
+        )
+        .await
+        .map_err(|_| "detached workspace settlement timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        let committed = state
+            .workspace
+            .last_transition
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| "detached transition did not publish a receipt".to_string())?;
+        assert_eq!(committed.status, WorkspaceTransitionStatus::Degraded);
+        assert_eq!(std::env::current_dir().ok(), Some(canonical_root_b.clone()));
+        assert_eq!(
+            state.current_workspace().await.map(|current| current.root),
+            Some(canonical_root_b.clone())
+        );
+        assert_eq!(
+            state
+                .tasks
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.active_shadow_root()),
+            Some(crate::workspace::layout::WorkspaceLayout::tasks(
+                &canonical_root_b
+            ))
+        );
+        assert_eq!(
+            plugin_runtime.workspace_root().await,
+            canonical_root_b.clone()
+        );
+        let watcher_failure = committed
+            .degraded_subsystems
+            .iter()
+            .find(|subsystem| subsystem.subsystem == "config_watcher")
+            .ok_or_else(|| "missing config watcher degradation".to_string())?;
+        assert_eq!(watcher_failure.target_root, canonical_root_b);
+        assert_eq!(watcher_failure.stale_roots, vec![canonical_root_a.clone()]);
+
+        let exited =
+            tokio::time::timeout(std::time::Duration::from_secs(5), state.exit_workspace())
+                .await
+                .map_err(|_| "workspace exit settlement timed out".to_string())?
+                .map_err(|error| error.to_string())?;
+        assert_eq!(exited.status, WorkspaceTransitionStatus::Degraded);
+        assert_eq!(std::env::current_dir().ok(), Some(original_cwd.clone()));
+        assert!(state.current_workspace().await.is_none());
+        assert_eq!(plugin_runtime.workspace_root().await, original_cwd.clone());
+        let exit_watcher_failure = exited
+            .degraded_subsystems
+            .iter()
+            .find(|subsystem| subsystem.subsystem == "config_watcher")
+            .ok_or_else(|| "missing exit config watcher degradation".to_string())?;
+        assert_eq!(exit_watcher_failure.target_root, original_cwd);
+        assert_eq!(exit_watcher_failure.stale_roots, vec![canonical_root_a]);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod service_bootstrap_tests {
+    use super::*;
+    use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::memory::{Store, StoreItem};
+    use echo_agent::testing::MockLlmClient;
+    use futures::future::BoxFuture;
+
+    struct SchedulerInitFailureStore;
+
+    fn scheduler_store_failure<T>() -> echo_agent::error::Result<T> {
+        Err(echo_agent::error::ReactError::Other(
+            "injected scheduler store failure".to_string(),
+        ))
+    }
+
+    impl Store for SchedulerInitFailureStore {
+        fn put<'a>(
+            &'a self,
+            _namespace: &'a [&'a str],
+            _key: &'a str,
+            _value: serde_json::Value,
+        ) -> BoxFuture<'a, echo_agent::error::Result<()>> {
+            Box::pin(async { scheduler_store_failure() })
+        }
+
+        fn get<'a>(
+            &'a self,
+            _namespace: &'a [&'a str],
+            _key: &'a str,
+        ) -> BoxFuture<'a, echo_agent::error::Result<Option<StoreItem>>> {
+            Box::pin(async { scheduler_store_failure() })
+        }
+
+        fn search<'a>(
+            &'a self,
+            _namespace: &'a [&'a str],
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, echo_agent::error::Result<Vec<StoreItem>>> {
+            Box::pin(async { scheduler_store_failure() })
+        }
+
+        fn delete<'a>(
+            &'a self,
+            _namespace: &'a [&'a str],
+            _key: &'a str,
+        ) -> BoxFuture<'a, echo_agent::error::Result<bool>> {
+            Box::pin(async { scheduler_store_failure() })
+        }
+
+        fn list_namespaces<'a>(
+            &'a self,
+            _prefix: Option<&'a [&'a str]>,
+        ) -> BoxFuture<'a, echo_agent::error::Result<Vec<Vec<String>>>> {
+            Box::pin(async { scheduler_store_failure() })
+        }
+
+        fn list<'a>(
+            &'a self,
+            _namespace: &'a [&'a str],
+        ) -> BoxFuture<'a, echo_agent::error::Result<Vec<StoreItem>>> {
+            Box::pin(async { scheduler_store_failure() })
+        }
+    }
+
+    #[tokio::test]
+    async fn scheduler_init_failure_does_not_start_task_service_or_run_driver()
+    -> std::result::Result<(), String> {
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("service bootstrap test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            std::env::temp_dir().join(format!("eko-mcp-{}.json", uuid::Uuid::new_v4())),
+            Default::default(),
+        ));
+        let mut state = AppState::from_shared(
+            AgentHandle::new(agent),
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            Default::default(),
+            mcp_runtime,
+        );
+        let runtime_store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        state.tasks.runtime = Some(runtime_store.clone());
+
+        let result = state
+            .start_scheduler_and_task_service(Some(Arc::new(SchedulerInitFailureStore)))
+            .await;
+
+        assert!(result.is_err());
+        assert!(state.scheduler.runner.is_none());
+        assert!(state.tasks.service.is_none());
+        assert_eq!(runtime_store.active_run_driver_count()?, 0);
+        Ok(())
+    }
+}
+
+async fn await_workspace_settlement(
+    handle: &mut WorkspaceSettlementHandle,
+) -> anyhow::Result<WorkspaceTransitionReceipt> {
+    handle
+        .await
+        .map_err(|error| anyhow::anyhow!("workspace settlement task failed: {error}"))?
 }
 
 fn validated_workspace_root(root: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
@@ -1348,12 +2103,12 @@ fn validated_workspace_root(root: &std::path::Path) -> anyhow::Result<std::path:
 }
 
 fn ensure_no_running_task_runs(
-    runtime: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    transition: Option<&crate::tasks::task_runtime::store::TaskRuntimeWorkspaceTransition<'_>>,
 ) -> anyhow::Result<()> {
-    let Some(runtime) = runtime else {
+    let Some(transition) = transition else {
         return Ok(());
     };
-    let running = runtime
+    let running = transition
         .list_runs_in(&[crate::tasks::task_runtime::TaskRunStatus::Running])
         .map_err(|error| anyhow::anyhow!("Failed to inspect active task runs: {error}"))?;
     if running.is_empty() {
@@ -1446,8 +2201,8 @@ mod permission_rule_tests {
         Ok(())
     }
 
-    #[test]
-    fn workspace_preflight_rejects_running_task_runs() -> std::result::Result<(), String> {
+    #[tokio::test]
+    async fn workspace_preflight_rejects_running_task_runs() -> std::result::Result<(), String> {
         use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
         let runtime = crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
@@ -1464,12 +2219,22 @@ mod permission_rule_tests {
                 AttendedMode::Attended,
             )
             .map_err(|error| error.to_string())?;
-        assert!(ensure_no_running_task_runs(Some(&runtime)).is_ok());
+        {
+            let transition = runtime
+                .begin_workspace_transition()
+                .await
+                .map_err(|error| error.to_string())?;
+            assert!(ensure_no_running_task_runs(Some(&transition)).is_ok());
+        }
 
         runtime
             .transition_run("workspace-transition-run", TaskRunStatus::Running)
             .map_err(|error| error.to_string())?;
-        let error = match ensure_no_running_task_runs(Some(&runtime)) {
+        let transition = runtime
+            .begin_workspace_transition()
+            .await
+            .map_err(|error| error.to_string())?;
+        let error = match ensure_no_running_task_runs(Some(&transition)) {
             Ok(()) => return Err("a running TaskRun did not block workspace change".to_string()),
             Err(error) => error,
         };

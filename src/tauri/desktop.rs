@@ -178,12 +178,12 @@ async fn run_desktop() -> anyhow::Result<()> {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let config_path = config_watcher::resolve_config_path(args.config.as_deref());
     let config_save_path = config_watcher::resolve_config_save_path(args.config.as_deref());
-    config_watcher::spawn_config_watcher(
+    let config_watcher = Arc::new(config_watcher::spawn_config_watcher(
         config_path,
         agent_handle.clone(),
         Some(webhook_emitter.clone()),
         cancel_token.clone(),
-    );
+    ));
 
     // Cron definitions are independent of TaskRun lifecycle state.
     let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
@@ -209,7 +209,8 @@ async fn run_desktop() -> anyhow::Result<()> {
     .with_config_path(config_save_path)
     .with_review_integration(runtime.review_integration.clone())
     .with_prompt_assembly(runtime.prompt_assembly.clone())
-    .with_plugin_runtime(Some(runtime.plugin_runtime.clone()));
+    .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
+    .with_config_watcher(Some(config_watcher.clone()));
     state_inner.webhook.emitter = webhook_emitter;
 
     // Build task tools before the pool extracts the shared ToolManager, and
@@ -223,7 +224,6 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
 
     // ── Initialize agent pool for multi-conversation parallel execution ──
-    // init_pool() also starts the cleanup monitor automatically.
     let pool = runtime
         .init_pool(
             echo_agent_app_core::agent_pool::PoolConfig::default(),
@@ -240,15 +240,28 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
     tracing::info!(
         pool_size = pool.pool_size().await,
-        "AgentPool initialized for GUI (cleanup monitor started)"
+        "AgentPool initialized for GUI"
     );
 
     state_inner.set_pool(pool);
 
-    state_inner.start_task_service().await;
-    state_inner
-        .start_scheduler_with_store(Some(scheduler_store))
-        .await?;
+    let service_result = state_inner
+        .start_scheduler_and_task_service(Some(scheduler_store))
+        .await;
+    if let Err(error) = service_result {
+        let error = infra::settle_service_bootstrap_failure(
+            anyhow::anyhow!(error),
+            state_inner.tasks.runtime.as_ref(),
+            state_inner.connection.pool.as_ref(),
+            &runtime.plugin_runtime,
+            &config_watcher,
+            &runtime.mcp_config_runtime,
+            &runtime.browser_runtime,
+        )
+        .await;
+        cancel_token.cancel();
+        return Err(error);
+    }
     if let Some(scheduler) = state_inner.scheduler.runner.as_ref()
         && let Err(error) = runtime
             .plugin_runtime
@@ -284,18 +297,40 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
-    runtime.mcp_config_runtime.shutdown().await;
     bridge_supervisor.shutdown().await;
     terminal_manager.close_all().await;
+    if let Err(error) = state.session.foreground_turns.shutdown().await {
+        tracing::warn!(%error, "failed to settle GUI foreground turns");
+    }
+    if let Err(error) = state.shutdown_workspace_transition().await {
+        tracing::warn!(%error, "failed to settle GUI workspace transition");
+    }
     if let Err(error) = state.shutdown_scheduler().await {
         tracing::warn!(%error, "failed to shut down GUI scheduler");
     }
+    if let Some(store) = state.tasks.runtime.as_ref()
+        && let Err(error) = store.shutdown_run_drivers().await
+    {
+        tracing::warn!(%error, "failed to settle GUI TaskRun drivers");
+    }
+    if let Some(pool) = state.connection.pool.as_ref()
+        && let Err(error) = pool.shutdown().await
+    {
+        tracing::warn!(%error, "failed to shut down GUI agent pool");
+    }
+    if let Err(error) = runtime.plugin_runtime.shutdown().await {
+        tracing::warn!(%error, "failed to shut down GUI plugin runtime");
+    }
+    if let Err(error) = config_watcher.shutdown().await {
+        tracing::warn!(%error, "failed to shut down GUI config watcher");
+    }
+    runtime.mcp_config_runtime.shutdown().await;
+    runtime.browser_runtime.shutdown().await;
     if let Some(store) = state.tasks.runtime.as_ref()
         && let Err(error) = store.shutdown_hook_events().await
     {
         tracing::warn!(%error, "failed to shut down task hook dispatcher");
     }
-    runtime.browser_runtime.shutdown().await;
     tauri_result.map_err(|e| anyhow::anyhow!("error while running Tauri application: {e}"))?;
 
     Ok(())

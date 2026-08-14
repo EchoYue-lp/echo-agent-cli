@@ -1,5 +1,10 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
-import type { RuntimeEventKind, StreamingEvent, ToolInfo } from '../generated';
+import type {
+  RuntimeEventKind,
+  StreamingEvent,
+  ToolInfo,
+  WorkspaceTransitionReceipt,
+} from '../generated';
 import type { TauriMcpServerInfo, TauriSkillInfo } from './api';
 
 const serializedToolInfo = {
@@ -48,6 +53,21 @@ const runtimeEventVariants = [
   'run_cancelled',
 ] satisfies RuntimeEventKind[];
 
+const serializedWorkspaceTransition = {
+  status: 'degraded',
+  previous_workspace_id: 'workspace-a',
+  target_workspace_id: 'workspace-b',
+  target_root: '/workspace-b',
+  degraded_subsystems: [
+    {
+      subsystem: 'config_watcher',
+      target_root: '/workspace-b',
+      stale_roots: [],
+      error: 'watch settled with degraded cleanup',
+    },
+  ],
+} satisfies WorkspaceTransitionReceipt;
+
 describe('Rust serialization contracts', () => {
   it('consumes the generated ToolInfo wire fields', () => {
     expect(serializedToolInfo.parameters).toHaveProperty('properties.path');
@@ -69,5 +89,11 @@ describe('Rust serialization contracts', () => {
       'done',
     ]);
     expect(runtimeEventVariants).toContain('artifact_produced');
+  });
+
+  it('consumes the generated workspace transition receipt', () => {
+    expect(serializedWorkspaceTransition.status).toBe('degraded');
+    expect(serializedWorkspaceTransition.degraded_subsystems[0]?.stale_roots).toEqual([]);
+    expectTypeOf(serializedWorkspaceTransition).toMatchTypeOf<WorkspaceTransitionReceipt>();
   });
 });

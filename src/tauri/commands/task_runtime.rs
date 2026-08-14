@@ -223,12 +223,6 @@ pub async fn resume_task_run(
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
-    if store.get_plan(&run_id).map_err(internal)?.is_none() {
-        return Err(IpcError::Validation(format!(
-            "run {run_id} has no persisted plan to resume"
-        )));
-    }
-
     let primary_agent = state.app_state.connection.primary_agent();
     let store_for_task = store.clone();
     let primary_agent_for_task = primary_agent.clone();
@@ -242,11 +236,7 @@ pub async fn resume_task_run(
         .as_ref()
         .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
     let cancel = echo_agent::agent::CancellationToken::new();
-    let cancel_registration = store
-        .register_run_cancellation(&run_id, cancel.clone())
-        .map_err(internal)?;
-    store.resume_task_run(&run_id).map_err(internal)?;
-    tracing::info!(run_id = %run_id, "task run resumed -> Running");
+    let supervisor_cancel = cancel.clone();
     let execution_projector = Arc::new(TauriExecutionProjector::new(
         app,
         state.app_state.storage.tool_executions.clone(),
@@ -257,8 +247,10 @@ pub async fn resume_task_run(
     });
     let run_id_for_task = run_id.clone();
 
-    tokio::spawn(async move {
-        let _cancel_registration = cancel_registration;
+    let driver = async move {
+        let _cancel_registration = store_for_task
+            .register_run_cancellation(&run_id_for_task, cancel.clone())
+            .map_err(|error| format!("register run cancellation: {error}"))?;
         let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
             store_for_task.clone(),
             Some(primary_agent_for_task),
@@ -281,9 +273,27 @@ pub async fn resume_task_run(
             }
             Err(e) => {
                 tracing::error!(run_id = %run_id_for_task, error = %e, "resumed run executor error");
+                return Err(e.to_string());
             }
         }
-    });
+        Ok(())
+    };
+    let preparation_store = store.clone();
+    let preparation_run_id = run_id.clone();
+    store
+        .spawn_supervised_run_driver(run_id.clone(), supervisor_cancel, move || {
+            if preparation_store.get_plan(&preparation_run_id)?.is_none() {
+                return Err(
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "run {preparation_run_id} has no persisted plan to resume"
+                    )),
+                );
+            }
+            preparation_store.resume_task_run(&preparation_run_id)?;
+            Ok(((), driver))
+        })
+        .map_err(internal)?;
+    tracing::info!(run_id = %run_id, "task run resumed -> Running");
 
     Ok(serde_json::json!({
         "kind": "resumed",
@@ -310,20 +320,6 @@ pub async fn retry_blocked_task(
     task_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
-    // Single atomic per-run transaction: validate run is Paused/Failed,
-    // task is Blocked/Failed, retry_count < max_retries, then bump
-    // retry_count, set Pending, and transition run to Running — all under
-    // one lock so concurrent retry requests serialize.
-    let next_retry = store
-        .retry_blocked_task(&run_id, &task_id)
-        .map_err(|e| match e {
-            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(msg) => {
-                IpcError::Validation(msg)
-            }
-            other => internal(other),
-        })?;
-    tracing::info!(run_id = %run_id, task_id = %task_id, attempt = next_retry, "blocked task retried atomically -> run Running");
-
     // Resume the run via the standard execute_run path (mirrors resume_task_run).
     let primary_agent = state.app_state.connection.primary_agent();
     let store_for_task = store.clone();
@@ -336,16 +332,7 @@ pub async fn retry_blocked_task(
         .as_ref()
         .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
     let cancel = echo_agent::agent::CancellationToken::new();
-    let cancel_registration = match store.register_run_cancellation(&run_id, cancel.clone()) {
-        Ok(registration) => registration,
-        Err(error) => {
-            let _ = store.transition_run(
-                &run_id,
-                echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused,
-            );
-            return Err(internal(error));
-        }
-    };
+    let supervisor_cancel = cancel.clone();
     // Run was already transitioned to Running inside retry_blocked_task's
     // atomic section. Skip resume_task_run here — it would re-attempt the
     // Paused → Running transition and fail with IllegalTransition.
@@ -359,8 +346,10 @@ pub async fn retry_blocked_task(
     });
     let run_id_for_task = run_id.clone();
 
-    tokio::spawn(async move {
-        let _cancel_registration = cancel_registration;
+    let driver = async move {
+        let _cancel_registration = store_for_task
+            .register_run_cancellation(&run_id_for_task, cancel.clone())
+            .map_err(|error| format!("register run cancellation: {error}"))?;
         let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
             store_for_task.clone(),
             Some(primary_agent_for_task),
@@ -382,9 +371,29 @@ pub async fn retry_blocked_task(
             }
             Err(e) => {
                 tracing::error!(run_id = %run_id_for_task, error = %e, "retried run executor error");
+                return Err(e.to_string());
             }
         }
-    });
+        Ok(())
+    };
+    let preparation_store = store.clone();
+    let preparation_run_id = run_id.clone();
+    let preparation_task_id = task_id.clone();
+    let (next_retry, _) = store
+        .spawn_supervised_run_driver(run_id.clone(), supervisor_cancel, move || {
+            // Single atomic per-run transaction: validate run/task and
+            // transition to Running while generation admission is held.
+            let next_retry =
+                preparation_store.retry_blocked_task(&preparation_run_id, &preparation_task_id)?;
+            Ok((next_retry, driver))
+        })
+        .map_err(|error| match error {
+            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(message) => {
+                IpcError::Validation(message)
+            }
+            other => internal(other),
+        })?;
+    tracing::info!(run_id = %run_id, task_id = %task_id, attempt = next_retry, "blocked task retried atomically -> run Running");
 
     Ok(serde_json::json!({
         "kind": "retry_scheduled",

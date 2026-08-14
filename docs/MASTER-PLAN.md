@@ -398,6 +398,32 @@ plugin Theme selection and fallback when reload/disable/uninstall removes it;
 selecting a built-in GUI theme deactivates the plugin preference first. Both
 theme/output-style choices survive process restart.
 
+Workspace generation changes use an application-owned two-phase adapter. Plugin
+and hook sources are fully preflighted before the process cwd commit boundary;
+after that boundary the target workspace is always published, with a typed
+`WorkspaceTransitionReceipt` reporting any subsystem that settled partially.
+Foreground turns, TaskRuntime file operations, and pooled agent execution use
+one ordered admission barrier; TaskRuntime callers receive a typed Busy result
+during a transition rather than blocking an async executor thread.
+The one owned config-watcher handle acknowledges each rebind, rebuilds target
+hooks immediately, reports actual residual watch directories, and is cancelled
+and awaited at shutdown. Plugin rebinds reuse the same registry, LSP manager,
+and framework receipts. A shared MCP name-ownership registry gives canonical
+user configuration priority over plugin declarations; exact plugin tokens make
+old receipts incapable of disconnecting a user connection that later took over
+the same name. Failed target plugin generations converge to the target's
+User-scope plugins and retire the old Project/Local generation. If that fallback
+also fails, the runtime publishes the target root after removing every
+plugin-owned live receipt and reports User-scope plugins as degraded instead of
+leaving any component bound to the previous workspace.
+
+Native `register_lifecycle` remains dormant (no production registration
+callsite) and its current name-only identity must not enter a production plugin
+host. Before activation, choose one authority: process-scoped callbacks that
+explicitly retire the previous current generation, or workspace-scoped
+callbacks keyed by scope + generation + exact ownership token. Do not extend
+the current name-only manager into a second lifecycle state machine.
+
 The scaffold writes unique Agent and output-style names plus valid Skills,
 Hooks, MCP, LSP, monitor, theme, and output-style files. Strict validation uses
 the framework resolver for declared paths and the application parsers for all

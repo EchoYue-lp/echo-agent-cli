@@ -3,6 +3,19 @@ import { sessionApi, workspaceApi, type Workspace } from '../api/endpoints';
 import { useChatStore } from './chatStore';
 import { useConversationStore } from './conversationStore';
 import { useFileStore } from './fileStore';
+import { useToastStore } from './toastStore';
+
+function showTransitionWarning(
+  transition: Awaited<ReturnType<typeof workspaceApi.switch>>['transition']
+) {
+  if (transition.status !== 'degraded') return;
+  const subsystems = transition.degraded_subsystems
+    .map((subsystem) => `${subsystem.subsystem}: ${subsystem.error}`)
+    .join('; ');
+  useToastStore
+    .getState()
+    .addToast('warning', `工作区已切换，但部分子系统降级：${subsystems}`, 8000);
+}
 
 interface WorkspaceState {
   /** All workspaces */
@@ -59,6 +72,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           (res as any).debug_conversation_count
         );
       set({ current: res.workspace });
+      showTransitionWarning(res.transition);
       const fileStore = useFileStore.getState();
       fileStore.markWorkspaceChanged();
       void fileStore.loadTree(4);
@@ -108,8 +122,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   exit: async () => {
-    await workspaceApi.exit();
+    const res = await workspaceApi.exit();
     set({ current: null });
+    showTransitionWarning(res.transition);
     useFileStore.getState().markWorkspaceChanged();
   },
 }));
