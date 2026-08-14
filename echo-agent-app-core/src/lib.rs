@@ -19,6 +19,7 @@ pub mod hitl;
 pub mod hook_config_loader;
 pub mod infra;
 pub mod instruction_provider;
+pub mod mcp_config_runtime;
 pub mod model_config;
 pub mod observability;
 pub mod output;

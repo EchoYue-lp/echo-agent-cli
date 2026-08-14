@@ -2220,7 +2220,7 @@ pub async fn get_mcp_server(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let mcp_config = state.app_state.plugins.mcp_config.read().await;
+    let mcp_config = state.app_state.plugins.mcp_config.snapshot().await;
     let mcp_health = state.app_state.plugins.mcp_health.read().await;
 
     let exists = state

@@ -7,7 +7,6 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use echo_agent::agent::CancellationToken;
-use echo_agent::mcp::McpConfigFile;
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -421,7 +420,7 @@ pub struct SessionState {
 
 /// 插件状态：MCP 服务管理
 pub struct PluginState {
-    pub mcp_config: RwLock<McpConfigFile>,
+    pub mcp_config: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
     pub mcp_health: RwLock<HashMap<String, McpHealthStatus>>,
 }
 
@@ -541,6 +540,7 @@ impl AppState {
         hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
         conversation_store: Option<Arc<dyn ConversationStore>>,
         app_config: echo_agent::config::AppConfig,
+        mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
     ) -> Self {
         let config = agent
             .try_write(|guard| WebConfig {
@@ -573,7 +573,7 @@ impl AppState {
                 foreground_turns: crate::foreground_turn::ForegroundTurnControl::default(),
             },
             plugins: PluginState {
-                mcp_config: RwLock::new(McpConfigFile::default()),
+                mcp_config: mcp_config_runtime,
                 mcp_health: RwLock::new(HashMap::new()),
             },
             storage: StorageState {

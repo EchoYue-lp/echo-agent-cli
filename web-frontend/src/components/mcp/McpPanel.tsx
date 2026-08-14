@@ -262,6 +262,10 @@ export function McpPanel() {
         ) : (
           servers.map((srv) => {
             const isEnabled = srv.enabled !== false;
+            const isUserConfigured = Boolean(
+              config?.mcpServers &&
+              Object.prototype.hasOwnProperty.call(config.mcpServers, srv.name)
+            );
             return (
               <div
                 key={srv.name}
@@ -291,17 +295,26 @@ export function McpPanel() {
                     {srv.transport} • {srv.tool_count ?? 0} tools
                   </span>
                   {/* Toggle enable/disable */}
-                  <button
-                    onClick={() => toggle(srv.name, isEnabled)}
-                    title={isEnabled ? '禁用' : '启用'}
-                    className="rounded-md p-1 transition-colors"
-                    style={{ color: isEnabled ? 'var(--color-success)' : 'var(--text-tertiary)' }}
-                  >
-                    <Power size={12} />
-                  </button>
-                  <button onClick={() => disconnect(srv.name)} style={{ color: s.textTer }}>
-                    <Trash2 size={12} />
-                  </button>
+                  {isUserConfigured && (
+                    <button
+                      onClick={() => toggle(srv.name, isEnabled)}
+                      title={isEnabled ? '禁用' : '启用'}
+                      className="rounded-md p-1 transition-colors"
+                      style={{ color: isEnabled ? 'var(--color-success)' : 'var(--text-tertiary)' }}
+                    >
+                      <Power size={12} />
+                    </button>
+                  )}
+                  {isUserConfigured && (
+                    <button
+                      onClick={() => disconnect(srv.name)}
+                      title="删除配置"
+                      aria-label={`删除 MCP 配置 ${srv.name}`}
+                      style={{ color: s.textTer }}
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  )}
                 </div>
                 {expanded === srv.name && (
                   <div className="border-t px-3 py-2 space-y-2" style={{ borderColor: s.border }}>

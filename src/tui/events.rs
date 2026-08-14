@@ -3461,29 +3461,41 @@ async fn handle_slash_command(
                 }
                 "load" if !target.is_empty() => {
                     let path = std::path::PathBuf::from(&target);
-                    match agent
-                        .write_async(|value| {
-                            Box::pin(async move { value.load_mcp_from_file(path).await })
-                        })
-                        .await
-                    {
-                        Ok(clients) => format!("Loaded {} MCP server(s).", clients.len()),
-                        Err(error) => format!("MCP load failed: {error}"),
+                    match app.app_state.as_ref() {
+                        Some(state) => {
+                            match echo_agent_app_core::mcp_config_runtime::load_existing_mcp_config_snapshot(&path) {
+                                Ok(config) => {
+                                    let server_count = config.mcp_servers.len();
+                                    match state
+                                        .plugins
+                                        .mcp_config
+                                        .replace_and_reconcile(agent.clone(), config)
+                                        .await
+                                    {
+                                        Ok(_) => format!(
+                                            "Imported {server_count} MCP server(s) into the user config."
+                                        ),
+                                        Err(error) => format!("MCP import failed: {error}"),
+                                    }
+                                }
+                                Err(error) => format!("MCP import failed: {error}"),
+                            }
+                        }
+                        None => "MCP configuration runtime is unavailable.".to_string(),
                     }
                 }
-                "disconnect" if !target.is_empty() => {
-                    if agent
-                        .write_async(|value| {
-                            let target = target.clone();
-                            Box::pin(async move { value.disconnect_mcp(&target).await })
-                        })
+                "disconnect" if !target.is_empty() => match app.app_state.as_ref() {
+                    Some(state) => match state
+                        .plugins
+                        .mcp_config
+                        .remove_and_reconcile(agent.clone(), &target)
                         .await
                     {
-                        format!("Disconnected MCP server: {target}")
-                    } else {
-                        format!("MCP server '{target}' is not connected.")
-                    }
-                }
+                        Ok(_) => format!("Removed MCP server from the user config: {target}"),
+                        Err(error) => format!("MCP removal failed: {error}"),
+                    },
+                    None => "MCP configuration runtime is unavailable.".to_string(),
+                },
                 _ => "Usage: /mcp [list|load <config-file>|disconnect <name>]".to_string(),
             };
             app.messages.push(ChatMessage {

@@ -8,10 +8,14 @@
 //! ```rust,ignore
 //! use echo_agent_app_core::runtime::AgentRuntime;
 //!
-//! let (agent_handle, hitl_dispatcher) =
-//!     AgentRuntime::bootstrap(&app_config, params).await?;
+//! let mcp_config_path = echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(
+//!     None,
+//!     &app_config,
+//! );
+//! let runtime = AgentRuntime::bootstrap(&app_config, params, mcp_config_path).await?;
 //! ```
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_handle::AgentHandle;
@@ -49,6 +53,8 @@ pub struct AgentRuntime {
     pub prompt_assembly: crate::project::prompt::PromptAssembly,
     /// Process-level shared plugin runtime used by every interaction surface.
     pub plugin_runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
+    /// Canonical durable user MCP configuration shared with application state.
+    pub mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
 }
 
 impl AgentRuntime {
@@ -73,6 +79,7 @@ impl AgentRuntime {
     pub async fn bootstrap(
         app_config: &AppConfig,
         mut params: AgentCreateParams,
+        mcp_config_path: PathBuf,
     ) -> anyhow::Result<Self> {
         // ── 0a. Runtime state store (must be ready before agent is built so that
         //       conversation_id + state_store land on the AgentConfig together;
@@ -90,6 +97,23 @@ impl AgentRuntime {
             params.conversation_id = Some(infra::default_primary_conversation_id());
         }
 
+        // ── 0b. Resolve and parse the canonical MCP source before starting
+        // background resources. A malformed existing file aborts bootstrap so
+        // it cannot later be overwritten by an empty in-memory snapshot.
+        let mcp_config_snapshot = crate::mcp_config_runtime::load_mcp_config_snapshot(
+            &mcp_config_path,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "canonical MCP config {} cannot be loaded: {error}",
+                mcp_config_path.display()
+            )
+        })?;
+        let mcp_config_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            mcp_config_path.clone(),
+            mcp_config_snapshot.clone(),
+        ));
+
         let browser_runtime = match params.browser_runtime.clone() {
             Some(runtime) => runtime,
             None => {
@@ -106,8 +130,12 @@ impl AgentRuntime {
         let mut agent = created.agent;
         let prompt_assembly = created.prompt_assembly;
 
-        // ── 2. Load MCP ──
-        infra::load_mcp_config(&mut agent, None, app_config).await;
+        // ── 2. Connect the same snapshot exposed to application state. ──
+        tracing::info!(path = %mcp_config_path.display(), "Canonical MCP config selected");
+        match agent.load_mcp_config(mcp_config_snapshot).await {
+            Ok(clients) => tracing::info!(count = clients.len(), "MCP user servers connected"),
+            Err(error) => tracing::warn!(%error, "MCP user config connection failed"),
+        }
 
         // ── 3. Auto-compression ──
         if app_config.has_compressor() {
@@ -371,6 +399,7 @@ impl AgentRuntime {
             browser_runtime,
             prompt_assembly,
             plugin_runtime,
+            mcp_config_runtime,
         })
     }
 
@@ -386,6 +415,7 @@ impl AgentRuntime {
             self.hitl_dispatcher.clone(),
             conversation_store,
             self.app_config.clone(),
+            self.mcp_config_runtime.clone(),
         )
         .with_review_integration(self.review_integration.clone())
         .with_prompt_assembly(self.prompt_assembly.clone())

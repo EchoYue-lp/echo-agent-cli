@@ -98,7 +98,17 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
     // 加载 YAML 配置文件
     let mut app_config = config::load_config(args.config.as_deref());
+    let configured_mcp_path = app_config.mcp.config_path.clone();
+    // Resolve MCP before the generic environment overlay copies
+    // MCP_CONFIG_PATH into AppConfig. This preserves CLI > YAML > env.
+    let mcp_config_path = echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(
+        args.mcp_config.as_deref(),
+        &app_config,
+    );
     config::apply_env_overrides(&mut app_config);
+    // Keep AppConfig as the file-backed configuration; the resolved runtime
+    // source above owns environment and CLI overrides.
+    app_config.mcp.config_path = configured_mcp_path;
 
     // --verbose 覆盖日志级别为 debug
     if args.verbose {
@@ -121,6 +131,17 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     #[cfg(not(feature = "tui"))]
     {
         infra::init_logging(&app_config.logging.level);
+    }
+
+    if args.web {
+        anyhow::bail!(
+            "Web 模式已移除。请使用 Tauri 桌面模式（cargo tauri dev）或 CLI 模式（--cli）。"
+        );
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if is_tui_entry {
+        anyhow::bail!("TUI 模式需要 tui feature。请使用: cargo build --features tui");
     }
 
     // TUI/CLI and GUI share the same file-backed conversation projection.
@@ -165,7 +186,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let runtime =
-        echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params).await?;
+        echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params, mcp_config_path)
+            .await?;
     let agent_handle = runtime.agent_handle.clone();
     echo_agent_app_core::infra::inject_conversation_store(&agent_handle, &conversation_store);
 
@@ -265,6 +287,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 webhook_emitter: webhook_emitter.clone(),
                 conversation_store: conversation_store.clone(),
                 review_integration: runtime.review_integration.clone(),
+                mcp_config_runtime: runtime.mcp_config_runtime.clone(),
             },
         )
         .await?;
@@ -339,6 +362,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         {
             tracing::warn!(%error, "failed to shut down task hook dispatcher");
         }
+        runtime.mcp_config_runtime.shutdown().await;
         runtime.browser_runtime.shutdown().await;
         drop(runtime);
         cancel_token.cancel();
@@ -346,20 +370,9 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         return tui_result;
     }
 
-    #[cfg(not(feature = "tui"))]
-    if is_tui_entry {
-        eprintln!("TUI 模式需要 tui feature。请使用: cargo build --features tui");
-        std::process::exit(1);
-    }
-
     // ── Hidden legacy/internal modes ───────────────────────────────────
     let run_cli = args.cli;
     let run_channels = args.channels;
-
-    if args.web {
-        eprintln!("Web 模式已移除。请使用 Tauri 桌面模式（cargo tauri dev）或 CLI 模式（--cli）。");
-        std::process::exit(1);
-    }
 
     let mut mode_error: Option<anyhow::Error> = None;
     if run_channels {
@@ -391,6 +404,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     conversation_id.clone(),
                     webhook_emitter.clone(),
                     runtime.plugin_runtime.clone(),
+                    runtime.mcp_config_runtime.clone(),
                     conversation_store.clone(),
                 )
                 .await
@@ -405,6 +419,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 {
                     tracing::warn!(%error, "failed to shut down task hook dispatcher");
                 }
+                runtime.mcp_config_runtime.shutdown().await;
                 runtime.browser_runtime.shutdown().await;
                 cancel_token.cancel();
                 channels_result??;
@@ -432,6 +447,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             conversation_id,
             webhook_emitter,
             runtime.plugin_runtime.clone(),
+            runtime.mcp_config_runtime.clone(),
             conversation_store.clone(),
         )
         .await
@@ -440,8 +456,9 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         }
     } else {
         // No legacy mode specified — should have entered TUI above
-        eprintln!("请使用 TUI（默认）、Tauri 桌面模式、或 --cli 模式。");
-        std::process::exit(1);
+        mode_error = Some(anyhow::anyhow!(
+            "请使用 TUI（默认）、Tauri 桌面模式、或 --cli 模式。"
+        ));
     }
 
     // Keep runtime alive until shutdown
@@ -450,6 +467,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     {
         tracing::warn!(%error, "failed to shut down task hook dispatcher");
     }
+    runtime.mcp_config_runtime.shutdown().await;
     runtime.browser_runtime.shutdown().await;
     drop(runtime);
     cancel_token.cancel();
@@ -551,6 +569,12 @@ mod tests {
     fn test_args_custom_port_for_internal_web() {
         let args = cli::Args::parse_from(["echo-agent-cli", "--port", "8080"]);
         assert_eq!(args.port, 8080);
+    }
+
+    #[test]
+    fn test_args_accepts_explicit_mcp_config_override() {
+        let args = cli::Args::parse_from(["echo-agent-cli", "--mcp-config", "/tmp/eko-mcp.json"]);
+        assert_eq!(args.mcp_config.as_deref(), Some("/tmp/eko-mcp.json"));
     }
 
     #[test]

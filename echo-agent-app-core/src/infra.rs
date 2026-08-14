@@ -1078,48 +1078,6 @@ fn register_default_hooks(agent: &mut ReactAgent) {
     );
 }
 
-/// 加载 MCP 配置并连接服务端
-pub async fn load_mcp_config(
-    agent: &mut ReactAgent,
-    mcp_cli_override: Option<&str>,
-    app_config: &AppConfig,
-) {
-    // 优先级: CLI --mcp-config > YAML mcp.config_path > 环境变量 > 默认路径
-    let config_path = mcp_cli_override
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            app_config
-                .mcp
-                .config_path
-                .as_ref()
-                .map(std::path::PathBuf::from)
-        })
-        .or_else(|| {
-            std::env::var("MCP_CONFIG_PATH")
-                .ok()
-                .map(std::path::PathBuf::from)
-        });
-
-    // 默认路径（仅从用户目录加载，不从 CWD 加载以防止仓库注入）
-    let default_paths = [echo_agent::paths::user_data_path("mcp.json")];
-
-    let config_path = config_path.or_else(|| default_paths.iter().find(|p| p.exists()).cloned());
-
-    if let Some(path) = config_path {
-        tracing::info!("加载 MCP 配置: {}", path.display());
-        match agent.load_mcp_from_file(&path).await {
-            Ok(clients) => {
-                tracing::info!("MCP 服务端连接成功: {} 个", clients.len());
-            }
-            Err(e) => {
-                tracing::warn!("MCP 配置加载失败: {}", e);
-            }
-        }
-    } else {
-        tracing::info!("未找到 MCP 配置文件，跳过 MCP 连接");
-    }
-}
-
 /// 启动 MCP 后台健康检查任务
 pub fn spawn_mcp_health_check(
     state: Arc<crate::state::AppState>,

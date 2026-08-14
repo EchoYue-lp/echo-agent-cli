@@ -65,7 +65,8 @@ AgentPool
 
 ```rust
 // GUI 入口 (desktop.rs)
-let runtime = AgentRuntime::bootstrap(&app_config, params).await?;
+let mcp_config_path = resolve_mcp_config_path(None, &app_config);
+let runtime = AgentRuntime::bootstrap(&app_config, params, mcp_config_path).await?;
 let pool = runtime.init_pool(PoolConfig::default()).await;
 pool.spawn_cleanup_monitor().await;
 

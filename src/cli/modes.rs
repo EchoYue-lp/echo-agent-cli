@@ -38,6 +38,8 @@ pub struct HeadlessServiceResources {
     pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     pub review_integration:
         Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    pub mcp_config_runtime:
+        std::sync::Arc<echo_agent_app_core::mcp_config_runtime::McpConfigRuntime>,
 }
 
 pub async fn start_headless_services(
@@ -67,6 +69,7 @@ pub async fn start_headless_services(
         hitl_dispatcher,
         resources.conversation_store,
         app_config.clone(),
+        resources.mcp_config_runtime,
     )
     .with_review_integration(resources.review_integration);
     state.webhook.emitter = resources.webhook_emitter;
@@ -97,6 +100,7 @@ pub async fn run_cli_mode(
     conversation_id: String,
     webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    mcp_config_runtime: std::sync::Arc<echo_agent_app_core::mcp_config_runtime::McpConfigRuntime>,
     conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
 ) -> Result<()> {
     let (task_service, scheduler_runner, app_state) = start_headless_services(
@@ -109,6 +113,7 @@ pub async fn run_cli_mode(
             webhook_emitter: webhook_emitter.clone(),
             conversation_store,
             review_integration: review_integration.clone(),
+            mcp_config_runtime,
         },
     )
     .await?;

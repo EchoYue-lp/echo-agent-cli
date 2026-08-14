@@ -2,13 +2,15 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use echo_agent::mcp::McpServerEntry;
+use echo_agent_app_core::mcp_config_runtime::McpConfigRuntimeError;
 use echo_agent_app_core::types::McpTransportConfig;
 
 #[tauri::command]
 pub async fn list_mcp_servers(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let mcp_config = state.app_state.plugins.mcp_config.read().await;
+    let mcp_config = state.app_state.plugins.mcp_config.snapshot().await;
     let mcp_health = state.app_state.plugins.mcp_health.read().await;
 
     let servers: Vec<serde_json::Value> = state
@@ -107,6 +109,16 @@ fn infer_transport(entry: &echo_agent::mcp::McpServerEntry) -> &'static str {
     }
 }
 
+fn map_mcp_config_error(error: McpConfigRuntimeError) -> IpcError {
+    match error {
+        McpConfigRuntimeError::Validation(message) => IpcError::Validation(message),
+        McpConfigRuntimeError::ServerNotFound(name) => {
+            IpcError::NotFound(format!("MCP server '{name}' not found in config"))
+        }
+        other => IpcError::Internal(other.to_string()),
+    }
+}
+
 /// Validate the shape of a user-configured MCP stdio command.
 ///
 /// EKO is a local desktop assistant, so an interactive MCP connection is not
@@ -187,48 +199,58 @@ pub async fn connect_mcp_server(
     name: String,
     transport: McpTransportConfig,
 ) -> Result<serde_json::Value, IpcError> {
-    use echo_agent::mcp::McpServerConfig;
     // MCP is a user-driven capability extension: the user explicitly configures
     // servers they trust. EKO is a local personal assistant with no online /
     // multi-user threat model, so we don't gate it behind a permission mode.
-    // Input validation (executable allowlist + URL scheme) below still guards
-    // against typos and obvious misconfiguration.
-
-    // P0-2 / N-P0-4: validate before spawning. The frontend must not be able
-    // to spawn an arbitrary process or POST to an arbitrary internal URL.
-    let config = match transport {
+    // Shape and URL-scheme checks catch obvious misconfiguration before the
+    // durable source is updated.
+    let entry = match transport {
         McpTransportConfig::Stdio { command, args, env } => {
             let validated_cmd = validate_ipc_mcp_stdio(&command)?;
-            let env_pairs: Vec<(String, String)> = env.into_iter().collect();
-            McpServerConfig::stdio_with_env(&name, &validated_cmd, args, env_pairs)
+            McpServerEntry {
+                command: Some(validated_cmd),
+                args,
+                env,
+                ..Default::default()
+            }
         }
         McpTransportConfig::Http { url, headers } => {
             let validated_url = validate_ipc_mcp_url(&url)?;
-            McpServerConfig::http_with_headers(&name, &validated_url, headers)
+            McpServerEntry {
+                url: Some(validated_url),
+                headers,
+                ..Default::default()
+            }
         }
         McpTransportConfig::Sse { url, headers } => {
             let validated_url = validate_ipc_mcp_url(&url)?;
-            McpServerConfig::sse_with_headers(&name, &validated_url, headers)
+            McpServerEntry {
+                url: Some(validated_url),
+                headers,
+                transport: Some("sse".to_string()),
+                ..Default::default()
+            }
         }
     };
 
-    let connect_result = state
+    let generation = state
         .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            let config = config.clone();
-            Box::pin(async move { agent.connect_mcp_from_config(config).await })
-        })
-        .await;
+        .plugins
+        .mcp_config
+        .upsert_and_reconcile(
+            state.app_state.connection.primary_agent(),
+            name.clone(),
+            entry,
+        )
+        .await
+        .map_err(map_mcp_config_error)?;
 
-    match connect_result {
-        Ok(_) => Ok(serde_json::json!({"success": true, "name": name})),
-        Err(e) => Ok(serde_json::json!({
-            "success": false,
-            "error": format!("Failed to connect to MCP server '{}': {}", name, e),
-        })),
-    }
+    Ok(serde_json::json!({
+        "success": true,
+        "name": name,
+        "generation": generation,
+        "message": "MCP server saved; connection is reconciling in the background",
+    }))
 }
 
 #[tauri::command]
@@ -236,17 +258,13 @@ pub async fn disconnect_mcp_server(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    state
+    let generation = state
         .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            let name = name.clone();
-            Box::pin(async move {
-                agent.disconnect_mcp(&name).await;
-            })
-        })
-        .await;
+        .plugins
+        .mcp_config
+        .remove_and_reconcile(state.app_state.connection.primary_agent(), &name)
+        .await
+        .map_err(map_mcp_config_error)?;
 
     {
         let mut health = state.app_state.plugins.mcp_health.write().await;
@@ -255,7 +273,8 @@ pub async fn disconnect_mcp_server(
 
     Ok(serde_json::json!({
         "success": true,
-        "message": format!("Disconnected from MCP server '{}'", name),
+        "generation": generation,
+        "message": format!("Removed MCP server '{}' from the user config", name),
     }))
 }
 
@@ -269,96 +288,38 @@ pub async fn toggle_mcp_server(
     name: String,
     enabled: bool,
 ) -> Result<serde_json::Value, IpcError> {
-    // Update the disabled flag in config
-    {
-        let mut cfg = state.app_state.plugins.mcp_config.write().await;
-        if let Some(entry) = cfg.mcp_servers.get_mut(&name) {
-            entry.disabled = !enabled;
-        } else if enabled {
-            return Err(IpcError::NotFound(format!(
-                "MCP server '{}' not found in config",
-                name
-            )));
-        }
-    }
+    let generation = state
+        .app_state
+        .plugins
+        .mcp_config
+        .set_enabled_and_reconcile(state.app_state.connection.primary_agent(), &name, enabled)
+        .await
+        .map_err(map_mcp_config_error)?;
 
-    if enabled {
-        // Connect: get the server config and connect via agent
-        let server_config = {
-            let cfg = state.app_state.plugins.mcp_config.read().await;
-            cfg.mcp_servers
-                .get(&name)
-                .and_then(|e| e.to_server_config(&name).ok())
-        };
-
-        if let Some(config) = server_config {
-            let result = state
-                .app_state
-                .connection
-                .agent
-                .write_async(|agent| {
-                    Box::pin(async move { agent.connect_mcp_from_config(config).await })
-                })
-                .await;
-
-            match result {
-                Ok(_) => Ok(serde_json::json!({
-                    "success": true,
-                    "enabled": true,
-                    "message": format!("MCP server '{}' enabled and connected", name),
-                })),
-                Err(e) => Ok(serde_json::json!({
-                    "success": true,
-                    "enabled": true,
-                    "message": format!("MCP server '{}' enabled but connection failed: {}", name, e),
-                })),
-            }
-        } else {
-            Ok(serde_json::json!({
-                "success": true,
-                "enabled": true,
-                "message": format!("MCP server '{}' enabled (no config to connect)", name),
-            }))
-        }
-    } else {
-        // Disconnect: remove from agent and health
-        state
-            .app_state
-            .connection
-            .agent
-            .write_async(|agent| {
-                let name = name.clone();
-                Box::pin(async move {
-                    agent.disconnect_mcp(&name).await;
-                })
-            })
-            .await;
-
+    if !enabled {
         {
             let mut health = state.app_state.plugins.mcp_health.write().await;
             health.remove(&name);
         }
-
-        Ok(serde_json::json!({
-            "success": true,
-            "enabled": false,
-            "message": format!("MCP server '{}' disabled and disconnected", name),
-        }))
     }
+
+    Ok(serde_json::json!({
+        "success": true,
+        "enabled": enabled,
+        "generation": generation,
+        "message": format!("MCP server '{}' setting saved; connection is reconciling", name),
+    }))
 }
 
 #[tauri::command]
 pub async fn get_mcp_config(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let config = state.app_state.plugins.mcp_config.read().await;
-    let mut value =
-        serde_json::to_value(&*config).map_err(|e| IpcError::Internal(e.to_string()))?;
-    // P1-3: redact secrets before returning to the frontend. MCP `env` and
-    // `headers` routinely carry API tokens (e.g. `Authorization: Bearer …`,
-    // `API_KEY=sk-…`); returning them verbatim means any page (or XSS) can
-    // exfiltrate every server's credentials via a single `invoke`. Replace
-    // each value with a presence marker so the UI can still show "configured".
+    let config = state.app_state.plugins.mcp_config.snapshot().await;
+    let mut value = serde_json::to_value(&config).map_err(|e| IpcError::Internal(e.to_string()))?;
+    // Renderer and diagnostic surfaces do not need local MCP credentials.
+    // Preserve only a presence marker so routine UI inspection and logs cannot
+    // accidentally disclose API tokens stored on the user's machine.
     redact_mcp_config_secrets(&mut value);
     Ok(value)
 }
@@ -454,80 +415,17 @@ pub async fn update_mcp_config(
 ) -> Result<serde_json::Value, IpcError> {
     let new_config: echo_agent::mcp::McpConfigFile =
         serde_json::from_value(config).map_err(|e| IpcError::Validation(e.to_string()))?;
-
-    // 1. Persist the new config synchronously and return success immediately.
-    //    Reconnection is potentially slow (stdio spawn / HTTP / SSE with their
-    //    own timeouts) and must NOT block the IPC response — otherwise the
-    //    frontend's "保存中..." spinner spins forever when a server is
-    //    unreachable. We reconcile connections in a background task below.
-    {
-        let mut cfg = state.app_state.plugins.mcp_config.write().await;
-        *cfg = new_config.clone();
-    }
-
-    let agent_handle = state.app_state.connection.primary_agent();
-
-    // 2. Reconnect in the background. Each server connection is bounded by a
-    //    timeout so one unreachable server (e.g. an `http://localhost:8100`
-    //    that nothing is serving) can't stall the whole reconnect loop for
-    //    tens of seconds. connect_mcp_from_config / disconnect_mcp require
-    //    `&mut self`, so this runs inside write_async (holds the write lock).
-    //    That's acceptable now because no IPC caller is waiting on it.
-    tokio::spawn(async move {
-        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-        agent_handle
-            .write_async(|agent| {
-                let cfg = new_config.clone();
-                Box::pin(async move {
-                    // Disconnect all existing servers first.
-                    let names: Vec<String> = agent
-                        .list_mcp_servers()
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect();
-                    for name in names {
-                        agent.disconnect_mcp(&name).await;
-                    }
-
-                    // Reconnect each enabled server, each with a timeout.
-                    // A timeout / error on one server is logged and skipped so
-                    // the remaining servers still get connected.
-                    for (name, entry) in &cfg.mcp_servers {
-                        if entry.disabled {
-                            continue;
-                        }
-                        let Ok(server_config) = entry.to_server_config(name) else {
-                            tracing::warn!(
-                                server = %name,
-                                "MCP server config invalid; skipped during reconnect"
-                            );
-                            continue;
-                        };
-                        let connect = agent.connect_mcp_from_config(server_config);
-                        match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-                            Ok(Ok(_)) => {
-                                tracing::info!(server = %name, "MCP server reconnected");
-                            }
-                            Ok(Err(e)) => {
-                                tracing::warn!(server = %name, error = %e, "MCP server connect failed");
-                            }
-                            Err(_) => {
-                                tracing::warn!(
-                                    server = %name,
-                                    timeout_secs = CONNECT_TIMEOUT.as_secs(),
-                                    "MCP server connect timed out; skipped"
-                                );
-                            }
-                        }
-                    }
-                })
-            })
-            .await;
-    });
+    let generation = state
+        .app_state
+        .plugins
+        .mcp_config
+        .replace_and_reconcile(state.app_state.connection.primary_agent(), new_config)
+        .await
+        .map_err(map_mcp_config_error)?;
 
     Ok(serde_json::json!({
         "success": true,
+        "generation": generation,
         "message": "MCP 配置已保存，正在后台连接服务器",
     }))
 }

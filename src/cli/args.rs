@@ -43,7 +43,7 @@ pub struct Args {
     pub project: Option<String>,
 
     /// MCP 配置文件路径
-    #[arg(long, env = "MCP_CONFIG_PATH")]
+    #[arg(long)]
     pub mcp_config: Option<String>,
 
     /// 配置文件路径 (echo-agent.yaml)

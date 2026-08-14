@@ -6,6 +6,7 @@
 use crate::{cli, config_watcher, infra, state::AppState};
 use clap::Parser;
 use echo_agent::config;
+use std::ffi::OsString;
 use std::sync::Arc;
 
 /// Crash log path — written to when the app panics before Tauri starts.
@@ -129,9 +130,21 @@ async fn run_desktop() -> anyhow::Result<()> {
     // Spawn the user's login shell to pick up API keys from ~/.zshrc etc.
     infra::load_shell_env();
 
-    let args = cli::Args::parse_from(["echo-agent-tauri"]);
+    // The desktop binary accepts the same model/project/config overrides as
+    // TUI/CLI, including the canonical `--mcp-config` source.
+    let args = parse_desktop_args(std::env::args_os())?;
     let mut app_config = config::load_config(args.config.as_deref());
+    let configured_mcp_path = app_config.mcp.config_path.clone();
+    // Resolve MCP before the generic environment overlay copies
+    // MCP_CONFIG_PATH into AppConfig. This preserves CLI > YAML > env.
+    let mcp_config_path = echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(
+        args.mcp_config.as_deref(),
+        &app_config,
+    );
     config::apply_env_overrides(&mut app_config);
+    // Keep AppConfig as the file-backed configuration; the resolved runtime
+    // source above owns environment and CLI overrides.
+    app_config.mcp.config_path = configured_mcp_path;
     let webhook_emitter = Arc::new(echo_agent_app_core::webhook::WebhookEmitter::from_config(
         &app_config,
     ));
@@ -157,7 +170,8 @@ async fn run_desktop() -> anyhow::Result<()> {
     };
 
     let runtime =
-        echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params).await?;
+        echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params, mcp_config_path)
+            .await?;
     let agent_handle = runtime.agent_handle.clone();
 
     // ── Config watcher ──
@@ -190,6 +204,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         runtime.hitl_dispatcher.clone(),
         conversation_store,
         app_config.clone(),
+        runtime.mcp_config_runtime.clone(),
     )
     .with_config_path(config_save_path)
     .with_review_integration(runtime.review_integration.clone())
@@ -269,6 +284,7 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
+    runtime.mcp_config_runtime.shutdown().await;
     bridge_supervisor.shutdown().await;
     terminal_manager.close_all().await;
     if let Err(error) = state.shutdown_scheduler().await {
@@ -283,4 +299,45 @@ async fn run_desktop() -> anyhow::Result<()> {
     tauri_result.map_err(|e| anyhow::anyhow!("error while running Tauri application: {e}"))?;
 
     Ok(())
+}
+
+fn parse_desktop_args(args: impl IntoIterator<Item = OsString>) -> Result<cli::Args, clap::Error> {
+    let args = args
+        .into_iter()
+        // Finder may add a process-serial-number argument when launching a
+        // macOS application bundle. It is platform metadata, not an EKO flag.
+        .filter(|arg| !arg.to_string_lossy().starts_with("-psn_"));
+    cli::Args::try_parse_from(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_args_preserve_explicit_mcp_override() -> anyhow::Result<()> {
+        let args = parse_desktop_args(
+            ["echo-agent-tauri", "--mcp-config", "/tmp/eko-mcp.json"]
+                .into_iter()
+                .map(OsString::from),
+        )?;
+        assert_eq!(args.mcp_config.as_deref(), Some("/tmp/eko-mcp.json"));
+        Ok(())
+    }
+
+    #[test]
+    fn desktop_args_ignore_macos_finder_process_serial_number() -> anyhow::Result<()> {
+        let args = parse_desktop_args(
+            [
+                "echo-agent-tauri",
+                "-psn_0_12345",
+                "--mcp-config",
+                "/tmp/eko-mcp.json",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )?;
+        assert_eq!(args.mcp_config.as_deref(), Some("/tmp/eko-mcp.json"));
+        Ok(())
+    }
 }
