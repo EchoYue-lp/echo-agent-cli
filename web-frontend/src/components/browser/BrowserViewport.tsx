@@ -68,13 +68,13 @@ export function BrowserViewport({
       }}
     >
       {frame ? (
-        <img
-          src={frame}
-          alt="浏览器页面截图"
-          draggable={false}
+        <button
+          type="button"
+          aria-label="在浏览器页面中点击"
+          disabled={!clickable || busy}
           onClick={(event) => {
-            if (!clickable || busy) return;
-            const image = event.currentTarget;
+            const image = event.currentTarget.querySelector('img');
+            if (!image) return;
             const point = imagePoint(
               event.clientX,
               event.clientY,
@@ -84,8 +84,15 @@ export function BrowserViewport({
             );
             if (point) onClickAt(point.x, point.y);
           }}
-          className={`block h-full w-full select-none object-contain object-top ${clickable && !busy ? 'cursor-pointer' : 'cursor-default'}`}
-        />
+          className={`block h-full w-full select-none border-0 bg-transparent p-0 ${clickable && !busy ? 'cursor-pointer' : 'cursor-default'}`}
+        >
+          <img
+            src={frame}
+            alt="浏览器页面截图"
+            draggable={false}
+            className="block h-full w-full object-contain object-top"
+          />
+        </button>
       ) : (
         <div className="flex h-full min-h-[240px] flex-col items-center justify-center gap-2 bg-[var(--bg-chat)] text-[var(--text-tertiary)]">
           <Globe2 size={28} strokeWidth={1.4} />

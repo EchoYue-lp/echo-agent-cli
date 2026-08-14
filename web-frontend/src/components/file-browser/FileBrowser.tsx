@@ -27,39 +27,46 @@ import { FileTree } from './FileTree';
 
 export function FileBrowser() {
   const store = useFileStore();
+  const {
+    loadChanges,
+    loadTree,
+    refreshSelectedFromDisk,
+    saveSelected,
+    selectFile: selectFileFromStore,
+  } = store;
   const [mobileShowTree, setMobileShowTree] = useState(true);
   const selectedDocument = store.selectedFile ? store.documents[store.selectedFile] : undefined;
 
   useEffect(() => {
-    void store.loadTree(4);
-    void store.loadChanges();
-  }, [store.loadTree, store.loadChanges]);
+    void loadTree(4);
+    void loadChanges();
+  }, [loadChanges, loadTree]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
-      void store.loadChanges();
-      void store.refreshSelectedFromDisk();
+      void loadChanges();
+      void refreshSelectedFromDisk();
     }, 2500);
     return () => window.clearInterval(timer);
-  }, [store.loadChanges, store.refreshSelectedFromDisk]);
+  }, [loadChanges, refreshSelectedFromDisk]);
 
   useEffect(() => {
     const save = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
         event.preventDefault();
-        void store.saveSelected();
+        void saveSelected();
       }
     };
     window.addEventListener('keydown', save);
     return () => window.removeEventListener('keydown', save);
-  }, [store.saveSelected]);
+  }, [saveSelected]);
 
   const selectFile = useCallback(
     (path: string) => {
-      void store.selectFile(path);
+      void selectFileFromStore(path);
       if (window.innerWidth < 768) setMobileShowTree(false);
     },
-    [store.selectFile]
+    [selectFileFromStore]
   );
 
   const closeFile = (path: string) => {

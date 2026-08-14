@@ -211,9 +211,10 @@ export function WorkflowDebugger({
           {nodes.map((node) => {
             const config = statusConfig[node.status];
             return (
-              <div
+              <button
+                type="button"
                 key={node.id}
-                className="absolute cursor-pointer"
+                className="absolute cursor-pointer border-0 bg-transparent p-0 text-left"
                 style={{ left: node.x, top: node.y, width: 160 }}
                 onClick={() => handleNodeClick(node)}
               >
@@ -239,7 +240,7 @@ export function WorkflowDebugger({
                     </span>
                   )}
                 </div>
-              </div>
+              </button>
             );
           })}
         </div>

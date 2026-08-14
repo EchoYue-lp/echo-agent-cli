@@ -37,7 +37,7 @@ export function useTauriChat() {
     setQueuedInputs(next);
   };
 
-  const dispatchNextQueued = () => {
+  const dispatchNextQueued = useCallback(() => {
     const [next, ...remaining] = queuedInputsRef.current;
     replaceQueue(remaining);
     if (next) {
@@ -45,7 +45,7 @@ export function useTauriChat() {
         void dispatchMessageRef.current?.(next.text, next.attachments);
       });
     }
-  };
+  }, []);
 
   const isCurrentRunEvent = (event: ChatEvent) => {
     if (event.message_key) {
@@ -57,19 +57,22 @@ export function useTauriChat() {
     return true;
   };
 
-  const handleEvent = useCallback((event: ChatEvent) => {
-    if (!isCurrentRunEvent(event)) return;
-    handleChatEvent(event, {
-      assistantIdRef,
-      currentMessageKeyRef,
-      currentMessageIdRef: currentMessageKeyRef,
-      isCancelledRef,
-      currentThinkingIdRef: thinkingIdRef,
-    });
-    if (event.type === 'done') {
-      dispatchNextQueued();
-    }
-  }, []);
+  const handleEvent = useCallback(
+    (event: ChatEvent) => {
+      if (!isCurrentRunEvent(event)) return;
+      handleChatEvent(event, {
+        assistantIdRef,
+        currentMessageKeyRef,
+        currentMessageIdRef: currentMessageKeyRef,
+        isCancelledRef,
+        currentThinkingIdRef: thinkingIdRef,
+      });
+      if (event.type === 'done') {
+        dispatchNextQueued();
+      }
+    },
+    [dispatchNextQueued]
+  );
 
   // Set up event listener on mount.
   //
@@ -166,85 +169,88 @@ export function useTauriChat() {
     };
   }, [handleEvent]);
 
-  const dispatchMessage = useCallback(async (text: string, attachments?: Attachment[]) => {
-    const store = useChatStore.getState();
-    const displayAttachments = attachments?.map((a) => ({
-      name: a.name,
-      mime_type: a.mime_type,
-      url: `data:${a.mime_type};base64,${a.data}`,
-      size: a.size,
-      source: a.source,
-    }));
-    const userMessageId = store.addUserMessage(text || '(附件)', displayAttachments);
-    let pendingAssistantId: string | null = null;
+  const dispatchMessage = useCallback(
+    async (text: string, attachments?: Attachment[]) => {
+      const store = useChatStore.getState();
+      const displayAttachments = attachments?.map((a) => ({
+        name: a.name,
+        mime_type: a.mime_type,
+        url: `data:${a.mime_type};base64,${a.data}`,
+        size: a.size,
+        source: a.source,
+      }));
+      const userMessageId = store.addUserMessage(text || '(附件)', displayAttachments);
+      let pendingAssistantId: string | null = null;
 
-    try {
-      isCancelledRef.current = false;
-      thinkingIdRef.current = null;
-      const message_key =
-        typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      currentMessageKeyRef.current = message_key;
-      pendingAssistantId = store.startAssistantMessage(message_key);
-      assistantIdRef.current = pendingAssistantId;
+      try {
+        isCancelledRef.current = false;
+        thinkingIdRef.current = null;
+        const message_key =
+          typeof crypto !== 'undefined' && 'randomUUID' in crypto
+            ? crypto.randomUUID()
+            : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        currentMessageKeyRef.current = message_key;
+        pendingAssistantId = store.startAssistantMessage(message_key);
+        assistantIdRef.current = pendingAssistantId;
 
-      // TaskRuntime runs are keyed by conversation_id. On the first turn there
-      // is no active conversation yet, so create it before routing; otherwise
-      // the backend falls back to a message-scoped id and the right rail loses
-      // the run as soon as the conversation is later saved as conv-*.
-      if (!useConversationStore.getState().activeId) {
-        await useConversationStore.getState().saveCurrent(useChatStore.getState().messages);
-      }
+        // TaskRuntime runs are keyed by conversation_id. On the first turn there
+        // is no active conversation yet, so create it before routing; otherwise
+        // the backend falls back to a message-scoped id and the right rail loses
+        // the run as soon as the conversation is later saved as conv-*.
+        if (!useConversationStore.getState().activeId) {
+          await useConversationStore.getState().saveCurrent(useChatStore.getState().messages);
+        }
 
-      // Pass conversation_id for pool-based parallel execution and TaskRuntime
-      // run binding.
-      const conversation_id = useConversationStore.getState().activeId;
-      if (!conversation_id) {
-        throw new Error('创建会话失败，无法启动 TaskRuntime。');
+        // Pass conversation_id for pool-based parallel execution and TaskRuntime
+        // run binding.
+        const conversation_id = useConversationStore.getState().activeId;
+        if (!conversation_id) {
+          throw new Error('创建会话失败，无法启动 TaskRuntime。');
+        }
+        currentConversationIdRef.current = conversation_id ?? null;
+        const chatResult = await apiInvoke<{
+          success: boolean;
+          run_id?: string;
+          status?: string;
+          mode?: string;
+          route?: string;
+          runId?: string;
+        }>('send_chat_message', {
+          message: text,
+          // Multimodal: forward attachments (base64-encoded) so the backend can
+          // persist them and build a multimodal Message for the LLM.
+          attachments: attachments && attachments.length > 0 ? attachments : undefined,
+          conversationId: conversation_id ?? undefined,
+          conversation_id: conversation_id ?? undefined,
+          messageKey: message_key,
+          message_key,
+        });
+        // If the backend created a TaskRuntime run, load it so the right rail
+        // panel can show plan/todos/subagents/tokens (replaces the old plan_ready
+        // event handler deleted in the 13→6 state machine migration).
+        const createdRunId = chatResult?.run_id ?? chatResult?.runId;
+        if (createdRunId && conversation_id) {
+          useTaskRuntimeStore
+            .getState()
+            .loadByConversation(conversation_id)
+            .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
+        }
+        return true;
+      } catch (e) {
+        console.error('[TauriChat] Failed to send message:', e);
+        store.removeMessages(
+          pendingAssistantId ? [userMessageId, pendingAssistantId] : [userMessageId]
+        );
+        useToastStore.getState().addToast('error', `发送失败：${errorMessage(e)}`);
+        store.setRunStatus('failed');
+        assistantIdRef.current = null;
+        currentMessageKeyRef.current = null;
+        dispatchNextQueued();
+        return false;
       }
-      currentConversationIdRef.current = conversation_id ?? null;
-      const chatResult = await apiInvoke<{
-        success: boolean;
-        run_id?: string;
-        status?: string;
-        mode?: string;
-        route?: string;
-        runId?: string;
-      }>('send_chat_message', {
-        message: text,
-        // Multimodal: forward attachments (base64-encoded) so the backend can
-        // persist them and build a multimodal Message for the LLM.
-        attachments: attachments && attachments.length > 0 ? attachments : undefined,
-        conversationId: conversation_id ?? undefined,
-        conversation_id: conversation_id ?? undefined,
-        messageKey: message_key,
-        message_key,
-      });
-      // If the backend created a TaskRuntime run, load it so the right rail
-      // panel can show plan/todos/subagents/tokens (replaces the old plan_ready
-      // event handler deleted in the 13→6 state machine migration).
-      const createdRunId = chatResult?.run_id ?? chatResult?.runId;
-      if (createdRunId && conversation_id) {
-        useTaskRuntimeStore
-          .getState()
-          .loadByConversation(conversation_id)
-          .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
-      }
-      return true;
-    } catch (e) {
-      console.error('[TauriChat] Failed to send message:', e);
-      store.removeMessages(
-        pendingAssistantId ? [userMessageId, pendingAssistantId] : [userMessageId]
-      );
-      useToastStore.getState().addToast('error', `发送失败：${errorMessage(e)}`);
-      store.setRunStatus('failed');
-      assistantIdRef.current = null;
-      currentMessageKeyRef.current = null;
-      dispatchNextQueued();
-      return false;
-    }
-  }, []);
+    },
+    [dispatchNextQueued]
+  );
 
   dispatchMessageRef.current = dispatchMessage;
 

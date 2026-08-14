@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { skillsApi } from '../../api/endpoints';
-import type { SkillInfo, SkillUpdateStatus } from '../../types/api';
+import type { TauriSkillInfo, SkillUpdateStatus } from '../../types/api';
 import { CATEGORY_LABELS } from '../../types/api';
 import {
   BookOpen,
@@ -29,7 +29,7 @@ const CATEGORY_ORDER = [
 ];
 
 export function SkillsPanel() {
-  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const [skills, setSkills] = useState<TauriSkillInfo[]>([]);
   const [dir, setDir] = useState('');
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
@@ -60,14 +60,14 @@ export function SkillsPanel() {
 
   /** Group filtered skills by category, maintaining display order. */
   const groupedSkills = useMemo(() => {
-    const groups: Record<string, SkillInfo[]> = {};
+    const groups: Record<string, TauriSkillInfo[]> = {};
     for (const sk of filteredSkills) {
       const cat = sk.category || 'other';
       if (!groups[cat]) groups[cat] = [];
       groups[cat].push(sk);
     }
     // Sort categories
-    const sorted: [string, SkillInfo[]][] = [];
+    const sorted: [string, TauriSkillInfo[]][] = [];
     for (const cat of CATEGORY_ORDER) {
       if (groups[cat]) sorted.push([cat, groups[cat]]);
     }

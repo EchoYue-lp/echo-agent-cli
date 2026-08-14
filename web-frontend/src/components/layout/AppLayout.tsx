@@ -1,4 +1,4 @@
-import { type ReactNode } from 'react';
+import { useEffect, type ReactNode } from 'react';
 import { PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
 import { TerminalDrawer } from '../terminal/TerminalDrawer';
@@ -14,17 +14,22 @@ export function AppLayout({
 }) {
   const { leftSidebarOpen, toggleLeftSidebar } = useUiStore();
 
-  const closeSidebarMobile = () => {
-    if (window.innerWidth < 768 && leftSidebarOpen) {
-      toggleLeftSidebar();
-    }
-  };
+  useEffect(() => {
+    if (!leftSidebarOpen) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && window.innerWidth < 768) toggleLeftSidebar();
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [leftSidebarOpen, toggleLeftSidebar]);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-[var(--bg-chat)]">
       {/* Left Sidebar - Mobile overlay with blur */}
       {leftSidebarOpen && (
-        <div
+        <button
+          type="button"
+          aria-label="关闭侧边栏"
           className="fixed inset-0 z-40 md:hidden"
           style={{ background: 'var(--bg-overlay)' }}
           onClick={toggleLeftSidebar}
@@ -44,12 +49,13 @@ export function AppLayout({
         {/* Left toggle */}
         <button
           onClick={toggleLeftSidebar}
+          aria-label={leftSidebarOpen ? '关闭侧边栏' : '打开侧边栏'}
           className="absolute left-3 top-3 z-20 flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           title={leftSidebarOpen ? '关闭侧边栏' : '打开侧边栏'}
         >
           {leftSidebarOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
         </button>
-        <div onClick={closeSidebarMobile} className="flex flex-1 min-h-0">
+        <div className="flex flex-1 min-h-0">
           <div className="flex min-w-0 flex-1 flex-col">{center}</div>
           {right}
         </div>

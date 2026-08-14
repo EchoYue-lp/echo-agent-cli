@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   X,
@@ -40,6 +40,7 @@ import { SchedulerPanel } from '../scheduler/SchedulerPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
 import { ObservabilityPanel } from '../observability/ObservabilityPanel';
 import { SandboxPanel } from '../sandbox/SandboxPanel';
+import { Modal } from '../common/Modal';
 
 interface SettingsItem {
   id: SettingsTabId;
@@ -329,155 +330,143 @@ export function SettingsDialog() {
     group.items.some((item) => item.id === effectiveSettingsTab)
   );
 
-  // Close on Escape key
-  useEffect(() => {
-    if (!settingsOpen) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') closeSettings();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [settingsOpen, closeSettings]);
-
   if (!settingsOpen) return null;
 
   return (
-    <>
-      {/* Backdrop */}
-      <div
-        className="fixed inset-0 z-50"
-        style={{ background: 'var(--bg-overlay)' }}
-        onClick={closeSettings}
-      />
-
-      {/* Dialog */}
-      <div
-        className="settings-dialog animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
-        style={
-          {
-            '--accent': 'var(--settings-accent)',
-            '--accent-bg': 'var(--settings-accent-bg)',
-            '--border-focus': 'var(--settings-accent)',
-            '--text-on-accent': 'var(--settings-text-on-accent)',
-          } as CSSProperties
-        }
-      >
-        {/* Left sidebar — settings nav */}
-        <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
-          <div className="flex items-center justify-between border-b border-[var(--border-secondary)] px-5 py-4">
-            <h2 className="text-sm font-semibold text-[var(--text-primary)]">设置</h2>
-            <button
-              onClick={closeSettings}
-              className="flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-            >
-              <X size={15} />
-            </button>
-          </div>
-          <nav className="flex-1 overflow-y-auto p-3 space-y-5">
-            <button
-              onClick={() => setActiveSettingsTab('overview')}
-              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150 ${
-                effectiveSettingsTab === 'overview'
-                  ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
-                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
-              }`}
-            >
-              <LayoutDashboard size={15} className="shrink-0" />
-              <span className="min-w-0 flex-1">
-                <span className="truncate text-[13px] font-medium">总览</span>
-                <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
-                  核心工作流入口
-                </span>
+    <Modal
+      onClose={closeSettings}
+      ariaLabelledBy="settings-dialog-title"
+      className="settings-dialog animate-scale-in flex h-[85vh] w-[92vw] max-w-6xl overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
+      style={
+        {
+          '--accent': 'var(--settings-accent)',
+          '--accent-bg': 'var(--settings-accent-bg)',
+          '--border-focus': 'var(--settings-accent)',
+          '--text-on-accent': 'var(--settings-text-on-accent)',
+        } as CSSProperties
+      }
+    >
+      {/* Left sidebar — settings nav */}
+      <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
+        <div className="flex items-center justify-between border-b border-[var(--border-secondary)] px-5 py-4">
+          <h2
+            id="settings-dialog-title"
+            className="text-sm font-semibold text-[var(--text-primary)]"
+          >
+            设置
+          </h2>
+          <button
+            onClick={closeSettings}
+            aria-label="关闭设置"
+            className="flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+          >
+            <X size={15} />
+          </button>
+        </div>
+        <nav className="flex-1 overflow-y-auto p-3 space-y-5">
+          <button
+            onClick={() => setActiveSettingsTab('overview')}
+            className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150 ${
+              effectiveSettingsTab === 'overview'
+                ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
+                : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
+            }`}
+          >
+            <LayoutDashboard size={15} className="shrink-0" />
+            <span className="min-w-0 flex-1">
+              <span className="truncate text-[13px] font-medium">总览</span>
+              <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
+                核心工作流入口
               </span>
-            </button>
-            {settingsGroups.map((group) => (
-              <div key={group.label}>
-                {/* Group header */}
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (group.tier === 'advanced') {
-                      setExpandedAdvanced((prev) => ({
-                        ...prev,
-                        [group.label]: !prev[group.label],
-                      }));
-                    }
-                  }}
-                  className="flex w-full items-center gap-2 px-2.5 pb-2 text-left"
-                >
-                  <group.icon size={12} className="text-[var(--text-tertiary)]" />
-                  <span className="flex-1 text-[11px] font-semibold uppercase text-[var(--text-tertiary)]">
-                    {group.label}
-                  </span>
-                  {group.tier === 'advanced' &&
-                    (expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
-                      <ChevronDown size={12} className="text-[var(--text-tertiary)]" />
-                    ) : (
-                      <ChevronRight size={12} className="text-[var(--text-tertiary)]" />
-                    ))}
-                </button>
-                {(group.tier === 'core' ||
-                  group.defaultOpen ||
-                  expandedAdvanced[group.label] ||
-                  activeGroup?.label === group.label) &&
-                  group.items.map(({ id, label, icon: Icon, maturity, description }) => (
-                    <button
-                      key={id}
-                      onClick={() => setActiveSettingsTab(id)}
-                      className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150
-                      ${
-                        effectiveSettingsTab === id
-                          ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
-                          : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
-                      }`}
-                    >
-                      <Icon size={15} className="mt-0.5 shrink-0" />
-                      <span className="min-w-0 flex-1">
-                        <span className="flex min-w-0 items-center gap-2">
-                          <span className="truncate text-[13px] font-medium">{label}</span>
-                          <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
-                            {maturityLabel[maturity]}
-                          </span>
-                        </span>
-                        <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
-                          {description}
+            </span>
+          </button>
+          {settingsGroups.map((group) => (
+            <div key={group.label}>
+              {/* Group header */}
+              <button
+                type="button"
+                onClick={() => {
+                  if (group.tier === 'advanced') {
+                    setExpandedAdvanced((prev) => ({
+                      ...prev,
+                      [group.label]: !prev[group.label],
+                    }));
+                  }
+                }}
+                className="flex w-full items-center gap-2 px-2.5 pb-2 text-left"
+              >
+                <group.icon size={12} className="text-[var(--text-tertiary)]" />
+                <span className="flex-1 text-[11px] font-semibold uppercase text-[var(--text-tertiary)]">
+                  {group.label}
+                </span>
+                {group.tier === 'advanced' &&
+                  (expandedAdvanced[group.label] || activeGroup?.label === group.label ? (
+                    <ChevronDown size={12} className="text-[var(--text-tertiary)]" />
+                  ) : (
+                    <ChevronRight size={12} className="text-[var(--text-tertiary)]" />
+                  ))}
+              </button>
+              {(group.tier === 'core' ||
+                group.defaultOpen ||
+                expandedAdvanced[group.label] ||
+                activeGroup?.label === group.label) &&
+                group.items.map(({ id, label, icon: Icon, maturity, description }) => (
+                  <button
+                    key={id}
+                    onClick={() => setActiveSettingsTab(id)}
+                    className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150
+                    ${
+                      effectiveSettingsTab === id
+                        ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
+                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    <Icon size={15} className="mt-0.5 shrink-0" />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <span className="truncate text-[13px] font-medium">{label}</span>
+                        <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
+                          {maturityLabel[maturity]}
                         </span>
                       </span>
-                    </button>
-                  ))}
-              </div>
-            ))}
-          </nav>
-        </div>
+                      <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
+                        {description}
+                      </span>
+                    </span>
+                  </button>
+                ))}
+            </div>
+          ))}
+        </nav>
+      </div>
 
-        {/* Content area */}
-        <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">
-          <div className="flex items-center justify-between border-b border-[var(--border-secondary)] bg-[var(--settings-panel-bg)] px-6 py-3.5">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-semibold text-[var(--text-primary)]">
-                  {effectiveItem?.label}
-                </span>
-                {effectiveItem && (
-                  <span className="rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
-                    {maturityLabel[effectiveItem.maturity]}
-                  </span>
-                )}
-              </div>
+      {/* Content area */}
+      <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">
+        <div className="flex items-center justify-between border-b border-[var(--border-secondary)] bg-[var(--settings-panel-bg)] px-6 py-3.5">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span className="text-sm font-semibold text-[var(--text-primary)]">
+                {effectiveItem?.label}
+              </span>
               {effectiveItem && (
-                <div className="mt-0.5 text-xs text-[var(--text-tertiary)]">
-                  {effectiveItem.description}
-                </div>
+                <span className="rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
+                  {maturityLabel[effectiveItem.maturity]}
+                </span>
               )}
             </div>
+            {effectiveItem && (
+              <div className="mt-0.5 text-xs text-[var(--text-tertiary)]">
+                {effectiveItem.description}
+              </div>
+            )}
           </div>
-          <div className="flex-1 overflow-y-auto">
-            <div className="animate-fade-up p-6">
-              <Panel />
-            </div>
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          <div className="animate-fade-up p-6">
+            <Panel />
           </div>
         </div>
       </div>
-    </>
+    </Modal>
   );
 }

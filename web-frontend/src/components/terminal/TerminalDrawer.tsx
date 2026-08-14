@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { X, Plus, Minimize2 } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
 import { Terminal } from '../terminal/Terminal';
@@ -21,14 +21,7 @@ export function TerminalDrawer() {
   const [dragging, setDragging] = useState(false);
   const addToast = useToastStore((s) => s.addToast);
 
-  // Create initial terminal session on first open
-  useEffect(() => {
-    if (terminalOpen && tabs.length === 0) {
-      createNewTerminal();
-    }
-  }, [terminalOpen]);
-
-  const createNewTerminal = async () => {
+  const createNewTerminal = useCallback(async () => {
     const newId = `term-${Date.now()}`;
     const newLabel = `Terminal ${tabs.length + 1}`;
 
@@ -55,7 +48,14 @@ export function TerminalDrawer() {
 
     setTabs((prev) => [...prev, { id: newId, label: newLabel }]);
     setActiveTabId(newId);
-  };
+  }, [addToast, tabs.length]);
+
+  // Create initial terminal session on first open
+  useEffect(() => {
+    if (terminalOpen && tabs.length === 0) {
+      void createNewTerminal();
+    }
+  }, [createNewTerminal, tabs.length, terminalOpen]);
 
   const closeTab = async (tabId: string) => {
     if (isTauri()) {
@@ -74,7 +74,7 @@ export function TerminalDrawer() {
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== tabId);
       if (activeTabId === tabId) {
-        setActiveTabId(next.length > 0 ? next[next.length - 1].id : null);
+        setActiveTabId(next.at(-1)?.id ?? null);
       }
       if (next.length === 0) {
         closeTerminal();
@@ -114,9 +114,16 @@ export function TerminalDrawer() {
       style={{ height: `${height}px` }}
     >
       {/* Resize handle */}
-      <div
+      <button
+        type="button"
+        aria-label="调整终端高度"
         className="h-1 cursor-row-resize hover:bg-[var(--accent)]/30 transition-colors"
         onMouseDown={() => setDragging(true)}
+        onKeyDown={(event) => {
+          if (event.key === 'ArrowUp')
+            setHeight((current) => Math.min(current + 20, window.innerHeight - 100));
+          if (event.key === 'ArrowDown') setHeight((current) => Math.max(current - 20, 150));
+        }}
       />
 
       {/* Tab bar */}
@@ -125,6 +132,9 @@ export function TerminalDrawer() {
           {tabs.map((tab) => (
             <div
               key={tab.id}
+              role="tab"
+              tabIndex={tab.id === activeTabId ? 0 : -1}
+              aria-selected={tab.id === activeTabId}
               className={`group flex items-center gap-1.5 rounded-t-md px-3 py-1.5 text-xs cursor-pointer transition-colors
                 ${
                   tab.id === activeTabId
@@ -132,6 +142,12 @@ export function TerminalDrawer() {
                     : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                 }`}
               onClick={() => setActiveTabId(tab.id)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  setActiveTabId(tab.id);
+                }
+              }}
             >
               <span>{tab.label}</span>
               <button

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   pluginApi,
   type PluginInfo,
@@ -59,11 +59,7 @@ export function PluginPanel() {
     return { type: 'success', text: result.message || fallback };
   };
 
-  useEffect(() => {
-    loadPlugins();
-  }, []);
-
-  const loadPlugins = async () => {
+  const loadPlugins = useCallback(async () => {
     try {
       setLoading(true);
       const [data, themes, styles] = await Promise.all([
@@ -82,7 +78,11 @@ export function PluginPanel() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void loadPlugins();
+  }, [loadPlugins]);
 
   const handleThemeChange = async (name: string) => {
     try {

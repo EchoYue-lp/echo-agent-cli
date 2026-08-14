@@ -863,6 +863,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
 
             <textarea
               ref={textareaRef}
+              aria-label="消息"
               value={text}
               onChange={(e) => setText(e.target.value)}
               onKeyDown={handleKeyDown}

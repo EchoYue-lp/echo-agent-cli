@@ -1,10 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { mcpApi } from '../../api/endpoints';
-import type { McpServerInfo, McpConfig } from '../../types/api';
+import type { TauriMcpServerInfo, McpConfig } from '../../types/api';
 import { Globe, Trash2, ChevronDown, ChevronRight, Save, RefreshCw, Power } from 'lucide-react';
 
 export function McpPanel() {
-  const [servers, setServers] = useState<McpServerInfo[]>([]);
+  const [servers, setServers] = useState<TauriMcpServerInfo[]>([]);
   const [config, setConfig] = useState<McpConfig | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [jsonEditor, setJsonEditor] = useState<string>('');
@@ -15,11 +15,7 @@ export function McpPanel() {
     text: string;
   } | null>(null);
 
-  useEffect(() => {
-    loadData();
-  }, []);
-
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       const [serversData, configData] = await Promise.all([mcpApi.list(), mcpApi.getConfig()]);
       setServers(serversData);
@@ -28,7 +24,11 @@ export function McpPanel() {
     } catch (e) {
       console.error(e);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void loadData();
+  }, [loadData]);
 
   const saveConfig = async () => {
     try {
@@ -135,14 +135,19 @@ export function McpPanel() {
         className="space-y-2 rounded-lg border p-3"
         style={{ borderColor: s.border, background: s.bgHover }}
       >
-        <div className="text-xs font-medium mb-1" style={{ color: s.text }}>
+        <label
+          htmlFor="mcp-config-editor"
+          className="text-xs font-medium mb-1"
+          style={{ color: s.text }}
+        >
           MCP 配置（JSON 格式）
-        </div>
+        </label>
         <div className="text-xs mb-2" style={{ color: s.textSec }}>
           编辑完整的 MCP 配置，保存后将立即应用。
         </div>
 
         <textarea
+          id="mcp-config-editor"
           value={jsonEditor}
           onChange={(e) => {
             setJsonEditor(e.target.value);

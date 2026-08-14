@@ -2,13 +2,12 @@ import { get, post, put, del } from './client';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 // A-tier types that have identical generated counterparts — import from
 // generated to eliminate the same-name duplication (6-10).
-import type { SessionInfo, ContextStats } from '../generated';
+import type { SessionInfo, ContextStats, ToolInfo } from '../generated';
 import type {
-  ToolInfo,
-  SkillInfo,
+  TauriSkillInfo,
   SkillSyncResult,
   SkillUpdateStatus,
-  McpServerInfo,
+  TauriMcpServerInfo,
   McpConfig,
   MemoryEntry,
   NamespacesResponse,
@@ -62,7 +61,7 @@ type LoadSkillsResponse = {
   success: boolean;
   loaded?: string[];
   count?: number;
-  skills?: SkillInfo[];
+  skills?: TauriSkillInfo[];
 };
 
 export interface AutoMemoryObservation {
@@ -152,9 +151,12 @@ export const toolsApi = {
 };
 
 export const skillsApi = {
-  list: () => (isTauri() ? apiInvoke<SkillInfo[]>('list_skills') : get<SkillInfo[]>('/skills')),
+  list: () =>
+    isTauri() ? apiInvoke<TauriSkillInfo[]>('list_skills') : get<TauriSkillInfo[]>('/skills'),
   get: (name: string) =>
-    isTauri() ? apiInvoke<SkillInfo>('get_skill', { name }) : get<SkillInfo>(`/skills/${name}`),
+    isTauri()
+      ? apiInvoke<TauriSkillInfo>('get_skill', { name })
+      : get<TauriSkillInfo>(`/skills/${name}`),
   load: (dir: string) =>
     isTauri()
       ? apiInvoke<LoadSkillsResponse>('load_skill', { name: dir })
@@ -169,18 +171,18 @@ export const skillsApi = {
           success: boolean;
           requires_restart?: boolean;
           message?: string;
-          skills?: SkillInfo[];
+          skills?: TauriSkillInfo[];
         }>('disable_skill', { name })
       : post<{
           success: boolean;
           requires_restart?: boolean;
           message?: string;
-          skills?: SkillInfo[];
+          skills?: TauriSkillInfo[];
         }>(`/skills/${name}/disable`, {}),
   upload: (rootDir: string, files: { path: string; content: string }[]) =>
     isTauri()
       ? Promise.reject(new Error('Tauri 模式请使用“浏览”选择本地技能目录加载'))
-      : post<{ message: string; loaded: string[]; skills: SkillInfo[] }>('/skills/upload', {
+      : post<{ message: string; loaded: string[]; skills: TauriSkillInfo[] }>('/skills/upload', {
           root_dir: rootDir,
           files,
         }),
@@ -196,18 +198,20 @@ export const skillsApi = {
 
 export const mcpApi = {
   list: () =>
-    isTauri() ? apiInvoke<McpServerInfo[]>('list_mcp_servers') : get<McpServerInfo[]>('/mcp'),
+    isTauri()
+      ? apiInvoke<TauriMcpServerInfo[]>('list_mcp_servers')
+      : get<TauriMcpServerInfo[]>('/mcp'),
   get: (name: string) =>
     isTauri()
-      ? apiInvoke<McpServerInfo>('get_mcp_server', { name })
-      : get<McpServerInfo>(`/mcp/${name}`),
+      ? apiInvoke<TauriMcpServerInfo>('get_mcp_server', { name })
+      : get<TauriMcpServerInfo>(`/mcp/${name}`),
   connect: (req: { name: string; transport: { transport: string; [key: string]: unknown } }) =>
     isTauri()
       ? apiInvoke<{ success: boolean; name?: string; error?: string }>('connect_mcp_server', {
           name: req.name,
           transport: req.transport,
         })
-      : post<McpServerInfo>('/mcp/connect', req),
+      : post<TauriMcpServerInfo>('/mcp/connect', req),
   disconnect: (name: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('disconnect_mcp_server', { name })

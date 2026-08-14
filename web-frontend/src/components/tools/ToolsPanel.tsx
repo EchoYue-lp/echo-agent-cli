@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { toolsApi } from '../../api/endpoints';
-import type { ToolInfo } from '../../types/api';
+import type { ToolInfo } from '../../generated';
 import { Wrench, ChevronDown, ChevronRight } from 'lucide-react';
 
 export function ToolsPanel() {
@@ -86,12 +86,12 @@ export function ToolsPanel() {
               <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
                 {tool.description}
               </p>
-              {tool.input_schema && (
+              {tool.parameters && (
                 <pre
                   className="mt-2 max-h-40 overflow-auto rounded-lg p-2 text-[10px] leading-relaxed"
                   style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}
                 >
-                  {JSON.stringify(tool.input_schema, null, 2)}
+                  {JSON.stringify(tool.parameters, null, 2)}
                 </pre>
               )}
             </div>

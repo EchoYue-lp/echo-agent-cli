@@ -14,6 +14,12 @@ export type {
   ToolCallInfo,
   ContextStats,
   SessionInfo,
+  ToolInfo,
+} from '../generated';
+import type {
+  McpServerInfo as GeneratedMcpServerInfo,
+  McpToolInfo as GeneratedMcpToolInfo,
+  SkillInfo as GeneratedSkillInfo,
 } from '../generated';
 // covered by ts-rs, or (c) represent frontend-only state.  When adding
 // or changing a type, prefer updating the Rust-side serde derives and
@@ -176,17 +182,8 @@ export type ChatEvent = {
   | { type: 'done' }
 );
 
-export interface ToolInfo {
-  name: string;
-  description: string;
-  source: string;
-  input_schema?: Record<string, unknown>;
-  enabled: boolean;
-}
-
-export interface SkillInfo {
-  name: string;
-  description: string;
+/** Product projection emitted by the Tauri skills panel commands. */
+export type TauriSkillInfo = Pick<GeneratedSkillInfo, 'name' | 'description'> & {
   file: string;
   loaded?: boolean;
   source?: string;
@@ -203,7 +200,7 @@ export interface SkillInfo {
   upstream_version?: string | null;
   has_updates?: boolean;
   missing_dependencies?: string[];
-}
+};
 
 export type SkillUpdateState =
   | 'up_to_date'
@@ -238,32 +235,20 @@ export const CATEGORY_LABELS: Record<string, string> = {
   automation: '自动化',
 };
 
-export interface McpServerInfo {
-  name: string;
+/** MCP tool projection emitted by the Tauri MCP commands. */
+export type TauriMcpToolInfo = Pick<GeneratedMcpToolInfo, 'name' | 'description'> &
+  Partial<Pick<GeneratedMcpToolInfo, 'input_schema'>>;
+
+/** Product projection emitted by the Tauri MCP commands. */
+export type TauriMcpServerInfo = Pick<
+  GeneratedMcpServerInfo,
+  'name' | 'transport' | 'connected_at' | 'error'
+> & {
   status: 'connected' | 'disconnected' | 'error' | 'disabled';
-  transport: string;
   tool_count?: number;
-  tools?: McpToolInfo[];
-  connected_at?: string | null;
-  error?: string | null;
+  tools?: TauriMcpToolInfo[];
   enabled?: boolean;
-}
-
-export interface McpToolInfo {
-  name: string;
-  description: string;
-  input_schema?: Record<string, unknown>;
-}
-
-export interface ConnectMcpRequest {
-  name: string;
-  transport: McpTransportConfig;
-}
-
-export type McpTransportConfig =
-  | { stdio: { command: string; args?: string[]; env?: Record<string, string> } }
-  | { http: { url: string; headers?: Record<string, string> } }
-  | { sse: { url: string; headers?: Record<string, string> } };
+};
 
 export interface MemoryEntry {
   namespace: string;

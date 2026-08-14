@@ -252,8 +252,16 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
             searchResults.map((conv) => (
               <div
                 key={conv.conversation_id}
+                role="button"
+                tabIndex={0}
                 className="cursor-pointer rounded-md px-2 py-2 text-[12px] transition-colors hover:bg-[var(--bg-hover)]"
                 onClick={() => handleSelectConv(conv.conversation_id)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    handleSelectConv(conv.conversation_id);
+                  }
+                }}
               >
                 <div className="flex items-center gap-1.5">
                   <MessageSquare size={11} className="shrink-0 text-[var(--accent)]" />
@@ -295,6 +303,9 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
             <div key={ws.id} className="mb-0.5">
               {/* Workspace row */}
               <div
+                role="button"
+                tabIndex={0}
+                aria-label={`打开工作区 ${ws.name}`}
                 className={`group relative cursor-pointer rounded-md transition-all
                   ${
                     isActive
@@ -302,6 +313,13 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                       : 'hover:bg-[var(--bg-sidebar-hover)]'
                   }`}
                 onClick={() => handleSwitch(ws)}
+                onKeyDown={(event) => {
+                  if (event.target !== event.currentTarget) return;
+                  if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    handleSwitch(ws);
+                  }
+                }}
               >
                 <div className="flex items-center gap-2 px-2.5 py-2">
                   {/* Expand arrow */}
@@ -369,6 +387,8 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   {visibleConvs.map((conv) => (
                     <div
                       key={conv.id}
+                      role="button"
+                      tabIndex={0}
                       className={`cursor-pointer rounded-md px-2 py-1.5 text-[12px] transition-colors
                         ${
                           activeConvId === conv.id
@@ -378,6 +398,13 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                       onClick={(e) => {
                         e.stopPropagation();
                         handleSelectConv(conv.id);
+                      }}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' || event.key === ' ') {
+                          event.preventDefault();
+                          event.stopPropagation();
+                          handleSelectConv(conv.id);
+                        }
                       }}
                     >
                       <div className="flex items-center gap-1.5">

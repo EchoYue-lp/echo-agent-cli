@@ -23,8 +23,9 @@ function truncateByChars(value: string, maxChars: number): string {
 }
 
 function ElapsedTimer({ startedAt }: { startedAt: number }) {
-  const [elapsed, setElapsed] = useState(Date.now() - startedAt);
+  const [elapsed, setElapsed] = useState(0);
   useEffect(() => {
+    setElapsed(Date.now() - startedAt);
     const t = setInterval(() => setElapsed(Date.now() - startedAt), 1000);
     return () => clearInterval(t);
   }, [startedAt]);

@@ -105,6 +105,7 @@ export function TasksPanel() {
 
   // Subscribe to SSE for active tasks
   useEffect(() => {
+    const eventSources = eventSourcesRef.current;
     const activeTasks = tasks.filter(
       (t) => !['completed', 'failed', 'cancelled', 'timed_out'].includes(t.status)
     );
@@ -182,7 +183,7 @@ export function TasksPanel() {
 
     return () => {
       // Cleanup on unmount
-      Object.values(eventSourcesRef.current).forEach((es) => es.close());
+      Object.values(eventSources).forEach((es) => es.close());
     };
   }, [tasks, fetchTasks]);
 
@@ -328,8 +329,9 @@ export function TasksPanel() {
                 className="rounded-lg border px-3 py-2 transition-colors"
                 style={{ borderColor: s.border, background: s.bg }}
               >
-                <div
-                  className="flex items-center gap-2 cursor-pointer"
+                <button
+                  type="button"
+                  className="flex w-full cursor-pointer items-center gap-2 text-left"
                   onClick={() => setExpandedId(isExpanded ? null : task.id)}
                 >
                   <span
@@ -372,7 +374,7 @@ export function TasksPanel() {
                   ) : (
                     <ChevronDown size={12} style={{ color: s.textTer }} />
                   )}
-                </div>
+                </button>
 
                 {/* Progress bar (inline, always visible when progress exists) */}
                 {progress?.percentage != null && task.status === 'in_progress' && (

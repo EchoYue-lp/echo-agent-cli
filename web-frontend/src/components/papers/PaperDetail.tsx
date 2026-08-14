@@ -281,13 +281,14 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
               autoFocus
             />
           ) : (
-            <div
-              className="rounded-lg border p-3 text-xs leading-relaxed min-h-[60px] cursor-text"
+            <button
+              type="button"
+              className="min-h-[60px] w-full cursor-text rounded-lg border p-3 text-left text-xs leading-relaxed"
               style={{ borderColor: s.border, background: s.bgCard, color: s.textSec }}
               onClick={() => setEditingNotes(true)}
             >
               {paper.notes || <span style={{ color: s.textTer }}>Click to add notes...</span>}
-            </div>
+            </button>
           )}
         </div>
       </div>

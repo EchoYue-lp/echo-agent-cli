@@ -165,7 +165,7 @@ export function EvolutionPanel() {
     }
   };
 
-  const loadEvidence = async (filter: EvidenceInboxFilter = evidenceFilter) => {
+  const loadEvidence = async (filter: EvidenceInboxFilter) => {
     setLoadingEvidence(true);
     try {
       const data = await evolutionApi.listEvidence(filter);
@@ -194,10 +194,10 @@ export function EvolutionPanel() {
         'success',
         `候选已${action === 'accept' ? '采纳' : action === 'reject' ? '拒绝' : action === 'undo' ? '撤销' : '更新'}`
       );
-      await Promise.all([loadEvidence(), loadDashboard()]);
+      await Promise.all([loadEvidence(evidenceFilter), loadDashboard()]);
     } catch (e) {
       addToast('error', `操作失败: ${e instanceof Error ? e.message : '未知错误'}`);
-      await loadEvidence();
+      await loadEvidence(evidenceFilter);
     }
     setActingOnEvidence(null);
   };
@@ -221,7 +221,7 @@ export function EvolutionPanel() {
         setReviewError(res.error);
       } else {
         setReviewResult(res);
-        await loadEvidence();
+        await loadEvidence(evidenceFilter);
       }
     } catch (e: unknown) {
       setReviewError(e instanceof Error ? e.message : 'Unknown error');
@@ -436,7 +436,7 @@ export function EvolutionPanel() {
             )}
           </div>
           <button
-            onClick={() => loadEvidence()}
+            onClick={() => loadEvidence(evidenceFilter)}
             disabled={loadingEvidence}
             className="p-1 transition-colors"
             style={{ color: 'var(--accent)' }}

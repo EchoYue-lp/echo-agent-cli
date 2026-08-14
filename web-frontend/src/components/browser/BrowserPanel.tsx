@@ -18,17 +18,20 @@ export function BrowserPanel() {
   const browserScopeId = conversationId ?? `ui-preview:${workspaceId ?? 'global'}`;
   const view = useBrowserStore((state) => state.views[browserScopeId]);
   const store = useBrowserStore();
+  const refreshChromeStatus = useBrowserStore((state) => state.refreshChromeStatus);
+  const refreshFrame = useBrowserStore((state) => state.refreshFrame);
+  const viewStatus = view?.session.status;
   const handleChromeConnectionChange = useCallback((connected: boolean) => {
     useBrowserStore.setState({ chromeConnected: connected });
   }, []);
   useEffect(() => {
-    void store.refreshChromeStatus();
-  }, [store.refreshChromeStatus]);
+    void refreshChromeStatus();
+  }, [refreshChromeStatus]);
   useEffect(() => {
-    if (!view || view.session.status !== 'ready') return;
-    const timer = window.setInterval(() => void store.refreshFrame(browserScopeId), 1500);
+    if (viewStatus !== 'ready') return;
+    const timer = window.setInterval(() => void refreshFrame(browserScopeId), 1500);
     return () => window.clearInterval(timer);
-  }, [browserScopeId, store.refreshFrame, view?.session.status]);
+  }, [browserScopeId, refreshFrame, viewStatus]);
   const activeTab =
     view?.session.tabs.find((tab) => tab.id === view.activeTabId) ?? view?.session.tabs[0];
   const busy =

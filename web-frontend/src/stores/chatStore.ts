@@ -313,7 +313,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   /** Start a new tool batch (received tool_batch_start event from backend) */
-  startToolBatch: (_toolCount: number) => {
+  startToolBatch: () => {
     const state = get();
     // Capture the last thinking segment from the streaming message.
     // During streaming, thinking content is accumulated on message.thinkingSegments,

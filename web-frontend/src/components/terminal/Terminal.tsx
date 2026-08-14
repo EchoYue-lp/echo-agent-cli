@@ -264,6 +264,9 @@ export function Terminal({ sessionId }: TerminalProps) {
       {/* xterm.js container — tabIndex required for keyboard focus in Tauri WebView */}
       <div
         ref={containerRef}
+        role="textbox"
+        aria-label="终端"
+        aria-multiline="true"
         className="flex-1 min-h-0 p-1"
         tabIndex={0}
         style={{ outline: 'none' }}

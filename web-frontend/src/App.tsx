@@ -18,7 +18,6 @@ import { useTaskRuntimeStore } from './stores/taskRuntimeStore';
 import { RequireAuth } from './components/Auth/RequireAuth';
 
 function App() {
-  const startNew = useConversationStore((s) => s.startNew);
   const initConversations = useConversationStore((s) => s.init);
   const activeId = useConversationStore((s) => s.activeId);
   const loadTaskRun = useTaskRuntimeStore((s) => s.loadByConversation);
@@ -171,7 +170,7 @@ function App() {
         category: 'Navigation',
       },
     ],
-    [startNew, openSettings, setActiveSettingsTab, toggleTheme, toggleSidebar, toggleTerminal]
+    [openSettings, setActiveSettingsTab, toggleTheme, toggleSidebar, toggleTerminal]
   );
 
   return (

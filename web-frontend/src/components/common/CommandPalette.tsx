@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Search, Command } from 'lucide-react';
+import { Modal } from './Modal';
 
 export interface CommandItem {
   id: string;
@@ -73,99 +74,96 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
   let flatIndex = 0;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-20" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/50" />
+    <Modal
+      onClose={onClose}
+      ariaLabel="命令面板"
+      initialFocusRef={inputRef}
+      overlayClassName="items-start pt-20"
+      className="relative w-full max-w-lg overflow-hidden rounded-xl bg-[var(--bg-primary)] shadow-[var(--shadow-xl)]"
+    >
+      {/* Search input */}
       <div
-        className="relative w-full max-w-lg rounded-xl shadow-[var(--shadow-xl)] overflow-hidden"
-        style={{ background: 'var(--bg-primary)' }}
-        onClick={(e) => e.stopPropagation()}
+        className="flex items-center gap-2 px-4 py-3 border-b"
+        style={{ borderColor: 'var(--border-primary)' }}
       >
-        {/* Search input */}
-        <div
-          className="flex items-center gap-2 px-4 py-3 border-b"
-          style={{ borderColor: 'var(--border-primary)' }}
+        <Search size={16} style={{ color: 'var(--text-secondary)' }} />
+        <input
+          ref={inputRef}
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Type a command..."
+          aria-label="搜索命令"
+          className="flex-1 bg-transparent outline-none text-sm"
+          style={{ color: 'var(--text-primary)' }}
+        />
+        <kbd
+          className="text-xs px-1.5 py-0.5 rounded-md"
+          style={{
+            background: 'var(--bg-secondary)',
+            color: 'var(--text-secondary)',
+          }}
         >
-          <Search size={16} style={{ color: 'var(--text-secondary)' }} />
-          <input
-            ref={inputRef}
-            type="text"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={handleKeyDown}
-            placeholder="Type a command..."
-            className="flex-1 bg-transparent outline-none text-sm"
-            style={{ color: 'var(--text-primary)' }}
-          />
-          <kbd
-            className="text-xs px-1.5 py-0.5 rounded-md"
-            style={{
-              background: 'var(--bg-secondary)',
-              color: 'var(--text-secondary)',
-            }}
-          >
-            ESC
-          </kbd>
-        </div>
-
-        {/* Results */}
-        <div className="max-h-80 overflow-y-auto py-2">
-          {filtered.length === 0 ? (
-            <div
-              className="px-4 py-8 text-center text-sm"
-              style={{ color: 'var(--text-secondary)' }}
-            >
-              No results found
-            </div>
-          ) : (
-            Object.entries(grouped).map(([category, items]) => (
-              <div key={category}>
-                <div
-                  className="px-4 py-1 text-xs font-medium uppercase tracking-wider"
-                  style={{ color: 'var(--text-tertiary)' }}
-                >
-                  {category}
-                </div>
-                {items.map((cmd) => {
-                  const idx = flatIndex++;
-                  return (
-                    <button
-                      key={cmd.id}
-                      className={`w-full flex items-center gap-3 px-4 py-2 text-left text-sm transition-colors ${
-                        idx === selectedIndex ? 'bg-[var(--accent)]/10' : ''
-                      }`}
-                      style={{ color: 'var(--text-primary)' }}
-                      onClick={() => {
-                        cmd.action();
-                        onClose();
-                      }}
-                      onMouseEnter={() => setSelectedIndex(idx)}
-                    >
-                      <Command size={14} style={{ color: 'var(--text-secondary)' }} />
-                      <div className="flex-1 min-w-0">
-                        <div className="truncate">{cmd.label}</div>
-                        {cmd.description && (
-                          <div
-                            className="text-xs truncate"
-                            style={{ color: 'var(--text-secondary)' }}
-                          >
-                            {cmd.description}
-                          </div>
-                        )}
-                      </div>
-                      <span
-                        className="ml-auto text-xs shrink-0"
-                        style={{ color: 'var(--text-tertiary)' }}
-                      >
-                        {cmd.category}
-                      </span>
-                    </button>
-                  );
-                })}
-              </div>
-            ))
-          )}
-        </div>
+          ESC
+        </kbd>
       </div>
-    </div>
+
+      {/* Results */}
+      <div className="max-h-80 overflow-y-auto py-2">
+        {filtered.length === 0 ? (
+          <div className="px-4 py-8 text-center text-sm" style={{ color: 'var(--text-secondary)' }}>
+            No results found
+          </div>
+        ) : (
+          Object.entries(grouped).map(([category, items]) => (
+            <div key={category}>
+              <div
+                className="px-4 py-1 text-xs font-medium uppercase tracking-wider"
+                style={{ color: 'var(--text-tertiary)' }}
+              >
+                {category}
+              </div>
+              {items.map((cmd) => {
+                const idx = flatIndex++;
+                return (
+                  <button
+                    key={cmd.id}
+                    className={`w-full flex items-center gap-3 px-4 py-2 text-left text-sm transition-colors ${
+                      idx === selectedIndex ? 'bg-[var(--accent)]/10' : ''
+                    }`}
+                    style={{ color: 'var(--text-primary)' }}
+                    onClick={() => {
+                      cmd.action();
+                      onClose();
+                    }}
+                    onMouseEnter={() => setSelectedIndex(idx)}
+                  >
+                    <Command size={14} style={{ color: 'var(--text-secondary)' }} />
+                    <div className="flex-1 min-w-0">
+                      <div className="truncate">{cmd.label}</div>
+                      {cmd.description && (
+                        <div
+                          className="text-xs truncate"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {cmd.description}
+                        </div>
+                      )}
+                    </div>
+                    <span
+                      className="ml-auto text-xs shrink-0"
+                      style={{ color: 'var(--text-tertiary)' }}
+                    >
+                      {cmd.category}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          ))
+        )}
+      </div>
+    </Modal>
   );
 }

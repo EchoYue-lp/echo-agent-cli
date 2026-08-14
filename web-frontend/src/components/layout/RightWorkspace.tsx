@@ -21,13 +21,14 @@ import { RightRail } from './RightRail';
 
 export function RightWorkspace() {
   const store = useRightWorkspaceStore();
+  const setWidth = store.setWidth;
   const leftSidebarOpen = useUiStore((state) => state.leftSidebarOpen);
   const resizing = useRef(false);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 
   useEffect(() => {
     const move = (event: PointerEvent) => {
-      if (resizing.current) store.setWidth(window.innerWidth - event.clientX);
+      if (resizing.current) setWidth(window.innerWidth - event.clientX);
     };
     const stop = () => {
       resizing.current = false;
@@ -41,7 +42,7 @@ export function RightWorkspace() {
       window.removeEventListener('pointerup', stop);
       window.removeEventListener('resize', resize);
     };
-  }, [store.setWidth]);
+  }, [setWidth]);
 
   if (!store.open) return null;
 
@@ -49,7 +50,12 @@ export function RightWorkspace() {
 
   return (
     <>
-      <div className="fixed inset-0 z-[55] bg-black/25 xl:hidden" onClick={store.close} />
+      <button
+        type="button"
+        aria-label="关闭工作区面板"
+        className="fixed inset-0 z-[55] bg-black/25 xl:hidden"
+        onClick={store.close}
+      />
       <aside
         className="fixed inset-y-0 right-0 z-[60] flex min-w-0 flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl max-md:!w-full max-md:border-l-0 xl:relative xl:z-20 xl:shadow-none"
         style={{ width }}

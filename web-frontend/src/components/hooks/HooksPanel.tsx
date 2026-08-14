@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { hooksApi, type HookSourceInfo, type HooksReloadSummary } from '../../api/endpoints';
 import {
   Webhook,
@@ -36,20 +36,7 @@ export function HooksPanel() {
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
-  useEffect(() => {
-    loadHooks();
-    hooksApi
-      .events()
-      .then((available) => {
-        setEvents(available);
-        setSelectedEvent((current) =>
-          available.length > 0 && !available.includes(current) ? available[0] : current
-        );
-      })
-      .catch((e: any) => setError(e.message || 'Failed to load hook events'));
-  }, []);
-
-  const loadHooks = async () => {
+  const loadHooks = useCallback(async () => {
     try {
       setLoading(true);
       const data = await hooksApi.list();
@@ -60,7 +47,20 @@ export function HooksPanel() {
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    void loadHooks();
+    hooksApi
+      .events()
+      .then((available) => {
+        setEvents(available);
+        setSelectedEvent((current) =>
+          available.length > 0 && !available.includes(current) ? available[0] : current
+        );
+      })
+      .catch((e: any) => setError(e.message || 'Failed to load hook events'));
+  }, [loadHooks]);
 
   const handleReload = async () => {
     try {

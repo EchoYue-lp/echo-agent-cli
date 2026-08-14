@@ -282,10 +282,14 @@ export function WorktreePanel() {
           </h3>
           <div className="space-y-3">
             <div>
-              <label className="mb-1 block text-xs font-medium text-[var(--text-secondary)]">
+              <label
+                htmlFor="worktree-branch"
+                className="mb-1 block text-xs font-medium text-[var(--text-secondary)]"
+              >
                 Branch Name <span className="text-[var(--color-error)]">*</span>
               </label>
               <input
+                id="worktree-branch"
                 value={newBranch}
                 onChange={(e) => setNewBranch(e.target.value)}
                 placeholder="feature/my-branch"
@@ -298,10 +302,14 @@ export function WorktreePanel() {
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-[var(--text-secondary)]">
+              <label
+                htmlFor="worktree-base"
+                className="mb-1 block text-xs font-medium text-[var(--text-secondary)]"
+              >
                 Base (optional)
               </label>
               <input
+                id="worktree-base"
                 value={newBase}
                 onChange={(e) => setNewBase(e.target.value)}
                 placeholder="main, HEAD, or commit hash"

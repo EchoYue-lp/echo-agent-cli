@@ -94,12 +94,14 @@ export function ExtractPanel() {
       {/* Input */}
       <div>
         <label
+          htmlFor="extract-input"
           className="text-[10px] font-medium uppercase tracking-wider"
           style={{ color: 'var(--text-tertiary)' }}
         >
           输入文本
         </label>
         <textarea
+          id="extract-input"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="输入自然语言文本以提取结构化数据..."
@@ -130,6 +132,7 @@ export function ExtractPanel() {
       <div>
         <div className="flex items-center justify-between">
           <label
+            htmlFor="extract-schema"
             className="text-[10px] font-medium uppercase tracking-wider"
             style={{ color: 'var(--text-tertiary)' }}
           >
@@ -144,6 +147,7 @@ export function ExtractPanel() {
           </button>
         </div>
         <textarea
+          id="extract-schema"
           value={schema}
           onChange={(e) => {
             setSchema(e.target.value);

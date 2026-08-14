@@ -48,9 +48,10 @@ export function GitLogPanel({ commits, branch = 'main', onCommitClick }: GitLogP
           <div className="py-8 text-center text-sm text-[var(--text-tertiary)]">No commits yet</div>
         ) : (
           commits.map((commit, index) => (
-            <div
+            <button
+              type="button"
               key={index}
-              className="flex gap-4 px-5 py-4 hover:bg-[var(--bg-hover)] transition-colors cursor-pointer group"
+              className="group flex w-full cursor-pointer gap-4 px-5 py-4 text-left transition-colors hover:bg-[var(--bg-hover)]"
               onClick={() => onCommitClick?.(commit)}
             >
               {/* Timeline */}
@@ -95,7 +96,7 @@ export function GitLogPanel({ commits, branch = 'main', onCommitClick }: GitLogP
                   </div>
                 )}
               </div>
-            </div>
+            </button>
           ))
         )}
       </div>

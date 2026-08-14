@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   autoMemoryApi,
   memoryApi,
@@ -26,23 +26,14 @@ export function MemoryPanel() {
   const [autoBusy, setAutoBusy] = useState(false);
   const [autoMessage, setAutoMessage] = useState<string | null>(null);
 
-  useEffect(() => {
-    memoryApi
-      .namespaces()
-      .then((data) => setNamespaces(data.namespaces.map((ns) => ns.join('/'))))
-      .catch(console.error);
-    loadEntries();
-    loadAutoMemoryStatus();
-  }, []);
-
-  const loadAutoMemoryStatus = async () => {
+  const loadAutoMemoryStatus = useCallback(async () => {
     try {
       const status = await autoMemoryApi.status();
       setAutoStatus(status);
     } catch (e) {
       console.error(e);
     }
-  };
+  }, []);
 
   const toggleAutoMemory = async () => {
     if (!autoStatus || autoBusy) return;
@@ -93,14 +84,23 @@ export function MemoryPanel() {
     }
   };
 
-  const loadEntries = async (ns?: string) => {
+  const loadEntries = useCallback(async (ns?: string) => {
     try {
       const data = await memoryApi.list(ns || undefined);
       setEntries(data);
     } catch (e) {
       console.error(e);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    memoryApi
+      .namespaces()
+      .then((data) => setNamespaces(data.namespaces.map((ns) => ns.join('/'))))
+      .catch(console.error);
+    void loadEntries();
+    void loadAutoMemoryStatus();
+  }, [loadAutoMemoryStatus, loadEntries]);
 
   const search = async () => {
     if (!searchQuery.trim()) {

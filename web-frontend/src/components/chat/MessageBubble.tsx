@@ -28,7 +28,9 @@ async function copyToClipboard(text: string): Promise<boolean> {
       await navigator.clipboard.writeText(text);
       return true;
     }
-  } catch {}
+  } catch {
+    // Fall through to the legacy clipboard path.
+  }
   const textarea = document.createElement('textarea');
   textarea.value = text;
   textarea.style.position = 'fixed';
@@ -237,13 +239,19 @@ export const MessageBubble = memo(function MessageBubble({
                 key={i}
                 className="overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)]"
               >
-                <img
-                  src={img.url}
-                  alt={img.name}
-                  className="w-full object-cover"
-                  style={{ maxHeight: '300px' }}
+                <button
+                  type="button"
+                  aria-label={`打开图片 ${img.name}`}
                   onClick={() => window.open(img.url, '_blank')}
-                />
+                  className="block w-full border-0 bg-transparent p-0"
+                >
+                  <img
+                    src={img.url}
+                    alt={img.name}
+                    className="w-full object-cover"
+                    style={{ maxHeight: '300px' }}
+                  />
+                </button>
               </div>
             ))}
           </div>

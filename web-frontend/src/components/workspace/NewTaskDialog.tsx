@@ -13,6 +13,7 @@ import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { workspaceApi } from '../../api/endpoints';
 import { fileSystem, isTauri } from '../../lib/tauri-bridge';
 import { WORKSPACE_KINDS as WORKSPACE_KIND } from '../../lib/workspaceKinds';
+import { Modal } from '../common/Modal';
 import DirectoryPicker from './DirectoryPicker';
 
 interface Props {
@@ -148,17 +149,11 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
   return (
     <>
-      {/* Backdrop */}
-      <div className="fixed inset-0 z-50 bg-black/50" onClick={onClose} />
-
-      {/* Dialog */}
-      <div
-        className="fixed left-1/2 top-1/2 z-50 flex w-[540px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border shadow-[var(--shadow-xl)]"
-        style={{
-          background: 'var(--bg-primary)',
-          borderColor: 'var(--border-primary)',
-          maxHeight: '85vh',
-        }}
+      <Modal
+        onClose={onClose}
+        ariaLabel="任务工作区"
+        active={!showPicker}
+        className="flex max-h-[85vh] w-[540px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-xl)]"
       >
         {/* Header */}
         <div
@@ -322,12 +317,14 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
               {/* Name input */}
               <div>
                 <label
+                  htmlFor="new-task-name"
                   className="block text-xs font-medium mb-1.5"
                   style={{ color: 'var(--text-secondary)' }}
                 >
                   任务名称
                 </label>
                 <input
+                  id="new-task-name"
                   type="text"
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
@@ -347,12 +344,12 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
               {/* Kind selector */}
               <div>
-                <label
+                <div
                   className="block text-xs font-medium mb-1.5"
                   style={{ color: 'var(--text-secondary)' }}
                 >
                   任务类型
-                </label>
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                   {WORKSPACE_KIND.map((k) => {
                     const Icon = k.icon;
@@ -360,6 +357,8 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                     return (
                       <button
                         key={k.value}
+                        type="button"
+                        aria-pressed={selected}
                         onClick={() => setNewKind(k.value)}
                         className={`flex items-center gap-2.5 rounded-lg border p-3 text-left transition-all ${
                           selected ? 'border-2' : ''
@@ -389,12 +388,12 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
               {/* Folder path */}
               <div>
-                <label
+                <div
                   className="block text-xs font-medium mb-2"
                   style={{ color: 'var(--text-secondary)' }}
                 >
                   工作目录
-                </label>
+                </div>
 
                 {useCustomRoot ? (
                   <div className="space-y-2">
@@ -490,7 +489,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
             </button>
           </div>
         )}
-      </div>
+      </Modal>
 
       {/* Directory Picker (web mode) */}
       <DirectoryPicker

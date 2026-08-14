@@ -100,8 +100,14 @@ export function McpManagerPanel({
           </h3>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div>
-              <label className="block text-xs text-[var(--text-tertiary)] mb-1">Server Name</label>
+              <label
+                htmlFor="mcp-server-name"
+                className="block text-xs text-[var(--text-tertiary)] mb-1"
+              >
+                Server Name
+              </label>
               <input
+                id="mcp-server-name"
                 placeholder="e.g., playwright"
                 value={newServer.name || ''}
                 onChange={(e) => setNewServer({ ...newServer, name: e.target.value })}
@@ -109,8 +115,14 @@ export function McpManagerPanel({
               />
             </div>
             <div>
-              <label className="block text-xs text-[var(--text-tertiary)] mb-1">Transport</label>
+              <label
+                htmlFor="mcp-server-transport"
+                className="block text-xs text-[var(--text-tertiary)] mb-1"
+              >
+                Transport
+              </label>
               <select
+                id="mcp-server-transport"
                 value={newServer.transport}
                 onChange={(e) =>
                   setNewServer({
@@ -126,8 +138,14 @@ export function McpManagerPanel({
               </select>
             </div>
             <div className="md:col-span-2">
-              <label className="block text-xs text-[var(--text-tertiary)] mb-1">Command</label>
+              <label
+                htmlFor="mcp-server-command"
+                className="block text-xs text-[var(--text-tertiary)] mb-1"
+              >
+                Command
+              </label>
               <input
+                id="mcp-server-command"
                 placeholder="e.g., npx -y @playwright/mcp@latest"
                 value={newServer.command || ''}
                 onChange={(e) => setNewServer({ ...newServer, command: e.target.value })}
@@ -135,10 +153,14 @@ export function McpManagerPanel({
               />
             </div>
             <div className="md:col-span-2">
-              <label className="block text-xs text-[var(--text-tertiary)] mb-1">
+              <label
+                htmlFor="mcp-server-description"
+                className="block text-xs text-[var(--text-tertiary)] mb-1"
+              >
                 Description (optional)
               </label>
               <textarea
+                id="mcp-server-description"
                 placeholder="Brief description of this MCP server"
                 value={newServer.description || ''}
                 onChange={(e) => setNewServer({ ...newServer, description: e.target.value })}

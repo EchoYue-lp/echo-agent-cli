@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { Modal } from '../common/Modal';
 
 interface PlanTask {
   id: string;
@@ -47,134 +48,129 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={onClose}
+    <Modal
+      onClose={onClose}
+      ariaLabel="编辑任务计划"
+      className="flex max-h-[80vh] w-[720px] max-w-[calc(100vw-2rem)] flex-col rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)]"
     >
-      <div
-        className="w-[720px] max-h-[80vh] rounded-lg flex flex-col"
-        style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-primary)' }}
-        onClick={(e) => e.stopPropagation()}
+      <header
+        className="flex items-center justify-between px-4 py-3 border-b"
+        style={{ borderColor: 'var(--border-primary)' }}
       >
-        <header
-          className="flex items-center justify-between px-4 py-3 border-b"
-          style={{ borderColor: 'var(--border-primary)' }}
-        >
-          <h2 className="font-medium" style={{ color: 'var(--text-primary)' }}>
-            编辑任务计划
-          </h2>
-          <div className="flex gap-2 items-center">
-            <button
-              className="text-xs"
-              style={{
-                color: mode === 'form' ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                fontWeight: mode === 'form' ? 600 : 400,
-              }}
-              onClick={() => setMode('form')}
-            >
-              表单
-            </button>
-            <button
-              className="text-xs"
-              style={{
-                color: mode === 'json' ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                fontWeight: mode === 'json' ? 600 : 400,
-              }}
-              onClick={() => setMode('json')}
-            >
-              JSON
-            </button>
-            <button
-              onClick={onClose}
-              className="text-xs ml-2"
-              style={{ color: 'var(--text-tertiary)' }}
-            >
-              ✕
-            </button>
-          </div>
-        </header>
-        <div className="flex-1 overflow-y-auto p-4">
-          {mode === 'form' ? (
-            <div className="space-y-3">
-              {tasks.map((t) => (
-                <div
-                  key={t.id}
-                  className="space-y-1 rounded-md p-2"
-                  style={{ border: '1px solid var(--border-secondary)' }}
-                >
-                  <input
-                    className="w-full bg-transparent text-sm font-medium"
-                    style={{ color: 'var(--text-primary)' }}
-                    value={t.title}
-                    onChange={(e) => updateTask(t.id, { title: e.target.value })}
-                    placeholder="任务标题"
-                  />
-                  <textarea
-                    className="w-full bg-transparent text-xs"
-                    style={{ color: 'var(--text-secondary)' }}
-                    rows={2}
-                    value={t.description ?? ''}
-                    onChange={(e) => updateTask(t.id, { description: e.target.value })}
-                    placeholder="任务描述（可选）"
-                  />
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div className="space-y-2">
-              <textarea
-                className="w-full font-mono text-xs p-2 rounded-md min-h-[300px]"
-                style={{
-                  color: 'var(--text-primary)',
-                  background: 'var(--bg-secondary)',
-                  border: '1px solid var(--border-secondary)',
-                }}
-                value={rawJson}
-                onChange={(e) => setRawJson(e.target.value)}
-              />
-              <button
-                onClick={applyJson}
-                className="text-xs px-2 py-1 rounded-md"
-                style={{
-                  background: 'var(--bg-hover)',
-                  color: 'var(--text-secondary)',
-                  border: '1px solid var(--border-secondary)',
-                }}
-              >
-                应用 JSON
-              </button>
-              {error && (
-                <div className="text-xs" style={{ color: 'var(--color-error)' }}>
-                  {error}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-        <footer
-          className="flex justify-end gap-2 px-4 py-3 border-t"
-          style={{ borderColor: 'var(--border-primary)' }}
-        >
+        <h2 className="font-medium" style={{ color: 'var(--text-primary)' }}>
+          编辑任务计划
+        </h2>
+        <div className="flex gap-2 items-center">
+          <button
+            className="text-xs"
+            style={{
+              color: mode === 'form' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+              fontWeight: mode === 'form' ? 600 : 400,
+            }}
+            onClick={() => setMode('form')}
+          >
+            表单
+          </button>
+          <button
+            className="text-xs"
+            style={{
+              color: mode === 'json' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+              fontWeight: mode === 'json' ? 600 : 400,
+            }}
+            onClick={() => setMode('json')}
+          >
+            JSON
+          </button>
           <button
             onClick={onClose}
-            className="px-3 py-1 text-xs rounded-md"
-            style={{
-              background: 'var(--bg-hover)',
-              color: 'var(--text-secondary)',
-              border: '1px solid var(--border-secondary)',
-            }}
+            className="text-xs ml-2"
+            style={{ color: 'var(--text-tertiary)' }}
           >
-            取消
+            ✕
           </button>
-          <button
-            onClick={handleSave}
-            className="px-3 py-1 text-xs rounded-md font-medium"
-            style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
-          >
-            保存
-          </button>
-        </footer>
+        </div>
+      </header>
+      <div className="flex-1 overflow-y-auto p-4">
+        {mode === 'form' ? (
+          <div className="space-y-3">
+            {tasks.map((t) => (
+              <div
+                key={t.id}
+                className="space-y-1 rounded-md p-2"
+                style={{ border: '1px solid var(--border-secondary)' }}
+              >
+                <input
+                  className="w-full bg-transparent text-sm font-medium"
+                  style={{ color: 'var(--text-primary)' }}
+                  value={t.title}
+                  onChange={(e) => updateTask(t.id, { title: e.target.value })}
+                  placeholder="任务标题"
+                />
+                <textarea
+                  className="w-full bg-transparent text-xs"
+                  style={{ color: 'var(--text-secondary)' }}
+                  rows={2}
+                  value={t.description ?? ''}
+                  onChange={(e) => updateTask(t.id, { description: e.target.value })}
+                  placeholder="任务描述（可选）"
+                />
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="space-y-2">
+            <textarea
+              className="w-full font-mono text-xs p-2 rounded-md min-h-[300px]"
+              style={{
+                color: 'var(--text-primary)',
+                background: 'var(--bg-secondary)',
+                border: '1px solid var(--border-secondary)',
+              }}
+              value={rawJson}
+              onChange={(e) => setRawJson(e.target.value)}
+            />
+            <button
+              onClick={applyJson}
+              className="text-xs px-2 py-1 rounded-md"
+              style={{
+                background: 'var(--bg-hover)',
+                color: 'var(--text-secondary)',
+                border: '1px solid var(--border-secondary)',
+              }}
+            >
+              应用 JSON
+            </button>
+            {error && (
+              <div className="text-xs" style={{ color: 'var(--color-error)' }}>
+                {error}
+              </div>
+            )}
+          </div>
+        )}
       </div>
-    </div>
+      <footer
+        className="flex justify-end gap-2 px-4 py-3 border-t"
+        style={{ borderColor: 'var(--border-primary)' }}
+      >
+        <button
+          onClick={onClose}
+          className="px-3 py-1 text-xs rounded-md"
+          style={{
+            background: 'var(--bg-hover)',
+            color: 'var(--text-secondary)',
+            border: '1px solid var(--border-secondary)',
+          }}
+        >
+          取消
+        </button>
+        <button
+          onClick={handleSave}
+          className="px-3 py-1 text-xs rounded-md font-medium"
+          style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
+        >
+          保存
+        </button>
+      </footer>
+    </Modal>
   );
 }

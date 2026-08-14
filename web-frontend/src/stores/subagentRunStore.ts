@@ -33,7 +33,6 @@ export type SubagentRunEventKind =
   | 'started'
   | 'usage' // canonical DispatchLlmUsage event with provider/cache metadata
   | 'isolation_observed'
-  | 'artifact'
   | 'completed'
   | 'failed'
   | 'timed_out'
@@ -147,7 +146,6 @@ const STORED_SUBAGENT_EVENTS = new Set<string>([
   'started',
   'usage',
   'isolation_observed',
-  'artifact',
   'completed',
   'failed',
   'timed_out',

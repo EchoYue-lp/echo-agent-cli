@@ -341,9 +341,15 @@ export function ProviderPanel() {
 
           {/* Model selection */}
           <div>
-            <label className="mb-1 block text-xs text-[var(--text-secondary)]">模型</label>
+            <label
+              htmlFor="provider-model"
+              className="mb-1 block text-xs text-[var(--text-secondary)]"
+            >
+              模型
+            </label>
             {isCustom || (selected.default_models ?? []).length === 0 ? (
               <input
+                id="provider-model"
                 type="text"
                 value={isCustom ? customModel || selectedModel : customModel}
                 onChange={(e) => {
@@ -361,6 +367,7 @@ export function ProviderPanel() {
               <>
                 <div className="flex gap-2">
                   <select
+                    id="provider-model"
                     value={customModel.trim() ? '__custom__' : selectedModel}
                     onChange={(e) => {
                       if (e.target.value === '__custom__') {
@@ -396,11 +403,15 @@ export function ProviderPanel() {
           {/* Temperature & Max Tokens */}
           <div className="grid grid-cols-2 gap-3">
             <div>
-              <label className="mb-1 block text-xs text-[var(--text-secondary)]">
+              <label
+                htmlFor="provider-temperature"
+                className="mb-1 block text-xs text-[var(--text-secondary)]"
+              >
                 温度
                 <span className="ml-1 text-[var(--text-tertiary)]">(可选)</span>
               </label>
               <input
+                id="provider-temperature"
                 type="number"
                 step="0.1"
                 min="0"
@@ -412,11 +423,15 @@ export function ProviderPanel() {
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs text-[var(--text-secondary)]">
+              <label
+                htmlFor="provider-max-tokens"
+                className="mb-1 block text-xs text-[var(--text-secondary)]"
+              >
                 最大输出 Token
                 <span className="ml-1 text-[var(--text-tertiary)]">(可选)</span>
               </label>
               <input
+                id="provider-max-tokens"
                 type="number"
                 min="1"
                 value={maxTokens}
@@ -436,12 +451,16 @@ export function ProviderPanel() {
 
           {/* Context Window */}
           <div>
-            <label className="mb-1 block text-xs text-[var(--text-secondary)]">
+            <label
+              htmlFor="provider-context-window"
+              className="mb-1 block text-xs text-[var(--text-secondary)]"
+            >
               模型上下文窗口
               <span className="ml-1 text-[var(--text-tertiary)]">(可选，留空自动推断)</span>
             </label>
             <div className="flex gap-2">
               <select
+                id="provider-context-window"
                 value={contextWindowPreset}
                 onChange={(e) => {
                   const val = e.target.value;
