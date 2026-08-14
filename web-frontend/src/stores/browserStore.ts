@@ -2,13 +2,7 @@ import { create } from 'zustand';
 import { apiInvoke, errorMessage, isTauri } from '../lib/tauri-bridge';
 
 export type BrowserStatus =
-  | 'starting'
-  | 'ready'
-  | 'navigating'
-  | 'acting'
-  | 'waiting_confirmation'
-  | 'closed'
-  | 'failed';
+  'starting' | 'ready' | 'navigating' | 'acting' | 'waiting_confirmation' | 'closed' | 'failed';
 
 export interface BrowserTab {
   id: string;

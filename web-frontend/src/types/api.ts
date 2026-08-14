@@ -55,8 +55,7 @@ export type ChatRunStatus =
 export type ToolExecutionStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 export type ToolExecutionOwner =
-  | { kind: 'chat'; message_id: string }
-  | { kind: 'subagent'; subagent_run_id: string };
+  { kind: 'chat'; message_id: string } | { kind: 'subagent'; subagent_run_id: string };
 
 export type ToolFailureCategory =
   | 'invalid_arguments'
@@ -68,11 +67,7 @@ export type ToolFailureCategory =
   | 'partial_side_effect';
 
 export type ToolRecoveryAction =
-  | 'correct_arguments'
-  | 'retry'
-  | 'restore_then_retry'
-  | 'verify_then_retry'
-  | 'stop';
+  'correct_arguments' | 'retry' | 'restore_then_retry' | 'verify_then_retry' | 'stop';
 
 export interface ToolFailure {
   category: ToolFailureCategory;
@@ -203,11 +198,7 @@ export type TauriSkillInfo = Pick<GeneratedSkillInfo, 'name' | 'description'> & 
 };
 
 export type SkillUpdateState =
-  | 'up_to_date'
-  | 'update_available'
-  | 'local_changes'
-  | 'untracked'
-  | 'error';
+  'up_to_date' | 'update_available' | 'local_changes' | 'untracked' | 'error';
 
 export interface SkillUpdateStatus {
   name: string;
@@ -711,8 +702,7 @@ export interface MemoryConflictProposal {
 }
 
 export type EvidenceAction =
-  | { kind: 'save_memory' }
-  | { kind: 'merge_memories'; proposal: MemoryConflictProposal };
+  { kind: 'save_memory' } | { kind: 'merge_memories'; proposal: MemoryConflictProposal };
 
 export type EvidenceTarget =
   | { kind: 'memory'; key: string }
