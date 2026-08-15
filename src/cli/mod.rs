@@ -21,4 +21,4 @@ pub use modes::run_channels_mode;
 pub use modes::{
     CompanionModeShutdown, HeadlessServiceResources, run_cli_mode, start_headless_services,
 };
-pub use repl::{ReplConfig, run_repl};
+pub use repl::{ReplConfig, ReplHumanLoopSession, run_repl};

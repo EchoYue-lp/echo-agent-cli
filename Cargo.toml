@@ -57,7 +57,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
-reedline = "0.38"
+reedline = { version = "0.38", features = ["external_printer"] }
 nu-ansi-term = "0.50"
 crossterm = { version = "0.28", optional = true }
 futures = "0.3"
@@ -101,8 +101,8 @@ base64 = "0.22"
 arboard = { version = "3", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
-
 [dev-dependencies]
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", default-features = false, features = ["testing"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }

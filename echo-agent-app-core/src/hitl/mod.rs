@@ -9,6 +9,6 @@ pub mod repl_provider;
 pub mod tui_provider;
 
 pub use channel_provider::{ChannelHumanLoopProvider, ChannelHumanLoopResolution};
-pub use dispatcher::HitlDispatcher;
-pub use repl_provider::ReplHumanLoopProvider;
+pub use dispatcher::{HitlDispatcher, HitlProviderRegistration};
+pub use repl_provider::{PendingReplHumanLoopRequest, ReplHumanLoopProvider};
 pub use tui_provider::{PendingApproval, PendingHumanLoopKind, TuiHumanLoopProvider};

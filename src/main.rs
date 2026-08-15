@@ -269,15 +269,14 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             "AgentPool initialized for TUI (background task isolation)"
         );
 
-        // Swap REPL provider → TUI provider (REPL blocks on stdin, incompatible
-        // with the TUI alternate screen).
+        // TUI owns its provider for the full-screen session. The REPL provider
+        // is registered only by CLI startup, so no provider swap is needed.
         let tui_pending = {
             use echo_agent_app_core::hitl::TuiHumanLoopProvider;
             let tui_provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
             let pending = tui_provider.pending_handle();
-            runtime.hitl_dispatcher.unregister("repl").await;
             runtime.hitl_dispatcher.register("tui", tui_provider).await;
-            tracing::info!("HITL: REPL provider swapped for TUI provider");
+            tracing::info!("HITL: TUI provider registered");
             pending
         };
         let tui_services = cli::start_headless_services(

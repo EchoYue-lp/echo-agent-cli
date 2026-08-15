@@ -49,7 +49,10 @@ impl Default for EditorConfig {
 }
 
 /// 创建增强版的 Reedline 编辑器
-pub fn create_enhanced_editor(config: &EditorConfig) -> anyhow::Result<Reedline> {
+pub fn create_enhanced_editor(
+    config: &EditorConfig,
+    external_printer: reedline::ExternalPrinter<String>,
+) -> anyhow::Result<Reedline> {
     // 扩展路径
     let history_path = shellexpand::tilde(&config.history_file);
     let history_path = std::path::Path::new(history_path.as_ref());
@@ -85,6 +88,7 @@ pub fn create_enhanced_editor(config: &EditorConfig) -> anyhow::Result<Reedline>
 
     // 构建编辑器
     let mut builder = Reedline::create()
+        .with_external_printer(external_printer)
         .with_history(Box::new(history))
         .with_completer(Box::new(completer));
 

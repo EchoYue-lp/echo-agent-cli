@@ -74,7 +74,7 @@ evidence, and the next bounded step.
 | Hook execution closure | Complete | The main registry exposes 31 emitted events and 7 Action types. Failed tool results emit `PostToolUseFailure`; the canonical call-scoped `permission_mode_override` participates in approval without mutating global mode; all Hook sources share strict registration filtering. CLI/TUI/GUI Hook tests use the same matcher-aware dry-run, and the watcher reloads app config plus global/project `hooks.yaml` on create/modify/remove. Evolution writes, layer changes, candidate detection, and health checks emit their declared events. Plain HTTP supports loopback/private/link-local IPs, localhost, single-label hosts, `.local`, and `.lan`; remote hosts require HTTPS. User-configured MCP tools have no deny-list. |
 | Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
 | Provider default protocol convergence | Complete | Framework `ProviderMetadata.default_api_protocol` is the sole built-in authority; EKO preserves explicit overrides, infers custom complete endpoints, keeps a non-persistent session selection for every future pooled agent, and projects the provider wire contract through generated ts-rs DTOs without a second provider mapping. |
-| Foreground turn ownership convergence | In progress | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, and settlement. GUI uses it end to end; TUI/CLI/channel adapter migration remains bounded follow-up work. |
+| Foreground turn ownership convergence | In progress | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, and settlement. GUI uses it end to end; the CLI REPL uses the same lease and typed settlement while TUI/channel adapter migration remains bounded follow-up work. |
 
 ## Current Decisions
 
@@ -338,7 +338,7 @@ SQLite, and no new Task state were introduced.
   `PreparedUserTurn::build`.
 - All six entry points switched: GUI send (`chat.rs`), GUI steer
   (`steer_chat_message`), TUI send (`events.rs` send path + `send_to_agent`),
-  TUI steer (`/steer`), CLI REPL (`chat_with_agent`), channel. Each now builds
+  TUI steer (`/steer`), CLI REPL (`start_chat_with_agent`), channel. Each now builds
   a `PreparedUserTurn` via `UserTurnInput` + `resolve_user_input_spill_dir`.
 - `ensure_task_mode_run`'s goal is now `turn.instruction` (reference block for
   spilled text = better task goal than the raw paste). Only inline resources
@@ -468,11 +468,52 @@ token; when no terminal event was accepted, the sole returned and registered
 outcome is `Failed` with code `downstream_disconnect`, not a synthetic user
 cancellation.
 
-The old GUI `active_chat_turns` and chat token maps are deleted. TUI, CLI, and
-channel entry points still own local cancellation tokens during this staged
-migration; they must be converted into thin `ForegroundTurnControl` adapters
-and their replaced local foreground ownership removed. Framework lifecycle and
-steering APIs must not be duplicated or changed for that follow-up.
+The old GUI `active_chat_turns` and chat token maps are deleted. The CLI REPL
+now uses the same owner and routes concurrent ordinary input through framework
+steering or one FIFO follow-up queue. After a steer rejection, the broker waits
+on the tracked supervisor completion and HITL enqueue channels; it calls the
+same synchronous Reedline reader only when a real HITL request is pending, and
+also selects the process Ctrl-C signal while no line editor is active. Typed
+settlement automatically starts the FIFO head exactly once. Because there is no
+line prompt in that parked wait, `/exit` is accepted before entering it or from
+a pending-HITL prompt; Ctrl-C remains the always-available exact-cancel path.
+Non-empty
+HITL request IDs are reserved until their exact pending request and requester
+both release them, so a duplicate cannot enter the broker queue. Its sole stdin
+owner remains Reedline's synchronous `read_line`: `/exit`, Ctrl-D, and Ctrl-C can request exact
+cancellation and await typed settlement after Reedline returns a signal, but an
+external future cancellation cannot interrupt an in-progress blocking read.
+If the outer future is dropped after control returns, the tracked turn's drop
+guard requests exact cancellation and aborts the sole supervisor; dropping that
+future drops the lease and defensively settles the registry. Because Drop cannot
+await, this boundary does not claim a join, but there is no inner or detached
+chat task left running.
+There is deliberately no per-request reader, `spawn_blocking` reader, detached
+thread, or second stdin owner; Reedline's external printer is the only path for
+turn/HITL output while line editing is active. TUI and channel entry points
+still own local cancellation tokens during this staged migration; they must be
+converted into thin `ForegroundTurnControl` adapters and their replaced local
+foreground ownership removed. Framework lifecycle and steering APIs must not
+be duplicated or changed for that follow-up.
+
+CLI startup registers the owned REPL HITL session before headless services can
+emit requests, then moves that same session into the input broker. Bootstrap
+failure, normal exit, and session failure unregister it and reject every exact
+pending request. Its exact dispatcher receipt also unregisters synchronously
+when the caller future is aborted; dropping an older receipt cannot remove a
+new provider registered under the same surface name. If Reedline's
+external-printer sink closes or fills, the HITL
+provider rejects the triggering request immediately, closes further admission,
+and publishes a session failure that cancels and drains the tracked foreground
+turn. Idle chat input always enters the existing FIFO before admission, so a
+head retained by `Busy` or `AdmissionSuspended` cannot be bypassed by a newer
+line after admission reopens. The bootstrap `ReviewIntegration` is the sole
+memory authority: each `ChatResources` carries that integration and lets the
+shared driver acquire its generation after foreground admission; no legacy
+layer-manager snapshot or temporary replacement integration remains. The CLI
+Dreaming owner retains both cancellation and `JoinHandle`, joins before
+auto-memory/session review, and reports a join failure through the REPL terminal
+result.
 
 ## Next Step
 
@@ -525,9 +566,12 @@ running, completed output loads only one page at a time, history reload restores
 summaries without eager detail reads, and conversation deletion returns before
 background detail cleanup finishes.
 
-Complete foreground-turn surface parity by routing TUI, CLI REPL, and channel
-entry points through the app-core lease while preserving their renderer-only
-differences. Add exact-id cancel/snapshot adapter tests for each surface, then
-delete their replaced local foreground token ownership. After all adapters use
-the owner, add one cross-surface integration gate covering independent scope,
-stale-id rejection, sink disconnect failure, and settlement-before-release.
+Complete foreground-turn surface parity by routing TUI and channel entry points
+through the app-core lease while preserving their renderer-only differences.
+The CLI REPL adapter is complete: it has one Reedline input broker, an exact
+foreground lease, typed cancellation settlement, framework steering plus FIFO
+follow-ups, and channel-backed HITL requests. Add exact-id cancel/snapshot
+adapter tests for the remaining surfaces, then delete their replaced local
+foreground token ownership. After all adapters use the owner, add one
+cross-surface integration gate covering independent scope, stale-id rejection,
+sink disconnect failure, and settlement-before-release.

@@ -6,13 +6,45 @@
 
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use futures::future::BoxFuture;
-use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::sync::{Arc, RwLock, Weak};
 
 /// Named provider entry.
 struct NamedProvider {
+    registration_id: uuid::Uuid,
     name: String,
     provider: Arc<dyn HumanLoopProvider>,
+}
+
+/// Exact ownership receipt for one dynamically registered HITL provider.
+///
+/// Dropping the receipt synchronously removes only its own registration, so an
+/// aborted surface cannot leave a closed provider behind or unregister a newer
+/// provider that reused the same display name.
+#[must_use]
+pub struct HitlProviderRegistration {
+    dispatcher: Weak<HitlDispatcher>,
+    registration_id: Option<uuid::Uuid>,
+}
+
+impl HitlProviderRegistration {
+    pub fn unregister(mut self) {
+        self.unregister_inner();
+    }
+
+    fn unregister_inner(&mut self) {
+        let Some(registration_id) = self.registration_id.take() else {
+            return;
+        };
+        if let Some(dispatcher) = self.dispatcher.upgrade() {
+            dispatcher.unregister_exact(registration_id);
+        }
+    }
+}
+
+impl Drop for HitlProviderRegistration {
+    fn drop(&mut self) {
+        self.unregister_inner();
+    }
 }
 
 /// Dispatcher that routes HITL requests to the first available provider.
@@ -33,24 +65,71 @@ impl HitlDispatcher {
     /// Register a new provider with a name.
     pub async fn register(&self, name: impl Into<String>, provider: Arc<dyn HumanLoopProvider>) {
         let name = name.into();
-        let mut providers = self.providers.write().await;
+        let mut providers = self
+            .providers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         providers.push(NamedProvider {
+            registration_id: uuid::Uuid::new_v4(),
             name: name.clone(),
             provider,
         });
         tracing::debug!(provider = %name, "HITL provider registered");
     }
 
+    /// Register a provider whose lifetime is controlled by an exact receipt.
+    pub async fn register_owned(
+        self: &Arc<Self>,
+        name: impl Into<String>,
+        provider: Arc<dyn HumanLoopProvider>,
+    ) -> HitlProviderRegistration {
+        let name = name.into();
+        let registration_id = uuid::Uuid::new_v4();
+        let mut providers = self
+            .providers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        providers.push(NamedProvider {
+            registration_id,
+            name: name.clone(),
+            provider,
+        });
+        drop(providers);
+        tracing::debug!(provider = %name, %registration_id, "owned HITL provider registered");
+        HitlProviderRegistration {
+            dispatcher: Arc::downgrade(self),
+            registration_id: Some(registration_id),
+        }
+    }
+
     /// Unregister a provider by name.
     pub async fn unregister(&self, name: &str) {
-        let mut providers = self.providers.write().await;
+        let mut providers = self
+            .providers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         providers.retain(|p| p.name != name);
         tracing::debug!(provider = %name, "HITL provider unregistered");
     }
 
+    fn unregister_exact(&self, registration_id: uuid::Uuid) {
+        let mut providers = self
+            .providers
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous_len = providers.len();
+        providers.retain(|provider| provider.registration_id != registration_id);
+        if providers.len() != previous_len {
+            tracing::debug!(%registration_id, "owned HITL provider unregistered");
+        }
+    }
+
     /// Get the number of registered providers.
     pub async fn provider_count(&self) -> usize {
-        self.providers.read().await.len()
+        self.providers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 }
 
@@ -72,7 +151,10 @@ impl HumanLoopProvider for HitlDispatcher {
             // held `self.providers.read().await` across the whole `while` loop,
             // deadlocking any concurrent `register`/`unregister` call.
             let providers: Vec<(String, Arc<dyn HumanLoopProvider>)> = {
-                let guard = self.providers.read().await;
+                let guard = self
+                    .providers
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 guard
                     .iter()
                     .map(|named| (named.name.clone(), named.provider.clone()))

@@ -44,37 +44,6 @@ pub fn is_protected_file(path: &str) -> bool {
     false
 }
 
-/// 在 CLI 中展示文件变更提示，等待用户选择。
-///
-/// 返回用户的选择：
-/// - 'c' = 提交
-/// - 's' = 仅暂存
-/// - 'n' = 不处理（默认）
-pub fn prompt_for_git_action(change_count: usize) -> char {
-    use std::io::{self, Write};
-
-    println!(
-        "\n  {} {} 个文件被修改",
-        nu_ansi_term::Color::Yellow.paint("📝"),
-        change_count
-    );
-    print!(
-        "  {} [c] 提交  [s] 仅暂存  [n] 不处理 (默认: n): ",
-        nu_ansi_term::Color::Fixed(8).paint("→")
-    );
-    io::stdout().flush().ok();
-
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return 'n';
-    }
-    let choice = input.trim().chars().next().unwrap_or('n');
-    match choice {
-        'c' | 'C' | 's' | 'S' => choice.to_ascii_lowercase(),
-        _ => 'n',
-    }
-}
-
 /// 执行 git add（排除保护文件）+ git commit。
 pub fn interactive_commit(cwd: &Path, change_count: usize) -> anyhow::Result<()> {
     // Stage tracked files only (not untracked, avoiding accidental inclusion)

@@ -168,8 +168,6 @@ impl AgentRuntime {
         // ── 4. HITL dispatcher ──
         let hitl_dispatcher = {
             let dispatcher = Arc::new(HitlDispatcher::new());
-            let repl_provider = Arc::new(crate::hitl::ReplHumanLoopProvider::new());
-            dispatcher.register("repl", repl_provider).await;
             agent_handle
                 .write_async(|a| {
                     let d = dispatcher.clone();
@@ -179,7 +177,9 @@ impl AgentRuntime {
                     })
                 })
                 .await;
-            tracing::info!("HITL dispatcher + PermissionService wired to agent");
+            tracing::info!(
+                "HITL dispatcher + PermissionService wired to agent; surfaces register transports"
+            );
             dispatcher
         };
         browser_runtime

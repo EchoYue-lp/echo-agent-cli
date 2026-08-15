@@ -55,6 +55,43 @@ impl Drop for CompanionModeShutdown {
     }
 }
 
+struct CliDreamingOwner {
+    cancel: tokio_util::sync::CancellationToken,
+    settlement: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl CliDreamingOwner {
+    fn new(
+        cancel: tokio_util::sync::CancellationToken,
+        settlement: tokio::task::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            cancel,
+            settlement: Some(settlement),
+        }
+    }
+
+    async fn shutdown(mut self) -> Result<()> {
+        self.cancel.cancel();
+        let settlement = self
+            .settlement
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("CLI Dreaming settlement handle is unavailable"))?;
+        settlement
+            .await
+            .map_err(|error| anyhow::anyhow!("CLI Dreaming settlement task failed: {error}"))
+    }
+}
+
+impl Drop for CliDreamingOwner {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(settlement) = self.settlement.take() {
+            settlement.abort();
+        }
+    }
+}
+
 async fn drain_cli_shutdown(
     repl_result: Result<()>,
     steps: Vec<CliShutdownStep<'_>>,
@@ -188,6 +225,8 @@ pub async fn run_cli_mode(
     companion_shutdown: Option<CompanionModeShutdown>,
 ) -> Result<()> {
     let mut companion_shutdown = companion_shutdown;
+    let repl_hitl_session =
+        crate::cli::ReplHumanLoopSession::register(hitl_dispatcher.clone()).await;
     let service_result = start_headless_services(
         agent.clone(),
         hitl_dispatcher,
@@ -210,7 +249,10 @@ pub async fn run_cli_mode(
     let (task_service, scheduler_runner, app_state) = match service_result {
         Ok(services) => services,
         Err(error) => {
-            let mut steps = Vec::new();
+            let mut steps = vec![CliShutdownStep {
+                name: "REPL HITL session",
+                future: Box::pin(repl_hitl_session.shutdown("CLI bootstrap failed")),
+            }];
             if let Some(companion) = companion_shutdown.take() {
                 steps.push(CliShutdownStep {
                     name: companion.name,
@@ -269,7 +311,7 @@ pub async fn run_cli_mode(
         tracing::warn!(%error, "failed to bind plugin monitors to CLI scheduler");
     }
 
-    let dreaming_task = review_integration.as_ref().map(|integration| {
+    let dreaming_owner = review_integration.as_ref().map(|integration| {
         let cancel = tokio_util::sync::CancellationToken::new();
         let task = echo_agent_app_core::infra::spawn_dreaming_task(
             integration.clone(),
@@ -278,7 +320,7 @@ pub async fn run_cli_mode(
             cancel.clone(),
         );
         tracing::info!("Dreaming task spawned for CLI session");
-        (cancel, task)
+        CliDreamingOwner::new(cancel, task)
     });
 
     let mut repl_config = repl_config_for(args);
@@ -297,7 +339,7 @@ pub async fn run_cli_mode(
     let auto_memory_integration = review_integration.clone();
     let session_review_integration = review_integration.clone();
     let background_review_integration = review_integration.clone();
-    let repl_result = crate::cli::run_repl(agent, repl_config).await;
+    let repl_result = crate::cli::run_repl(agent, repl_config, repl_hitl_session).await;
     let mut steps = Vec::new();
     if let Some(companion) = companion_shutdown.take() {
         steps.push(CliShutdownStep {
@@ -329,10 +371,8 @@ pub async fn run_cli_mode(
         CliShutdownStep {
             name: "Dreaming",
             future: Box::pin(async move {
-                if let Some((cancel, task)) = dreaming_task {
-                    cancel.cancel();
-                    task.await
-                        .map_err(|error| anyhow::anyhow!("Dreaming task failed: {error}"))?;
+                if let Some(owner) = dreaming_owner {
+                    owner.shutdown().await?;
                 }
                 Ok(())
             }),
@@ -609,6 +649,22 @@ mod tests {
         );
         assert!(error.to_string().contains("foreground injected failure"));
         assert!(error.to_string().contains("workspace injected failure"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cli_dreaming_owner_cancels_and_joins_its_task() -> Result<()> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_cancel = cancel.clone();
+        let task_observed = Arc::clone(&observed);
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            task_observed.store(true, std::sync::atomic::Ordering::Release);
+        });
+
+        CliDreamingOwner::new(cancel, task).shutdown().await?;
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
         Ok(())
     }
 }
