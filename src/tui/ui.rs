@@ -112,11 +112,12 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
         Some(h) => h,
         None => return,
     };
-    let guard = match pending_handle.try_lock() {
+    let mut guard = match pending_handle.try_lock() {
         Ok(g) => g,
         Err(_) => return,
     };
-    let approval = match guard.as_ref() {
+    echo_agent_app_core::hitl::prune_closed_pending(&mut guard);
+    let approval = match guard.front() {
         Some(a) => a,
         None => return,
     };

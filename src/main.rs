@@ -271,14 +271,14 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
         // TUI owns its provider for the full-screen session. The REPL provider
         // is registered only by CLI startup, so no provider swap is needed.
-        let tui_pending = {
-            use echo_agent_app_core::hitl::TuiHumanLoopProvider;
-            let tui_provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
-            let pending = tui_provider.pending_handle();
-            runtime.hitl_dispatcher.register("tui", tui_provider).await;
-            tracing::info!("HITL: TUI provider registered");
-            pending
-        };
+        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
+        let tui_provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
+        let tui_pending = tui_provider.pending_handle();
+        let tui_hitl_registration = runtime
+            .hitl_dispatcher
+            .register_owned("tui", tui_provider.clone())
+            .await;
+        tracing::info!("HITL: TUI provider registered");
         let tui_services = cli::start_headless_services(
             agent_handle.clone(),
             runtime.hitl_dispatcher.clone(),
@@ -301,6 +301,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         let tui_services = match tui_services {
             Ok(services) => services,
             Err(error) => {
+                tui_provider.close_now("TUI bootstrap failed");
+                drop(tui_hitl_registration);
                 let error = infra::settle_service_bootstrap_failure(
                     anyhow::anyhow!(error),
                     task_runtime_store.as_ref(),
@@ -326,16 +328,16 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tracing::warn!(%error, "failed to bind plugin monitors to TUI scheduler");
         }
 
-        let tui_dreaming_task = runtime.review_integration.as_ref().map(|integration| {
+        let tui_dreaming_owner = runtime.review_integration.as_ref().map(|integration| {
             let cancel = tokio_util::sync::CancellationToken::new();
-            let task = echo_agent_app_core::infra::spawn_dreaming_task(
+            let settlement = echo_agent_app_core::infra::spawn_dreaming_task(
                 integration.clone(),
                 agent_handle.clone(),
                 Some(pool.clone()),
                 cancel.clone(),
             );
             tracing::info!("Dreaming task spawned for TUI session");
-            (cancel, task)
+            cli::HeadlessDreamingOwner::new(cancel, settlement)
         });
 
         let tui_result = echo_agent_cli::tui::run_tui(
@@ -369,78 +371,22 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         )
         .await;
 
-        if let Err(error) = tui_app_state.session.foreground_turns.shutdown().await {
-            tracing::warn!(%error, "failed to settle TUI foreground turns");
-        }
-        if let Err(error) = tui_app_state.shutdown_model_mutations().await {
-            tracing::warn!(%error, "failed to settle TUI model mutations");
-        }
-        if let Some((cancel, task)) = tui_dreaming_task {
-            cancel.cancel();
-            if let Err(error) = task.await {
-                tracing::warn!(%error, "failed to join TUI Dreaming task");
-            }
-        }
-        // ── Memory review on session end (TUI) ──────────────────────
-        if tui_result.is_ok()
-            && let Some(ref review_integration) = runtime.review_integration
-            && let Some(review_result) = review_integration.on_session_end().await
-        {
-            match review_result {
-                Ok(report) => {
-                    if report.total_scanned > 0 {
-                        println!(
-                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} proposals queued",
-                            report.total_scanned,
-                            report.stale_count,
-                            report.conflict_groups,
-                            report.conflict_proposals.len()
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("  ⚠ Memory review failed: {e}");
-                }
-            }
-        }
-        if let Some(integration) = runtime.review_integration.as_ref()
-            && let Err(error) = integration.shutdown_background_reviews().await
-        {
-            tracing::warn!(%error, "failed to settle TUI background reviews");
-        }
-        // Memory merge point: settle ReviewIntegration here, after foreground
-        // receipts and before the workspace transition owner.
-        if let Err(error) = tui_app_state.shutdown_workspace_transition().await {
-            tracing::warn!(%error, "failed to settle TUI workspace transition");
-        }
-        if let Err(error) = tui_app_state.shutdown_scheduler().await {
-            tracing::warn!(%error, "failed to shut down TUI scheduler");
-        }
-        if let Some(store) = task_runtime_store.as_ref()
-            && let Err(error) = store.shutdown_run_drivers().await
-        {
-            tracing::warn!(%error, "failed to settle TUI TaskRun drivers");
-        }
-        if let Err(error) = pool.shutdown().await {
-            tracing::warn!(%error, "failed to shut down TUI agent pool");
-        }
-        if let Err(error) = runtime.plugin_runtime.shutdown().await {
-            tracing::warn!(%error, "failed to shut down TUI plugin runtime");
-        }
-        if let Err(error) = config_watcher.shutdown().await {
-            tracing::warn!(%error, "failed to shut down TUI config watcher");
-        }
-        runtime.mcp_config_runtime.shutdown().await;
-        runtime.browser_runtime.shutdown().await;
-        if let Some(store) = task_runtime_store.as_ref()
-            && let Err(error) = store.shutdown_hook_events().await
-        {
-            tracing::warn!(%error, "failed to shut down task hook dispatcher");
-        }
+        tui_provider.close_now("TUI session ended");
+        drop(tui_hitl_registration);
+        let shutdown_result = cli::shutdown_headless_services(
+            tui_result,
+            tui_services,
+            tui_dreaming_owner,
+            Some(agent_handle.clone()),
+            runtime.plugin_runtime.clone(),
+            config_watcher.clone(),
+            runtime.mcp_config_runtime.clone(),
+            runtime.browser_runtime.clone(),
+            cancel_token.clone(),
+        )
+        .await;
         drop(runtime);
-        cancel_token.cancel();
-
-        return tui_result;
+        return shutdown_result;
     }
 
     // ── Hidden legacy/internal modes ───────────────────────────────────

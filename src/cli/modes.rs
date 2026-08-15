@@ -79,10 +79,10 @@ impl HeadlessDreamingOwner {
         let settlement = self
             .settlement
             .take()
-            .ok_or_else(|| anyhow::anyhow!("CLI Dreaming settlement handle is unavailable"))?;
+            .ok_or_else(|| anyhow::anyhow!("Dreaming settlement handle is unavailable"))?;
         settlement
             .await
-            .map_err(|error| anyhow::anyhow!("CLI Dreaming settlement task failed: {error}"))
+            .map_err(|error| anyhow::anyhow!("Dreaming settlement task failed: {error}"))
     }
 }
 
@@ -96,18 +96,18 @@ impl Drop for HeadlessDreamingOwner {
 }
 
 async fn drain_cli_shutdown(
-    repl_result: Result<()>,
+    mode_result: Result<()>,
     steps: Vec<CliShutdownStep<'_>>,
 ) -> Result<()> {
-    let mut failures = repl_result
+    let mut failures = mode_result
         .err()
-        .map(|error| format!("REPL: {error}"))
+        .map(|error| format!("surface: {error}"))
         .into_iter()
         .collect::<Vec<_>>();
 
     for step in steps {
         if let Err(error) = step.future.await {
-            tracing::warn!(step = step.name, %error, "CLI shutdown step failed");
+            tracing::warn!(step = step.name, %error, "application shutdown step failed");
             failures.push(format!("{}: {error}", step.name));
         }
     }
@@ -115,7 +115,10 @@ async fn drain_cli_shutdown(
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(anyhow::anyhow!("CLI mode failed: {}", failures.join("; ")))
+        Err(anyhow::anyhow!(
+            "application mode failed: {}",
+            failures.join("; ")
+        ))
     }
 }
 

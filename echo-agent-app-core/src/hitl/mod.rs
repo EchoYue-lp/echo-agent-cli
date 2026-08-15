@@ -11,4 +11,7 @@ pub mod tui_provider;
 pub use channel_provider::{ChannelHumanLoopProvider, ChannelHumanLoopResolution};
 pub use dispatcher::{HitlDispatcher, HitlProviderRegistration};
 pub use repl_provider::{PendingReplHumanLoopRequest, ReplHumanLoopProvider};
-pub use tui_provider::{PendingApproval, PendingHumanLoopKind, TuiHumanLoopProvider};
+pub use tui_provider::{
+    PendingApproval, PendingApprovalQueue, PendingHumanLoopKind, TuiHumanLoopProvider,
+    prune_closed_pending,
+};

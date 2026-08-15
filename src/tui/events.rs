@@ -16,6 +16,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use futures::FutureExt;
 use ratatui::layout::Rect;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
@@ -25,7 +26,11 @@ use tokio::sync::mpsc;
 
 use echo_agent::agent::subagent::SubagentEvent;
 use echo_agent::tools::ToolFailure;
+use echo_agent_app_core::chat_driver::TurnOutcome;
 use echo_agent_app_core::context_window::ContextWindowSnapshot;
+use echo_agent_app_core::foreground_turn::{
+    ForegroundTurnLease, ForegroundTurnSnapshot, ForegroundTurnSurface,
+};
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -35,7 +40,7 @@ const PASTE_ATTACHMENT_CHAR_THRESHOLD: usize = 1_000;
 /// Returns `true` if the key was consumed.
 async fn handle_approval_key(
     _app: &mut TuiApp,
-    pending_handle: &Arc<tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>>,
+    pending_handle: &echo_agent_app_core::hitl::PendingApprovalQueue,
     key: &KeyEvent,
 ) -> bool {
     use echo_agent::human_loop::HumanLoopResponse;
@@ -45,7 +50,8 @@ async fn handle_approval_key(
         Ok(g) => g,
         Err(_) => return false,
     };
-    let approval = match guard.as_mut() {
+    echo_agent_app_core::hitl::prune_closed_pending(&mut guard);
+    let approval = match guard.front_mut() {
         Some(a) => a,
         None => return false,
     };
@@ -55,11 +61,14 @@ async fn handle_approval_key(
         match key.code {
             KeyCode::Esc => {
                 if approval.kind == PendingHumanLoopKind::Input {
-                    if let Some(tx) = approval.response_tx.take() {
-                        let _ = tx.send(HumanLoopResponse::Rejected {
+                    let request_id = approval.request_id.clone();
+                    send_and_remove_front(
+                        &mut guard,
+                        &request_id,
+                        HumanLoopResponse::Rejected {
                             reason: Some("User dismissed".to_string()),
-                        });
-                    }
+                        },
+                    );
                 } else {
                     approval.input_mode = false;
                     approval.feedback_input.clear();
@@ -82,9 +91,8 @@ async fn handle_approval_key(
                         reason: Some(reason),
                     }
                 };
-                if let Some(tx) = approval.response_tx.take() {
-                    let _ = tx.send(response);
-                }
+                let request_id = approval.request_id.clone();
+                send_and_remove_front(&mut guard, &request_id, response);
                 true
             }
             KeyCode::Backspace => {
@@ -164,12 +172,18 @@ async fn handle_approval_key(
             }
             KeyCode::Enter => {
                 // Confirm selected option
-                send_pending_response(approval);
+                let request_id = approval.request_id.clone();
+                if let Some(response) = pending_response(approval) {
+                    send_and_remove_front(&mut guard, &request_id, response);
+                }
                 true
             }
             KeyCode::Char('y') if approval.kind == PendingHumanLoopKind::Approval => {
                 approval.selected_option = 0;
-                send_pending_response(approval);
+                let request_id = approval.request_id.clone();
+                if let Some(response) = pending_response(approval) {
+                    send_and_remove_front(&mut guard, &request_id, response);
+                }
                 true
             }
             KeyCode::Char('n') if approval.kind == PendingHumanLoopKind::Approval => {
@@ -190,16 +204,21 @@ async fn handle_approval_key(
             }
             KeyCode::Char('a') if approval.kind == PendingHumanLoopKind::Approval => {
                 approval.selected_option = 3;
-                send_pending_response(approval);
+                let request_id = approval.request_id.clone();
+                if let Some(response) = pending_response(approval) {
+                    send_and_remove_front(&mut guard, &request_id, response);
+                }
                 true
             }
             KeyCode::Esc => {
-                // Esc = reject
-                if let Some(tx) = approval.response_tx.take() {
-                    let _ = tx.send(HumanLoopResponse::Rejected {
+                let request_id = approval.request_id.clone();
+                send_and_remove_front(
+                    &mut guard,
+                    &request_id,
+                    HumanLoopResponse::Rejected {
                         reason: Some("User dismissed".to_string()),
-                    });
-                }
+                    },
+                );
                 true
             }
             _ => false, // Let other keys through
@@ -207,17 +226,17 @@ async fn handle_approval_key(
     }
 }
 
-/// Send the approval response based on the currently selected option.
-fn send_pending_response(approval: &mut echo_agent_app_core::hitl::PendingApproval) {
+/// Build the response for the currently selected option.
+fn pending_response(
+    approval: &mut echo_agent_app_core::hitl::PendingApproval,
+) -> Option<echo_agent::human_loop::HumanLoopResponse> {
     use echo_agent::human_loop::{ApprovalScope, HumanLoopResponse};
     use echo_agent_app_core::hitl::PendingHumanLoopKind;
 
     let response = match approval.kind {
         PendingHumanLoopKind::Input => HumanLoopResponse::Text(approval.feedback_input.clone()),
         PendingHumanLoopKind::Selection => {
-            let Some(selection) = approval.options.get(approval.selected_option).cloned() else {
-                return;
-            };
+            let selection = approval.options.get(approval.selected_option).cloned()?;
             HumanLoopResponse::Selection {
                 selection,
                 instructions: None,
@@ -230,14 +249,14 @@ fn send_pending_response(approval: &mut echo_agent_app_core::hitl::PendingApprov
                 approval.input_label = "拒绝原因".to_string();
                 approval.feedback_input.clear();
                 approval.feedback_cursor = 0;
-                return;
+                return None;
             }
             2 => {
                 approval.input_mode = true;
                 approval.input_label = "修改意见".to_string();
                 approval.feedback_input.clear();
                 approval.feedback_cursor = 0;
-                return;
+                return None;
             }
             3 => HumanLoopResponse::ApprovedWithScope {
                 scope: ApprovalScope::SessionTool,
@@ -246,9 +265,16 @@ fn send_pending_response(approval: &mut echo_agent_app_core::hitl::PendingApprov
         },
     };
 
-    if let Some(tx) = approval.response_tx.take() {
-        let _ = tx.send(response);
-    }
+    Some(response)
+}
+
+/// Resolve and remove the exact front request before releasing the queue lock.
+fn send_and_remove_front(
+    pending: &mut echo_agent_app_core::hitl::tui_provider::TuiHumanLoopState,
+    request_id: &str,
+    response: echo_agent::human_loop::HumanLoopResponse,
+) -> bool {
+    pending.resolve_front(request_id, response)
 }
 
 enum AgentEvent {
@@ -320,6 +346,11 @@ enum AgentEvent {
     Notice(String),
     Execution(echo_agent_app_core::tasks::task_runtime::executor::ExecEvent),
     TurnStatus(String),
+    /// The sole TUI lifecycle terminal, emitted after the driver settles.
+    TurnSettled {
+        turn_id: String,
+        outcome: TurnOutcome,
+    },
     ExecutionPath {
         requested_mode: String,
         observed_path: String,
@@ -656,22 +687,9 @@ pub async fn run_event_loop(
                 }
                 AgentEvent::FinalAnswer(_answer) => {
                     app.finalize_stream();
-                    dispatch_next_queued(app, &agent, agent_tx.clone()).await;
                 }
                 AgentEvent::Cancelled => {
-                    let now = Instant::now();
-                    for message in &mut app.messages {
-                        if let MessageRole::ToolExecution(tool) = &mut message.role
-                            && tool.status == ToolExecutionStatus::Running
-                        {
-                            tool.status = ToolExecutionStatus::Cancelled;
-                            tool.finished_at = Some(now);
-                        }
-                    }
-                    app.invalidate_messages_cache();
-                    app.is_processing = false;
-                    app.active_cancel = None;
-                    app.status_msg = "Cancelled".to_string();
+                    render_cancelled_event(app);
                 }
                 AgentEvent::ToolCall {
                     call_id,
@@ -803,43 +821,7 @@ pub async fn run_event_loop(
                     app.invalidate_messages_cache();
                 }
                 AgentEvent::Error(e) => {
-                    let was_cancelled = app
-                        .active_cancel
-                        .as_ref()
-                        .is_some_and(echo_agent::agent::CancellationToken::is_cancelled);
-                    for message in &mut app.messages {
-                        if let MessageRole::ToolExecution(tool) = &mut message.role
-                            && tool.status == ToolExecutionStatus::Running
-                        {
-                            tool.status = if was_cancelled {
-                                ToolExecutionStatus::Cancelled
-                            } else {
-                                ToolExecutionStatus::Failed
-                            };
-                            if !was_cancelled && tool.stderr.is_empty() {
-                                tool.stderr = e.clone();
-                            }
-                            tool.finished_at = Some(Instant::now());
-                        }
-                    }
-                    app.invalidate_messages_cache();
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: if was_cancelled {
-                            "Cancelled by user.".to_string()
-                        } else {
-                            format!("Error: {e}")
-                        },
-                    });
-                    app.is_processing = false;
-                    app.active_cancel = None;
-                    app.active_turn_id = None;
-                    app.status_msg = if was_cancelled {
-                        "Cancelled".to_string()
-                    } else {
-                        "Error".to_string()
-                    };
-                    dispatch_next_queued(app, &agent, agent_tx.clone()).await;
+                    render_error_event(app, &e);
                 }
                 AgentEvent::ContextCompressed {
                     before_count,
@@ -878,11 +860,11 @@ pub async fn run_event_loop(
                     }
                 }
                 AgentEvent::TurnStatus(status) => {
-                    app.status_msg = status.clone();
-                    if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
-                        app.is_processing = false;
-                        app.active_cancel = None;
-                        app.active_turn_id = None;
+                    app.status_msg = status;
+                }
+                AgentEvent::TurnSettled { turn_id, outcome } => {
+                    if apply_turn_settlement(app, &turn_id, &outcome) {
+                        dispatch_next_queued(app, &agent, agent_tx.clone()).await;
                     }
                 }
                 AgentEvent::ExecutionPath {
@@ -905,6 +887,10 @@ pub async fn run_event_loop(
                     app.rebuild_message_groups();
                 }
             }
+        }
+
+        if !app.is_processing && !app.queued_turns.is_empty() {
+            dispatch_next_queued(app, &agent, agent_tx.clone()).await;
         }
 
         // Handle events.
@@ -973,6 +959,80 @@ pub async fn run_event_loop(
     }
 
     Ok(())
+}
+
+fn render_cancelled_event(app: &mut TuiApp) {
+    app.status_msg = "Cancellation acknowledged · settling".to_string();
+}
+
+fn render_error_event(app: &mut TuiApp, error: &str) {
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: format!("Error: {error}"),
+    });
+    app.rebuild_message_groups();
+    app.status_msg = "Turn ending · awaiting settlement".to_string();
+}
+
+/// Apply the one authoritative terminal projection for the current TUI turn.
+///
+/// Returning `true` is the event loop's only permission to advance the FIFO.
+/// Exact id matching makes duplicate and stale settlements harmless.
+fn apply_turn_settlement(app: &mut TuiApp, turn_id: &str, outcome: &TurnOutcome) -> bool {
+    if app.active_turn_id.as_deref() != Some(turn_id) {
+        tracing::debug!(
+            settlement_turn_id = turn_id,
+            active_turn_id = ?app.active_turn_id.as_deref(),
+            "ignoring stale TUI turn settlement"
+        );
+        return false;
+    }
+
+    app.finalize_stream();
+    let now = Instant::now();
+    for message in &mut app.messages {
+        if let MessageRole::ToolExecution(tool) = &mut message.role
+            && tool.status == ToolExecutionStatus::Running
+        {
+            match outcome {
+                TurnOutcome::Completed => {
+                    tracing::warn!(
+                        call_id = %tool.call_id,
+                        tool = %tool.name,
+                        "completed TUI turn was missing a tool terminal event"
+                    );
+                    tool.status = ToolExecutionStatus::Failed;
+                    tool.finished_at = Some(now);
+                    if tool.stderr.is_empty() {
+                        tool.stderr =
+                            "Tool terminal event missing before completed turn settlement"
+                                .to_string();
+                    }
+                }
+                TurnOutcome::Cancelled => {
+                    tool.status = ToolExecutionStatus::Cancelled;
+                    tool.finished_at = Some(now);
+                }
+                TurnOutcome::Failed(failure) => {
+                    tool.status = ToolExecutionStatus::Failed;
+                    tool.finished_at = Some(now);
+                    if tool.stderr.is_empty() {
+                        tool.stderr = failure.message.clone();
+                    }
+                }
+            }
+        }
+    }
+    app.is_processing = false;
+    app.active_turn_id = None;
+    app.status_msg = match outcome {
+        TurnOutcome::Completed => "Ready".to_string(),
+        TurnOutcome::Cancelled => "Cancelled".to_string(),
+        TurnOutcome::Failed(failure) => format!("Error: {}", failure.message),
+    };
+    app.invalidate_messages_cache();
+    app.rebuild_message_groups();
+    true
 }
 
 // ── Mouse selection ────────────────────────────────────────────────────
@@ -1046,7 +1106,7 @@ async fn handle_key(
         // Check if there's a pending approval
         let has_pending = {
             let guard = pending_handle.try_lock();
-            guard.as_ref().map(|g| g.is_some()).unwrap_or(false)
+            guard.as_ref().map(|g| !g.is_empty()).unwrap_or(false)
         };
         if has_pending && handle_approval_key(app, &pending_handle, &key).await {
             return;
@@ -1061,7 +1121,7 @@ async fn handle_key(
         }
     }
 
-    if let Some(result) = handle_global_shortcuts(app, &key)
+    if let Some(result) = handle_global_shortcuts(app, &key).await
         && result
     {
         return;
@@ -1126,7 +1186,7 @@ fn handle_command_palette_key(app: &mut TuiApp, key: &KeyEvent) -> bool {
 // ── Global shortcuts ──────────────────────────────────────────────────
 
 /// Returns true if the key was handled (shortcut consumed).
-fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
+async fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         return None;
     }
@@ -1134,7 +1194,7 @@ fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
     match key.code {
         KeyCode::Char('c') => {
             if app.is_processing {
-                handle_esc(app);
+                handle_esc(app).await;
             } else if !app.input.is_empty() {
                 app.input.clear();
                 app.cursor = 0;
@@ -1145,8 +1205,10 @@ fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
             Some(true)
         }
         KeyCode::Char('q') => {
-            if let Some(cancel) = &app.active_cancel {
-                cancel.cancel();
+            if app.is_processing
+                && let Err(error) = cancel_active_tui_turn(app).await
+            {
+                app.status_msg = format!("Unable to stop current turn: {error}");
             }
             app.should_quit = true;
             Some(true)
@@ -1286,7 +1348,7 @@ async fn handle_normal_key(
         KeyCode::PageDown => app.chat_scroll = app.chat_scroll.saturating_sub(30),
         KeyCode::Tab if complete_file_reference(app) => {}
         KeyCode::Tab => app.sidebar_tab = (app.sidebar_tab + 1) % 3,
-        KeyCode::Esc => handle_esc(app),
+        KeyCode::Esc => handle_esc(app).await,
         _ => {}
     }
 }
@@ -1301,10 +1363,6 @@ async fn handle_enter(
         None if !app.pending_attachments.is_empty() => String::new(),
         None => return,
     };
-    if let Some(steer_text) = text.strip_prefix("/steer ") {
-        steer_active_turn(app, agent, steer_text.trim()).await;
-        return;
-    }
     if text.starts_with('/') {
         if app.is_processing && !slash_command_allowed_while_busy(&text) {
             app.messages.push(ChatMessage {
@@ -1335,7 +1393,20 @@ async fn handle_enter(
         tracing::info!(queued = app.queued_turns.len(), preview, "TUI turn queued");
         return;
     }
-    dispatch_turn(app, agent, agent_tx, turn).await;
+    if let TurnDispatchResult::Rejected { turn, error, .. } =
+        dispatch_turn(app, agent, agent_tx, turn).await
+    {
+        restore_undispatched_turn(app, turn, error);
+    }
+}
+
+enum TurnDispatchResult {
+    Started,
+    Rejected {
+        turn: QueuedTurn,
+        error: String,
+        retryable: bool,
+    },
 }
 
 async fn dispatch_turn(
@@ -1343,27 +1414,10 @@ async fn dispatch_turn(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
     turn: QueuedTurn,
-) {
-    if let (Some(store), Some(conversation_id)) = (
-        app.conversation_store.as_ref(),
-        app.conversation_id.as_deref(),
-    ) {
-        let title: String = turn.text.chars().take(80).collect();
-        if let Err(error) = store
-            .ensure_conversation(echo_agent::memory::NewConversation {
-                conversation_id: conversation_id.to_string(),
-                user_id: "default".to_string(),
-                agent_type: None,
-                title: Some(title),
-            })
-            .await
-        {
-            tracing::warn!(error = %error, conversation_id, "failed to ensure TUI conversation metadata");
-        }
-    }
+) -> TurnDispatchResult {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
-        std::sync::Arc::new(TuiChatSink::new(agent_tx));
+        std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
     let mode_hint_str = turn.interaction_mode.prompt_hint().to_string();
     let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
         app.workspace_root.as_deref(),
@@ -1381,22 +1435,11 @@ async fn dispatch_turn(
         Ok(prepared) => prepared,
         Err(error) => {
             tracing::warn!(%error, "failed to prepare TUI user turn");
-            app.pending_attachments.extend(turn.attachments);
-            if !turn.text.is_empty() {
-                if app.history.last().is_some_and(|entry| entry == &turn.text) {
-                    app.history.pop();
-                }
-                app.input = turn.text;
-                app.cursor = app.input.len();
-                app.update_suggestions();
-            }
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content: format!("Failed to prepare user turn: {error}"),
-            });
-            app.status_msg = "Ready".to_string();
-            app.rebuild_message_groups();
-            return;
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: format!("Failed to prepare user turn: {error}"),
+                retryable: false,
+            };
         }
     };
     let task_attachments = prepared.inline_attachment_refs();
@@ -1405,10 +1448,49 @@ async fn dispatch_turn(
     } else {
         turn.text.clone()
     };
-    app.start_turn(&display_text);
-    let cancel = echo_agent::agent::CancellationToken::new();
-    app.active_cancel = Some(cancel.clone());
-    app.active_turn_id = Some(turn_id.clone());
+    let foreground_turns = match app.app_state.as_ref() {
+        Some(state) => state.session.foreground_turns.clone(),
+        None => {
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: "TUI application state is unavailable".to_string(),
+                retryable: false,
+            };
+        }
+    };
+    let lease = match begin_tui_foreground_turn(app, &turn_id) {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, turn_id, "failed to acquire TUI foreground turn");
+            let retryable = matches!(
+                &error,
+                echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
+                    | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
+            );
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: format!("Unable to start foreground turn: {error}"),
+                retryable,
+            };
+        }
+    };
+    if let (Some(store), Some(conversation_id)) = (
+        app.conversation_store.as_ref(),
+        app.conversation_id.as_deref(),
+    ) {
+        let title: String = turn.text.chars().take(80).collect();
+        if let Err(error) = store
+            .ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: conversation_id.to_string(),
+                user_id: "default".to_string(),
+                agent_type: None,
+                title: Some(title),
+            })
+            .await
+        {
+            tracing::warn!(error = %error, conversation_id, "failed to ensure TUI conversation metadata");
+        }
+    }
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: app.pool.clone(),
         store: app.task_runtime_store.clone(),
@@ -1417,55 +1499,107 @@ async fn dispatch_turn(
         // TUI/GUI parity (AGENTS.md): bind this turn to the session's
         // conversation id so TaskRuntime runs + transcript projection work.
         conv_id: app.conversation_id.clone(),
-        root_message_id: turn_id,
+        root_message_id: turn_id.clone(),
         // Bind staged refs so subagents in an autonomous run see them too.
         attachments: task_attachments,
-        cancel,
+        cancel: lease.cancellation_token(),
         mode_hint: Some(mode_hint_str),
         interaction_mode: turn.interaction_mode,
         review_integration: app.review_integration.clone(),
         layer_manager: None,
         memory_generation: None,
     });
-    send_to_agent(agent, prepared, res).await;
+    let agent_owned = agent.clone();
+    let settled_turn_id = turn_id.clone();
+    if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
+        let outcome =
+            match std::panic::AssertUnwindSafe(send_to_agent(&agent_owned, prepared, res, lease))
+                .catch_unwind()
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(_) => {
+                    tracing::error!(turn_id = %settled_turn_id, "TUI foreground driver panicked");
+                    TurnOutcome::Cancelled
+                }
+            };
+        let _ = agent_tx.send(AgentEvent::TurnSettled {
+            turn_id: settled_turn_id,
+            outcome,
+        });
+    }) {
+        return TurnDispatchResult::Rejected {
+            turn,
+            error: format!("Unable to supervise foreground turn: {error}"),
+            retryable: false,
+        };
+    }
+    app.start_turn(&display_text);
+    app.active_turn_id = Some(turn_id);
+    TurnDispatchResult::Started
 }
 
-async fn steer_active_turn(app: &mut TuiApp, agent: &AgentHandle, text: &str) {
-    if text.is_empty() {
-        app.status_msg = "Usage: /steer <补充指令>".to_string();
-        return;
+fn begin_tui_foreground_turn(
+    app: &TuiApp,
+    turn_id: &str,
+) -> Result<ForegroundTurnLease, echo_agent_app_core::foreground_turn::ForegroundTurnError> {
+    let app_state = app
+        .app_state
+        .as_ref()
+        .ok_or(echo_agent_app_core::foreground_turn::ForegroundTurnError::StateUnavailable)?;
+    let conversation_id = app
+        .conversation_id
+        .as_deref()
+        .ok_or(echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId)?;
+    app_state
+        .session
+        .foreground_turns
+        .begin(ForegroundTurnSurface::Tui, conversation_id, turn_id)
+}
+
+fn restore_undispatched_turn(app: &mut TuiApp, turn: QueuedTurn, error: String) {
+    app.pending_attachments.extend(turn.attachments);
+    if !turn.text.is_empty() {
+        if app.history.last().is_some_and(|entry| entry == &turn.text) {
+            app.history.pop();
+        }
+        app.input = turn.text;
+        app.cursor = app.input.len();
+        app.update_suggestions();
     }
-    let Some(turn_id) = app.active_turn_id.clone() else {
-        app.status_msg = "当前没有可补充的运行任务".to_string();
-        return;
-    };
-    match agent
-        .steer_input(
-            Some(&turn_id),
-            echo_agent::prelude::Message::user(text.to_string()),
-        )
-        .await
-    {
-        Ok(_) => {
-            app.messages.push(ChatMessage {
-                role: MessageRole::User,
-                content: text.to_string(),
-            });
-            app.rebuild_message_groups();
-            app.status_msg = "已补充到当前任务".to_string();
-        }
-        Err(echo_agent::agent::TurnSteerError::NotSteerable { .. }) => {
-            app.queued_turns.push_back(QueuedTurn {
-                text: text.to_string(),
-                attachments: Vec::new(),
-                interaction_mode: app.interaction_mode,
-            });
-            app.status_msg = format!("当前阶段不可插入 · 已排队 {} 条", app.queued_turns.len());
-        }
-        Err(error) => {
-            app.status_msg = format!("补充失败: {error}");
-        }
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: error,
+    });
+    app.status_msg = "Ready".to_string();
+    app.rebuild_message_groups();
+}
+
+fn active_tui_turn(app: &TuiApp) -> Result<ForegroundTurnSnapshot, String> {
+    let app_state = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| "TUI application state is unavailable".to_string())?;
+    let conversation_id = app
+        .conversation_id
+        .as_deref()
+        .ok_or_else(|| "TUI conversation id is unavailable".to_string())?;
+    let expected_turn_id = app
+        .active_turn_id
+        .as_deref()
+        .ok_or_else(|| "TUI turn projection is unavailable".to_string())?;
+    let snapshot = app_state
+        .session
+        .foreground_turns
+        .snapshot(ForegroundTurnSurface::Tui, conversation_id)
+        .ok_or_else(|| "No active TUI foreground turn".to_string())?;
+    if snapshot.turn_id != expected_turn_id {
+        return Err(format!(
+            "TUI foreground turn mismatch: expected {expected_turn_id}, actual {}",
+            snapshot.turn_id
+        ));
     }
+    Ok(snapshot)
 }
 
 async fn dispatch_next_queued(
@@ -1473,9 +1607,52 @@ async fn dispatch_next_queued(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    if let Some(turn) = app.queued_turns.pop_front() {
-        dispatch_turn(app, agent, agent_tx, turn).await;
+    let Some(turn) = app.queued_turns.pop_front() else {
+        return;
+    };
+    let result = dispatch_turn(app, agent, agent_tx, turn).await;
+    project_queued_dispatch(app, result);
+}
+
+fn project_queued_dispatch(app: &mut TuiApp, result: TurnDispatchResult) {
+    match result {
+        TurnDispatchResult::Started => {}
+        TurnDispatchResult::Rejected {
+            turn,
+            error,
+            retryable: true,
+        } => {
+            app.queued_turns.push_front(turn);
+            app.status_msg = format!("Queued turn is waiting for admission: {error}");
+        }
+        TurnDispatchResult::Rejected {
+            error,
+            retryable: false,
+            ..
+        } => {
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: error,
+            });
+            app.rebuild_message_groups();
+        }
     }
+}
+
+fn queue_steer_follow_up(
+    app: &mut TuiApp,
+    instruction: &str,
+    attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+) {
+    app.queued_turns.push_back(QueuedTurn {
+        text: instruction.to_string(),
+        attachments,
+        interaction_mode: app.interaction_mode,
+    });
+    app.status_msg = format!(
+        "Current stage is not steerable; queued {} follow-up(s)",
+        app.queued_turns.len()
+    );
 }
 
 fn slash_command_allowed_while_busy(text: &str) -> bool {
@@ -1936,13 +2113,10 @@ fn delete_previous_word(app: &mut TuiApp) {
     app.update_suggestions();
 }
 
-fn handle_esc(app: &mut TuiApp) {
+async fn handle_esc(app: &mut TuiApp) {
     if app.is_processing {
-        if let Some(cancel) = &app.active_cancel {
-            cancel.cancel();
-            app.status_msg = "Cancelling...".to_string();
-        } else {
-            app.status_msg = "Waiting for current turn to settle...".to_string();
+        if let Err(error) = cancel_active_tui_turn(app).await {
+            app.status_msg = format!("Unable to cancel current turn: {error}");
         }
     } else {
         let now = Instant::now();
@@ -1957,6 +2131,27 @@ fn handle_esc(app: &mut TuiApp) {
             app.status_msg = "Press Esc again to rewind the last turn".to_string();
         }
     }
+}
+
+async fn cancel_active_tui_turn(app: &mut TuiApp) -> Result<(), String> {
+    let snapshot = active_tui_turn(app)?;
+    let control = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| "TUI application state is unavailable".to_string())?
+        .session
+        .foreground_turns
+        .clone();
+    app.status_msg = "Cancelling...".to_string();
+    control
+        .cancel_and_wait(
+            ForegroundTurnSurface::Tui,
+            &snapshot.conversation_id,
+            &snapshot.turn_id,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 async fn rewind_last_turn(app: &mut TuiApp, agent: &AgentHandle) -> anyhow::Result<()> {
@@ -2215,20 +2410,22 @@ async fn send_to_agent(
     agent: &AgentHandle,
     turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
-) {
-    use echo_agent_app_core::chat_driver::drive_chat;
+    lease: ForegroundTurnLease,
+) -> TurnOutcome {
+    use echo_agent_app_core::foreground_turn::drive_foreground_chat;
 
-    // 极简入口(Phase B1/B3):TUI 不预判 normal/complex——agent 自主决定是否
-    // 建后台 Run(create_complex_task 工具,B3b)。ChatResources(pool/store/sink)
-    // 经 drive_chat scope 进 task_local 供工具读。B5.3: 用户输入(含 /attach 暂存
-    // 的图片/文档)经 PreparedUserTurn 统一构造(与 GUI 同路径)。
-    let agent_owned = agent.clone();
-
-    tokio::spawn(async move {
-        if let Err(e) = drive_chat(&agent_owned, &turn, res).await {
-            tracing::warn!(error = %e, "TUI drive_chat failed");
-        }
-    });
+    // TUI does not classify chat versus task locally. The shared foreground
+    // driver owns TaskRuntime, memory-generation, and pool admission, while
+    // PreparedUserTurn preserves the same staged attachment path as GUI.
+    drive_foreground_chat(lease, agent, &turn, res)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "TUI foreground chat failed");
+            TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                "foreground_turn",
+                error,
+            ))
+        })
 }
 
 async fn handle_tui_cron(app: &TuiApp, args: &str) -> String {
@@ -4338,6 +4535,13 @@ async fn handle_slash_command(
                 return;
             }
             let attachments = std::mem::take(&mut app.pending_attachments);
+            let snapshot = match active_tui_turn(app) {
+                Ok(snapshot) => snapshot,
+                Err(_) => {
+                    queue_steer_follow_up(app, instruction, attachments);
+                    return;
+                }
+            };
             let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
                 app.workspace_root.as_deref(),
             );
@@ -4348,7 +4552,7 @@ async fn handle_slash_command(
                     mode_hint: None,
                     spill_dir: &spill_dir,
                     conversation_id: app.conversation_id.as_deref(),
-                    turn_id: app.active_turn_id.as_deref(),
+                    turn_id: Some(&snapshot.turn_id),
                 },
             ) {
                 Ok(prepared) => prepared,
@@ -4372,7 +4576,7 @@ async fn handle_slash_command(
                     return;
                 }
             };
-            match agent.steer_input(None, message).await {
+            match agent.steer_input(Some(&snapshot.turn_id), message).await {
                 Ok(turn_id) => {
                     app.messages.push(ChatMessage {
                         role: MessageRole::User,
@@ -4385,15 +4589,7 @@ async fn handle_slash_command(
                     | echo_agent::agent::TurnSteerError::NotSteerable { .. }
                     | echo_agent::agent::TurnSteerError::TurnMismatch { .. },
                 ) => {
-                    app.queued_turns.push_back(QueuedTurn {
-                        text: instruction.to_string(),
-                        attachments,
-                        interaction_mode: app.interaction_mode,
-                    });
-                    app.status_msg = format!(
-                        "Current stage is not steerable; queued {} follow-up(s)",
-                        app.queued_turns.len()
-                    );
+                    queue_steer_follow_up(app, instruction, attachments);
                 }
                 Err(error) => {
                     app.pending_attachments = attachments;
@@ -4733,7 +4929,7 @@ async fn handle_slash_command(
                 }
                 _ => String::new(),
             };
-            dispatch_turn(
+            let result = dispatch_turn(
                 app,
                 agent,
                 agent_tx,
@@ -4744,6 +4940,7 @@ async fn handle_slash_command(
                 },
             )
             .await;
+            project_queued_dispatch(app, result);
         }
         None => {
             app.messages.push(ChatMessage {
@@ -4974,7 +5171,6 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
     app.pending_stream.clear();
     app.pending_attachments.clear();
     app.queued_turns.clear();
-    app.active_cancel = None;
     app.active_turn_id = None;
     app.task_runtime_view = None;
     app.subagent_runs.clear();
@@ -5668,17 +5864,24 @@ fn parse_interaction_mode(
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_file_reference, delete_previous_word, format_task_runtime_view,
-        format_unattended_worktrees, handle_esc, move_cursor_vertical, parse_interaction_mode,
+        TurnDispatchResult, apply_turn_settlement, complete_file_reference, delete_previous_word,
+        format_task_runtime_view, format_unattended_worktrees, handle_approval_key, handle_esc,
+        move_cursor_vertical, parse_interaction_mode, project_queued_dispatch,
+        queue_steer_follow_up, render_cancelled_event, render_error_event,
         resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
         slash_command_allowed_while_busy, update_subagent_runs,
     };
-    use crate::tui::{TaskRuntimeTaskView, TaskRuntimeView, Theme, TuiApp};
+    use crate::tui::{
+        ChatMessage, MessageRole, QueuedTurn, TaskRuntimeTaskView, TaskRuntimeView, Theme,
+        ToolExecutionMessage, ToolExecutionStatus, TuiApp,
+    };
+    use echo_agent_app_core::chat_driver::TurnOutcome;
     use echo_agent_app_core::tasks::task_runtime::{
         AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanTask, TaskPlan,
         TaskRunStatus, TaskRuntimeStore, TodoStatus, commit_eko_task_plan,
     };
     use std::sync::Arc;
+    use std::time::Instant;
 
     fn app() -> TuiApp {
         let theme =
@@ -5840,17 +6043,333 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_cancels_backend_but_keeps_turn_busy_until_settle() {
+    fn only_matching_settlement_releases_the_tui_slot_once() {
         let mut app = app();
-        let cancel = echo_agent::agent::CancellationToken::new();
         app.is_processing = true;
-        app.active_cancel = Some(cancel.clone());
+        app.active_turn_id = Some("turn-1".to_string());
+        app.queued_turns.push_back(QueuedTurn {
+            text: "next".to_string(),
+            attachments: Vec::new(),
+            interaction_mode: InteractionMode::Auto,
+        });
 
-        handle_esc(&mut app);
-
-        assert!(cancel.is_cancelled());
+        assert!(!apply_turn_settlement(
+            &mut app,
+            "stale-turn",
+            &TurnOutcome::Completed
+        ));
         assert!(app.is_processing);
-        assert_eq!(app.status_msg, "Cancelling...");
+        assert_eq!(app.active_turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(app.queued_turns.len(), 1);
+
+        assert!(apply_turn_settlement(
+            &mut app,
+            "turn-1",
+            &TurnOutcome::Cancelled
+        ));
+        assert!(!app.is_processing);
+        assert!(app.active_turn_id.is_none());
+        assert_eq!(app.status_msg, "Cancelled");
+        assert_eq!(app.queued_turns.len(), 1);
+
+        assert!(!apply_turn_settlement(
+            &mut app,
+            "turn-1",
+            &TurnOutcome::Cancelled
+        ));
+        assert_eq!(app.queued_turns.len(), 1);
+    }
+
+    #[test]
+    fn retryable_fifo_rejection_preserves_head_attachments_and_editor_draft() {
+        let mut app = app();
+        app.input = "draft still being edited".to_string();
+        app.cursor = app.input.len();
+        let attachment = echo_agent_app_core::attachments::AttachmentRef {
+            path: std::path::PathBuf::from("/tmp/queued.txt"),
+            name: "queued.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            source: echo_agent_app_core::types::AttachmentSource::Upload,
+        };
+        let first = QueuedTurn {
+            text: "first".to_string(),
+            attachments: vec![attachment],
+            interaction_mode: InteractionMode::Auto,
+        };
+        let second = QueuedTurn {
+            text: "second".to_string(),
+            attachments: Vec::new(),
+            interaction_mode: InteractionMode::Auto,
+        };
+        app.queued_turns.push_back(second);
+
+        project_queued_dispatch(
+            &mut app,
+            TurnDispatchResult::Rejected {
+                turn: first,
+                error: "workspace transition".to_string(),
+                retryable: true,
+            },
+        );
+
+        assert_eq!(app.input, "draft still being edited");
+        assert_eq!(app.cursor, app.input.len());
+        assert_eq!(app.queued_turns.len(), 2);
+        assert_eq!(
+            app.queued_turns.front().map(|turn| turn.text.as_str()),
+            Some("first")
+        );
+        assert_eq!(
+            app.queued_turns.front().map(|turn| turn.attachments.len()),
+            Some(1)
+        );
+        assert_eq!(
+            app.queued_turns.get(1).map(|turn| turn.text.as_str()),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn steer_settlement_race_queues_text_and_attachments_once() {
+        let mut app = app();
+        let attachment = echo_agent_app_core::attachments::AttachmentRef {
+            path: std::path::PathBuf::from("/tmp/steer.txt"),
+            name: "steer.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            source: echo_agent_app_core::types::AttachmentSource::Upload,
+        };
+
+        queue_steer_follow_up(&mut app, "continue with this", vec![attachment]);
+
+        assert_eq!(app.queued_turns.len(), 1);
+        assert_eq!(
+            app.queued_turns.front().map(|turn| turn.text.as_str()),
+            Some("continue with this")
+        );
+        assert_eq!(
+            app.queued_turns.front().map(|turn| turn.attachments.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn terminal_stream_events_render_without_releasing_the_tui_slot() {
+        let mut app = app();
+        app.is_processing = true;
+        app.active_turn_id = Some("turn-1".to_string());
+
+        render_cancelled_event(&mut app);
+        assert!(app.is_processing);
+        assert_eq!(app.active_turn_id.as_deref(), Some("turn-1"));
+
+        render_error_event(&mut app, "provider failed");
+        assert!(app.is_processing);
+        assert_eq!(app.active_turn_id.as_deref(), Some("turn-1"));
+        assert!(
+            app.messages
+                .iter()
+                .any(|message| message.content == "Error: provider failed")
+        );
+    }
+
+    #[test]
+    fn completed_settlement_converges_a_missing_tool_terminal_event() {
+        let mut app = app();
+        app.is_processing = true;
+        app.active_turn_id = Some("turn-1".to_string());
+        app.messages.push(ChatMessage {
+            role: MessageRole::ToolExecution(Box::new(ToolExecutionMessage {
+                call_id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                args: "{}".to_string(),
+                status: ToolExecutionStatus::Running,
+                stdout: String::new(),
+                stderr: String::new(),
+                log: String::new(),
+                progress: None,
+                truncated: false,
+                started_at: Instant::now(),
+                finished_at: None,
+                metadata: std::collections::HashMap::new(),
+            })),
+            content: String::new(),
+        });
+
+        assert!(apply_turn_settlement(
+            &mut app,
+            "turn-1",
+            &TurnOutcome::Completed
+        ));
+        assert!(!app.has_running_tools());
+        assert!(app.messages.iter().any(|message| {
+            matches!(
+                &message.role,
+                MessageRole::ToolExecution(tool)
+                    if tool.status == ToolExecutionStatus::Failed
+                        && tool.stderr.contains("terminal event missing")
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn consecutive_hitl_inputs_advance_the_front_immediately() -> Result<(), String> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
+        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
+
+        let provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
+        let first_provider = provider.clone();
+        let mut first = HumanLoopRequest::input("First");
+        first.request_id = Some("request-1".to_string());
+        let first_task = tokio::spawn(async move { first_provider.request(first).await });
+        let pending = provider.pending_handle();
+        wait_for_tui_pending_count(&pending, 1).await?;
+
+        let second_provider = provider.clone();
+        let mut second = HumanLoopRequest::input("Second");
+        second.request_id = Some("request-2".to_string());
+        let second_task = tokio::spawn(async move { second_provider.request(second).await });
+        wait_for_tui_pending_count(&pending, 2).await?;
+
+        let mut app = app();
+        assert!(
+            handle_approval_key(
+                &mut app,
+                &pending,
+                &KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            )
+            .await
+        );
+        assert!(
+            handle_approval_key(
+                &mut app,
+                &pending,
+                &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .await
+        );
+        {
+            let state = pending.lock().map_err(|error| error.to_string())?;
+            assert_eq!(
+                state.front().map(|request| request.request_id.as_str()),
+                Some("request-2")
+            );
+        }
+
+        assert!(
+            handle_approval_key(
+                &mut app,
+                &pending,
+                &KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+            )
+            .await
+        );
+        assert!(
+            handle_approval_key(
+                &mut app,
+                &pending,
+                &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .await
+        );
+        assert!(
+            pending
+                .lock()
+                .map_err(|error| error.to_string())?
+                .is_empty()
+        );
+
+        let first_response = first_task
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let second_response = second_task
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(first_response, HumanLoopResponse::Text(text) if text == "a"));
+        assert!(matches!(second_response, HumanLoopResponse::Text(text) if text == "b"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_hitl_front_exposes_the_next_request_on_input() -> Result<(), String> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
+        use echo_agent_app_core::hitl::TuiHumanLoopProvider;
+
+        let provider = std::sync::Arc::new(TuiHumanLoopProvider::new());
+        let first_provider = provider.clone();
+        let mut first = HumanLoopRequest::input("First");
+        first.request_id = Some("request-1".to_string());
+        let first_task = tokio::spawn(async move { first_provider.request(first).await });
+        let pending = provider.pending_handle();
+        wait_for_tui_pending_count(&pending, 1).await?;
+
+        let second_provider = provider.clone();
+        let mut second = HumanLoopRequest::input("Second");
+        second.request_id = Some("request-2".to_string());
+        let second_task = tokio::spawn(async move { second_provider.request(second).await });
+        wait_for_tui_pending_count(&pending, 2).await?;
+
+        first_task.abort();
+        let _ = first_task.await;
+        assert_eq!(pending.lock().map_err(|error| error.to_string())?.len(), 1);
+
+        let mut app = app();
+        assert!(
+            handle_approval_key(
+                &mut app,
+                &pending,
+                &KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+            )
+            .await
+        );
+        {
+            let queue = pending.lock().map_err(|error| error.to_string())?;
+            let front = queue
+                .front()
+                .ok_or_else(|| "next request was not exposed".to_string())?;
+            assert_eq!(front.request_id, "request-2");
+            assert_eq!(front.feedback_input, "z");
+        }
+        assert!(
+            handle_approval_key(
+                &mut app,
+                &pending,
+                &KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .await
+        );
+        assert!(
+            pending
+                .lock()
+                .map_err(|error| error.to_string())?
+                .is_empty()
+        );
+
+        let response = second_task
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(response, HumanLoopResponse::Text(text) if text == "z"));
+        Ok(())
+    }
+
+    async fn wait_for_tui_pending_count(
+        pending: &echo_agent_app_core::hitl::PendingApprovalQueue,
+        expected: usize,
+    ) -> Result<(), String> {
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if pending.lock().map(|state| state.len()).unwrap_or_default() == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| format!("pending request count did not reach {expected}"))
     }
 
     #[test]
@@ -5910,13 +6429,13 @@ mod tests {
         assert!(formatted.contains("no checkout"));
     }
 
-    #[test]
-    fn repeated_idle_escape_requests_rewind() {
+    #[tokio::test]
+    async fn repeated_idle_escape_requests_rewind() {
         let mut app = app();
 
-        handle_esc(&mut app);
+        handle_esc(&mut app).await;
         assert!(!app.rewind_requested);
-        handle_esc(&mut app);
+        handle_esc(&mut app).await;
 
         assert!(app.rewind_requested);
         assert!(app.last_escape_at.is_none());

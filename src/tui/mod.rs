@@ -272,9 +272,7 @@ pub struct TuiApp {
     pub message_groups: Vec<MessageGroup>,
     /// Whether the agent is currently processing.
     pub is_processing: bool,
-    /// Cancellation authority for the current foreground turn.
-    pub active_cancel: Option<echo_agent::agent::CancellationToken>,
-    /// Framework turn id used by `/steer` while the turn is active.
+    /// UI correlation id for the authoritative application foreground turn.
     pub active_turn_id: Option<String>,
     /// FIFO turns submitted while the foreground agent is busy.
     pub queued_turns: VecDeque<QueuedTurn>,
@@ -360,9 +358,7 @@ pub struct TuiApp {
     /// Mouse selection end: (wrapped_line_index, visual_column).
     pub selection_end: Option<(usize, usize)>,
     /// Pending approval request from the agent (TUI HITL provider).
-    pub pending_approval: Option<
-        std::sync::Arc<tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>>,
-    >,
+    pub pending_approval: Option<echo_agent_app_core::hitl::PendingApprovalQueue>,
     /// AgentPool for acquiring an isolated agent per background run (Phase B3).
     /// Set by `run_tui` at startup; `handle_enter` reads it to build
     /// `ChatResources` for `drive_chat`. `None` until set.
@@ -804,7 +800,6 @@ impl TuiApp {
             }],
             message_groups: vec![],
             is_processing: false,
-            active_cancel: None,
             active_turn_id: None,
             queued_turns: VecDeque::new(),
             streaming_text: String::new(),
@@ -1108,7 +1103,9 @@ impl TuiApp {
         true
     }
 
-    /// Finalize the current streaming response.
+    /// Finalize streamed content without projecting a lifecycle terminal.
+    ///
+    /// Only the exact `TurnSettled` reducer may release the foreground UI slot.
     pub fn finalize_stream(&mut self) {
         // Flush any remaining buffered tokens.
         if !self.pending_stream.is_empty() {
@@ -1122,10 +1119,6 @@ impl TuiApp {
             });
             self.streaming_text.clear();
         }
-        self.is_processing = false;
-        self.active_cancel = None;
-        self.active_turn_id = None;
-        self.status_msg = "Ready".to_string();
         self.trim_old_messages();
         self.rebuild_message_groups();
     }
@@ -1790,17 +1783,45 @@ mod state_tests {
     }
 
     #[test]
-    fn finalize_stream_releases_cancellation_authority() {
+    fn finalize_stream_only_commits_content() {
         let mut app = app();
         app.is_processing = true;
-        app.active_cancel = Some(echo_agent::agent::CancellationToken::new());
+        app.active_turn_id = Some("turn-1".to_string());
         app.streaming_text = "done".to_string();
 
         app.finalize_stream();
 
-        assert!(!app.is_processing);
-        assert!(app.active_cancel.is_none());
+        assert!(app.is_processing);
+        assert_eq!(app.active_turn_id.as_deref(), Some("turn-1"));
         assert_eq!(app.last_assistant_response(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn tui_shutdown_waits_for_foreground_settlement() -> Result<(), String> {
+        use echo_agent_app_core::chat_driver::TurnOutcome;
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+
+        let control = ForegroundTurnControl::default();
+        let lease = control
+            .begin(ForegroundTurnSurface::Tui, "conversation", "turn-1")
+            .map_err(|error| error.to_string())?;
+        let cancelled = lease.cancellation_token();
+        let driver = tokio::spawn(async move {
+            cancelled.cancelled().await;
+            tokio::task::yield_now().await;
+            let _ = lease.settle(TurnOutcome::Cancelled);
+        });
+
+        super::settle_tui_foreground_on_exit(&control, "conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+        driver.await.map_err(|error| error.to_string())?;
+        assert!(
+            control
+                .snapshot(ForegroundTurnSurface::Tui, "conversation")
+                .is_none()
+        );
+        Ok(())
     }
 }
 
@@ -1880,6 +1901,33 @@ impl Drop for TerminalGuard {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
+async fn settle_tui_foreground_on_exit(
+    control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    conversation_id: &str,
+) -> Result<(), echo_agent_app_core::foreground_turn::ForegroundTurnError> {
+    use echo_agent_app_core::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
+
+    loop {
+        let Some(snapshot) = control.snapshot(ForegroundTurnSurface::Tui, conversation_id) else {
+            return Ok(());
+        };
+        match control
+            .cancel_and_wait(
+                ForegroundTurnSurface::Tui,
+                conversation_id,
+                &snapshot.turn_id,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(
+                ForegroundTurnError::NoActiveTurn { .. } | ForegroundTurnError::TurnMismatch { .. },
+            ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Run the TUI application.
 ///
 /// This function handles all terminal setup/teardown via [`TerminalGuard`],
@@ -1889,9 +1937,7 @@ pub async fn run_tui(
     agent: AgentHandle,
     tui_config: &echo_agent::config::TuiConfig,
     mode_display: &str,
-    tui_pending: std::sync::Arc<
-        tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>,
-    >,
+    tui_pending: echo_agent_app_core::hitl::PendingApprovalQueue,
     pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
@@ -2006,12 +2052,23 @@ pub async fn run_tui(
         app.rebuild_message_groups();
     }
     agent
-        .write(|value| value.set_conversation_id(conversation_id))
+        .write(|value| value.set_conversation_id(conversation_id.clone()))
         .await;
 
     // Main event loop.
     let result = events::run_event_loop(&mut terminal, &mut app, agent).await;
 
+    let foreground_shutdown =
+        settle_tui_foreground_on_exit(&app_state.session.foreground_turns, &conversation_id).await;
     // Guard drop will restore the terminal.
-    result
+    match (result, foreground_shutdown) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(anyhow::anyhow!(
+            "failed to settle TUI foreground turn during shutdown: {error}"
+        )),
+        (Err(loop_error), Err(shutdown_error)) => Err(anyhow::anyhow!(
+            "TUI event loop failed: {loop_error}; foreground shutdown failed: {shutdown_error}"
+        )),
+    }
 }

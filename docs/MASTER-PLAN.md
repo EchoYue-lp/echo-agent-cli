@@ -74,7 +74,7 @@ evidence, and the next bounded step.
 | Hook execution closure | Complete | The main registry exposes 31 emitted events and 7 Action types. Failed tool results emit `PostToolUseFailure`; the canonical call-scoped `permission_mode_override` participates in approval without mutating global mode; all Hook sources share strict registration filtering. CLI/TUI/GUI Hook tests use the same matcher-aware dry-run, and the watcher reloads app config plus global/project `hooks.yaml` on create/modify/remove. Evolution writes, layer changes, candidate detection, and health checks emit their declared events. Plain HTTP supports loopback/private/link-local IPs, localhost, single-label hosts, `.local`, and `.lan`; remote hosts require HTTPS. User-configured MCP tools have no deny-list. |
 | Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
 | Provider default protocol convergence | Complete | Framework `ProviderMetadata.default_api_protocol` is the sole built-in authority; EKO preserves explicit overrides, infers custom complete endpoints, keeps a non-persistent session selection for every future pooled agent, and projects the provider wire contract through generated ts-rs DTOs without a second provider mapping. |
-| Foreground turn ownership convergence | In progress | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, and channel use it end to end; TUI adapter migration remains bounded follow-up work. |
+| Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
 
 ## Current Decisions
 
@@ -255,13 +255,11 @@ context is now a replaceable projection instead of a boot-only system-prompt
 suffix. Bootstrap, workspace switch/exit, Dreaming promotion, explicit hot
 memory mutation, and rule promotion refresh the primary Agent immediately;
 pooled Agents refresh too, and future pooled Agents inherit the current working
-directory. GUI and TUI own and settle their Dreaming schedules today. TUI
-normal Chat still needs its foreground JoinHandle moved under the shared
-foreground owner, while standalone channel mode does not yet start Dreaming.
-Their foreground/channel follow-up branches must close those exact surface
-lifecycle gaps and await settlement before workspace transition teardown. The
-memory-generation branch deliberately does not add a second Dreaming owner
-while those surface lifecycles are being unified.
+directory. GUI, TUI, and CLI own and settle their Dreaming schedules today.
+TUI normal Chat is supervised by the shared foreground owner and settles before
+Dreaming, review, and workspace transition teardown. Standalone channel mode
+still needs the same Dreaming schedule composition; that remaining adapter must
+reuse the existing owner rather than introduce a second schedule authority.
 
 EKO product writes use one `MemoryLayerManager` path and the unified
 `agent/memories` namespace. Raw Store tools and the optional cold tier remain
@@ -526,11 +524,19 @@ manager snapshot or generation reacquisition.
 Shutdown inserts the existing `ReviewIntegration` settlement immediately after
 foreground shutdown and before workspace transition shutdown.
 
-TUI still requires a thin `ForegroundTurnControl` adapter and deletion of its
-replaced local foreground ownership. Normal TUI chat must acquire the same
-Memory generation receipt before pool admission and must not preserve a legacy
-`create_layer_manager` snapshot across an await. Framework lifecycle and
-steering APIs must not be duplicated or changed for that follow-up.
+TUI now acquires the same exact lease and runs its driver through the owner's
+supervisor. `active_turn_id` is renderer correlation only; `FinalAnswer`,
+`Cancelled`, `Error`, and textual status events cannot release busy state or
+advance the follow-up queue. Only an exact matching `TurnSettled` projection
+does so once. Retryable admission failures restore the original FIFO head and
+leave the editor draft and attachments untouched. Steering settlement races
+reuse that FIFO instead of discarding accepted input. TUI HITL is one
+request-id-reserving FIFO owner with atomic close-and-drain, and its exact
+dispatcher registration is removed before the shared ordered shutdown drains
+foreground, model, Dreaming/review, workspace, scheduler, TaskRun, pool,
+plugin, watcher, MCP, browser, and Hook owners. The shared chat driver remains
+the sole TaskRuntime/Memory/pool generation authority; TUI does not snapshot a
+legacy layer manager or add a framework lifecycle API.
 
 ## Next Step
 
@@ -583,11 +589,9 @@ running, completed output loads only one page at a time, history reload restores
 summaries without eager detail reads, and conversation deletion returns before
 background detail cleanup finishes.
 
-Complete foreground-turn surface parity by routing TUI through the app-core
-lease while preserving renderer-only differences. The CLI REPL and channel
-adapters already use exact cancellation, typed settlement, and the shared
-TaskRuntime/Memory/pool generation order. Add exact-id cancel/snapshot adapter
-tests for TUI, then delete its replaced local foreground token ownership.
-After all adapters use the owner, add one cross-surface integration gate
-covering independent scope, stale-id rejection, sink disconnect failure, and
-settlement-before-release.
+Add one cross-surface integration gate over GUI, TUI, CLI REPL, and channel that
+covers independent scope, stale-id rejection, sink disconnect failure, and
+settlement-before-release through their real transport adapters. Then continue
+the broader capability-parity matrix for Task/Subagent/reviewer,
+MCP/LSP/browser/terminal, and research/evolution/memory without introducing
+surface-local lifecycle owners.
