@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use echo_agent::agent::CancellationToken;
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,6 +21,8 @@ use crate::agent_handle::AgentHandle;
 use crate::persistence::Persistence;
 use crate::workspace::Workspace;
 use crate::workspace::registry::WorkspaceRegistry;
+
+type Result<T, E = echo_agent::error::ReactError> = std::result::Result<T, E>;
 
 /// 工具状态
 #[derive(Debug, Clone)]
@@ -355,6 +358,8 @@ pub struct McpHealthStatus {
 /// 连接管理状态：Agent 句柄 + HITL Dispatcher + 可选 Agent Pool
 pub struct ConnectionState {
     pub agent: AgentHandle,
+    /// EKO-owned consumers coupled to the primary agent's model generation.
+    pub model_consumers: Option<crate::infra::AgentModelConsumers>,
     /// HITL dispatcher — 多 Provider 协作（repl, ws, webhook 等）
     /// WS handler 注册到 dispatcher 而非替换 agent 的 provider，
     /// 确保多模式下 HITL 请求能路由到正确的 Provider。
@@ -401,12 +406,96 @@ impl ConnectionState {
 /// 配置状态：应用 / Web / 沙箱 / 权限
 pub struct ConfigState {
     pub app_config: RwLock<echo_agent::config::AppConfig>,
+    /// Runtime model currently published to primary and pooled agents. This
+    /// remains distinct from the durable default when startup used `--model`.
+    active_model_id: RwLock<String>,
     /// Immutable startup source used for every application-side config commit.
     pub config_path: std::path::PathBuf,
     pub web_config: RwLock<WebConfig>,
     pub sandbox_config: RwLock<SandboxConfigData>,
     pub permission_mode: RwLock<String>,
     pub permission_rules: RwLock<Vec<PermissionRuleConfig>>,
+    model_mutations: Mutex<ModelMutationOwnerState>,
+}
+
+type ModelMutationSettlement =
+    Shared<BoxFuture<'static, Result<ModelMutationReceipt, ModelMutationError>>>;
+
+struct ModelMutationOwnerState {
+    lifecycle: ModelMutationOwnerLifecycle,
+}
+
+enum ModelMutationOwnerLifecycle {
+    Running(ModelMutationSettlement),
+    Settled(Box<Result<Option<ModelMutationReceipt>, ModelMutationError>>),
+    Closed(Result<(), ModelMutationError>),
+}
+
+impl Default for ModelMutationOwnerState {
+    fn default() -> Self {
+        Self {
+            lifecycle: ModelMutationOwnerLifecycle::Settled(Box::new(Ok(None))),
+        }
+    }
+}
+
+/// Application input for one configured-model upsert. Provider credentials
+/// remain part of the same candidate config and commit atomically with it.
+#[derive(Debug, Clone)]
+pub struct ConfiguredModelMutation {
+    pub model: echo_agent::config::ConfiguredModel,
+    pub auth_token: Option<String>,
+    pub base_url: Option<String>,
+    pub set_default: bool,
+}
+
+/// Linearized result returned only after disk, snapshot, primary, and pool
+/// publication have completed for an active-model mutation.
+#[derive(Clone)]
+pub struct ModelMutationReceipt {
+    pub config: echo_agent::config::AppConfig,
+    pub model_id: String,
+    pub runtime: Option<crate::model_config::ModelRuntimeConfig>,
+    pub activated: bool,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ModelMutationError {
+    #[error("model mutation rejected: {0}")]
+    Validation(String),
+    #[error("model mutation persistence failed: {0}")]
+    Persistence(String),
+    #[error("model mutation publication failed: {0}")]
+    Publication(String),
+    #[error("model mutation owner is shutting down")]
+    ShuttingDown,
+    #[error("model mutation settlement task failed: {0}")]
+    Settlement(String),
+}
+
+type OwnedConfigUpdate =
+    Box<dyn FnOnce(&mut echo_agent::config::AppConfig) -> Result<(), String> + Send + 'static>;
+
+enum ModelMutationRequest {
+    Upsert(ConfiguredModelMutation),
+    SetDefault(String),
+    Delete(String),
+    UpdateConfig {
+        update: OwnedConfigUpdate,
+        reapply_active_model: bool,
+    },
+    #[cfg(test)]
+    AbortSettlementForTest,
+}
+
+struct PreparedModelMutation {
+    config: echo_agent::config::AppConfig,
+    model_id: String,
+    runtime: Option<crate::model_config::ModelRuntimeConfig>,
+    prepared: Option<crate::infra::PreparedRuntimeLlm>,
+    activated: bool,
+    deleted: bool,
 }
 
 /// 会话状态：工具状态、非聊天操作取消和前台 turn 控制。
@@ -622,6 +711,7 @@ impl AppState {
     /// 从共享的 Agent 和 HITL Dispatcher 创建状态（用于双模式）
     pub fn from_shared(
         agent: AgentHandle,
+        model_consumers: Option<crate::infra::AgentModelConsumers>,
         hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
         conversation_store: Option<Arc<dyn ConversationStore>>,
         app_config: echo_agent::config::AppConfig,
@@ -636,21 +726,29 @@ impl AppState {
             })
             .unwrap_or_default();
 
+        let active_model_id = crate::model_config::resolve_runtime_model(
+            &app_config,
+            app_config.model.default_model_id.as_deref(),
+        )
+        .id;
         let webhook_emitter = Arc::new(crate::webhook::WebhookEmitter::from_config(&app_config));
 
         Self {
             connection: ConnectionState {
                 agent,
+                model_consumers,
                 hitl_dispatcher,
                 pool: None,
             },
             config: ConfigState {
                 app_config: RwLock::new(app_config),
+                active_model_id: RwLock::new(active_model_id),
                 config_path: crate::config_watcher::resolve_config_save_path(None),
                 web_config: RwLock::new(config),
                 sandbox_config: RwLock::new(SandboxConfigData::default()),
                 permission_mode: RwLock::new("default".to_string()),
                 permission_rules: RwLock::new(Vec::new()),
+                model_mutations: Mutex::new(ModelMutationOwnerState::default()),
             },
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
@@ -779,6 +877,12 @@ impl AppState {
         }
     }
 
+    /// Record the non-persistent model generation selected during bootstrap.
+    pub fn with_active_model_id(mut self, active_model_id: impl Into<String>) -> Self {
+        *self.config.active_model_id.get_mut() = active_model_id.into();
+        self
+    }
+
     /// Bind config persistence to the source selected during bootstrap.
     pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
         self.config.config_path = path;
@@ -786,11 +890,249 @@ impl AppState {
     }
 
     /// Persist one complete config snapshot to the immutable bootstrap source.
-    pub fn save_app_config(
+    fn save_app_config(
         &self,
         config: &echo_agent::config::AppConfig,
     ) -> std::result::Result<(), String> {
         echo_agent::config::save_config_file(&self.config.config_path, config)
+    }
+
+    /// Upsert one configured model through the sole application-owned config
+    /// mutation settlement path.
+    pub async fn upsert_configured_model_owned(
+        self: &Arc<Self>,
+        mutation: ConfiguredModelMutation,
+    ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        self.run_owned_model_mutation(ModelMutationRequest::Upsert(mutation))
+            .await
+    }
+
+    /// Resolve an id or unambiguous model selector, persist it as the default,
+    /// and publish the exact prepared client to primary and pooled agents.
+    pub async fn set_default_model_owned(
+        self: &Arc<Self>,
+        selector: impl Into<String>,
+    ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        self.run_owned_model_mutation(ModelMutationRequest::SetDefault(selector.into()))
+            .await
+    }
+
+    /// Delete a configured model. Deleting the active default is accepted only
+    /// when another enabled model has passed the real client preflight.
+    pub async fn delete_configured_model_owned(
+        self: &Arc<Self>,
+        model_id: impl Into<String>,
+    ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        self.run_owned_model_mutation(ModelMutationRequest::Delete(model_id.into()))
+            .await
+    }
+
+    /// Serialize a broader AppConfig edit with model mutations so a stale
+    /// whole-config snapshot cannot overwrite an accepted model publication.
+    /// When model runtime fields change, the active model is preflighted and
+    /// republished within the same owned settlement.
+    pub async fn update_app_config_owned<Update>(
+        self: &Arc<Self>,
+        reapply_active_model: bool,
+        update: Update,
+    ) -> Result<echo_agent::config::AppConfig, ModelMutationError>
+    where
+        Update: FnOnce(&mut echo_agent::config::AppConfig) -> Result<(), String> + Send + 'static,
+    {
+        self.run_owned_model_mutation(ModelMutationRequest::UpdateConfig {
+            update: Box::new(update),
+            reapply_active_model,
+        })
+        .await
+        .map(|receipt| receipt.config)
+    }
+
+    async fn run_owned_model_mutation(
+        self: &Arc<Self>,
+        request: ModelMutationRequest,
+    ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        let mut owner = self.config.model_mutations.lock().await;
+        if let ModelMutationOwnerLifecycle::Closed(_) = &owner.lifecycle {
+            return Err(ModelMutationError::ShuttingDown);
+        }
+        let previous = match &owner.lifecycle {
+            ModelMutationOwnerLifecycle::Running(previous) => Some(previous.clone()),
+            _ => None,
+        };
+        if let Some(previous) = previous {
+            let previous = previous.await.map(Some);
+            owner.lifecycle = ModelMutationOwnerLifecycle::Settled(Box::new(previous.clone()));
+            previous?;
+        }
+        if let ModelMutationOwnerLifecycle::Settled(result) = &owner.lifecycle {
+            result.as_ref().clone()?;
+        }
+
+        let state = Arc::clone(self);
+        #[cfg(test)]
+        let abort_for_test = matches!(&request, ModelMutationRequest::AbortSettlementForTest);
+        let task = tokio::spawn(async move {
+            #[cfg(test)]
+            if matches!(&request, ModelMutationRequest::AbortSettlementForTest) {
+                return std::future::pending::<Result<ModelMutationReceipt, ModelMutationError>>()
+                    .await;
+            }
+            state.apply_model_mutation_inner(request).await
+        });
+        #[cfg(test)]
+        if abort_for_test {
+            task.abort();
+        }
+        let settlement = async move {
+            task.await
+                .map_err(|error| ModelMutationError::Settlement(error.to_string()))?
+        }
+        .boxed()
+        .shared();
+        owner.lifecycle = ModelMutationOwnerLifecycle::Running(settlement.clone());
+        let result = settlement.await;
+        owner.lifecycle = ModelMutationOwnerLifecycle::Settled(Box::new(result.clone().map(Some)));
+        result
+    }
+
+    async fn apply_model_mutation_inner(
+        &self,
+        request: ModelMutationRequest,
+    ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        let current = self.config.app_config.read().await.clone();
+        let active_model_id = self.config.active_model_id.read().await.clone();
+        let mutation = prepare_model_mutation(&current, &active_model_id, request)?;
+        let next_active_runtime = if mutation.activated {
+            mutation.runtime.clone().ok_or_else(|| {
+                ModelMutationError::Publication(
+                    "active model mutation lost its runtime candidate".to_string(),
+                )
+            })?
+        } else {
+            resolve_active_model_runtime(&mutation.config, &active_model_id)?
+        };
+        let pool_session_config =
+            crate::model_config::session_config_for_runtime(&mutation.config, &next_active_runtime)
+                .map_err(ModelMutationError::Publication)?;
+        let _foreground = if mutation.activated {
+            Some(
+                self.session
+                    .foreground_turns
+                    .suspend_admission_if_idle()
+                    .map_err(|error| ModelMutationError::Publication(error.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let (runtime, prepared) = if mutation.activated {
+            let runtime = mutation.runtime.clone().ok_or_else(|| {
+                ModelMutationError::Publication(
+                    "active model mutation lost its runtime candidate".to_string(),
+                )
+            })?;
+            let prepared = mutation.prepared.clone().ok_or_else(|| {
+                ModelMutationError::Publication(
+                    "active model mutation lost its prepared client".to_string(),
+                )
+            })?;
+            (Some(runtime), Some(prepared))
+        } else {
+            (None, None)
+        };
+        let pool_publication = match (
+            self.connection.pool.as_ref(),
+            runtime.as_ref(),
+            prepared.as_ref(),
+        ) {
+            (Some(pool), Some(runtime), Some(prepared)) => Some(
+                pool.prepare_model_publication(
+                    pool_session_config.clone(),
+                    runtime.clone(),
+                    prepared.clone(),
+                )
+                .await
+                .map_err(ModelMutationError::Publication)?,
+            ),
+            _ => None,
+        };
+        let primary_publication = match (runtime.as_ref(), prepared.as_ref()) {
+            (Some(runtime), Some(prepared)) => {
+                let consumers = self.connection.model_consumers.clone().ok_or_else(|| {
+                    ModelMutationError::Publication(
+                        "primary model consumers are unavailable".to_string(),
+                    )
+                })?;
+                Some(
+                    crate::infra::prepare_agent_model_publication(
+                        &self.connection.agent,
+                        consumers,
+                        runtime,
+                        prepared,
+                        crate::infra::effective_token_limit(&mutation.config, runtime),
+                    )
+                    .await
+                    .map_err(ModelMutationError::Publication)?,
+                )
+            }
+            _ => None,
+        };
+
+        self.save_app_config(&mutation.config)
+            .map_err(ModelMutationError::Persistence)?;
+        *self.config.app_config.write().await = mutation.config.clone();
+
+        if let Some(publication) = primary_publication {
+            publication.commit().await;
+        }
+
+        if let Some(publication) = pool_publication {
+            publication.commit().await;
+        } else if let Some(pool) = self.connection.pool.as_ref() {
+            pool.update_app_config(pool_session_config).await;
+        }
+
+        if let Some(runtime) = runtime.as_ref() {
+            *self.config.active_model_id.write().await = runtime.id.clone();
+            tracing::info!(
+                model_id = %runtime.id,
+                provider = %runtime.provider,
+                model = %runtime.model,
+                "active model mutation fully settled"
+            );
+        }
+        Ok(ModelMutationReceipt {
+            config: mutation.config,
+            model_id: mutation.model_id,
+            runtime: mutation.runtime,
+            activated: mutation.activated,
+            deleted: mutation.deleted,
+        })
+    }
+
+    /// Close model mutation admission and await an accepted settlement whose
+    /// caller was dropped before application shutdown.
+    pub async fn shutdown_model_mutations(&self) -> Result<(), ModelMutationError> {
+        let mut owner = self.config.model_mutations.lock().await;
+        if let ModelMutationOwnerLifecycle::Closed(result) = &owner.lifecycle {
+            return result.clone();
+        }
+        let settlement = match &owner.lifecycle {
+            ModelMutationOwnerLifecycle::Running(settlement) => Some(settlement.clone()),
+            _ => None,
+        };
+        if let Some(settlement) = settlement {
+            let result = settlement.await.map(Some);
+            owner.lifecycle = ModelMutationOwnerLifecycle::Settled(Box::new(result));
+        }
+        let result = match &owner.lifecycle {
+            ModelMutationOwnerLifecycle::Settled(result) => result.as_ref().clone().map(|_| ()),
+            ModelMutationOwnerLifecycle::Closed(result) => result.clone(),
+            ModelMutationOwnerLifecycle::Running(_) => Err(ModelMutationError::Settlement(
+                "model mutation owner did not reach a terminal state".to_string(),
+            )),
+        };
+        owner.lifecycle = ModelMutationOwnerLifecycle::Closed(result.clone());
+        result
     }
 
     /// Attach the shared review integration created during runtime bootstrap.
@@ -1749,6 +2091,1151 @@ impl AppState {
     }
 }
 
+fn prepare_model_mutation(
+    current: &echo_agent::config::AppConfig,
+    active_model_id: &str,
+    request: ModelMutationRequest,
+) -> Result<PreparedModelMutation, ModelMutationError> {
+    match request {
+        ModelMutationRequest::Upsert(mutation) => {
+            let mut config = current.clone();
+            let provider = mutation.model.provider.clone();
+            let active_before = resolve_active_model_runtime(current, active_model_id)?;
+            let provider_before = config.model_providers.get(&provider).cloned();
+            let provider_config = config.model_providers.entry(provider.clone()).or_default();
+            if let Some(auth_token) = mutation
+                .auth_token
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty())
+            {
+                provider_config.auth_token = Some(auth_token);
+            }
+            if let Some(base_url) = mutation
+                .base_url
+                .map(|url| url.trim().to_string())
+                .filter(|url| !url.is_empty())
+            {
+                provider_config.base_url = Some(base_url);
+            }
+            let provider_config_changed = provider_before
+                .as_ref()
+                .map(|before| {
+                    before.auth_token != provider_config.auth_token
+                        || before.base_url != provider_config.base_url
+                })
+                .unwrap_or_else(|| {
+                    provider_config.auth_token.is_some() || provider_config.base_url.is_some()
+                });
+            let previous_default = current.model.default_model_id.clone();
+            let model_id =
+                crate::model_config::upsert_configured_model(&mut config, mutation.model);
+            let became_first_default = previous_default.is_none()
+                && config.model.default_model_id.as_deref() == Some(model_id.as_str());
+            let updates_persisted_default = mutation.set_default
+                || previous_default.as_deref() == Some(model_id.as_str())
+                || became_first_default;
+            if updates_persisted_default {
+                crate::model_config::set_default_model(&mut config, &model_id)
+                    .map_err(ModelMutationError::Validation)?;
+            }
+            let updates_active_model = active_before.id == model_id;
+            let activates_upserted_model =
+                mutation.set_default || updates_active_model || became_first_default;
+            let refreshes_active_provider = !activates_upserted_model
+                && provider_config_changed
+                && active_before.provider == provider;
+            let activated = activates_upserted_model || refreshes_active_provider;
+            let runtime = if activates_upserted_model {
+                crate::model_config::resolve_runtime_model(&config, Some(&model_id))
+            } else if refreshes_active_provider {
+                resolve_active_model_runtime(&config, &active_before.id)?
+            } else {
+                crate::model_config::resolve_runtime_model(&config, Some(&model_id))
+            };
+            let prepared = crate::infra::prepare_runtime_llm(&runtime)
+                .map_err(ModelMutationError::Validation)?;
+            Ok(PreparedModelMutation {
+                config,
+                model_id,
+                runtime: Some(runtime),
+                prepared: Some(prepared),
+                activated,
+                deleted: false,
+            })
+        }
+        ModelMutationRequest::SetDefault(selector) => {
+            let selected =
+                crate::model_config::resolve_runtime_model_selector(current, Some(&selector))
+                    .map_err(|error| ModelMutationError::Validation(error.to_string()))?;
+            let mut config = current.clone();
+            let runtime = crate::model_config::set_default_model(&mut config, &selected.id)
+                .map_err(ModelMutationError::Validation)?;
+            let prepared = crate::infra::prepare_runtime_llm(&runtime)
+                .map_err(ModelMutationError::Validation)?;
+            Ok(PreparedModelMutation {
+                config,
+                model_id: runtime.id.clone(),
+                runtime: Some(runtime),
+                prepared: Some(prepared),
+                activated: true,
+                deleted: false,
+            })
+        }
+        ModelMutationRequest::Delete(model_id) => {
+            let mut config = current.clone();
+            match crate::model_config::delete_configured_model(&mut config, &model_id)
+                .map_err(ModelMutationError::Validation)?
+            {
+                crate::model_config::DeleteConfiguredModelOutcome::RemovedNonDefault => {
+                    if active_model_id == model_id {
+                        let runtime = resolve_active_model_runtime(&config, active_model_id)?;
+                        let prepared = crate::infra::prepare_runtime_llm(&runtime)
+                            .map_err(ModelMutationError::Validation)?;
+                        Ok(PreparedModelMutation {
+                            config,
+                            model_id,
+                            runtime: Some(runtime),
+                            prepared: Some(prepared),
+                            activated: true,
+                            deleted: true,
+                        })
+                    } else {
+                        Ok(PreparedModelMutation {
+                            config,
+                            model_id,
+                            runtime: None,
+                            prepared: None,
+                            activated: false,
+                            deleted: true,
+                        })
+                    }
+                }
+                crate::model_config::DeleteConfiguredModelOutcome::ActivatedSuccessor(runtime) => {
+                    let prepared = crate::infra::prepare_runtime_llm(&runtime)
+                        .map_err(ModelMutationError::Validation)?;
+                    Ok(PreparedModelMutation {
+                        config,
+                        model_id,
+                        runtime: Some(*runtime),
+                        prepared: Some(prepared),
+                        activated: true,
+                        deleted: true,
+                    })
+                }
+            }
+        }
+        ModelMutationRequest::UpdateConfig {
+            update,
+            reapply_active_model,
+        } => {
+            let mut config = current.clone();
+            update(&mut config).map_err(ModelMutationError::Validation)?;
+            let runtime = if reapply_active_model {
+                Some(resolve_active_model_runtime(&config, active_model_id)?)
+            } else {
+                None
+            };
+            let prepared = runtime
+                .as_ref()
+                .map(crate::infra::prepare_runtime_llm)
+                .transpose()
+                .map_err(ModelMutationError::Validation)?;
+            let model_id = runtime
+                .as_ref()
+                .map(|runtime| runtime.id.clone())
+                .or_else(|| config.model.default_model_id.clone())
+                .unwrap_or_default();
+            Ok(PreparedModelMutation {
+                config,
+                model_id,
+                runtime,
+                prepared,
+                activated: reapply_active_model,
+                deleted: false,
+            })
+        }
+        #[cfg(test)]
+        ModelMutationRequest::AbortSettlementForTest => Err(ModelMutationError::Settlement(
+            "test-only aborted settlement reached mutation preparation".to_string(),
+        )),
+    }
+}
+
+fn resolve_active_model_runtime(
+    config: &echo_agent::config::AppConfig,
+    active_model_id: &str,
+) -> Result<crate::model_config::ModelRuntimeConfig, ModelMutationError> {
+    let active_is_available = config
+        .configured_models
+        .iter()
+        .any(|model| model.id == active_model_id && model.enabled);
+    let selector = if active_is_available || config.configured_models.is_empty() {
+        Some(active_model_id)
+    } else {
+        config.model.default_model_id.as_deref()
+    };
+    crate::model_config::resolve_runtime_model_selector(config, selector)
+        .map_err(|error| ModelMutationError::Validation(error.to_string()))
+}
+
+#[cfg(test)]
+mod model_mutation_tests {
+    use super::*;
+    use echo_agent::config::{ConfiguredModel, ModelProviderConfig};
+    use echo_agent::llm::LlmApiProtocol;
+
+    const MODEL_A: &str = "model-a";
+    const MODEL_B: &str = "model-b";
+    const ENDPOINT_A: &str = "http://127.0.0.1:11434/v1/chat/completions";
+    const ENDPOINT_B: &str = "http://127.0.0.1:11435/v1/chat/completions";
+    const ENDPOINT_C: &str = "http://127.0.0.1:11436/v1/chat/completions";
+    const RESPONSES_ENDPOINT: &str = "http://127.0.0.1:11435/v1/responses";
+    const WINDOW_A: usize = 120_000;
+    const WINDOW_B: usize = 240_000;
+
+    struct ModelMutationFixture {
+        _temp: tempfile::TempDir,
+        config_path: std::path::PathBuf,
+        state: Arc<AppState>,
+        pool: Arc<crate::agent_pool::AgentPool>,
+        existing: AgentHandle,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct AgentModelProjection {
+        model: String,
+        client_model: String,
+        base_url: String,
+        api_protocol: LlmApiProtocol,
+        token_limit: usize,
+    }
+
+    fn model(id: &str, provider: &str, model: &str, context_window: u32) -> ConfiguredModel {
+        ConfiguredModel {
+            id: id.to_string(),
+            display_name: id.to_string(),
+            provider: provider.to_string(),
+            model: model.to_string(),
+            api_protocol: Some(LlmApiProtocol::ChatCompletions),
+            enabled: true,
+            context_window: Some(context_window),
+            ..ConfiguredModel::default()
+        }
+    }
+
+    fn valid_config() -> Result<echo_agent::config::AppConfig, String> {
+        let mut config = echo_agent::config::AppConfig::default();
+        config.model_providers.insert(
+            "local-a".to_string(),
+            ModelProviderConfig {
+                auth_token: None,
+                base_url: Some(ENDPOINT_A.to_string()),
+            },
+        );
+        config.model_providers.insert(
+            "local-b".to_string(),
+            ModelProviderConfig {
+                auth_token: None,
+                base_url: Some(ENDPOINT_B.to_string()),
+            },
+        );
+        config.configured_models = vec![
+            model(MODEL_A, "local-a", "runtime-a", WINDOW_A as u32),
+            model(MODEL_B, "local-b", "runtime-b", WINDOW_B as u32),
+        ];
+        crate::model_config::set_default_model(&mut config, MODEL_A)?;
+        Ok(config)
+    }
+
+    fn invalid_successor_config() -> Result<echo_agent::config::AppConfig, String> {
+        let mut config = valid_config()?;
+        let invalid = config
+            .configured_models
+            .iter_mut()
+            .find(|model| model.id == MODEL_B)
+            .ok_or_else(|| "missing invalid successor candidate".to_string())?;
+        invalid.provider = "openai".to_string();
+        invalid.api_protocol = Some(LlmApiProtocol::Responses);
+        config.model_providers.insert(
+            "openai".to_string(),
+            ModelProviderConfig {
+                auth_token: Some("invalid\nheader".to_string()),
+                base_url: Some("https://api.openai.com/v1/responses".to_string()),
+            },
+        );
+        Ok(config)
+    }
+
+    fn shared_provider_config() -> Result<echo_agent::config::AppConfig, String> {
+        let mut config = echo_agent::config::AppConfig::default();
+        config.model_providers.insert(
+            "local-shared".to_string(),
+            ModelProviderConfig {
+                auth_token: None,
+                base_url: Some(ENDPOINT_A.to_string()),
+            },
+        );
+        config.configured_models = vec![
+            model(MODEL_A, "local-shared", "runtime-a", WINDOW_A as u32),
+            model(MODEL_B, "local-shared", "runtime-b", WINDOW_B as u32),
+        ];
+        crate::model_config::set_default_model(&mut config, MODEL_A)?;
+        Ok(config)
+    }
+
+    async fn fixture(
+        config: echo_agent::config::AppConfig,
+        persistence_fails: bool,
+    ) -> Result<ModelMutationFixture, String> {
+        fixture_with_active(config, persistence_fails, MODEL_A).await
+    }
+
+    async fn fixture_with_active(
+        config: echo_agent::config::AppConfig,
+        persistence_fails: bool,
+        active_model_id: &str,
+    ) -> Result<ModelMutationFixture, String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let config_path = if persistence_fails {
+            let path = temp.path().join("config-as-directory");
+            std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+            path
+        } else {
+            let path = temp.path().join("echo-agent.yaml");
+            echo_agent::config::save_config_file(&path, &config)?;
+            path
+        };
+        let created = crate::infra::create_agent_with_diagnostics(
+            &crate::infra::AgentCreateParams {
+                model: Some(active_model_id.to_string()),
+                system_prompt: Some("model mutation test".to_string()),
+                ..Default::default()
+            },
+            &config,
+        )
+        .await?;
+        let active_runtime = created.runtime_model;
+        let primary_consumers = created.model_consumers;
+        let primary = AgentHandle::new(created.agent);
+        let session_config =
+            crate::model_config::session_config_for_runtime(&config, &active_runtime)?;
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::for_model_mutation_test(&primary, session_config).await,
+        );
+        let existing_lease = pool
+            .acquire("existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing = existing_lease.agent();
+        drop(existing_lease);
+        let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let mut state = AppState::from_shared(
+            primary,
+            Some(primary_consumers),
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            config,
+            mcp_runtime,
+        )
+        .with_active_model_id(active_runtime.id)
+        .with_config_path(config_path.clone());
+        state.set_pool(pool.clone());
+        Ok(ModelMutationFixture {
+            _temp: temp,
+            config_path,
+            state: Arc::new(state),
+            pool,
+            existing,
+        })
+    }
+
+    async fn agent_projection(handle: &AgentHandle) -> Result<AgentModelProjection, String> {
+        handle
+            .read(|agent| {
+                let llm = agent
+                    .llm_config()
+                    .ok_or_else(|| "agent has no LLM config".to_string())?;
+                Ok(AgentModelProjection {
+                    model: llm.model.clone(),
+                    client_model: agent
+                        .llm_client()
+                        .map(|client| client.model_name().to_string())
+                        .ok_or_else(|| "agent has no prepared LLM client".to_string())?,
+                    base_url: llm.base_url.clone(),
+                    api_protocol: llm.api_protocol,
+                    token_limit: agent.config().get_token_limit(),
+                })
+            })
+            .await
+    }
+
+    async fn assert_live_generation(
+        fixture: &ModelMutationFixture,
+        model_id: &str,
+        runtime_model: &str,
+        endpoint: &str,
+        context_window: usize,
+    ) -> Result<(), String> {
+        let snapshot = fixture.state.config.app_config.read().await;
+        assert_eq!(snapshot.model.default_model_id.as_deref(), Some(model_id));
+        drop(snapshot);
+        let expected = AgentModelProjection {
+            model: runtime_model.to_string(),
+            client_model: runtime_model.to_string(),
+            base_url: endpoint.to_string(),
+            api_protocol: LlmApiProtocol::ChatCompletions,
+            token_limit: context_window,
+        };
+        assert_eq!(
+            agent_projection(&fixture.state.connection.agent).await?,
+            expected
+        );
+        assert_eq!(agent_projection(&fixture.existing).await?, expected);
+        let new_lease = fixture
+            .pool
+            .acquire("new-after-mutation")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(agent_projection(&new_lease.agent()).await?, expected);
+        drop(new_lease);
+        Ok(())
+    }
+
+    async fn assert_session_generation(
+        fixture: &ModelMutationFixture,
+        durable_default_id: &str,
+        active_model_id: &str,
+        runtime_model: &str,
+        endpoint: &str,
+        context_window: usize,
+    ) -> Result<(), String> {
+        let snapshot = fixture.state.config.app_config.read().await;
+        assert_eq!(
+            snapshot.model.default_model_id.as_deref(),
+            Some(durable_default_id)
+        );
+        drop(snapshot);
+        assert_eq!(
+            fixture.state.config.active_model_id.read().await.as_str(),
+            active_model_id
+        );
+        let expected = AgentModelProjection {
+            model: runtime_model.to_string(),
+            client_model: runtime_model.to_string(),
+            base_url: endpoint.to_string(),
+            api_protocol: LlmApiProtocol::ChatCompletions,
+            token_limit: context_window,
+        };
+        assert_eq!(
+            agent_projection(&fixture.state.connection.agent).await?,
+            expected
+        );
+        assert_eq!(agent_projection(&fixture.existing).await?, expected);
+        let new_lease = fixture
+            .pool
+            .acquire("new-after-session-mutation")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(agent_projection(&new_lease.agent()).await?, expected);
+        drop(new_lease);
+        Ok(())
+    }
+
+    async fn assert_full_generation(
+        fixture: &ModelMutationFixture,
+        model_id: &str,
+        runtime_model: &str,
+        endpoint: &str,
+        context_window: usize,
+    ) -> Result<(), String> {
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.model.default_model_id.as_deref(), Some(model_id));
+        assert_live_generation(fixture, model_id, runtime_model, endpoint, context_window).await
+    }
+
+    async fn wait_for_pool_model_admission(
+        pool: &crate::agent_pool::AgentPool,
+    ) -> Result<(), String> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if pool.transition_admission_closed_for_test() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "timed out waiting for pool model admission".to_string())?;
+        Ok(())
+    }
+
+    async fn join_mutation(
+        handle: tokio::task::JoinHandle<Result<ModelMutationReceipt, ModelMutationError>>,
+    ) -> Result<ModelMutationReceipt, String> {
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+            .await
+            .map_err(|_| "model mutation task timed out".to_string())?;
+        let settled = joined.map_err(|error| error.to_string())?;
+        settled.map_err(|error| error.to_string())
+    }
+
+    async fn invalidate_model_budget(handle: &AgentHandle) {
+        let invalid_budget =
+            echo_agent::workspace::core::budget::TokenBudgetConfig::enabled().with_total_window(0);
+        handle
+            .write(|agent| {
+                let config = agent.config();
+                let model = config.get_model_name().to_string();
+                let name = config.get_agent_name().to_string();
+                let prompt = config.get_system_prompt().to_string();
+                let token_limit = config.get_token_limit();
+                *agent.config_mut() = echo_agent::agent::AgentConfig::new(&model, &name, &prompt)
+                    .token_limit(token_limit)
+                    .token_budget(invalid_budget);
+            })
+            .await;
+    }
+
+    fn inherited_handle(fixture: &ModelMutationFixture) -> Result<AgentHandle, String> {
+        fixture
+            .state
+            .connection
+            .model_consumers
+            .as_ref()
+            .and_then(|consumers| consumers.inherited_handle_for_test("general-purpose"))
+            .ok_or_else(|| "inherit-parent handle was not retained".to_string())
+    }
+
+    #[tokio::test]
+    async fn gui_and_tui_model_mutations_share_one_linearized_owner() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.agent.inner().clone();
+        let barrier = primary.write().await;
+        let gui_state = fixture.state.clone();
+        let gui = tokio::spawn(async move { gui_state.set_default_model_owned(MODEL_B).await });
+        wait_for_pool_model_admission(&fixture.pool).await?;
+
+        let tui_state = fixture.state.clone();
+        let tui = tokio::spawn(async move { tui_state.set_default_model_owned(MODEL_A).await });
+        assert_eq!(
+            fixture
+                .state
+                .config
+                .app_config
+                .read()
+                .await
+                .model
+                .default_model_id
+                .as_deref(),
+            Some(MODEL_A)
+        );
+        drop(barrier);
+
+        let gui_receipt = join_mutation(gui).await?;
+        let tui_receipt = join_mutation(tui).await?;
+        assert_eq!(gui_receipt.model_id, MODEL_B);
+        assert_eq!(tui_receipt.model_id, MODEL_A);
+        assert_full_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+
+    #[tokio::test]
+    async fn aborted_model_mutation_waiter_does_not_cancel_accepted_settlement()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let primary = fixture.state.connection.agent.inner().clone();
+        let barrier = primary.write().await;
+        let caller_state = fixture.state.clone();
+        let caller =
+            tokio::spawn(async move { caller_state.set_default_model_owned(MODEL_B).await });
+        wait_for_pool_model_admission(&fixture.pool).await?;
+        caller.abort();
+        assert!(caller.await.is_err());
+        drop(barrier);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            fixture.state.shutdown_model_mutations(),
+        )
+        .await
+        .map_err(|_| "model mutation shutdown timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        assert_full_generation(&fixture, MODEL_B, "runtime-b", ENDPOINT_B, WINDOW_B).await
+    }
+
+    #[tokio::test]
+    async fn invalid_default_successor_delete_changes_no_layer() -> Result<(), String> {
+        let fixture = fixture(invalid_successor_config()?, false).await?;
+
+        let result = fixture.state.delete_configured_model_owned(MODEL_A).await;
+
+        assert!(matches!(result, Err(ModelMutationError::Validation(_))));
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.configured_models.len(), 2);
+        assert!(
+            persisted
+                .configured_models
+                .iter()
+                .any(|model| model.id == MODEL_A)
+        );
+        assert_live_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+
+    #[tokio::test]
+    async fn valid_default_successor_delete_settles_all_layers() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+
+        let receipt = fixture
+            .state
+            .delete_configured_model_owned(MODEL_A)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(receipt.deleted);
+        assert!(receipt.activated);
+        assert!(
+            receipt
+                .config
+                .configured_models
+                .iter()
+                .all(|model| model.id != MODEL_A)
+        );
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert!(
+            persisted
+                .configured_models
+                .iter()
+                .all(|model| model.id != MODEL_A)
+        );
+        assert_full_generation(&fixture, MODEL_B, "runtime-b", ENDPOINT_B, WINDOW_B).await
+    }
+
+    #[tokio::test]
+    async fn omitted_subagent_model_tracks_parent_while_explicit_model_stays_fixed()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let registry = fixture
+            .state
+            .connection
+            .agent
+            .read(|agent| agent.subagent_registry().clone())
+            .await;
+        let inherited_before = registry
+            .get_agent("general-purpose")
+            .await
+            .ok_or_else(|| "inherit-parent subagent was not registered".to_string())?;
+        let fixed_before = registry
+            .get_agent("explorer")
+            .await
+            .ok_or_else(|| "explicit-model subagent was not registered".to_string())?;
+        let inherited_handle = fixture
+            .state
+            .connection
+            .model_consumers
+            .as_ref()
+            .and_then(|consumers| consumers.inherited_handle_for_test("general-purpose"))
+            .ok_or_else(|| "inherit-parent handle was not retained".to_string())?;
+        let fixed_model = fixed_before.model_name().to_string();
+        assert_eq!(inherited_before.model_name(), "runtime-a");
+
+        fixture
+            .state
+            .set_default_model_owned(MODEL_B)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let inherited_after = registry
+            .get_agent("general-purpose")
+            .await
+            .ok_or_else(|| "inherit-parent subagent was not refreshed".to_string())?;
+        let fixed_after = registry
+            .get_agent("explorer")
+            .await
+            .ok_or_else(|| "explicit-model subagent disappeared".to_string())?;
+        assert_eq!(inherited_after.model_name(), "runtime-b");
+        assert_eq!(fixed_after.model_name(), fixed_model);
+        assert_eq!(
+            agent_projection(&inherited_handle).await?,
+            AgentModelProjection {
+                model: "runtime-b".to_string(),
+                client_model: "runtime-b".to_string(),
+                base_url: ENDPOINT_B.to_string(),
+                api_protocol: LlmApiProtocol::ChatCompletions,
+                token_limit: WINDOW_B,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn model_mutation_preserves_primary_custom_critic() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let custom = Arc::new(echo_agent::agent::critic::StaticCritic::always_pass());
+        fixture
+            .state
+            .connection
+            .agent
+            .write(|agent| agent.set_critic(custom.clone()))
+            .await;
+
+        fixture
+            .state
+            .set_default_model_owned(MODEL_B)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(Arc::strong_count(&custom), 2);
+        assert_eq!(
+            fixture
+                .state
+                .connection
+                .agent
+                .read(|agent| agent.critic_owner().map(str::to_string))
+                .await,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_last_default_is_rejected_without_legacy_resurrection() -> Result<(), String> {
+        let mut config = valid_config()?;
+        config.configured_models.retain(|model| model.id == MODEL_A);
+        let fixture = fixture(config, false).await?;
+
+        let result = fixture.state.delete_configured_model_owned(MODEL_A).await;
+
+        assert!(matches!(result, Err(ModelMutationError::Validation(_))));
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.configured_models.len(), 1);
+        assert_eq!(
+            persisted.configured_models.first().map(|m| m.id.as_str()),
+            Some(MODEL_A)
+        );
+        assert_full_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_rolls_back_snapshot_primary_and_pool() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, true).await?;
+
+        let result = fixture.state.set_default_model_owned(MODEL_B).await;
+
+        assert!(matches!(result, Err(ModelMutationError::Persistence(_))));
+        assert!(fixture.config_path.is_dir());
+        assert_live_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+
+    #[tokio::test]
+    async fn failed_settlement_is_stable_for_later_mutations_and_repeated_shutdown()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, true).await?;
+        let first = fixture
+            .state
+            .set_default_model_owned(MODEL_B)
+            .await
+            .err()
+            .ok_or_else(|| "persistence unexpectedly succeeded".to_string())?
+            .to_string();
+        let second = fixture
+            .state
+            .set_default_model_owned(MODEL_A)
+            .await
+            .err()
+            .ok_or_else(|| "later mutation ignored failed settlement".to_string())?
+            .to_string();
+        assert_eq!(second, first);
+
+        let first_shutdown = fixture
+            .state
+            .shutdown_model_mutations()
+            .await
+            .err()
+            .ok_or_else(|| "shutdown lost the settlement failure".to_string())?
+            .to_string();
+        let second_shutdown = fixture
+            .state
+            .shutdown_model_mutations()
+            .await
+            .err()
+            .ok_or_else(|| "repeated shutdown lost the settlement failure".to_string())?
+            .to_string();
+        assert_eq!(first_shutdown, first);
+        assert_eq!(second_shutdown, first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn join_error_is_stable_for_later_mutations_and_repeated_shutdown() -> Result<(), String>
+    {
+        let fixture = fixture(valid_config()?, false).await?;
+        let first = fixture
+            .state
+            .run_owned_model_mutation(ModelMutationRequest::AbortSettlementForTest)
+            .await
+            .err()
+            .ok_or_else(|| "aborted settlement unexpectedly succeeded".to_string())?;
+        assert!(matches!(first, ModelMutationError::Settlement(_)));
+        let first = first.to_string();
+
+        let later = fixture
+            .state
+            .set_default_model_owned(MODEL_B)
+            .await
+            .err()
+            .ok_or_else(|| "later mutation ignored JoinError".to_string())?
+            .to_string();
+        let shutdown = fixture
+            .state
+            .shutdown_model_mutations()
+            .await
+            .err()
+            .ok_or_else(|| "shutdown lost JoinError".to_string())?
+            .to_string();
+        let repeated = fixture
+            .state
+            .shutdown_model_mutations()
+            .await
+            .err()
+            .ok_or_else(|| "repeated shutdown lost JoinError".to_string())?
+            .to_string();
+        assert_eq!(later, first);
+        assert_eq!(shutdown, first);
+        assert_eq!(repeated, first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn later_pool_agent_prepare_failure_changes_no_layer() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let failing_lease = fixture
+            .pool
+            .acquire("z-failing")
+            .await
+            .map_err(|error| error.to_string())?;
+        let failing = failing_lease.agent();
+        drop(failing_lease);
+        invalidate_model_budget(&failing).await;
+
+        let result = fixture.state.set_default_model_owned(MODEL_B).await;
+
+        assert!(matches!(result, Err(ModelMutationError::Publication(_))));
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
+        assert_eq!(
+            agent_projection(&failing).await?,
+            AgentModelProjection {
+                model: "runtime-a".to_string(),
+                client_model: "runtime-a".to_string(),
+                base_url: ENDPOINT_A.to_string(),
+                api_protocol: LlmApiProtocol::ChatCompletions,
+                token_limit: WINDOW_A,
+            }
+        );
+        assert_live_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+
+    #[tokio::test]
+    async fn inherited_subagent_prepare_failure_changes_no_layer() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let inherited = fixture
+            .state
+            .connection
+            .model_consumers
+            .as_ref()
+            .and_then(|consumers| consumers.inherited_handle_for_test("general-purpose"))
+            .ok_or_else(|| "inherit-parent handle was not retained".to_string())?;
+        invalidate_model_budget(&inherited).await;
+
+        let result = fixture.state.set_default_model_owned(MODEL_B).await;
+
+        assert!(matches!(result, Err(ModelMutationError::Publication(_))));
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
+        assert_eq!(
+            agent_projection(&inherited).await?,
+            AgentModelProjection {
+                model: "runtime-a".to_string(),
+                client_model: "runtime-a".to_string(),
+                base_url: ENDPOINT_A.to_string(),
+                api_protocol: LlmApiProtocol::ChatCompletions,
+                token_limit: WINDOW_A,
+            }
+        );
+        assert_live_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+
+    #[tokio::test]
+    async fn zero_context_window_is_rejected_before_persistence_or_publication()
+    -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let mutation = ConfiguredModelMutation {
+            model: model(MODEL_A, "local-a", "runtime-a", 0),
+            auth_token: None,
+            base_url: None,
+            set_default: false,
+        };
+
+        let result = fixture.state.upsert_configured_model_owned(mutation).await;
+
+        assert!(matches!(result, Err(ModelMutationError::Validation(_))));
+        assert_full_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+
+    #[tokio::test]
+    async fn nondefault_upsert_refreshes_active_generation_when_provider_config_is_shared()
+    -> Result<(), String> {
+        let fixture = fixture(shared_provider_config()?, false).await?;
+        let inherited = inherited_handle(&fixture)?;
+        let receipt = fixture
+            .state
+            .upsert_configured_model_owned(ConfiguredModelMutation {
+                model: model(MODEL_B, "local-shared", "runtime-b", WINDOW_B as u32),
+                auth_token: None,
+                base_url: Some(ENDPOINT_B.to_string()),
+                set_default: false,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(receipt.activated);
+        assert_eq!(receipt.model_id, MODEL_B);
+        assert_eq!(
+            receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
+            Some(MODEL_A)
+        );
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
+        assert_eq!(
+            persisted
+                .model_providers
+                .get("local-shared")
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some(ENDPOINT_B)
+        );
+        assert_eq!(
+            fixture
+                .state
+                .config
+                .app_config
+                .read()
+                .await
+                .model_providers
+                .get("local-shared")
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some(ENDPOINT_B)
+        );
+        assert_full_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_B, WINDOW_A).await?;
+        assert_eq!(
+            agent_projection(&inherited).await?,
+            AgentModelProjection {
+                model: "runtime-a".to_string(),
+                client_model: "runtime-a".to_string(),
+                base_url: ENDPOINT_B.to_string(),
+                api_protocol: LlmApiProtocol::ChatCompletions,
+                token_limit: WINDOW_A,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn session_override_stays_active_when_its_shared_provider_changes() -> Result<(), String>
+    {
+        let fixture = fixture_with_active(shared_provider_config()?, false, MODEL_B).await?;
+        let receipt = fixture
+            .state
+            .upsert_configured_model_owned(ConfiguredModelMutation {
+                model: model(MODEL_A, "local-shared", "runtime-a", WINDOW_A as u32),
+                auth_token: None,
+                base_url: Some(ENDPOINT_C.to_string()),
+                set_default: false,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(receipt.activated);
+        assert_eq!(receipt.model_id, MODEL_A);
+        assert_eq!(
+            receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
+            Some(MODEL_B)
+        );
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
+        assert_session_generation(
+            &fixture,
+            MODEL_A,
+            MODEL_B,
+            "runtime-b",
+            ENDPOINT_C,
+            WINDOW_B,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn deleting_session_override_reactivates_the_durable_default() -> Result<(), String> {
+        let fixture = fixture_with_active(valid_config()?, false, MODEL_B).await?;
+
+        let receipt = fixture
+            .state
+            .delete_configured_model_owned(MODEL_B)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(receipt.activated);
+        assert!(receipt.deleted);
+        assert_eq!(
+            receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
+            Some(MODEL_A)
+        );
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
+        assert!(
+            persisted
+                .configured_models
+                .iter()
+                .all(|model| model.id != MODEL_B)
+        );
+        assert_session_generation(
+            &fixture,
+            MODEL_A,
+            MODEL_A,
+            "runtime-a",
+            ENDPOINT_A,
+            WINDOW_A,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn invalid_shared_provider_upsert_rolls_back_every_layer() -> Result<(), String> {
+        let fixture = fixture(shared_provider_config()?, false).await?;
+        let inherited = inherited_handle(&fixture)?;
+        let result = fixture
+            .state
+            .upsert_configured_model_owned(ConfiguredModelMutation {
+                model: model(MODEL_B, "local-shared", "runtime-b", WINDOW_B as u32),
+                auth_token: None,
+                base_url: Some(RESPONSES_ENDPOINT.to_string()),
+                set_default: false,
+            })
+            .await;
+
+        assert!(matches!(result, Err(ModelMutationError::Validation(_))));
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(
+            persisted
+                .model_providers
+                .get("local-shared")
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some(ENDPOINT_A)
+        );
+        assert_eq!(
+            fixture
+                .state
+                .config
+                .app_config
+                .read()
+                .await
+                .model_providers
+                .get("local-shared")
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some(ENDPOINT_A)
+        );
+        assert_full_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await?;
+        assert_eq!(
+            agent_projection(&inherited).await?,
+            AgentModelProjection {
+                model: "runtime-a".to_string(),
+                client_model: "runtime-a".to_string(),
+                base_url: ENDPOINT_A.to_string(),
+                api_protocol: LlmApiProtocol::ChatCompletions,
+                token_limit: WINDOW_A,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrelated_provider_upsert_remains_persistence_only() -> Result<(), String> {
+        let fixture = fixture(valid_config()?, false).await?;
+        let inherited = inherited_handle(&fixture)?;
+        invalidate_model_budget(&fixture.state.connection.agent).await;
+        let receipt = fixture
+            .state
+            .upsert_configured_model_owned(ConfiguredModelMutation {
+                model: model(MODEL_B, "local-b", "runtime-b", WINDOW_B as u32),
+                auth_token: None,
+                base_url: Some(ENDPOINT_C.to_string()),
+                set_default: false,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(!receipt.activated);
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
+        assert_eq!(
+            persisted
+                .model_providers
+                .get("local-b")
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some(ENDPOINT_C)
+        );
+        assert_eq!(
+            fixture
+                .state
+                .config
+                .app_config
+                .read()
+                .await
+                .model_providers
+                .get("local-b")
+                .and_then(|provider| provider.base_url.as_deref()),
+            Some(ENDPOINT_C)
+        );
+        assert_live_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await?;
+        assert_eq!(
+            agent_projection(&inherited).await?,
+            AgentModelProjection {
+                model: "runtime-a".to_string(),
+                client_model: "runtime-a".to_string(),
+                base_url: ENDPOINT_A.to_string(),
+                api_protocol: LlmApiProtocol::ChatCompletions,
+                token_limit: WINDOW_A,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_non_default_commits_without_reapplying_active_runtime() -> Result<(), String>
+    {
+        let fixture = fixture(valid_config()?, false).await?;
+
+        let receipt = fixture
+            .state
+            .delete_configured_model_owned(MODEL_B)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(receipt.deleted);
+        assert!(!receipt.activated);
+        assert!(receipt.runtime.is_none());
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert!(
+            persisted
+                .configured_models
+                .iter()
+                .all(|model| model.id != MODEL_B)
+        );
+        assert_full_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+    }
+}
+
 #[cfg(test)]
 mod workspace_transition_tests {
     use super::*;
@@ -1909,6 +3396,7 @@ mod workspace_transition_tests {
         ));
         let mut state = AppState::from_shared(
             agent,
+            None,
             Arc::new(crate::hitl::HitlDispatcher::new()),
             None,
             Default::default(),
@@ -2081,6 +3569,7 @@ mod workspace_transition_tests {
         .await;
         let mut state = AppState::from_shared(
             agent,
+            None,
             Arc::new(crate::hitl::HitlDispatcher::new()),
             None,
             Default::default(),
@@ -2337,6 +3826,7 @@ mod service_bootstrap_tests {
         ));
         let mut state = AppState::from_shared(
             AgentHandle::new(agent),
+            None,
             Arc::new(crate::hitl::HitlDispatcher::new()),
             None,
             Default::default(),

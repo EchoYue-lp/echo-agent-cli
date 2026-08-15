@@ -2009,29 +2009,8 @@ pub async fn run_tui(
         .write(|value| value.set_conversation_id(conversation_id))
         .await;
 
-    // ── Dreaming: daily self-evolution pass (mode parity with GUI) ────
-    let dreaming_cancel = app.review_integration.as_ref().map(|ri| {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let task = echo_agent_app_core::infra::spawn_dreaming_task(
-            ri.clone(),
-            agent.clone(),
-            app.pool.clone(),
-            cancel.clone(),
-        );
-        tracing::info!("Dreaming task spawned for TUI session");
-        (cancel, task)
-    });
-
     // Main event loop.
     let result = events::run_event_loop(&mut terminal, &mut app, agent).await;
-
-    // Stop Dreaming when the TUI session ends.
-    if let Some((cancel, task)) = dreaming_cancel {
-        cancel.cancel();
-        if let Err(error) = task.await {
-            tracing::warn!(%error, "failed to join TUI Dreaming task");
-        }
-    }
 
     // Guard drop will restore the terminal.
     result

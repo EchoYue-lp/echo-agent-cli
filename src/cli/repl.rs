@@ -100,22 +100,6 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 
     output.print_banner(env!("CARGO_PKG_VERSION"));
 
-    // ── Dreaming: daily self-evolution pass (mode parity with GUI) ────
-    // Spawn background Dreaming task so CLI sessions also get recall-
-    // frequency-driven memory promotion/demotion (AGENTS.md: TUI/CLI must
-    // be feature-equivalent with GUI). Cancelled on session exit.
-    let dreaming_cancel = config.review_integration.as_ref().map(|ri| {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let task = echo_agent_app_core::infra::spawn_dreaming_task(
-            ri.clone(),
-            agent.clone(),
-            config.pool.clone(),
-            cancel.clone(),
-        );
-        tracing::info!("Dreaming task spawned for CLI session");
-        (cancel, task)
-    });
-
     let model_name = agent.read(|a| a.model_name().to_string()).await;
 
     // Load project context: use explicit --project path, or auto-discover from cwd.
@@ -253,27 +237,13 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         }
     }
 
-    // Stop and join Dreaming before final memory/evolution settlement.
-    if let Some((cancel, task)) = dreaming_cancel {
-        cancel.cancel();
-        if let Err(error) = task.await {
-            tracing::warn!(%error, "failed to join CLI Dreaming task");
-        }
-    }
-
-    // ── Auto-memory: extract observations on session end ────────────
-    run_auto_memory_on_exit(&agent, &config.review_integration).await;
-
-    // ── Memory review: staleness scoring, conflict detection, GC ────
-    run_memory_review_on_exit(&config.review_integration).await;
-
     Ok(())
 }
 
 /// Run auto-memory extraction when the session ends.
 ///
 /// Non-blocking: errors are silently ignored to avoid disrupting exit flow.
-async fn run_auto_memory_on_exit(
+pub(crate) async fn run_auto_memory_on_exit(
     agent: &AgentHandle,
     review_integration: &Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 ) {
@@ -347,7 +317,7 @@ async fn run_auto_memory_on_exit(
 /// memories, then queues actionable proposals in the Review Inbox. Non-blocking:
 /// errors are reported without disrupting exit flow.
 ///
-async fn run_memory_review_on_exit(
+pub(crate) async fn run_memory_review_on_exit(
     shared_ri: &Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 ) {
     let Some(ri) = shared_ri else {

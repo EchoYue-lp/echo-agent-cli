@@ -103,3 +103,6 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+
+[dev-dependencies]
+echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", default-features = false, features = ["testing"] }

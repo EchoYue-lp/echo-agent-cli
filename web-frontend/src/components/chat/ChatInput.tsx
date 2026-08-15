@@ -18,7 +18,8 @@ import { permissionsApi, providerApi, taskRuntimeApi } from '../../api/endpoints
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useChatStore, cacheHitRate } from '../../stores/chatStore';
-import type { Attachment, ConfiguredModel } from '../../types/api';
+import type { Attachment } from '../../types/api';
+import type { ConfiguredModel } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import {

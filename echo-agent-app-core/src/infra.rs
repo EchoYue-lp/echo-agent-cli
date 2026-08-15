@@ -8,7 +8,7 @@ use echo_agent::agent::subagent::{
     AgentFactory, FnAgentFactory, SubagentBuilder, SubagentPromptCompiler,
     SubagentSystemPromptInput,
 };
-use echo_agent::llm::LlmConfig;
+use echo_agent::llm::{LlmApiProtocol, LlmClient, LlmConfig};
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
 use echo_agent::state::RuntimeStateStore;
@@ -19,8 +19,11 @@ use crate::model_config;
 use crate::project::prompt::PromptAssembler;
 use echo_agent::config::AppConfig;
 
+type Result<T, E = echo_agent::error::ReactError> = std::result::Result<T, E>;
+
 /// Default context window size in tokens (396K).
 const DEFAULT_CONTEXT_WINDOW: usize = 396_000;
+pub(crate) const EKO_MODEL_CRITIC_OWNER: &str = "eko:model-generation";
 
 /// Default max output tokens when not configured (sensible for 128K context models).
 const DEFAULT_MAX_TOKENS: u32 = 8192;
@@ -36,6 +39,122 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
         configured
     } else {
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS
+    }
+}
+
+/// Resolve the one context budget used by prompt assembly, the parent agent,
+/// and every subagent that inherits the selected runtime model.
+///
+/// Product priority is explicit agent override, selected model context window,
+/// then EKO's documented fallback.
+pub fn effective_token_limit(
+    app_config: &AppConfig,
+    runtime: &model_config::ModelRuntimeConfig,
+) -> usize {
+    if app_config.agent.token_limit > 0 {
+        return app_config.agent.token_limit;
+    }
+    runtime
+        .context_window
+        .and_then(|window| usize::try_from(window).ok())
+        .filter(|window| *window > 0)
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+}
+
+#[derive(Clone)]
+struct SubagentRuntimeGeneration {
+    model: String,
+    llm_config: Option<LlmConfig>,
+    llm_client: Option<Arc<dyn LlmClient>>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    token_limit: usize,
+}
+
+#[derive(Clone)]
+enum SubagentModelBinding {
+    Inherit(Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>),
+    Fixed(SubagentRuntimeGeneration),
+}
+
+impl SubagentModelBinding {
+    async fn snapshot(&self) -> SubagentRuntimeGeneration {
+        match self {
+            Self::Inherit(generation) => generation.read().await.clone(),
+            Self::Fixed(generation) => generation.clone(),
+        }
+    }
+}
+
+fn subagent_model_binding(
+    spec: Option<&str>,
+    parent_generation: &SubagentRuntimeGeneration,
+    inherited_generation: &Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>,
+) -> SubagentModelBinding {
+    let model = resolve_subagent_model(spec, &parent_generation.model);
+    if spec.is_none() {
+        SubagentModelBinding::Inherit(inherited_generation.clone())
+    } else {
+        SubagentModelBinding::Fixed(SubagentRuntimeGeneration {
+            model: model.clone(),
+            llm_config: parent_generation.llm_config.clone().map(|mut config| {
+                config.model = model;
+                config
+            }),
+            llm_client: None,
+            temperature: parent_generation.temperature,
+            max_tokens: parent_generation.max_tokens,
+            token_limit: parent_generation.token_limit,
+        })
+    }
+}
+
+#[derive(Clone)]
+struct InheritedSubagentFactory {
+    definition: echo_agent::agent::subagent::SubagentDefinition,
+    handle: AgentHandle,
+    factory: Arc<dyn AgentFactory>,
+}
+
+/// EKO-owned model consumers attached to one parent agent generation.
+///
+/// Only subagent definitions with omitted `model` frontmatter are included.
+/// Explicit frontmatter values are resolved once and remain fixed.
+#[derive(Clone)]
+pub struct AgentModelConsumers {
+    inherited_generation: Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>,
+    registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
+    inherited_factories: Arc<Vec<InheritedSubagentFactory>>,
+}
+
+impl AgentModelConsumers {
+    async fn publish_inherited_generation(
+        &self,
+        runtime: &model_config::ModelRuntimeConfig,
+        prepared: &PreparedRuntimeLlm,
+        token_limit: usize,
+    ) {
+        *self.inherited_generation.write().await = SubagentRuntimeGeneration {
+            model: runtime.model.clone(),
+            llm_config: Some(prepared.config.clone()),
+            llm_client: Some(prepared.client.clone()),
+            temperature: runtime.temperature,
+            max_tokens: runtime.max_tokens,
+            token_limit,
+        };
+        for inherited in self.inherited_factories.iter() {
+            self.registry
+                .register_factory(inherited.definition.clone(), inherited.factory.clone())
+                .await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inherited_handle_for_test(&self, name: &str) -> Option<AgentHandle> {
+        self.inherited_factories
+            .iter()
+            .find(|inherited| inherited.definition.name == name)
+            .map(|inherited| inherited.handle.clone())
     }
 }
 
@@ -178,6 +297,8 @@ pub fn load_or_create_cache_user_id() -> String {
 pub struct CreatedAgent {
     pub agent: ReactAgent,
     pub prompt_assembly: crate::project::prompt::PromptAssembly,
+    pub model_consumers: AgentModelConsumers,
+    pub runtime_model: model_config::ModelRuntimeConfig,
 }
 
 /// Create an Agent instance without retaining build diagnostics.
@@ -198,26 +319,11 @@ pub async fn create_agent_with_diagnostics(
     // Resolve the product-level configured model first. The legacy `model`
     // section is only a persisted mirror/fallback; GUI/CLI/TUI should all
     // converge on configured_models for actual runtime wiring.
-    let runtime_model = model_config::resolve_runtime_model(
-        app_config,
-        app_config.model.default_model_id.as_deref(),
-    );
-    if model_config::provider_requires_api_key(&runtime_model.provider)
-        && runtime_model.auth_token.is_none()
-    {
-        let variables = model_config::env_vars_display(&runtime_model.provider);
-        return Err(format!(
-            "Provider '{}' requires an API key for model '{}'. Configure a token or set one of: {}",
-            runtime_model.provider,
-            runtime_model.model,
-            if variables.is_empty() {
-                "the provider-specific API key variable"
-            } else {
-                variables.as_str()
-            }
-        ));
-    }
-    let model = params.model.as_deref().unwrap_or(&runtime_model.model);
+    let runtime_model =
+        model_config::resolve_runtime_model_selector(app_config, params.model.as_deref())
+            .map_err(|error| error.to_string())?;
+    model_config::validate_runtime_model_requirements(&runtime_model)?;
+    let model = runtime_model.model.as_str();
     let temperature = runtime_model.temperature.or(app_config.model.temperature);
     let max_tokens = runtime_model.max_tokens.or(app_config.model.max_tokens);
 
@@ -227,11 +333,7 @@ pub async fn create_agent_with_diagnostics(
         .unwrap_or(&app_config.agent.system_prompt);
 
     // Use PromptAssembler for modular, budget-aware prompt construction
-    let model_window = if app_config.agent.token_limit > 0 {
-        app_config.agent.token_limit
-    } else {
-        DEFAULT_CONTEXT_WINDOW
-    };
+    let model_window = effective_token_limit(app_config, &runtime_model);
     let mut assembler = PromptAssembler::default(
         base_system_prompt,
         Some(TASK_MANAGEMENT_GUIDE),
@@ -270,11 +372,7 @@ pub async fn create_agent_with_diagnostics(
     let system_prompt = prompt_assembly.prompt.clone();
 
     // Determine config values from AppConfig
-    let token_limit = if app_config.agent.token_limit > 0 {
-        app_config.agent.token_limit
-    } else {
-        DEFAULT_CONTEXT_WINDOW
-    };
+    let token_limit = effective_token_limit(app_config, &runtime_model);
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
@@ -318,21 +416,19 @@ pub async fn create_agent_with_diagnostics(
     // ── Pass the resolved configured model to the LLM client ──
     // Without this, the agent falls back to env vars + echo-agent-models.yaml,
     // which may not exist (especially in GUI apps where shell env vars aren't inherited).
-    let mut injected_llm_config: Option<LlmConfig> = None;
-    if let Some(auth_token) = runtime_model.auth_token.as_deref() {
-        let provider = runtime_model.provider.as_str();
-        let base_url_override = runtime_model.base_url.as_deref();
-        let llm_config = build_llm_config(provider, auth_token, model, base_url_override);
-        tracing::info!(
-            provider = provider,
-            model = model,
-            auth_source = %runtime_model.auth_source,
-            has_base_url = base_url_override.is_some(),
-            "Injecting LlmConfig from configured model"
-        );
-        injected_llm_config = Some(llm_config.clone());
-        builder = builder.llm_config(llm_config);
-    }
+    let provider = runtime_model.provider.as_str();
+    let base_url_override = runtime_model.base_url.as_deref();
+    let prepared_llm = prepare_runtime_llm(&runtime_model)?;
+    let llm_config = prepared_llm.config.clone();
+    tracing::info!(
+        provider = provider,
+        model = model,
+        auth_source = %runtime_model.auth_source,
+        has_base_url = base_url_override.is_some(),
+        "Injecting LlmConfig from configured model"
+    );
+    let injected_llm_config = Some(llm_config.clone());
+    builder = builder.llm_config(llm_config);
 
     // Set session_id if provided (used by background tasks for checkpoint isolation)
     if let Some(ref sid) = params.session_id {
@@ -456,6 +552,10 @@ pub async fn create_agent_with_diagnostics(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    // `prepare_runtime_llm` already constructed this exact client before any
+    // runtime state was accepted. Install it explicitly so agent bootstrap can
+    // never fall back to an environment/YAML client after a swallowed rebuild.
+    agent.set_llm_client(prepared_llm.client.clone());
     refresh_dynamic_context(&mut agent, subagent_project_root.as_deref()).await;
     configure_run_code_capability(&mut agent, run_code_available);
     agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
@@ -473,24 +573,20 @@ pub async fn create_agent_with_diagnostics(
     // Inject LlmCritic for self-verification. The critic scores the agent's
     // final_answer; if below threshold (7.0), feedback is injected and the
     // agent retries (up to verifier_max_retries=2).
-    // Reuse the exact client prepared by the builder for the parent Agent.
-    // This keeps critic transport/protocol identity aligned without adding a
-    // second application-side provider resolver.
+    // The critic consumes the exact prepared transport used by the parent;
+    // it never re-resolves global config or assumes Chat Completions.
     // Fail-open on errors (verify.rs:91-93) ensures the main flow is never
     // blocked if the critic LLM call fails.
-    if let Some(critic_client) = agent.llm_client().cloned() {
-        agent.set_critic(std::sync::Arc::new(
-            echo_agent::agent::critic::LlmCritic::new(critic_client)
+    agent.set_owned_critic(
+        EKO_MODEL_CRITIC_OWNER,
+        std::sync::Arc::new(
+            echo_agent::agent::critic::LlmCritic::new(prepared_llm.client.clone())
                 .with_pass_threshold(7.0)
                 .with_cache_user_id(cache_user_id.clone()),
-        ));
-        agent.config_mut().set_verifier_enabled(true);
-        tracing::info!(
-            "main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)"
-        );
-    } else {
-        tracing::debug!("main agent: Critic self-verification skipped without an LLM client");
-    }
+        ),
+    );
+    agent.config_mut().set_verifier_enabled(true);
+    tracing::info!("main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)");
 
     tracing::info!(
         has_llm_config = injected_llm_config.is_some(),
@@ -498,13 +594,16 @@ pub async fn create_agent_with_diagnostics(
         "main agent: registering default subagents with llm_config={}",
         injected_llm_config.as_ref().map(|c| c.model.as_str()).unwrap_or("NONE")
     );
-    register_default_subagents(
+    let model_consumers = register_default_subagents(
         &mut agent,
-        model,
-        injected_llm_config,
-        temperature,
-        max_tokens,
-        token_limit,
+        SubagentRuntimeGeneration {
+            model: model.to_string(),
+            llm_config: injected_llm_config,
+            llm_client: Some(prepared_llm.client.clone()),
+            temperature,
+            max_tokens,
+            token_limit,
+        },
         app_config.agent.tool_timeout_ms,
         max_tool_output_tokens,
         &cache_user_id,
@@ -543,6 +642,8 @@ pub async fn create_agent_with_diagnostics(
     Ok(CreatedAgent {
         agent,
         prompt_assembly,
+        model_consumers,
+        runtime_model,
     })
 }
 
@@ -567,11 +668,13 @@ fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
 /// Resolve a subagent model frontmatter value to a concrete model id.
 ///
 /// - `None` / omitted → parent model
+/// - `"inherit"` → current parent model, fixed at registration
 /// - `"fast"` → `EKO_FAST_MODEL` env if set, else parent model
 /// - any other string → used as-is
 pub fn resolve_subagent_model(spec: Option<&str>, parent_model: &str) -> String {
     match spec {
         None => parent_model.to_string(),
+        Some("inherit") => parent_model.to_string(),
         Some("fast") => std::env::var("EKO_FAST_MODEL")
             .ok()
             .map(|s| s.trim().to_string())
@@ -597,11 +700,7 @@ pub fn resolve_subagent_model(spec: Option<&str>, parent_model: &str) -> String 
 #[allow(clippy::too_many_arguments)]
 async fn register_default_subagents(
     agent: &mut ReactAgent,
-    model: &str,
-    llm_config: Option<LlmConfig>,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-    token_limit: usize,
+    parent_generation: SubagentRuntimeGeneration,
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
     cache_user_id: &str,
@@ -611,7 +710,7 @@ async fn register_default_subagents(
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
-) {
+) -> AgentModelConsumers {
     let tool_output_artifacts = agent.tool_output_artifacts();
     tracing::info!(
         count = subagents.len(),
@@ -628,9 +727,11 @@ async fn register_default_subagents(
         isolate_workspace: bool,
         has_team: bool,
         can_delegate: bool,
+        inherits_parent_model: bool,
         tags: Vec<String>,
     }
 
+    let inherited_generation = Arc::new(tokio::sync::RwLock::new(parent_generation.clone()));
     let mut built_subagents: Vec<BuiltSubagent> = Vec::with_capacity(subagents.len());
     for subagent_def in subagents {
         // Sprint 9: register BOTH readonly and writer subagents. Readonly subagents
@@ -639,11 +740,12 @@ async fn register_default_subagents(
         // isolated git worktree when `isolate_worktree` is set (Sprint 8 wiring).
         // TaskRuntime may run disjoint exact owners concurrently; every writer
         // still gets a separate checkout and a reviewed integration boundary.
-        let subagent_model = resolve_subagent_model(subagent_def.model.as_deref(), model);
-        let subagent_llm = llm_config.clone().map(|mut cfg| {
-            cfg.model = subagent_model.clone();
-            cfg
-        });
+        let model_binding = subagent_model_binding(
+            subagent_def.model.as_deref(),
+            &parent_generation,
+            &inherited_generation,
+        );
+        let initial_generation = model_binding.snapshot().await;
         let max_iterations = subagent_def.max_turns.unwrap_or(0);
         let isolation = crate::subagent_loader::subagent_isolation(subagent_def);
         let compiled_system = prompt_compiler.compile_system(&SubagentSystemPromptInput {
@@ -662,11 +764,12 @@ async fn register_default_subagents(
             build_readonly_subagent_agent(
                 &subagent_def.name,
                 &compiled_system.system_prompt,
-                &subagent_model,
-                subagent_llm.clone(),
-                temperature,
-                max_tokens,
-                token_limit,
+                &initial_generation.model,
+                initial_generation.llm_config.clone(),
+                initial_generation.llm_client.clone(),
+                initial_generation.temperature,
+                initial_generation.max_tokens,
+                initial_generation.token_limit,
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
@@ -680,11 +783,12 @@ async fn register_default_subagents(
             build_writer_subagent_agent(
                 &subagent_def.name,
                 &compiled_system.system_prompt,
-                &subagent_model,
-                subagent_llm.clone(),
-                temperature,
-                max_tokens,
-                token_limit,
+                &initial_generation.model,
+                initial_generation.llm_config.clone(),
+                initial_generation.llm_client.clone(),
+                initial_generation.temperature,
+                initial_generation.max_tokens,
+                initial_generation.token_limit,
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
@@ -767,8 +871,7 @@ async fn register_default_subagents(
                 }
                 let def = builder.build();
                 let factory_def = subagent_def.clone();
-                let factory_model = subagent_model.clone();
-                let factory_llm = subagent_llm.clone();
+                let factory_model_binding = model_binding.clone();
                 let factory_cache_user_id = cache_user_id.to_string();
                 let factory_browser_runtime = browser_runtime.clone();
                 let factory_sandbox_manager = sandbox_manager.clone();
@@ -779,8 +882,7 @@ async fn register_default_subagents(
                 let fork_factory = Arc::new(FnAgentFactory::new(
                     move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
                         let subagent_def = factory_def.clone();
-                        let model = factory_model.clone();
-                        let llm = factory_llm.clone();
+                        let model_binding = factory_model_binding.clone();
                         let cache_user_id = factory_cache_user_id.clone();
                         let browser_runtime = factory_browser_runtime.clone();
                         let sandbox_manager = factory_sandbox_manager.clone();
@@ -789,17 +891,19 @@ async fn register_default_subagents(
                         let prompt_compiler = factory_prompt_compiler.clone();
                         let subagent_registry = factory_subagent_registry.clone();
                         Box::pin(async move {
+                            let model_generation = model_binding.snapshot().await;
                             let max_iterations = subagent_def.max_turns.unwrap_or(0);
                             let catalog_registry = subagent_registry.clone();
                             let subagent = if subagent_def.readonly {
                                 build_readonly_subagent_agent(
                                     &subagent_def.name,
                                     &system_prompt,
-                                    &model,
-                                    llm,
-                                    temperature,
-                                    max_tokens,
-                                    token_limit,
+                                    &model_generation.model,
+                                    model_generation.llm_config,
+                                    model_generation.llm_client,
+                                    model_generation.temperature,
+                                    model_generation.max_tokens,
+                                    model_generation.token_limit,
                                     tool_timeout_ms,
                                     max_tool_output_tokens,
                                     &cache_user_id,
@@ -813,11 +917,12 @@ async fn register_default_subagents(
                                 build_writer_subagent_agent(
                                     &subagent_def.name,
                                     &system_prompt,
-                                    &model,
-                                    llm,
-                                    temperature,
-                                    max_tokens,
-                                    token_limit,
+                                    &model_generation.model,
+                                    model_generation.llm_config,
+                                    model_generation.llm_client,
+                                    model_generation.temperature,
+                                    model_generation.max_tokens,
+                                    model_generation.token_limit,
                                     tool_timeout_ms,
                                     max_tool_output_tokens,
                                     &cache_user_id,
@@ -852,6 +957,7 @@ async fn register_default_subagents(
                     isolate_workspace: subagent_def.isolate_workspace,
                     has_team: subagent_def.team.is_some(),
                     can_delegate: subagent_def.can_delegate,
+                    inherits_parent_model: subagent_def.model.is_none(),
                     tags: subagent_def.tags.clone(),
                 });
             }
@@ -892,6 +998,20 @@ async fn register_default_subagents(
                 .await;
         }
     }
+    let inherited_factories = built_subagents
+        .iter()
+        .filter(|built| built.inherits_parent_model)
+        .map(|built| InheritedSubagentFactory {
+            definition: built.definition.clone(),
+            handle: built.handle.clone(),
+            factory: built.fork_factory.clone(),
+        })
+        .collect();
+    AgentModelConsumers {
+        inherited_generation,
+        registry: subagent_registry,
+        inherited_factories: Arc::new(inherited_factories),
+    }
 }
 
 /// Build a **writer** subagent (Sprint 9): same as the readonly subagent
@@ -905,6 +1025,7 @@ fn build_writer_subagent_agent(
     prompt: &str,
     model: &str,
     llm_config: Option<LlmConfig>,
+    llm_client: Option<Arc<dyn LlmClient>>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
@@ -969,6 +1090,9 @@ fn build_writer_subagent_agent(
     }
 
     let mut subagent = builder.build()?;
+    if let Some(client) = llm_client {
+        subagent.set_llm_client(client);
+    }
     configure_run_code_capability(&mut subagent, run_code_available);
     if let Some(browser_runtime) = browser_runtime {
         browser_runtime.install_subagent_tools(&mut subagent);
@@ -991,6 +1115,7 @@ fn build_readonly_subagent_agent(
     prompt: &str,
     model: &str,
     llm_config: Option<LlmConfig>,
+    llm_client: Option<Arc<dyn LlmClient>>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
@@ -1046,6 +1171,9 @@ fn build_readonly_subagent_agent(
     }
 
     let mut subagent = builder.build()?;
+    if let Some(client) = llm_client {
+        subagent.set_llm_client(client);
+    }
     if let Some(browser_runtime) = browser_runtime {
         browser_runtime.install_subagent_tools(&mut subagent);
     }
@@ -1863,18 +1991,6 @@ fn provider_from_model(model: &str) -> &str {
         })
 }
 
-fn provider_required_keys(provider: &str) -> &'static [&'static str] {
-    match provider.to_ascii_lowercase().as_str() {
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "openai" => &["OPENAI_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "dashscope" | "qwen" | "aliyun" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
-        "moonshot" | "kimi" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        "zhipu" | "glm" => &["ZHIPU_API_KEY", "GLM_API_KEY"],
-        _ => &[],
-    }
-}
-
 /// Send a minimal chat request to verify the model is reachable and responding.
 async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> {
     use echo_agent::error::ReactError;
@@ -1936,7 +2052,7 @@ pub fn run_base_doctor_for_model_with_connectivity(
     let base_display = base.display();
 
     let provider = provider_from_model(model);
-    let required_keys = provider_required_keys(provider);
+    let required_keys = model_config::provider_env_vars(provider);
     if required_keys.is_empty() {
         checks.push(format!(
             "ℹ️  当前模型: {} (provider: {}, 无需或未知 API Key)",
@@ -2160,9 +2276,10 @@ pub fn build_llm_config(
     auth_token: &str,
     model: &str,
     base_url_override: Option<&str>,
+    api_protocol: Option<LlmApiProtocol>,
 ) -> LlmConfig {
     let default_base_url = echo_agent::llm::config::provider_base_url(provider)
-        .unwrap_or("https://api.openai.com/v1/chat/completions");
+        .unwrap_or(echo_agent::llm::config::provider_urls::OPENAI_CHAT_COMPLETIONS);
     let mut config = match provider.to_lowercase().as_str() {
         "anthropic" => LlmConfig::anthropic(auth_token, model),
         "deepseek" => LlmConfig::deepseek(auth_token, model),
@@ -2187,6 +2304,13 @@ pub fn build_llm_config(
     if let Some(url) = base_url_override {
         config.base_url = url.to_string();
     }
+    config.api_protocol = api_protocol
+        .or_else(|| base_url_override.and_then(LlmApiProtocol::try_from_endpoint))
+        .or_else(|| {
+            echo_agent::llm::config::provider_metadata(provider)
+                .map(|metadata| metadata.default_api_protocol)
+        })
+        .unwrap_or_else(|| LlmApiProtocol::from_endpoint(&config.base_url));
     // Ensure provider_name is set so the thinking-protocol resolver picks the
     // right wire field (e.g. enable_thinking for dashscope vs reasoning_effort
     // for deepseek). The named constructors already set it; the generic
@@ -2197,12 +2321,395 @@ pub fn build_llm_config(
     config
 }
 
+/// Convert one fully resolved EKO model into the framework wire configuration.
+/// Empty API keys remain valid for local endpoints; required-key policy is
+/// enforced separately before this adapter is called.
+pub fn build_runtime_llm_config(
+    runtime: &model_config::ModelRuntimeConfig,
+) -> Result<LlmConfig, String> {
+    model_config::validate_runtime_model_endpoint(runtime)?;
+    Ok(build_llm_config(
+        &runtime.provider,
+        runtime.auth_token.as_deref().unwrap_or_default(),
+        &runtime.model,
+        runtime.base_url.as_deref(),
+        Some(runtime.api_protocol),
+    ))
+}
+
+/// One fully validated EKO runtime model and the client built from it.
+///
+/// The application uses this as a pre-commit value: invalid headers, tokens,
+/// endpoints, and provider/client combinations fail before config persistence
+/// or live-agent mutation begins.
+#[derive(Clone)]
+pub struct PreparedRuntimeLlm {
+    pub config: LlmConfig,
+    pub client: Arc<dyn LlmClient>,
+    pub thinking: Option<echo_agent::llm::ThinkingConfig>,
+}
+
+/// Exact admission receipt for publishing one prepared model generation to a
+/// live parent agent and its inherited subagent factories.
+pub(crate) struct PreparedAgentModelPublication {
+    generation: echo_agent::agent::PreparedAgentModelGeneration,
+    inherited: Vec<PreparedInheritedSubagentPublication>,
+    consumers: AgentModelConsumers,
+    runtime: model_config::ModelRuntimeConfig,
+    prepared: PreparedRuntimeLlm,
+    token_limit: usize,
+}
+
+struct PreparedInheritedSubagentPublication {
+    generation: echo_agent::agent::PreparedAgentModelGeneration,
+}
+
+impl PreparedInheritedSubagentPublication {
+    fn commit(self) {
+        self.generation.commit();
+    }
+}
+
+impl PreparedAgentModelPublication {
+    /// Publish only pre-owned values. All validation and context admission was
+    /// completed by [`prepare_agent_model_publication`].
+    pub(crate) async fn commit(self) {
+        self.generation.commit();
+        for inherited in self.inherited {
+            inherited.commit();
+        }
+        self.consumers
+            .publish_inherited_generation(&self.runtime, &self.prepared, self.token_limit)
+            .await;
+    }
+}
+
+/// Resolve and construct the exact client used by every EKO model surface.
+pub fn prepare_runtime_llm(
+    runtime: &model_config::ModelRuntimeConfig,
+) -> Result<PreparedRuntimeLlm, String> {
+    model_config::validate_runtime_model_requirements(runtime)?;
+    let config = build_runtime_llm_config(runtime)?;
+    let thinking = match runtime.thinking.as_deref() {
+        Some(spec) => echo_agent::llm::ThinkingConfig::parse_spec(spec)?,
+        None => None,
+    };
+    let client: Arc<dyn LlmClient> = config
+        .build_client()
+        .map(Arc::from)
+        .map_err(|error| format!("Failed to create client: {error}"))?;
+    Ok(PreparedRuntimeLlm {
+        config,
+        client,
+        thinking,
+    })
+}
+
+/// Prepare one live agent and every model-coupled runtime consumer without
+/// changing any published state.
+pub(crate) async fn prepare_agent_model_publication(
+    handle: &AgentHandle,
+    consumers: AgentModelConsumers,
+    runtime: &model_config::ModelRuntimeConfig,
+    prepared: &PreparedRuntimeLlm,
+    token_limit: usize,
+) -> Result<PreparedAgentModelPublication, String> {
+    let (critic_owner, cache_user_id) = handle
+        .read(|agent| {
+            (
+                agent.critic_owner().map(str::to_string),
+                agent.config().get_cache_user_id().map(str::to_string),
+            )
+        })
+        .await;
+    let critic = if critic_owner.as_deref() == Some(EKO_MODEL_CRITIC_OWNER) {
+        let mut critic = echo_agent::agent::critic::LlmCritic::new(prepared.client.clone())
+            .with_pass_threshold(7.0);
+        if let Some(cache_user_id) = cache_user_id {
+            critic = critic.with_cache_user_id(cache_user_id);
+        }
+        echo_agent::agent::PreparedCriticUpdate::ReplaceOwned {
+            owner: EKO_MODEL_CRITIC_OWNER.to_string(),
+            critic: Arc::new(critic),
+        }
+    } else {
+        echo_agent::agent::PreparedCriticUpdate::Preserve
+    };
+    let generation = handle
+        .prepare_model_generation(
+            prepared.config.clone(),
+            prepared.client.clone(),
+            runtime.temperature,
+            runtime.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
+            prepared.thinking.clone(),
+            token_limit,
+            critic,
+        )
+        .await
+        .map_err(|error| format!("Failed to prepare agent model generation: {error}"))?;
+    let mut inherited_publications = Vec::with_capacity(consumers.inherited_factories.len());
+    for inherited in consumers.inherited_factories.iter() {
+        let inherited_generation = inherited
+            .handle
+            .prepare_model_generation(
+                prepared.config.clone(),
+                prepared.client.clone(),
+                runtime.temperature,
+                runtime.max_tokens.or(Some(DEFAULT_MAX_TOKENS)),
+                prepared.thinking.clone(),
+                token_limit,
+                echo_agent::agent::PreparedCriticUpdate::Preserve,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to prepare inherited subagent '{}' model generation: {error}",
+                    inherited.definition.name
+                )
+            })?;
+        inherited_publications.push(PreparedInheritedSubagentPublication {
+            generation: inherited_generation,
+        });
+    }
+    Ok(PreparedAgentModelPublication {
+        generation,
+        inherited: inherited_publications,
+        consumers,
+        runtime: runtime.clone(),
+        prepared: prepared.clone(),
+        token_limit,
+    })
+}
+
+#[cfg(test)]
+mod llm_config_tests {
+    use super::{
+        AgentCreateParams, build_llm_config, build_runtime_llm_config,
+        create_agent_with_diagnostics, prepare_runtime_llm,
+    };
+    use crate::model_config::ModelRuntimeConfig;
+    use echo_agent::agent::Agent;
+    use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
+    use echo_agent::llm::LlmApiProtocol;
+
+    #[test]
+    fn builtin_protocol_defaults_come_from_framework_config() {
+        for (provider, expected) in [
+            ("openai", LlmApiProtocol::Responses),
+            ("anthropic", LlmApiProtocol::Anthropic),
+            ("deepseek", LlmApiProtocol::ChatCompletions),
+        ] {
+            assert_eq!(
+                build_llm_config(provider, "test-key", "test-model", None, None).api_protocol,
+                expected,
+                "unexpected builder protocol for {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn custom_endpoint_inference_preserves_explicit_override_priority() {
+        let endpoint = "https://gateway.example/v1/responses";
+        assert_eq!(
+            build_llm_config("custom", "test-key", "test-model", Some(endpoint), None).api_protocol,
+            LlmApiProtocol::Responses
+        );
+        assert_eq!(
+            build_llm_config(
+                "custom",
+                "test-key",
+                "test-model",
+                Some(endpoint),
+                Some(LlmApiProtocol::ChatCompletions),
+            )
+            .api_protocol,
+            LlmApiProtocol::ChatCompletions
+        );
+    }
+
+    #[test]
+    fn named_provider_constructors_infer_complete_endpoint_overrides() {
+        for (provider, endpoint, expected) in [
+            (
+                "anthropic",
+                "https://gateway.example/v1/responses",
+                LlmApiProtocol::Responses,
+            ),
+            (
+                "deepseek",
+                "https://gateway.example/v1/messages",
+                LlmApiProtocol::Anthropic,
+            ),
+            (
+                "dashscope",
+                "https://gateway.example/v1/responses",
+                LlmApiProtocol::Responses,
+            ),
+        ] {
+            assert_eq!(
+                build_llm_config(provider, "test-key", "test-model", Some(endpoint), None,)
+                    .api_protocol,
+                expected,
+                "unexpected endpoint override for {provider}"
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_builder_injects_local_endpoint_without_api_key() -> Result<(), String> {
+        let runtime = ModelRuntimeConfig {
+            id: "local:model".to_string(),
+            display_name: "Local model".to_string(),
+            provider: "local".to_string(),
+            model: "model".to_string(),
+            api_protocol: LlmApiProtocol::ChatCompletions,
+            api_protocol_explicit: false,
+            auth_token: None,
+            auth_source: "none".to_string(),
+            base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            temperature: None,
+            max_tokens: None,
+            context_window: None,
+            thinking: None,
+        };
+
+        let config = build_runtime_llm_config(&runtime)?;
+        assert!(config.api_key.is_empty());
+        assert_eq!(
+            config.base_url,
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        assert_eq!(config.api_protocol, LlmApiProtocol::ChatCompletions);
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_preflight_rejects_invalid_authorization_header() {
+        let runtime = ModelRuntimeConfig {
+            id: "openai:gpt-test".to_string(),
+            display_name: "Invalid token".to_string(),
+            provider: "openai".to_string(),
+            model: "gpt-test".to_string(),
+            api_protocol: LlmApiProtocol::Responses,
+            api_protocol_explicit: true,
+            auth_token: Some("invalid\nheader".to_string()),
+            auth_source: "input".to_string(),
+            base_url: Some("https://api.openai.com/v1/responses".to_string()),
+            temperature: None,
+            max_tokens: None,
+            context_window: None,
+            thinking: None,
+        };
+
+        assert!(prepare_runtime_llm(&runtime).is_err());
+    }
+
+    fn selectable_model_config(agent_token_limit: usize) -> Result<AppConfig, String> {
+        let mut config = AppConfig::default();
+        config.agent.token_limit = agent_token_limit;
+        config.model_providers.insert(
+            "local".to_string(),
+            ModelProviderConfig {
+                auth_token: None,
+                base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            },
+        );
+        config.configured_models = vec![
+            ConfiguredModel {
+                id: "local:default".to_string(),
+                display_name: "Default".to_string(),
+                provider: "local".to_string(),
+                model: "default-runtime".to_string(),
+                api_protocol: Some(LlmApiProtocol::ChatCompletions),
+                context_window: Some(16_384),
+                ..ConfiguredModel::default()
+            },
+            ConfiguredModel {
+                id: "local:selected".to_string(),
+                display_name: "Selected".to_string(),
+                provider: "local".to_string(),
+                model: "selected-runtime".to_string(),
+                api_protocol: Some(LlmApiProtocol::ChatCompletions),
+                context_window: Some(65_536),
+                ..ConfiguredModel::default()
+            },
+        ];
+        crate::model_config::set_default_model(&mut config, "local:default")?;
+        Ok(config)
+    }
+
+    #[tokio::test]
+    async fn default_and_cli_selected_models_use_their_effective_context_window()
+    -> Result<(), String> {
+        let config = selectable_model_config(0)?;
+        let default = create_agent_with_diagnostics(&AgentCreateParams::default(), &config).await?;
+        let selected = create_agent_with_diagnostics(
+            &AgentCreateParams {
+                model: Some("local:selected".to_string()),
+                ..Default::default()
+            },
+            &config,
+        )
+        .await?;
+
+        assert_eq!(default.agent.model_name(), "default-runtime");
+        assert_eq!(default.agent.config().get_token_limit(), 16_384);
+        assert_eq!(
+            default
+                .model_consumers
+                .inherited_generation
+                .read()
+                .await
+                .token_limit,
+            16_384
+        );
+        assert_eq!(selected.agent.model_name(), "selected-runtime");
+        assert_eq!(selected.agent.config().get_token_limit(), 65_536);
+        assert_eq!(
+            selected
+                .model_consumers
+                .inherited_generation
+                .read()
+                .await
+                .token_limit,
+            65_536
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_agent_token_limit_overrides_cli_selected_model_window() -> Result<(), String>
+    {
+        let config = selectable_model_config(7_777)?;
+        let selected = create_agent_with_diagnostics(
+            &AgentCreateParams {
+                model: Some("local:selected".to_string()),
+                ..Default::default()
+            },
+            &config,
+        )
+        .await?;
+
+        assert_eq!(selected.agent.config().get_token_limit(), 7_777);
+        assert_eq!(
+            selected
+                .model_consumers
+                .inherited_generation
+                .read()
+                .await
+                .token_limit,
+            7_777
+        );
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod resolve_subagent_model_tests {
     use super::{
-        DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, build_writer_subagent_agent,
-        configure_run_code_capability, resolve_subagent_model, resolved_max_tool_output_tokens,
-        tool_output_artifact_config,
+        DEFAULT_MAX_TOOL_OUTPUT_TOKENS, SubagentRuntimeGeneration, TASK_MANAGEMENT_GUIDE,
+        build_writer_subagent_agent, configure_run_code_capability, resolve_subagent_model,
+        resolved_max_tool_output_tokens, subagent_model_binding, tool_output_artifact_config,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
@@ -2238,6 +2745,29 @@ mod resolve_subagent_model_tests {
     #[test]
     fn none_inherits_parent() {
         assert_eq!(resolve_subagent_model(None, "parent-model"), "parent-model");
+    }
+
+    #[tokio::test]
+    async fn explicit_inherit_is_resolved_once_and_remains_fixed() {
+        let initial = SubagentRuntimeGeneration {
+            model: "parent-a".to_string(),
+            llm_config: None,
+            llm_client: None,
+            temperature: None,
+            max_tokens: None,
+            token_limit: 16_384,
+        };
+        let authority = Arc::new(tokio::sync::RwLock::new(initial.clone()));
+        let binding = subagent_model_binding(Some("inherit"), &initial, &authority);
+        *authority.write().await = SubagentRuntimeGeneration {
+            model: "parent-b".to_string(),
+            token_limit: 65_536,
+            ..initial
+        };
+
+        let fixed = binding.snapshot().await;
+        assert_eq!(fixed.model, "parent-a");
+        assert_eq!(fixed.token_limit, 16_384);
     }
 
     #[test]
@@ -2286,6 +2816,7 @@ mod resolve_subagent_model_tests {
             None,
             None,
             None,
+            None,
             8_192,
             30_000,
             1_024,
@@ -2324,6 +2855,7 @@ mod resolve_subagent_model_tests {
             "delegator",
             "delegate bounded work",
             "test-model",
+            None,
             None,
             None,
             None,

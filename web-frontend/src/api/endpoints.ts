@@ -37,8 +37,6 @@ import type {
   SkillCandidateInfo,
   EvidenceCandidate,
   EvidenceInboxFilter,
-  ConfiguredModelListResponse,
-  ProviderTemplate,
   TestConnectionResponse,
   ToolExecution,
   ToolExecutionDetailManifest,
@@ -56,6 +54,9 @@ import type {
   TaskExecutionSummary,
   RecoveryBlocker,
   WorkspaceTransitionReceipt,
+  ConfiguredModelListResponse,
+  LlmApiProtocol,
+  ProviderTemplateListResponse,
 } from '../generated';
 
 export type {
@@ -1619,8 +1620,8 @@ export const evolutionApi = {
 export const providerApi = {
   listTemplates: () =>
     isTauri()
-      ? apiInvoke<{ providers: ProviderTemplate[] }>('list_model_templates')
-      : get<{ providers: ProviderTemplate[] }>('/models/templates'),
+      ? apiInvoke<ProviderTemplateListResponse>('list_model_templates')
+      : get<ProviderTemplateListResponse>('/models/templates'),
   listConfigured: () =>
     isTauri()
       ? apiInvoke<ConfiguredModelListResponse>('list_configured_models')
@@ -1646,6 +1647,7 @@ export const providerApi = {
     display_name?: string;
     provider: string;
     model: string;
+    api_protocol?: LlmApiProtocol;
     api_key?: string;
     base_url?: string;
     temperature?: number;
@@ -1671,11 +1673,18 @@ export const providerApi = {
     isTauri()
       ? apiInvoke<{ success: boolean }>('delete_configured_model', { modelId })
       : del<{ success: boolean }>(`/models/configured/${encodeURIComponent(modelId)}`),
-  test: (req: { provider: string; model: string; api_key?: string; base_url?: string }) =>
+  test: (req: {
+    provider: string;
+    model: string;
+    api_protocol?: LlmApiProtocol;
+    api_key?: string;
+    base_url?: string;
+  }) =>
     isTauri()
       ? apiInvoke<TestConnectionResponse>('test_connection', {
           provider: req.provider,
           model: req.model,
+          apiProtocol: req.api_protocol,
           apiKey: req.api_key,
           baseUrl: req.base_url,
         })

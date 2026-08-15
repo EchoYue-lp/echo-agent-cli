@@ -34,7 +34,7 @@ pub struct Args {
     #[arg(long, default_value = "127.0.0.1", hide = true)]
     pub host: String,
 
-    /// 模型名称（不指定则使用配置文件中的值）
+    /// 已配置模型 ID 或唯一模型名称（不指定则使用默认模型）
     #[arg(long, short = 'm', env = "MODEL_NAME")]
     pub model: Option<String>,
 

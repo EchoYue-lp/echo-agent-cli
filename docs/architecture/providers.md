@@ -1,182 +1,107 @@
-# Provider 架构决策
+# LLM Provider 与协议架构
 
-> **状态**：已采纳（2026-06）
-> **适用范围**：echo-agent / echo-integration / echo-agent-cli 全栈
-> **决策性质**：架构约束——偏离此决策需显式评审
-> **最后更新**：2026-06-22（Provider 收敛至 2 个 client 实现）
+> **状态**：已采纳（2026-08）
+> **适用范围**：`echo-agent` / `echo-integration` / `echo-agent-cli`
+> **决策性质**：架构约束，偏离需显式评审
 
-## 决策陈述
+## 决策
 
-**LLM provider 层只维护两个 `LlmClient` 实现：OpenAI Chat Completions + Anthropic Messages。**
-所有其他厂商通过 `LlmConfig` 预设接入对应基础协议，个性化差异收敛在 thinking 协议翻译（`translate_thinking_openai_compat`）+ usage 解析 fallback + 缓存适配器。**不实现 OpenAI Responses API**。
+供应商身份和 wire protocol 是两个不同维度：
 
-## 决策理由
+- `provider` 表示供应商身份，用于默认端点、认证来源、模型能力和 thinking 策略。
+- `LlmApiProtocol` 表示端点实际使用的协议，目前为 `responses`、`chat_completions`、`anthropic`。
+- `ProviderMetadata.default_api_protocol` 是内置供应商默认协议的唯一权威。
+- `LlmConfig::build_client()` 只按 `api_protocol` 选择协议适配器，不再按供应商名称硬编码客户端。
 
-### 1. Chat Completions 是行业事实标准，覆盖面足够
+内置默认值：
 
-OpenAI Chat Completions API 是当前覆盖面最广的"通行证"。DeepSeek、Kimi(Moonshot)、通义千问、智谱 GLM、xAI、Groq、Mistral 等均兼容此协议。维护一个高质量的 Chat Completions 实现，即可覆盖绝大多数主流厂商。
-
-### 2. Anthropic Messages API 协议差异大，必须独立实现
-
-Anthropic 的 `cache_control` 断点、`system` 独立字段、content blocks 结构与 Chat Completions 差异显著，强行统一会增加复杂度且削弱 Anthropic 的 prompt cache 能力。独立实现是合理的。
-
-### 3. 不实现 Responses API——与 prompt cache 架构冲突
-
-OpenAI Responses API（2025 年推出）把对话状态移到服务端，客户端只发 `previous_response_id`。这与本项目的 prompt cache 优化目标**根本冲突**：
-
-- `PromptCacheLayout` / `cache_hints` / 稳定 prefix 依赖客户端控制完整 messages 数组
-- Responses 模式下 prefix 在服务端，客户端无法保证其字节稳定
-- `cache_user_id` 的 KV-cache 分区机制在 Responses 模式下语义不同
-
-Chat Completions 已能覆盖 OpenAI 自家模型，Responses API 投入产出比低且会削弱缓存效果，**不实现**。
-
-### 4. 已删除冗余厂商 client 文件
-
-2026-06-22 收敛中删除了 7 个冗余/不支持的 vendor client 文件（DeepSeek/Qwen/Glm/Kimi Gemini/Azure/Ollama）。其中 4 个国内厂商 client 是纯冗余——`OpenAiClient` 已通过 `config.provider_name` + `translate_thinking_openai_compat` 正确处理它们的 thinking 协议，两者逻辑完全一致。Gemini/Azure/Ollama 因 auth 机制差异（如 Gemini 的 `x-goog-api-key` header、Azure 的 `api-key` header + URL query param、Ollama 的无 auth）暂不支持。
-
-## 当前架构
-
-### 文件结构
-
-```
-echo-integration/src/providers/
-├── openai.rs              ← OpenAI Chat Completions 基础实现（覆盖 OpenAI/DeepSeek/Qwen/GLM/Kimi 等）
-├── openai_cache.rs        ← OpenAI 缓存适配器（稳定 user_id + 前缀缓存）
-├── anthropic.rs           ← Anthropic Messages API 独立实现
-├── anthropic_cache.rs     ← Anthropic 缓存适配器（cache_control 断点策略）
-├── client.rs              ← 通用 HTTP post/stream_post
-├── thinking_translate.rs  ← thinking 协议策略（函数式，translate_thinking_openai_compat）
-├── config.rs              ← LlmConfig 预设 + ProviderMetadata + build_client
-└── adapter_client.rs      ← 协议适配器
-```
-
-### 个性化差异的处理位置
-
-| 差异类型 | 处理位置 | 示例 |
+| Provider | 默认协议 | 默认端点 |
 |---|---|---|
-| base_url / model name | `LlmConfig` 预设（`config.rs`） | `LlmConfig::deepseek()` 设 base_url=deepseek 官方 |
-| usage 字段名差异 | `Usage::cached_prompt_tokens()`（`types.rs:690-703`） | 按优先级 fallback：OpenAI `cached_tokens` → Anthropic `cache_read_input_tokens` → DeepSeek `prompt_cache_hit_tokens` |
-| 缓存行为 | `OpenAiCacheAdapter` / `AnthropicCachePlan` | OpenAI 靠稳定 prefix + user_id；Anthropic 靠 cache_control 断点 |
-| 厂商专属参数 | `ChatRequest.glm_thinking` 字段（**待改进**） | GLM `enable_thinking` |
+| OpenAI | Responses | `https://api.openai.com/v1/responses` |
+| Anthropic | Anthropic Messages | `https://api.anthropic.com/v1/messages` |
+| DeepSeek / Qwen / Kimi / GLM 等 | Chat Completions | 各自兼容端点 |
+| Custom | 由 URL 推断，也可显式指定 | 用户配置 |
 
-### 两个基础 provider 的协议映射
+## 分层判定
 
-**OpenAI Chat Completions（`OpenAiClient`）**：
-- 端点：`POST /v1/chat/completions`
-- 状态：无状态，客户端持有完整 history
-- 缓存：自动前缀缓存（依赖稳定 prefix + 稳定 `user` 字段）
-- 覆盖：OpenAI / DeepSeek / GLM / Kimi / Qwen / xAI / Groq / Mistral 等
+### 通用机制：框架层
 
-**Anthropic Messages（`AnthropicClient`）**：
-- 端点：`POST /v1/messages`
-- 状态：无状态，客户端持有完整 history
-- 缓存：显式 `cache_control: ephemeral` 断点（最多 4 个，由 `AnthropicCachePlan` 分配）
-- 覆盖：Anthropic Claude 系列（DeepSeek 也兼容此协议，但走 OpenAI 路径即可）
+以下能力对任何使用 `echo-agent` 的应用都成立，放在 `echo-agent`：
 
-## 厂商接入指南
+- 三种 wire protocol 的请求、响应和 SSE 适配器。
+- 文本、图片、文件、结构化输出、function call、并行 tool call、reasoning、usage 与取消。
+- Responses 加密 reasoning item 的保存和后续回放。
+- 完整 raw Responses create/stream 接口，保留未知字段和语义事件。
+- `ProviderMetadata` 中的供应商身份、默认端点、环境变量和默认协议。
 
-新增一个厂商时，**不需要写新的 provider 代码**。步骤：
+### EKO 产品策略：应用层
 
-### 1. 添加 `LlmConfig` 预设（如需要）
+以下是本地个人助理的产品选择，留在 `echo-agent-cli`：
 
-在 `echo-integration/src/providers/config.rs` 加一个构造方法：
+- GUI/TUI/CLI 的模型选择与配置持久化。
+- 把框架 provider metadata 和用户显式 override 无损投影到 GUI/TUI/CLI。
+- EKO 以本地会话历史为权威，不依赖远端 conversation 状态。
+- EKO 的工具和 Task/Subagent 运行时仍在本地执行。
 
-```rust
-pub fn new_provider(api_key: impl Into<String>, model: impl Into<String>) -> Self {
-    Self::new(api_key, model)
-        .with_base_url("https://api.newprovider.com/v1")
-        // 如有非标准行为，在此设置
-}
+### 适配边界
+
+`echo-agent-app-core` 只把模型配置转换为 `LlmConfig`，不维护 provider-to-protocol 映射。解析顺序固定为：用户显式 `api_protocol`、框架可识别的完整 endpoint 协议推断、框架 `ProviderMetadata.default_api_protocol`、unknown provider 的 Chat Completions fallback。协议语义、默认值和 endpoint 推断全部由框架提供。Auto 模式允许保留无法单独识别协议的 provider 根地址；显式协议则要求完整 endpoint，且后缀必须匹配。应用在启动/保存/测试连接前执行这一校验；本地、兼容 override 或 unknown provider 不强制 API Key，但仍注入同一份运行时配置。
+
+## Responses 支持范围
+
+### Agent 高层路径
+
+`ResponsesClient` 把 provider-neutral `ChatRequest` 映射为 Responses：
+
+- 完整本地消息历史映射为 `input` items，system/developer/user/assistant/tool role 不丢失。
+- 图片映射为 `input_image`，文件映射为 `input_file`。
+- function tools 使用 Responses 的扁平定义；tool output 使用 `function_call_output`。
+- `max_tokens`、temperature、tool choice、JSON schema、reasoning effort 和 prompt cache key 使用 Responses 对应字段。
+- 请求固定 `store:false`，并请求 `reasoning.encrypted_content`；加密 reasoning item 会存入消息并在下一轮回放。
+- 非流式响应保留原始 `Response` 对象；流式按语义事件解析，不依赖 Chat Completions 的 `[DONE]`。
+- input/output/total、cached/cache-write 和 reasoning token usage 均归一到框架 `Usage`。
+
+这条路径刻意不使用 `previous_response_id` 或远端 conversation，因此不会改变 EKO 本地历史、压缩和恢复模型。
+
+### 完整低层路径
+
+`ResponsesClient::create_raw()` 和 `create_raw_stream()` 接受完整 JSON 请求并返回完整 JSON 响应/语义事件，不裁剪 schema。调用方可使用 Responses 的 hosted tools、background、conversation、metadata、service tier、moderation、context management 及后续新增字段，而无需把这些协议专属概念塞进 `ChatRequest`。
+
+## 为什么 Responses 不破坏缓存
+
+Responses 并不要求使用服务端状态。`input` 可以携带完整历史，`store:false` 可关闭存储，`reasoning.encrypted_content` 支持无状态 reasoning 回放，`prompt_cache_key` 继续提供缓存分区。因而 EKO 可以同时保持本地历史权威、稳定前缀和 provider prompt cache。
+
+## 参考实现与取舍
+
+- [OpenAI Responses create reference](https://developers.openai.com/api/reference/resources/responses/methods/create)：确认完整请求/响应 schema、`store`、`input`、tools、reasoning、usage 和流事件模型。
+- [OpenAI Node SDK Responses resource](https://github.com/openai/openai-node/tree/master/src/resources/responses)：交叉核对官方 SDK 的请求类型、输出 item 和 streaming event union。
+- [DeepSeek Responses API 指南](https://api-docs.deepseek.com/zh-cn/guides/responses_api)：仅用于独立验证兼容协议的 input item、function call、usage 和语义 SSE 事件；本项目没有 DeepSeek Responses 专属分支。
+
+跨实现的共同模式是：Responses 是独立 wire protocol，流使用具名语义事件，工具调用由 output item 与 call ID 串联。项目据此保留一个 provider-neutral `LlmClient` 高层接口，再提供 raw 接口承载协议完整能力。
+
+## 文件结构
+
+```text
+echo-integration/src/providers/
+├── responses.rs          # OpenAI Responses 高层映射 + 完整 raw API
+├── openai.rs             # OpenAI-compatible Chat Completions
+├── anthropic.rs          # Anthropic Messages
+├── client.rs             # 共享 HTTP 与 UTF-8-safe SSE transport
+├── thinking_translate.rs # thinking 配置翻译
+└── config.rs             # provider 默认值、协议选择与 client factory
 ```
 
-如果新厂商的 base_url 和 model 命名规则与 OpenAI 一致，连预设都不需要——用户直接用 `LlmConfig::new()` 配置即可。
+## 新供应商接入
 
-### 2. 确认 usage 字段兼容性
+1. 确认供应商实际 wire protocol，而不是根据品牌猜测。
+2. 兼容现有协议时只在框架 `ProviderMetadata` 增加 provider/default，不在 EKO 复制映射或新增 client。
+3. 自定义服务可显式设置 `api_protocol`；省略时按完整 endpoint URL 推断。
+4. 只有协议结构无法被三种现有适配器表达，且不是单一厂商扩展字段时，才评估新增协议。
 
-新厂商的 `cached_tokens` 字段位置如果与 OpenAI 标准（`prompt_tokens_details.cached_tokens`）不同，在 `Usage::cached_prompt_tokens()`（`echo-core/src/llm/types.rs:690`）的 fallback 链中补一个分支。**不要**在 provider 文件里特殊处理。
+## 反模式
 
-### 3. 确认缓存行为
-
-走 OpenAI 兼容路径的厂商，`OpenAiCacheAdapter` 已经处理了稳定 `user_id` + 前缀缓存。如果该厂商的缓存机制有特殊要求（如需要额外的 header），在 `OpenAiCacheAdapter` 或 `OpenAiClient` 中补充，**不要建新 provider**。
-
-### 4. 厂商专属参数（如需要）
-
-如果厂商有非标准扩展参数（如 GLM 的 `enable_thinking`）：
-
-- **当前做法**（可接受）：在 `ChatRequest` 加专属字段，`OpenAiClient` 序列化时处理
-- **未来改进**（推荐）：收敛到 `provider_extensions: HashMap<String, serde_json::Value>`，避免核心请求类型耦合单厂商
-
-## 反模式（不要做）
-
-### ❌ 实现 OpenAI Responses API
-
-```rust
-// 不要这样做
-echo-integration/src/providers/responses.rs  // ❌
-```
-
-Responses API 的服务端状态管理与本项目的 prompt cache 架构（`PromptCacheLayout` / `cache_hints` / 稳定 prefix）冲突。Chat Completions 已覆盖 OpenAI 自家模型。
-
-### ❌ 在核心类型加厂商专属字段
-
-```rust
-// 不要这样做（当前 glm_thinking 是历史遗留，可接受但不应扩展）
-pub struct ChatRequest {
-    pub glm_thinking: Option<GlmThinkingBlock>,      // ❌ 厂商耦合
-    pub deepseek_reasoning: Option<bool>,             // ❌
-    pub qwen_enable_search: Option<bool>,             // ❌
-}
-```
-
-未来新增厂商专属参数应走 `provider_extensions` map。
-
-### ❌ 统一 OpenAI 和 Anthropic 两个基础实现
-
-不要为了"统一"而抽象出泛型 provider 接口把两者合并。两者的协议差异（system 字段位置、content blocks、cache_control）是本质性的，强行统一会增加复杂度且削弱各自的缓存能力。
-
-## 已确认覆盖的厂商
-
-| 厂商 | 接入方式 | 缓存支持 | 备注 |
-|---|---|---|---|
-| OpenAI | `LlmConfig::openai()` + `OpenAiClient` | ✅ `cached_tokens` | 基础实现 |
-| DeepSeek | `LlmConfig::deepseek()` + `OpenAiClient` | ✅ `prompt_cache_hit_tokens` | thinking 由 `translate_thinking_openai_compat` 处理 |
-| Anthropic Claude | `LlmConfig::anthropic()` + `AnthropicClient` | ✅ `cache_control` 断点 | 独立实现 |
-| 智谱 GLM | `LlmConfig::new()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | `glm_thinking` 字段处理扩展参数 |
-| Kimi (Moonshot) | `LlmConfig::new()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | |
-| 通义千问 (Qwen/DashScope) | `LlmConfig::dashscope()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | thinking 由 `translate_thinking_openai_compat` 处理 |
-| xAI / Groq / Mistral 等 | `LlmConfig::new()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | |
-
-## 暂不支持的厂商
-
-以下厂商因 auth 机制差异暂不支持，直接删除。未来若恢复支持，需评估 auth 差异是否用策略抽象：
-
-| 厂商 | 原因 |
-|---|---|
-| Google Gemini | 使用 `x-goog-api-key` header（非标准 Bearer） |
-| Azure OpenAI | 使用 `api-key` header + URL 含 `?api-version=` query param |
-| Ollama | 无 auth（本地），但已删除 |
-
-已配置这些 provider 的用户，启动时会走兜底分支并收到 warn 日志提示。
-
-## 相关代码索引
-
-- `echo-integration/src/providers/config.rs` — `LlmConfig` 预设 + `LlmProvider` 枚举 + `build_client()` + `ProviderFactory`
-- `echo-integration/src/providers/openai.rs` — OpenAI Chat Completions 实现（覆盖 OpenAI/DeepSeek/Qwen/GLM/Kimi 等）
-- `echo-integration/src/providers/openai_cache.rs` — OpenAI 缓存适配器
-- `echo-integration/src/providers/anthropic.rs` — Anthropic Messages 实现
-- `echo-integration/src/providers/anthropic_cache.rs` — Anthropic 缓存适配器
-- `echo-integration/src/providers/thinking_translate.rs` — thinking 协议策略（`translate_thinking_openai_compat`）
-- `echo-integration/src/providers/client.rs` — 通用 HTTP post/stream_post
-- `echo-core/src/llm/types.rs:566` — `ChatRequest`（含 `glm_thinking` 字段，待改进）
-- `echo-core/src/llm/types.rs:690-703` — `Usage::cached_prompt_tokens()` 多厂商 fallback
-- `echo-core/src/llm/cache/layout.rs` — `PromptCacheLayout`（与 Responses API 冲突的根因）
-- `echo-agent-app-core/src/infra.rs:69` — `load_or_create_cache_user_id()`（机器级稳定 ID）
-
-## 决策回顾触发条件
-
-如遇以下情况，需重新评审本决策：
-
-1. 某主流厂商**仅**支持 Responses API 且无法通过 Chat Completions 接入
-2. Responses API 引入客户端可控的 prefix 缓存机制（消除与 prompt cache 架构的冲突）
-3. 某厂商的协议差异大到无法通过 `LlmConfig` + usage fallback 处理（需评估独立 provider）
-4. `glm_thinking` 模式的厂商专属字段超过 3 个（需收敛到 `provider_extensions`）
+- 不得按 provider 名称复制 Responses/Chat/Anthropic 客户端。
+- 不得在 EKO 增加第二套 provider 默认协议 helper/switch。
+- 不得把 `previous_response_id` 作为 EKO 本地多轮对话的必需状态。
+- 不得把 hosted tool、background 等协议专属字段逐个塞进 provider-neutral `ChatRequest`；使用 raw Responses API。
+- 不得在应用 adapter 重做 SSE、tool-call frontier 或 reasoning 回放。

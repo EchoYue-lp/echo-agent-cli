@@ -90,9 +90,9 @@ cd web-frontend && npm install && cd ..
 
 ### 配置
 
-GUI 用户推荐在 **设置 → 模型供应商** 中添加模型。每个厂商可以添加多个模型，保存后可在聊天输入框底部的“默认模型”下拉框中切换。用户填写的 API Key 优先级高于系统环境变量，CLI/TUI 也会读取同一份默认已配置模型。
+GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_model_id`。GUI 用户可以在 **设置 → 模型供应商** 中添加模型；`api_protocol` 省略时，OpenAI 使用 Responses、Anthropic 使用 Messages，其余内置供应商使用 Chat Completions，自定义完整端点按 URL 推断。用户填写的 API Key 优先级高于系统环境变量。
 
-自动化部署也可以通过 `echo-agent.yaml` 设置 `model_providers` 和 `configured_models`。完整配置参考：
+也可以通过 `echo-agent.yaml` 设置模型。完整配置参考：
 
 - [配置指南](docs/configuration.md)
 
@@ -419,7 +419,7 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 
 | 参数 | 短形式 | 描述 |
 |------|--------|------|
-| `--model <name>` | `-m` | 指定模型名称 |
+| `--model <id-or-name>` | `-m` | 选择已启用的配置模型 ID 或唯一模型名称；未知/重名会报错 |
 | `--config <path>` | | 指定配置文件路径 |
 | `--mcp-config <path>` | | 指定 MCP 配置文件路径 |
 | `--project <path>` | | 指定项目目录 |

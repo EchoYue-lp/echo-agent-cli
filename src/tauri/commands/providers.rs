@@ -3,10 +3,14 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::config::{ConfiguredModel, ModelProviderConfig};
+use echo_agent::llm::LlmApiProtocol;
 use echo_agent::prelude::Message;
-use echo_agent_app_core::infra::build_llm_config;
-use echo_agent_app_core::model_config;
+use echo_agent_app_core::AppState;
+use echo_agent_app_core::infra::prepare_runtime_llm;
+use echo_agent_app_core::model_config::{self, ModelRuntimeConfig};
+use echo_agent_app_core::state::{ConfiguredModelMutation, ModelMutationError};
 use serde::Deserialize;
+use std::sync::Arc;
 
 #[derive(Debug, Deserialize)]
 pub struct UpsertConfiguredModelRequest {
@@ -14,6 +18,7 @@ pub struct UpsertConfiguredModelRequest {
     pub display_name: Option<String>,
     pub provider: String,
     pub model: String,
+    pub api_protocol: Option<LlmApiProtocol>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub temperature: Option<f32>,
@@ -29,6 +34,11 @@ pub struct UpsertConfiguredModelRequest {
 struct ResolvedAuth {
     token: String,
     source: &'static str,
+}
+
+struct ConnectionProbe {
+    runtime: ModelRuntimeConfig,
+    auth: ResolvedAuth,
 }
 
 fn resolve_auth_token(
@@ -67,90 +77,90 @@ fn resolve_auth_token(
     }
 }
 
-async fn apply_runtime_model(
-    state: &tauri::State<'_, TauriState>,
-    runtime: echo_agent_app_core::model_config::ModelRuntimeConfig,
-) {
-    state
-        .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            let runtime = runtime.clone();
-            Box::pin(async move {
-                if let Some(ref token) = runtime.auth_token {
-                    let config = build_llm_config(
-                        &runtime.provider,
-                        token,
-                        &runtime.model,
-                        runtime.base_url.as_deref(),
-                    );
-                    agent.set_llm_config(config);
-                } else {
-                    agent.set_model(&runtime.model);
-                }
-                agent.set_temperature(runtime.temperature);
-                agent.set_max_tokens(runtime.max_tokens);
-                // Apply thinking depth: translate the spec string into a
-                // ThinkingConfig and inject it. "auto"/empty → None (model
-                // default). Unparseable specs are warned and dropped.
-                match runtime.thinking.as_deref() {
-                    Some(spec) if !spec.trim().is_empty() => {
-                        match echo_agent::llm::ThinkingConfig::parse_spec(spec) {
-                            Ok(cfg) => agent.set_thinking(cfg),
-                            Err(e) => tracing::warn!(
-                                thinking_spec = spec,
-                                error = %e,
-                                "ignoring unparseable thinking config"
-                            ),
-                        }
-                    }
-                    _ => agent.set_thinking(None),
-                }
-                // Apply context_window: if set, use it as token_limit so the
-                // agent gets the right budget/compression behavior. If not
-                // set, leave token_limit unchanged (framework infers).
-                if let Some(cw) = runtime.context_window
-                    && let Err(error) = agent.set_token_limit(cw as usize)
-                {
-                    tracing::error!(error = %error, "failed to apply model context window");
-                }
-                tracing::info!(
-                    provider = %runtime.provider,
-                    model = %runtime.model,
-                    display_name = %runtime.display_name,
-                    auth_source = %runtime.auth_source,
-                    "模型配置已应用到当前 Agent"
-                );
-            })
-        })
-        .await;
+fn configured_model_mutation(req: UpsertConfiguredModelRequest) -> ConfiguredModelMutation {
+    ConfiguredModelMutation {
+        model: ConfiguredModel {
+            id: req.id.unwrap_or_default(),
+            display_name: req.display_name.unwrap_or_default(),
+            provider: req.provider,
+            model: req.model,
+            api_protocol: req.api_protocol,
+            enabled: req.enabled.unwrap_or(true),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+            context_window: req.context_window,
+            thinking: req.thinking,
+        },
+        auth_token: req.api_key,
+        base_url: req.base_url,
+        set_default: req.set_default.unwrap_or(false),
+    }
+}
 
-    if let Some(pool) = state.app_state.connection.pool.as_ref() {
-        let app_config = state.app_state.config.app_config.read().await.clone();
-        pool.update_app_config(app_config).await;
-        pool.apply_runtime_model(runtime).await;
+fn model_mutation_ipc_error(error: ModelMutationError) -> IpcError {
+    match error {
+        ModelMutationError::Validation(message) => IpcError::Validation(message),
+        other => IpcError::Internal(other.to_string()),
+    }
+}
+
+fn resolve_connection_probe(
+    app_config: &echo_agent::config::AppConfig,
+    provider: String,
+    model: String,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    api_protocol: Option<LlmApiProtocol>,
+) -> ConnectionProbe {
+    let provider_config = app_config.model_providers.get(&provider);
+    let auth = resolve_auth_token(api_key.as_deref(), provider_config, &provider);
+    let base_url = base_url
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| provider_config.and_then(|config| config.base_url.clone()))
+        .or_else(|| model_config::default_base_url(&provider));
+    let mut probe_config = app_config.clone();
+    probe_config.model_providers.insert(
+        provider.clone(),
+        ModelProviderConfig {
+            auth_token: (!auth.token.is_empty()).then(|| auth.token.clone()),
+            base_url,
+        },
+    );
+    let probe_id = format!("__connection_test__:{provider}:{model}");
+    probe_config.configured_models = vec![ConfiguredModel {
+        id: probe_id.clone(),
+        display_name: "Connection test".to_string(),
+        provider,
+        model,
+        api_protocol,
+        enabled: true,
+        ..ConfiguredModel::default()
+    }];
+    ConnectionProbe {
+        runtime: model_config::resolve_runtime_model(&probe_config, Some(&probe_id)),
+        auth,
     }
 }
 
 #[tauri::command]
-pub async fn list_model_templates() -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "providers": model_config::provider_templates(),
-    }))
+pub async fn list_model_templates() -> Result<model_config::ProviderTemplateListResponse, IpcError>
+{
+    Ok(model_config::ProviderTemplateListResponse {
+        providers: model_config::provider_templates(),
+    })
 }
 
 #[tauri::command]
 pub async fn list_configured_models(
     state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<model_config::ConfiguredModelListResponse, IpcError> {
     let cfg = state.app_state.config.app_config.read().await;
     let models = model_config::configured_model_views(&cfg);
     let default_model_id = cfg.model.default_model_id.clone();
-    Ok(serde_json::json!({
-        "models": models,
-        "default_model_id": default_model_id,
-    }))
+    Ok(model_config::ConfiguredModelListResponse {
+        models,
+        default_model_id,
+    })
 }
 
 #[tauri::command]
@@ -158,66 +168,24 @@ pub async fn upsert_configured_model(
     state: tauri::State<'_, TauriState>,
     req: UpsertConfiguredModelRequest,
 ) -> Result<serde_json::Value, IpcError> {
-    let model_id;
-    let runtime;
-    {
-        let mut cfg = state.app_state.config.app_config.write().await;
-        let original = cfg.clone();
-        let provider_config = cfg
-            .model_providers
-            .entry(req.provider.clone())
-            .or_insert_with(ModelProviderConfig::default);
-        if let Some(key) = req
-            .api_key
-            .as_ref()
-            .map(|key| key.trim().to_string())
-            .filter(|key| !key.is_empty())
-        {
-            provider_config.auth_token = Some(key);
-        }
-        if let Some(url) = req
-            .base_url
-            .as_ref()
-            .map(|url| url.trim().to_string())
-            .filter(|url| !url.is_empty())
-        {
-            provider_config.base_url = Some(url);
-        }
+    upsert_configured_model_inner(&state.app_state, req).await
+}
 
-        let configured = ConfiguredModel {
-            id: req.id.unwrap_or_default(),
-            display_name: req.display_name.unwrap_or_default(),
-            provider: req.provider,
-            model: req.model,
-            api_protocol: None,
-            enabled: req.enabled.unwrap_or(true),
-            max_tokens: req.max_tokens,
-            temperature: req.temperature,
-            context_window: req.context_window,
-            thinking: req.thinking,
-        };
-        model_id = model_config::upsert_configured_model(&mut cfg, configured);
-        if req.set_default.unwrap_or(false) {
-            runtime = model_config::set_default_model(&mut cfg, &model_id)
-                .map_err(IpcError::Validation)?;
-        } else {
-            runtime = model_config::resolve_runtime_model(&cfg, Some(&model_id));
-        }
-        if let Err(error) = state.app_state.save_app_config(&cfg) {
-            *cfg = original;
-            return Err(IpcError::Internal(format!(
-                "Failed to persist configured model: {error}"
-            )));
-        }
-    }
-
-    if req.set_default.unwrap_or(false) {
-        apply_runtime_model(&state, runtime.clone()).await;
-    }
+async fn upsert_configured_model_inner(
+    app_state: &Arc<AppState>,
+    req: UpsertConfiguredModelRequest,
+) -> Result<serde_json::Value, IpcError> {
+    let mutation = app_state
+        .upsert_configured_model_owned(configured_model_mutation(req))
+        .await
+        .map_err(model_mutation_ipc_error)?;
+    let runtime = mutation.runtime.ok_or_else(|| {
+        IpcError::Internal("configured model mutation lost its runtime receipt".to_string())
+    })?;
 
     Ok(serde_json::json!({
         "success": true,
-        "model_id": model_id,
+        "model_id": mutation.model_id,
         "auth_source": runtime.auth_source,
     }))
 }
@@ -227,17 +195,11 @@ pub async fn delete_configured_model(
     state: tauri::State<'_, TauriState>,
     model_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    {
-        let mut cfg = state.app_state.config.app_config.write().await;
-        let original = cfg.clone();
-        model_config::delete_configured_model(&mut cfg, &model_id).map_err(IpcError::Validation)?;
-        if let Err(error) = state.app_state.save_app_config(&cfg) {
-            *cfg = original;
-            return Err(IpcError::Internal(format!(
-                "Failed to persist configured model deletion: {error}"
-            )));
-        }
-    }
+    state
+        .app_state
+        .delete_configured_model_owned(model_id)
+        .await
+        .map_err(model_mutation_ipc_error)?;
     Ok(serde_json::json!({ "success": true }))
 }
 
@@ -246,21 +208,20 @@ pub async fn set_default_model(
     state: tauri::State<'_, TauriState>,
     model_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let runtime;
-    {
-        let mut cfg = state.app_state.config.app_config.write().await;
-        let original = cfg.clone();
-        runtime =
-            model_config::set_default_model(&mut cfg, &model_id).map_err(IpcError::Validation)?;
-        if let Err(error) = state.app_state.save_app_config(&cfg) {
-            *cfg = original;
-            return Err(IpcError::Internal(format!(
-                "Failed to persist default model: {error}"
-            )));
-        }
-    }
+    set_default_model_inner(&state.app_state, model_id).await
+}
 
-    apply_runtime_model(&state, runtime.clone()).await;
+async fn set_default_model_inner(
+    app_state: &Arc<AppState>,
+    model_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    let mutation = app_state
+        .set_default_model_owned(model_id)
+        .await
+        .map_err(model_mutation_ipc_error)?;
+    let runtime = mutation.runtime.ok_or_else(|| {
+        IpcError::Internal("default model mutation lost its runtime receipt".to_string())
+    })?;
     Ok(serde_json::json!({
         "success": true,
         "model_id": runtime.id,
@@ -367,54 +328,92 @@ pub async fn test_connection(
     model: String,
     api_key: Option<String>,
     base_url: Option<String>,
+    api_protocol: Option<LlmApiProtocol>,
 ) -> Result<serde_json::Value, IpcError> {
-    let app_config = state.app_state.config.app_config.read().await;
-    let provider_config = app_config.model_providers.get(&provider);
-    let auth = resolve_auth_token(api_key.as_deref(), provider_config, &provider);
-    let base_url = base_url
-        .filter(|url| !url.trim().is_empty())
-        .or_else(|| provider_config.and_then(|config| config.base_url.clone()))
-        .or_else(|| model_config::default_base_url(&provider));
-    let requires_api_key = model_config::provider_templates()
-        .iter()
-        .find(|template| template.id == provider)
-        .map(|template| template.requires_api_key)
-        .unwrap_or(true);
-    if requires_api_key && auth.token.is_empty() {
+    test_connection_inner(
+        &state.app_state,
+        provider,
+        model,
+        api_key,
+        base_url,
+        api_protocol,
+    )
+    .await
+}
+
+async fn test_connection_inner(
+    app_state: &AppState,
+    provider: String,
+    model: String,
+    api_key: Option<String>,
+    base_url: Option<String>,
+    api_protocol: Option<LlmApiProtocol>,
+) -> Result<serde_json::Value, IpcError> {
+    let app_config = app_state.config.app_config.read().await.clone();
+    let probe = resolve_connection_probe(
+        &app_config,
+        provider,
+        model,
+        api_key,
+        base_url,
+        api_protocol,
+    );
+    if model_config::runtime_requires_api_key(&probe.runtime) && probe.auth.token.is_empty() {
         return Ok(serde_json::json!({
             "success": false,
             "error": "没有可用的 API Key。请填写 API Key，或设置对应环境变量后重试。",
-            "auth_source": auth.source,
+            "auth_source": probe.auth.source,
             "has_auth_token": false,
         }));
     }
-
-    let config = build_llm_config(&provider, &auth.token, &model, base_url.as_deref());
-
-    match config.build_client() {
-        Ok(client) => {
-            let messages = vec![Message::user("Hi, respond with just 'OK'.".to_string())];
-            match client.chat_simple(messages).await {
-                Ok(response) => Ok(serde_json::json!({
-                    "success": true,
-                    "response": response,
-                    "model": client.model_name(),
-                    "auth_source": auth.source,
-                    "has_auth_token": !auth.token.is_empty(),
-                })),
-                Err(e) => Ok(serde_json::json!({
-                    "success": false,
-                    "error": format!("API call failed: {e}"),
-                    "auth_source": auth.source,
-                    "has_auth_token": !auth.token.is_empty(),
-                })),
-            }
-        }
+    let prepared = prepare_runtime_llm(&probe.runtime).map_err(IpcError::Validation)?;
+    let messages = vec![Message::user("Hi, respond with just 'OK'.".to_string())];
+    match prepared.client.chat_simple(messages).await {
+        Ok(response) => Ok(serde_json::json!({
+            "success": true,
+            "response": response,
+            "model": prepared.client.model_name(),
+            "auth_source": probe.auth.source,
+            "has_auth_token": !probe.auth.token.is_empty(),
+        })),
         Err(e) => Ok(serde_json::json!({
             "success": false,
-            "error": format!("Failed to create client: {e}"),
-            "auth_source": auth.source,
-            "has_auth_token": !auth.token.is_empty(),
+            "error": format!("API call failed: {e}"),
+            "auth_source": probe.auth.source,
+            "has_auth_token": !probe.auth.token.is_empty(),
         })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_connection_probe;
+    use echo_agent::config::{AppConfig, ModelProviderConfig};
+    use echo_agent::llm::LlmApiProtocol;
+    use echo_agent_app_core::infra::prepare_runtime_llm;
+
+    #[test]
+    fn connection_probe_uses_real_client_preflight() -> Result<(), String> {
+        let mut config = AppConfig::default();
+        config.model_providers.insert(
+            "openai".to_string(),
+            ModelProviderConfig {
+                auth_token: Some("invalid\nauthorization".to_string()),
+                base_url: Some("https://api.openai.com/v1/responses".to_string()),
+            },
+        );
+        let probe = resolve_connection_probe(
+            &config,
+            "openai".to_string(),
+            "gpt-test".to_string(),
+            Some("invalid\nauthorization".to_string()),
+            Some("https://api.openai.com/v1/responses".to_string()),
+            Some(LlmApiProtocol::Responses),
+        );
+        let probe_error = prepare_runtime_llm(&probe.runtime)
+            .err()
+            .ok_or_else(|| "invalid connection probe unexpectedly passed preflight".to_string())?;
+        assert!(probe_error.contains("header") || probe_error.contains("Header"));
+        Ok(())
     }
 }

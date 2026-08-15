@@ -92,8 +92,9 @@ struct SubagentFrontmatter {
     /// child subagents unless explicitly granted this capability.
     #[serde(default)]
     can_delegate: bool,
-    /// Model override: omit / `inherit` → parent model; `fast` → resolved at
-    /// registration; any other string → concrete model id.
+    /// Model override. Omitted values track the current parent generation.
+    /// Explicit `inherit` / `fast` values resolve once at registration and then
+    /// remain fixed; any other string is a concrete model id.
     #[serde(default)]
     model: Option<String>,
     /// Max ReAct turns for this role (`None` = unlimited / builder default).
@@ -478,11 +479,13 @@ pub fn parse_subagent_md(
         None
     };
 
-    // `inherit` / empty → None (parent model). Keep `fast` and concrete ids.
+    // Only an omitted/empty value dynamically inherits the parent generation.
+    // Explicit aliases stay present so the runtime can resolve them once and
+    // preserve the resulting fixed model across parent hot-swaps.
     let model = fm
         .model
         .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty() && m != "inherit");
+        .filter(|m| !m.is_empty());
 
     Ok(SubagentDefinition {
         source: fallback_name
@@ -585,12 +588,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_model_inherit_becomes_none() {
+    fn parse_explicit_model_inherit_remains_an_override() -> Result<(), String> {
         let md = "---\nname: explorer\ndescription: \"x\"\nmodel: inherit\n---\nbody";
-        let def = parse_subagent_md(md, None).unwrap();
-        assert!(def.model.is_none());
+        let def = parse_subagent_md(md, None)?;
+        assert_eq!(def.model.as_deref(), Some("inherit"));
         assert!(!def.is_background);
         assert!(def.max_turns.is_none());
+        Ok(())
     }
 
     #[test]

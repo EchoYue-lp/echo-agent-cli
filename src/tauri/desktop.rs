@@ -201,11 +201,13 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     let mut state_inner = AppState::from_shared(
         agent_handle.clone(),
+        Some(runtime.model_consumers.clone()),
         runtime.hitl_dispatcher.clone(),
         conversation_store,
         app_config.clone(),
         runtime.mcp_config_runtime.clone(),
     )
+    .with_active_model_id(runtime.active_runtime_model.id.clone())
     .with_config_path(config_save_path)
     .with_review_integration(runtime.review_integration.clone())
     .with_prompt_assembly(runtime.prompt_assembly.clone())
@@ -299,6 +301,9 @@ async fn run_desktop() -> anyhow::Result<()> {
     cancel_token.cancel();
     if let Err(error) = state.session.foreground_turns.shutdown().await {
         tracing::warn!(%error, "failed to settle GUI foreground turns");
+    }
+    if let Err(error) = state.shutdown_model_mutations().await {
+        tracing::warn!(%error, "failed to settle GUI model mutations");
     }
     if let Some(task) = dreaming_task
         && let Err(error) = task.await

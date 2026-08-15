@@ -285,6 +285,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             runtime.hitl_dispatcher.clone(),
             &app_config,
             cli::HeadlessServiceResources {
+                model_consumers: runtime.model_consumers.clone(),
+                active_model_id: runtime.active_runtime_model.id.clone(),
                 pool: pool.clone(),
                 task_runtime_store: task_runtime_store.clone(),
                 webhook_emitter: webhook_emitter.clone(),
@@ -323,6 +325,18 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tracing::warn!(%error, "failed to bind plugin monitors to TUI scheduler");
         }
 
+        let tui_dreaming_task = runtime.review_integration.as_ref().map(|integration| {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let task = echo_agent_app_core::infra::spawn_dreaming_task(
+                integration.clone(),
+                agent_handle.clone(),
+                Some(pool.clone()),
+                cancel.clone(),
+            );
+            tracing::info!("Dreaming task spawned for TUI session");
+            (cancel, task)
+        });
+
         let tui_result = echo_agent_cli::tui::run_tui(
             agent_handle.clone(),
             &app_config.tui,
@@ -354,6 +368,18 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         )
         .await;
 
+        if let Err(error) = tui_app_state.session.foreground_turns.shutdown().await {
+            tracing::warn!(%error, "failed to settle TUI foreground turns");
+        }
+        if let Err(error) = tui_app_state.shutdown_model_mutations().await {
+            tracing::warn!(%error, "failed to settle TUI model mutations");
+        }
+        if let Some((cancel, task)) = tui_dreaming_task {
+            cancel.cancel();
+            if let Err(error) = task.await {
+                tracing::warn!(%error, "failed to join TUI Dreaming task");
+            }
+        }
         // ── Memory review on session end (TUI) ──────────────────────
         if tui_result.is_ok()
             && let Some(ref review_integration) = runtime.review_integration
@@ -375,10 +401,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     eprintln!("  ⚠ Memory review failed: {e}");
                 }
             }
-        }
-
-        if let Err(error) = tui_app_state.session.foreground_turns.shutdown().await {
-            tracing::warn!(%error, "failed to settle TUI foreground turns");
         }
         if let Some(integration) = runtime.review_integration.as_ref()
             && let Err(error) = integration.shutdown_background_reviews().await
@@ -448,6 +470,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     cli::CompanionModeShutdown::new("channels", channels_cancel, channels_handle);
                 if let Err(error) = cli::run_cli_mode(
                     agent_handle,
+                    runtime.model_consumers.clone(),
+                    runtime.active_runtime_model.id.clone(),
                     runtime.hitl_dispatcher.clone(),
                     &args,
                     &app_config,
@@ -515,6 +539,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         // 仅 CLI 模式
         if let Err(error) = cli::run_cli_mode(
             agent_handle,
+            runtime.model_consumers.clone(),
+            runtime.active_runtime_model.id.clone(),
             runtime.hitl_dispatcher.clone(),
             &args,
             &app_config,
@@ -622,7 +648,10 @@ mod tests {
             task_runtime_store: None,
             browser_runtime: None,
         };
-        let app_config = config::AppConfig::default();
+        let mut app_config = config::AppConfig::default();
+        app_config.model.provider = "local-test".to_string();
+        app_config.model.name = "test-model".to_string();
+        app_config.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(runtime) => runtime,
             Err(error) => {

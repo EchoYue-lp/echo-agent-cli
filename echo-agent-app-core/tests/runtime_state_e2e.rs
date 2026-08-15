@@ -27,7 +27,9 @@ fn make_app_config() -> AppConfig {
     c.agent.system_prompt = "You are a test runtime agent.".to_string();
     c.agent.max_iterations = 1;
     c.agent.token_limit = 4096;
-    c.model.provider = "ollama".to_string(); // no auth_token needed
+    c.model.provider = "ollama".to_string();
+    c.model.name = "test-model".to_string();
+    c.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());
     c
 }
 

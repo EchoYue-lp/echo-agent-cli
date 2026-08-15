@@ -741,37 +741,6 @@ export interface EvidenceCandidate {
   expired?: boolean;
 }
 
-// ── Provider types ──────────────────────────────────────────────────────────
-
-export interface ProviderTemplate {
-  id: string;
-  name: string;
-  base_url: string;
-  api_key_env: string;
-  default_models: string[];
-  requires_api_key: boolean;
-}
-
-export interface ConfiguredModel {
-  id: string;
-  display_name: string;
-  provider: string;
-  model: string;
-  enabled: boolean;
-  is_default: boolean;
-  has_auth_token: boolean;
-  auth_source: 'config' | 'env' | 'none' | string;
-  base_url: string | null;
-  temperature: number | null;
-  max_tokens: number | null;
-  context_window: number | null;
-}
-
-export interface ConfiguredModelListResponse {
-  models: ConfiguredModel[];
-  default_model_id: string | null;
-}
-
 export interface TestConnectionResponse {
   success: boolean;
   response?: string;

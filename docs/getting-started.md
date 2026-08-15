@@ -193,7 +193,7 @@ agent:
   enable_memory: true
   enable_human_in_loop: true
   memory_path: "~/.echo-agent/memory"
-  # token_limit: 0             # 上下文自动压缩阈值（0 = 禁用）
+  # token_limit: 0             # 0 = 使用所选模型 context_window；缺失时使用 EKO 默认值
   # compress_strategy: sliding # 压缩策略: sliding / summary / hybrid
   # compress_window: 20        # 滑动窗口大小
 

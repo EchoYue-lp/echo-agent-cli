@@ -101,6 +101,8 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
 }
 
 pub struct HeadlessServiceResources {
+    pub model_consumers: echo_agent_app_core::infra::AgentModelConsumers,
+    pub active_model_id: String,
     pub pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
     pub task_runtime_store:
         Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
@@ -139,11 +141,13 @@ pub async fn start_headless_services(
     use crate::state::AppState;
     let mut state = AppState::from_shared(
         agent,
+        Some(resources.model_consumers),
         hitl_dispatcher,
         resources.conversation_store,
         app_config.clone(),
         resources.mcp_config_runtime,
     )
+    .with_active_model_id(resources.active_model_id)
     .with_review_integration(resources.review_integration)
     .with_plugin_runtime(Some(resources.plugin_runtime))
     .with_config_watcher(Some(resources.config_watcher))
@@ -163,6 +167,8 @@ pub async fn start_headless_services(
 #[allow(clippy::too_many_arguments)] // startup adapter wires the shared agent, pool, stores, and UI services once
 pub async fn run_cli_mode(
     agent: AgentHandle,
+    model_consumers: echo_agent_app_core::infra::AgentModelConsumers,
+    active_model_id: String,
     hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
     args: &Args,
     app_config: &AppConfig,
@@ -187,6 +193,8 @@ pub async fn run_cli_mode(
         hitl_dispatcher,
         app_config,
         HeadlessServiceResources {
+            model_consumers,
+            active_model_id,
             pool: pool.clone(),
             task_runtime_store: task_runtime_store.clone(),
             webhook_emitter: webhook_emitter.clone(),
@@ -261,10 +269,22 @@ pub async fn run_cli_mode(
         tracing::warn!(%error, "failed to bind plugin monitors to CLI scheduler");
     }
 
+    let dreaming_task = review_integration.as_ref().map(|integration| {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task = echo_agent_app_core::infra::spawn_dreaming_task(
+            integration.clone(),
+            agent.clone(),
+            Some(pool.clone()),
+            cancel.clone(),
+        );
+        tracing::info!("Dreaming task spawned for CLI session");
+        (cancel, task)
+    });
+
     let mut repl_config = repl_config_for(args);
     repl_config.task_service = task_service;
     repl_config.scheduler_runner = scheduler_runner;
-    repl_config.review_integration = review_integration;
+    repl_config.review_integration = review_integration.clone();
     repl_config.prompt_assembly = Some(prompt_assembly);
     repl_config.pool = Some(pool.clone());
     repl_config.task_runtime_store = task_runtime_store.clone();
@@ -273,6 +293,10 @@ pub async fn run_cli_mode(
     repl_config.plugin_runtime = Some(plugin_runtime.clone());
     repl_config.app_state = Some(app_state.clone());
 
+    let auto_memory_agent = agent.clone();
+    let auto_memory_integration = review_integration.clone();
+    let session_review_integration = review_integration.clone();
+    let background_review_integration = review_integration.clone();
     let repl_result = crate::cli::run_repl(agent, repl_config).await;
     let mut steps = Vec::new();
     if let Some(companion) = companion_shutdown.take() {
@@ -294,9 +318,41 @@ pub async fn run_cli_mode(
             }),
         },
         CliShutdownStep {
-            name: "memory review",
+            name: "model mutations",
             future: Box::pin(async {
-                if let Some(integration) = app_state.review_integration.as_ref() {
+                app_state
+                    .shutdown_model_mutations()
+                    .await
+                    .map_err(anyhow::Error::from)
+            }),
+        },
+        CliShutdownStep {
+            name: "Dreaming",
+            future: Box::pin(async move {
+                if let Some((cancel, task)) = dreaming_task {
+                    cancel.cancel();
+                    task.await
+                        .map_err(|error| anyhow::anyhow!("Dreaming task failed: {error}"))?;
+                }
+                Ok(())
+            }),
+        },
+        CliShutdownStep {
+            name: "auto-memory",
+            future: Box::pin(async move {
+                crate::cli::repl::run_auto_memory_on_exit(
+                    &auto_memory_agent,
+                    &auto_memory_integration,
+                )
+                .await;
+                Ok(())
+            }),
+        },
+        CliShutdownStep {
+            name: "memory review",
+            future: Box::pin(async move {
+                crate::cli::repl::run_memory_review_on_exit(&session_review_integration).await;
+                if let Some(integration) = background_review_integration.as_ref() {
                     integration
                         .shutdown_background_reviews()
                         .await
@@ -518,6 +574,8 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let steps = vec![
             recorded_shutdown_step(Arc::clone(&calls), "foreground", true),
+            recorded_shutdown_step(Arc::clone(&calls), "model", false),
+            recorded_shutdown_step(Arc::clone(&calls), "Dreaming", false),
             recorded_shutdown_step(Arc::clone(&calls), "memory", false),
             recorded_shutdown_step(Arc::clone(&calls), "workspace", true),
             recorded_shutdown_step(Arc::clone(&calls), "scheduler", false),
@@ -539,6 +597,8 @@ mod tests {
             observed,
             [
                 "foreground",
+                "model",
+                "Dreaming",
                 "memory",
                 "workspace",
                 "scheduler",

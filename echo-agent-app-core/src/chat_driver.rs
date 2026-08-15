@@ -1283,8 +1283,10 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         let pooled_agent = foreground_execution.agent();
+        let pooled_llm = llm.clone();
         pooled_agent
-            .write(|agent| {
+            .write(move |agent| {
+                agent.set_llm_client(pooled_llm);
                 agent.register_subagent_with_definition(
                     SubagentDefinition::new("explorer", "Inspect pooled runtime evidence"),
                     Box::new(

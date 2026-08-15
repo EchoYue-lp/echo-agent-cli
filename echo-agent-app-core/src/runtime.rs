@@ -34,8 +34,16 @@ use echo_agent::intent::{
 /// Created once at application startup and lives for the entire process lifetime.
 pub struct AgentRuntime {
     pub agent_handle: AgentHandle,
+    pub model_consumers: crate::infra::AgentModelConsumers,
     pub hitl_dispatcher: Arc<HitlDispatcher>,
     pub app_config: AppConfig,
+    /// Exact model generation selected for this process. This may differ from
+    /// the durable default when startup used `--model`.
+    pub active_runtime_model: crate::model_config::ModelRuntimeConfig,
+    /// Non-persistent session view used when creating future pooled agents.
+    /// A CLI/TUI `--model` selector updates this view without changing the
+    /// durable application default consumed by configuration mutations.
+    pub session_app_config: AppConfig,
     pub keyword_classifier: KeywordClassifier,
     /// Shared `RuntimeStateStore` produced during bootstrap. Surfaced on the
     /// runtime so `init_pool` (and any future product paths) can inject the
@@ -129,6 +137,11 @@ impl AgentRuntime {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut agent = created.agent;
         let prompt_assembly = created.prompt_assembly;
+        let model_consumers = created.model_consumers;
+        let active_runtime_model = created.runtime_model;
+        let session_app_config =
+            crate::model_config::session_config_for_runtime(app_config, &active_runtime_model)
+                .map_err(anyhow::Error::msg)?;
 
         // ── 2. Connect the same snapshot exposed to application state. ──
         tracing::info!(path = %mcp_config_path.display(), "Canonical MCP config selected");
@@ -394,8 +407,11 @@ impl AgentRuntime {
 
         Ok(Self {
             agent_handle,
+            model_consumers,
             hitl_dispatcher,
             app_config: app_config.clone(),
+            active_runtime_model,
+            session_app_config,
             keyword_classifier,
             state_store,
             review_integration,
@@ -415,11 +431,13 @@ impl AgentRuntime {
     ) -> AppState {
         let state = AppState::from_shared(
             self.agent_handle.clone(),
+            Some(self.model_consumers.clone()),
             self.hitl_dispatcher.clone(),
             conversation_store,
             self.app_config.clone(),
             self.mcp_config_runtime.clone(),
         )
+        .with_active_model_id(self.active_runtime_model.id.clone())
         .with_review_integration(self.review_integration.clone())
         .with_prompt_assembly(self.prompt_assembly.clone())
         .with_plugin_runtime(Some(self.plugin_runtime.clone()));

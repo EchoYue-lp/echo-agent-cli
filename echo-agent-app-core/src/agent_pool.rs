@@ -9,7 +9,7 @@
 //! ```text
 //! AgentPool
 //! ├── SharedResources (Arc-shared across all pool agents)
-//! │   ├── LlmClient, ToolManager, HookRegistry, SandboxManager
+//! │   ├── ToolManager, HookRegistry, SandboxManager
 //! │   ├── Store, ConversationStore, RunStore, RuntimeStateStore
 //! │   └── TokenUsageTracker, PermissionService, ToolExecutionPipeline, ReviewIntegration
 //! │
@@ -38,7 +38,6 @@ use std::time::{Duration, Instant};
 
 use echo_agent::agent::AgentHandle;
 use echo_agent::agent::CancellationToken;
-use echo_agent::llm::LlmClient;
 use tokio::sync::{Notify, RwLock};
 
 use crate::infra;
@@ -112,7 +111,6 @@ impl std::error::Error for PoolError {}
 /// Resources extracted from the primary agent that can be shared across
 /// multiple pool agents. All fields are `Arc`-wrapped for thread-safe sharing.
 pub struct SharedResources {
-    pub llm_client: Option<Arc<dyn LlmClient>>,
     pub tool_manager: Option<Arc<echo_agent::tools::ToolManager>>,
     pub hook_registry: Option<Arc<tokio::sync::RwLock<echo_agent::skills::hooks::HookRegistry>>>,
     pub sandbox_manager: Option<Arc<echo_agent::sandbox::SandboxManager>>,
@@ -143,7 +141,6 @@ impl SharedResources {
     ) -> Self {
         agent
             .read(|a| {
-                let llm_client = a.llm_client().cloned();
                 let tool_manager = Some(a.tool_manager().clone());
                 let hook_registry = Some(a.hook_registry().clone());
                 let sandbox_manager = a.sandbox_manager().cloned();
@@ -156,7 +153,6 @@ impl SharedResources {
                 let permission_service = a.permission_service().cloned();
 
                 SharedResources {
-                    llm_client,
                     tool_manager,
                     hook_registry,
                     sandbox_manager,
@@ -183,6 +179,7 @@ impl SharedResources {
 /// Internal wrapper around a pooled agent with metadata.
 struct PooledAgent {
     handle: AgentHandle,
+    model_consumers: infra::AgentModelConsumers,
     _conversation_id: String,
     created_at: Instant,
     last_used: Instant,
@@ -328,10 +325,15 @@ impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for OwnedRunPo
 }
 
 impl PooledAgent {
-    fn new(handle: AgentHandle, conversation_id: String) -> Self {
+    fn new(
+        handle: AgentHandle,
+        model_consumers: infra::AgentModelConsumers,
+        conversation_id: String,
+    ) -> Self {
         let now = Instant::now();
         Self {
             handle,
+            model_consumers,
             _conversation_id: conversation_id,
             created_at: now,
             last_used: now,
@@ -354,7 +356,6 @@ pub struct AgentPool {
     app_config: RwLock<AppConfig>,
     /// Working directory applied to existing and future pooled agents.
     working_dir: RwLock<Option<std::path::PathBuf>>,
-    runtime_llm_config: RwLock<Option<echo_agent::llm::LlmConfig>>,
     permission_mode: RwLock<String>,
     /// Skill descriptors extracted from the primary agent.
     /// Pool agents register these instead of re-reading from disk.
@@ -381,6 +382,43 @@ pub struct AgentPool {
 pub(crate) struct AgentPoolWorkspaceTransition<'a> {
     pool: &'a AgentPool,
     committed: bool,
+}
+
+/// Exact pool-wide receipt prepared before config persistence.
+///
+/// The agents write guard prevents eviction or creation while every existing
+/// agent generation is admitted. Dropping this value rolls back all prepared
+/// context receipts without touching live or future pool state.
+pub(crate) struct PreparedAgentPoolModelPublication<'a> {
+    pool: &'a AgentPool,
+    _transition: AgentPoolWorkspaceTransition<'a>,
+    _agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
+    publications: Vec<infra::PreparedAgentModelPublication>,
+    app_config: AppConfig,
+    runtime: ModelRuntimeConfig,
+}
+
+impl PreparedAgentPoolModelPublication<'_> {
+    pub(crate) async fn commit(self) {
+        let Self {
+            pool,
+            _transition,
+            _agents,
+            publications,
+            app_config,
+            runtime,
+        } = self;
+        for publication in publications {
+            publication.commit().await;
+        }
+        *pool.app_config.write().await = app_config;
+        tracing::info!(
+            provider = %runtime.provider,
+            model = %runtime.model,
+            pooled_agents = _agents.len(),
+            "AgentPool: prepared runtime generation committed"
+        );
+    }
 }
 
 impl AgentPoolWorkspaceTransition<'_> {
@@ -454,9 +492,8 @@ impl AgentPool {
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(AgentPoolAdmission::default()),
             config,
-            app_config: RwLock::new(runtime.app_config.clone()),
+            app_config: RwLock::new(runtime.session_app_config.clone()),
             working_dir: RwLock::new(working_dir),
-            runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(skill_descriptors),
             cleanup_cancel: CancellationToken::new(),
@@ -470,12 +507,9 @@ impl AgentPool {
         // Pre-create background agent if enabled
         if pool.config.enable_background_agent {
             match pool.create_agent("__background__").await {
-                Ok(handle) => {
+                Ok(pooled) => {
                     let mut agents = pool.agents.write().await;
-                    agents.insert(
-                        "__background__".to_string(),
-                        PooledAgent::new(handle, "__background__".to_string()),
-                    );
+                    agents.insert("__background__".to_string(), pooled);
                     tracing::info!("AgentPool: background agent created");
                 }
                 Err(e) => {
@@ -488,6 +522,14 @@ impl AgentPool {
     }
 
     #[cfg(test)]
+    pub(crate) async fn for_model_mutation_test(
+        primary: &AgentHandle,
+        app_config: AppConfig,
+    ) -> Self {
+        Self::new_for_test_with_config(primary, None, None, 8, false, app_config).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn new_for_test(
         agent: AgentHandle,
         review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
@@ -495,13 +537,34 @@ impl AgentPool {
         max_agents: usize,
         enable_background_agent: bool,
     ) -> Self {
-        let mut shared = SharedResources::extract_from(&agent, review_integration).await;
-        if let Some(store) = store {
-            shared.store = Some(store);
-        }
         let mut app_config = AppConfig::default();
         app_config.model.provider = "test".to_string();
         app_config.model.name = "test-model".to_string();
+        app_config.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());
+        Self::new_for_test_with_config(
+            &agent,
+            review_integration,
+            store,
+            max_agents,
+            enable_background_agent,
+            app_config,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn new_for_test_with_config(
+        agent: &AgentHandle,
+        review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+        store: Option<Arc<dyn echo_agent::memory::Store>>,
+        max_agents: usize,
+        enable_background_agent: bool,
+        app_config: AppConfig,
+    ) -> Self {
+        let mut shared = SharedResources::extract_from(agent, review_integration).await;
+        if let Some(store) = store {
+            shared.store = Some(store);
+        }
         Self {
             shared,
             agents: RwLock::new(HashMap::new()),
@@ -515,7 +578,6 @@ impl AgentPool {
             },
             app_config: RwLock::new(app_config),
             working_dir: RwLock::new(None),
-            runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(Vec::new()),
             cleanup_cancel: CancellationToken::new(),
@@ -606,15 +668,13 @@ impl AgentPool {
         }
 
         // Create new agent (lock is held — prevents concurrent insert races)
-        let handle = self
+        let pooled = self
             .create_agent(conversation_id)
             .await
             .map_err(|e| PoolError::AgentCreation(e.to_string()))?;
+        let handle = pooled.handle.clone();
 
-        agents.insert(
-            conversation_id.to_string(),
-            PooledAgent::new(handle.clone(), conversation_id.to_string()),
-        );
+        agents.insert(conversation_id.to_string(), pooled);
 
         tracing::info!(
             conv_id = %conversation_id,
@@ -688,78 +748,46 @@ impl AgentPool {
 
     /// Update the pool's app config snapshot used for future agents.
     pub async fn update_app_config(&self, app_config: AppConfig) {
+        let _agents = self.agents.write().await;
         *self.app_config.write().await = app_config;
     }
 
-    /// Apply a runtime model to all existing pooled agents and remember it for
-    /// future agents. This prevents pooled GUI conversations from continuing to
-    /// use stale env-derived credentials after the user saves a GUI API key.
-    pub async fn apply_runtime_model(&self, runtime: ModelRuntimeConfig) {
-        let llm_config = runtime.auth_token.as_ref().map(|token| {
-            infra::build_llm_config(
-                &runtime.provider,
-                token,
-                &runtime.model,
-                runtime.base_url.as_deref(),
-            )
-        });
-        *self.runtime_llm_config.write().await = llm_config.clone();
-
-        let agents: Vec<AgentHandle> = self
-            .agents
-            .read()
+    /// Admit every existing and future pool consumer before persistence.
+    pub(crate) async fn prepare_model_publication(
+        &self,
+        app_config: AppConfig,
+        runtime: ModelRuntimeConfig,
+        prepared: infra::PreparedRuntimeLlm,
+    ) -> Result<PreparedAgentPoolModelPublication<'_>, String> {
+        let transition = self
+            .preflight_model_mutation()
             .await
-            .values()
-            .map(|pa| pa.handle.clone())
-            .collect();
-        for handle in agents {
-            let runtime = runtime.clone();
-            let llm_config = llm_config.clone();
-            handle
-                .write_async(|agent| {
-                    Box::pin(async move {
-                        if let Some(config) = llm_config {
-                            agent.set_llm_config(config);
-                        } else {
-                            agent.set_model(&runtime.model);
-                        }
-                        agent.set_temperature(runtime.temperature);
-                        agent.set_max_tokens(runtime.max_tokens);
-                        // Apply context_window as token_limit when set.
-                        if let Some(cw) = runtime.context_window
-                            && let Err(error) = agent.set_token_limit(cw as usize)
-                        {
-                            tracing::error!(
-                                error = %error,
-                                "AgentPool: failed to apply model context window"
-                            );
-                        }
-                        match runtime.thinking.as_deref() {
-                            Some(spec) if !spec.trim().is_empty() => {
-                                match echo_agent::llm::ThinkingConfig::parse_spec(spec) {
-                                    Ok(config) => agent.set_thinking(config),
-                                    Err(error) => tracing::warn!(
-                                        thinking_spec = spec,
-                                        error = %error,
-                                        "AgentPool: ignoring invalid thinking configuration"
-                                    ),
-                                }
-                            }
-                            _ => agent.set_thinking(None),
-                        }
-                    })
-                })
-                .await;
+            .map_err(|error| error.to_string())?;
+        let agents = self.agents.write().await;
+        let token_limit = infra::effective_token_limit(&app_config, &runtime);
+        let mut publications = Vec::with_capacity(agents.len());
+        let mut pooled_agents: Vec<(&String, &PooledAgent)> = agents.iter().collect();
+        pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
+        for (_, pooled) in pooled_agents {
+            publications.push(
+                infra::prepare_agent_model_publication(
+                    &pooled.handle,
+                    pooled.model_consumers.clone(),
+                    &runtime,
+                    &prepared,
+                    token_limit,
+                )
+                .await?,
+            );
         }
-
-        let pooled_agents = self.agents.read().await.len();
-        tracing::info!(
-            provider = %runtime.provider,
-            model = %runtime.model,
-            auth_source = %runtime.auth_source,
-            pooled_agents = pooled_agents,
-            "AgentPool: runtime model applied"
-        );
+        Ok(PreparedAgentPoolModelPublication {
+            pool: self,
+            _transition: transition,
+            _agents: agents,
+            publications,
+            app_config,
+            runtime,
+        })
     }
 
     /// Apply the current permission mode to all existing pooled agents and
@@ -1233,6 +1261,20 @@ impl AgentPool {
         Ok(transition)
     }
 
+    /// Reuse the pool's existing generation admission boundary for an active
+    /// model publication. Dropping the returned guard reopens admission
+    /// without clearing cached agents.
+    pub(crate) async fn preflight_model_mutation(
+        &self,
+    ) -> anyhow::Result<AgentPoolWorkspaceTransition<'_>> {
+        self.preflight_workspace_transition().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transition_admission_closed_for_test(&self) -> bool {
+        self.workspace_transitioning.load(Ordering::Acquire)
+    }
+
     /// Internal: create a new agent with shared resources injected.
     ///
     /// `conversation_id` is used both as the pool key and as the
@@ -1240,7 +1282,7 @@ impl AgentPool {
     /// `save_runtime_checkpoint` and `ConversationStore` projection. We also
     /// keep it as `session_id` so existing `session_id`-keyed paths (e.g.
     /// background tasks) continue to work.
-    async fn create_agent(&self, conversation_id: &str) -> anyhow::Result<AgentHandle> {
+    async fn create_agent(&self, conversation_id: &str) -> anyhow::Result<PooledAgent> {
         // 1. Create a base agent — pass conversation_id + state_store at build
         //    time so the agent boots with everything the framework's checkpoint
         //    helpers need. (Previously the pool called `set_state_store` here,
@@ -1266,38 +1308,16 @@ impl AgentPool {
             task_runtime_store: self.shared.task_runtime_store.clone(),
             browser_runtime: self.shared.browser_runtime.clone(),
         };
-        let mut agent = infra::create_agent(&params, &app_config)
+        let created = infra::create_agent_with_diagnostics(&params, &app_config)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut agent = created.agent;
+        let model_consumers = created.model_consumers;
         agent.set_tool_output_artifacts(Some(self.tool_output_artifacts.read().await.clone()));
 
-        // 2. Inject shared resources (replace independently-created ones)
-        if let Some(ref llm) = self.shared.llm_client {
-            agent.set_llm_client(llm.clone());
-        }
-        if let Some(llm_config) = self.runtime_llm_config.read().await.clone() {
-            // Translate the optional thinking spec (e.g. "high", "4000",
-            // "disabled") into a ThinkingConfig and inject it so every chat
-            // request the agent makes carries the configured reasoning depth.
-            // Unparseable specs are logged and dropped (config typos shouldn't
-            // wedge the agent). "auto"/empty → None (model default).
-            if let Some(spec) = llm_config.thinking.as_deref()
-                && !spec.trim().is_empty()
-            {
-                match echo_agent::llm::ThinkingConfig::parse_spec(spec) {
-                    Ok(Some(cfg)) => agent.set_thinking(Some(cfg)),
-                    Ok(None) => agent.set_thinking(None),
-                    Err(e) => {
-                        tracing::warn!(
-                            thinking_spec = spec,
-                            error = %e,
-                            "ignoring unparseable thinking config; using model default"
-                        );
-                    }
-                }
-            }
-            agent.set_llm_config(llm_config);
-        }
+        // 2. Inject non-model shared resources. The model transport produced by
+        // create_agent_with_diagnostics is authoritative and must not be
+        // overwritten by the primary agent's startup client.
         if let Some(ref tm) = self.shared.tool_manager {
             agent.set_tool_manager(tm.clone());
         }
@@ -1399,7 +1419,11 @@ impl AgentPool {
                 .await;
         }
 
-        Ok(handle)
+        Ok(PooledAgent::new(
+            handle,
+            model_consumers,
+            conversation_id.to_string(),
+        ))
     }
 }
 
@@ -1497,11 +1521,18 @@ mod tests {
         assert!(err.to_string().contains("3"));
     }
 
-    #[test]
-    fn test_pooled_agent_timestamps() -> TestResult {
-        // Verify PooledAgent records creation time
-        let mock_handle = create_test_agent_handle()?;
-        let pa = PooledAgent::new(mock_handle, "test-conv".to_string());
+    #[tokio::test]
+    async fn test_pooled_agent_timestamps() -> TestResult {
+        let pool = create_test_pool(2, false).await?;
+        let lease = pool
+            .acquire("test-conv")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(lease);
+        let agents = pool.agents.read().await;
+        let pa = agents
+            .get("test-conv")
+            .ok_or_else(|| "pooled agent was not retained".to_string())?;
         assert!(pa.created_at.elapsed().as_millis() < 100);
         assert!(pa.last_used.elapsed().as_millis() < 100);
         Ok(())
@@ -1681,8 +1712,6 @@ mod tests {
         let handle = AgentHandle::new(agent);
         let shared = SharedResources::extract_from(&handle, None).await;
 
-        // LlmClient should be extracted
-        assert!(shared.llm_client.is_some());
         // ToolManager should be extracted
         assert!(shared.tool_manager.is_some());
         // HookRegistry should be extracted
@@ -1761,6 +1790,110 @@ mod tests {
             store.clone(),
         ));
         Ok(AgentPool::new_for_test(handle, Some(review_integration), Some(store), 3, false).await)
+    }
+
+    #[tokio::test]
+    async fn future_agent_uses_committed_local_config_without_api_key() -> TestResult {
+        let pool = create_test_pool(4, false).await?;
+        let runtime = ModelRuntimeConfig {
+            id: "local:model".to_string(),
+            display_name: "Local model".to_string(),
+            provider: "local".to_string(),
+            model: "model".to_string(),
+            api_protocol: echo_agent::llm::LlmApiProtocol::ChatCompletions,
+            api_protocol_explicit: false,
+            auth_token: None,
+            auth_source: "none".to_string(),
+            base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            temperature: None,
+            max_tokens: None,
+            context_window: None,
+            thinking: None,
+        };
+
+        let prepared = infra::prepare_runtime_llm(&runtime)?;
+        let mut candidate = pool.app_config.read().await.clone();
+        candidate.model.provider = runtime.provider.clone();
+        candidate.model.name = runtime.model.clone();
+        candidate.model.auth_token = runtime.auth_token.clone();
+        candidate.model.base_url = runtime.base_url.clone();
+        candidate.model.api_protocol = Some(runtime.api_protocol);
+        pool.prepare_model_publication(candidate, runtime, prepared)
+            .await?
+            .commit()
+            .await;
+        let lease = pool
+            .acquire("future-local")
+            .await
+            .map_err(|error| error.to_string())?;
+        let handle = lease.agent();
+        let applied = handle
+            .read(|agent| agent.llm_config().cloned())
+            .await
+            .ok_or_else(|| "future agent has no LLM config".to_string())?;
+        assert!(applied.api_key.is_empty());
+        assert_eq!(
+            applied.base_url,
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn future_pool_agent_uses_the_session_model_selection() -> TestResult {
+        use echo_agent::agent::Agent;
+
+        let agent = create_test_agent_handle()?;
+        let mut config = AppConfig {
+            configured_models: vec![
+                echo_agent::config::ConfiguredModel {
+                    id: "local:a".to_string(),
+                    display_name: "A".to_string(),
+                    provider: "local".to_string(),
+                    model: "a".to_string(),
+                    context_window: Some(100_000),
+                    ..echo_agent::config::ConfiguredModel::default()
+                },
+                echo_agent::config::ConfiguredModel {
+                    id: "local:b".to_string(),
+                    display_name: "B".to_string(),
+                    provider: "local".to_string(),
+                    model: "b".to_string(),
+                    context_window: Some(200_000),
+                    ..echo_agent::config::ConfiguredModel::default()
+                },
+            ],
+            ..AppConfig::default()
+        };
+        config.model.default_model_id = Some("local:a".to_string());
+        config.model_providers.insert(
+            "local".to_string(),
+            echo_agent::config::ModelProviderConfig {
+                auth_token: None,
+                base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            },
+        );
+        let selected = crate::model_config::resolve_runtime_model(&config, Some("local:b"));
+        let session = crate::model_config::session_config_for_runtime(&config, &selected)?;
+        let pool = AgentPool::new_for_test_with_config(&agent, None, None, 3, false, session).await;
+
+        let lease = pool
+            .acquire("future-session-selection")
+            .await
+            .map_err(|error| error.to_string())?;
+        let handle = lease.agent();
+        let (model, token_limit) = handle
+            .read(|pooled| {
+                (
+                    pooled.model_name().to_string(),
+                    pooled.config().get_token_limit(),
+                )
+            })
+            .await;
+
+        assert_eq!(model, "b");
+        assert_eq!(token_limit, 200_000);
+        Ok(())
     }
 
     #[tokio::test]

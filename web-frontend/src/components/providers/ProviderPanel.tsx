@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useState } from 'react';
 import { providerApi } from '../../api/endpoints';
-import type { ConfiguredModel, ProviderTemplate } from '../../types/api';
+import { errorMessage } from '../../lib/tauri-bridge';
+import type { ConfiguredModel, LlmApiProtocol, ProviderTemplate } from '../../generated';
 import { Card } from '../common/Card';
 
 const MODELS_CHANGED_EVENT = 'eko:models-changed';
+const API_PROTOCOLS = [
+  ['chat_completions', 'Chat Completions'],
+  ['responses', 'Responses'],
+  ['anthropic', 'Anthropic'],
+] as const;
 
 function notifyModelsChanged() {
   window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
@@ -17,6 +23,7 @@ export function ProviderPanel() {
   const [apiKey, setApiKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
   const [selectedModel, setSelectedModel] = useState('');
+  const [apiProtocol, setApiProtocol] = useState<LlmApiProtocol | undefined>(undefined);
   const [customModel, setCustomModel] = useState('');
   const [temperature, setTemperature] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
@@ -56,6 +63,7 @@ export function ProviderPanel() {
           setSelectedId(firstProvider.id);
           setSelectedModel((firstProvider.default_models ?? [])[0] ?? '');
           setBaseUrl(firstProvider.base_url);
+          setApiProtocol(undefined);
         }
         setLoading(false);
       })
@@ -89,6 +97,7 @@ export function ProviderPanel() {
     setSelectedModel((p.default_models ?? [])[0] ?? '');
     setCustomModel('');
     setBaseUrl(p.base_url);
+    setApiProtocol(undefined);
     setApiKey('');
     setTemperature('');
     setMaxTokens('');
@@ -107,6 +116,7 @@ export function ProviderPanel() {
       const res = await providerApi.test({
         provider: selected.id,
         model,
+        api_protocol: apiProtocol,
         api_key: apiKey || undefined,
         base_url: baseUrl && baseUrl !== selected.base_url ? baseUrl : undefined,
       });
@@ -116,8 +126,8 @@ export function ProviderPanel() {
           ? `连接成功！模型: ${res.model}，使用: ${authSourceLabel(res.auth_source)}，响应: ${res.response?.slice(0, 100)}`
           : `连接失败: ${res.error}（使用: ${authSourceLabel(res.auth_source)}）`,
       });
-    } catch (e: any) {
-      setTestResult({ success: false, message: `请求失败: ${e.message}` });
+    } catch (error: unknown) {
+      setTestResult({ success: false, message: `请求失败: ${errorMessage(error)}` });
     } finally {
       setTesting(false);
     }
@@ -136,6 +146,7 @@ export function ProviderPanel() {
       const res = await providerApi.upsertConfigured({
         model,
         provider: selected.id,
+        api_protocol: apiProtocol,
         api_key: hasCustomApiKey ? trimmedApiKey : undefined,
         base_url: hasCustomBaseUrl || isCustom ? trimmedBaseUrl : undefined,
         temperature: temperature ? Number(temperature) : undefined,
@@ -151,8 +162,8 @@ export function ProviderPanel() {
         await loadConfiguredModels();
         notifyModelsChanged();
       }
-    } catch (e: any) {
-      setSwitchResult({ success: false, message: `切换失败: ${e.message}` });
+    } catch (error: unknown) {
+      setSwitchResult({ success: false, message: `切换失败: ${errorMessage(error)}` });
     } finally {
       setSwitching(false);
     }
@@ -160,11 +171,18 @@ export function ProviderPanel() {
 
   const handleSetDefault = async (model: ConfiguredModel) => {
     setModelActionId(model.id);
+    setSwitchResult(null);
     try {
       const res = await providerApi.setDefault(model.id);
       setCurrentModel(res.display_name || res.model);
       await loadConfiguredModels();
       notifyModelsChanged();
+      setSwitchResult({
+        success: true,
+        message: `已将 ${res.display_name || res.model} 设为默认模型`,
+      });
+    } catch (error: unknown) {
+      setSwitchResult({ success: false, message: `切换失败: ${errorMessage(error)}` });
     } finally {
       setModelActionId(null);
     }
@@ -172,10 +190,14 @@ export function ProviderPanel() {
 
   const handleDeleteModel = async (model: ConfiguredModel) => {
     setModelActionId(model.id);
+    setSwitchResult(null);
     try {
       await providerApi.deleteConfigured(model.id);
       await loadConfiguredModels();
       notifyModelsChanged();
+      setSwitchResult({ success: true, message: `已删除 ${model.display_name || model.model}` });
+    } catch (error: unknown) {
+      setSwitchResult({ success: false, message: `删除失败: ${errorMessage(error)}` });
     } finally {
       setModelActionId(null);
     }
@@ -217,6 +239,13 @@ export function ProviderPanel() {
                   </div>
                   <div className="truncate text-[10px] text-[var(--text-tertiary)]">
                     {model.provider}
+                    <span className="ml-2">
+                      {model.api_protocol === 'responses'
+                        ? 'Responses'
+                        : model.api_protocol === 'anthropic'
+                          ? 'Anthropic Messages'
+                          : 'Chat Completions'}
+                    </span>
                     {model.is_default && <span className="ml-2 text-[var(--accent)]">默认</span>}
                   </div>
                 </div>
@@ -309,7 +338,7 @@ export function ProviderPanel() {
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={
                   isCustom
-                    ? '输入 API Key'
+                    ? '可选，本地端点通常无需 API Key'
                     : providerHasModels(selected.id)
                       ? '已配置 (留空使用已保存配置或环境变量)'
                       : '输入 API Key'
@@ -317,10 +346,44 @@ export function ProviderPanel() {
                 className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
               />
               <p className="mt-1 text-[10px] text-[var(--text-tertiary)]">
-                留空时会使用已保存配置，其次使用环境变量。重新输入并保存会覆盖已保存的 API Key。
+                留空时会使用已保存配置，其次使用环境变量；本地/自定义端点也可以不使用 API Key。
               </p>
             </div>
           )}
+
+          {/* API protocol */}
+          <fieldset>
+            <legend className="mb-1 block text-xs text-[var(--text-secondary)]">API 协议</legend>
+            <div className="grid w-full grid-cols-2 rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] p-0.5">
+              <button
+                type="button"
+                aria-pressed={apiProtocol === undefined}
+                onClick={() => setApiProtocol(undefined)}
+                className={`min-w-0 rounded px-3 py-1.5 text-xs transition-colors ${
+                  apiProtocol === undefined
+                    ? 'bg-[var(--accent)] text-white'
+                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+                }`}
+              >
+                Auto
+              </button>
+              {API_PROTOCOLS.map(([value, label]) => (
+                <button
+                  key={value}
+                  type="button"
+                  aria-pressed={apiProtocol === value}
+                  onClick={() => setApiProtocol(value)}
+                  className={`min-w-0 rounded px-3 py-1.5 text-xs transition-colors ${
+                    apiProtocol === value
+                      ? 'bg-[var(--accent)] text-white'
+                      : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
 
           {/* Base URL */}
           <div>
@@ -334,7 +397,9 @@ export function ProviderPanel() {
               type="text"
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder={isCustom ? 'https://api.example.com/v1' : selected.base_url}
+              placeholder={
+                isCustom ? 'https://api.example.com/v1/chat/completions' : selected.base_url
+              }
               className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
             />
           </div>
@@ -509,10 +574,7 @@ export function ProviderPanel() {
               onClick={handleTest}
               disabled={
                 testing ||
-                (isCustom &&
-                  (!apiKey.trim() ||
-                    !baseUrl.trim() ||
-                    !(customModel.trim() || selectedModel.trim())))
+                (isCustom && (!baseUrl.trim() || !(customModel.trim() || selectedModel.trim())))
               }
               className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-40"
             >
@@ -522,10 +584,7 @@ export function ProviderPanel() {
               onClick={handleSwitch}
               disabled={
                 switching ||
-                (isCustom &&
-                  (!apiKey.trim() ||
-                    !baseUrl.trim() ||
-                    !(customModel.trim() || selectedModel.trim())))
+                (isCustom && (!baseUrl.trim() || !(customModel.trim() || selectedModel.trim())))
               }
               className="rounded-lg bg-[var(--accent)] px-4 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
             >

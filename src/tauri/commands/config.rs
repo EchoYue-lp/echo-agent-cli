@@ -20,6 +20,7 @@ fn configured_model_names(cfg: &echo_agent::config::AppConfig) -> Vec<String> {
 
 fn full_config_response(cfg: &echo_agent::config::AppConfig) -> FullConfigResponse {
     let runtime = model_config::resolve_runtime_model(cfg, cfg.model.default_model_id.as_deref());
+    let token_limit = echo_agent_app_core::infra::effective_token_limit(cfg, &runtime);
     let available_models = configured_model_names(cfg);
     FullConfigResponse {
         model: ModelConfigResponse {
@@ -34,7 +35,7 @@ fn full_config_response(cfg: &echo_agent::config::AppConfig) -> FullConfigRespon
             model: runtime.model,
             system_prompt: cfg.agent.system_prompt.clone(),
             max_iterations: cfg.agent.max_iterations,
-            token_limit: runtime.max_tokens.unwrap_or(8000) as usize,
+            token_limit,
             enable_memory: cfg.agent.enable_memory,
             enable_human_loop: cfg.agent.enable_human_in_loop,
             session_id: None,
@@ -165,127 +166,120 @@ pub async fn update_full_config(
     state: tauri::State<'_, TauriState>,
     req: UpdateFullConfigRequest,
 ) -> Result<FullConfigResponse, IpcError> {
-    {
-        let mut cfg = state.app_state.config.app_config.write().await;
-        let original = cfg.clone();
+    let reapply_active_model = req.model.is_some();
+    let config = state
+        .app_state
+        .update_app_config_owned(reapply_active_model, move |cfg| {
+            if let Some(m) = req.model {
+                cfg.model.max_tokens = m.max_tokens.or(cfg.model.max_tokens);
+                cfg.model.temperature = m.temperature.or(cfg.model.temperature);
+                let max_tokens = cfg.model.max_tokens;
+                let temperature = cfg.model.temperature;
+                if let Some(default_id) = cfg.model.default_model_id.clone()
+                    && let Some(default_model) = cfg
+                        .configured_models
+                        .iter_mut()
+                        .find(|model| model.id == default_id)
+                {
+                    default_model.max_tokens = max_tokens;
+                    default_model.temperature = temperature;
+                }
+            }
 
-        if let Some(m) = req.model {
-            cfg.model.max_tokens = m.max_tokens.or(cfg.model.max_tokens);
-            cfg.model.temperature = m.temperature.or(cfg.model.temperature);
-            let max_tokens = cfg.model.max_tokens;
-            let temperature = cfg.model.temperature;
-            if let Some(default_id) = cfg.model.default_model_id.clone()
-                && let Some(default_model) = cfg
-                    .configured_models
-                    .iter_mut()
-                    .find(|model| model.id == default_id)
+            if let Some(a) = req.agent {
+                if let Some(v) = a.name {
+                    cfg.agent.name = v;
+                }
+                if let Some(v) = a.system_prompt {
+                    cfg.agent.system_prompt = v;
+                }
+                if let Some(v) = a.max_iterations {
+                    cfg.agent.max_iterations = v;
+                }
+                if let Some(v) = a.enable_tools {
+                    cfg.agent.enable_tools = v;
+                }
+                if let Some(v) = a.enable_memory {
+                    cfg.agent.enable_memory = v;
+                }
+                if let Some(v) = a.enable_human_in_loop {
+                    cfg.agent.enable_human_in_loop = v;
+                }
+                if let Some(v) = a.memory_path {
+                    cfg.agent.memory_path = v;
+                }
+            }
+
+            if let Some(m) = req.mcp {
+                cfg.mcp.config_path = m.config_path.or(cfg.mcp.config_path.clone());
+            }
+
+            if let Some(ch) = req.channels {
+                if let Some(qq) = ch.qq {
+                    if let Some(v) = qq.enabled {
+                        cfg.channels.qq.enabled = v;
+                    }
+                    if let Some(v) = qq.app_id {
+                        cfg.channels.qq.app_id = v;
+                    }
+                    if let Some(v) = qq.client_secret {
+                        cfg.channels.qq.client_secret = v;
+                    }
+                }
+                if let Some(fs) = ch.feishu {
+                    if let Some(v) = fs.enabled {
+                        cfg.channels.feishu.enabled = v;
+                    }
+                    if let Some(v) = fs.app_id {
+                        cfg.channels.feishu.app_id = v;
+                    }
+                    if let Some(v) = fs.app_secret {
+                        cfg.channels.feishu.app_secret = v;
+                    }
+                    if let Some(v) = fs.mode {
+                        cfg.channels.feishu.mode = v;
+                    }
+                }
+                if let Some(s) = ch.session {
+                    if let Some(v) = s.timeout_minutes {
+                        cfg.channels.session.timeout_minutes = v;
+                    }
+                    if let Some(v) = s.reset_keywords {
+                        cfg.channels.session.reset_keywords = v;
+                    }
+                    if let Some(v) = s.reset_commands {
+                        cfg.channels.session.reset_commands = v;
+                    }
+                }
+            }
+
+            if let Some(s) = req.server {
+                if let Some(v) = s.host {
+                    cfg.server.host = v;
+                }
+                if let Some(v) = s.port {
+                    cfg.server.port = v;
+                }
+            }
+
+            if let Some(l) = req.logging
+                && let Some(v) = l.level
             {
-                default_model.max_tokens = max_tokens;
-                default_model.temperature = temperature;
+                cfg.logging.level = v;
             }
-        }
+            Ok(())
+        })
+        .await
+        .map_err(|error| match error {
+            echo_agent_app_core::state::ModelMutationError::Validation(message) => {
+                IpcError::Validation(message)
+            }
+            other => IpcError::Internal(other.to_string()),
+        })?;
 
-        if let Some(a) = req.agent {
-            if let Some(v) = a.name {
-                cfg.agent.name = v;
-            }
-            if let Some(v) = a.system_prompt {
-                cfg.agent.system_prompt = v;
-            }
-            if let Some(v) = a.max_iterations {
-                cfg.agent.max_iterations = v;
-            }
-            if let Some(v) = a.enable_tools {
-                cfg.agent.enable_tools = v;
-            }
-            if let Some(v) = a.enable_memory {
-                cfg.agent.enable_memory = v;
-            }
-            if let Some(v) = a.enable_human_in_loop {
-                cfg.agent.enable_human_in_loop = v;
-            }
-            if let Some(v) = a.memory_path {
-                cfg.agent.memory_path = v;
-            }
-        }
-
-        if let Some(m) = req.mcp {
-            cfg.mcp.config_path = m.config_path.or(cfg.mcp.config_path.clone());
-        }
-
-        if let Some(ch) = req.channels {
-            if let Some(qq) = ch.qq {
-                if let Some(v) = qq.enabled {
-                    cfg.channels.qq.enabled = v;
-                }
-                if let Some(v) = qq.app_id {
-                    cfg.channels.qq.app_id = v;
-                }
-                if let Some(v) = qq.client_secret {
-                    cfg.channels.qq.client_secret = v;
-                }
-            }
-            if let Some(fs) = ch.feishu {
-                if let Some(v) = fs.enabled {
-                    cfg.channels.feishu.enabled = v;
-                }
-                if let Some(v) = fs.app_id {
-                    cfg.channels.feishu.app_id = v;
-                }
-                if let Some(v) = fs.app_secret {
-                    cfg.channels.feishu.app_secret = v;
-                }
-                if let Some(v) = fs.mode {
-                    cfg.channels.feishu.mode = v;
-                }
-            }
-            if let Some(s) = ch.session {
-                if let Some(v) = s.timeout_minutes {
-                    cfg.channels.session.timeout_minutes = v;
-                }
-                if let Some(v) = s.reset_keywords {
-                    cfg.channels.session.reset_keywords = v;
-                }
-                if let Some(v) = s.reset_commands {
-                    cfg.channels.session.reset_commands = v;
-                }
-            }
-        }
-
-        if let Some(s) = req.server {
-            if let Some(v) = s.host {
-                cfg.server.host = v;
-            }
-            if let Some(v) = s.port {
-                cfg.server.port = v;
-            }
-        }
-
-        if let Some(l) = req.logging
-            && let Some(v) = l.level
-        {
-            cfg.logging.level = v;
-        }
-        if let Err(error) = state.app_state.save_app_config(&cfg) {
-            *cfg = original;
-            return Err(IpcError::Internal(format!(
-                "Failed to persist config: {error}"
-            )));
-        }
-    }
-
-    // Sync model runtime settings + system_prompt to agent (await completion before responding)
-    let temperature;
-    let max_tokens;
-    let system_prompt;
-    {
-        let cfg = state.app_state.config.app_config.read().await;
-        let runtime =
-            model_config::resolve_runtime_model(&cfg, cfg.model.default_model_id.as_deref());
-        temperature = runtime.temperature;
-        max_tokens = runtime.max_tokens;
-        system_prompt = cfg.agent.system_prompt.clone();
-    }
+    // Model runtime settings were settled by the owned config mutation. The
+    // system prompt is independent of model generation publication.
+    let system_prompt = config.agent.system_prompt.clone();
     state
         .app_state
         .connection
@@ -293,17 +287,13 @@ pub async fn update_full_config(
         .write_async(|agent| {
             let system_prompt = system_prompt.clone();
             Box::pin(async move {
-                agent.set_temperature(temperature);
-                agent.set_max_tokens(max_tokens);
                 agent.set_system_prompt(system_prompt.clone()).await;
                 tracing::info!("配置已同步到 Agent");
             })
         })
         .await;
 
-    // Return updated config
-    let cfg = state.app_state.config.app_config.read().await;
-    Ok(full_config_response(&cfg))
+    Ok(full_config_response(&config))
 }
 
 #[tauri::command]

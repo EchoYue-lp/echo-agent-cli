@@ -14,11 +14,14 @@ EKO 按以下优先级查找配置文件：
 GUI 用户不需要手写 YAML。打开 **设置 → 模型供应商**：
 
 1. 选择厂商。
-2. 填写 API Key、模型名和可选 API 地址。
-3. 点击“保存并使用”。
-4. 在聊天输入框底部的“默认模型”下拉框中切换已配置模型。
+2. 填写模型名；云厂商填写 API Key，本地/自定义兼容端点可留空。
+3. “自动”协议会先识别完整 endpoint，再使用框架中的厂商默认值；provider 根地址也可以保留。显式选择协议时，必须同时填写与之匹配的完整 API endpoint。
+4. 点击“保存并使用”。
+5. 在聊天输入框底部的“默认模型”下拉框中切换已配置模型。
 
 用户填写的 API Key 优先级高于系统环境变量。CLI/TUI 会读取同一份已配置默认模型。
+CLI 的 `--model` 接受已启用的配置模型 ID 或唯一模型名称，不会把一个裸模型名套用到
+默认供应商的密钥、endpoint 和协议；未知或重名选择会直接报错。
 
 ## 完整配置文件（echo-agent.yaml）
 
@@ -26,7 +29,11 @@ GUI 用户不需要手写 YAML。打开 **设置 → 模型供应商**：
 
 ```yaml
 # ── 模型配置 ─────────────────────────────────────────────────────
-# 推荐通过 GUI 的“模型供应商”页面维护。YAML 适合自动化部署。
+# GUI、TUI 和 CLI 共享同一模型配置。
+# api_protocol 是可选 override；省略时先识别完整 endpoint，再使用框架 provider 默认值。
+# Auto 可保留 provider 根地址；完整 endpoint 会自动推断协议。
+# 显式协议要求 endpoint 以 /responses、/messages 或 /chat/completions 结尾，且两者必须匹配。
+# 本地、兼容 override 或 unknown provider 可省略 auth_token。
 model:
   default_model_id: "deepseek:deepseek-v4-flash"
   provider: "deepseek"        # 运行时镜像字段，由“模型供应商”保存默认模型时同步
@@ -58,7 +65,7 @@ agent:
   enable_human_in_loop: true  # 启用人工介入
   memory_path: "~/.echo-agent/memory"  # 记忆存储路径
   tool_timeout_ms: 120000     # 工具执行超时（毫秒）
-  token_limit: 0              # 上下文自动压缩阈值（0 = 禁用）
+  token_limit: 0              # 0 = 使用所选模型 context_window；缺失时使用 EKO 默认值
   compress_strategy: "sliding" # 压缩策略: sliding / summary / hybrid
   compress_window: 20         # 滑动窗口保留消息数
 
@@ -245,7 +252,7 @@ localhost 仍默认使用托管 Chromium。
 
 ### 模型供应商配置
 
-推荐在 GUI 中配置。需要手写 YAML 时，按下面结构添加到 `model_providers` 和 `configured_models`。
+GUI、TUI 和 CLI 使用同一份 `model_providers` 和 `configured_models`。`configured_models[].api_protocol` 是可选 override，可选值为 `responses`、`chat_completions`、`anthropic`。省略时，OpenAI 使用 Responses、Anthropic 使用 Messages，其余内置供应商使用 Chat Completions；自定义完整端点按 URL 推断。显式值始终优先。
 
 **DeepSeek：**
 ```yaml
@@ -273,7 +280,7 @@ model:
 model_providers:
   openai:
     auth_token: "your-api-key"
-    base_url: "https://api.openai.com/v1/chat/completions"
+    base_url: "https://api.openai.com/v1/responses"
 
 configured_models:
   - id: "openai:gpt-5.5"
@@ -316,6 +323,23 @@ configured_models:
     display_name: "Your Model Name"
     provider: "custom"
     model: "your-model-name"
+    enabled: true
+```
+
+若要覆盖默认协议，例如让 OpenAI 使用兼容的 Chat Completions 端点，请同时显式配置完整端点和协议：
+
+```yaml
+model_providers:
+  openai:
+    auth_token: "your-api-key"
+    base_url: "https://api.openai.com/v1/chat/completions"
+
+configured_models:
+  - id: "openai:gpt-5.5-chat"
+    display_name: "Gpt 5.5 Chat"
+    provider: "openai"
+    model: "gpt-5.5"
+    api_protocol: "chat_completions"
     enabled: true
 ```
 

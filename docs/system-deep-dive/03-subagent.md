@@ -50,7 +50,7 @@ can_delegate: false
 语义:
 
 - `readonly: true`:应用层用 readonly builder 注册,工具集物理只读。
-- `model`: `inherit`/缺省 → 父模型；`fast` → `EKO_FAST_MODEL`（未设则回退父模型）；其它字符串 → 具体 model id。
+- `model`: 缺省时随父 agent 的当前 model generation 更新；显式 `inherit` 在注册时解析为当时的父模型并保持固定；`fast` 在注册时解析 `EKO_FAST_MODEL`（未设则取当时父模型）并保持固定；其它字符串为固定 model id。
 - `max_turns`:写入 `SubagentDefinition.max_iterations` 与 subagent ReactAgent builder。
 - `is_background`:写入 `SubagentDefinition.is_background`。为 true 时（或 `agent_tool` 传 `background: true`）走框架 `dispatch_background`：立即返回 `{status:"started", execution_id, agent_name}`，Subagent 在后台跑；`DispatchStarted.background=true` 经 `execution://event` 到执行卡片，完成后由 terminal event 更新同一卡片，GUI 只补充 toast，不再插入重复 assistant summary。
 - `worktree: true`:writer role 通过框架 Fork worktree 隔离写入。

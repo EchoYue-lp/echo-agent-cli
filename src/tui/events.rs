@@ -2699,50 +2699,41 @@ async fn handle_slash_command(
                 });
             } else {
                 let requested = args.trim().to_string();
-                let runtime = app
-                    .configured_models
-                    .iter()
-                    .find(|model| model.id == requested || model.model == requested)
-                    .cloned();
-                let active_model = match runtime {
-                    Some(runtime) => {
-                        agent
-                            .write(|value| {
-                                if let Some(token) = runtime.auth_token.as_deref() {
-                                    value.set_llm_config(
-                                        echo_agent_app_core::infra::build_llm_config(
-                                            &runtime.provider,
-                                            token,
-                                            &runtime.model,
-                                            runtime.base_url.as_deref(),
-                                        ),
-                                    );
-                                } else {
-                                    value.set_model(&runtime.model);
-                                }
-                                value.set_temperature(runtime.temperature);
-                                value.set_max_tokens(runtime.max_tokens);
-                                if let Some(limit) = runtime.context_window
-                                    && let Err(error) = value.set_token_limit(limit as usize)
-                                {
-                                    tracing::error!(
-                                        error = %error,
-                                        "TUI: failed to apply model context window"
-                                    );
-                                }
-                            })
-                            .await;
-                        if let Some(pool) = &app.pool {
-                            pool.apply_runtime_model(runtime.clone()).await;
-                        }
-                        runtime.model
-                    }
-                    None => {
-                        agent.write(|value| value.set_model(&requested)).await;
-                        requested
+                let Some(app_state) = app.app_state.clone() else {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: "Model selection is unavailable in this runtime.".to_string(),
+                    });
+                    return;
+                };
+                let mutation = match app_state.set_default_model_owned(requested).await {
+                    Ok(mutation) => mutation,
+                    Err(error) => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: error.to_string(),
+                        });
+                        return;
                     }
                 };
-                app.model = active_model;
+                let Some(runtime) = mutation.runtime else {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: "Model mutation completed without an active runtime.".to_string(),
+                    });
+                    return;
+                };
+                app.configured_models =
+                    echo_agent_app_core::model_config::configured_model_views(&mutation.config)
+                        .into_iter()
+                        .map(|view| {
+                            echo_agent_app_core::model_config::resolve_runtime_model(
+                                &mutation.config,
+                                Some(&view.id),
+                            )
+                        })
+                        .collect();
+                app.model = runtime.model;
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Active model switched to: {}", app.model),
