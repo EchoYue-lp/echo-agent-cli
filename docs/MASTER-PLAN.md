@@ -74,7 +74,7 @@ evidence, and the next bounded step.
 | Hook execution closure | Complete | The main registry exposes 31 emitted events and 7 Action types. Failed tool results emit `PostToolUseFailure`; the canonical call-scoped `permission_mode_override` participates in approval without mutating global mode; all Hook sources share strict registration filtering. CLI/TUI/GUI Hook tests use the same matcher-aware dry-run, and the watcher reloads app config plus global/project `hooks.yaml` on create/modify/remove. Evolution writes, layer changes, candidate detection, and health checks emit their declared events. Plain HTTP supports loopback/private/link-local IPs, localhost, single-label hosts, `.local`, and `.lan`; remote hosts require HTTPS. User-configured MCP tools have no deny-list. |
 | Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
 | Provider default protocol convergence | Complete | Framework `ProviderMetadata.default_api_protocol` is the sole built-in authority; EKO preserves explicit overrides, infers custom complete endpoints, keeps a non-persistent session selection for every future pooled agent, and projects the provider wire contract through generated ts-rs DTOs without a second provider mapping. |
-| Foreground turn ownership convergence | In progress | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, and settlement. GUI uses it end to end; the CLI REPL uses the same lease and typed settlement while TUI/channel adapter migration remains bounded follow-up work. |
+| Foreground turn ownership convergence | In progress | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, and channel use it end to end; TUI adapter migration remains bounded follow-up work. |
 
 ## Current Decisions
 
@@ -490,11 +490,7 @@ await, this boundary does not claim a join, but there is no inner or detached
 chat task left running.
 There is deliberately no per-request reader, `spawn_blocking` reader, detached
 thread, or second stdin owner; Reedline's external printer is the only path for
-turn/HITL output while line editing is active. TUI and channel entry points
-still own local cancellation tokens during this staged migration; they must be
-converted into thin `ForegroundTurnControl` adapters and their replaced local
-foreground ownership removed. Framework lifecycle and steering APIs must not
-be duplicated or changed for that follow-up.
+turn/HITL output while line editing is active.
 
 CLI startup registers the owned REPL HITL session before headless services can
 emit requests, then moves that same session into the input broker. Bootstrap
@@ -514,6 +510,27 @@ layer-manager snapshot or temporary replacement integration remains. The CLI
 Dreaming owner retains both cancellation and `JoinHandle`, joins before
 auto-memory/session review, and reports a join failure through the REPL terminal
 result.
+
+Channel chat,
+management commands, exact reset, steering, and stop now use the same owner;
+framework reset aliases are disabled at `SessionHandler` composition so they
+cannot replace a generation before EKO settlement. The channel driver is held
+by the owner's `JoinSet`; accepted reset settlement uses the same owner even if
+its transport waiter disappears. Its composite receipt stack defines
+`Foreground -> TaskRuntime -> Memory -> pool` acquisition with reverse release
+before the typed terminal is published. The shared chat driver acquires the
+Memory generation after TaskRuntime registration and before pool admission,
+passes that exact lease through `ChatResources.memory_generation`, and derives
+the layer manager from it. This preserves one owner and prevents a second
+manager snapshot or generation reacquisition.
+Shutdown inserts the existing `ReviewIntegration` settlement immediately after
+foreground shutdown and before workspace transition shutdown.
+
+TUI still requires a thin `ForegroundTurnControl` adapter and deletion of its
+replaced local foreground ownership. Normal TUI chat must acquire the same
+Memory generation receipt before pool admission and must not preserve a legacy
+`create_layer_manager` snapshot across an await. Framework lifecycle and
+steering APIs must not be duplicated or changed for that follow-up.
 
 ## Next Step
 
@@ -566,12 +583,11 @@ running, completed output loads only one page at a time, history reload restores
 summaries without eager detail reads, and conversation deletion returns before
 background detail cleanup finishes.
 
-Complete foreground-turn surface parity by routing TUI and channel entry points
-through the app-core lease while preserving their renderer-only differences.
-The CLI REPL adapter is complete: it has one Reedline input broker, an exact
-foreground lease, typed cancellation settlement, framework steering plus FIFO
-follow-ups, and channel-backed HITL requests. Add exact-id cancel/snapshot
-adapter tests for the remaining surfaces, then delete their replaced local
-foreground token ownership. After all adapters use the owner, add one
-cross-surface integration gate covering independent scope, stale-id rejection,
-sink disconnect failure, and settlement-before-release.
+Complete foreground-turn surface parity by routing TUI through the app-core
+lease while preserving renderer-only differences. The CLI REPL and channel
+adapters already use exact cancellation, typed settlement, and the shared
+TaskRuntime/Memory/pool generation order. Add exact-id cancel/snapshot adapter
+tests for TUI, then delete its replaced local foreground token ownership.
+After all adapters use the owner, add one cross-surface integration gate
+covering independent scope, stale-id rejection, sink disconnect failure, and
+settlement-before-release.

@@ -16,18 +16,88 @@ use std::sync::Arc;
 use echo_agent_app_core::agent_pool::AgentPool;
 
 #[cfg(feature = "channels")]
+use echo_agent_app_core::foreground_turn::{
+    ForegroundTurnControl, ForegroundTurnError, ForegroundTurnSurface,
+};
+
+#[cfg(feature = "channels")]
 use echo_agent_app_core::hitl::{ChannelHumanLoopProvider, ChannelHumanLoopResolution};
 
 #[cfg(feature = "channels")]
 enum ChannelRenderEvent {
     Driver(echo_agent_app_core::chat_driver::ChatDriverEvent),
     Prompt(String),
+    Terminal(echo_agent_app_core::chat_driver::TurnOutcome),
+}
+
+#[cfg(feature = "channels")]
+struct ChannelStreamDropGuard(echo_agent::agent::CancellationToken);
+
+#[cfg(feature = "channels")]
+impl Drop for ChannelStreamDropGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+#[cfg(feature = "channels")]
+fn channel_render_event_stream(
+    mut driver_rx: tokio::sync::mpsc::UnboundedReceiver<
+        echo_agent_app_core::chat_driver::ChatDriverEvent,
+    >,
+    mut prompt_rx: tokio::sync::broadcast::Receiver<String>,
+    mut terminal_rx: tokio::sync::oneshot::Receiver<echo_agent_app_core::chat_driver::TurnOutcome>,
+    stream_drop_guard: ChannelStreamDropGuard,
+) -> futures::stream::BoxStream<'static, echo_core::error::Result<ChannelRenderEvent>> {
+    use futures::StreamExt;
+
+    async_stream::stream! {
+        let _stream_drop_guard = stream_drop_guard;
+        let mut driver_open = true;
+        let mut prompt_open = true;
+        loop {
+            tokio::select! {
+                event = driver_rx.recv(), if driver_open => match event {
+                    Some(event) => yield Ok(ChannelRenderEvent::Driver(event)),
+                    None => driver_open = false,
+                },
+                prompt = prompt_rx.recv(), if prompt_open => match prompt {
+                    Ok(prompt) => yield Ok(ChannelRenderEvent::Prompt(prompt)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "channel HITL prompt receiver lagged");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        prompt_open = false;
+                    }
+                },
+                terminal = &mut terminal_rx => {
+                    let outcome = terminal.unwrap_or_else(|_| {
+                        echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message(
+                                "foreground_supervisor",
+                                "channel foreground owner ended without a terminal receipt",
+                            ),
+                        )
+                    });
+                    // The driver sends terminal only after drive_chat returns.
+                    // Wait for its sender to close and preserve every accepted
+                    // event before projecting the canonical terminal receipt.
+                    while let Some(event) = driver_rx.recv().await {
+                        yield Ok(ChannelRenderEvent::Driver(event));
+                    }
+                    yield Ok(ChannelRenderEvent::Terminal(outcome));
+                    break;
+                }
+            }
+        }
+    }
+    .boxed()
 }
 
 /// IM channel 消息处理器：持 `AgentPool`，每 `handle` 从 pool 取/复用 per-sender agent。
 ///
 /// TUI/GUI functional parity (AGENTS.md): channels drive chat through the
-/// shared `drive_chat` entry. Holds the per-sender `AgentPool` + the
+/// shared foreground driver. Holds the per-sender `AgentPool` + the
 /// `TaskRuntimeStore` (so `create_complex_task` can build `ChatResources`).
 /// Whether a complex run is warranted is decided by the agent itself, not
 /// pre-judged here.
@@ -38,7 +108,7 @@ pub struct AppChannelMessageHandler {
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     hitl: Arc<ChannelHumanLoopProvider>,
-    foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    foreground_turns: ForegroundTurnControl,
     interaction_mode:
         tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
 }
@@ -50,7 +120,7 @@ impl AppChannelMessageHandler {
         store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
         review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
         webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
-        foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+        foreground_turns: ForegroundTurnControl,
     ) -> Self {
         Self {
             pool,
@@ -74,6 +144,223 @@ impl AppChannelMessageHandler {
     fn cache_user_id(channel_id: &str, chat_id: &str) -> String {
         sanitize_cache_user_id(&format!("im-{channel_id}-{chat_id}"))
     }
+
+    fn generation_receipts(
+        &self,
+    ) -> Result<echo_agent_app_core::foreground_turn::ForegroundExecutionReceipts, String> {
+        let task_generation = self
+            .store
+            .as_ref()
+            .map(|store| store.lease_foreground_generation())
+            .transpose()
+            .map_err(|error| format!("TaskRuntime generation is unavailable: {error}"))?;
+        let mut receipts =
+            echo_agent_app_core::foreground_turn::ForegroundExecutionReceipts::new(task_generation);
+        if let Some(integration) = self.review_integration.as_ref() {
+            let memory_generation = integration
+                .lease_generation()
+                .map_err(|error| format!("Memory generation is unavailable: {error}"))?;
+            receipts.retain(memory_generation);
+        }
+        Ok(receipts)
+    }
+
+    async fn control_command_response(&self, message: &str, conv: &str) -> Option<String> {
+        let mut parts = message.trim().splitn(2, char::is_whitespace);
+        let command = parts.next()?;
+        let argument = parts.next().map(str::trim).unwrap_or_default();
+        match command {
+            "/stop" => {
+                let Some(snapshot) = self
+                    .foreground_turns
+                    .snapshot(ForegroundTurnSurface::Channel, conv)
+                else {
+                    return Some("No active channel turn to stop.".to_string());
+                };
+                Some(
+                    match self
+                        .foreground_turns
+                        .cancel_and_wait(ForegroundTurnSurface::Channel, conv, &snapshot.turn_id)
+                        .await
+                    {
+                        Ok(settlement) => format!(
+                            "Turn {} settled as {}.",
+                            settlement.turn_id,
+                            settlement.outcome.status()
+                        ),
+                        Err(ForegroundTurnError::NoActiveTurn { .. }) => {
+                            "The channel turn already settled.".to_string()
+                        }
+                        Err(error) => format!("Unable to stop the active turn: {error}"),
+                    },
+                )
+            }
+            "/cancel" => Some(match self.hitl.reject_front("Cancelled by user").await {
+                ChannelHumanLoopResolution::NoPending => {
+                    "No pending approval or input request to cancel.".to_string()
+                }
+                ChannelHumanLoopResolution::Resolved(message)
+                | ChannelHumanLoopResolution::Invalid(message) => message,
+            }),
+            "/reset" => {
+                if let Some(snapshot) = self
+                    .foreground_turns
+                    .snapshot(ForegroundTurnSurface::Channel, conv)
+                    && let Err(error) = self
+                        .foreground_turns
+                        .cancel_and_wait(ForegroundTurnSurface::Channel, conv, &snapshot.turn_id)
+                        .await
+                    && !matches!(error, ForegroundTurnError::NoActiveTurn { .. })
+                {
+                    return Some(format!(
+                        "Unable to reset before the active turn settles: {error}"
+                    ));
+                }
+                let reset_turn_id = uuid::Uuid::new_v4().to_string();
+                let reset_lease = match self.foreground_turns.begin(
+                    ForegroundTurnSurface::Channel,
+                    conv.to_string(),
+                    reset_turn_id,
+                ) {
+                    Ok(lease) => lease,
+                    Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+                        return Some(format!(
+                            "Turn {active_turn_id} started before reset admission; stop it and retry."
+                        ));
+                    }
+                    Err(error) => return Some(format!("Unable to admit reset: {error}")),
+                };
+                let generation_receipts = match self.generation_receipts() {
+                    Ok(receipts) => receipts,
+                    Err(message) => {
+                        reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message(
+                                "workspace_generation",
+                                message.clone(),
+                            ),
+                        ));
+                        return Some(message);
+                    }
+                };
+                let pool = Arc::clone(&self.pool);
+                let hitl = Arc::clone(&self.hitl);
+                let conv_owned = conv.to_string();
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                if let Err(error) =
+                    self.foreground_turns
+                        .supervise(reset_lease, move |reset_lease| async move {
+                            hitl.reject_all("Conversation reset by user").await;
+                            let retirement = match pool.lease_existing(&conv_owned).await {
+                                Ok(Some(execution)) => {
+                                    pool.retire_execution(&conv_owned, execution).await
+                                }
+                                Ok(None) => Ok(false),
+                                Err(error) => Err(error),
+                            };
+                            let (outcome, message) = match retirement {
+                                Ok(_) => (
+                                    echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                                    "Conversation reset after exact foreground settlement."
+                                        .to_string(),
+                                ),
+                                Err(error) => (
+                                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                        echo_agent::error::AgentFailure::message(
+                                            "channel_reset",
+                                            error.to_string(),
+                                        ),
+                                    ),
+                                    format!("Unable to retire the conversation agent: {error}"),
+                                ),
+                            };
+                            generation_receipts.release_lifo();
+                            reset_lease.settle(outcome);
+                            let _delivered = result_tx.send(message);
+                        })
+                {
+                    return Some(format!("Unable to supervise reset settlement: {error}"));
+                }
+                Some(result_rx.await.unwrap_or_else(|_| {
+                    "Reset owner ended without publishing its terminal result.".to_string()
+                }))
+            }
+            "/steer" => {
+                if argument.is_empty() {
+                    return Some("Usage: /steer <additional instruction>".to_string());
+                }
+                let Some(snapshot) = self
+                    .foreground_turns
+                    .snapshot(ForegroundTurnSurface::Channel, conv)
+                else {
+                    return Some("No active channel turn to steer.".to_string());
+                };
+                let execution = match self.pool.lease_existing(conv).await {
+                    Ok(Some(execution)) => execution,
+                    Ok(None) => {
+                        return Some("The active channel turn has no attached agent.".to_string());
+                    }
+                    Err(error) => {
+                        return Some(format!(
+                            "Unable to access the active channel agent: {error}"
+                        ));
+                    }
+                };
+                let agent = execution.agent();
+                let response = match agent
+                    .steer_input(
+                        Some(&snapshot.turn_id),
+                        echo_agent::prelude::Message::user(argument.to_string()),
+                    )
+                    .await
+                {
+                    Ok(turn_id) => format!("Additional instruction accepted for {turn_id}."),
+                    Err(echo_agent::agent::TurnSteerError::NotSteerable { .. }) => {
+                        "The active turn is not currently steerable; try again shortly.".to_string()
+                    }
+                    Err(echo_agent::agent::TurnSteerError::NoActiveTurn) => {
+                        "The channel turn already settled.".to_string()
+                    }
+                    Err(error) => format!("Unable to steer the active turn: {error}"),
+                };
+                drop(execution);
+                Some(response)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "channels")]
+impl Drop for AppChannelMessageHandler {
+    fn drop(&mut self) {
+        self.hitl
+            .close_now("Channel session ended before the request settled");
+    }
+}
+
+#[cfg(feature = "channels")]
+fn immediate_channel_response<'a>(
+    msg: &echo_agent::channels::InboundMessage,
+    message: impl Into<String>,
+) -> futures::stream::BoxStream<'a, echo_core::error::Result<echo_agent::channels::OutboundMessage>>
+{
+    use futures::StreamExt;
+
+    let outbound = echo_agent::channels::OutboundMessage::new(
+        &msg.channel_id,
+        msg.reply_target(),
+        msg.chat_type,
+        message,
+    );
+    futures::stream::once(async move { Ok(outbound) }).boxed()
+}
+
+#[cfg(feature = "channels")]
+fn is_agent_management_command(message: &str) -> bool {
+    matches!(
+        message.split_whitespace().next(),
+        Some("/trace" | "/analysis" | "/papers" | "/skills")
+    )
 }
 
 #[cfg(feature = "channels")]
@@ -111,112 +398,139 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             echo_core::error::Result<echo_agent::channels::OutboundMessage>,
         >,
     > {
-        use echo_core::error::ChannelError;
-        use futures::StreamExt;
-
-        let immediate = match self.hitl.resolve_message(&msg.text).await {
-            ChannelHumanLoopResolution::Resolved(message)
-            | ChannelHumanLoopResolution::Invalid(message) => Some(message),
-            ChannelHumanLoopResolution::NoPending => {
-                parse_channel_mode_command(&msg.text, &self.interaction_mode).await
-            }
-        };
-        if let Some(message) = immediate {
-            let outbound = echo_agent::channels::OutboundMessage::new(
-                &msg.channel_id,
-                msg.reply_target(),
-                msg.chat_type,
-                message,
-            );
-            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
-        }
-
         let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id());
         let cache_id = Self::cache_user_id(&msg.channel_id, msg.conversation_id());
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        let foreground_lease = self
-            .foreground_turns
-            .begin(
-                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Channel,
+        // Product control commands always outrank HITL parsing. `/stop` owns
+        // turn cancellation; `/cancel` rejects only the queue front.
+        if let Some(message) = self.control_command_response(&msg.text, &conv).await {
+            return Ok(immediate_channel_response(&msg, message));
+        }
+        if self.hitl.has_pending().await {
+            match self.hitl.resolve_message(&msg.text).await {
+                ChannelHumanLoopResolution::Resolved(message)
+                | ChannelHumanLoopResolution::Invalid(message) => {
+                    return Ok(immediate_channel_response(&msg, message));
+                }
+                ChannelHumanLoopResolution::NoPending => {}
+            }
+        }
+        if msg.text.split_whitespace().next() == Some("/mode") {
+            let command_id = uuid::Uuid::new_v4().to_string();
+            let lease = match self.foreground_turns.begin(
+                ForegroundTurnSurface::Channel,
                 conv.clone(),
-                turn_id.clone(),
-            )
-            .map_err(|error| ChannelError::SendError(error.to_string()))?;
-
-        // Foreground admission precedes pool admission, matching the workspace
-        // transition lock order. The receipt is moved into the spawned driver.
-        let pool_execution = self
-            .pool
-            .acquire(&conv)
-            .await
-            .map_err(|e| ChannelError::SendError(format!("AgentPool acquire failed: {e}")))?;
-        let agent = pool_execution.agent();
-
-        // 2. 设 per-sender cache_user_id（写锁短暂）
-        agent
-            .write(|a| a.config_mut().set_cache_user_id(&cache_id))
-            .await;
-        let hitl = self.hitl.clone();
-        agent
-            .write_async(|agent| {
-                Box::pin(async move {
-                    agent.set_human_loop_provider_preserving_approvals(hitl);
-                })
-            })
-            .await;
-        if let Some(message) = channel_trace_response(&agent, &msg.text).await {
-            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
-            drop(pool_execution);
-            let outbound = echo_agent::channels::OutboundMessage::new(
-                &msg.channel_id,
-                msg.reply_target(),
-                msg.chat_type,
-                message,
-            );
-            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
-        }
-        if let Some(message) = channel_analysis_response(&agent, &msg.text).await {
-            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
-            drop(pool_execution);
-            let outbound = echo_agent::channels::OutboundMessage::new(
-                &msg.channel_id,
-                msg.reply_target(),
-                msg.chat_type,
-                message,
-            );
-            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
-        }
-        if let Some(message) = channel_papers_response(&agent, &msg.text).await {
-            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
-            drop(pool_execution);
-            let outbound = echo_agent::channels::OutboundMessage::new(
-                &msg.channel_id,
-                msg.reply_target(),
-                msg.chat_type,
-                message,
-            );
-            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
-        }
-        if let Some(message) = channel_skills_response(&agent, &msg.text).await {
-            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
-            drop(pool_execution);
-            let outbound = echo_agent::channels::OutboundMessage::new(
-                &msg.channel_id,
-                msg.reply_target(),
-                msg.chat_type,
-                message,
-            );
-            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
+                command_id,
+            ) {
+                Ok(lease) => lease,
+                Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Turn {active_turn_id} is still running; mode was not changed."),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Unable to admit the mode command: {error}"),
+                    ));
+                }
+            };
+            let message = parse_channel_mode_command(&msg.text, &self.interaction_mode)
+                .await
+                .unwrap_or_else(|| "Usage: /mode chat|task|auto".to_string());
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+            return Ok(immediate_channel_response(&msg, message));
         }
 
-        // 3. Drive through the shared `drive_chat` entry (TUI/GUI parity,
-        //    AGENTS.md): route the message (normal vs complex) and stream
-        //    versioned agent events to a channel sink; per-sender isolation means no
-        //    concurrency, so the read guard is held for the stream lifetime
-        //    inside `drive_chat` (same as TUI send_to_agent).
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-            echo_agent_app_core::chat_driver::ChatDriverEvent,
-        >();
+        // Management commands use the same exact foreground admission and
+        // TaskRuntime -> pool order as chat. They do not mutate the agent when
+        // any admission step fails.
+        if is_agent_management_command(&msg.text) {
+            let command_id = uuid::Uuid::new_v4().to_string();
+            let lease = match self.foreground_turns.begin(
+                ForegroundTurnSurface::Channel,
+                conv.clone(),
+                command_id,
+            ) {
+                Ok(lease) => lease,
+                Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Turn {active_turn_id} is still running; command was not applied."),
+                    ));
+                }
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Unable to admit the command: {error}"),
+                    ));
+                }
+            };
+            let generation_receipts = match self.generation_receipts() {
+                Ok(receipts) => receipts,
+                Err(message) => {
+                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "workspace_generation",
+                            message.clone(),
+                        ),
+                    ));
+                    return Ok(immediate_channel_response(&msg, message));
+                }
+            };
+            let pool_execution = match self.pool.acquire(&conv).await {
+                Ok(execution) => execution,
+                Err(error) => {
+                    generation_receipts.release_lifo();
+                    let message = format!("AgentPool admission failed: {error}");
+                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message("agent_pool", message.clone()),
+                    ));
+                    return Ok(immediate_channel_response(&msg, message));
+                }
+            };
+            let agent = pool_execution.agent();
+            configure_channel_agent(&agent, &cache_id, Arc::clone(&self.hitl)).await;
+            let message = if let Some(message) = channel_trace_response(&agent, &msg.text).await {
+                message
+            } else if let Some(message) = channel_analysis_response(&agent, &msg.text).await {
+                message
+            } else if let Some(message) = channel_papers_response(&agent, &msg.text).await {
+                message
+            } else if let Some(message) = channel_skills_response(&agent, &msg.text).await {
+                message
+            } else {
+                "Unsupported channel management command.".to_string()
+            };
+            drop(pool_execution);
+            generation_receipts.release_lifo();
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+            return Ok(immediate_channel_response(&msg, message));
+        }
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let foreground_lease = match self.foreground_turns.begin(
+            ForegroundTurnSurface::Channel,
+            conv.clone(),
+            turn_id.clone(),
+        ) {
+            Ok(lease) => lease,
+            Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+                return Ok(immediate_channel_response(
+                    &msg,
+                    format!(
+                        "Turn {active_turn_id} is still running. Use /steer <instruction> or /stop."
+                    ),
+                ));
+            }
+            Err(error) => {
+                return Ok(immediate_channel_response(
+                    &msg,
+                    format!("Foreground turn admission failed: {error}"),
+                ));
+            }
+        };
+        let stream_cancel = foreground_lease.cancellation_token();
         let text = msg.text.clone();
         // Persist IM attachments into the same durable reference contract as
         // GUI/TUI so TaskRuntime subagents can reconstruct the same message.
@@ -242,80 +556,77 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message("prepared_turn", error.to_string()),
                 ));
-                drop(pool_execution);
-                let outbound = echo_agent::channels::OutboundMessage::new(
-                    &msg.channel_id,
-                    msg.reply_target(),
-                    msg.chat_type,
+                return Ok(immediate_channel_response(
+                    &msg,
                     format!("无法安全保存这条长消息，请检查本地磁盘后重试：{error}"),
-                );
-                return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
+                ));
             }
         };
-        let agent_owned = agent.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+            echo_agent_app_core::chat_driver::ChatDriverEvent,
+        >();
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let pool = self.pool.clone();
         let store = self.store.clone();
         let webhook_emitter = self.webhook_emitter.clone();
         let review_integration = self.review_integration.clone();
-        let mut prompt_rx = self.hitl.subscribe_prompts();
+        let hitl = Arc::clone(&self.hitl);
+        let prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
-        tokio::spawn(async move {
-            use echo_agent_app_core::chat_driver::ChannelChatSink;
+        let supervision =
+            self.foreground_turns
+                .supervise(foreground_lease, move |foreground_lease| async move {
+                    use echo_agent_app_core::chat_driver::ChannelChatSink;
+                    use echo_agent_app_core::foreground_turn::drive_foreground_pooled_chat;
 
-            // 极简入口(Phase B1/B3):channel 不预判 normal/complex——agent 自主
-            // 决定是否建后台 Run(create_complex_task,B3b)。ChatResources 经
-            // drive_chat scope 进 task_local 供工具读。B5.4: multimodal 透传
-            // IM 附件(图片/文件,与 GUI/TUI 同路径)。
-            let cancel = foreground_lease.cancellation_token();
-            let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
-                std::sync::Arc::new(ChannelChatSink::new(tx));
-            let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-                pool: Some(pool),
-                store,
-                sink,
-                webhook_emitter: Some(webhook_emitter),
-                conv_id: Some(conv_owned.clone()),
-                root_message_id: turn_id,
-                attachments: turn.inline_attachment_refs(),
-                cancel,
-                mode_hint: Some(mode_hint_str),
-                interaction_mode,
-                review_integration,
-                layer_manager: None,
-                memory_generation: None,
-            });
-            if let Err(e) = echo_agent_app_core::foreground_turn::drive_foreground_chat(
-                foreground_lease,
-                &agent_owned,
-                &turn,
-                res,
-            )
-            .await
-            {
-                tracing::warn!(error = %e, conv = %conv_owned, "channel drive_chat failed");
-            }
-            drop(pool_execution);
-        });
-        // Project the complete shared product stream into channel text.
-        let event_stream = async_stream::stream! {
-            let mut rx = rx;
-            loop {
-                tokio::select! {
-                    event = rx.recv() => match event {
-                        Some(event) => yield Ok(ChannelRenderEvent::Driver(event)),
-                        None => break,
-                    },
-                    prompt = prompt_rx.recv() => match prompt {
-                        Ok(prompt) => yield Ok(ChannelRenderEvent::Prompt(prompt)),
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "channel HITL prompt receiver lagged");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
-                    }
-                }
-            }
+                    let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+                        std::sync::Arc::new(ChannelChatSink::new(tx));
+                    let res =
+                        std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+                            pool: Some(pool.clone()),
+                            store,
+                            sink,
+                            webhook_emitter: Some(webhook_emitter),
+                            conv_id: Some(conv_owned.clone()),
+                            root_message_id: turn_id,
+                            attachments: turn.inline_attachment_refs(),
+                            cancel: foreground_lease.cancellation_token(),
+                            mode_hint: Some(mode_hint_str),
+                            interaction_mode,
+                            review_integration,
+                            layer_manager: None,
+                            memory_generation: None,
+                        });
+                    let configure_cache_id = cache_id;
+                    let configure_hitl = hitl;
+                    let outcome = drive_foreground_pooled_chat(
+                        foreground_lease,
+                        pool,
+                        conv_owned,
+                        move |agent| async move {
+                            configure_channel_agent(&agent, &configure_cache_id, configure_hitl)
+                                .await;
+                            Ok(())
+                        },
+                        &turn,
+                        res,
+                    )
+                    .await;
+                    let _delivered = terminal_tx.send(outcome);
+                });
+        if let Err(error) = supervision {
+            return Ok(immediate_channel_response(
+                &msg,
+                format!("Unable to supervise the channel turn: {error}"),
+            ));
         }
-        .boxed();
+        // Project the complete shared product stream into channel text.
+        // Construct the guard before the generator so dropping an unpolled
+        // stream still cancels the lease-owned token.
+        let stream_drop_guard = ChannelStreamDropGuard(stream_cancel);
+        let event_stream =
+            channel_render_event_stream(rx, prompt_rx, terminal_rx, stream_drop_guard);
 
         // 4. 聚合成逐段 OutboundMessage 流
         let channel_id = msg.channel_id.clone();
@@ -333,6 +644,24 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         // 与原 AgentChannelHandler::reply 一致。
         Ok(())
     }
+}
+
+#[cfg(feature = "channels")]
+async fn configure_channel_agent(
+    agent: &echo_agent_app_core::agent_handle::AgentHandle,
+    cache_id: &str,
+    hitl: Arc<ChannelHumanLoopProvider>,
+) {
+    agent
+        .write(|agent| agent.config_mut().set_cache_user_id(cache_id))
+        .await;
+    agent
+        .write_async(|agent| {
+            Box::pin(async move {
+                agent.set_human_loop_provider_preserving_approvals(hitl);
+            })
+        })
+        .await;
 }
 
 #[cfg(feature = "channels")]
@@ -538,8 +867,8 @@ fn is_sentence_end(c: char) -> bool {
 /// 2. buf 以句末标点结尾 → flush 全 buf。
 /// 3. buf.chars().count() >= FLUSH_THRESHOLD → flush 全 buf。
 ///
-/// 终态事件:FinalAnswer / Cancelled 先 flush 剩余 buf(若非空);
-/// Error 先 flush 剩余后 yield Err;其它事件忽略。
+/// Agent terminal events flush buffered text; the application-owned terminal
+/// receipt then renders an explicit cancelled/failed outcome and closes.
 ///
 /// 生命周期:返回流借用 'a(随 `events`),由 `try_stream!` 自然处理(宏生成的
 /// future 持有 `events` 的借用)。UTF-8 安全:全用 chars() 判长和拆分
@@ -555,7 +884,6 @@ async fn aggregate_by_sentence<'a>(
     use echo_agent::channels::OutboundMessage;
     use echo_agent_app_core::chat_driver::ChatDriverEvent;
     use echo_core::agent::AgentEvent;
-    use echo_core::error::{ChannelError, ReactError};
     use futures::StreamExt;
 
     let s = async_stream::try_stream! {
@@ -598,13 +926,9 @@ async fn aggregate_by_sentence<'a>(
                 }
                 AgentEvent::Cancelled => {
                     flush_all!();
-                    break;
                 }
-                AgentEvent::Error { message, .. } => {
+                AgentEvent::Error { .. } => {
                     flush_all!();
-                    Err(ReactError::Channel(Box::new(ChannelError::Other(format!(
-                        "agent stream error: {message}"
-                    )))))?;
                 }
                 AgentEvent::BudgetDecision { decision, reason, .. } => {
                     flush_all!();
@@ -680,6 +1004,36 @@ async fn aggregate_by_sentence<'a>(
                         format!("[paused:{run_id}] {goal}; new instruction: {new_message}"),
                     );
                 }
+                ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                ) => {
+                    flush_all!();
+                    break;
+                }
+                ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                ) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        "[cancelled] The channel turn was cancelled.",
+                    );
+                    break;
+                }
+                ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(failure),
+                ) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[failed:{}] {}", failure.code, failure.message),
+                    );
+                    break;
+                }
             }
         }
     };
@@ -737,6 +1091,108 @@ mod tests {
             super::AppChannelMessageHandler::cache_user_id("qqbot", "user_123"),
             "im-qqbot-user_123"
         );
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn management_commands_are_classified_exactly() {
+        assert!(super::is_agent_management_command("/trace run-1"));
+        assert!(super::is_agent_management_command(" /skills list "));
+        assert!(!super::is_agent_management_command("/stop"));
+        assert!(!super::is_agent_management_command("/traceable"));
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn downstream_drop_cancels_same_token_without_releasing_registry()
+    -> Result<(), echo_agent_app_core::foreground_turn::ForegroundTurnError> {
+        use echo_agent_app_core::chat_driver::TurnOutcome;
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin(ForegroundTurnSurface::Channel, "channel:test", "turn-1")?;
+        let token = lease.cancellation_token();
+        let guard = super::ChannelStreamDropGuard(token.clone());
+        drop(guard);
+        assert!(token.is_cancelled());
+        assert!(
+            control
+                .snapshot(ForegroundTurnSurface::Channel, "channel:test")
+                .is_some(),
+            "stream disconnect requests cancellation but settlement owns registry release"
+        );
+        lease.settle(TurnOutcome::Cancelled);
+        assert!(
+            control
+                .snapshot(ForegroundTurnSurface::Channel, "channel:test")
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn terminal_drains_accepted_final_answer_before_publication() -> Result<(), String> {
+        use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
+        use echo_agent_app_core::chat_driver::{ChatDriverEvent, TurnOutcome};
+        use futures::StreamExt;
+
+        let (driver_tx, driver_rx) = tokio::sync::mpsc::unbounded_channel();
+        let identity = EventIdentity::new("channel-driver", "channel-conversation")
+            .map_err(|error| error.to_string())?;
+        let final_answer = EventEnvelope::new(
+            &identity,
+            1,
+            None,
+            AgentEvent::FinalAnswer("complete answer".to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+        driver_tx
+            .send(ChatDriverEvent::Agent(Box::new(final_answer)))
+            .map_err(|_| "channel driver receiver closed".to_string())?;
+        let (_prompt_tx, prompt_rx) = tokio::sync::broadcast::channel::<String>(1);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        terminal_tx
+            .send(TurnOutcome::Completed)
+            .map_err(|_| "channel terminal receiver closed".to_string())?;
+        drop(driver_tx);
+        let cancellation = echo_agent::agent::CancellationToken::new();
+        let mut stream = super::channel_render_event_stream(
+            driver_rx,
+            prompt_rx,
+            terminal_rx,
+            super::ChannelStreamDropGuard(cancellation.clone()),
+        );
+
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| "missing queued final answer".to_string())?
+            .map_err(|error| error.to_string())?;
+        let final_answer_first = matches!(
+            first,
+            super::ChannelRenderEvent::Driver(ChatDriverEvent::Agent(envelope))
+                if matches!(envelope.payload, AgentEvent::FinalAnswer(ref answer) if answer == "complete answer")
+        );
+        if !final_answer_first {
+            return Err("terminal was published before the queued final answer".to_string());
+        }
+        let second = stream
+            .next()
+            .await
+            .ok_or_else(|| "missing terminal receipt".to_string())?
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            second,
+            super::ChannelRenderEvent::Terminal(TurnOutcome::Completed)
+        ) {
+            return Err("queued driver event was not followed by terminal receipt".to_string());
+        }
+        if stream.next().await.is_some() {
+            return Err("channel stream continued after terminal receipt".to_string());
+        }
+        assert!(cancellation.is_cancelled());
+        Ok(())
     }
 
     // ── channel attachment transport tests ──────────────────────────────
@@ -872,38 +1328,56 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn cancelled_flushes_remaining_then_stops() {
-            let evs = events_to_stream(vec![
+        async fn cancelled_terminal_is_user_visible() {
+            let driver = events_to_stream(vec![
                 Ok(AgentEvent::Token("partial".into())),
                 Ok(AgentEvent::Cancelled),
             ]);
+            let terminal = futures::stream::once(async {
+                Ok(ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                ))
+            });
+            let evs = driver.chain(terminal).boxed();
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let texts = collect_texts(out).await;
-            assert_eq!(texts, vec!["partial".to_string()]);
+            assert_eq!(
+                texts,
+                vec![
+                    "partial".to_string(),
+                    "[cancelled] The channel turn was cancelled.".to_string()
+                ]
+            );
         }
 
         #[tokio::test]
-        async fn error_flushes_then_propagates() -> std::result::Result<(), String> {
-            let evs = events_to_stream(vec![
+        async fn failed_terminal_is_typed_and_user_visible() -> std::result::Result<(), String> {
+            let driver = events_to_stream(vec![
                 Ok(AgentEvent::Token("partial".into())),
                 Ok(AgentEvent::error_message("llm", "boom")),
             ]);
+            let terminal = futures::stream::once(async {
+                Ok(ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message("llm_network", "boom"),
+                    ),
+                ))
+            });
+            let evs = driver.chain(terminal).boxed();
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let mut s = out;
-            // 第一条:flush 的 partial
             let first = s
                 .next()
                 .await
                 .ok_or_else(|| "missing partial output".to_string())?
                 .map_err(|error| error.to_string())?;
             assert_eq!(first.text, "partial");
-            // 之后:Error 事件 → yield Err
-            let second = s.next().await;
-            assert!(second.is_some(), "error propagated as stream item");
-            assert!(
-                second.is_some_and(|item| item.is_err()),
-                "error item is Err"
-            );
+            let second = s
+                .next()
+                .await
+                .ok_or_else(|| "missing typed terminal output".to_string())?
+                .map_err(|error| error.to_string())?;
+            assert_eq!(second.text, "[failed:llm_network] boom");
             Ok(())
         }
 

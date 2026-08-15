@@ -100,6 +100,12 @@ pub enum ForegroundTurnError {
     ActiveTurns,
     #[error("foreground turn control state is unavailable")]
     StateUnavailable,
+    #[error("foreground driver supervision requires an active Tokio runtime: {0}")]
+    RuntimeUnavailable(String),
+    #[error("foreground driver lease belongs to another control")]
+    LeaseOwnerMismatch,
+    #[error("foreground driver settlement failed: {0}")]
+    DriverSettlement(String),
 }
 
 struct ActiveForegroundTurn {
@@ -120,9 +126,29 @@ impl ActiveForegroundTurn {
     }
 }
 
+type ForegroundShutdownResult = Result<(), ForegroundTurnError>;
+
+#[derive(Default)]
+enum ForegroundShutdownState {
+    #[default]
+    Open,
+    Running(watch::Receiver<Option<ForegroundShutdownResult>>),
+    Settled(ForegroundShutdownResult),
+}
+
+impl ForegroundShutdownState {
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running(_))
+    }
+}
+
 #[derive(Default)]
 struct ForegroundTurnState {
     active: HashMap<ForegroundTurnKey, Arc<ActiveForegroundTurn>>,
+    drivers: tokio::task::JoinSet<()>,
+    driver_failures: Vec<String>,
+    shutdown: ForegroundShutdownState,
+    shutdown_owner: Option<tokio::task::JoinHandle<()>>,
     admission_suspended: bool,
     shutting_down: bool,
 }
@@ -136,6 +162,49 @@ struct ForegroundTurnControlInner {
 #[derive(Clone, Default)]
 pub struct ForegroundTurnControl {
     inner: Arc<ForegroundTurnControlInner>,
+}
+
+/// Ordered generation receipts for one foreground execution. TaskRuntime is
+/// retained first; memory evolution is appended by the Memory integration;
+/// the pool receipt is held separately and released before this stack.
+#[must_use]
+pub struct ForegroundExecutionReceipts {
+    generations: Vec<Box<dyn Send>>,
+}
+
+impl ForegroundExecutionReceipts {
+    pub fn new(
+        task_runtime: Option<crate::tasks::task_runtime::store::TaskRuntimeGenerationReceipt>,
+    ) -> Self {
+        let mut receipts = Self {
+            generations: Vec::new(),
+        };
+        if let Some(receipt) = task_runtime {
+            receipts.retain(receipt);
+        }
+        receipts
+    }
+
+    pub fn retain<Receipt>(&mut self, receipt: Receipt)
+    where
+        Receipt: Send + 'static,
+    {
+        self.generations.push(Box::new(receipt));
+    }
+
+    pub fn release_lifo(mut self) {
+        self.release_inner();
+    }
+
+    fn release_inner(&mut self) {
+        while self.generations.pop().is_some() {}
+    }
+}
+
+impl Drop for ForegroundExecutionReceipts {
+    fn drop(&mut self) {
+        self.release_inner();
+    }
 }
 
 /// Pauses new foreground turns while an application workspace transition is
@@ -272,9 +341,97 @@ impl ForegroundTurnControl {
 
     pub fn has_active_turns(&self) -> bool {
         match self.inner.state.lock() {
-            Ok(state) => !state.active.is_empty(),
+            Ok(mut state) => {
+                Self::collect_finished_drivers(&mut state);
+                !state.active.is_empty() || !state.drivers.is_empty() || state.shutdown.is_running()
+            }
             Err(_) => true,
         }
+    }
+
+    fn collect_finished_drivers(state: &mut ForegroundTurnState) {
+        while let Some(result) = state.drivers.try_join_next() {
+            if let Err(error) = result {
+                let message = error.to_string();
+                tracing::error!(%error, "foreground driver failed to join");
+                state.driver_failures.push(message);
+            }
+        }
+    }
+
+    /// Transfer one accepted foreground lease into the canonical application
+    /// owner. The operation future may retain pool and memory-generation
+    /// receipts; they remain live even if the surface caller drops its stream.
+    /// Finished drivers are collected on each admission and shutdown drains the
+    /// same `JoinSet`, so no detached cleanup owner is created.
+    pub fn supervise<F, Fut>(
+        &self,
+        lease: ForegroundTurnLease,
+        operation: F,
+    ) -> Result<(), ForegroundTurnError>
+    where
+        F: FnOnce(ForegroundTurnLease) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if !Arc::ptr_eq(&self.inner, &lease.control.inner) {
+            return Self::reject_supervision(
+                lease,
+                operation,
+                ForegroundTurnError::LeaseOwnerMismatch,
+            );
+        }
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return Self::reject_supervision(
+                    lease,
+                    operation,
+                    ForegroundTurnError::RuntimeUnavailable(error.to_string()),
+                );
+            }
+        };
+        let mut state = match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return Self::reject_supervision(
+                    lease,
+                    operation,
+                    ForegroundTurnError::StateUnavailable,
+                );
+            }
+        };
+        if state.shutting_down {
+            drop(state);
+            return Self::reject_supervision(lease, operation, ForegroundTurnError::ShuttingDown);
+        }
+        let owns_active_lease = state
+            .active
+            .get(&lease.entry.key)
+            .is_some_and(|entry| Arc::ptr_eq(entry, &lease.entry));
+        if !owns_active_lease {
+            drop(state);
+            return Self::reject_supervision(
+                lease,
+                operation,
+                ForegroundTurnError::LeaseOwnerMismatch,
+            );
+        }
+        Self::collect_finished_drivers(&mut state);
+        state.drivers.spawn_on(operation(lease), &runtime);
+        Ok(())
+    }
+
+    fn reject_supervision<F>(
+        lease: ForegroundTurnLease,
+        operation: F,
+        error: ForegroundTurnError,
+    ) -> Result<(), ForegroundTurnError> {
+        let message = error.to_string();
+        drop(operation);
+        lease.settle(TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message("foreground_supervision", message),
+        ));
+        Err(error)
     }
 
     /// Atomically verify idleness and suspend new foreground admission.
@@ -292,7 +449,8 @@ impl ForegroundTurnControl {
         if state.admission_suspended {
             return Err(ForegroundTurnError::AdmissionSuspended);
         }
-        if !state.active.is_empty() {
+        Self::collect_finished_drivers(&mut state);
+        if !state.active.is_empty() || !state.drivers.is_empty() {
             return Err(ForegroundTurnError::ActiveTurns);
         }
         state.admission_suspended = true;
@@ -357,29 +515,100 @@ impl ForegroundTurnControl {
 
     /// Permanently close foreground admission, cancel every exact active turn,
     /// and wait for their existing driver leases to publish settlement.
+    ///
+    /// The first caller starts the state-owned settlement task. Every caller
+    /// observes the same typed result, and dropping any caller future cannot
+    /// drop the accepted driver `JoinSet` or its receipts.
     pub async fn shutdown(&self) -> Result<(), ForegroundTurnError> {
-        let waiters = {
+        let result_rx = {
             let mut state = self
                 .inner
                 .state
                 .lock()
                 .map_err(|_| ForegroundTurnError::StateUnavailable)?;
-            state.shutting_down = true;
-            state.admission_suspended = true;
-            state
-                .active
-                .values()
-                .map(|entry| {
-                    let settlement_rx = entry.settlement_tx.subscribe();
-                    entry.cancel.cancel();
-                    ForegroundTurnSettlementWaiter { settlement_rx }
-                })
-                .collect::<Vec<_>>()
+            if let ForegroundShutdownState::Running(result_rx) = &state.shutdown {
+                result_rx.clone()
+            } else if let ForegroundShutdownState::Settled(result) = &state.shutdown {
+                let result = result.clone();
+                if state
+                    .shutdown_owner
+                    .as_ref()
+                    .is_some_and(tokio::task::JoinHandle::is_finished)
+                {
+                    state.shutdown_owner.take();
+                }
+                return result;
+            } else {
+                state.shutting_down = true;
+                state.admission_suspended = true;
+                let runtime = match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let result =
+                            Err(ForegroundTurnError::RuntimeUnavailable(error.to_string()));
+                        state.shutdown = ForegroundShutdownState::Settled(result.clone());
+                        return result;
+                    }
+                };
+                let waiters = state
+                    .active
+                    .values()
+                    .map(|entry| {
+                        let settlement_rx = entry.settlement_tx.subscribe();
+                        entry.cancel.cancel();
+                        ForegroundTurnSettlementWaiter { settlement_rx }
+                    })
+                    .collect::<Vec<_>>();
+                let mut drivers = std::mem::take(&mut state.drivers);
+                let mut failures = std::mem::take(&mut state.driver_failures);
+                let (result_tx, result_rx) = watch::channel(None);
+                let inner = Arc::clone(&self.inner);
+                let owner = runtime.spawn(async move {
+                    for waiter in waiters {
+                        if let Err(error) = waiter.wait().await {
+                            failures.push(error.to_string());
+                        }
+                    }
+                    while let Some(result) = drivers.join_next().await {
+                        if let Err(error) = result {
+                            tracing::error!(%error, "foreground driver failed during shutdown");
+                            failures.push(error.to_string());
+                        }
+                    }
+                    let result = if failures.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(ForegroundTurnError::DriverSettlement(failures.join("; ")))
+                    };
+                    let mut state = inner
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.driver_failures = failures;
+                    state.shutdown = ForegroundShutdownState::Settled(result.clone());
+                    result_tx.send_replace(Some(result));
+                });
+                state.shutdown = ForegroundShutdownState::Running(result_rx.clone());
+                state.shutdown_owner = Some(owner);
+                result_rx
+            }
         };
-        for waiter in waiters {
-            waiter.wait().await?;
+        Self::wait_for_shutdown(result_rx).await
+    }
+
+    async fn wait_for_shutdown(
+        mut result_rx: watch::Receiver<Option<ForegroundShutdownResult>>,
+    ) -> ForegroundShutdownResult {
+        loop {
+            if let Some(result) = result_rx.borrow().clone() {
+                return result;
+            }
+            result_rx.changed().await.map_err(|_| {
+                ForegroundTurnError::DriverSettlement(
+                    "foreground shutdown owner ended without publishing settlement".to_string(),
+                )
+            })?;
         }
-        Ok(())
     }
 
     fn settle(&self, entry: &Arc<ActiveForegroundTurn>, outcome: TurnOutcome) {
@@ -551,6 +780,65 @@ pub async fn drive_foreground_chat(
     turn: &PreparedUserTurn,
     resources: Arc<ChatResources>,
 ) -> Result<TurnOutcome, String> {
+    let (result, settlement_outcome) = run_foreground_chat(&lease, agent, turn, resources).await;
+    lease.settle(settlement_outcome);
+    result
+}
+
+/// Drive a pooled foreground chat while the existing foreground owner retains
+/// every subsystem receipt through outer settlement. The shared chat driver
+/// acquires them in `Foreground -> TaskRuntime -> Memory -> pool` order and
+/// releases `pool -> Memory -> TaskRuntime` before this function publishes the
+/// foreground terminal receipt.
+pub async fn drive_foreground_pooled_chat<Configure, ConfigureFuture>(
+    lease: ForegroundTurnLease,
+    pool: Arc<crate::agent_pool::AgentPool>,
+    pool_key: String,
+    configure: Configure,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+) -> TurnOutcome
+where
+    Configure: FnOnce(AgentHandle) -> ConfigureFuture,
+    ConfigureFuture: std::future::Future<Output = Result<(), String>>,
+{
+    let (_result, settlement_outcome) =
+        run_foreground_chat_with(&lease, resources, move |controlled_resources| async move {
+            crate::chat_driver::drive_pooled_chat(
+                pool,
+                &pool_key,
+                configure,
+                turn,
+                controlled_resources,
+            )
+            .await
+        })
+        .await;
+    lease.settle(settlement_outcome.clone());
+    settlement_outcome
+}
+
+async fn run_foreground_chat(
+    lease: &ForegroundTurnLease,
+    agent: &AgentHandle,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+) -> (Result<TurnOutcome, String>, TurnOutcome) {
+    run_foreground_chat_with(lease, resources, |controlled_resources| {
+        drive_chat(agent, turn, controlled_resources)
+    })
+    .await
+}
+
+async fn run_foreground_chat_with<Execute, ExecuteFuture>(
+    lease: &ForegroundTurnLease,
+    resources: Arc<ChatResources>,
+    execute: Execute,
+) -> (Result<TurnOutcome, String>, TurnOutcome)
+where
+    Execute: FnOnce(Arc<ChatResources>) -> ExecuteFuture,
+    ExecuteFuture: std::future::Future<Output = Result<TurnOutcome, String>>,
+{
     let identity_error = if resources.conv_id.as_deref() != Some(lease.conversation_id()) {
         Some("foreground conversation id does not match chat resources".to_string())
     } else if resources.root_message_id != lease.turn_id() {
@@ -563,8 +851,7 @@ pub async fn drive_foreground_chat(
             "foreground_turn",
             error.clone(),
         ));
-        lease.settle(outcome);
-        return Err(error);
+        return (Err(error), outcome);
     }
 
     let cancel = lease.cancellation_token();
@@ -574,6 +861,9 @@ pub async fn drive_foreground_chat(
         cancel: cancel.clone(),
         delivery: Arc::clone(&delivery),
     });
+    // Memory merge copies `review_integration` and the exact caller-pinned
+    // `memory_generation` into this controlled view. This wrapper must never
+    // reacquire a generation while decorating the sink.
     let controlled_resources = Arc::new(ChatResources {
         pool: resources.pool.clone(),
         store: resources.store.clone(),
@@ -589,23 +879,42 @@ pub async fn drive_foreground_chat(
         layer_manager: resources.layer_manager.clone(),
         memory_generation: resources.memory_generation.clone(),
     });
-    let result = normalize_downstream_outcome(
-        drive_chat(agent, turn, controlled_resources).await,
-        delivery.as_ref(),
-    );
+    let result =
+        normalize_downstream_outcome(execute(controlled_resources).await, delivery.as_ref());
     let settlement_outcome = result.clone().unwrap_or_else(|error| {
         TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
             "foreground_turn",
             error,
         ))
     });
-    lease.settle(settlement_outcome);
-    result
+    (result, settlement_outcome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct DropReceipt(Arc<AtomicBool>);
+
+    impl Drop for DropReceipt {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct OrderedReceipt {
+        name: &'static str,
+        releases: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Drop for OrderedReceipt {
+        fn drop(&mut self) {
+            self.releases
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(self.name);
+        }
+    }
 
     struct ClosedSink;
 
@@ -613,6 +922,86 @@ mod tests {
         fn on_event(&self, _event: ChatDriverEvent) -> bool {
             false
         }
+    }
+
+    #[test]
+    fn generation_receipts_release_in_reverse_acquisition_order() {
+        let releases = Arc::new(Mutex::new(Vec::new()));
+        let mut receipts = ForegroundExecutionReceipts::new(None);
+        receipts.retain(OrderedReceipt {
+            name: "task-runtime",
+            releases: Arc::clone(&releases),
+        });
+        receipts.retain(OrderedReceipt {
+            name: "memory",
+            releases: Arc::clone(&releases),
+        });
+
+        receipts.release_lifo();
+
+        let observed = releases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(observed, ["memory", "task-runtime"]);
+    }
+
+    #[test]
+    fn generation_receipt_drop_uses_the_same_reverse_order() {
+        let releases = Arc::new(Mutex::new(Vec::new()));
+        let mut receipts = ForegroundExecutionReceipts::new(None);
+        receipts.retain(OrderedReceipt {
+            name: "task-runtime",
+            releases: Arc::clone(&releases),
+        });
+        receipts.retain(OrderedReceipt {
+            name: "memory",
+            releases: Arc::clone(&releases),
+        });
+
+        drop(receipts);
+
+        let observed = releases
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(observed, ["memory", "task-runtime"]);
+    }
+
+    #[test]
+    fn supervision_rejection_releases_operation_before_typed_terminal() -> Result<(), String> {
+        let control = ForegroundTurnControl::default();
+        let lease = control
+            .begin(ForegroundTurnSurface::Channel, "conversation", "turn")
+            .map_err(|error| error.to_string())?;
+        let waiter = control
+            .request_cancel(ForegroundTurnSurface::Channel, "conversation", "turn")
+            .map_err(|error| error.to_string())?;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let receipt = DropReceipt(Arc::clone(&dropped));
+
+        let error = control
+            .supervise(lease, move |_lease| {
+                let _receipt = receipt;
+                async move {}
+            })
+            .err()
+            .ok_or_else(|| "supervision unexpectedly succeeded without a runtime".to_string())?;
+        assert!(matches!(error, ForegroundTurnError::RuntimeUnavailable(_)));
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "operation receipts must release before rejection is returned"
+        );
+
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+        let settlement = runtime
+            .block_on(waiter.wait())
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            settlement.outcome,
+            TurnOutcome::Failed(ref failure) if failure.code == "foreground_supervision"
+        ));
+        Ok(())
     }
 
     #[test]
@@ -781,6 +1170,119 @@ mod tests {
             Err(ForegroundTurnError::ShuttingDown)
         ));
         control.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn supervised_driver_owns_receipt_until_outer_settlement() -> Result<(), String> {
+        let control = ForegroundTurnControl::default();
+        let lease = control
+            .begin(ForegroundTurnSurface::Channel, "conversation", "turn")
+            .map_err(|error| error.to_string())?;
+        let token = lease.cancellation_token();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let receipt = DropReceipt(Arc::clone(&dropped));
+        control
+            .supervise(lease, move |lease| async move {
+                let _receipt = receipt;
+                token.cancelled().await;
+                let _released = release_rx.await;
+                lease.settle(TurnOutcome::Cancelled);
+            })
+            .map_err(|error| error.to_string())?;
+
+        let shutdown_control = control.clone();
+        let mut shutdown = tokio::spawn(async move { shutdown_control.shutdown().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let cancellation_requested = control
+                    .snapshot(ForegroundTurnSurface::Channel, "conversation")
+                    .is_some_and(|snapshot| snapshot.cancellation_requested);
+                if cancellation_requested {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "shutdown did not cancel the supervised driver".to_string())?;
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must await the owner task, not only the foreground watch receipt"
+        );
+
+        release_tx
+            .send(())
+            .map_err(|_| "supervised driver release receiver closed".to_string())?;
+        shutdown
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(dropped.load(Ordering::SeqCst));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_owner_survives_waiter_abort_and_shares_driver_join_error()
+    -> Result<(), String> {
+        let control = ForegroundTurnControl::default();
+        let lease = control
+            .begin(ForegroundTurnSurface::Channel, "conversation", "turn")
+            .map_err(|error| error.to_string())?;
+        let token = lease.cancellation_token();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let receipt = DropReceipt(Arc::clone(&dropped));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (panic_tx, panic_rx) = tokio::sync::oneshot::channel();
+        control
+            .supervise(lease, move |lease| async move {
+                let _receipt = receipt;
+                let _started = started_tx.send(());
+                lease.cancellation_token().cancelled().await;
+                let trigger = panic_rx.await;
+                assert!(
+                    trigger.is_err(),
+                    "injected foreground driver panic after cancellation"
+                );
+                lease.settle(TurnOutcome::Cancelled);
+            })
+            .map_err(|error| error.to_string())?;
+        started_rx
+            .await
+            .map_err(|_| "foreground driver did not start".to_string())?;
+
+        let first_control = control.clone();
+        let first = tokio::spawn(async move { first_control.shutdown().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled())
+            .await
+            .map_err(|_| "shutdown did not cancel the driver".to_string())?;
+        let second_control = control.clone();
+        let second = tokio::spawn(async move { second_control.shutdown().await });
+        let third_control = control.clone();
+        let third = tokio::spawn(async move { third_control.shutdown().await });
+        first.abort();
+        let _first_join = first.await;
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "aborting one shutdown waiter must not drop the owned driver receipt"
+        );
+
+        panic_tx
+            .send(())
+            .map_err(|_| "foreground panic trigger receiver closed".to_string())?;
+        let second_result = second.await.map_err(|error| error.to_string())?;
+        let third_result = third.await.map_err(|error| error.to_string())?;
+        assert_eq!(second_result, third_result);
+        assert!(matches!(
+            &second_result,
+            Err(ForegroundTurnError::DriverSettlement(message)) if message.contains("panicked")
+        ));
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(control.shutdown().await, second_result);
+        Ok(())
     }
 
     #[tokio::test]

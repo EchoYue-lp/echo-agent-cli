@@ -224,7 +224,7 @@ impl ReplHumanLoopSession {
         }
     }
 
-    pub(crate) async fn shutdown(mut self, reason: &str) -> anyhow::Result<()> {
+    pub async fn shutdown(mut self, reason: &str) -> anyhow::Result<()> {
         if let Some(registration) = self.registration.take() {
             registration.unregister();
         }

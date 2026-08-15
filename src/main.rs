@@ -298,7 +298,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             },
         )
         .await;
-        let (_, tui_scheduler, tui_app_state) = match tui_services {
+        let tui_services = match tui_services {
             Ok(services) => services,
             Err(error) => {
                 let error = infra::settle_service_bootstrap_failure(
@@ -315,6 +315,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 return Err(error);
             }
         };
+        let tui_scheduler = tui_services.scheduler_runner.clone();
+        let tui_app_state = tui_services.app_state.clone();
         if let Some(scheduler) = tui_scheduler.as_ref()
             && let Err(error) = runtime
                 .plugin_runtime
@@ -406,6 +408,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         {
             tracing::warn!(%error, "failed to settle TUI background reviews");
         }
+        // Memory merge point: settle ReviewIntegration here, after foreground
+        // receipts and before the workspace transition owner.
         if let Err(error) = tui_app_state.shutdown_workspace_transition().await {
             tracing::warn!(%error, "failed to settle TUI workspace transition");
         }
@@ -443,6 +447,81 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let run_cli = args.cli;
     let run_channels = args.channels;
 
+    // CLI is the sole Reedline/stdin owner. Register its HITL transport
+    // before scheduler and TaskRun recovery can emit interactive requests.
+    let mut repl_hitl_session = if run_cli {
+        Some(cli::ReplHumanLoopSession::register(runtime.hitl_dispatcher.clone()).await)
+    } else {
+        None
+    };
+
+    // CLI-only, channel-only, and combined mode share one application service
+    // bootstrap. Surface composition below only owns input/output lifetimes.
+    let headless_services = match cli::start_headless_services(
+        agent_handle.clone(),
+        runtime.hitl_dispatcher.clone(),
+        &app_config,
+        cli::HeadlessServiceResources {
+            model_consumers: runtime.model_consumers.clone(),
+            active_model_id: runtime.active_runtime_model.id.clone(),
+            pool: pool.clone(),
+            task_runtime_store: task_runtime_store.clone(),
+            webhook_emitter: webhook_emitter.clone(),
+            conversation_store: conversation_store.clone(),
+            review_integration: runtime.review_integration.clone(),
+            mcp_config_runtime: runtime.mcp_config_runtime.clone(),
+            plugin_runtime: runtime.plugin_runtime.clone(),
+            config_watcher: config_watcher.clone(),
+            foreground_turns: foreground_turns.clone(),
+        },
+    )
+    .await
+    {
+        Ok(services) => services,
+        Err(error) => {
+            let hitl_shutdown_error = match repl_hitl_session.take() {
+                Some(session) => session.shutdown("CLI bootstrap failed").await.err(),
+                None => None,
+            };
+            let error = infra::settle_service_bootstrap_failure(
+                anyhow::anyhow!(error),
+                task_runtime_store.as_ref(),
+                Some(&pool),
+                &runtime.plugin_runtime,
+                &config_watcher,
+                &runtime.mcp_config_runtime,
+                &runtime.browser_runtime,
+            )
+            .await;
+            cancel_token.cancel();
+            return match hitl_shutdown_error {
+                Some(hitl_error) => Err(anyhow::anyhow!(
+                    "{error}; REPL HITL bootstrap shutdown failed: {hitl_error}"
+                )),
+                None => Err(error),
+            };
+        }
+    };
+    if let Some(scheduler) = headless_services.scheduler_runner.as_ref()
+        && let Err(error) = runtime
+            .plugin_runtime
+            .bind_scheduler(scheduler.clone())
+            .await
+    {
+        tracing::warn!(%error, "failed to bind plugin monitors to headless scheduler");
+    }
+
+    let dreaming_owner = runtime.review_integration.as_ref().map(|integration| {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let settlement = echo_agent_app_core::infra::spawn_dreaming_task(
+            integration.clone(),
+            agent_handle.clone(),
+            Some(pool.clone()),
+            cancel.clone(),
+        );
+        cli::HeadlessDreamingOwner::new(cancel, settlement)
+    });
+
     let mut mode_error: Option<anyhow::Error> = None;
     if run_channels {
         #[cfg(feature = "channels")]
@@ -451,8 +530,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 pool_size = pool.pool_size().await,
                 "AgentPool initialized for channels (IM per-sender agents)"
             );
-            pool.spawn_cleanup_monitor().await;
-
             let channels_cancel = echo_agent::agent::CancellationToken::new();
             let channels_handle = tokio::spawn(cli::run_channels_mode(
                 pool.clone(),
@@ -467,13 +544,54 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             if run_cli {
                 let companion_shutdown =
                     cli::CompanionModeShutdown::new("channels", channels_cancel, channels_handle);
-                if let Err(error) = cli::run_cli_mode(
-                    agent_handle,
-                    runtime.model_consumers.clone(),
-                    runtime.active_runtime_model.id.clone(),
-                    runtime.hitl_dispatcher.clone(),
+                let cli_result = match repl_hitl_session.take() {
+                    Some(session) => {
+                        cli::run_cli_mode(
+                            agent_handle.clone(),
+                            &args,
+                            runtime.review_integration.clone(),
+                            runtime.prompt_assembly.clone(),
+                            pool.clone(),
+                            task_runtime_store.clone(),
+                            conversation_id.clone(),
+                            webhook_emitter.clone(),
+                            runtime.plugin_runtime.clone(),
+                            &headless_services,
+                            session,
+                            Some(companion_shutdown),
+                        )
+                        .await
+                    }
+                    None => Err(anyhow::anyhow!("CLI HITL session owner is unavailable")),
+                };
+                if let Err(error) = cli_result {
+                    mode_error = Some(error);
+                }
+            } else {
+                match channels_handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => mode_error = Some(error),
+                    Err(error) => {
+                        mode_error = Some(anyhow::anyhow!(
+                            "channel lifecycle owner failed to join: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "channels"))]
+        {
+            mode_error = Some(anyhow::anyhow!(
+                "--channels 需要启用 channels feature: cargo build --features channels"
+            ));
+        }
+    } else if run_cli {
+        // 仅 CLI 模式
+        let cli_result = match repl_hitl_session.take() {
+            Some(session) => {
+                cli::run_cli_mode(
+                    agent_handle.clone(),
                     &args,
-                    &app_config,
                     runtime.review_integration.clone(),
                     runtime.prompt_assembly.clone(),
                     pool.clone(),
@@ -481,83 +599,15 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     conversation_id.clone(),
                     webhook_emitter.clone(),
                     runtime.plugin_runtime.clone(),
-                    runtime.mcp_config_runtime.clone(),
-                    config_watcher.clone(),
-                    conversation_store.clone(),
-                    foreground_turns.clone(),
-                    Some(companion_shutdown),
+                    &headless_services,
+                    session,
+                    None,
                 )
                 .await
-                {
-                    mode_error = Some(error);
-                }
-            } else {
-                // 仅 channels 模式，等待 channels 或 Ctrl+C
-                let channels_result = channels_handle.await;
-                if let Err(error) = foreground_turns.shutdown().await {
-                    tracing::warn!(%error, "failed to settle channel foreground turns");
-                }
-                if let Some(integration) = runtime.review_integration.as_ref()
-                    && let Err(error) = integration.shutdown_background_reviews().await
-                {
-                    tracing::warn!(%error, "failed to settle channel background reviews");
-                }
-                if let Some(store) = task_runtime_store.as_ref()
-                    && let Err(error) = store.shutdown_run_drivers().await
-                {
-                    tracing::warn!(%error, "failed to settle channel TaskRun drivers");
-                }
-                if let Err(error) = pool.shutdown().await {
-                    tracing::warn!(%error, "failed to shut down channels agent pool");
-                }
-                if let Err(error) = runtime.plugin_runtime.shutdown().await {
-                    tracing::warn!(%error, "failed to shut down channels plugin runtime");
-                }
-                if let Err(error) = config_watcher.shutdown().await {
-                    tracing::warn!(%error, "failed to shut down channels config watcher");
-                }
-                runtime.mcp_config_runtime.shutdown().await;
-                runtime.browser_runtime.shutdown().await;
-                if let Some(store) = task_runtime_store.as_ref()
-                    && let Err(error) = store.shutdown_hook_events().await
-                {
-                    tracing::warn!(%error, "failed to shut down task hook dispatcher");
-                }
-                cancel_token.cancel();
-                channels_result??;
-                return Ok(());
             }
-        }
-        #[cfg(not(feature = "channels"))]
-        {
-            tracing::error!(
-                "--channels 需要启用 channels feature: cargo build --features channels"
-            );
-        }
-    } else if run_cli {
-        // 仅 CLI 模式
-        if let Err(error) = cli::run_cli_mode(
-            agent_handle,
-            runtime.model_consumers.clone(),
-            runtime.active_runtime_model.id.clone(),
-            runtime.hitl_dispatcher.clone(),
-            &args,
-            &app_config,
-            runtime.review_integration.clone(),
-            runtime.prompt_assembly.clone(),
-            pool.clone(),
-            task_runtime_store.clone(),
-            conversation_id,
-            webhook_emitter,
-            runtime.plugin_runtime.clone(),
-            runtime.mcp_config_runtime.clone(),
-            config_watcher.clone(),
-            conversation_store.clone(),
-            foreground_turns,
-            None,
-        )
-        .await
-        {
+            None => Err(anyhow::anyhow!("CLI HITL session owner is unavailable")),
+        };
+        if let Err(error) = cli_result {
             mode_error = Some(error);
         }
     } else {
@@ -567,40 +617,29 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         ));
     }
 
-    // Keep runtime alive until shutdown
-    if let Some(integration) = runtime.review_integration.as_ref()
-        && let Err(error) = integration.shutdown_background_reviews().await
+    if let Some(session) = repl_hitl_session.take()
+        && let Err(error) = session.shutdown("CLI mode did not start").await
     {
-        tracing::warn!(%error, "failed to settle background reviews");
+        mode_error = Some(match mode_error {
+            Some(previous) => anyhow::anyhow!("{previous}; REPL HITL shutdown: {error}"),
+            None => anyhow::anyhow!("REPL HITL shutdown: {error}"),
+        });
     }
-    if let Some(store) = task_runtime_store.as_ref()
-        && let Err(error) = store.shutdown_run_drivers().await
-    {
-        tracing::warn!(%error, "failed to settle TaskRun drivers");
-    }
-    if let Err(error) = pool.shutdown().await {
-        tracing::warn!(%error, "failed to shut down agent pool");
-    }
-    if let Err(error) = runtime.plugin_runtime.shutdown().await {
-        tracing::warn!(%error, "failed to shut down plugin runtime");
-    }
-    if let Err(error) = config_watcher.shutdown().await {
-        tracing::warn!(%error, "failed to shut down config watcher");
-    }
-    runtime.mcp_config_runtime.shutdown().await;
-    runtime.browser_runtime.shutdown().await;
-    if let Some(store) = task_runtime_store.as_ref()
-        && let Err(error) = store.shutdown_hook_events().await
-    {
-        tracing::warn!(%error, "failed to shut down task hook dispatcher");
-    }
+    let mode_result = mode_error.map_or(Ok(()), Err);
+    let shutdown_result = cli::shutdown_headless_services(
+        mode_result,
+        headless_services,
+        dreaming_owner,
+        run_cli.then_some(agent_handle.clone()),
+        runtime.plugin_runtime.clone(),
+        config_watcher.clone(),
+        runtime.mcp_config_runtime.clone(),
+        runtime.browser_runtime.clone(),
+        cancel_token.clone(),
+    )
+    .await;
     drop(runtime);
-    cancel_token.cancel();
-
-    match mode_error {
-        Some(error) => Err(error),
-        None => Ok(()),
-    }
+    shutdown_result
 }
 
 // ── 单元测试 ─────────────────────────────────────────────────────

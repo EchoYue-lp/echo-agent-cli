@@ -240,6 +240,65 @@ pub async fn drive_chat(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
 ) -> Result<TurnOutcome, String> {
+    match prepare_chat_execution(turn, res)? {
+        ChatExecutionPreparation::Ready(prepared) => {
+            drive_prepared_chat(agent.clone(), turn, prepared, None).await
+        }
+        ChatExecutionPreparation::Settled(outcome) => Ok(outcome),
+    }
+}
+
+/// Drive one top-level pooled conversation without reversing the canonical
+/// `TaskRuntime -> Memory -> pool` acquisition order.
+///
+/// The returned pool lease is retained by the existing TaskRun supervisor when
+/// a store is configured. No second lifecycle owner is introduced here.
+pub async fn drive_pooled_chat<Configure, ConfigureFuture>(
+    pool: std::sync::Arc<crate::agent_pool::AgentPool>,
+    pool_key: &str,
+    configure: Configure,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+) -> Result<TurnOutcome, String>
+where
+    Configure: FnOnce(AgentHandle) -> ConfigureFuture,
+    ConfigureFuture: std::future::Future<Output = Result<(), String>>,
+{
+    let prepared = match prepare_chat_execution(turn, res)? {
+        ChatExecutionPreparation::Ready(prepared) => prepared,
+        ChatExecutionPreparation::Settled(outcome) => return Ok(outcome),
+    };
+    let execution = pool
+        .acquire(pool_key)
+        .await
+        .map_err(|error| format!("AgentPool admission failed: {error}"))?;
+    let agent = execution.agent();
+    configure(agent.clone()).await?;
+    drive_prepared_chat(agent, turn, prepared, Some(execution)).await
+}
+
+enum ChatExecutionPreparation {
+    Ready(PreparedChatExecution),
+    Settled(TurnOutcome),
+}
+
+struct PreparedChatExecution {
+    turn_id: String,
+    formal_run_id: String,
+    task_driver_registration:
+        Option<crate::tasks::task_runtime::store::RegisteredRunDriver<TurnOutcome>>,
+    resources: std::sync::Arc<crate::chat_resources::ChatResources>,
+    cancel: echo_agent::agent::CancellationToken,
+    sink: std::sync::Arc<dyn ChatSink>,
+    trace_sink: crate::tasks::task_runtime::task_tools::TraceSink,
+    interaction_mode: crate::tasks::task_runtime::InteractionMode,
+    store: Option<std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+}
+
+fn prepare_chat_execution(
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+) -> Result<ChatExecutionPreparation, String> {
     // Scope a per-turn run_id so task tools (task_create /
     // task_execute / create_complex_task) can read it via require_run_id().
     // Use root_message_id (unique per turn, set by all callers); fall back to
@@ -307,7 +366,9 @@ pub async fn drive_chat(
                     tracing::error!(%envelope_error, "failed to report memory admission failure");
                 }
             }
-            return Ok(TurnOutcome::Failed(failure));
+            return Ok(ChatExecutionPreparation::Settled(TurnOutcome::Failed(
+                failure,
+            )));
         }
     };
     let layer_manager = memory_generation
@@ -357,27 +418,50 @@ pub async fn drive_chat(
             return Err(error);
         }
     }
-    let result = if let Some(registration) = task_driver_registration.take() {
-        let driver_store = store
+    Ok(ChatExecutionPreparation::Ready(PreparedChatExecution {
+        turn_id,
+        formal_run_id,
+        task_driver_registration,
+        resources: res,
+        cancel,
+        sink,
+        trace_sink,
+        interaction_mode,
+        store,
+    }))
+}
+
+async fn drive_prepared_chat(
+    agent: AgentHandle,
+    turn: &crate::prepared_turn::PreparedUserTurn,
+    mut prepared: PreparedChatExecution,
+    pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+) -> Result<TurnOutcome, String> {
+    let result = if let Some(registration) = prepared.task_driver_registration.take() {
+        let store = prepared
+            .store
             .as_ref()
             .ok_or_else(|| "chat driver registration lost TaskRuntimeStore".to_string())?
             .clone();
-        let owned_agent = agent.clone();
+        let owned_agent = agent;
         let owned_turn = turn.clone();
-        let owned_resources = res.clone();
-        let owned_run_id = formal_run_id.clone();
-        let owned_turn_id = turn_id.clone();
-        let owned_cancel = cancel.clone();
-        let owned_trace_sink = trace_sink.clone();
-        let waiter = registration.start(move |receipt_owner| async move {
+        let owned_resources = prepared.resources.clone();
+        let owned_run_id = prepared.formal_run_id.clone();
+        let owned_turn_id = prepared.turn_id.clone();
+        let owned_cancel = prepared.cancel.clone();
+        let owned_trace_sink = prepared.trace_sink.clone();
+        let interaction_mode = prepared.interaction_mode;
+        let waiter = registration.start(move |mut receipt_owner| async move {
             let driver_execution_context = receipt_owner.execution_context_id();
-            let mut receipt_owner = receipt_owner;
             if let Some(generation) = owned_resources.memory_generation.as_ref() {
                 receipt_owner.retain(generation.clone());
             }
+            if let Some(execution) = pool_execution {
+                receipt_owner.retain(execution);
+            }
             let _projection_registration =
                 crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
-                    .register(owned_run_id.clone(), driver_store.clone());
+                    .register(owned_run_id.clone(), store.clone());
             let result = crate::tasks::task_runtime::task_tools::with_run_context(
                 owned_run_id.clone(),
                 owned_cancel.clone(),
@@ -393,7 +477,7 @@ pub async fn drive_chat(
             .await;
             if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
                 finalize_task_mode_run(
-                    Some(&driver_store),
+                    Some(&store),
                     &owned_run_id,
                     owned_cancel.is_cancelled(),
                     Some(&owned_trace_sink),
@@ -405,30 +489,40 @@ pub async fn drive_chat(
             .await
             .map_err(|error| format!("chat driver result waiter failed: {error}"))?
     } else {
-        let turn_id_for_inner = turn_id.clone();
-        let _projection_registration = res.store.as_ref().map(|store| {
+        let _pool_execution = pool_execution;
+        let _projection_registration = prepared.store.as_ref().map(|store| {
             crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
-                .register(formal_run_id.clone(), std::sync::Arc::clone(store))
+                .register(prepared.formal_run_id.clone(), std::sync::Arc::clone(store))
         });
         crate::tasks::task_runtime::task_tools::with_run_context(
-            formal_run_id.clone(),
-            cancel,
-            Some(trace_sink.clone()),
-            drive_chat_inner(agent, turn, res, turn_id_for_inner, None),
+            prepared.formal_run_id.clone(),
+            prepared.cancel.clone(),
+            Some(prepared.trace_sink.clone()),
+            drive_chat_inner(
+                &agent,
+                turn,
+                prepared.resources.clone(),
+                prepared.turn_id.clone(),
+                None,
+            ),
         )
         .await
     };
-    let requested_mode = interaction_mode.as_str();
-    let observed_path =
-        observe_execution_path(store.as_ref(), &formal_run_id, &turn_id, requested_mode);
-    let _ = sink.on_event(ChatDriverEvent::ExecutionPath {
+    let requested_mode = prepared.interaction_mode.as_str();
+    let observed_path = observe_execution_path(
+        prepared.store.as_ref(),
+        &prepared.formal_run_id,
+        &prepared.turn_id,
+        requested_mode,
+    );
+    let _ = prepared.sink.on_event(ChatDriverEvent::ExecutionPath {
         requested_mode: requested_mode.to_string(),
         observed_path: observed_path.to_string(),
     });
     tracing::info!(
         requested_mode,
         observed_path,
-        turn_id,
+        turn_id = %prepared.turn_id,
         "chat execution path observed"
     );
     result
@@ -981,6 +1075,71 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "pinned memory generation was discarded".to_string())?;
         assert_eq!(resolved.echo_agent_dir(), pinned_root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pooled_chat_rejects_closed_task_runtime_before_pool_admission() -> Result<(), String> {
+        use echo_agent::agent::{CancellationToken, ReactAgentBuilder};
+        use echo_agent::testing::MockLlmClient;
+        use std::sync::Arc;
+
+        let agent = AgentHandle::new(
+            ReactAgentBuilder::new()
+                .model("pooled-order")
+                .llm_client(Arc::new(
+                    MockLlmClient::new().with_model_name("pooled-order"),
+                ))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let pool =
+            Arc::new(crate::agent_pool::AgentPool::new_for_test(agent, None, None, 3, false).await);
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let configured = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let configured_for_call = configured.clone();
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            pool: Some(pool.clone()),
+            store: Some(store),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("pooled-order-conversation".to_string()),
+            root_message_id: "pooled-order-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            mode_hint: None,
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Chat,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+        });
+        let result = drive_pooled_chat(
+            pool.clone(),
+            "pooled-order-conversation",
+            move |_agent| async move {
+                configured_for_call.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            &make_turn("do not enter the pool", None),
+            resources,
+        )
+        .await;
+
+        let error = match result {
+            Ok(outcome) => return Err(format!("closed TaskRuntime admitted {outcome:?}")),
+            Err(error) => error,
+        };
+        assert!(error.contains("admission"));
+        assert!(!configured.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(pool.pool_size().await, 0);
         Ok(())
     }
 

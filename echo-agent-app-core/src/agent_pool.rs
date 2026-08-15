@@ -79,6 +79,8 @@ pub enum PoolError {
     ShuttingDown,
     /// The in-process execution lease counter cannot admit another owner.
     ExecutionLeaseCapacity,
+    /// The caller attempted to retire a pool entry with another key/pool's receipt.
+    ExecutionLeaseMismatch,
 }
 
 impl std::fmt::Display for PoolError {
@@ -101,6 +103,9 @@ impl std::fmt::Display for PoolError {
             }
             PoolError::ExecutionLeaseCapacity => {
                 write!(f, "Agent pool execution lease capacity exhausted")
+            }
+            PoolError::ExecutionLeaseMismatch => {
+                write!(f, "Agent pool execution lease does not own this pool entry")
             }
         }
     }
@@ -277,6 +282,12 @@ impl AgentPoolExecutionLease {
             admission: None,
         }
     }
+
+    fn owns(&self, admission: &Arc<AgentPoolAdmission>, key: &str) -> bool {
+        self.admission
+            .as_ref()
+            .is_some_and(|(owner, owned_key)| Arc::ptr_eq(owner, admission) && owned_key == key)
+    }
 }
 
 impl Drop for AgentPoolExecutionLease {
@@ -300,6 +311,14 @@ impl Drop for AgentPoolExecutionLease {
         if released_last {
             admission.idle.notify_waiters();
         }
+    }
+}
+
+impl crate::tasks::task_runtime::store::RunDriverExecutionReceipt for AgentPoolExecutionLease {
+    fn release(self: Box<Self>) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(async move {
+            drop(self);
+        })
     }
 }
 
@@ -705,16 +724,20 @@ impl AgentPool {
             .transpose()
     }
 
-    /// Release an agent from the pool (marks for cleanup).
-    pub async fn release(&self, conversation_id: &str) {
-        let mut agents = self.agents.write().await;
-        if let Some(pa) = agents.remove(conversation_id) {
-            tracing::info!(
-                conv_id = %conversation_id,
-                age_secs = pa.created_at.elapsed().as_secs(),
-                "AgentPool: agent released"
-            );
+    /// Retire one cached agent using the exact execution receipt that owns it.
+    /// The receipt and cache decision settle under the same pool lock, so reset
+    /// cannot remove a generation still used by another accepted execution.
+    pub async fn retire_execution(
+        &self,
+        conversation_id: &str,
+        execution: AgentPoolExecutionLease,
+    ) -> Result<bool, PoolError> {
+        if !execution.owns(&self.admission, conversation_id) {
+            return Err(PoolError::ExecutionLeaseMismatch);
         }
+        Ok(self
+            .release_supervised_execution(conversation_id, execution)
+            .await)
     }
 
     /// Release one exact supervised execution receipt. Dropping the receipt
@@ -725,19 +748,21 @@ impl AgentPool {
         &self,
         conversation_id: &str,
         execution: AgentPoolExecutionLease,
-    ) {
+    ) -> bool {
         let mut agents = self.agents.write().await;
         drop(execution);
         if self.admission.is_active(conversation_id) {
-            return;
+            return false;
         }
-        if let Some(agent) = agents.remove(conversation_id) {
+        let removed = agents.remove(conversation_id);
+        if let Some(agent) = removed.as_ref() {
             tracing::info!(
                 conv_id = %conversation_id,
                 age_secs = agent.created_at.elapsed().as_secs(),
                 "AgentPool: supervised agent released"
             );
         }
+        removed.is_some()
     }
 
     #[cfg(test)]
@@ -1574,21 +1599,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pool_release_removes_agent() -> TestResult {
+    async fn test_exact_execution_retirement_removes_agent() -> TestResult {
         let pool = create_test_pool(5, false).await?;
 
-        let _h = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
+        let execution = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
         assert_eq!(pool.pool_size().await, 1);
 
-        pool.release("conv-1").await;
+        assert!(
+            pool.retire_execution("conv-1", execution)
+                .await
+                .map_err(|error| error.to_string())?
+        );
         assert_eq!(pool.pool_size().await, 0);
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_release_nonexistent_is_noop() -> TestResult {
+    async fn exact_execution_retirement_rejects_wrong_key() -> TestResult {
         let pool = create_test_pool(5, false).await?;
-        pool.release("nonexistent").await;
+        let execution = pool.acquire("owned").await.map_err(|e| e.to_string())?;
+        assert!(matches!(
+            pool.retire_execution("other", execution).await,
+            Err(PoolError::ExecutionLeaseMismatch)
+        ));
+        assert_eq!(pool.pool_size().await, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_execution_retirement_waits_for_overlapping_same_key_receipt() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
+        let first = pool.acquire("shared").await.map_err(|e| e.to_string())?;
+        let second = pool.acquire("shared").await.map_err(|e| e.to_string())?;
+
+        assert!(
+            !pool
+                .retire_execution("shared", first)
+                .await
+                .map_err(|error| error.to_string())?
+        );
+        assert_eq!(pool.pool_size().await, 1);
+        assert!(
+            pool.retire_execution("shared", second)
+                .await
+                .map_err(|error| error.to_string())?
+        );
         assert_eq!(pool.pool_size().await, 0);
         Ok(())
     }
@@ -2124,13 +2179,17 @@ mod tests {
     async fn test_released_task_subagent_frees_pool_capacity() -> TestResult {
         let pool = create_test_pool(1, false).await?;
 
-        let _task_a = pool
+        let task_a = pool
             .acquire("__task__:task-a")
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(pool.pool_size().await, 1);
 
-        pool.release("__task__:task-a").await;
+        assert!(
+            pool.retire_execution("__task__:task-a", task_a)
+                .await
+                .map_err(|error| error.to_string())?
+        );
         assert_eq!(pool.pool_size().await, 0);
 
         let task_b = pool.acquire("__task__:task-b").await;

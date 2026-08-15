@@ -19,6 +19,7 @@ pub use args::Args;
 #[cfg(feature = "channels")]
 pub use modes::run_channels_mode;
 pub use modes::{
-    CompanionModeShutdown, HeadlessServiceResources, run_cli_mode, start_headless_services,
+    CompanionModeShutdown, HeadlessDreamingOwner, HeadlessServiceResources, HeadlessServices,
+    run_cli_mode, shutdown_headless_services, start_headless_services,
 };
 pub use repl::{ReplConfig, ReplHumanLoopSession, run_repl};

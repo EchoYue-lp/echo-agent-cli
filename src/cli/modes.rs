@@ -52,16 +52,19 @@ impl CompanionModeShutdown {
 impl Drop for CompanionModeShutdown {
     fn drop(&mut self) {
         self.cancel.cancel();
+        if let Some(settlement) = self.settlement.take() {
+            settlement.abort();
+        }
     }
 }
 
-struct CliDreamingOwner {
+pub struct HeadlessDreamingOwner {
     cancel: tokio_util::sync::CancellationToken,
     settlement: Option<tokio::task::JoinHandle<()>>,
 }
 
-impl CliDreamingOwner {
-    fn new(
+impl HeadlessDreamingOwner {
+    pub fn new(
         cancel: tokio_util::sync::CancellationToken,
         settlement: tokio::task::JoinHandle<()>,
     ) -> Self {
@@ -71,7 +74,7 @@ impl CliDreamingOwner {
         }
     }
 
-    async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(mut self) -> Result<()> {
         self.cancel.cancel();
         let settlement = self
             .settlement
@@ -83,7 +86,7 @@ impl CliDreamingOwner {
     }
 }
 
-impl Drop for CliDreamingOwner {
+impl Drop for HeadlessDreamingOwner {
     fn drop(&mut self) {
         self.cancel.cancel();
         if let Some(settlement) = self.settlement.take() {
@@ -154,16 +157,21 @@ pub struct HeadlessServiceResources {
     pub foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
 }
 
+/// Composition receipt for the single headless bootstrap shared by CLI and
+/// channel surfaces. It contains no independent lifecycle state; shutdown is
+/// delegated to the existing AppState subsystem owners.
+pub struct HeadlessServices {
+    pub task_service: Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    pub scheduler_runner: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    pub app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
+}
+
 pub async fn start_headless_services(
     agent: AgentHandle,
     hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
     app_config: &AppConfig,
     resources: HeadlessServiceResources,
-) -> Result<(
-    Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
-    Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
-    std::sync::Arc<echo_agent_app_core::state::AppState>,
-)> {
+) -> Result<HeadlessServices> {
     let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
         let file_path =
             echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
@@ -197,18 +205,18 @@ pub async fn start_headless_services(
         .await?;
     let task_service = state.tasks.service.clone();
     let scheduler = state.scheduler.runner.clone();
-    Ok((task_service, scheduler, std::sync::Arc::new(state)))
+    Ok(HeadlessServices {
+        task_service,
+        scheduler_runner: scheduler,
+        app_state: std::sync::Arc::new(state),
+    })
 }
 
 /// 运行 CLI 模式
 #[allow(clippy::too_many_arguments)] // startup adapter wires the shared agent, pool, stores, and UI services once
 pub async fn run_cli_mode(
     agent: AgentHandle,
-    model_consumers: echo_agent_app_core::infra::AgentModelConsumers,
-    active_model_id: String,
-    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
     args: &Args,
-    app_config: &AppConfig,
     review_integration: Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
     pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
@@ -218,127 +226,23 @@ pub async fn run_cli_mode(
     conversation_id: String,
     webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
-    mcp_config_runtime: std::sync::Arc<echo_agent_app_core::mcp_config_runtime::McpConfigRuntime>,
-    config_watcher: std::sync::Arc<echo_agent_app_core::config_watcher::ConfigWatcherHandle>,
-    conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
-    foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    services: &HeadlessServices,
+    repl_hitl_session: crate::cli::ReplHumanLoopSession,
     companion_shutdown: Option<CompanionModeShutdown>,
 ) -> Result<()> {
     let mut companion_shutdown = companion_shutdown;
-    let repl_hitl_session =
-        crate::cli::ReplHumanLoopSession::register(hitl_dispatcher.clone()).await;
-    let service_result = start_headless_services(
-        agent.clone(),
-        hitl_dispatcher,
-        app_config,
-        HeadlessServiceResources {
-            model_consumers,
-            active_model_id,
-            pool: pool.clone(),
-            task_runtime_store: task_runtime_store.clone(),
-            webhook_emitter: webhook_emitter.clone(),
-            conversation_store,
-            review_integration: review_integration.clone(),
-            mcp_config_runtime,
-            plugin_runtime: plugin_runtime.clone(),
-            config_watcher,
-            foreground_turns: foreground_turns.clone(),
-        },
-    )
-    .await;
-    let (task_service, scheduler_runner, app_state) = match service_result {
-        Ok(services) => services,
-        Err(error) => {
-            let mut steps = vec![CliShutdownStep {
-                name: "REPL HITL session",
-                future: Box::pin(repl_hitl_session.shutdown("CLI bootstrap failed")),
-            }];
-            if let Some(companion) = companion_shutdown.take() {
-                steps.push(CliShutdownStep {
-                    name: companion.name,
-                    future: Box::pin(companion.shutdown()),
-                });
-            }
-            steps.extend([
-                CliShutdownStep {
-                    name: "foreground turns",
-                    future: Box::pin(async {
-                        foreground_turns
-                            .shutdown()
-                            .await
-                            .map_err(|shutdown_error| anyhow::anyhow!(shutdown_error))
-                    }),
-                },
-                CliShutdownStep {
-                    name: "memory review",
-                    future: Box::pin(async {
-                        if let Some(integration) = review_integration.as_ref() {
-                            integration
-                                .shutdown_background_reviews()
-                                .await
-                                .map_err(anyhow::Error::msg)?;
-                        }
-                        Ok(())
-                    }),
-                },
-                CliShutdownStep {
-                    name: "TaskRun drivers",
-                    future: Box::pin(async {
-                        if let Some(store) = task_runtime_store.as_ref() {
-                            store
-                                .shutdown_run_drivers()
-                                .await
-                                .map_err(|shutdown_error| anyhow::anyhow!(shutdown_error))?;
-                        }
-                        Ok(())
-                    }),
-                },
-                CliShutdownStep {
-                    name: "agent pool",
-                    future: Box::pin(async { pool.shutdown().await.map_err(anyhow::Error::msg) }),
-                },
-                CliShutdownStep {
-                    name: "plugin runtime",
-                    future: Box::pin(async { plugin_runtime.shutdown().await }),
-                },
-            ]);
-            return drain_cli_shutdown(Err(error), steps).await;
-        }
-    };
-    if let Some(scheduler) = scheduler_runner.as_ref()
-        && let Err(error) = plugin_runtime.bind_scheduler(scheduler.clone()).await
-    {
-        tracing::warn!(%error, "failed to bind plugin monitors to CLI scheduler");
-    }
-
-    let dreaming_owner = review_integration.as_ref().map(|integration| {
-        let cancel = tokio_util::sync::CancellationToken::new();
-        let task = echo_agent_app_core::infra::spawn_dreaming_task(
-            integration.clone(),
-            agent.clone(),
-            Some(pool.clone()),
-            cancel.clone(),
-        );
-        tracing::info!("Dreaming task spawned for CLI session");
-        CliDreamingOwner::new(cancel, task)
-    });
-
     let mut repl_config = repl_config_for(args);
-    repl_config.task_service = task_service;
-    repl_config.scheduler_runner = scheduler_runner;
-    repl_config.review_integration = review_integration.clone();
+    repl_config.task_service = services.task_service.clone();
+    repl_config.scheduler_runner = services.scheduler_runner.clone();
+    repl_config.review_integration = review_integration;
     repl_config.prompt_assembly = Some(prompt_assembly);
     repl_config.pool = Some(pool.clone());
     repl_config.task_runtime_store = task_runtime_store.clone();
     repl_config.conversation_id = conversation_id;
     repl_config.webhook_emitter = Some(webhook_emitter);
     repl_config.plugin_runtime = Some(plugin_runtime.clone());
-    repl_config.app_state = Some(app_state.clone());
+    repl_config.app_state = Some(services.app_state.clone());
 
-    let auto_memory_agent = agent.clone();
-    let auto_memory_integration = review_integration.clone();
-    let session_review_integration = review_integration.clone();
-    let background_review_integration = review_integration.clone();
     let repl_result = crate::cli::run_repl(agent, repl_config, repl_hitl_session).await;
     let mut steps = Vec::new();
     if let Some(companion) = companion_shutdown.take() {
@@ -347,7 +251,31 @@ pub async fn run_cli_mode(
             future: Box::pin(companion.shutdown()),
         });
     }
-    steps.extend([
+    drain_cli_shutdown(repl_result, steps).await
+}
+
+/// Settle every shared headless owner exactly once after all product surfaces
+/// have stopped accepting work. Failures are aggregated without skipping later
+/// teardown steps.
+#[allow(clippy::too_many_arguments)]
+pub async fn shutdown_headless_services(
+    mode_result: Result<()>,
+    services: HeadlessServices,
+    dreaming_owner: Option<HeadlessDreamingOwner>,
+    session_exit_agent: Option<AgentHandle>,
+    plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    config_watcher: std::sync::Arc<echo_agent_app_core::config_watcher::ConfigWatcherHandle>,
+    mcp_config_runtime: std::sync::Arc<echo_agent_app_core::mcp_config_runtime::McpConfigRuntime>,
+    browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
+    root_cancel: tokio_util::sync::CancellationToken,
+) -> Result<()> {
+    let app_state = services.app_state;
+    let review_integration = app_state.review_integration.clone();
+    let auto_memory_integration = review_integration.clone();
+    let session_review_integration = review_integration.clone();
+    let background_review_integration = review_integration;
+    let run_session_review = session_exit_agent.is_some();
+    let steps = vec![
         CliShutdownStep {
             name: "foreground turns",
             future: Box::pin(async {
@@ -356,7 +284,7 @@ pub async fn run_cli_mode(
                     .foreground_turns
                     .shutdown()
                     .await
-                    .map_err(|error| anyhow::anyhow!(error))
+                    .map_err(anyhow::Error::from)
             }),
         },
         CliShutdownStep {
@@ -380,18 +308,19 @@ pub async fn run_cli_mode(
         CliShutdownStep {
             name: "auto-memory",
             future: Box::pin(async move {
-                crate::cli::repl::run_auto_memory_on_exit(
-                    &auto_memory_agent,
-                    &auto_memory_integration,
-                )
-                .await;
+                if let Some(agent) = session_exit_agent.as_ref() {
+                    crate::cli::repl::run_auto_memory_on_exit(agent, &auto_memory_integration)
+                        .await;
+                }
                 Ok(())
             }),
         },
         CliShutdownStep {
             name: "memory review",
             future: Box::pin(async move {
-                crate::cli::repl::run_memory_review_on_exit(&session_review_integration).await;
+                if run_session_review {
+                    crate::cli::repl::run_memory_review_on_exit(&session_review_integration).await;
+                }
                 if let Some(integration) = background_review_integration.as_ref() {
                     integration
                         .shutdown_background_reviews()
@@ -421,7 +350,7 @@ pub async fn run_cli_mode(
                     store
                         .shutdown_run_drivers()
                         .await
-                        .map_err(|error| anyhow::anyhow!(error))?;
+                        .map_err(anyhow::Error::msg)?;
                 }
                 Ok(())
             }),
@@ -439,8 +368,45 @@ pub async fn run_cli_mode(
             name: "plugin runtime",
             future: Box::pin(async { plugin_runtime.shutdown().await }),
         },
-    ]);
-    drain_cli_shutdown(repl_result, steps).await
+        CliShutdownStep {
+            name: "config watcher",
+            future: Box::pin(async { config_watcher.shutdown().await }),
+        },
+        CliShutdownStep {
+            name: "MCP runtime",
+            future: Box::pin(async {
+                mcp_config_runtime.shutdown().await;
+                Ok(())
+            }),
+        },
+        CliShutdownStep {
+            name: "browser runtime",
+            future: Box::pin(async {
+                browser_runtime.shutdown().await;
+                Ok(())
+            }),
+        },
+        CliShutdownStep {
+            name: "task hook dispatcher",
+            future: Box::pin(async {
+                if let Some(store) = app_state.tasks.runtime.as_ref() {
+                    store
+                        .shutdown_hook_events()
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Ok(())
+            }),
+        },
+        CliShutdownStep {
+            name: "root cancellation",
+            future: Box::pin(async {
+                root_cancel.cancel();
+                Ok(())
+            }),
+        },
+    ];
+    drain_cli_shutdown(mode_result, steps).await
 }
 
 /// 运行 IM 通道模式（QQ Bot、飞书等）
@@ -464,12 +430,13 @@ pub async fn run_channels_mode(
 
     use echo_agent::channels::{
         ChannelManager, FeishuChannel, FeishuConfig, MessageHandler, QqChannel, QqConfig,
-        SessionConfig, SessionHandler,
+        SessionHandler,
     };
 
     use crate::cli::channels::AppChannelMessageHandler;
 
     let mut manager = ChannelManager::new();
+    let mut failures = Vec::new();
 
     // 注册 QQ Bot
     if app_config.channels.qq.enabled {
@@ -479,10 +446,13 @@ pub async fn run_channels_mode(
         };
         match QqChannel::new(config) {
             Ok(ch) => {
-                manager.register(Box::new(ch))?;
-                tracing::info!("已注册 QQ Bot 通道");
+                if let Err(error) = manager.register(Box::new(ch)) {
+                    failures.push(format!("qqbot registration: {error}"));
+                } else {
+                    tracing::info!("已注册 QQ Bot 通道");
+                }
             }
-            Err(e) => tracing::warn!("QQ Bot 注册失败: {e}"),
+            Err(error) => failures.push(format!("qqbot configuration: {error}")),
         }
     } else {
         tracing::info!("QQ Bot 通道已禁用（channels.qq.enabled = false）");
@@ -509,22 +479,27 @@ pub async fn run_channels_mode(
         };
         match FeishuChannel::new(config) {
             Ok(ch) => {
-                manager.register(Box::new(ch))?;
-                tracing::info!("已注册飞书通道（{}模式）", app_config.channels.feishu.mode);
+                if let Err(error) = manager.register(Box::new(ch)) {
+                    failures.push(format!("feishu registration: {error}"));
+                } else {
+                    tracing::info!("已注册飞书通道（{}模式）", app_config.channels.feishu.mode);
+                }
             }
-            Err(e) => tracing::warn!("飞书注册失败: {e}"),
+            Err(error) => failures.push(format!("feishu configuration: {error}")),
         }
     } else {
         tracing::info!("飞书通道已禁用（channels.feishu.enabled = false）");
     }
 
     if manager.is_empty() {
-        tracing::error!("没有可用的 IM 通道，请在 echo-agent.yaml 中启用并配置 channels");
-        return Ok(());
+        failures.push("no configured IM channel could be started".to_string());
+        return finish_channel_lifecycle(failures, Ok(()));
     }
 
-    let session_config =
-        SessionConfig::default().with_timeout_minutes(app_config.channels.session.timeout_minutes);
+    // Framework reset aliases would replace SessionHandler generations before
+    // EKO's exact foreground/pool owner can settle them. Disable those aliases
+    // at composition; `/reset` is handled by AppChannelMessageHandler.
+    let session_config = channel_session_config(app_config.channels.session.timeout_minutes);
 
     // pool create_agent 用 app_config 默认 model(system_prompt/agent_name 来自
     // app_config),无需在此解析 runtime_model 或裸建 agent —— bootstrap 全套已由
@@ -553,23 +528,35 @@ pub async fn run_channels_mode(
 
     tracing::info!("启动 {} 个 IM 通道...", manager.len());
     let start_results = manager.start_all(handler_factory).await;
-    let failures: Vec<_> = start_results
+    let start_failures = start_results
         .iter()
-        .filter(|result| result.result.is_err())
-        .collect();
-    if !failures.is_empty() {
+        .filter_map(|result| {
+            result
+                .result
+                .as_ref()
+                .err()
+                .map(|error| format!("{}: {error}", result.channel_id))
+        })
+        .collect::<Vec<_>>();
+    let started_count = start_results.len().saturating_sub(start_failures.len());
+    if !start_failures.is_empty() {
         tracing::warn!(
-            failed_channels = %failures
+            failed_channels = %start_failures
                 .iter()
-                .map(|failure| failure.channel_id.as_str())
+                .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(","),
             "{} 个通道启动失败（共 {} 个）",
-            failures.len(),
+            start_failures.len(),
             start_results.len()
         );
     }
-    tracing::info!("所有 IM 通道已启动");
+    failures.extend(start_failures);
+    if started_count == 0 {
+        let stop_result = manager.stop_all().await.map_err(anyhow::Error::from);
+        return finish_channel_lifecycle(failures, stop_result);
+    }
+    tracing::info!(started_count, "IM channels started");
 
     tokio::select! {
         _ = crate::infra::shutdown_signal() => {}
@@ -577,15 +564,40 @@ pub async fn run_channels_mode(
     }
 
     tracing::info!("正在关闭 IM 通道...");
-    manager.stop_all().await?;
-    tracing::info!("所有 IM 通道已关闭");
+    let stop_result = manager.stop_all().await.map_err(anyhow::Error::from);
+    finish_channel_lifecycle(failures, stop_result)
+}
 
-    Ok(())
+#[cfg(feature = "channels")]
+fn finish_channel_lifecycle(start_failures: Vec<String>, stop_result: Result<()>) -> Result<()> {
+    let mut failures = start_failures;
+    if let Err(error) = stop_result {
+        failures.push(format!("shutdown: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "channel lifecycle failed: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+#[cfg(feature = "channels")]
+fn channel_session_config(timeout_minutes: u64) -> echo_agent::channels::SessionConfig {
+    echo_agent::channels::SessionConfig::default()
+        .with_timeout_minutes(timeout_minutes)
+        .with_reset_keywords(Vec::new())
+        .with_command_prefix(None)
+        .with_reset_commands(Vec::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "channels")]
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     fn recorded_shutdown_step(
@@ -653,7 +665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cli_dreaming_owner_cancels_and_joins_its_task() -> Result<()> {
+    async fn headless_dreaming_owner_cancels_and_joins_its_task() -> Result<()> {
         let cancel = tokio_util::sync::CancellationToken::new();
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let task_cancel = cancel.clone();
@@ -663,8 +675,181 @@ mod tests {
             task_observed.store(true, std::sync::atomic::Ordering::Release);
         });
 
-        CliDreamingOwner::new(cancel, task).shutdown().await?;
+        HeadlessDreamingOwner::new(cancel, task).shutdown().await?;
         assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    struct ResetProbe {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "channels")]
+    #[async_trait::async_trait]
+    impl echo_agent::channels::MessageHandler for ResetProbe {
+        async fn handle(
+            &self,
+            message: echo_agent::channels::InboundMessage,
+        ) -> echo_core::error::Result<echo_agent::channels::OutboundMessage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(echo_agent::channels::OutboundMessage::new(
+                message.channel_id,
+                message.chat_id,
+                message.chat_type,
+                "app-owned-reset",
+            ))
+        }
+
+        async fn reply(
+            &self,
+            _message: echo_agent::channels::OutboundMessage,
+        ) -> echo_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn production_session_config_forwards_reset_to_app_handler() -> Result<()> {
+        use echo_agent::channels::{ChatType, InboundMessage, MessageHandler, SessionHandler};
+        use futures::StreamExt;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factory_calls = Arc::clone(&calls);
+        let handler = SessionHandler::new(channel_session_config(30), move || {
+            Box::new(ResetProbe {
+                calls: Arc::clone(&factory_calls),
+            }) as Box<dyn MessageHandler>
+        });
+        let mut stream = handler
+            .handle_stream(InboundMessage::new(
+                "test-channel",
+                "sender",
+                "conversation",
+                ChatType::Direct,
+                "/reset",
+                "message",
+            ))
+            .await?;
+        let response = stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("session handler returned an empty reset stream"))??;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(response.text, "app-owned-reset");
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    struct LifecycleProbeChannel {
+        id: &'static str,
+        fail_start: bool,
+        fail_stop: bool,
+        stops: Arc<AtomicUsize>,
+    }
+
+    #[cfg(feature = "channels")]
+    fn channel_test_error(message: impl Into<String>) -> echo_core::error::ReactError {
+        echo_core::error::ReactError::Channel(Box::new(echo_core::error::ChannelError::Other(
+            message.into(),
+        )))
+    }
+
+    #[cfg(feature = "channels")]
+    static LIFECYCLE_PROBE_CAPABILITIES: echo_agent::channels::ChannelCapabilities =
+        echo_agent::channels::ChannelCapabilities {
+            chat_types: &[echo_agent::channels::ChatType::Direct],
+            supports_media: false,
+            supports_threads: false,
+        };
+
+    #[cfg(feature = "channels")]
+    #[async_trait::async_trait]
+    impl echo_agent::channels::ChannelPlugin for LifecycleProbeChannel {
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn capabilities(&self) -> &echo_agent::channels::ChannelCapabilities {
+            &LIFECYCLE_PROBE_CAPABILITIES
+        }
+
+        async fn start(
+            &mut self,
+            _handler: Arc<dyn echo_agent::channels::MessageHandler>,
+        ) -> echo_core::error::Result<()> {
+            if self.fail_start {
+                Err(channel_test_error(format!("{} start failure", self.id)))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn stop(&mut self) -> echo_core::error::Result<()> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
+            if self.fail_stop {
+                Err(channel_test_error(format!("{} stop failure", self.id)))
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn send(
+            &self,
+            _message: echo_agent::channels::OutboundMessage,
+        ) -> echo_core::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn real_channel_manager_drains_and_aggregates_start_and_stop_failures() -> Result<()> {
+        use echo_agent::channels::{ChannelManager, MessageHandler};
+
+        let start_stops = Arc::new(AtomicUsize::new(0));
+        let stop_stops = Arc::new(AtomicUsize::new(0));
+        let mut manager = ChannelManager::new();
+        manager.register(Box::new(LifecycleProbeChannel {
+            id: "start-fails",
+            fail_start: true,
+            fail_stop: false,
+            stops: Arc::clone(&start_stops),
+        }))?;
+        manager.register(Box::new(LifecycleProbeChannel {
+            id: "stop-fails",
+            fail_start: false,
+            fail_stop: true,
+            stops: Arc::clone(&stop_stops),
+        }))?;
+
+        let starts = manager
+            .start_all(|_| {
+                Arc::new(ResetProbe {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                }) as Arc<dyn MessageHandler>
+            })
+            .await;
+        let start_failures = starts
+            .into_iter()
+            .filter_map(|result| {
+                result
+                    .result
+                    .err()
+                    .map(|error| format!("{}: {error}", result.channel_id))
+            })
+            .collect::<Vec<_>>();
+        let stop_result = manager.stop_all().await.map_err(anyhow::Error::from);
+        let error = finish_channel_lifecycle(start_failures, stop_result)
+            .err()
+            .ok_or_else(|| anyhow::anyhow!("channel lifecycle failures were not reported"))?;
+
+        assert_eq!(start_stops.load(Ordering::SeqCst), 1);
+        assert_eq!(stop_stops.load(Ordering::SeqCst), 1);
+        assert!(error.to_string().contains("start-fails"));
+        assert!(error.to_string().contains("stop-fails"));
         Ok(())
     }
 }

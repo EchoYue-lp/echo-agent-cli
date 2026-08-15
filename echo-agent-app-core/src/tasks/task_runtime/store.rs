@@ -129,6 +129,15 @@ pub(crate) struct WorkspaceGenerationLease {
     store: std::sync::Arc<TaskRuntimeStore>,
 }
 
+/// Opaque application receipt used by foreground surfaces to establish the
+/// canonical lock order before memory and pool admission. The TaskRuntime
+/// store remains the only generation authority; this type only retains its
+/// existing lease until the outer foreground driver settles.
+#[must_use]
+pub struct TaskRuntimeGenerationReceipt {
+    _lease: WorkspaceGenerationLease,
+}
+
 struct RunDriverSupervisor {
     accepting: bool,
     pending_admissions: usize,
@@ -1904,6 +1913,16 @@ impl TaskRuntimeStore {
         Ok(WorkspaceGenerationLease {
             store: std::sync::Arc::clone(self),
         })
+    }
+
+    /// Pin the active TaskRuntime generation for an application foreground
+    /// driver. Surfaces acquire this after foreground admission and before the
+    /// memory-generation and agent-pool receipts.
+    pub fn lease_foreground_generation(
+        self: &std::sync::Arc<Self>,
+    ) -> Result<TaskRuntimeGenerationReceipt, StoreError> {
+        self.lease_active_workspace_generation()
+            .map(|lease| TaskRuntimeGenerationReceipt { _lease: lease })
     }
 
     /// Atomically switch the file authority after all operations using the
