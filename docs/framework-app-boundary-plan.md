@@ -256,8 +256,11 @@ Status: audit complete; no tool move needed yet.
 
 Findings:
 
-- `spawn_background_task` / `check_task_status` remain generic framework
-  background-task tools.
+- The old `spawn_background_task` / `check_task_status` / `list_background_tasks`
+  trio was replaced by the generic framework command-cell surface: `shell
+  background=true` + `wait` / `stop_cell` / `list_cells` (`echo-core`
+  `CommandCellRegistry` contract, `echo-orchestration`
+  `BackgroundCommandManager`), injected via `ReactAgentBuilder::command_cells`.
 - Process-global `todo_write` was removed and replaced by the framework's
   instance-local revisioned `task_create/task_update/task_list` tools.
 - `agent_tool` remains the generic framework delegate tool. EKO decides whether

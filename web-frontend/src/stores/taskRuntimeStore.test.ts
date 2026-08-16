@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   pauseRun: vi.fn(),
+  configureContinuation: vi.fn(),
   resumeRun: vi.fn(),
   retryBlockedTask: vi.fn(),
   resolveRecoveryTask: vi.fn(),
@@ -11,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   listTodos: vi.fn(),
   listArtifacts: vi.fn(),
   listRecoveryBlockers: vi.fn(),
+  getContinuation: vi.fn(),
+  listBackgroundCells: vi.fn(),
   getRun: vi.fn(),
   listEvents: vi.fn(),
   listToolExecutions: vi.fn(),
@@ -21,7 +24,7 @@ vi.mock('../api/endpoints', () => ({
   toolExecutionApi: { list: mocks.listToolExecutions },
 }));
 
-import type { TaskPlan, TaskRun } from '../generated';
+import type { RunContinuationState, TaskPlan, TaskRun } from '../generated';
 import { subagentRunStoreKey, useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
 import { useToolExecutionStore } from './toolExecutionStore';
@@ -59,6 +62,11 @@ describe('taskRuntimeStore recovery controls', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.pauseRun.mockResolvedValue({ success: true, run_id: 'run-1' });
+    mocks.configureContinuation.mockResolvedValue({
+      enabled: true,
+      token_budget: 200_000,
+      time_budget_seconds: null,
+    });
     mocks.resumeRun.mockResolvedValue({ kind: 'resumed', run_id: 'run-1' });
     mocks.retryBlockedTask.mockResolvedValue({ kind: 'recovery_retry_recorded' });
     mocks.resolveRecoveryTask.mockResolvedValue(undefined);
@@ -79,6 +87,13 @@ describe('taskRuntimeStore recovery controls', () => {
     await useTaskRuntimeStore.getState().pause('run-1');
 
     expect(mocks.pauseRun).toHaveBeenCalledWith('run-1');
+    expect(refresh).toHaveBeenCalledWith('run-1');
+  });
+
+  it('updates continuation budgets and refreshes the canonical projection', async () => {
+    await useTaskRuntimeStore.getState().updateContinuationBudgets('run-1', 200_000, null);
+
+    expect(mocks.configureContinuation).toHaveBeenCalledWith('run-1', 200_000, null);
     expect(refresh).toHaveBeenCalledWith('run-1');
   });
 
@@ -158,6 +173,8 @@ describe('taskRuntimeStore conversation loading', () => {
     mocks.listTodos.mockResolvedValue([]);
     mocks.listArtifacts.mockResolvedValue([]);
     mocks.listRecoveryBlockers.mockResolvedValue([]);
+    mocks.getContinuation.mockResolvedValue(null);
+    mocks.listBackgroundCells.mockResolvedValue([]);
     mocks.listEvents.mockResolvedValue([]);
     mocks.listToolExecutions.mockResolvedValue([]);
     useSubagentRunStore.getState().clear();
@@ -181,6 +198,31 @@ describe('taskRuntimeStore conversation loading', () => {
 
     expect(useTaskRuntimeStore.getState().activeRun?.status).toBe('completed');
     expect(useTaskRuntimeStore.getState().pollingInterval).toBeNull();
+  });
+
+  it('hydrates token and time budgets from the canonical continuation snapshot', async () => {
+    const continuation = {
+      enabled: true,
+      auto_resume_after_restart: false,
+      token_budget: 100_000,
+      time_budget_seconds: 7_200,
+      tokens_used: 12_000,
+      time_used_seconds: 90,
+      compaction_count: 2,
+      next_turn_ordinal: 4,
+      active_turn: null,
+      last_turn: null,
+      pause: null,
+      blocker_audit: null,
+      deferred: false,
+    } satisfies RunContinuationState;
+    mocks.latestRunForConversation.mockResolvedValueOnce(run('completed'));
+    mocks.getContinuation.mockResolvedValueOnce(continuation);
+
+    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+
+    expect(mocks.getContinuation).toHaveBeenCalledWith('run-1');
+    expect(useTaskRuntimeStore.getState().continuation).toEqual(continuation);
   });
 
   it('hydrates the prior Subagent GUI from the run event history', async () => {

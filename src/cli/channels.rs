@@ -31,6 +31,29 @@ enum ChannelRenderEvent {
 }
 
 #[cfg(feature = "channels")]
+enum ChannelTaskRunControl {
+    Reply(String),
+    Resume {
+        run_id: String,
+        root_message_id: String,
+    },
+}
+
+#[cfg(feature = "channels")]
+fn parse_channel_budget(value: &str, label: &str) -> Result<Option<u64>, String> {
+    if matches!(value, "none" | "unbounded") {
+        return Ok(None);
+    }
+    let budget = value
+        .parse::<u64>()
+        .map_err(|error| format!("Invalid {label} budget: {error}"))?;
+    if budget == 0 {
+        return Err(format!("{label} budget must be positive or 'none'."));
+    }
+    Ok(Some(budget))
+}
+
+#[cfg(feature = "channels")]
 struct ChannelStreamDropGuard(echo_agent::agent::CancellationToken);
 
 #[cfg(feature = "channels")]
@@ -55,6 +78,8 @@ fn channel_render_event_stream(
         let _stream_drop_guard = stream_drop_guard;
         let mut driver_open = true;
         let mut prompt_open = true;
+        let mut terminal_open = true;
+        let mut terminal_outcome = None;
         loop {
             tokio::select! {
                 event = driver_rx.recv(), if driver_open => match event {
@@ -70,24 +95,27 @@ fn channel_render_event_stream(
                         prompt_open = false;
                     }
                 },
-                terminal = &mut terminal_rx => {
-                    let outcome = terminal.unwrap_or_else(|_| {
+                terminal = &mut terminal_rx, if terminal_open => {
+                    terminal_open = false;
+                    terminal_outcome = Some(terminal.unwrap_or_else(|_| {
                         echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                             echo_agent::error::AgentFailure::message(
                                 "foreground_supervisor",
                                 "channel foreground owner ended without a terminal receipt",
                             ),
                         )
-                    });
-                    // The driver sends terminal only after drive_chat returns.
-                    // Wait for its sender to close and preserve every accepted
-                    // event before projecting the canonical terminal receipt.
-                    while let Some(event) = driver_rx.recv().await {
-                        yield Ok(ChannelRenderEvent::Driver(event));
-                    }
-                    yield Ok(ChannelRenderEvent::Terminal(outcome));
-                    break;
+                    }));
                 }
+            }
+            // The first finite foreground turn settles before its independent
+            // continuation turns. Keep consuming both driver events and HITL
+            // prompts until the retained continuation sink closes, then publish
+            // the foreground terminal receipt last.
+            if !driver_open
+                && let Some(outcome) = terminal_outcome.take()
+            {
+                yield Ok(ChannelRenderEvent::Terminal(outcome));
+                break;
             }
         }
     }
@@ -163,6 +191,148 @@ impl AppChannelMessageHandler {
             receipts.retain(memory_generation);
         }
         Ok(receipts)
+    }
+
+    fn current_task_run(
+        &self,
+        conv: &str,
+        requested_run_id: Option<&str>,
+    ) -> Result<
+        (
+            Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+            echo_agent_app_core::tasks::task_runtime::RunStateSnapshot,
+        ),
+        String,
+    > {
+        let store = self
+            .store
+            .clone()
+            .ok_or_else(|| "TaskRuntime store is unavailable".to_string())?;
+        let run = match requested_run_id.filter(|run_id| !run_id.trim().is_empty()) {
+            Some(run_id) => store.get_run(run_id).map_err(|error| error.to_string())?,
+            None => store
+                .latest_run_for_conversation(conv)
+                .map_err(|error| error.to_string())?,
+        }
+        .ok_or_else(|| "No TaskRun was found for this conversation.".to_string())?;
+        if run.conversation_id != conv {
+            return Err(format!(
+                "TaskRun {} belongs to another conversation.",
+                run.run_id
+            ));
+        }
+        let snapshot = store
+            .get_run_state(&run.run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| format!("TaskRun {} has no event projection.", run.run_id))?;
+        Ok((store, snapshot))
+    }
+
+    async fn task_run_command_response(
+        &self,
+        message: &str,
+        conv: &str,
+    ) -> Option<ChannelTaskRunControl> {
+        let mut parts = message.split_whitespace();
+        let command = parts.next()?;
+        let (action, budget_values, requested_run_id) = match command {
+            "/task-run" => {
+                let action = parts.next().unwrap_or("status");
+                if !matches!(action, "status" | "pause" | "resume" | "cancel" | "budget") {
+                    return Some(ChannelTaskRunControl::Reply(
+                        "Usage: /task-run [status|pause|resume|cancel] [run-id], or /task-run budget <tokens|none> <seconds|none> [run-id]".to_string(),
+                    ));
+                }
+                if action == "budget" {
+                    let Some(tokens) = parts.next() else {
+                        return Some(ChannelTaskRunControl::Reply(
+                            "Usage: /task-run budget <tokens|none> <seconds|none> [run-id]"
+                                .to_string(),
+                        ));
+                    };
+                    let Some(time) = parts.next() else {
+                        return Some(ChannelTaskRunControl::Reply(
+                            "Usage: /task-run budget <tokens|none> <seconds|none> [run-id]"
+                                .to_string(),
+                        ));
+                    };
+                    (action, Some((tokens, time)), parts.next())
+                } else {
+                    (action, None, parts.next())
+                }
+            }
+            "/task-status" => ("status", None, parts.next()),
+            "/task-pause" => ("pause", None, parts.next()),
+            "/task-resume" => ("resume", None, parts.next()),
+            "/task-cancel" => ("cancel", None, parts.next()),
+            "/task-budget" => {
+                let Some(tokens) = parts.next() else {
+                    return Some(ChannelTaskRunControl::Reply(
+                        "Usage: /task-budget <tokens|none> <seconds|none> [run-id]".to_string(),
+                    ));
+                };
+                let Some(time) = parts.next() else {
+                    return Some(ChannelTaskRunControl::Reply(
+                        "Usage: /task-budget <tokens|none> <seconds|none> [run-id]".to_string(),
+                    ));
+                };
+                ("budget", Some((tokens, time)), parts.next())
+            }
+            _ => return None,
+        };
+        let (store, snapshot) = match self.current_task_run(conv, requested_run_id) {
+            Ok(value) => value,
+            Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+        };
+        let run_id = snapshot.run.run_id.clone();
+        let reply = match action {
+            "status" => format_channel_task_run_status(&snapshot),
+            "pause" => match store.request_pause(&run_id) {
+                Ok(true) => format!("TaskRun {run_id} paused."),
+                Ok(false) => format!("TaskRun {run_id} is not actively pausable."),
+                Err(error) => format!("Unable to pause TaskRun {run_id}: {error}"),
+            },
+            "cancel" => match store.request_cancel(&run_id) {
+                Ok(true) => format!("TaskRun {run_id} cancelled."),
+                Ok(false) => format!("TaskRun {run_id} is already terminal."),
+                Err(error) => format!("Unable to cancel TaskRun {run_id}: {error}"),
+            },
+            "resume" => {
+                if snapshot.run.status
+                    != echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused
+                {
+                    format!(
+                        "TaskRun {run_id} is {}; resume requires paused.",
+                        snapshot.run.status.as_str()
+                    )
+                } else {
+                    return Some(ChannelTaskRunControl::Resume {
+                        run_id,
+                        root_message_id: snapshot.run.root_message_id.clone(),
+                    });
+                }
+            }
+            "budget" => {
+                let Some((token_value, time_value)) = budget_values else {
+                    return Some(ChannelTaskRunControl::Reply(
+                        "Usage: /task-budget <tokens|none> <seconds|none> [run-id]".to_string(),
+                    ));
+                };
+                let budgets = parse_channel_budget(token_value, "token").and_then(|tokens| {
+                    parse_channel_budget(time_value, "time").map(|time| (tokens, time))
+                });
+                match budgets.and_then(|(tokens, time)| {
+                    store
+                        .update_run_continuation_budgets(&run_id, tokens, time)
+                        .map_err(|error| error.to_string())
+                }) {
+                    Ok(_) => format!("TaskRun {run_id} budgets updated."),
+                    Err(error) => format!("Unable to update TaskRun {run_id} budgets: {error}"),
+                }
+            }
+            _ => "Unsupported TaskRun command.".to_string(),
+        };
+        Some(ChannelTaskRunControl::Reply(reply))
     }
 
     async fn control_command_response(&self, message: &str, conv: &str) -> Option<String> {
@@ -356,6 +526,73 @@ fn immediate_channel_response<'a>(
 }
 
 #[cfg(feature = "channels")]
+fn format_channel_task_run_status(
+    snapshot: &echo_agent_app_core::tasks::task_runtime::RunStateSnapshot,
+) -> String {
+    let mut lines = vec![
+        format!(
+            "TaskRun {}: {}",
+            snapshot.run.run_id,
+            snapshot.run.status.as_str()
+        ),
+        format!("Goal: {}", snapshot.run.goal),
+    ];
+    if let Some(continuation) = snapshot.continuation.as_ref() {
+        let token_budget = continuation
+            .token_budget
+            .map(|budget| budget.to_string())
+            .unwrap_or_else(|| "unbounded".to_string());
+        let tokens_remaining = continuation
+            .token_budget
+            .map(|budget| budget.saturating_sub(continuation.tokens_used).to_string())
+            .unwrap_or_else(|| "unbounded".to_string());
+        let time_budget = continuation
+            .time_budget_seconds
+            .map(|budget| budget.to_string())
+            .unwrap_or_else(|| "unbounded".to_string());
+        let time_remaining = continuation
+            .time_budget_seconds
+            .map(|budget| {
+                budget
+                    .saturating_sub(continuation.time_used_seconds)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unbounded".to_string());
+        lines.push(format!(
+            "Turn: {}; compactions: {}; deferred: {}",
+            continuation
+                .active_turn
+                .as_ref()
+                .or(continuation.last_turn.as_ref())
+                .map(|turn| turn.ordinal.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            continuation.compaction_count,
+            continuation.deferred
+        ));
+        lines.push(format!(
+            "Tokens: used {}, budget {token_budget}, remaining {tokens_remaining}",
+            continuation.tokens_used
+        ));
+        lines.push(format!(
+            "Time seconds: used {}, budget {time_budget}, remaining {time_remaining}",
+            continuation.time_used_seconds
+        ));
+        if let Some(pause) = continuation.pause.as_ref() {
+            lines.push(format!(
+                "Pause: {}{}",
+                pause.reason.as_str(),
+                pause
+                    .detail
+                    .as_ref()
+                    .map(|detail| format!(" ({detail})"))
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+#[cfg(feature = "channels")]
 fn is_agent_management_command(message: &str) -> bool {
     matches!(
         message.split_whitespace().next(),
@@ -400,6 +637,18 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     > {
         let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id());
         let cache_id = Self::cache_user_id(&msg.channel_id, msg.conversation_id());
+        let mut resume_task_run = None;
+        if let Some(control) = self.task_run_command_response(&msg.text, &conv).await {
+            match control {
+                ChannelTaskRunControl::Reply(message) => {
+                    return Ok(immediate_channel_response(&msg, message));
+                }
+                ChannelTaskRunControl::Resume {
+                    run_id,
+                    root_message_id,
+                } => resume_task_run = Some((run_id, root_message_id)),
+            }
+        }
         // Product control commands always outrank HITL parsing. `/stop` owns
         // turn cancellation; `/cancel` rejects only the queue front.
         if let Some(message) = self.control_command_response(&msg.text, &conv).await {
@@ -531,14 +780,25 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             }
         };
         let stream_cancel = foreground_lease.cancellation_token();
-        let text = msg.text.clone();
+        let text = resume_task_run.as_ref().map_or_else(
+            || msg.text.clone(),
+            |(run_id, _)| {
+                format!(
+                    "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection and continue the next useful work."
+                )
+            },
+        );
         // Persist IM attachments into the same durable reference contract as
         // GUI/TUI so TaskRuntime subagents can reconstruct the same message.
         let attachment_refs = stage_channel_attachments(&msg.attachments);
         // Channels have no workspace root; long pastes spill to the global
         // user-input artifact dir (~/.eko/artifacts/user-input/).
         let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
-        let interaction_mode = *self.interaction_mode.read().await;
+        let interaction_mode = if resume_task_run.is_some() {
+            echo_agent_app_core::tasks::task_runtime::InteractionMode::Task
+        } else {
+            *self.interaction_mode.read().await
+        };
         let mode_hint_str = interaction_mode.prompt_hint().to_string();
         let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
             echo_agent_app_core::prepared_turn::UserTurnInput {
@@ -574,11 +834,23 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let hitl = Arc::clone(&self.hitl);
         let prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
+        let explicit_binding = resume_task_run.map(|(run_id, root_message_id)| {
+            echo_agent_app_core::tasks::task_runtime::RunTurnBinding {
+                run_id: Some(run_id),
+                turn_id: turn_id.clone(),
+                root_message_id,
+                origin: echo_agent_app_core::tasks::task_runtime::RunTurnOrigin::Resume,
+                transcript_visibility:
+                    echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible,
+            }
+        });
         let supervision =
             self.foreground_turns
                 .supervise(foreground_lease, move |foreground_lease| async move {
                     use echo_agent_app_core::chat_driver::ChannelChatSink;
-                    use echo_agent_app_core::foreground_turn::drive_foreground_pooled_chat;
+                    use echo_agent_app_core::foreground_turn::{
+                        drive_foreground_pooled_chat, drive_foreground_pooled_chat_turn,
+                    };
 
                     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
                         std::sync::Arc::new(ChannelChatSink::new(tx));
@@ -597,22 +869,39 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                             review_integration,
                             layer_manager: None,
                             memory_generation: None,
+                            human_loop_provider: Some(hitl.clone()),
                         });
                     let configure_cache_id = cache_id;
                     let configure_hitl = hitl;
-                    let outcome = drive_foreground_pooled_chat(
-                        foreground_lease,
-                        pool,
-                        conv_owned,
-                        move |agent| async move {
-                            configure_channel_agent(&agent, &configure_cache_id, configure_hitl)
-                                .await;
-                            Ok(())
-                        },
-                        &turn,
-                        res,
-                    )
-                    .await;
+                    let configure = move |agent| async move {
+                        configure_channel_agent(&agent, &configure_cache_id, configure_hitl).await;
+                        Ok(())
+                    };
+                    let outcome = match explicit_binding {
+                        Some(binding) => {
+                            drive_foreground_pooled_chat_turn(
+                                foreground_lease,
+                                pool,
+                                conv_owned,
+                                configure,
+                                &turn,
+                                res,
+                                binding,
+                            )
+                            .await
+                        }
+                        None => {
+                            drive_foreground_pooled_chat(
+                                foreground_lease,
+                                pool,
+                                conv_owned,
+                                configure,
+                                &turn,
+                                res,
+                            )
+                            .await
+                        }
+                    };
                     let _delivered = terminal_tx.send(outcome);
                 });
         if let Err(error) = supervision {
@@ -1044,6 +1333,14 @@ async fn aggregate_by_sentence<'a>(
 mod tests {
     use super::sanitize_cache_user_id;
 
+    #[cfg(feature = "channels")]
+    #[test]
+    fn channel_budget_parser_accepts_positive_or_unbounded() {
+        assert_eq!(super::parse_channel_budget("42", "token"), Ok(Some(42)));
+        assert_eq!(super::parse_channel_budget("unbounded", "time"), Ok(None));
+        assert!(super::parse_channel_budget("0", "time").is_err());
+    }
+
     #[test]
     fn ascii_passthrough() {
         assert_eq!(
@@ -1192,6 +1489,55 @@ mod tests {
             return Err("channel stream continued after terminal receipt".to_string());
         }
         assert!(cancellation.is_cancelled());
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn continuation_prompt_is_delivered_after_first_turn_terminal() -> Result<(), String> {
+        use echo_agent_app_core::chat_driver::TurnOutcome;
+        use futures::StreamExt;
+
+        let (driver_tx, driver_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (prompt_tx, prompt_rx) = tokio::sync::broadcast::channel::<String>(2);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+        let cancellation = echo_agent::agent::CancellationToken::new();
+        let mut stream = super::channel_render_event_stream(
+            driver_rx,
+            prompt_rx,
+            terminal_rx,
+            super::ChannelStreamDropGuard(cancellation),
+        );
+        terminal_tx
+            .send(TurnOutcome::Completed)
+            .map_err(|_| "channel terminal receiver closed".to_string())?;
+        prompt_tx
+            .send("Approve continuation?".to_string())
+            .map_err(|error| error.to_string())?;
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .map_err(|_| "continuation prompt timed out".to_string())?
+            .ok_or_else(|| "continuation stream closed before prompt".to_string())?
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            first,
+            super::ChannelRenderEvent::Prompt(ref prompt) if prompt == "Approve continuation?"
+        ) {
+            return Err("first-turn terminal overtook the continuation prompt".to_string());
+        }
+        drop(driver_tx);
+        let second = stream
+            .next()
+            .await
+            .ok_or_else(|| "missing delayed terminal receipt".to_string())?
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            second,
+            super::ChannelRenderEvent::Terminal(TurnOutcome::Completed)
+        ) {
+            return Err("continuation sink closure did not publish terminal".to_string());
+        }
         Ok(())
     }
 

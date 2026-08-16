@@ -1,6 +1,8 @@
 import { describe, expect, expectTypeOf, it } from 'vitest';
 import type {
+  BackgroundCellState,
   RuntimeEventKind,
+  RunContinuationState,
   StreamingEvent,
   ToolInfo,
   WorkspaceTransitionReceipt,
@@ -50,8 +52,57 @@ const runtimeEventVariants = [
   'task_completed',
   'subagent_assigned',
   'artifact_produced',
+  'background_cell_started',
+  'background_cell_finished',
+  'run_continuation_configured',
+  'run_turn_started',
+  'run_turn_usage_accounted',
+  'run_turn_compacted',
+  'run_turn_finished',
+  'run_pause_reason_changed',
   'run_cancelled',
 ] satisfies RuntimeEventKind[];
+
+const serializedBackgroundCell = {
+  cell_id: 'cell-1',
+  name: 'test suite',
+  command_hash: 'sha256:test',
+  turn_id: 'turn-1',
+  execution_id: null,
+  call_id: 'call-1',
+  phase: 'running',
+  exit_code: null,
+  total_output_bytes: 128,
+  output_truncated: false,
+  output_excerpt: 'tests are running',
+  artifact_path: null,
+  artifact_sha256: null,
+  started_at: '2026-08-15T00:00:00Z',
+  finished_at: null,
+} satisfies BackgroundCellState;
+
+const serializedContinuation = {
+  enabled: true,
+  auto_resume_after_restart: false,
+  token_budget: 100_000,
+  time_budget_seconds: 7_200,
+  tokens_used: 12_000,
+  time_used_seconds: 90,
+  compaction_count: 2,
+  next_turn_ordinal: 4,
+  active_turn: null,
+  last_turn: null,
+  pause: {
+    reason: 'repeated_blocker',
+    detail: 'three turns without progress',
+    changed_at: '2026-08-15T00:00:00Z',
+  },
+  blocker_audit: {
+    fingerprint: 'no-task-progress',
+    consecutive_turns: 3,
+  },
+  deferred: false,
+} satisfies RunContinuationState;
 
 const serializedWorkspaceTransition = {
   status: 'degraded',
@@ -89,6 +140,12 @@ describe('Rust serialization contracts', () => {
       'done',
     ]);
     expect(runtimeEventVariants).toContain('artifact_produced');
+    expect(runtimeEventVariants).toContain('background_cell_finished');
+    expect(runtimeEventVariants).toContain('run_turn_usage_accounted');
+    expect(serializedBackgroundCell.finished_at).toBeNull();
+    expect(serializedContinuation.pause?.reason).toBe('repeated_blocker');
+    expect(serializedContinuation.time_budget_seconds).toBe(7_200);
+    expect(serializedContinuation.compaction_count).toBe(2);
   });
 
   it('consumes the generated workspace transition receipt', () => {

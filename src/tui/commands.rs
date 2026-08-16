@@ -94,6 +94,7 @@ pub enum SlashCommand {
     TaskCancel,
     TaskPause,
     TaskResume,
+    TaskBudget,
     TaskRecovery,
     TaskRetry,
     TaskSkip,
@@ -174,6 +175,7 @@ impl SlashCommand {
             Self::TaskCancel => "Cancel the current or specified task run",
             Self::TaskPause => "Pause the current or specified task run",
             Self::TaskResume => "Resume the current or specified task run",
+            Self::TaskBudget => "Set token and time budgets for a task run",
             Self::TaskRecovery => "Show unresolved recovery barriers",
             Self::TaskRetry => "Confirm retry for an indeterminate task",
             Self::TaskSkip => "Skip an indeterminate task",
@@ -246,6 +248,7 @@ impl SlashCommand {
             | Self::TaskCancel
             | Self::TaskPause
             | Self::TaskResume
+            | Self::TaskBudget
             | Self::TaskRecovery
             | Self::TaskRetry
             | Self::TaskSkip
@@ -295,6 +298,7 @@ impl SlashCommand {
             Self::Plan => "",
             Self::Mode => "[auto|chat|task]",
             Self::TaskCancel | Self::TaskPause | Self::TaskResume => "[run-id]",
+            Self::TaskBudget => "<tokens|none> <seconds|none> [run-id]",
             Self::TaskRecovery => "[run-id]",
             Self::TaskRetry | Self::TaskSkip => "<task-id> [run-id]",
             Self::Steer => "<instruction>",
@@ -373,6 +377,16 @@ mod tests {
         assert_eq!(retry.usage(), "<task-id> [run-id]");
         assert_eq!(skip.category(), Category::Coding);
         assert_eq!(recovery.usage(), "[run-id]");
+        Ok(())
+    }
+
+    #[test]
+    fn task_budget_is_a_first_class_coding_action() -> Result<(), String> {
+        let budget = "task-budget"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(budget.category(), Category::Coding);
+        assert_eq!(budget.usage(), "<tokens|none> <seconds|none> [run-id]");
         Ok(())
     }
 

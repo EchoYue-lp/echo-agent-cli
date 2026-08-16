@@ -656,6 +656,26 @@ pub enum RuntimeEventKind {
     CircuitBreakerTripped,
     RecoveryBlocked,
     RecoveryResolved,
+    /// A process-scoped background command cell was launched for this run.
+    BackgroundCellStarted,
+    /// The command cell reached a terminal state and its result was captured.
+    BackgroundCellFinished,
+    /// Long-horizon continuation policy was created or updated for this run.
+    RunContinuationConfigured,
+    /// One finite primary-Agent turn claimed the run.
+    RunTurnStarted,
+    /// One provider usage event was durably accounted exactly once.
+    RunTurnUsageAccounted,
+    /// The active primary-Agent turn crossed a context-compaction boundary.
+    RunTurnCompacted,
+    /// One finite primary-Agent turn reached a terminal outcome.
+    RunTurnFinished,
+    /// Automatic continuation is temporarily yielding to user/control input.
+    RunContinuationDeferred,
+    /// A previous continuation deferral was cleared.
+    RunContinuationResumed,
+    /// Structured explanation for a recoverable Paused run.
+    RunPauseReasonChanged,
     RunCancelled,
     Note,
 }
@@ -707,6 +727,16 @@ impl RuntimeEventKind {
             CircuitBreakerTripped => "circuit_breaker_tripped",
             RecoveryBlocked => "recovery_blocked",
             RecoveryResolved => "recovery_resolved",
+            BackgroundCellStarted => "background_cell_started",
+            BackgroundCellFinished => "background_cell_finished",
+            RunContinuationConfigured => "run_continuation_configured",
+            RunTurnStarted => "run_turn_started",
+            RunTurnUsageAccounted => "run_turn_usage_accounted",
+            RunTurnCompacted => "run_turn_compacted",
+            RunTurnFinished => "run_turn_finished",
+            RunContinuationDeferred => "run_continuation_deferred",
+            RunContinuationResumed => "run_continuation_resumed",
+            RunPauseReasonChanged => "run_pause_reason_changed",
             RunCancelled => "run_cancelled",
             Note => "note",
         }
@@ -726,6 +756,7 @@ impl RuntimeEventKind {
                 | RuntimeEventKind::Cancelled
                 | RuntimeEventKind::TimedOut
                 | RuntimeEventKind::ArtifactProduced
+                | RuntimeEventKind::BackgroundCellFinished
                 | RuntimeEventKind::MergeStarted
                 | RuntimeEventKind::MergeCompleted
                 | RuntimeEventKind::MergeFailed
@@ -779,6 +810,16 @@ impl RuntimeEventKind {
             "circuit_breaker_tripped" => CircuitBreakerTripped,
             "recovery_blocked" => RecoveryBlocked,
             "recovery_resolved" => RecoveryResolved,
+            "background_cell_started" => BackgroundCellStarted,
+            "background_cell_finished" => BackgroundCellFinished,
+            "run_continuation_configured" => RunContinuationConfigured,
+            "run_turn_started" => RunTurnStarted,
+            "run_turn_usage_accounted" => RunTurnUsageAccounted,
+            "run_turn_compacted" => RunTurnCompacted,
+            "run_turn_finished" => RunTurnFinished,
+            "run_continuation_deferred" => RunContinuationDeferred,
+            "run_continuation_resumed" => RunContinuationResumed,
+            "run_pause_reason_changed" => RunPauseReasonChanged,
             "run_cancelled" => RunCancelled,
             "note" => Note,
             _ => return None,
@@ -976,6 +1017,277 @@ pub struct PlanRevision {
 pub struct RunStateSnapshot {
     pub run: TaskRun,
     pub tasks: Vec<EkoTaskExecution>,
+    /// Event-folded long-horizon control state. Absent for ordinary one-shot runs.
+    #[serde(default)]
+    pub continuation: Option<RunContinuationState>,
+    /// Event-folded background command cells owned by this run.
+    #[serde(default)]
+    pub background_cells: Vec<BackgroundCellState>,
+}
+
+/// Source of one finite primary-Agent turn within a long-horizon TaskRun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RunTurnOrigin")]
+pub enum RunTurnOrigin {
+    User,
+    Continuation,
+    Resume,
+    Recovery,
+}
+
+impl RunTurnOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Continuation => "continuation",
+            Self::Resume => "resume",
+            Self::Recovery => "recovery",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(Self::User),
+            "continuation" => Some(Self::Continuation),
+            "resume" => Some(Self::Resume),
+            "recovery" => Some(Self::Recovery),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a turn instruction belongs in the user-visible transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "TurnVisibility")]
+pub enum TurnVisibility {
+    Visible,
+    Internal,
+}
+
+impl TurnVisibility {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// Thin identity binding that prevents continuation turns from deriving a new run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTurnBinding {
+    pub run_id: Option<String>,
+    pub turn_id: String,
+    pub root_message_id: String,
+    pub origin: RunTurnOrigin,
+    pub transcript_visibility: TurnVisibility,
+}
+
+/// Terminal execution state of one finite RunTurn. `Ended` is not Goal completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RunTurnStatus")]
+pub enum RunTurnStatus {
+    Running,
+    Ended,
+    Cancelled,
+    Failed,
+}
+
+impl RunTurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Ended => "ended",
+            Self::Cancelled => "cancelled",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "running" => Some(Self::Running),
+            "ended" => Some(Self::Ended),
+            "cancelled" => Some(Self::Cancelled),
+            "failed" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+
+/// Why a run is recoverably Paused instead of irreversibly Failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RunPauseReason")]
+pub enum RunPauseReason {
+    User,
+    NeedsInput,
+    Approval,
+    BootRecovery,
+    UsageLimit,
+    TokenBudget,
+    TimeBudget,
+    RepeatedBlocker,
+    IndeterminateSideEffect,
+    ProviderUnavailable,
+}
+
+impl RunPauseReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::NeedsInput => "needs_input",
+            Self::Approval => "approval",
+            Self::BootRecovery => "boot_recovery",
+            Self::UsageLimit => "usage_limit",
+            Self::TokenBudget => "token_budget",
+            Self::TimeBudget => "time_budget",
+            Self::RepeatedBlocker => "repeated_blocker",
+            Self::IndeterminateSideEffect => "indeterminate_side_effect",
+            Self::ProviderUnavailable => "provider_unavailable",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(Self::User),
+            "needs_input" => Some(Self::NeedsInput),
+            "approval" => Some(Self::Approval),
+            "boot_recovery" => Some(Self::BootRecovery),
+            "usage_limit" => Some(Self::UsageLimit),
+            "token_budget" => Some(Self::TokenBudget),
+            "time_budget" => Some(Self::TimeBudget),
+            "repeated_blocker" => Some(Self::RepeatedBlocker),
+            "indeterminate_side_effect" => Some(Self::IndeterminateSideEffect),
+            "provider_unavailable" => Some(Self::ProviderUnavailable),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RunPause")]
+pub struct RunPause {
+    pub reason: RunPauseReason,
+    pub detail: Option<String>,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
+    pub changed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "BlockerAudit")]
+pub struct BlockerAudit {
+    pub fingerprint: String,
+    pub consecutive_turns: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RunTurnSummary")]
+pub struct RunTurnSummary {
+    pub turn_id: String,
+    #[ts(type = "number")]
+    pub ordinal: u64,
+    pub origin: RunTurnOrigin,
+    pub status: RunTurnStatus,
+    pub transcript_visibility: TurnVisibility,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
+    pub started_at: DateTime<Utc>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[ts(type = "number")]
+    pub input_tokens: u64,
+    #[ts(type = "number")]
+    pub output_tokens: u64,
+    #[ts(type = "number")]
+    pub elapsed_seconds: u64,
+    pub compaction_count: u32,
+    pub final_message_id: Option<String>,
+    pub error_fingerprint: Option<String>,
+}
+
+/// Rebuildable control projection for one long-horizon TaskRun.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RunContinuationState")]
+pub struct RunContinuationState {
+    pub enabled: bool,
+    pub auto_resume_after_restart: bool,
+    #[ts(type = "number | null")]
+    pub token_budget: Option<u64>,
+    #[ts(type = "number | null")]
+    pub time_budget_seconds: Option<u64>,
+    #[ts(type = "number")]
+    pub tokens_used: u64,
+    #[ts(type = "number")]
+    pub time_used_seconds: u64,
+    pub compaction_count: u32,
+    #[ts(type = "number")]
+    pub next_turn_ordinal: u64,
+    pub active_turn: Option<RunTurnSummary>,
+    pub last_turn: Option<RunTurnSummary>,
+    pub pause: Option<RunPause>,
+    pub blocker_audit: Option<BlockerAudit>,
+    pub deferred: bool,
+}
+
+impl Default for RunContinuationState {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_resume_after_restart: false,
+            token_budget: None,
+            time_budget_seconds: None,
+            tokens_used: 0,
+            time_used_seconds: 0,
+            compaction_count: 0,
+            next_turn_ordinal: 1,
+            active_turn: None,
+            last_turn: None,
+            pause: None,
+            blocker_audit: None,
+            deferred: false,
+        }
+    }
+}
+
+/// Durable TaskRuntime projection of one process-scoped command cell.
+///
+/// The OS handle is never persisted. A started record without `finished_at`
+/// means the current process still owns the cell, or that boot recovery must
+/// close it as interrupted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "BackgroundCellState")]
+pub struct BackgroundCellState {
+    pub cell_id: String,
+    pub name: String,
+    pub command_hash: String,
+    pub turn_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub call_id: Option<String>,
+    pub phase: String,
+    pub exit_code: Option<i32>,
+    #[ts(type = "number")]
+    pub total_output_bytes: u64,
+    pub output_truncated: bool,
+    pub output_excerpt: Option<String>,
+    pub artifact_path: Option<String>,
+    pub artifact_sha256: Option<String>,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
+    pub started_at: DateTime<Utc>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+impl BackgroundCellState {
+    pub fn is_active(&self) -> bool {
+        self.finished_at.is_none()
+    }
 }
 
 /// Materialized EKO plan node used by tools, persistence, review, and UI.

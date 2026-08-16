@@ -260,6 +260,16 @@ impl FileTaskShadow {
                 | RuntimeEventKind::TaskSkipped
                 | RuntimeEventKind::TaskBlocked
                 | RuntimeEventKind::TodoUpdated
+                | RuntimeEventKind::BackgroundCellStarted
+                | RuntimeEventKind::BackgroundCellFinished
+                | RuntimeEventKind::RunContinuationConfigured
+                | RuntimeEventKind::RunTurnStarted
+                | RuntimeEventKind::RunTurnUsageAccounted
+                | RuntimeEventKind::RunTurnCompacted
+                | RuntimeEventKind::RunTurnFinished
+                | RuntimeEventKind::RunContinuationDeferred
+                | RuntimeEventKind::RunContinuationResumed
+                | RuntimeEventKind::RunPauseReasonChanged
         ) || (latest.event_type == RuntimeEventKind::Note
             && matches!(note_kind, Some("summary_persisted")));
         if !affects_plan && !affects_run_state {

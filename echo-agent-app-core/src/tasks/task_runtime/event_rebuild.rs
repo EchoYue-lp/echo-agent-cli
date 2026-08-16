@@ -14,9 +14,10 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::types::{
-    AttendedMode, DomainProfile, EkoTaskExecution, ExecutionMode, PlanRevision, PlanTask,
-    RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus,
-    TodoStatus,
+    AttendedMode, BackgroundCellState, BlockerAudit, DomainProfile, EkoTaskExecution,
+    ExecutionMode, PlanRevision, PlanTask, RunContinuationState, RunPause, RunPauseReason,
+    RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
+    RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus, TurnVisibility,
 };
 
 /// Rebuilt plan snapshot — the shape `plan.json` will take.
@@ -25,6 +26,10 @@ pub struct RebuiltPlan {
     pub run: TaskRun,
     pub plan: TaskPlan,
     pub tasks: Vec<PlanTask>,
+    #[serde(default)]
+    pub background_cells: Vec<BackgroundCellState>,
+    #[serde(default)]
+    pub continuation: Option<RunContinuationState>,
 }
 
 impl RebuiltPlan {
@@ -46,6 +51,8 @@ impl RebuiltPlan {
         RunStateSnapshot {
             run: self.run.clone(),
             tasks: self.tasks.iter().map(PlanTask::execution).collect(),
+            continuation: self.continuation.clone(),
+            background_cells: self.background_cells.clone(),
         }
     }
 }
@@ -62,6 +69,12 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
     let mut run: Option<TaskRun> = None;
     let mut plan: Option<TaskPlan> = None;
     let mut tasks: Vec<PlanTask> = Vec::new();
+    let mut background_cells = std::collections::BTreeMap::<String, BackgroundCellState>::new();
+    let mut continuation: Option<RunContinuationState> = None;
+    let mut started_turns = std::collections::HashSet::<String>::new();
+    let mut accounted_usage = std::collections::HashSet::<String>::new();
+    let mut accounted_compactions = std::collections::HashSet::<String>::new();
+    let mut finished_turns = std::collections::HashSet::<String>::new();
 
     for ev in events {
         match ev.event_type {
@@ -250,13 +263,303 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                     // separately via list_todos. They land on plan.json tasks[] in 0b.
                 }
             }
+            K::BackgroundCellStarted => {
+                let Some(cell_id) = ev.payload.get("cell_id").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                background_cells
+                    .entry(cell_id.to_string())
+                    .or_insert_with(|| BackgroundCellState {
+                        cell_id: cell_id.to_string(),
+                        name: json_string(&ev.payload, "name").unwrap_or_default(),
+                        command_hash: json_string(&ev.payload, "command_hash").unwrap_or_default(),
+                        turn_id: json_string(&ev.payload, "turn_id"),
+                        execution_id: json_string(&ev.payload, "execution_id"),
+                        call_id: json_string(&ev.payload, "call_id"),
+                        phase: "running".to_string(),
+                        exit_code: None,
+                        total_output_bytes: 0,
+                        output_truncated: false,
+                        output_excerpt: None,
+                        artifact_path: None,
+                        artifact_sha256: None,
+                        started_at: ev.timestamp,
+                        finished_at: None,
+                    });
+            }
+            K::BackgroundCellFinished => {
+                let Some(cell_id) = ev.payload.get("cell_id").and_then(|value| value.as_str())
+                else {
+                    continue;
+                };
+                let cell = background_cells
+                    .entry(cell_id.to_string())
+                    .or_insert_with(|| BackgroundCellState {
+                        cell_id: cell_id.to_string(),
+                        name: json_string(&ev.payload, "name").unwrap_or_default(),
+                        command_hash: String::new(),
+                        turn_id: None,
+                        execution_id: None,
+                        call_id: None,
+                        phase: "unknown".to_string(),
+                        exit_code: None,
+                        total_output_bytes: 0,
+                        output_truncated: false,
+                        output_excerpt: None,
+                        artifact_path: None,
+                        artifact_sha256: None,
+                        started_at: ev.timestamp,
+                        finished_at: None,
+                    });
+                cell.phase =
+                    json_string(&ev.payload, "phase").unwrap_or_else(|| "unknown".to_string());
+                cell.exit_code = ev
+                    .payload
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok());
+                cell.total_output_bytes = ev
+                    .payload
+                    .get("total_output_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                cell.output_truncated = ev
+                    .payload
+                    .get("output_truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                cell.output_excerpt = json_string(&ev.payload, "output_excerpt");
+                cell.artifact_path = json_string(&ev.payload, "artifact_path");
+                cell.artifact_sha256 = json_string(&ev.payload, "artifact_sha256");
+                cell.finished_at = Some(ev.timestamp);
+            }
+            K::RunContinuationConfigured => {
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                state.enabled = ev
+                    .payload
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(state.enabled);
+                state.auto_resume_after_restart = ev
+                    .payload
+                    .get("auto_resume_after_restart")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(state.auto_resume_after_restart);
+                if ev.payload.get("token_budget").is_some() {
+                    state.token_budget = ev
+                        .payload
+                        .get("token_budget")
+                        .and_then(serde_json::Value::as_u64);
+                }
+                if ev.payload.get("time_budget_seconds").is_some() {
+                    state.time_budget_seconds = ev
+                        .payload
+                        .get("time_budget_seconds")
+                        .and_then(serde_json::Value::as_u64);
+                }
+            }
+            K::RunTurnStarted => {
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                let ordinal = ev
+                    .payload
+                    .get("ordinal")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(state.next_turn_ordinal);
+                let turn_id = json_string(&ev.payload, "turn_id")
+                    .unwrap_or_else(|| format!("{}:turn:{ordinal}", ev.run_id));
+                if !started_turns.insert(turn_id.clone()) {
+                    continue;
+                }
+                let origin = json_string(&ev.payload, "origin")
+                    .as_deref()
+                    .and_then(RunTurnOrigin::from_wire)
+                    .unwrap_or(RunTurnOrigin::Continuation);
+                let transcript_visibility =
+                    match json_string(&ev.payload, "transcript_visibility").as_deref() {
+                        Some("visible") => TurnVisibility::Visible,
+                        _ => TurnVisibility::Internal,
+                    };
+                state.next_turn_ordinal = ordinal.saturating_add(1);
+                state.active_turn = Some(RunTurnSummary {
+                    turn_id,
+                    ordinal,
+                    origin,
+                    status: RunTurnStatus::Running,
+                    transcript_visibility,
+                    started_at: ev.timestamp,
+                    ended_at: None,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    elapsed_seconds: 0,
+                    compaction_count: 0,
+                    final_message_id: None,
+                    error_fingerprint: None,
+                });
+                state.pause = None;
+            }
+            K::RunTurnUsageAccounted => {
+                let Some(event_id) = json_string(&ev.payload, "event_id") else {
+                    continue;
+                };
+                if !accounted_usage.insert(event_id) {
+                    continue;
+                }
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                let input_tokens = ev
+                    .payload
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let output_tokens = ev
+                    .payload
+                    .get("output_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                state.tokens_used = state
+                    .tokens_used
+                    .saturating_add(input_tokens.saturating_add(output_tokens));
+                let turn_id = json_string(&ev.payload, "turn_id");
+                if let Some(active) = state.active_turn.as_mut()
+                    && turn_id.as_deref() == Some(active.turn_id.as_str())
+                {
+                    active.input_tokens = active.input_tokens.saturating_add(input_tokens);
+                    active.output_tokens = active.output_tokens.saturating_add(output_tokens);
+                }
+            }
+            K::RunTurnCompacted => {
+                let Some(event_id) = json_string(&ev.payload, "event_id") else {
+                    continue;
+                };
+                if !accounted_compactions.insert(event_id) {
+                    continue;
+                }
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                state.compaction_count = state.compaction_count.saturating_add(1);
+                let turn_id = json_string(&ev.payload, "turn_id");
+                if let Some(active) = state.active_turn.as_mut()
+                    && turn_id.as_deref() == Some(active.turn_id.as_str())
+                {
+                    active.compaction_count = active.compaction_count.saturating_add(1);
+                }
+            }
+            K::RunTurnFinished => {
+                let Some(turn_id) = json_string(&ev.payload, "turn_id") else {
+                    continue;
+                };
+                if finished_turns.contains(&turn_id) {
+                    continue;
+                }
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                let mut finished = match state.active_turn.as_ref() {
+                    Some(active) if active.turn_id == turn_id => {
+                        finished_turns.insert(turn_id);
+                        state.active_turn.take()
+                    }
+                    _ => continue,
+                };
+                if let Some(summary) = finished.as_mut() {
+                    summary.status = json_string(&ev.payload, "status")
+                        .as_deref()
+                        .and_then(RunTurnStatus::from_wire)
+                        .unwrap_or(RunTurnStatus::Failed);
+                    summary.ended_at = Some(ev.timestamp);
+                    summary.elapsed_seconds = ev
+                        .payload
+                        .get("elapsed_seconds")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    summary.final_message_id = json_string(&ev.payload, "final_message_id");
+                    summary.error_fingerprint = json_string(&ev.payload, "error_fingerprint");
+                    state.time_used_seconds = state
+                        .time_used_seconds
+                        .saturating_add(summary.elapsed_seconds);
+                    state.last_turn = Some(summary.clone());
+                }
+                match ev
+                    .payload
+                    .get("made_progress")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    Some(true) => state.blocker_audit = None,
+                    Some(false) => {
+                        let blocker_fingerprint = json_string(&ev.payload, "blocker_fingerprint")
+                            .unwrap_or_else(|| "stalled:unknown".to_string());
+                        state.blocker_audit = Some(match state.blocker_audit.take() {
+                            Some(previous) if previous.fingerprint == blocker_fingerprint => {
+                                BlockerAudit {
+                                    fingerprint: blocker_fingerprint,
+                                    consecutive_turns: previous.consecutive_turns.saturating_add(1),
+                                }
+                            }
+                            _ => BlockerAudit {
+                                fingerprint: blocker_fingerprint,
+                                consecutive_turns: 1,
+                            },
+                        });
+                    }
+                    None => {
+                        let Some(progress_fingerprint) =
+                            json_string(&ev.payload, "progress_fingerprint")
+                        else {
+                            continue;
+                        };
+                        state.blocker_audit = Some(match state.blocker_audit.take() {
+                            Some(previous) if previous.fingerprint == progress_fingerprint => {
+                                BlockerAudit {
+                                    fingerprint: progress_fingerprint,
+                                    consecutive_turns: previous.consecutive_turns.saturating_add(1),
+                                }
+                            }
+                            _ => BlockerAudit {
+                                fingerprint: progress_fingerprint,
+                                consecutive_turns: 1,
+                            },
+                        });
+                    }
+                }
+            }
+            K::RunContinuationDeferred => {
+                continuation
+                    .get_or_insert_with(RunContinuationState::default)
+                    .deferred = true;
+            }
+            K::RunContinuationResumed => {
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                state.deferred = false;
+                state.blocker_audit = None;
+            }
+            K::RunPauseReasonChanged => {
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                state.pause = json_string(&ev.payload, "reason")
+                    .as_deref()
+                    .and_then(RunPauseReason::from_wire)
+                    .map(|reason| RunPause {
+                        reason,
+                        detail: json_string(&ev.payload, "detail"),
+                        changed_at: ev.timestamp,
+                    });
+            }
             _ => {} // ArtifactProduced/Review*/Approval*/Note(other) don't affect plan.json
         }
     }
 
     let run = run.ok_or(RebuildError::NoRunCreated)?;
     let plan = plan.unwrap_or_else(|| empty_plan_for(&run));
-    Ok(RebuiltPlan { run, plan, tasks })
+    Ok(RebuiltPlan {
+        run,
+        plan,
+        tasks,
+        background_cells: background_cells.into_values().collect(),
+        continuation,
+    })
+}
+
+fn json_string(payload: &serde_json::Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -300,10 +603,13 @@ fn empty_plan_for(run: &TaskRun) -> TaskPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::task_runtime::store::TaskRuntimeStore;
+    use crate::tasks::task_runtime::store::{
+        RunTurnClaimOutcome, RunTurnCompletion, TaskRuntimeStore,
+    };
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan,
-        TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
+        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RunTurnOrigin, RunTurnStatus,
+        TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
+        TurnVisibility,
     };
 
     fn fresh() -> TaskRuntimeStore {
@@ -487,6 +793,94 @@ mod tests {
         assert_eq!(t.kind, PlanTaskKind::ReadOnlyReview);
         assert_eq!(t.agent_role, "explorer");
         assert_eq!(t.files, vec!["b.rs".to_string()]);
+    }
+
+    #[test]
+    fn continuation_fold_is_idempotent_under_duplicate_event_delivery() -> Result<(), String> {
+        let store = fresh();
+        store
+            .create_run(
+                "continuation-run",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "finish the goal",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("continuation-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("continuation-run", true, false, Some(100), None)
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            store
+                .claim_run_turn(
+                    "continuation-run",
+                    "turn-1",
+                    RunTurnOrigin::User,
+                    TurnVisibility::Visible,
+                )
+                .map_err(|error| error.to_string())?,
+            RunTurnClaimOutcome::Started(_)
+        ) {
+            return Err("first RunTurn was not started".to_string());
+        }
+        store
+            .account_run_turn_usage("continuation-run", "turn-1", "usage-1", 11, 7)
+            .map_err(|error| error.to_string())?;
+        store
+            .record_run_turn_compaction("continuation-run", "turn-1", "compact-1")
+            .map_err(|error| error.to_string())?;
+        store
+            .finish_run_turn(
+                "continuation-run",
+                RunTurnCompletion {
+                    turn_id: "turn-1",
+                    status: RunTurnStatus::Ended,
+                    elapsed_seconds: 5,
+                    final_message_id: Some("message-1"),
+                    error_fingerprint: None,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        let mut events = store
+            .list_events("continuation-run", 0)
+            .map_err(|error| error.to_string())?;
+        let duplicates = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type,
+                    RuntimeEventKind::RunTurnStarted
+                        | RuntimeEventKind::RunTurnUsageAccounted
+                        | RuntimeEventKind::RunTurnCompacted
+                        | RuntimeEventKind::RunTurnFinished
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        events.extend(duplicates);
+        let continuation = rebuild_plan_from_events(&events)
+            .map_err(|error| error.to_string())?
+            .continuation
+            .ok_or_else(|| "continuation projection missing".to_string())?;
+        assert!(continuation.active_turn.is_none());
+        assert_eq!(continuation.tokens_used, 18);
+        assert_eq!(continuation.time_used_seconds, 5);
+        assert_eq!(continuation.compaction_count, 1);
+        assert_eq!(continuation.next_turn_ordinal, 2);
+        let last = continuation
+            .last_turn
+            .ok_or_else(|| "finished turn missing".to_string())?;
+        assert_eq!(last.compaction_count, 1);
+        assert_eq!(last.input_tokens, 11);
+        assert_eq!(last.output_tokens, 7);
+        Ok(())
     }
 
     /// Rebuild without RunCreated is an error (can't have a plan with no run).

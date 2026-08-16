@@ -1508,6 +1508,9 @@ async fn dispatch_turn(
         review_integration: app.review_integration.clone(),
         layer_manager: None,
         memory_generation: None,
+        human_loop_provider: app.human_loop_provider.clone().map(|provider| {
+            provider as std::sync::Arc<dyn echo_agent::human_loop::HumanLoopProvider>
+        }),
     });
     let agent_owned = agent.clone();
     let settled_turn_id = turn_id.clone();
@@ -4645,13 +4648,39 @@ async fn handle_slash_command(
                             .ok_or_else(|| "run is not actively pausable".to_string())
                     }),
                 SlashCommand::TaskResume => {
-                    resume_tui_task_run(
-                        store.clone(),
-                        agent.clone(),
-                        run_id.clone(),
-                        app.review_integration.clone(),
-                    )
-                    .await
+                    let is_continuation = store
+                        .get_run_state(&run_id)
+                        .ok()
+                        .flatten()
+                        .and_then(|state| state.continuation)
+                        .is_some_and(|continuation| continuation.enabled);
+                    if is_continuation {
+                        match dispatch_turn(
+                            app,
+                            agent,
+                            agent_tx.clone(),
+                            QueuedTurn {
+                                text: format!(
+                                    "Continue the existing TaskRun {run_id} toward its unchanged Goal."
+                                ),
+                                attachments: Vec::new(),
+                                interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
+                            },
+                        )
+                        .await
+                        {
+                            TurnDispatchResult::Started => Ok("continuation submitted"),
+                            TurnDispatchResult::Rejected { error, .. } => Err(error),
+                        }
+                    } else {
+                        resume_tui_task_run(
+                            store.clone(),
+                            agent.clone(),
+                            run_id.clone(),
+                            app.review_integration.clone(),
+                        )
+                        .await
+                    }
                 }
                 _ => Err("unsupported task action".to_string()),
             };
@@ -4660,6 +4689,57 @@ async fn handle_slash_command(
                 content: match result {
                     Ok(label) => format!("Task run {run_id} {label}."),
                     Err(error) => format!("Task run action failed: {error}"),
+                },
+            });
+            refresh_task_runtime_view(app);
+        }
+        Some(SlashCommand::TaskBudget) => {
+            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let mut values = args.split_whitespace();
+            let Some(token_value) = values.next() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Usage: /task-budget <tokens|none> <seconds|none> [run-id]"
+                        .to_string(),
+                });
+                return;
+            };
+            let Some(time_value) = values.next() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Usage: /task-budget <tokens|none> <seconds|none> [run-id]"
+                        .to_string(),
+                });
+                return;
+            };
+            let run_id = values.next().map(str::to_string).or_else(|| {
+                app.task_runtime_view
+                    .as_ref()
+                    .map(|view| view.run_id.clone())
+            });
+            let result = run_id
+                .ok_or_else(|| "No active task run. Supply a run id explicitly.".to_string())
+                .and_then(|run_id| {
+                    parse_tui_budget(token_value, "token").and_then(|tokens| {
+                        parse_tui_budget(time_value, "time").and_then(|time| {
+                            store
+                                .update_run_continuation_budgets(&run_id, tokens, time)
+                                .map(|_| run_id)
+                                .map_err(|error| error.to_string())
+                        })
+                    })
+                });
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(run_id) => format!("Task run {run_id} budgets updated."),
+                    Err(error) => format!("Task budget update failed: {error}"),
                 },
             });
             refresh_task_runtime_view(app);
@@ -5327,16 +5407,134 @@ fn refresh_task_runtime_view(app: &mut TuiApp) {
             Vec::new()
         }
     };
+    let continuation = store
+        .get_run_state(&run.run_id)
+        .ok()
+        .flatten()
+        .and_then(|state| state.continuation);
+    let active_cell_count = store
+        .list_background_cells(&run.run_id)
+        .map(|cells| cells.iter().filter(|cell| cell.is_active()).count())
+        .unwrap_or(0);
     app.task_runtime_view = Some(TaskRuntimeView {
         run_id: run.run_id,
         goal: run.goal,
         status: run.status.as_str().to_string(),
+        continuation_enabled: continuation.as_ref().is_some_and(|state| state.enabled),
+        turn_ordinal: continuation
+            .as_ref()
+            .and_then(|state| state.active_turn.as_ref().or(state.last_turn.as_ref()))
+            .map(|turn| turn.ordinal),
+        tokens_used: continuation
+            .as_ref()
+            .map(|state| state.tokens_used)
+            .unwrap_or(0),
+        token_budget: continuation.as_ref().and_then(|state| state.token_budget),
+        time_used_seconds: continuation
+            .as_ref()
+            .map(|state| state.time_used_seconds)
+            .unwrap_or(0),
+        time_budget_seconds: continuation
+            .as_ref()
+            .and_then(|state| state.time_budget_seconds),
+        compaction_count: continuation
+            .as_ref()
+            .map(|state| state.compaction_count)
+            .unwrap_or(0),
+        pause_reason: continuation
+            .as_ref()
+            .and_then(|state| state.pause.as_ref())
+            .map(|pause| pause.reason.as_str().to_string()),
+        pause_detail: continuation
+            .as_ref()
+            .and_then(|state| state.pause.as_ref())
+            .and_then(|pause| pause.detail.clone()),
+        deferred: continuation.as_ref().is_some_and(|state| state.deferred),
+        active_cell_count,
         tasks,
     });
 }
 
+fn format_budget_usage(label: &str, used: u64, budget: Option<u64>, unit: &str) -> String {
+    match budget {
+        Some(budget) => format!(
+            "{label}: {used}{unit} used | {budget}{unit} budget | {}{unit} remaining",
+            budget.saturating_sub(used)
+        ),
+        None => format!("{label}: {used}{unit} used | unbounded"),
+    }
+}
+
+fn parse_tui_budget(value: &str, label: &str) -> Result<Option<u64>, String> {
+    if matches!(value, "none" | "unbounded") {
+        return Ok(None);
+    }
+    let budget = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid {label} budget: {error}"))?;
+    if budget == 0 {
+        return Err(format!("{label} budget must be positive or 'none'"));
+    }
+    Ok(Some(budget))
+}
+
+fn format_pause_reason(reason: &str) -> &str {
+    match reason {
+        "user" => "paused by user",
+        "needs_input" => "input required",
+        "approval" => "approval required",
+        "boot_recovery" => "restart recovery required",
+        "usage_limit" => "provider usage limit reached",
+        "token_budget" => "token budget exhausted",
+        "time_budget" => "time budget exhausted",
+        "repeated_blocker" => "repeated blocker detected",
+        "indeterminate_side_effect" => "side effect needs review",
+        "provider_unavailable" => "provider unavailable",
+        unknown => unknown,
+    }
+}
+
 fn format_task_runtime_view(view: &TaskRuntimeView) -> String {
     let mut content = format!("Run {} [{}]\nGoal: {}", view.run_id, view.status, view.goal);
+    if view.continuation_enabled {
+        let turn = view
+            .turn_ordinal
+            .map(|ordinal| ordinal.to_string())
+            .unwrap_or_else(|| "not started".to_string());
+        content.push_str(&format!(
+            "\nContinuation: active | turn: {turn} | compactions: {} | active cells: {}{}",
+            view.compaction_count,
+            view.active_cell_count,
+            if view.deferred {
+                " | waiting for cell"
+            } else {
+                ""
+            }
+        ));
+        content.push_str(&format!(
+            "\n{}",
+            format_budget_usage("Tokens", view.tokens_used, view.token_budget, "")
+        ));
+        content.push_str(&format!(
+            "\n{}",
+            format_budget_usage(
+                "Time",
+                view.time_used_seconds,
+                view.time_budget_seconds,
+                "s"
+            )
+        ));
+    }
+    if let Some(reason) = &view.pause_reason {
+        content.push_str(&format!("\nPause reason: {}", format_pause_reason(reason)));
+        if let Some(detail) = view
+            .pause_detail
+            .as_deref()
+            .filter(|detail| !detail.is_empty())
+        {
+            content.push_str(&format!("\nPause detail: {detail}"));
+        }
+    }
     if view.tasks.is_empty() {
         content.push_str("\nPlan: not created yet");
         return content;
@@ -6482,6 +6680,17 @@ mod tests {
             run_id: "run-1".to_string(),
             goal: "补齐 TUI".to_string(),
             status: "running".to_string(),
+            continuation_enabled: true,
+            turn_ordinal: Some(4),
+            tokens_used: 12_345,
+            token_budget: Some(50_000),
+            time_used_seconds: 90,
+            time_budget_seconds: Some(300),
+            compaction_count: 2,
+            pause_reason: None,
+            pause_detail: None,
+            deferred: false,
+            active_cell_count: 1,
             tasks: vec![TaskRuntimeTaskView {
                 title: "实现队列".to_string(),
                 status: "completed".to_string(),
@@ -6491,7 +6700,37 @@ mod tests {
 
         let text = format_task_runtime_view(&view);
         assert!(text.contains("run-1 [running]"));
+        assert!(text.contains("Continuation: active | turn: 4 | compactions: 2"));
+        assert!(text.contains("Tokens: 12345 used | 50000 budget | 37655 remaining"));
+        assert!(text.contains("Time: 90s used | 300s budget | 210s remaining"));
         assert!(text.contains("[completed] 实现队列 (implementer)"));
+    }
+
+    #[test]
+    fn task_runtime_projection_formats_exhausted_time_budget_without_underflow() {
+        let view = TaskRuntimeView {
+            run_id: "run-time-budget".to_string(),
+            goal: "finish within the configured time".to_string(),
+            status: "paused".to_string(),
+            continuation_enabled: true,
+            turn_ordinal: Some(8),
+            tokens_used: 900,
+            token_budget: None,
+            time_used_seconds: 305,
+            time_budget_seconds: Some(300),
+            compaction_count: 1,
+            pause_reason: Some("time_budget".to_string()),
+            pause_detail: Some("configured limit reached".to_string()),
+            deferred: false,
+            active_cell_count: 0,
+            tasks: Vec::new(),
+        };
+
+        let text = format_task_runtime_view(&view);
+        assert!(text.contains("Tokens: 900 used | unbounded"));
+        assert!(text.contains("Time: 305s used | 300s budget | 0s remaining"));
+        assert!(text.contains("Pause reason: time budget exhausted"));
+        assert!(text.contains("Pause detail: configured limit reached"));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use echo_agent::agent::{AgentEvent, AgentHandle, CancellationToken};
 use tokio::sync::watch;
 
-use crate::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome, drive_chat};
+use crate::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome, drive_chat, drive_chat_turn};
 use crate::chat_resources::ChatResources;
 use crate::prepared_turn::PreparedUserTurn;
 
@@ -110,20 +110,48 @@ pub enum ForegroundTurnError {
 
 struct ActiveForegroundTurn {
     key: ForegroundTurnKey,
-    turn_id: String,
+    root_turn_id: String,
+    active_agent_turn_id: Mutex<String>,
     cancel: CancellationToken,
     settlement_tx: watch::Sender<Option<ForegroundTurnSettlement>>,
 }
 
 impl ActiveForegroundTurn {
+    fn active_agent_turn_id(&self) -> String {
+        self.active_agent_turn_id
+            .lock()
+            .map(|turn_id| turn_id.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
     fn snapshot(&self) -> ForegroundTurnSnapshot {
         ForegroundTurnSnapshot {
             surface: self.key.surface,
             conversation_id: self.key.conversation_id.clone(),
-            turn_id: self.turn_id.clone(),
+            turn_id: self.active_agent_turn_id(),
             cancellation_requested: self.cancel.is_cancelled(),
         }
     }
+}
+
+tokio::task_local! {
+    static CURRENT_FOREGROUND_TURN: Arc<ActiveForegroundTurn>;
+}
+
+/// Update only the steerable Agent turn identity for the currently owned
+/// foreground operation. The root UI message and settlement identity do not
+/// change across internal continuation turns.
+pub(crate) fn advance_current_agent_turn(turn_id: &str) {
+    if turn_id.trim().is_empty() {
+        return;
+    }
+    let _ = CURRENT_FOREGROUND_TURN.try_with(|entry| {
+        let mut current = entry
+            .active_agent_turn_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *current = turn_id.to_string();
+    });
 }
 
 type ForegroundShutdownResult = Result<(), ForegroundTurnError>;
@@ -269,14 +297,15 @@ impl ForegroundTurnControl {
             return Err(ForegroundTurnError::Busy {
                 surface,
                 conversation_id: key.conversation_id.clone(),
-                active_turn_id: existing.turn_id.clone(),
+                active_turn_id: existing.active_agent_turn_id(),
             });
         }
         let cancel = CancellationToken::new();
         let (settlement_tx, _) = watch::channel(None);
         let entry = Arc::new(ActiveForegroundTurn {
             key: key.clone(),
-            turn_id,
+            root_turn_id: turn_id.clone(),
+            active_agent_turn_id: Mutex::new(turn_id),
             cancel,
             settlement_tx,
         });
@@ -488,12 +517,13 @@ impl ForegroundTurnControl {
                     }
                 })?
             };
-        if entry.turn_id != expected_turn_id {
+        let active_turn_id = entry.active_agent_turn_id();
+        if active_turn_id != expected_turn_id {
             return Err(ForegroundTurnError::TurnMismatch {
                 surface,
                 conversation_id: conversation_id.to_string(),
                 expected_turn_id: expected_turn_id.to_string(),
-                actual_turn_id: entry.turn_id.clone(),
+                actual_turn_id: active_turn_id,
             });
         }
         let settlement_rx = entry.settlement_tx.subscribe();
@@ -615,7 +645,7 @@ impl ForegroundTurnControl {
         let settlement = ForegroundTurnSettlement {
             surface: entry.key.surface,
             conversation_id: entry.key.conversation_id.clone(),
-            turn_id: entry.turn_id.clone(),
+            turn_id: entry.root_turn_id.clone(),
             outcome,
         };
         if let Ok(mut state) = self.inner.state.lock()
@@ -672,7 +702,7 @@ impl ForegroundTurnLease {
     }
 
     pub fn turn_id(&self) -> &str {
-        &self.entry.turn_id
+        &self.entry.root_turn_id
     }
 
     pub fn cancellation_token(&self) -> CancellationToken {
@@ -749,6 +779,10 @@ impl ChatSink for CancellationAwareChatSink {
         }
         accepted
     }
+
+    fn continuation_sink(&self) -> Option<Arc<dyn ChatSink>> {
+        Some(Arc::clone(&self.inner))
+    }
 }
 
 fn normalize_downstream_outcome(
@@ -785,6 +819,25 @@ pub async fn drive_foreground_chat(
     result
 }
 
+/// Resume or recover an existing TaskRun through the same foreground owner.
+pub async fn drive_foreground_chat_turn(
+    lease: ForegroundTurnLease,
+    agent: &AgentHandle,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    binding: crate::tasks::task_runtime::types::RunTurnBinding,
+) -> Result<TurnOutcome, String> {
+    let (result, settlement_outcome) =
+        run_foreground_chat_with(&lease, resources, |controlled_resources| async move {
+            drive_chat_turn(agent, turn, controlled_resources, Some(binding))
+                .await
+                .map(|outcome| outcome.terminal)
+        })
+        .await;
+    lease.settle(settlement_outcome);
+    result
+}
+
 /// Drive a pooled foreground chat while the existing foreground owner retains
 /// every subsystem receipt through outer settlement. The shared chat driver
 /// acquires them in `Foreground -> TaskRuntime -> Memory -> pool` order and
@@ -802,16 +855,65 @@ where
     Configure: FnOnce(AgentHandle) -> ConfigureFuture,
     ConfigureFuture: std::future::Future<Output = Result<(), String>>,
 {
+    drive_foreground_pooled_chat_with_binding(
+        lease, pool, pool_key, configure, turn, resources, None,
+    )
+    .await
+}
+
+/// Resume one exact TaskRun through a pooled foreground owner. The explicit
+/// binding prevents a conversation with multiple paused runs from selecting a
+/// different goal during the prepare/claim transaction.
+pub async fn drive_foreground_pooled_chat_turn<Configure, ConfigureFuture>(
+    lease: ForegroundTurnLease,
+    pool: Arc<crate::agent_pool::AgentPool>,
+    pool_key: String,
+    configure: Configure,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    binding: crate::tasks::task_runtime::types::RunTurnBinding,
+) -> TurnOutcome
+where
+    Configure: FnOnce(AgentHandle) -> ConfigureFuture,
+    ConfigureFuture: std::future::Future<Output = Result<(), String>>,
+{
+    drive_foreground_pooled_chat_with_binding(
+        lease,
+        pool,
+        pool_key,
+        configure,
+        turn,
+        resources,
+        Some(binding),
+    )
+    .await
+}
+
+async fn drive_foreground_pooled_chat_with_binding<Configure, ConfigureFuture>(
+    lease: ForegroundTurnLease,
+    pool: Arc<crate::agent_pool::AgentPool>,
+    pool_key: String,
+    configure: Configure,
+    turn: &PreparedUserTurn,
+    resources: Arc<ChatResources>,
+    binding: Option<crate::tasks::task_runtime::types::RunTurnBinding>,
+) -> TurnOutcome
+where
+    Configure: FnOnce(AgentHandle) -> ConfigureFuture,
+    ConfigureFuture: std::future::Future<Output = Result<(), String>>,
+{
     let (_result, settlement_outcome) =
         run_foreground_chat_with(&lease, resources, move |controlled_resources| async move {
-            crate::chat_driver::drive_pooled_chat(
+            crate::chat_driver::drive_pooled_chat_turn(
                 pool,
                 &pool_key,
                 configure,
                 turn,
                 controlled_resources,
+                binding,
             )
             .await
+            .map(|outcome| outcome.terminal)
         })
         .await;
     lease.settle(settlement_outcome.clone());
@@ -878,9 +980,14 @@ where
         review_integration: resources.review_integration.clone(),
         layer_manager: resources.layer_manager.clone(),
         memory_generation: resources.memory_generation.clone(),
+        human_loop_provider: resources.human_loop_provider.clone(),
     });
-    let result =
-        normalize_downstream_outcome(execute(controlled_resources).await, delivery.as_ref());
+    let result = normalize_downstream_outcome(
+        CURRENT_FOREGROUND_TURN
+            .scope(Arc::clone(&lease.entry), execute(controlled_resources))
+            .await,
+        delivery.as_ref(),
+    );
     let settlement_outcome = result.clone().unwrap_or_else(|error| {
         TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
             "foreground_turn",
@@ -1098,6 +1205,36 @@ mod tests {
         assert!(!next.cancellation_token().is_cancelled());
         next.settle(TurnOutcome::Completed);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn foreground_control_tracks_the_current_continuation_turn_id()
+    -> Result<(), ForegroundTurnError> {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin(ForegroundTurnSurface::Gui, "conversation", "root-turn")?;
+        CURRENT_FOREGROUND_TURN
+            .scope(Arc::clone(&lease.entry), async {
+                advance_current_agent_turn("continuation-turn");
+                let snapshot = control
+                    .snapshot(ForegroundTurnSurface::Gui, "conversation")
+                    .ok_or(ForegroundTurnError::StateUnavailable)?;
+                assert_eq!(snapshot.turn_id, "continuation-turn");
+                assert!(matches!(
+                    control
+                        .request_cancel(ForegroundTurnSurface::Gui, "conversation", "root-turn",),
+                    Err(ForegroundTurnError::TurnMismatch { .. })
+                ));
+                let waiter = control.request_cancel(
+                    ForegroundTurnSurface::Gui,
+                    "conversation",
+                    "continuation-turn",
+                )?;
+                assert!(lease.cancellation_token().is_cancelled());
+                lease.settle(TurnOutcome::Cancelled);
+                assert_eq!(waiter.wait().await?.turn_id, "root-turn");
+                Ok::<(), ForegroundTurnError>(())
+            })
+            .await
     }
 
     #[tokio::test]

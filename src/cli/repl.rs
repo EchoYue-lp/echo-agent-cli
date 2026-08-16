@@ -29,10 +29,17 @@ static TOTAL_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FILE_CHANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone)]
+struct ExplicitTaskRunResume {
+    run_id: String,
+    root_message_id: String,
+}
+
 struct QueuedReplTurn {
     message: String,
     interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
     attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    task_run_resume: Option<ExplicitTaskRunResume>,
 }
 
 #[derive(Default)]
@@ -1125,6 +1132,7 @@ async fn run_repl_inner(
         .with_prompt_assembly(config.prompt_assembly.clone())
         .with_review_integration(config.review_integration.clone())
         .with_app_state_opt(config.app_state.clone())
+        .with_conversation_id(config.conversation_id.clone())
         .with_interaction_mode(interaction_mode.clone())
         .with_staged_attachments(staged_attachments.clone());
 
@@ -1238,6 +1246,7 @@ async fn run_repl_inner(
                             message: line.to_string(),
                             interaction_mode: mode,
                             attachments,
+                            task_run_resume: None,
                         };
                         if let Some(active) = active_turn.as_ref() {
                             let disposition = route_active_input(
@@ -1388,10 +1397,36 @@ async fn run_repl_inner(
                                     message,
                                     attachments,
                                     interaction_mode: mode,
+                                    task_run_resume: None,
                                 };
                                 // Every idle chat enters the same queue before
                                 // admission. If an older head was retained by
                                 // Busy/AdmissionSuspended, it always starts first.
+                                enqueue_idle_input(&mut queued_turns, input);
+                                start_next_queued_turn(
+                                    &agent,
+                                    output.as_ref(),
+                                    live_output.clone(),
+                                    &config,
+                                    &mut active_turn,
+                                    &mut queued_turns,
+                                )
+                                .await;
+                            }
+                            CommandResult::ResumeTaskRun {
+                                message,
+                                run_id,
+                                root_message_id,
+                            } => {
+                                let input = QueuedReplTurn {
+                                    message,
+                                    attachments: Vec::new(),
+                                    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
+                                    task_run_resume: Some(ExplicitTaskRunResume {
+                                        run_id,
+                                        root_message_id,
+                                    }),
+                                };
                                 enqueue_idle_input(&mut queued_turns, input);
                                 start_next_queued_turn(
                                     &agent,
@@ -1808,6 +1843,7 @@ fn queued_turn_from_prepared(
         message: prepared.instruction.clone(),
         interaction_mode: input.interaction_mode,
         attachments: prepared.inline_attachment_refs(),
+        task_run_resume: input.task_run_resume.clone(),
     }
 }
 
@@ -1934,19 +1970,45 @@ fn spawn_prepared_repl_turn(
         review_integration: config.review_integration.clone(),
         layer_manager: None,
         memory_generation: None,
+        human_loop_provider: config.app_state.as_ref().map(|state| {
+            state.connection.hitl_dispatcher.clone()
+                as Arc<dyn echo_agent::human_loop::HumanLoopProvider>
+        }),
     });
     let agent_owned = agent.clone();
+    let bound_turn_id = turn_id.clone();
     let (completion_tx, completion) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let _ = live_output.print_user_message(&input.message);
         let _ = live_output.emit("Connecting to model...");
-        let result = echo_agent_app_core::foreground_turn::drive_foreground_chat(
-            lease,
-            &agent_owned,
-            &turn,
-            resources,
-        )
-        .await;
+        let result = match input.task_run_resume {
+            Some(resume) => {
+                echo_agent_app_core::foreground_turn::drive_foreground_chat_turn(
+                    lease,
+                    &agent_owned,
+                    &turn,
+                    resources,
+                    echo_agent_app_core::tasks::task_runtime::RunTurnBinding {
+                        run_id: Some(resume.run_id),
+                        turn_id: bound_turn_id,
+                        root_message_id: resume.root_message_id,
+                        origin: echo_agent_app_core::tasks::task_runtime::RunTurnOrigin::Resume,
+                        transcript_visibility:
+                            echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible,
+                    },
+                )
+                .await
+            }
+            None => {
+                echo_agent_app_core::foreground_turn::drive_foreground_chat(
+                    lease,
+                    &agent_owned,
+                    &turn,
+                    resources,
+                )
+                .await
+            }
+        };
         let changes = renderer.finish(&result);
         live_output.clear_turn_cancel();
         let _ = completion_tx.send(());
@@ -2130,6 +2192,7 @@ mod tests {
             message: message.to_string(),
             interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             attachments: Vec::new(),
+            task_run_resume: None,
         }
     }
 
@@ -2270,6 +2333,7 @@ mod tests {
                 mime_type: "text/plain".to_string(),
                 source: echo_agent_app_core::types::AttachmentSource::Paste,
             }],
+            task_run_resume: None,
         };
         let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
             echo_agent_app_core::prepared_turn::UserTurnInput {
@@ -2744,6 +2808,7 @@ mod tests {
             review_integration: None,
             layer_manager: None,
             memory_generation: None,
+            human_loop_provider: None,
         });
         let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn {
             instruction: "respond".to_string(),

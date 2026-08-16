@@ -53,6 +53,8 @@ import type {
   ReviewResult,
   TaskExecutionSummary,
   RecoveryBlocker,
+  RunContinuationState,
+  BackgroundCellState,
   WorkspaceTransitionReceipt,
   ConfiguredModelListResponse,
   LlmApiProtocol,
@@ -551,6 +553,29 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<TaskRun | null>('get_task_run', { runId })
       : get<TaskRun | null>(`/task_runtime/runs/${runId}`),
+  getContinuation: (runId: string) =>
+    isTauri()
+      ? apiInvoke<RunContinuationState | null>('get_task_continuation', { runId })
+      : get<RunContinuationState | null>(`/task_runtime/runs/${runId}/continuation`),
+  configureContinuation: (
+    runId: string,
+    tokenBudget: number | null,
+    timeBudgetSeconds: number | null
+  ) =>
+    isTauri()
+      ? apiInvoke<RunContinuationState>('configure_task_continuation', {
+          runId,
+          tokenBudget,
+          timeBudgetSeconds,
+        })
+      : post<RunContinuationState>(`/task_runtime/runs/${runId}/continuation`, {
+          token_budget: tokenBudget,
+          time_budget_seconds: timeBudgetSeconds,
+        }),
+  listBackgroundCells: (runId: string) =>
+    isTauri()
+      ? apiInvoke<BackgroundCellState[]>('list_task_background_cells', { runId })
+      : get<BackgroundCellState[]>(`/task_runtime/runs/${runId}/background_cells`),
   latestRunForConversation: (conversationId: string) =>
     isTauri()
       ? apiInvoke<TaskRun | null>('latest_task_run_for_conversation', {

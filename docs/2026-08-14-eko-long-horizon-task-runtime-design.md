@@ -1,9 +1,51 @@
 # EKO 长程任务运行时完整设计
 
 > 日期：2026-08-14
-> 状态：实现前架构方案
+> 状态：核心控制面已实现，Phase 6 长时评测与安全自动重启续跑待完成
 > 基线：`echo-agent-cli@d01b653dddb4eb8ce9ff1566677bf4742166aabe`
 > 配套取证：[`Codex Goal、Turn 与压缩长程运行机制取证`](./2026-08-14-codex-goal-turn-compaction-forensics.md)
+
+## 0. 2026-08-16 实现状态
+
+当前权威路径已经从“一个前台 `drive_chat` 内无限循环”切换为应用层独立的
+`TaskContinuationRuntime`。每个有限 RunTurn 单独注册、持有并释放
+TaskRuntime driver；协调器只在 exact driver idle 后，依据 `events.jsonl` 折叠的
+`RunContinuationState` 请求下一 Turn。前台 GUI/TUI/CLI/channel 不再被整个长程
+Goal 占住。
+
+已经完成：
+
+- 同一 `TaskRun` 跨 Turn 绑定、原子 start-if-idle claim 和内部 transcript visibility。
+- token/time budget、usage/compaction 幂等记账、结构化 pause reason、连续阻塞审计。
+- Goal Contract 与 Recovery Capsule 的压缩后重投影；目标 hash 在 100 次刷新中稳定。
+- background command cell 的 runtime 长轮询、durable terminal fact、完成后事件唤醒；
+  pending wake 防止 cell terminal 与协调器退出竞态丢通知。
+- surface HITL provider 在每个 continuation pool agent 上重新注入；resume 继续使用稳定
+  root message identity，取消中的 pending request 由 RAII guard 立即清理。
+- continuation agent 使用独立且有界的容量域：不占普通 conversation pool 容量，也
+  不会因同时存在大量长程 run 而无界常驻。
+- pause 后等待 exact old driver settlement 再 resume；并发 claim loser 使用无副作用
+  reject，不再把 winner 写成 `Failed`。
+- pool admission/configuration 失败关闭已 claim Turn 并转可恢复暂停；应用 shutdown
+  中断 active continuation 时写 `Paused/BootRecovery`，而非伪装成用户取消。
+- GUI 与 TUI 展示 Turn、压缩、cell、pause detail 及 token/time 的已用、预算、剩余；
+  TypeScript 类型由 Rust `ts-rs` 契约生成。
+- GUI、TUI、CLI 与 channel 共用 TaskRuntime budget/pause/resume/cancel service；显式
+  resume 携带用户选定的 run identity，不再按 conversation 隐式猜测目标。
+
+尚未宣称完成：
+
+- `auto_resume_after_restart` 仍只持久化策略字段。冷启动没有可安全复用的 surface
+  launcher/HITL owner，因此当前统一进入 `Paused/BootRecovery`，由用户显式 resume。
+- Phase 6 的 Goal requirement → PlanTask → artifact/test evidence 完成映射尚未建模。
+- 已有 100 RunTurn/100 compaction 语义 soak；1k/10k 事件性能门槛、真实数十小时任务、
+  kill/sleep/provider-failure 矩阵仍需专项评测。事件全量 fold 的长期 O(n²) 成本需要以
+  可校验 checkpoint projection 优化，但不得引入第二权威 store。
+
+本轮尝试检索官方 OpenAI Docs 时搜索端点返回 404；Codex 对照继续以配套取证文档
+记录的 OpenAI Codex 官方源码快照为主，并用本机 `codex exec --help` 验证
+non-interactive `--json`/`resume` 表面。当前环境实际 `codex-cli` 为 `0.144.1`，不把
+用户另一安装中的 alpha 版本细节当作 EKO 的稳定协议。
 
 ## 1. 决策摘要
 
@@ -264,6 +306,7 @@ pub struct RunContinuationState {
     pub enabled: bool,
     pub auto_resume_after_restart: bool,
     pub token_budget: Option<u64>,
+    pub time_budget_seconds: Option<u64>,
     pub tokens_used: u64,
     pub time_used_seconds: u64,
     pub next_turn_ordinal: u64,
@@ -280,6 +323,8 @@ pub struct RunContinuationState {
 - `enabled` 由用户创建长程目标或显式把 TaskRun 切换为连续执行时设置。
 - `auto_resume_after_restart` 只对显式长程任务生效，不把所有 Paused run 自动启动。
 - `token_budget` 是可选资源上限；用户未要求时为 `None`。
+- `time_budget_seconds` 是可选累计 RunTurn 时间上限；不足一秒的非零 Turn 向上计为
+  一秒，避免大量快速 Turn 绕过时间预算。
 - `tokens_used/time_used_seconds` 是所有 Goal RunTurn 的聚合值。
 - `active_turn/last_turn` 是事件折叠后的有界摘要，不保存完整 transcript。
 - `pause` 解释为什么 `TaskRunStatus::Paused`，而不是增加状态变体。
@@ -328,6 +373,7 @@ Approval
 BootRecovery
 UsageLimit
 TokenBudget
+TimeBudget
 RepeatedBlocker
 IndeterminateSideEffect
 ProviderUnavailable

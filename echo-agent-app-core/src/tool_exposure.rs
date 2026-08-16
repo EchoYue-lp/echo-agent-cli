@@ -67,6 +67,10 @@ const DIRECTORY_TOOLS: &[&str] = &["list_dir"];
 const EXECUTION_TOOLS: &[&str] = &["shell"];
 const CODE_EXECUTION_TOOLS: &[&str] = &["run_code"];
 const TASK_TOOLS: &[&str] = &["task_create", "task_update", "task_list", "task_execute"];
+// Background command cells: long-poll primitives for commands started with
+// shell(background=true). They share the foreground shell safety classifier
+// and are not a second task API.
+const CELL_TOOLS: &[&str] = &["wait", "stop_cell", "list_cells", "watch_cell"];
 const SKILL_RESOURCE_TOOLS: &[&str] = &["read_skill_resource"];
 const WEB_SEARCH_TOOLS: &[&str] = &["web_search"];
 const WEB_FETCH_TOOLS: &[&str] = &["web_fetch"];
@@ -80,6 +84,7 @@ fn groups_for_mode(interaction_mode: InteractionMode) -> &'static [&'static [&'s
         DIRECTORY_TOOLS,
         EXECUTION_TOOLS,
         CODE_EXECUTION_TOOLS,
+        CELL_TOOLS,
         TASK_TOOLS,
         WEB_SEARCH_TOOLS,
     ];
@@ -88,6 +93,7 @@ fn groups_for_mode(interaction_mode: InteractionMode) -> &'static [&'static [&'s
         FILE_TOOLS,
         EXECUTION_TOOLS,
         CODE_EXECUTION_TOOLS,
+        CELL_TOOLS,
         TASK_TOOLS,
         SKILL_RESOURCE_TOOLS,
         WEB_SEARCH_TOOLS,
@@ -98,6 +104,7 @@ fn groups_for_mode(interaction_mode: InteractionMode) -> &'static [&'static [&'s
         FILE_TOOLS,
         DIRECTORY_TOOLS,
         EXECUTION_TOOLS,
+        CELL_TOOLS,
         TASK_TOOLS,
         WEB_SEARCH_TOOLS,
         WEB_FETCH_TOOLS,
@@ -135,14 +142,7 @@ pub(crate) fn initial_visible_tools(
 }
 
 pub(crate) fn disabled_tools_for_mode(interaction_mode: InteractionMode) -> HashSet<String> {
-    let mut disabled = [
-        "spawn_background_task",
-        "check_task_status",
-        "list_background_tasks",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<HashSet<_>>();
+    let mut disabled = HashSet::new();
 
     match interaction_mode {
         InteractionMode::Chat => disabled.extend(
@@ -181,6 +181,7 @@ mod tests {
             DIRECTORY_TOOLS,
             EXECUTION_TOOLS,
             CODE_EXECUTION_TOOLS,
+            CELL_TOOLS,
             TASK_TOOLS,
             SKILL_RESOURCE_TOOLS,
             WEB_SEARCH_TOOLS,
@@ -211,16 +212,20 @@ mod tests {
                 "final_answer",
                 "glob",
                 "grep",
+                "list_cells",
                 "list_dir",
                 "read_artifact",
                 "read_file",
                 "run_code",
                 "shell",
+                "stop_cell",
                 "task_create",
                 "task_execute",
                 "task_list",
                 "task_update",
                 "tool_search",
+                "wait",
+                "watch_cell",
                 "web_search",
                 "write_file",
             ]
@@ -233,16 +238,20 @@ mod tests {
                 "final_answer",
                 "glob",
                 "grep",
+                "list_cells",
                 "read_artifact",
                 "read_file",
                 "read_skill_resource",
                 "run_code",
                 "shell",
+                "stop_cell",
                 "task_create",
                 "task_execute",
                 "task_list",
                 "task_update",
                 "tool_search",
+                "wait",
+                "watch_cell",
                 "web_search",
                 "write_file",
             ]
@@ -255,17 +264,21 @@ mod tests {
                 "final_answer",
                 "glob",
                 "grep",
+                "list_cells",
                 "list_dir",
                 "read_artifact",
                 "read_file",
                 "recall",
                 "search_memory",
                 "shell",
+                "stop_cell",
                 "task_create",
                 "task_execute",
                 "task_list",
                 "task_update",
                 "tool_search",
+                "wait",
+                "watch_cell",
                 "web_fetch",
                 "web_search",
                 "write_file",
@@ -323,9 +336,9 @@ mod tests {
             let stats = ToolManager::schema_stats_for(&selected)?;
             eprintln!("{} tool schema baseline: {stats:?}", mode.as_str());
             let (minimum_tools, maximum_tools) = match mode {
-                InteractionMode::Chat => (12, 18),
-                InteractionMode::Task => (16, 22),
-                InteractionMode::Auto => (18, 25),
+                InteractionMode::Chat => (12, 21),
+                InteractionMode::Task => (16, 25),
+                InteractionMode::Auto => (18, 28),
             };
             assert!(
                 stats.tool_count >= minimum_tools && stats.tool_count <= maximum_tools,

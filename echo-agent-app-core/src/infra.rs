@@ -69,6 +69,10 @@ struct SubagentRuntimeGeneration {
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
+    /// Reasoning-depth knob carried with the generation. Inherited bindings
+    /// track the parent's published thinking; Fixed bindings resolve the
+    /// role's `thinking` frontmatter once at registration.
+    thinking: Option<echo_agent::llm::ThinkingConfig>,
 }
 
 #[derive(Clone)]
@@ -86,15 +90,47 @@ impl SubagentModelBinding {
     }
 }
 
+/// Resolve the thinking config for one subagent build.
+///
+/// An explicit role `thinking` frontmatter spec wins (`parse_spec` syntax;
+/// "auto"/empty → model default); without one the generation's inherited
+/// thinking applies (parent's current thinking for Inherit bindings, the
+/// registration-time copy for Fixed bindings). Unrecognized specs warn loudly
+/// and fall back to the generation value rather than failing registration.
+fn subagent_build_thinking(
+    spec: Option<&str>,
+    generation: &SubagentRuntimeGeneration,
+) -> Option<echo_agent::llm::ThinkingConfig> {
+    match spec.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(spec) => match echo_agent::llm::ThinkingConfig::parse_spec(spec) {
+            Ok(config) => config,
+            Err(error) => {
+                tracing::warn!(
+                    spec = %spec,
+                    %error,
+                    "Invalid subagent thinking spec — falling back to the generation thinking"
+                );
+                generation.thinking.clone()
+            }
+        },
+        None => generation.thinking.clone(),
+    }
+}
+
 fn subagent_model_binding(
     spec: Option<&str>,
+    thinking_spec: Option<&str>,
     parent_generation: &SubagentRuntimeGeneration,
     inherited_generation: &Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>,
 ) -> SubagentModelBinding {
     let model = resolve_subagent_model(spec, &parent_generation.model);
     if spec.is_none() {
+        // Inherit: no thinking of its own — snapshots follow the shared
+        // generation the parent republishes on every model hot-swap.
         SubagentModelBinding::Inherit(inherited_generation.clone())
     } else {
+        // Fixed: resolve the role's thinking spec once; without one keep the
+        // parent's thinking as of registration (mirrors temperature/max_tokens).
         SubagentModelBinding::Fixed(SubagentRuntimeGeneration {
             model: model.clone(),
             llm_config: parent_generation.llm_config.clone().map(|mut config| {
@@ -105,6 +141,7 @@ fn subagent_model_binding(
             temperature: parent_generation.temperature,
             max_tokens: parent_generation.max_tokens,
             token_limit: parent_generation.token_limit,
+            thinking: subagent_build_thinking(thinking_spec, parent_generation),
         })
     }
 }
@@ -141,6 +178,7 @@ impl AgentModelConsumers {
             temperature: runtime.temperature,
             max_tokens: runtime.max_tokens,
             token_limit,
+            thinking: prepared.thinking.clone(),
         };
         for inherited in self.inherited_factories.iter() {
             self.registry
@@ -293,6 +331,7 @@ pub fn load_or_create_cache_user_id() -> String {
     tracing::info!(%id, "created new cache_user_id");
     id
 }
+
 /// Agent plus EKO-owned prompt assembly diagnostics.
 pub struct CreatedAgent {
     pub agent: ReactAgent,
@@ -316,6 +355,9 @@ pub async fn create_agent_with_diagnostics(
     params: &AgentCreateParams,
     app_config: &AppConfig,
 ) -> std::result::Result<CreatedAgent, String> {
+    if let Some(store) = &params.task_runtime_store {
+        crate::tasks::task_runtime::command_cells::register_task_runtime_store(store);
+    }
     // Resolve the product-level configured model first. The legacy `model`
     // section is only a persisted mirror/fallback; GUI/CLI/TUI should all
     // converge on configured_models for actual runtime wiring.
@@ -376,6 +418,8 @@ pub async fn create_agent_with_diagnostics(
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
+    let command_cells =
+        crate::tasks::task_runtime::command_cells::shared_command_cells(sandbox_manager.clone());
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
     let subagent_registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
@@ -392,9 +436,11 @@ pub async fn create_agent_with_diagnostics(
         .system_prompt(&system_prompt)
         .enable_tools()
         .enable_memory()
-        // EKO owns planning through TaskRuntime. The framework's optional
-        // background-task tools use a separate store and must not be exposed
-        // alongside task_create/task_execute.
+        .command_cells(command_cells.clone())
+        // EKO owns planning through TaskRuntime. Background command cells
+        // (shell background=true + wait/stop_cell/list_cells) are shared
+        // execution primitives with the same safety classifier — not a second
+        // task API — so they coexist with task_create/task_execute.
         .enable_subagent()
         .subagent_registry(subagent_registry.clone())
         .subagent_prompt_compiler(subagent_prompt_compiler.clone())
@@ -603,6 +649,7 @@ pub async fn create_agent_with_diagnostics(
             temperature,
             max_tokens,
             token_limit,
+            thinking: prepared_llm.thinking.clone(),
         },
         app_config.agent.tool_timeout_ms,
         max_tool_output_tokens,
@@ -612,9 +659,11 @@ pub async fn create_agent_with_diagnostics(
         subagent_registry,
         params.browser_runtime.clone(),
         sandbox_manager,
+        command_cells.clone(),
         run_code_available,
     )
     .await;
+    crate::tasks::task_runtime::command_cells::install_watch_cell_tool(&mut agent, command_cells);
 
     // Register default hooks
     register_default_hooks(&mut agent);
@@ -709,6 +758,7 @@ async fn register_default_subagents(
     subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
     run_code_available: bool,
 ) -> AgentModelConsumers {
     let tool_output_artifacts = agent.tool_output_artifacts();
@@ -742,12 +792,17 @@ async fn register_default_subagents(
         // still gets a separate checkout and a reviewed integration boundary.
         let model_binding = subagent_model_binding(
             subagent_def.model.as_deref(),
+            subagent_def.thinking.as_deref(),
             &parent_generation,
             &inherited_generation,
         );
         let initial_generation = model_binding.snapshot().await;
         let max_iterations = subagent_def.max_turns.unwrap_or(0);
         let isolation = crate::subagent_loader::subagent_isolation(subagent_def);
+        // Per-subagent thinking: an explicit role spec wins; otherwise the
+        // generation's (inherited parent or registration-time fixed) thinking.
+        let initial_thinking =
+            subagent_build_thinking(subagent_def.thinking.as_deref(), &initial_generation);
         let compiled_system = prompt_compiler.compile_system(&SubagentSystemPromptInput {
             name: &subagent_def.name,
             description: &subagent_def.description,
@@ -770,6 +825,7 @@ async fn register_default_subagents(
                 initial_generation.temperature,
                 initial_generation.max_tokens,
                 initial_generation.token_limit,
+                initial_thinking,
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
@@ -778,6 +834,7 @@ async fn register_default_subagents(
                 prompt_compiler.clone(),
                 subagent_registry.clone(),
                 browser_runtime.clone(),
+                command_cells.clone(),
             )
         } else {
             build_writer_subagent_agent(
@@ -789,6 +846,7 @@ async fn register_default_subagents(
                 initial_generation.temperature,
                 initial_generation.max_tokens,
                 initial_generation.token_limit,
+                initial_thinking,
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
@@ -798,6 +856,7 @@ async fn register_default_subagents(
                 subagent_registry.clone(),
                 browser_runtime.clone(),
                 sandbox_manager.clone(),
+                command_cells.clone(),
                 run_code_available,
             )
         };
@@ -847,6 +906,12 @@ async fn register_default_subagents(
                 if let Some(max_turns) = subagent_def.max_turns {
                     builder = builder.max_iterations(max_turns);
                 }
+                // Per-subagent execution timeout (e.g. the awaiter watches one
+                // background cell for up to `timeout_secs` before the framework
+                // escalates). None → framework default (no timeout).
+                if let Some(timeout_secs) = subagent_def.timeout_secs {
+                    builder = builder.timeout(timeout_secs);
+                }
                 if subagent_def.is_background {
                     builder = builder.background().tag("background");
                 }
@@ -875,6 +940,7 @@ async fn register_default_subagents(
                 let factory_cache_user_id = cache_user_id.to_string();
                 let factory_browser_runtime = browser_runtime.clone();
                 let factory_sandbox_manager = sandbox_manager.clone();
+                let factory_command_cells = command_cells.clone();
                 let factory_tool_output_artifacts = tool_output_artifacts.clone();
                 let factory_system_prompt = compiled_system.system_prompt.clone();
                 let factory_prompt_compiler = prompt_compiler.clone();
@@ -886,6 +952,7 @@ async fn register_default_subagents(
                         let cache_user_id = factory_cache_user_id.clone();
                         let browser_runtime = factory_browser_runtime.clone();
                         let sandbox_manager = factory_sandbox_manager.clone();
+                        let command_cells = factory_command_cells.clone();
                         let tool_output_artifacts = factory_tool_output_artifacts.clone();
                         let system_prompt = factory_system_prompt.clone();
                         let prompt_compiler = factory_prompt_compiler.clone();
@@ -893,6 +960,13 @@ async fn register_default_subagents(
                         Box::pin(async move {
                             let model_generation = model_binding.snapshot().await;
                             let max_iterations = subagent_def.max_turns.unwrap_or(0);
+                            // Re-resolve per fork build: role spec wins, else the
+                            // snapshotted generation thinking (Inherit tracks the
+                            // parent's hot-swaps, Fixed stays registration-time).
+                            let thinking = subagent_build_thinking(
+                                subagent_def.thinking.as_deref(),
+                                &model_generation,
+                            );
                             let catalog_registry = subagent_registry.clone();
                             let subagent = if subagent_def.readonly {
                                 build_readonly_subagent_agent(
@@ -904,6 +978,7 @@ async fn register_default_subagents(
                                     model_generation.temperature,
                                     model_generation.max_tokens,
                                     model_generation.token_limit,
+                                    thinking,
                                     tool_timeout_ms,
                                     max_tool_output_tokens,
                                     &cache_user_id,
@@ -912,6 +987,7 @@ async fn register_default_subagents(
                                     prompt_compiler,
                                     subagent_registry,
                                     browser_runtime,
+                                    command_cells,
                                 )?
                             } else {
                                 build_writer_subagent_agent(
@@ -923,6 +999,7 @@ async fn register_default_subagents(
                                     model_generation.temperature,
                                     model_generation.max_tokens,
                                     model_generation.token_limit,
+                                    thinking,
                                     tool_timeout_ms,
                                     max_tool_output_tokens,
                                     &cache_user_id,
@@ -932,6 +1009,7 @@ async fn register_default_subagents(
                                     subagent_registry,
                                     browser_runtime,
                                     sandbox_manager,
+                                    command_cells,
                                     run_code_available,
                                 )?
                             };
@@ -1029,6 +1107,7 @@ fn build_writer_subagent_agent(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
+    thinking: Option<echo_agent::llm::ThinkingConfig>,
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
     cache_user_id: &str,
@@ -1038,6 +1117,7 @@ fn build_writer_subagent_agent(
     subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
     run_code_available: bool,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_subagent_agent, but OMIT `.readonly_tools()` → the
@@ -1063,7 +1143,10 @@ fn build_writer_subagent_agent(
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         })
-        .sandbox_manager(sandbox_manager);
+        .sandbox_manager(sandbox_manager)
+        // 与主智能体共享同一进程级 registry；cell 自身通过同一个 sandbox
+        // executor 执行，不会从前台策略静默降级为宿主机直连。
+        .command_cells(command_cells);
 
     if can_delegate {
         builder = builder
@@ -1093,6 +1176,9 @@ fn build_writer_subagent_agent(
     if let Some(client) = llm_client {
         subagent.set_llm_client(client);
     }
+    // Per-subagent reasoning depth: role spec or inherited parent generation
+    // thinking, applied to every chat request this subagent issues.
+    subagent.set_thinking(thinking);
     configure_run_code_capability(&mut subagent, run_code_available);
     if let Some(browser_runtime) = browser_runtime {
         browser_runtime.install_subagent_tools(&mut subagent);
@@ -1119,6 +1205,7 @@ fn build_readonly_subagent_agent(
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     token_limit: usize,
+    thinking: Option<echo_agent::llm::ThinkingConfig>,
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
     cache_user_id: &str,
@@ -1127,6 +1214,7 @@ fn build_readonly_subagent_agent(
     prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     subagent_registry: Arc<echo_agent::agent::subagent::SubagentRegistry>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
         .model(model)
@@ -1144,7 +1232,10 @@ fn build_readonly_subagent_agent(
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: tool_timeout_ms,
             ..Default::default()
-        });
+        })
+        // readonly 子智能体没有 shell,但注入共享 cell registry 后仍获得
+        // wait/stop_cell/list_cells——awaiter 角色正是靠这组工具等待后台命令。
+        .command_cells(command_cells);
 
     if can_delegate {
         builder = builder
@@ -1174,6 +1265,9 @@ fn build_readonly_subagent_agent(
     if let Some(client) = llm_client {
         subagent.set_llm_client(client);
     }
+    // Per-subagent reasoning depth: role spec or inherited parent generation
+    // thinking, applied to every chat request this subagent issues.
+    subagent.set_thinking(thinking);
     if let Some(browser_runtime) = browser_runtime {
         browser_runtime.install_subagent_tools(&mut subagent);
     }
@@ -2708,13 +2802,20 @@ mod llm_config_tests {
 mod resolve_subagent_model_tests {
     use super::{
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS, SubagentRuntimeGeneration, TASK_MANAGEMENT_GUIDE,
-        build_writer_subagent_agent, configure_run_code_capability, resolve_subagent_model,
-        resolved_max_tool_output_tokens, subagent_model_binding, tool_output_artifact_config,
+        build_readonly_subagent_agent, build_writer_subagent_agent, configure_run_code_capability,
+        resolve_subagent_model, resolved_max_tool_output_tokens, subagent_model_binding,
+        tool_output_artifact_config,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
     use echo_agent::sandbox::SandboxManager;
     use std::sync::Arc;
+
+    fn test_command_cells() -> Arc<dyn echo_agent::tools::cell::CommandCellRegistry> {
+        crate::tasks::task_runtime::command_cells::shared_command_cells(Arc::new(
+            SandboxManager::local_sandbox(),
+        ))
+    }
 
     #[test]
     fn stable_task_guide_stays_within_cache_budget() {
@@ -2756,9 +2857,10 @@ mod resolve_subagent_model_tests {
             temperature: None,
             max_tokens: None,
             token_limit: 16_384,
+            thinking: None,
         };
         let authority = Arc::new(tokio::sync::RwLock::new(initial.clone()));
-        let binding = subagent_model_binding(Some("inherit"), &initial, &authority);
+        let binding = subagent_model_binding(Some("inherit"), None, &initial, &authority);
         *authority.write().await = SubagentRuntimeGeneration {
             model: "parent-b".to_string(),
             token_limit: 65_536,
@@ -2768,6 +2870,42 @@ mod resolve_subagent_model_tests {
         let fixed = binding.snapshot().await;
         assert_eq!(fixed.model, "parent-a");
         assert_eq!(fixed.token_limit, 16_384);
+    }
+
+    #[tokio::test]
+    async fn fixed_binding_parses_role_thinking_once() {
+        // Explicit model + explicit thinking → the Fixed generation carries the
+        // parsed spec; parent hot-swaps no longer affect it.
+        let parent = SubagentRuntimeGeneration {
+            model: "parent-a".to_string(),
+            llm_config: None,
+            llm_client: None,
+            temperature: None,
+            max_tokens: None,
+            token_limit: 16_384,
+            thinking: Some(echo_agent::llm::ThinkingConfig::Level(
+                echo_agent::llm::ThinkingLevel::High,
+            )),
+        };
+        let authority = Arc::new(tokio::sync::RwLock::new(parent.clone()));
+        let binding = subagent_model_binding(Some("fast"), Some("low"), &parent, &authority);
+        let fixed = binding.snapshot().await;
+        assert_eq!(
+            fixed.thinking,
+            Some(echo_agent::llm::ThinkingConfig::Level(
+                echo_agent::llm::ThinkingLevel::Low
+            ))
+        );
+
+        // Explicit model but NO thinking spec → the registration-time parent
+        // thinking is copied (mirrors temperature/max_tokens).
+        let no_spec = subagent_model_binding(Some("fast"), None, &parent, &authority);
+        assert_eq!(no_spec.snapshot().await.thinking, parent.thinking);
+
+        // No model spec → Inherit binding follows the parent generation's
+        // thinking, so the published parent value flows into forks.
+        let inherit = subagent_model_binding(None, None, &parent, &authority);
+        assert_eq!(inherit.snapshot().await.thinking, parent.thinking);
     }
 
     #[test]
@@ -2818,6 +2956,7 @@ mod resolve_subagent_model_tests {
             None,
             None,
             8_192,
+            None,
             30_000,
             1_024,
             "test-cache-user",
@@ -2828,6 +2967,7 @@ mod resolve_subagent_model_tests {
             Arc::new(SubagentRegistry::new()),
             None,
             sandbox,
+            test_command_cells(),
             true,
         )?;
 
@@ -2860,6 +3000,7 @@ mod resolve_subagent_model_tests {
             None,
             None,
             8_192,
+            None,
             30_000,
             1_024,
             "test-cache-user",
@@ -2869,6 +3010,7 @@ mod resolve_subagent_model_tests {
             Arc::new(SubagentRegistry::new()),
             None,
             Arc::new(SandboxManager::local_sandbox()),
+            test_command_cells(),
             true,
         )?;
 
@@ -2879,5 +3021,118 @@ mod resolve_subagent_model_tests {
                 .any(|name| name == "agent_tool")
         );
         Ok(())
+    }
+
+    #[test]
+    fn readonly_subagent_applies_per_subagent_thinking() -> echo_agent::error::Result<()> {
+        // build_readonly_subagent_agent must install the resolved thinking on
+        // the built agent (ReactAgent::thinking getter) — this is the wire the
+        // awaiter's `thinking: low` frontmatter rides on.
+        let low = echo_agent::llm::ThinkingConfig::Level(echo_agent::llm::ThinkingLevel::Low);
+        let subagent = build_readonly_subagent_agent(
+            "awaiter",
+            "wait for one background cell",
+            "test-model",
+            None,
+            None,
+            None,
+            None,
+            8_192,
+            Some(low.clone()),
+            30_000,
+            1_024,
+            "test-cache-user",
+            64,
+            false,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
+            Arc::new(SubagentRegistry::new()),
+            None,
+            test_command_cells(),
+        )?;
+        assert_eq!(subagent.thinking(), Some(&low));
+
+        // None → the agent keeps "use the model default" (no thinking field).
+        let plain = build_readonly_subagent_agent(
+            "explorer",
+            "explore",
+            "test-model",
+            None,
+            None,
+            None,
+            None,
+            8_192,
+            None,
+            30_000,
+            1_024,
+            "test-cache-user",
+            0,
+            false,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
+            Arc::new(SubagentRegistry::new()),
+            None,
+            test_command_cells(),
+        )?;
+        assert!(plain.thinking().is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_and_writer_subagents_share_cell_tools() {
+        // C2b:两个构建路径都注入进程级共享 cell registry——readonly 子智能体
+        // (如 awaiter)没有 shell,但必须拥有 wait/stop_cell/list_cells。
+        let readonly = build_readonly_subagent_agent(
+            "awaiter",
+            "wait for one background cell",
+            "test-model",
+            None,
+            None,
+            None,
+            None,
+            8_192,
+            None,
+            30_000,
+            1_024,
+            "test-cache-user",
+            64,
+            false,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
+            Arc::new(SubagentRegistry::new()),
+            None,
+            test_command_cells(),
+        )
+        .unwrap_or_else(|error| panic!("readonly build failed: {error}"));
+        let readonly_names = readonly.tool_names();
+        for expected in ["wait", "stop_cell", "list_cells"] {
+            assert!(
+                readonly_names.contains(&expected.to_string()),
+                "readonly subagent missing cell tool {expected}: {readonly_names:?}"
+            );
+        }
+        assert!(
+            !readonly_names.contains(&"shell".to_string()),
+            "readonly subagent must not gain shell: {readonly_names:?}"
+        );
+    }
+
+    #[test]
+    fn loader_thinking_specs_parse_through_binding_path() {
+        // The builtin awaiter declares `thinking: low`; the same parse_spec the
+        // binding uses must accept it, and the loader spec string must flow
+        // unchanged from the .md frontmatter.
+        let defs = crate::subagent_loader::discover_subagents(None, None);
+        let awaiter = defs
+            .iter()
+            .find(|d| d.name == "awaiter")
+            .expect("builtin awaiter.md must load");
+        let parsed = echo_agent::llm::ThinkingConfig::parse_spec(
+            awaiter.thinking.as_deref().unwrap_or_default(),
+        )
+        .expect("awaiter thinking spec must parse");
+        assert_eq!(
+            parsed,
+            Some(echo_agent::llm::ThinkingConfig::Level(
+                echo_agent::llm::ThinkingLevel::Low
+            ))
+        );
     }
 }

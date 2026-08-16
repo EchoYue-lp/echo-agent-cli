@@ -231,7 +231,7 @@ pub enum RunPlanPolicy {
 /// worktree is created only when the writer is dispatched, then integrated by
 /// the existing review/integration stage. Hiding these tools prevents a second
 /// run-level worktree mechanism from being required around the planning Agent.
-const UNATTENDED_DIRECT_MUTATION_TOOLS: [&str; 19] = [
+const UNATTENDED_DIRECT_MUTATION_TOOLS: [&str; 18] = [
     "agent_tool",
     "shell",
     "run_code",
@@ -250,7 +250,6 @@ const UNATTENDED_DIRECT_MUTATION_TOOLS: [&str; 19] = [
     "export_data",
     "export_text",
     "create_complex_task",
-    "spawn_background_task",
 ];
 
 fn unattended_direct_disabled_tools(
@@ -641,6 +640,17 @@ fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String
         }
         Err(error) => blockers.push(format!("recovery blockers could not be read: {error}")),
         _ => {}
+    }
+    match store.list_background_cells(run_id) {
+        Ok(cells) => {
+            for cell in cells.into_iter().filter(BackgroundCellState::is_active) {
+                blockers.push(format!(
+                    "background cell '{}' ({}) is still running",
+                    cell.name, cell.cell_id
+                ));
+            }
+        }
+        Err(error) => blockers.push(format!("background cells could not be read: {error}")),
     }
     blockers
 }
@@ -5242,6 +5252,45 @@ Read the runtime path and found one missing branch.
                 suggested_tasks: Vec::new(),
                 created_at: chrono::Utc::now(),
             })
+            .map_err(|error| error.to_string())?;
+        assert!(run_completion_blockers(&store, &run_id).is_empty());
+
+        store
+            .record_background_cell_started(
+                &run_id,
+                "cell-running",
+                "cargo test --workspace",
+                "command-hash",
+                Some("turn-1"),
+                Some("execution-1"),
+                Some("call-1"),
+            )
+            .map_err(|error| error.to_string())?;
+        let blockers = run_completion_blockers(&store, &run_id);
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("cell-running"))
+        );
+        assert!(
+            !store
+                .complete_run_if_quiescent(&run_id)
+                .map_err(|error| error.to_string())?
+        );
+        store
+            .record_background_cell_finished(
+                &run_id,
+                "cell-running",
+                "cargo test --workspace",
+                "succeeded",
+                Some(0),
+                128,
+                false,
+                Some("128 tests passed"),
+                None,
+                None,
+                Some("call-1"),
+            )
             .map_err(|error| error.to_string())?;
         assert!(run_completion_blockers(&store, &run_id).is_empty());
         Ok(())

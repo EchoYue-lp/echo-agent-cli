@@ -122,9 +122,11 @@ if config.enable_task {
 | `list_tasks` | `ListTasksTool` | `task.rs:413-491` |
 | `visualize_dependencies` | `VisualizeDependenciesTool` | `task.rs:493-529` |
 | `get_execution_order` | `GetExecutionOrderTool` | `task.rs:531+` |
-| `spawn_background_task` | `SpawnBackgroundTaskTool` | `src/tools/builtin/spawn_task.rs` |
-| `check_task_status` | `CheckTaskStatusTool` | `src/tools/builtin/check_task.rs` |
-| `list_background_tasks` | `ListBackgroundTasksTool` | (同上) |
+| `wait` / `stop_cell` / `list_cells` | `WaitCellTool` / `StopCellTool` / `ListCellsTool` | `src/tools/builtin/cell_tools.rs` |
+
+> 旧的 `spawn_background_task` / `check_task_status` / `list_background_tasks`
+> 三件套已被后台命令 cell 工具面取代并删除(shell `background=true` 启动
+> cell、`wait` 长轮询;见 `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11)。
 
 ### §3.1 ⚠️ `"plan"` 工具的 wiring 空缺
 

@@ -34,6 +34,44 @@ pub async fn get_task_run(
     store(&state)?.get_run(&run_id).map_err(internal)
 }
 
+/// Event-folded long-horizon control state for the existing TaskRun.
+#[tauri::command]
+pub async fn get_task_continuation(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+) -> Result<Option<RunContinuationState>, IpcError> {
+    store(&state)?
+        .get_run_state(&run_id)
+        .map(|snapshot| snapshot.and_then(|state| state.continuation))
+        .map_err(internal)
+}
+
+/// Update finite-turn budgets for an existing long-horizon TaskRun. Restart
+/// auto-resume remains disabled until a surface can reconstruct its HITL owner;
+/// changing a budget never bypasses an existing pause.
+#[tauri::command]
+pub async fn configure_task_continuation(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    token_budget: Option<u64>,
+    time_budget_seconds: Option<u64>,
+) -> Result<RunContinuationState, IpcError> {
+    store(&state)?
+        .update_run_continuation_budgets(&run_id, token_budget, time_budget_seconds)
+        .map_err(internal)
+}
+
+/// Background command cells owned by the run, including bounded terminal facts.
+#[tauri::command]
+pub async fn list_task_background_cells(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+) -> Result<Vec<BackgroundCellState>, IpcError> {
+    store(&state)?
+        .list_background_cells(&run_id)
+        .map_err(internal)
+}
+
 /// Latest run for a conversation — binds a chat thread to its runtime run.
 #[tauri::command]
 pub async fn latest_task_run_for_conversation(
@@ -223,6 +261,14 @@ pub async fn resume_task_run(
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
+    let run_state = store.get_run_state(&run_id).map_err(internal)?;
+    if run_state
+        .as_ref()
+        .and_then(|snapshot| snapshot.continuation.as_ref())
+        .is_some_and(|continuation| continuation.enabled)
+    {
+        return resume_continuation_run(&state, app, store, run_id, run_state).await;
+    }
     let primary_agent = state.app_state.connection.primary_agent();
     let review_integration = state.app_state.review_integration.clone();
     let cancel = echo_agent::agent::CancellationToken::new();
@@ -305,6 +351,170 @@ pub async fn resume_task_run(
     Ok(serde_json::json!({
         "kind": "resumed",
         "run_id": run_id,
+    }))
+}
+
+async fn resume_continuation_run(
+    state: &tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    run_id: String,
+    run_state: Option<RunStateSnapshot>,
+) -> Result<serde_json::Value, IpcError> {
+    let snapshot =
+        run_state.ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?;
+    if snapshot.run.status != TaskRunStatus::Paused {
+        return Err(IpcError::Validation(format!(
+            "long-horizon run {run_id} is {}; resume requires paused",
+            snapshot.run.status.as_str()
+        )));
+    }
+    if let Some(continuation) = snapshot.continuation.as_ref() {
+        if continuation
+            .token_budget
+            .is_some_and(|budget| continuation.tokens_used >= budget)
+        {
+            return Err(IpcError::Validation(
+                "the TaskRun token budget is exhausted; increase or remove the budget before resume"
+                    .to_string(),
+            ));
+        }
+        if continuation
+            .time_budget_seconds
+            .is_some_and(|budget| continuation.time_used_seconds >= budget)
+        {
+            return Err(IpcError::Validation(
+                "the TaskRun time budget is exhausted; increase or remove the budget before resume"
+                    .to_string(),
+            ));
+        }
+    }
+    let blockers = store.list_recovery_blockers(&run_id).map_err(internal)?;
+    if !blockers.is_empty() {
+        return Err(IpcError::Validation(format!(
+            "run {run_id} has unresolved recovery blockers"
+        )));
+    }
+
+    // Pause is durable before the cancelled finite turn necessarily releases
+    // its exact driver. Do not mutate Paused -> Running until that old claim
+    // has closed, otherwise an immediate resume can lose to its own old turn.
+    store.wait_for_run_driver_idle(&run_id).await;
+    let snapshot = store
+        .get_run_state(&run_id)
+        .map_err(internal)?
+        .ok_or_else(|| {
+            IpcError::Validation("TaskRun not found after driver settlement".to_string())
+        })?;
+    if snapshot.run.status != TaskRunStatus::Paused {
+        return Err(IpcError::Validation(format!(
+            "long-horizon run {run_id} became {}; resume requires paused",
+            snapshot.run.status.as_str()
+        )));
+    }
+    if snapshot
+        .continuation
+        .as_ref()
+        .is_some_and(|continuation| continuation.active_turn.is_some())
+    {
+        return Err(IpcError::Validation(format!(
+            "long-horizon run {run_id} still has an active RunTurn after driver settlement"
+        )));
+    }
+
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let conversation_id = snapshot.run.conversation_id.clone();
+    let root_message_id = snapshot.run.root_message_id.clone();
+    let lease = state
+        .app_state
+        .session
+        .foreground_turns
+        .begin(
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            conversation_id.clone(),
+            turn_id.clone(),
+        )
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let sink = crate::tauri::commands::chat::tauri_chat_sink(
+        app.clone(),
+        turn_id.clone(),
+        Some(conversation_id.clone()),
+        state.app_state.storage.tool_executions.clone(),
+        Some(store.clone()),
+    );
+    let _ = sink.on_event(
+        echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+            status: "running".to_string(),
+        },
+    );
+    let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn {
+        instruction: format!(
+            "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative runtime projection and continue the next useful work."
+        ),
+        resources: Vec::new(),
+    };
+    let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+        pool: state.app_state.connection.pool.clone(),
+        store: Some(store.clone()),
+        sink: sink.clone(),
+        webhook_emitter: Some(state.app_state.webhook.emitter.clone()),
+        conv_id: Some(conversation_id.clone()),
+        root_message_id: turn_id.clone(),
+        attachments: snapshot.run.attachments,
+        cancel: lease.cancellation_token(),
+        mode_hint: Some(InteractionMode::Task.prompt_hint().to_string()),
+        interaction_mode: InteractionMode::Task,
+        review_integration: state.app_state.review_integration.clone(),
+        layer_manager: None,
+        memory_generation: None,
+        human_loop_provider: Some(Arc::new(
+            crate::tauri::commands::chat::TauriHumanLoopHandler::new(
+                app.clone(),
+                Some(conversation_id.clone()),
+                root_message_id.clone(),
+            ),
+        )),
+    });
+    let binding = RunTurnBinding {
+        run_id: Some(run_id.clone()),
+        turn_id: turn_id.clone(),
+        root_message_id,
+        origin: RunTurnOrigin::Resume,
+        transcript_visibility: TurnVisibility::Internal,
+    };
+    let agent = state.app_state.connection.primary_agent();
+    let spawned_run_id = run_id.clone();
+    let status_store = store;
+    tokio::spawn(async move {
+        let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat_turn(
+            lease, &agent, &turn, resources, binding,
+        )
+        .await;
+        if let Err(error) = outcome.as_ref() {
+            tracing::warn!(%error, run_id = %spawned_run_id, "long-horizon GUI resume failed");
+        }
+        let terminal_status = status_store
+            .get_run(&spawned_run_id)
+            .ok()
+            .flatten()
+            .map(|run| run.status.as_str().to_string())
+            .unwrap_or_else(|| {
+                outcome
+                    .as_ref()
+                    .map(|terminal| terminal.status().to_string())
+                    .unwrap_or_else(|_| "failed".to_string())
+            });
+        let _ = sink.on_event(
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+                status: terminal_status,
+            },
+        );
+    });
+
+    Ok(serde_json::json!({
+        "kind": "continuation_resumed",
+        "run_id": run_id,
+        "turn_id": turn_id,
     }))
 }
 

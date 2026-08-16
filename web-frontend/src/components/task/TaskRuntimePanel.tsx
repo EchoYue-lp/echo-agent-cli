@@ -7,7 +7,7 @@
 //! The compact panel is mounted inside RightRail; the full detail panel is
 //! mounted in the main chat/work area.
 
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   CheckCircle2,
   Circle,
@@ -27,6 +27,7 @@ import {
   X,
   AlertTriangle,
   Clock3,
+  Save,
 } from 'lucide-react';
 import { Card } from '../common/Card';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -35,7 +36,12 @@ import {
   type ExecutionEvent,
   type SubagentRunState,
 } from '../../stores/subagentRunStore';
-import type { TaskRunStatus, TodoStatus } from '../../generated';
+import type {
+  RunContinuationState,
+  RunPauseReason,
+  TaskRunStatus,
+  TodoStatus,
+} from '../../generated';
 import { isCanonicalUsageEvent } from '../compress/subagentUsage';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -58,6 +64,19 @@ const TODO_LABEL: Record<string, string> = {
   skipped: '已跳过',
 };
 
+const PAUSE_REASON_LABEL: Record<RunPauseReason, string> = {
+  user: '用户暂停',
+  needs_input: '等待补充信息',
+  approval: '等待确认',
+  boot_recovery: '启动恢复',
+  usage_limit: '用量限制',
+  token_budget: 'Token 预算已耗尽',
+  time_budget: '时间预算已耗尽',
+  repeated_blocker: '连续受阻',
+  indeterminate_side_effect: '副作用状态待确认',
+  provider_unavailable: '模型服务暂不可用',
+};
+
 const SUBAGENT_STATUS_LABEL: Record<SubagentRunState['status'], string> = {
   running: '执行中',
   completed: '执行已完成',
@@ -65,6 +84,80 @@ const SUBAGENT_STATUS_LABEL: Record<SubagentRunState['status'], string> = {
   cancelled: '执行已取消',
   timed_out: '执行超时',
 };
+
+type ContinuationBudget = Pick<
+  RunContinuationState,
+  'token_budget' | 'time_budget_seconds' | 'tokens_used' | 'time_used_seconds'
+>;
+
+function normalizedAmount(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+}
+
+export function parseContinuationBudgetInput(value: string, label: string): number | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new Error(`${label}必须是正整数，留空表示不限`);
+  }
+  return parsed;
+}
+
+export function formatDurationSeconds(value: number): string {
+  let remaining = normalizedAmount(value);
+  const days = Math.floor(remaining / 86_400);
+  remaining %= 86_400;
+  const hours = Math.floor(remaining / 3_600);
+  remaining %= 3_600;
+  const minutes = Math.floor(remaining / 60);
+  const seconds = remaining % 60;
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days} 天`);
+  if (hours > 0) parts.push(`${hours} 小时`);
+  if (minutes > 0) parts.push(`${minutes} 分钟`);
+  if (seconds > 0 || parts.length === 0) parts.push(`${seconds} 秒`);
+  return parts.join(' ');
+}
+
+function formatTokenCount(value: number): string {
+  return normalizedAmount(value).toLocaleString('en-US');
+}
+
+function formatBudgetLine(
+  label: string,
+  used: number,
+  budget: number | null | undefined,
+  format: (value: number) => string
+): string {
+  const normalizedUsed = normalizedAmount(used);
+  if (budget === null || budget === undefined) {
+    return `${label}已用 ${format(normalizedUsed)} · 预算不限 · 剩余不限`;
+  }
+  const normalizedBudget = normalizedAmount(budget);
+  const remaining = Math.max(0, normalizedBudget - normalizedUsed);
+  return `${label}已用 ${format(normalizedUsed)} · 预算 ${format(normalizedBudget)} · 剩余 ${format(remaining)}`;
+}
+
+export function continuationBudgetLabels(continuation: ContinuationBudget): {
+  tokens: string;
+  time: string;
+} {
+  return {
+    tokens: formatBudgetLine(
+      'Token ',
+      continuation.tokens_used,
+      continuation.token_budget,
+      formatTokenCount
+    ),
+    time: formatBudgetLine(
+      '时间',
+      continuation.time_used_seconds,
+      continuation.time_budget_seconds,
+      formatDurationSeconds
+    ),
+  };
+}
 
 function statusColor(status: string): string {
   if (['completed'].includes(status)) return 'var(--color-success)';
@@ -521,14 +614,26 @@ export function TaskRuntimePanel() {
     plan,
     todos,
     recoveryBlockers,
+    continuation,
+    backgroundCells,
     error,
     refresh,
     cancel,
     pause,
+    updateContinuationBudgets,
     resumeTaskRun,
     retryBlockedTask,
     resolveRecoveryTask,
   } = useTaskRuntimeStore();
+  const [tokenBudgetInput, setTokenBudgetInput] = useState('');
+  const [timeBudgetInput, setTimeBudgetInput] = useState('');
+  const [budgetError, setBudgetError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setTokenBudgetInput(continuation?.token_budget?.toString() ?? '');
+    setTimeBudgetInput(continuation?.time_budget_seconds?.toString() ?? '');
+    setBudgetError(null);
+  }, [activeRun?.run_id, continuation?.token_budget, continuation?.time_budget_seconds]);
 
   const visibleTraceRuns = useMemo(
     () =>
@@ -566,6 +671,21 @@ export function TaskRuntimePanel() {
       displayedTodoStatus(todo, activeTaskTraceRuns) === ('completed' as TodoStatus)
     );
   }).length;
+  const currentTurn = continuation?.active_turn ?? continuation?.last_turn;
+  const activeCellCount = backgroundCells.filter((cell) => cell.phase === 'running').length;
+  const budgetLabels = continuation?.enabled ? continuationBudgetLabels(continuation) : null;
+  const applyBudgets = async () => {
+    try {
+      const tokenBudget = parseContinuationBudgetInput(tokenBudgetInput, 'Token 预算');
+      const timeBudget = parseContinuationBudgetInput(timeBudgetInput, '时间预算');
+      setBudgetError(null);
+      await updateContinuationBudgets(runId, tokenBudget, timeBudget);
+    } catch (budgetInputError) {
+      setBudgetError(
+        budgetInputError instanceof Error ? budgetInputError.message : String(budgetInputError)
+      );
+    }
+  };
 
   return (
     <section className="border-b border-[var(--border-primary)] px-3 py-2.5">
@@ -594,6 +714,78 @@ export function TaskRuntimePanel() {
       >
         {activeRun.goal}
       </div>
+
+      {continuation?.enabled && (
+        <div className="mb-2 space-y-1 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+            <span>第 {currentTurn?.ordinal ?? continuation.next_turn_ordinal} 轮</span>
+            <span>压缩 {continuation.compaction_count} 次</span>
+            {activeCellCount > 0 && <span>后台命令 {activeCellCount}</span>}
+          </div>
+          {budgetLabels && <div>{budgetLabels.tokens}</div>}
+          {budgetLabels && <div>{budgetLabels.time}</div>}
+          <form
+            className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)_28px] gap-1 pt-1"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void applyBudgets();
+            }}
+          >
+            <label className="min-w-0">
+              <span className="sr-only">Token 预算</span>
+              <input
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={tokenBudgetInput}
+                onChange={(event) => setTokenBudgetInput(event.target.value)}
+                placeholder="Token 不限"
+                className="h-7 w-full min-w-0 rounded-md px-1.5 text-[10px] outline-none"
+                style={{
+                  background: 'var(--bg-primary)',
+                  border: '1px solid var(--border-primary)',
+                  color: 'var(--text-primary)',
+                }}
+              />
+            </label>
+            <label className="min-w-0">
+              <span className="sr-only">时间预算（秒）</span>
+              <input
+                type="number"
+                min={1}
+                step={1}
+                inputMode="numeric"
+                value={timeBudgetInput}
+                onChange={(event) => setTimeBudgetInput(event.target.value)}
+                placeholder="秒数不限"
+                className="h-7 w-full min-w-0 rounded-md px-1.5 text-[10px] outline-none"
+                style={{
+                  background: 'var(--bg-primary)',
+                  border: '1px solid var(--border-primary)',
+                  color: 'var(--text-primary)',
+                }}
+              />
+            </label>
+            <button
+              type="submit"
+              className="flex h-7 w-7 items-center justify-center rounded-md"
+              style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
+              title="应用任务预算"
+              aria-label="应用任务预算"
+            >
+              <Save size={12} />
+            </button>
+          </form>
+          {budgetError && <div style={{ color: 'var(--color-error)' }}>{budgetError}</div>}
+          {continuation.pause && (
+            <div style={{ color: 'var(--color-warning)' }}>
+              {PAUSE_REASON_LABEL[continuation.pause.reason] ?? continuation.pause.reason}
+              {continuation.pause.detail ? ` · ${continuation.pause.detail}` : ''}
+            </div>
+          )}
+        </div>
+      )}
 
       {activeRun.status === 'running' && (
         <div className="mb-2 grid grid-cols-2 gap-1.5">

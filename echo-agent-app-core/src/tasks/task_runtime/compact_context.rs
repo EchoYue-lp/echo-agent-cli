@@ -15,12 +15,15 @@ use echo_agent::compression::{ContextProjection, PreModelContextProjector, Proje
 use echo_agent::error::Result as AgentResult;
 use echo_agent::llm::types::Message;
 use futures::future::BoxFuture;
+use sha2::{Digest, Sha256};
 
 use super::store::TaskRuntimeStore;
-use super::types::{PlanTask, TaskExecutionSummary, TodoItem, TodoStatus};
+use super::types::{BackgroundCellState, PlanTask, TaskExecutionSummary, TodoItem, TodoStatus};
 
 /// Stable application marker identifying the run-level recovery projection.
 pub const RUNTIME_RECOVERY_MARKER: &str = "[eko_runtime_recovery_capsule]";
+/// Stable objective contract projected separately from volatile recovery state.
+pub const RUNTIME_GOAL_MARKER: &str = "[eko_run_goal_contract]";
 
 /// Marker emitted by the EKO Subagent prompt compiler for planned invocations.
 /// Protecting it keeps the per-task brief alive if a Subagent compact runs
@@ -28,6 +31,7 @@ pub const RUNTIME_RECOVERY_MARKER: &str = "[eko_runtime_recovery_capsule]";
 pub const TASK_CONTEXT_MARKER: &str = "[task_context]";
 
 const MAX_GOAL_CHARS: usize = 420;
+const MAX_GOAL_CONTRACT_CHARS: usize = 8_000;
 const MAX_TASK_TITLE_CHARS: usize = 96;
 const MAX_TASK_DESC_CHARS: usize = 220;
 const MAX_SUMMARY_CHARS: usize = 260;
@@ -87,6 +91,10 @@ impl TaskRuntimeProjectionRegistry {
             .map(|registration| Arc::clone(&registration.store))
     }
 
+    pub(crate) fn store_for_run(&self, run_id: &str) -> Option<Arc<TaskRuntimeStore>> {
+        self.store(run_id)
+    }
+
     pub fn contains(&self, run_id: &str) -> bool {
         self.registrations
             .read()
@@ -142,13 +150,22 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                 .map(super::task_tools::formal_run_id_for_turn);
             let run_id = context.run_id.as_deref().or(derived_run_id.as_deref());
             let store = run_id.and_then(|run_id| self.registry.store(run_id));
-            Ok(vec![ContextProjection {
-                marker: RUNTIME_RECOVERY_MARKER.to_string(),
-                message: run_id
-                    .zip(store.as_deref())
-                    .and_then(|(run_id, store)| build_runtime_recovery_capsule(store, run_id))
-                    .map(Message::user),
-            }])
+            Ok(vec![
+                ContextProjection {
+                    marker: RUNTIME_GOAL_MARKER.to_string(),
+                    message: run_id
+                        .zip(store.as_deref())
+                        .and_then(|(run_id, store)| build_runtime_goal_contract(store, run_id))
+                        .map(Message::user),
+                },
+                ContextProjection {
+                    marker: RUNTIME_RECOVERY_MARKER.to_string(),
+                    message: run_id
+                        .zip(store.as_deref())
+                        .and_then(|(run_id, store)| build_runtime_recovery_capsule(store, run_id))
+                        .map(Message::user),
+                },
+            ])
         })
     }
 }
@@ -160,20 +177,95 @@ pub async fn install_task_context_protection(agent: &ReactAgent) {
 }
 
 /// Derive a compact, compression-safe view of the active runtime state.
+pub fn build_runtime_goal_contract(store: &TaskRuntimeStore, run_id: &str) -> Option<String> {
+    let state = store.get_run_state(run_id).ok().flatten()?;
+    let continuation = state.continuation.as_ref()?;
+    if !continuation.enabled {
+        return None;
+    }
+    let run = state.run;
+    let mut hasher = Sha256::new();
+    hasher.update(run.goal.as_bytes());
+    let goal_hash = format!("{:x}", hasher.finalize());
+    let objective = run
+        .goal
+        .chars()
+        .take(MAX_GOAL_CONTRACT_CHARS)
+        .collect::<String>();
+    let objective_truncated = run.goal.chars().count() > MAX_GOAL_CONTRACT_CHARS;
+    let plan_revision = store
+        .get_plan(run_id)
+        .ok()
+        .flatten()
+        .map(|plan| plan.revision);
+    let remaining_tokens = continuation
+        .token_budget
+        .map(|budget| budget.saturating_sub(continuation.tokens_used));
+    let remaining_time_seconds = continuation
+        .time_budget_seconds
+        .map(|budget| budget.saturating_sub(continuation.time_used_seconds));
+
+    Some(format!(
+        "{RUNTIME_GOAL_MARKER}\n\
+         Run: id={}, status={}, objective_sha256={}, plan_revision={}\n\
+         Objective{}:\n{}\n\
+         Continuation contract:\n\
+         - This finite Turn ending is not evidence that the TaskRun Goal is complete.\n\
+         - Do not narrow or replace the objective with what fits in one Turn.\n\
+         - Before completion, audit the original objective, current plan, artifacts, and verification evidence.\n\
+         - TaskRuntime completion blockers are authoritative; final wording never overrides them.\n\
+         - On a recoverable blocker, record the concrete blocker and preserve resumable state.\n\
+         Budget: tokens_used={}, token_budget={}, tokens_remaining={}; time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}\n",
+        run.run_id,
+        run.status.as_str(),
+        goal_hash,
+        plan_revision
+            .map(|revision| revision.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        if objective_truncated {
+            " (bounded here; recover the full referenced objective artifact before acting)"
+        } else {
+            ""
+        },
+        objective,
+        continuation.tokens_used,
+        continuation
+            .token_budget
+            .map(|budget| budget.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        remaining_tokens
+            .map(|tokens| tokens.to_string())
+            .unwrap_or_else(|| "unbounded".to_string()),
+        continuation.time_used_seconds,
+        continuation
+            .time_budget_seconds
+            .map(|budget| budget.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        remaining_time_seconds
+            .map(|seconds| seconds.to_string())
+            .unwrap_or_else(|| "unbounded".to_string()),
+    ))
+}
+
+/// Derive a compact, compression-safe view of the active runtime state.
 pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) -> Option<String> {
-    let run = match store.get_run(run_id) {
-        Ok(Some(run)) => run,
-        Ok(None) | Err(_) => return None,
-    };
+    let state = store.get_run_state(run_id).ok().flatten()?;
+    let run = state.run;
+    let continuation = state.continuation;
     let plan = store.get_plan(run_id).unwrap_or_default();
     let todos = store.list_todos(run_id).unwrap_or_default();
+    let cells = store.list_background_cells(run_id).unwrap_or_default();
 
     let has_plan_tasks = plan
         .as_ref()
         .map(|plan| !plan.tasks.is_empty())
         .unwrap_or(false);
     let has_runtime_todos = todos.iter().any(|todo| !todo.task_id.trim().is_empty());
-    if !has_plan_tasks && !has_runtime_todos {
+    if !has_plan_tasks
+        && !has_runtime_todos
+        && cells.is_empty()
+        && continuation.as_ref().is_none_or(|state| !state.enabled)
+    {
         return None;
     }
 
@@ -193,6 +285,51 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
         run.domain_profile.as_str(),
         truncate_chars(&run.goal, MAX_GOAL_CHARS),
     ));
+    if let Some(continuation) = continuation {
+        out.push_str(&format!(
+            "Continuation: active_turn={}, last_turn={}, turns_next={}, tokens_used={}, token_budget={}, tokens_remaining={}, time_used_seconds={}, time_budget_seconds={}, time_remaining_seconds={}, compactions={}, deferred={}, pause={}\n",
+            continuation
+                .active_turn
+                .as_ref()
+                .map(|turn| format!("{}#{}", turn.turn_id, turn.ordinal))
+                .unwrap_or_else(|| "none".to_string()),
+            continuation
+                .last_turn
+                .as_ref()
+                .map(|turn| format!("{}:{}", turn.turn_id, turn.status.as_str()))
+                .unwrap_or_else(|| "none".to_string()),
+            continuation.next_turn_ordinal,
+            continuation.tokens_used,
+            continuation
+                .token_budget
+                .map(|budget| budget.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            continuation
+                .token_budget
+                .map(|budget| budget.saturating_sub(continuation.tokens_used).to_string())
+                .unwrap_or_else(|| "unbounded".to_string()),
+            continuation.time_used_seconds,
+            continuation
+                .time_budget_seconds
+                .map(|budget| budget.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            continuation
+                .time_budget_seconds
+                .map(|budget| {
+                    budget
+                        .saturating_sub(continuation.time_used_seconds)
+                        .to_string()
+                })
+                .unwrap_or_else(|| "unbounded".to_string()),
+            continuation.compaction_count,
+            continuation.deferred,
+            continuation
+                .pause
+                .as_ref()
+                .map(|pause| pause.reason.as_str())
+                .unwrap_or("none"),
+        ));
+    }
 
     if let Some(plan) = &plan {
         out.push_str(&format!(
@@ -250,8 +387,61 @@ pub fn build_runtime_recovery_capsule(store: &TaskRuntimeStore, run_id: &str) ->
         &[TodoStatus::Completed],
         5,
     );
+    push_background_cells(&mut out, &cells);
 
     Some(out)
+}
+
+fn push_background_cells(out: &mut String, cells: &[BackgroundCellState]) {
+    let mut active = cells
+        .iter()
+        .filter(|cell| cell.is_active())
+        .collect::<Vec<_>>();
+    active.sort_by_key(|cell| cell.started_at);
+    if !active.is_empty() {
+        out.push_str("Running background cells:\n");
+        for cell in active.into_iter().take(6) {
+            out.push_str(&format!(
+                "- [running] {} ({}, {} bytes); use wait(cell_id={}, cursor=0) to observe or stop_cell to cancel\n",
+                truncate_chars(&cell.name, MAX_TASK_TITLE_CHARS),
+                cell.cell_id,
+                cell.total_output_bytes,
+                cell.cell_id,
+            ));
+        }
+    }
+
+    let mut terminal = cells
+        .iter()
+        .filter(|cell| !cell.is_active())
+        .collect::<Vec<_>>();
+    terminal.sort_by_key(|cell| std::cmp::Reverse(cell.finished_at));
+    if terminal.is_empty() {
+        return;
+    }
+    out.push_str("Recent background cell results:\n");
+    for cell in terminal.into_iter().take(4) {
+        out.push_str(&format!(
+            "- [{}] {} ({}, exit={}, {} bytes)",
+            cell.phase,
+            truncate_chars(&cell.name, MAX_TASK_TITLE_CHARS),
+            cell.cell_id,
+            cell.exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            cell.total_output_bytes,
+        ));
+        if let Some(excerpt) = &cell.output_excerpt {
+            out.push_str(&format!(
+                "; output={}",
+                truncate_chars(excerpt, MAX_SUMMARY_CHARS)
+            ));
+        }
+        if let Some(path) = &cell.artifact_path {
+            out.push_str(&format!("; artifact={}", truncate_chars(path, 220)));
+        }
+        out.push('\n');
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Compact rendering keeps the shared truncation/state inputs explicit.
@@ -632,6 +822,9 @@ mod tests {
                 }],
             })
             .map_err(|err| format!("seed projection plan failed: {err}"))?;
+        store
+            .configure_run_continuation(run_id, true, false, None, None)
+            .map_err(|err| format!("seed continuation failed: {err}"))?;
         Ok(store)
     }
 
@@ -722,6 +915,109 @@ mod tests {
         if context.has_projection(RUNTIME_RECOVERY_MARKER) {
             return Err("outside scope must remove the runtime capsule".to_string());
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn projector_keeps_one_stable_goal_contract_across_one_hundred_refreshes()
+    -> Result<(), String> {
+        let registry = Arc::new(TaskRuntimeProjectionRegistry::new());
+        let projector = TaskRuntimeContextProjector::new(Arc::clone(&registry));
+        let objective = format!(
+            "{}终点🚀",
+            "跨窗口目标".repeat(MAX_GOAL_CONTRACT_CHARS.saturating_add(32))
+        );
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| format!("seed store failed: {error}"))?,
+        );
+        store
+            .create_run(
+                "long-goal",
+                "default",
+                "c1",
+                "root-message",
+                DomainProfile::General,
+                &objective,
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("long-goal", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("long-goal", true, false, Some(200_000), None)
+            .map_err(|error| error.to_string())?;
+        let _registration = registry.register("long-goal", store);
+        let mut context = ContextManager::builder(64_000).build();
+        let mut expected_hash = None;
+
+        for _ in 0..100 {
+            let projections = projector
+                .project(&projection_context(Some("long-goal")))
+                .await
+                .map_err(|error| error.to_string())?;
+            if projections.len() != 2 {
+                return Err(format!(
+                    "expected two replaceable projections, got {}",
+                    projections.len()
+                ));
+            }
+            let contract = projections
+                .first()
+                .and_then(|projection| projection.message.as_ref())
+                .and_then(|message| message.content.as_text())
+                .ok_or_else(|| "Goal contract missing before Plan creation".to_string())?;
+            let hash = contract
+                .split("objective_sha256=")
+                .nth(1)
+                .and_then(|suffix| suffix.split(',').next())
+                .ok_or_else(|| "objective hash missing".to_string())?
+                .to_string();
+            match expected_hash.as_ref() {
+                Some(expected) if expected != &hash => {
+                    return Err("objective hash changed across projection refreshes".to_string());
+                }
+                None => expected_hash = Some(hash),
+                _ => {}
+            }
+            if !contract.contains("跨窗口目标") || !contract.contains("bounded here") {
+                return Err("UTF-8 Goal contract was not safely bounded".to_string());
+            }
+            let capsule = projections
+                .get(1)
+                .and_then(|projection| projection.message.as_ref())
+                .and_then(|message| message.content.as_text())
+                .ok_or_else(|| "recovery capsule missing before Plan creation".to_string())?;
+            if !capsule.contains("Continuation:") || capsule.contains("Plan: id=") {
+                return Err("unexpected Plan projection before Plan creation".to_string());
+            }
+            context.apply_projections(&projections);
+        }
+
+        let goal_contracts = context
+            .messages()
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .as_text_ref()
+                    .is_some_and(|text| text.contains(RUNTIME_GOAL_MARKER))
+            })
+            .count();
+        let recovery_capsules = context
+            .messages()
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .as_text_ref()
+                    .is_some_and(|text| text.contains(RUNTIME_RECOVERY_MARKER))
+            })
+            .count();
+        assert_eq!(goal_contracts, 1);
+        assert_eq!(recovery_capsules, 1);
         Ok(())
     }
 }

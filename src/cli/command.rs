@@ -39,6 +39,12 @@ pub enum CommandOutcome {
     Exit,
     /// Execute a chat message with the agent.
     Chat(String),
+    /// Resume one exact long-horizon TaskRun through a finite foreground turn.
+    ResumeTaskRun {
+        message: String,
+        run_id: String,
+        root_message_id: String,
+    },
 }
 
 // ── CommandCategory ──────────────────────────────────────────────────
@@ -106,6 +112,8 @@ pub struct CommandContext {
     pub staged_attachments:
         Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
     pub app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
+    /// Persisted REPL conversation used to resolve its current TaskRun.
+    pub conversation_id: Option<String>,
 }
 
 impl CommandContext {
@@ -125,6 +133,7 @@ impl CommandContext {
             )),
             staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             app_state: None,
+            conversation_id: None,
         }
     }
 

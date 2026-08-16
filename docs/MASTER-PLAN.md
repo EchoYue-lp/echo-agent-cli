@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-08-14
+Last updated: 2026-08-15
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -75,6 +75,8 @@ evidence, and the next bounded step.
 | Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
 | Provider default protocol convergence | Complete | Framework `ProviderMetadata.default_api_protocol` is the sole built-in authority; EKO preserves explicit overrides, infers custom complete endpoints, keeps a non-persistent session selection for every future pooled agent, and projects the provider wire contract through generated ts-rs DTOs without a second provider mapping. |
 | Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
+| Background command cells + awaiter role (Phase C1-C4) | Complete | Design: `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11 (C track). Framework commits `58e6733`, `7f66ff5`: one `CommandCellRegistry`, sandbox-preserving launch, durable output artifacts, retry-safe multi-waiter cursors, explicit owner cancellation, and UTF-8-safe bounded output. Application commit `5cf49c2`: process-wide registry, low-thinking `awaiter`, `watch_cell`, TaskRuntime start/finish events, recovery-capsule projection, active-cell completion blocker, explicit-cancel propagation, and boot recovery that closes orphaned cells without replaying external commands. Pause keeps cells alive; only explicit run cancellation stops them. |
+| Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; Phase 6 pending | One app-layer `TaskContinuationRuntime` now owns idle continuation without a second graph/executor/store. Finite RunTurns use event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, stable surface HITL replay, and GUI/TUI/CLI/channel controls. Continuation agents have an independent bounded capacity domain. Concurrency/shutdown regressions cover claim loser, pool admission/configuration cancellation, pending wake, pause/resume settlement, channel HITL retention, and `BootRecovery`. Remaining work is explicitly limited to safe cold-start auto-resume after a new surface launcher exists, requirement-to-evidence completion audit, 1k/10k performance thresholds, and real multi-hour kill/sleep/provider-failure evals. See `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §0. |
 
 ## Current Decisions
 

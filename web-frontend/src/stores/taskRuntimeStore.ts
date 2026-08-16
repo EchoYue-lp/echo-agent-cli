@@ -37,6 +37,8 @@ import type {
   TaskSpec,
   TaskPatch,
   TaskUpdateOperation,
+  RunContinuationState,
+  BackgroundCellState,
 } from '../generated';
 
 type RunSnapshot = {
@@ -45,16 +47,21 @@ type RunSnapshot = {
   todos: TodoItem[];
   artifacts: RuntimeArtifact[];
   recoveryBlockers: RecoveryBlocker[];
+  continuation: RunContinuationState | null;
+  backgroundCells: BackgroundCellState[];
 };
 
 async function loadRunSnapshot(run: TaskRun): Promise<RunSnapshot> {
-  const [plan, todos, artifacts, recoveryBlockers] = await Promise.all([
-    taskRuntimeApi.getPlan(run.run_id),
-    taskRuntimeApi.listTodos(run.run_id),
-    taskRuntimeApi.listArtifacts(run.run_id),
-    taskRuntimeApi.listRecoveryBlockers(run.run_id),
-  ]);
-  return { run, plan, todos, artifacts, recoveryBlockers };
+  const [plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells] =
+    await Promise.all([
+      taskRuntimeApi.getPlan(run.run_id),
+      taskRuntimeApi.listTodos(run.run_id),
+      taskRuntimeApi.listArtifacts(run.run_id),
+      taskRuntimeApi.listRecoveryBlockers(run.run_id),
+      taskRuntimeApi.getContinuation(run.run_id),
+      taskRuntimeApi.listBackgroundCells(run.run_id),
+    ]);
+  return { run, plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells };
 }
 
 function completeTaskPatch(patch: Partial<TaskPatch>): TaskPatch {
@@ -82,6 +89,8 @@ export interface TaskRuntimeState {
   events: RuntimeTaskEvent[];
   artifacts: RuntimeArtifact[];
   recoveryBlockers: RecoveryBlocker[];
+  continuation: RunContinuationState | null;
+  backgroundCells: BackgroundCellState[];
   /// Highest event seq we've already ingested (string per the seq-as-string
   /// transport contract). Used for incremental polling.
   lastSeq: string;
@@ -104,6 +113,11 @@ export interface TaskRuntimeState {
   loadByConversation: (conversationId: string) => Promise<void>;
   cancel: (runId: string) => Promise<void>;
   pause: (runId: string) => Promise<void>;
+  updateContinuationBudgets: (
+    runId: string,
+    tokenBudget: number | null,
+    timeBudgetSeconds: number | null
+  ) => Promise<void>;
   openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
   dismissInterruptPrompt: () => void;
   updateTasks: (reason: string, operations: TaskUpdateOperation[]) => Promise<void>;
@@ -124,6 +138,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   events: [],
   artifacts: [],
   recoveryBlockers: [],
+  continuation: null,
+  backgroundCells: [],
   lastSeq: '0',
   error: null,
   generatingPlan: false,
@@ -184,12 +200,16 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           todos: [],
           events: [...get().events, ...events].slice(-MAX_EVENTS),
           artifacts: [],
+          recoveryBlockers: [],
+          continuation: null,
+          backgroundCells: [],
           lastSeq,
           error: `TaskRuntime run ${runId} 暂时不可用`,
         });
         return;
       }
-      const { plan, todos, artifacts, recoveryBlockers } = await loadRunSnapshot(run);
+      const { plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells } =
+        await loadRunSnapshot(run);
       if (generation !== loadGeneration || requestGeneration !== refreshRequestGeneration) {
         return;
       }
@@ -204,6 +224,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         events: [...get().events, ...events].slice(-MAX_EVENTS),
         artifacts,
         recoveryBlockers,
+        continuation,
+        backgroundCells,
         lastSeq,
         error: null,
       });
@@ -232,15 +254,18 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       if (run) {
         // Reset event cursor when switching runs so we don't cross streams.
         set({ events: [], lastSeq: '0' });
-        const [{ plan, todos, artifacts, recoveryBlockers }, events, persistedTools] =
-          await Promise.all([
-            loadRunSnapshot(run),
-            taskRuntimeApi.listEvents(run.run_id, '0'),
-            toolExecutionApi.list(run.conversation_id).catch((error) => {
-              console.warn('[TaskRuntime] Failed to restore persisted tool executions:', error);
-              return [];
-            }),
-          ]);
+        const [
+          { plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells },
+          events,
+          persistedTools,
+        ] = await Promise.all([
+          loadRunSnapshot(run),
+          taskRuntimeApi.listEvents(run.run_id, '0'),
+          toolExecutionApi.list(run.conversation_id).catch((error) => {
+            console.warn('[TaskRuntime] Failed to restore persisted tool executions:', error);
+            return [];
+          }),
+        ]);
         if (generation !== loadGeneration) return;
         const lastSeq = events.length ? events[events.length - 1].seq : '0';
         ingestTaskRuntimeSubagentEvents(run, plan, events);
@@ -257,6 +282,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           events: events.slice(-MAX_EVENTS),
           artifacts,
           recoveryBlockers,
+          continuation,
+          backgroundCells,
           lastSeq,
           error: null,
         });
@@ -271,6 +298,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           events: [],
           artifacts: [],
           recoveryBlockers: [],
+          continuation: null,
+          backgroundCells: [],
           lastSeq: '0',
           error: null,
         });
@@ -294,6 +323,15 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   pause: async (runId: string) => {
     try {
       await taskRuntimeApi.pauseRun(runId);
+      await get().refresh(runId);
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  updateContinuationBudgets: async (runId, tokenBudget, timeBudgetSeconds) => {
+    try {
+      await taskRuntimeApi.configureContinuation(runId, tokenBudget, timeBudgetSeconds);
       await get().refresh(runId);
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
@@ -384,6 +422,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       events: [],
       artifacts: [],
       recoveryBlockers: [],
+      continuation: null,
+      backgroundCells: [],
       lastSeq: '0',
       error: null,
       generatingPlan: false,

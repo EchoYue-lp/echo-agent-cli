@@ -48,6 +48,9 @@ const BUILTIN_SUBAGENT_FILES: &[(&str, &str)] = &[
         "general-purpose",
         include_str!("subagents/coding/general-purpose.md"),
     ),
+    // Low-intensity waiting subagent: watches exactly one background command
+    // cell via the `wait` long-poll loop until it reaches a terminal state.
+    ("awaiter", include_str!("subagents/coding/awaiter.md")),
     // Sprint 10: data/research subagents — per-subagent tmpdir workspace
     // (workspace:true → isolate_workspace) for disjoint output artifacts.
     ("data-shaper", include_str!("subagents/data/data-shaper.md")),
@@ -116,6 +119,15 @@ struct SubagentFrontmatter {
     /// Required (non-empty) when `team_strategy` is set.
     #[serde(default)]
     team_subagents: Vec<String>,
+    /// Per-subagent execution timeout in seconds (0/None = framework default).
+    /// Used by long-running roles such as the awaiter watching background cells.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// Per-subagent reasoning-depth spec (`ThinkingConfig::parse_spec` syntax:
+    /// `low`/`medium`/`high`/`disabled`/`auto`/budget number). `None` = inherit
+    /// the parent generation's thinking.
+    #[serde(default)]
+    thinking: Option<String>,
 }
 
 /// A resolved subagent definition ready for registration.
@@ -149,6 +161,12 @@ pub struct SubagentDefinition {
     pub max_turns: Option<usize>,
     /// Prefer background dispatch (stored for Phase 2).
     pub is_background: bool,
+    /// Per-subagent execution timeout in seconds (`None` = framework default).
+    pub timeout_secs: Option<u64>,
+    /// Per-subagent reasoning-depth spec, parsed via
+    /// `ThinkingConfig::parse_spec` at registration (`None` = inherit the
+    /// parent generation's thinking).
+    pub thinking: Option<String>,
     pub tags: Vec<String>,
 }
 
@@ -487,6 +505,14 @@ pub fn parse_subagent_md(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty());
 
+    // Same normalization as `model`: only an omitted/empty value inherits the
+    // parent generation's thinking; any other string is an explicit spec
+    // resolved once at registration.
+    let thinking = fm
+        .thinking
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+
     Ok(SubagentDefinition {
         source: fallback_name
             .map(|name| format!("builtin:{name}"))
@@ -502,6 +528,8 @@ pub fn parse_subagent_md(
         model,
         max_turns: fm.max_turns,
         is_background: fm.is_background,
+        timeout_secs: fm.timeout_secs,
+        thinking,
         tags,
     })
 }
@@ -588,6 +616,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_timeout_secs_and_thinking() {
+        // Per-subagent thinking/timeout frontmatter: explicit values pass
+        // through as specs (parsed by infra at registration); empty/whitespace
+        // thinking normalizes to None (inherit parent generation).
+        let md = "---\nname: awaiter\ndescription: \"x\"\nreadonly: true\nmodel: fast\nmax_turns: 64\ntimeout_secs: 90000\nthinking: low\nis_background: true\n---\nbody";
+        let def = parse_subagent_md(md, None).unwrap();
+        assert_eq!(def.timeout_secs, Some(90000));
+        assert_eq!(def.thinking.as_deref(), Some("low"));
+
+        let unset = parse_subagent_md("---\nname: w\ndescription: \"d\"\n---\nbody", None).unwrap();
+        assert_eq!(unset.timeout_secs, None);
+        assert_eq!(unset.thinking, None);
+
+        let blank = parse_subagent_md(
+            "---\nname: w\ndescription: \"d\"\nthinking: \"  \"\n---\nbody",
+            None,
+        )
+        .unwrap();
+        assert_eq!(blank.thinking, None, "whitespace-only thinking → None");
+    }
+
+    #[test]
+    fn builtin_awaiter_frontmatter_declares_waiting_role() {
+        // The builtin awaiter role must parse with the per-subagent
+        // thinking/timeout/model/background wiring the infra path expects.
+        let defs = discover_subagents(None, None);
+        let awaiter = defs
+            .iter()
+            .find(|d| d.name == "awaiter")
+            .expect("builtin awaiter.md must load");
+        assert!(awaiter.readonly);
+        assert!(awaiter.is_background);
+        assert_eq!(awaiter.model.as_deref(), Some("fast"));
+        assert_eq!(awaiter.max_turns, Some(64));
+        assert_eq!(awaiter.timeout_secs, Some(90000));
+        assert_eq!(awaiter.thinking.as_deref(), Some("low"));
+        assert!(awaiter.tags.contains(&"readonly".to_string()));
+        assert!(awaiter.tags.contains(&"background".to_string()));
+    }
+
+    #[test]
     fn parse_explicit_model_inherit_remains_an_override() -> Result<(), String> {
         let md = "---\nname: explorer\ndescription: \"x\"\nmodel: inherit\n---\nbody";
         let def = parse_subagent_md(md, None)?;
@@ -650,7 +719,8 @@ mod tests {
         // The compiled-in defaults must all parse without error — guards
         // against a corrupt source .md slipping through. Sprint 9 added a
         // writer subagent (implementer); Sprint 10 added data subagents
-        // (data-shaper, analyst); Phase 1 added general-purpose.
+        // (data-shaper, analyst); Phase 1 added general-purpose; the awaiter
+        // role added per-subagent thinking/timeout wiring.
         let defs = discover_subagents(None, None);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
@@ -662,6 +732,7 @@ mod tests {
                 "summarizer",
                 "implementer",
                 "general-purpose",
+                "awaiter",
                 "data-shaper",
                 "analyst"
             ]
@@ -872,10 +943,10 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
     #[test]
     fn nonexistent_scope_dirs_are_silently_skipped() {
         // Neither scope dir exists → only builtins returned, no panic.
-        // 4 readonly + 1 writer + 1 general-purpose + 2 data = 8 builtins.
+        // 4 readonly + 1 writer + 1 general-purpose + awaiter + 2 data = 9 builtins.
         let fake_root = PathBuf::from("/nonexistent/definitely/not/here");
         let defs = discover_subagents(Some(&fake_root), Some(&fake_root));
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 9);
     }
 
     #[test]

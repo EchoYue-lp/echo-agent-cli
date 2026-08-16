@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use echo_agent::agent::CancellationToken;
 use echo_agent::evolution::MemoryLayerManager;
+use echo_agent::human_loop::HumanLoopProvider;
 
 use crate::agent_pool::AgentPool;
 use crate::attachments::AttachmentRef;
@@ -58,6 +59,9 @@ pub struct ChatResources {
     /// Pins every memory/evidence write initiated by this turn to the same
     /// workspace generation as `layer_manager`.
     pub memory_generation: Option<crate::evolution::ReviewGenerationLease>,
+    /// Surface-owned approval/input transport. Long-horizon continuation
+    /// replays this onto its run-scoped pooled agent for every finite turn.
+    pub human_loop_provider: Option<Arc<dyn HumanLoopProvider>>,
 }
 
 tokio::task_local! {

@@ -141,12 +141,47 @@ fn render_tasks_list(_f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
             format!("  {}", super::task_strip::truncate_str(&view.goal, 20)),
             Style::default().fg(t.subtext),
         ))));
+        if view.continuation_enabled {
+            let turn = view
+                .turn_ordinal
+                .map(|ordinal| ordinal.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!(
+                    "  turn {turn} · {} compact · {} cells",
+                    view.compaction_count, view.active_cell_count
+                ),
+                Style::default().fg(t.overlay0),
+            ))));
+            items.push(ListItem::new(Line::from(Span::styled(
+                compact_budget_summary("tok", view.tokens_used, view.token_budget, ""),
+                Style::default().fg(t.overlay0),
+            ))));
+            items.push(ListItem::new(Line::from(Span::styled(
+                compact_budget_summary(
+                    "time",
+                    view.time_used_seconds,
+                    view.time_budget_seconds,
+                    "s",
+                ),
+                Style::default().fg(t.overlay0),
+            ))));
+        }
+        if let Some(reason) = &view.pause_reason {
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("  paused: {}", reason.replace('_', " ")),
+                Style::default().fg(t.yellow),
+            ))));
+        } else if view.deferred {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "  waiting for background cell",
+                Style::default().fg(t.yellow),
+            ))));
+        }
         items.push(ListItem::new(Line::from("")));
-        for task in view
-            .tasks
-            .iter()
-            .take(area.height.saturating_sub(6).saturating_div(2) as usize)
-        {
+        let header_rows = u16::try_from(items.len()).unwrap_or(u16::MAX);
+        let task_limit = area.height.saturating_sub(header_rows).saturating_div(2) as usize;
+        for task in view.tasks.iter().take(task_limit) {
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("  {} ", task_icon(&task.status)),
@@ -236,6 +271,16 @@ fn render_tasks_list(_f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
 
     let list = List::new(items);
     _f.render_widget(list, area);
+}
+
+fn compact_budget_summary(label: &str, used: u64, budget: Option<u64>, unit: &str) -> String {
+    match budget {
+        Some(budget) => format!(
+            "  {label} {used}{unit}/{budget}{unit} · {}{unit} left",
+            budget.saturating_sub(used)
+        ),
+        None => format!("  {label} {used}{unit} · unbounded"),
+    }
 }
 
 fn task_icon(status: &str) -> &'static str {

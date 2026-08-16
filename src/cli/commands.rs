@@ -17,6 +17,12 @@ pub enum CommandResult {
     Exit,
     /// Execute a chat message.
     Chat(String),
+    /// Execute a resume turn explicitly bound to one TaskRun.
+    ResumeTaskRun {
+        message: String,
+        run_id: String,
+        root_message_id: String,
+    },
 }
 
 /// Command handler — owns agent, mode, and optional coding loop + registry.
@@ -35,6 +41,7 @@ pub struct CommandHandler {
     staged_attachments:
         Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
     app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
+    conversation_id: Option<String>,
 }
 
 impl CommandHandler {
@@ -54,6 +61,7 @@ impl CommandHandler {
             )),
             staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             app_state: None,
+            conversation_id: None,
         }
     }
 
@@ -144,6 +152,11 @@ impl CommandHandler {
         self
     }
 
+    pub fn with_conversation_id(mut self, conversation_id: String) -> Self {
+        self.conversation_id = Some(conversation_id);
+        self
+    }
+
     pub fn with_interaction_mode(
         mut self,
         mode: Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
@@ -203,6 +216,7 @@ impl CommandHandler {
                 interaction_mode: self.interaction_mode.clone(),
                 staged_attachments: self.staged_attachments.clone(),
                 app_state: self.app_state.clone(),
+                conversation_id: self.conversation_id.clone(),
             };
 
             if let Some(outcome) = registry.dispatch(cmd_name, &ctx, args).await {
@@ -213,6 +227,17 @@ impl CommandHandler {
                     crate::cli::command::CommandOutcome::Exit => return CommandResult::Exit,
                     crate::cli::command::CommandOutcome::Chat(msg) => {
                         return CommandResult::Chat(msg);
+                    }
+                    crate::cli::command::CommandOutcome::ResumeTaskRun {
+                        message,
+                        run_id,
+                        root_message_id,
+                    } => {
+                        return CommandResult::ResumeTaskRun {
+                            message,
+                            run_id,
+                            root_message_id,
+                        };
                     }
                 }
             }

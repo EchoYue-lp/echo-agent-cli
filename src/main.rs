@@ -345,6 +345,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &app_config.tui,
             "💬 通用",
             tui_pending,
+            tui_provider.clone(),
             pool.clone(),
             task_runtime_store.clone(),
             webhook_emitter.clone(),

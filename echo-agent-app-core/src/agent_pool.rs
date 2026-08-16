@@ -610,15 +610,30 @@ impl AgentPool {
 
     /// Whether this key consumes one user-conversation capacity slot.
     fn is_conversation_agent(key: &str) -> bool {
-        key != "__background__" && !key.starts_with("__task__:")
+        key != "__background__"
+            && !key.starts_with("__task__:")
+            && !key.starts_with("__continuation__:")
+    }
+
+    /// Whether this key consumes one internal continuation capacity slot.
+    fn is_continuation_agent(key: &str) -> bool {
+        key.starts_with("__continuation__:")
+    }
+
+    /// Capacity is isolated by product ownership: foreground conversations
+    /// cannot evict continuations, and continuations cannot evict conversations.
+    fn shares_capacity_class(candidate: &str, requested: &str) -> bool {
+        (Self::is_conversation_agent(requested) && Self::is_conversation_agent(candidate))
+            || (Self::is_continuation_agent(requested) && Self::is_continuation_agent(candidate))
     }
 
     /// Acquire an agent for a given conversation ID.
     ///
     /// If an agent already exists for this ID, it is returned (with updated
     /// `last_used` timestamp). Otherwise, a new agent is created and added
-    /// to the pool. Pool capacity counts conversation agents only; task
-    /// subagents and the background agent have separate product ownership.
+    /// to the pool. Foreground conversations and internal continuations each
+    /// have an independent capacity limit; task subagents and the background
+    /// agent have separate product ownership.
     ///
     /// The write lock is held across the entire operation (including async
     /// agent creation) to prevent TOCTOU races between concurrent acquirers.
@@ -642,17 +657,22 @@ impl AgentPool {
                 .issue(conversation_id, existing.handle.clone());
         }
 
-        // Enforce pool limit — evict oldest idle agent that is NOT executing
-        // P1-13: 只计对话 agent, 排除 __background__ 和 __task__ subagent。
+        // Enforce the requested class limit and evict only from that class.
+        // Dedicated background and task subagents own separate admission paths.
+        let capacity_limited = Self::is_conversation_agent(conversation_id)
+            || Self::is_continuation_agent(conversation_id);
         let active_count = agents
             .keys()
-            .filter(|k| Self::is_conversation_agent(k))
+            .filter(|candidate| Self::shares_capacity_class(candidate, conversation_id))
             .count();
-        if active_count >= self.config.max_agents {
-            // Find oldest non-background, non-executing conversation agent
+        if capacity_limited && active_count >= self.config.max_agents {
+            // Find the oldest inactive agent in the requested capacity class.
             let mut candidates: Vec<(String, Instant)> = agents
                 .iter()
-                .filter(|(id, _)| Self::is_conversation_agent(id) && !self.admission.is_active(id))
+                .filter(|(id, _)| {
+                    Self::shares_capacity_class(id, conversation_id)
+                        && !self.admission.is_active(id)
+                })
                 .map(|(id, agent)| (id.clone(), agent.last_used))
                 .collect();
             candidates.sort_by_key(|(_, ts)| *ts);
@@ -1728,6 +1748,61 @@ mod tests {
         drop(h2);
 
         let _h3 = pool.acquire("conv-3").await.map_err(|e| e.to_string())?;
+        assert_eq!(pool.pool_size().await, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continuation_capacity_is_bounded_without_consuming_conversation_slots() -> TestResult {
+        let pool = create_test_pool(2, false).await?;
+
+        let _continuation_one = pool
+            .acquire("__continuation__:run-1")
+            .await
+            .map_err(|error| error.to_string())?;
+        let _continuation_two = pool
+            .acquire("__continuation__:run-2")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            pool.acquire("__continuation__:run-3").await,
+            Err(PoolError::PoolFull { max: 2 })
+        ));
+
+        let _conversation_one = pool
+            .acquire("conv-1")
+            .await
+            .map_err(|error| error.to_string())?;
+        let _conversation_two = pool
+            .acquire("conv-2")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(pool.pool_size().await, 4);
+        assert!(matches!(
+            pool.acquire("conv-3").await,
+            Err(PoolError::PoolFull { max: 2 })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continuation_capacity_reuses_an_idle_slot() -> TestResult {
+        let pool = create_test_pool(2, false).await?;
+        let first = pool
+            .acquire("__continuation__:run-1")
+            .await
+            .map_err(|error| error.to_string())?;
+        let second = pool
+            .acquire("__continuation__:run-2")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(first);
+        drop(second);
+
+        let _replacement = pool
+            .acquire("__continuation__:run-3")
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(pool.pool_size().await, 2);
         Ok(())
     }

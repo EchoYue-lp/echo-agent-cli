@@ -513,6 +513,7 @@ fn framework_definition(
             ExecutionMode::Fork
         },
         model: definition.model.clone(),
+        thinking: None,
         system_prompt: Some(definition.system_prompt.clone()),
         tool_filter: None,
         max_iterations: definition.max_turns,

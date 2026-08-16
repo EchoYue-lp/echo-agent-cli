@@ -67,6 +67,99 @@ pub enum TaskRetryPreparation {
     Recovery,
 }
 
+/// Result of the event-sourced start-if-idle continuation claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunTurnClaimOutcome {
+    Started(RunTurnSummary),
+    NotSubmitted(ContinuationNotSubmittedReason),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationNotSubmittedReason {
+    Disabled,
+    Deferred,
+    AlreadyRunning,
+    RunNotRunning,
+    TokenBudgetExhausted,
+    TimeBudgetExhausted,
+}
+
+/// Bounded control-plane facts produced by one finite primary-Agent turn.
+pub struct RunTurnCompletion<'a> {
+    pub turn_id: &'a str,
+    pub status: RunTurnStatus,
+    pub elapsed_seconds: u64,
+    pub final_message_id: Option<&'a str>,
+    pub error_fingerprint: Option<&'a str>,
+}
+
+fn is_run_progress_event(event: &RuntimeTaskEvent) -> bool {
+    matches!(
+        event.event_type,
+        RuntimeEventKind::PlanRevisionCommitted
+            | RuntimeEventKind::TaskStarted
+            | RuntimeEventKind::TaskCompleted
+            | RuntimeEventKind::TaskFailed
+            | RuntimeEventKind::TaskCancelled
+            | RuntimeEventKind::TaskTimedOut
+            | RuntimeEventKind::TaskSkipped
+            | RuntimeEventKind::TaskBlocked
+            | RuntimeEventKind::TodoUpdated
+            | RuntimeEventKind::ArtifactProduced
+            | RuntimeEventKind::MergeStarted
+            | RuntimeEventKind::MergeCompleted
+            | RuntimeEventKind::MergeFailed
+            | RuntimeEventKind::ReviewPassed
+            | RuntimeEventKind::ReviewNeedsFix
+            | RuntimeEventKind::ReviewBlocked
+            | RuntimeEventKind::RecoveryBlocked
+            | RuntimeEventKind::RecoveryResolved
+            | RuntimeEventKind::BackgroundCellStarted
+            | RuntimeEventKind::BackgroundCellFinished
+    )
+}
+
+fn run_progress_fingerprint(events: &[RuntimeTaskEvent]) -> String {
+    events
+        .iter()
+        .rev()
+        .find(|event| is_run_progress_event(event))
+        .map(|event| format!("{}:{}", event.seq, event.event_type.as_str()))
+        .unwrap_or_else(|| "no-task-progress".to_string())
+}
+
+fn run_turn_made_progress(events: &[RuntimeTaskEvent], turn_id: &str) -> bool {
+    let Some(start_seq) = events.iter().rev().find_map(|event| {
+        (event.event_type == RuntimeEventKind::RunTurnStarted
+            && event
+                .payload
+                .get("turn_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(turn_id))
+        .then_some(event.seq)
+    }) else {
+        return false;
+    };
+    events
+        .iter()
+        .any(|event| event.seq > start_seq && is_run_progress_event(event))
+}
+
+fn blocker_fingerprint(error_fingerprint: Option<&str>, progress_fingerprint: &str) -> String {
+    error_fingerprint
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .map(|fingerprint| {
+            let bounded = fingerprint
+                .chars()
+                .filter(|character| !character.is_control())
+                .take(160)
+                .collect::<String>();
+            format!("error:{}", bounded.to_ascii_lowercase())
+        })
+        .unwrap_or_else(|| format!("stalled:{progress_fingerprint}"))
+}
+
 /// File-backed TaskRuntime store. One instance per process; cheap to clone
 /// behind `Arc`. The event stream is authoritative; plan and execution files
 /// are deterministic read projections.
@@ -87,6 +180,13 @@ pub struct TaskRuntimeStore {
     /// Wakes the store-owned shutdown settlement after the last pre-shutdown
     /// driver admission reservation either registers a driver or is released.
     run_driver_admission_idle: tokio::sync::Notify,
+    /// Wakes the continuation coordinator after the exact current driver has
+    /// released its run-scoped cancellation registration.
+    run_driver_idle: tokio::sync::Notify,
+    /// EKO-owned control plane for finite primary-Agent RunTurns. The runtime
+    /// keeps only a weak store reference, so this does not create an Arc cycle.
+    pub(super) continuation_runtime:
+        std::sync::OnceLock<std::sync::Arc<super::continuation::TaskContinuationRuntime>>,
     #[cfg(test)]
     run_driver_shutdown_started: tokio::sync::Notify,
     #[cfg(test)]
@@ -570,10 +670,7 @@ impl RunCancellationRegistration {
         };
         if !matches!(
             run.status,
-            TaskRunStatus::Pending
-                | TaskRunStatus::Running
-                | TaskRunStatus::Paused
-                | TaskRunStatus::Failed
+            TaskRunStatus::Pending | TaskRunStatus::Running | TaskRunStatus::Failed
         ) {
             return;
         }
@@ -687,10 +784,21 @@ impl Drop for RunCancellationRegistration {
         if cancelled && owns_registration && self.terminalize_on_cancel {
             self.finalize_cancelled_run();
         }
+        self.store.run_driver_idle.notify_waiters();
     }
 }
 
 impl TaskRuntimeStore {
+    /// Whether the process runtime still accepts new finite TaskRun drivers.
+    /// Long-horizon coordinators use this to stop cleanly during application
+    /// shutdown and leave durable recovery to the next process.
+    pub fn is_run_driver_admission_open(&self) -> bool {
+        self.run_driver_supervisor
+            .lock()
+            .map(|supervisor| supervisor.accepting)
+            .unwrap_or(false)
+    }
+
     /// Create the store at the default location.
     ///
     /// task/plan data lives under the file shadow root (`~/.eko/tasks/`);
@@ -712,6 +820,8 @@ impl TaskRuntimeStore {
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
             run_driver_admission_idle: tokio::sync::Notify::new(),
+            run_driver_idle: tokio::sync::Notify::new(),
+            continuation_runtime: std::sync::OnceLock::new(),
             #[cfg(test)]
             run_driver_shutdown_started: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -755,6 +865,8 @@ impl TaskRuntimeStore {
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
             run_driver_admission_idle: tokio::sync::Notify::new(),
+            run_driver_idle: tokio::sync::Notify::new(),
+            continuation_runtime: std::sync::OnceLock::new(),
             #[cfg(test)]
             run_driver_shutdown_started: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -883,6 +995,7 @@ impl TaskRuntimeStore {
                 (result_receiver, result_sender, reporter)
             }
         };
+        super::continuation::shutdown(self);
 
         loop {
             let observed_result = shutdown_result.borrow().clone();
@@ -1530,6 +1643,7 @@ impl TaskRuntimeStore {
                     Err(error) => {
                         match settlement_store.get_run(&run_id) {
                             Ok(None) if !run_required => Ok(()),
+                            Ok(Some(run)) if run.status == TaskRunStatus::Paused => Ok(()),
                             Ok(_) => {
                                 let target = if driver_cancel.is_cancelled() {
                                     TaskRunStatus::Cancelled
@@ -1817,6 +1931,16 @@ impl TaskRuntimeStore {
                 | TaskRunStatus::Cancelled
                 | TaskRunStatus::Paused
         ) {
+            Ok(())
+        } else if run.status == TaskRunStatus::Running
+            && self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .is_some_and(|state| state.enabled && state.active_turn.is_none())
+        {
+            // A long-horizon Goal may intentionally be Running between finite
+            // RunTurns (for deferral or queued continuation). The event-folded
+            // active-turn claim, not a driver future, is the authority here.
             Ok(())
         } else {
             Err(StoreError::InvalidPlan(format!(
@@ -2171,20 +2295,84 @@ impl TaskRuntimeStore {
     /// The caller (IPC layer) is responsible for re-launching the executor
     /// after this succeeds — the store only handles the state transition.
     pub fn resume_task_run(&self, run_id: &str) -> Result<TaskRun, StoreError> {
-        let _operation = self.shadow_operation()?;
-        let blockers = self.list_recovery_blockers(run_id)?;
-        if !blockers.is_empty() {
-            let details = blockers
-                .iter()
-                .map(|blocker| format!("{}: {}", blocker.task_id, blocker.reason))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(StoreError::RecoveryBlocked {
-                run_id: run_id.to_string(),
-                details,
-            });
-        }
-        self.transition_run(run_id, TaskRunStatus::Running)
+        self.with_run_lock(run_id, || {
+            let blockers = self.list_recovery_blockers(run_id)?;
+            if !blockers.is_empty() {
+                let details = blockers
+                    .iter()
+                    .map(|blocker| format!("{}: {}", blocker.task_id, blocker.reason))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(StoreError::RecoveryBlocked {
+                    run_id: run_id.to_string(),
+                    details,
+                });
+            }
+            let mut run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if let Some(continuation) = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+            {
+                if continuation.active_turn.is_some() {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "run {run_id} still has an active RunTurn; wait for exact driver settlement before resume"
+                    )));
+                }
+                if continuation
+                    .token_budget
+                    .is_some_and(|budget| continuation.tokens_used >= budget)
+                {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "run {run_id} exhausted its continuation token budget"
+                    )));
+                }
+                if continuation
+                    .time_budget_seconds
+                    .is_some_and(|budget| continuation.time_used_seconds >= budget)
+                {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "run {run_id} exhausted its continuation time budget"
+                    )));
+                }
+            }
+            if !run.status.can_transition_to(TaskRunStatus::Running) {
+                return Err(StoreError::IllegalTransition {
+                    run_id: run_id.to_string(),
+                    from: run.status.as_str().to_string(),
+                    to: TaskRunStatus::Running.as_str().to_string(),
+                });
+            }
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({
+                    "from": run.status.as_str(),
+                    "to": TaskRunStatus::Running.as_str(),
+                }),
+            )?;
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunPauseReasonChanged,
+                serde_json::json!({ "reason": serde_json::Value::Null }),
+            )?;
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunContinuationResumed,
+                serde_json::json!({ "deferred": false, "reset_blocker_audit": true }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            run.status = TaskRunStatus::Running;
+            run.updated_at = Utc::now();
+            Ok(run)
+        })
     }
 
     /// Atomically mark a running run completed only when the latest committed
@@ -2208,6 +2396,13 @@ impl TaskRuntimeStore {
                 .tasks
                 .iter()
                 .any(|task| !matches!(task.status, TodoStatus::Completed | TodoStatus::Skipped))
+            {
+                return Ok(false);
+            }
+            if self
+                .list_background_cells(run_id)?
+                .iter()
+                .any(BackgroundCellState::is_active)
             {
                 return Ok(false);
             }
@@ -2308,6 +2503,18 @@ impl TaskRuntimeStore {
             .unwrap_or(false)
     }
 
+    /// Wait until no live driver owns this run. The notification is armed
+    /// before the state check so a release between the two cannot be missed.
+    pub async fn wait_for_run_driver_idle(&self, run_id: &str) {
+        loop {
+            let released = self.run_driver_idle.notified();
+            if !self.is_run_active(run_id) {
+                return;
+            }
+            released.await;
+        }
+    }
+
     fn cancel_active_run(&self, run_id: &str) -> bool {
         if let Ok(mut map) = self.run_cancel_tokens.lock() {
             #[allow(clippy::collapsible_if)]
@@ -2327,6 +2534,8 @@ impl TaskRuntimeStore {
     pub fn request_cancel(&self, run_id: &str) -> Result<bool, StoreError> {
         let _operation = self.shadow_operation()?;
         if self.cancel_active_run(run_id) {
+            super::continuation::clear_launcher(self, run_id);
+            super::command_cells::stop_cells_for_run(run_id);
             return Ok(true);
         }
         let Some(run) = self.get_run(run_id)? else {
@@ -2335,11 +2544,17 @@ impl TaskRuntimeStore {
         match run.status {
             TaskRunStatus::Pending | TaskRunStatus::Paused | TaskRunStatus::Failed => {
                 self.transition_run(run_id, TaskRunStatus::Cancelled)?;
+                super::continuation::clear_launcher(self, run_id);
+                super::command_cells::stop_cells_for_run(run_id);
                 Ok(true)
             }
-            TaskRunStatus::Running | TaskRunStatus::Cancelled | TaskRunStatus::Completed => {
-                Ok(false)
+            TaskRunStatus::Running => {
+                self.transition_run(run_id, TaskRunStatus::Cancelled)?;
+                super::continuation::clear_launcher(self, run_id);
+                super::command_cells::stop_cells_for_run(run_id);
+                Ok(true)
             }
+            TaskRunStatus::Cancelled | TaskRunStatus::Completed => Ok(false),
         }
     }
 
@@ -2347,29 +2562,62 @@ impl TaskRuntimeStore {
     /// run-scoped token used for cancellation stops in-flight Subagents. The
     /// executor observes the durable Paused status and leaves the run resumable.
     pub fn request_pause(&self, run_id: &str) -> Result<bool, StoreError> {
-        let _operation = self.shadow_operation()?;
-        let Some(run) = self.get_run(run_id)? else {
-            return Ok(false);
-        };
-        if run.status != TaskRunStatus::Running {
-            return Ok(false);
-        }
+        self.request_pause_with_reason(run_id, RunPauseReason::User, None)
+    }
+
+    /// Pause an active driver while atomically persisting the structured reason
+    /// with the Paused transition. Background command cells intentionally keep
+    /// running; explicit cancellation is the only path that stops them.
+    pub fn request_pause_with_reason(
+        &self,
+        run_id: &str,
+        reason: RunPauseReason,
+        detail: Option<&str>,
+    ) -> Result<bool, StoreError> {
         let token = self
             .run_cancel_tokens
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?
-            .remove(run_id);
-        let Some(token) = token else {
+            .get(run_id)
+            .cloned();
+        let transition = self.with_run_lock(run_id, || {
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if run.status != TaskRunStatus::Running {
+                return Ok(false);
+            }
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunPauseReasonChanged,
+                serde_json::json!({
+                    "reason": reason.as_str(),
+                    "detail": detail.map(|text| text.chars().take(600).collect::<String>()),
+                }),
+            )?;
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({
+                    "from": TaskRunStatus::Running.as_str(),
+                    "to": TaskRunStatus::Paused.as_str(),
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(true)
+        });
+        let transitioned = transition?;
+        if !transitioned {
             return Ok(false);
-        };
-        if let Err(error) = self.transition_run(run_id, TaskRunStatus::Paused) {
-            self.run_cancel_tokens
-                .lock()
-                .map_err(|_| StoreError::LockPoisoned)?
-                .insert(run_id.to_string(), token);
-            return Err(error);
         }
-        token.cancel();
+        if let Some(token) = token {
+            token.cancel();
+        }
+        super::continuation::clear_launcher(self, run_id);
         Ok(true)
     }
 
@@ -3405,8 +3653,72 @@ impl TaskRuntimeStore {
                     "recover_incomplete: failed to note recovery"
                 );
             }
+            if let Ok(Some(state)) = self.get_run_state(&run.run_id)
+                && let Some(active_turn) = state.continuation.and_then(|state| state.active_turn)
+                && let Err(error) = self.finish_run_turn(
+                    &run.run_id,
+                    RunTurnCompletion {
+                        turn_id: &active_turn.turn_id,
+                        status: RunTurnStatus::Failed,
+                        elapsed_seconds: 0,
+                        final_message_id: None,
+                        error_fingerprint: Some("process_interrupted"),
+                    },
+                )
+            {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    turn_id = %active_turn.turn_id,
+                    %error,
+                    "recover_incomplete: failed to close orphan RunTurn"
+                );
+            }
+            if let Err(error) = self.record_run_pause_reason(
+                &run.run_id,
+                RunPauseReason::BootRecovery,
+                Some("the application process ended while this run was active"),
+            ) {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    %error,
+                    "recover_incomplete: failed to persist boot-recovery pause reason"
+                );
+            }
             match self.transition_run(&run.run_id, TaskRunStatus::Paused) {
                 Ok(_) => {
+                    // Cell handles are process-scoped. A started cell without
+                    // a terminal event cannot still exist after boot, so close
+                    // the durable projection as interrupted. The command is
+                    // never replayed here; normal task recovery decides
+                    // whether its side effects require user review.
+                    let orphan_cells = self
+                        .list_background_cells(&run.run_id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(BackgroundCellState::is_active)
+                        .collect::<Vec<_>>();
+                    for cell in orphan_cells {
+                        if let Err(error) = self.record_background_cell_finished(
+                            &run.run_id,
+                            &cell.cell_id,
+                            &cell.name,
+                            "interrupted",
+                            None,
+                            cell.total_output_bytes,
+                            cell.output_truncated,
+                            Some("cell process ended with the previous application process"),
+                            cell.artifact_path.as_deref(),
+                            cell.artifact_sha256.as_deref(),
+                            cell.call_id.as_deref(),
+                        ) {
+                            tracing::warn!(
+                                run_id = %run.run_id,
+                                cell_id = %cell.cell_id,
+                                %error,
+                                "recover_incomplete: failed to close orphan command cell"
+                            );
+                        }
+                    }
                     let plan = self.get_plan(&run.run_id).ok().flatten();
                     let active_subagents = self
                         .active_subagent_boundaries(&run.run_id)
@@ -3556,6 +3868,543 @@ impl TaskRuntimeStore {
         self.file_store()?
             .list_events(run_id, since_seq)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+    }
+
+    /// Read the deterministic event-folded run-state projection.
+    pub fn get_run_state(&self, run_id: &str) -> Result<Option<RunStateSnapshot>, StoreError> {
+        let events = self.list_events(run_id, 0)?;
+        if events.is_empty() {
+            return Ok(None);
+        }
+        super::event_rebuild::rebuild_plan_from_events(&events)
+            .map(|rebuilt| Some(rebuilt.run_state()))
+            .map_err(|error| StoreError::InvalidPlan(format!("run-state rebuild: {error}")))
+    }
+
+    /// Configure long-horizon execution without introducing a second Goal store.
+    pub fn configure_run_continuation(
+        &self,
+        run_id: &str,
+        enabled: bool,
+        auto_resume_after_restart: bool,
+        token_budget: Option<u64>,
+        time_budget_seconds: Option<u64>,
+    ) -> Result<RunContinuationState, StoreError> {
+        self.with_run_lock(run_id, || {
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let current = self
+                .get_run_state(run_id)?
+                .and_then(|state| state.continuation);
+            let unchanged = current.as_ref().is_some_and(|state| {
+                state.enabled == enabled
+                    && state.auto_resume_after_restart == auto_resume_after_restart
+                    && state.token_budget == token_budget
+                    && state.time_budget_seconds == time_budget_seconds
+            });
+            if !unchanged {
+                self.shadow.append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunContinuationConfigured,
+                    serde_json::json!({
+                        "enabled": enabled,
+                        "auto_resume_after_restart": auto_resume_after_restart,
+                        "token_budget": token_budget,
+                        "time_budget_seconds": time_budget_seconds,
+                    }),
+                )?;
+                self.shadow.rewrite_plan(run_id)?;
+            }
+            self.get_run_state(run_id)?
+                .and_then(|state| state.continuation)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan(format!(
+                        "continuation projection missing after configuration for {run_id}"
+                    ))
+                })
+        })
+    }
+
+    /// Update only the budgets of an already-enabled continuation. Product
+    /// surfaces use this instead of the bootstrap configuration API so a typo
+    /// cannot silently turn an ordinary one-shot run into a long-horizon run.
+    pub fn update_run_continuation_budgets(
+        &self,
+        run_id: &str,
+        token_budget: Option<u64>,
+        time_budget_seconds: Option<u64>,
+    ) -> Result<RunContinuationState, StoreError> {
+        if token_budget == Some(0) || time_budget_seconds == Some(0) {
+            return Err(StoreError::InvalidPlan(
+                "continuation budgets must be positive or omitted".to_string(),
+            ));
+        }
+        let current = self
+            .get_run_state(run_id)?
+            .and_then(|snapshot| snapshot.continuation)
+            .filter(|continuation| continuation.enabled)
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(format!(
+                    "run {run_id} is not configured for long-horizon continuation"
+                ))
+            })?;
+        self.configure_run_continuation(
+            run_id,
+            true,
+            current.auto_resume_after_restart,
+            token_budget,
+            time_budget_seconds,
+        )
+    }
+
+    /// Atomically claim the next RunTurn ordinal when this run is eligible.
+    pub fn claim_run_turn(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        origin: RunTurnOrigin,
+        transcript_visibility: TurnVisibility,
+    ) -> Result<RunTurnClaimOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            if turn_id.trim().is_empty() {
+                return Err(StoreError::InvalidPlan(
+                    "RunTurn id must not be empty".to_string(),
+                ));
+            }
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if run.status != TaskRunStatus::Running {
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::RunNotRunning,
+                ));
+            }
+            let state = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .unwrap_or_default();
+            if !state.enabled {
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::Disabled,
+                ));
+            }
+            if state.deferred {
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::Deferred,
+                ));
+            }
+            if state.active_turn.is_some() {
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::AlreadyRunning,
+                ));
+            }
+            if self.list_events(run_id, 0)?.iter().any(|event| {
+                event.event_type == RuntimeEventKind::RunTurnStarted
+                    && event
+                        .payload
+                        .get("turn_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(turn_id)
+            }) {
+                return Err(StoreError::InvalidPlan(format!(
+                    "RunTurn id {turn_id} was already used by {run_id}"
+                )));
+            }
+            if state
+                .token_budget
+                .is_some_and(|budget| state.tokens_used >= budget)
+            {
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::TokenBudgetExhausted,
+                ));
+            }
+            if state
+                .time_budget_seconds
+                .is_some_and(|budget| state.time_used_seconds >= budget)
+            {
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::TimeBudgetExhausted,
+                ));
+            }
+            let ordinal = state.next_turn_ordinal.max(1);
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunTurnStarted,
+                serde_json::json!({
+                    "event_id": format!("{run_id}:{turn_id}:started"),
+                    "turn_id": turn_id,
+                    "ordinal": ordinal,
+                    "origin": origin.as_str(),
+                    "transcript_visibility": transcript_visibility.as_str(),
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            let summary = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .and_then(|state| state.active_turn)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan(format!(
+                        "active RunTurn missing after claim for {run_id}:{turn_id}"
+                    ))
+                })?;
+            Ok(RunTurnClaimOutcome::Started(summary))
+        })
+    }
+
+    /// Account a provider usage envelope exactly once. Returns true once the
+    /// optional user token budget is exhausted.
+    pub fn account_run_turn_usage(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        provider_event_id: &str,
+        input_tokens: u64,
+        output_tokens: u64,
+    ) -> Result<bool, StoreError> {
+        self.with_run_lock(run_id, || {
+            let active_turn_id = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .and_then(|state| state.active_turn)
+                .map(|turn| turn.turn_id);
+            if active_turn_id.as_deref() != Some(turn_id) {
+                return Err(StoreError::InvalidPlan(format!(
+                    "usage event targets inactive RunTurn {turn_id} in {run_id}"
+                )));
+            }
+            let events = self.list_events(run_id, 0)?;
+            let event_id = format!("{run_id}:{turn_id}:usage:{provider_event_id}");
+            let already_recorded = events.iter().any(|event| {
+                event.event_type == RuntimeEventKind::RunTurnUsageAccounted
+                    && event
+                        .payload
+                        .get("event_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(event_id.as_str())
+            });
+            if !already_recorded {
+                self.shadow.append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunTurnUsageAccounted,
+                    serde_json::json!({
+                        "event_id": event_id,
+                        "turn_id": turn_id,
+                        "provider_event_id": provider_event_id,
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                    }),
+                )?;
+                self.shadow.rewrite_plan(run_id)?;
+            }
+            let state = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .unwrap_or_default();
+            Ok(state
+                .token_budget
+                .is_some_and(|budget| state.tokens_used >= budget))
+        })
+    }
+
+    pub fn record_run_turn_compaction(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        provider_event_id: &str,
+    ) -> Result<(), StoreError> {
+        self.with_run_lock(run_id, || {
+            let active_turn_id = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .and_then(|state| state.active_turn)
+                .map(|turn| turn.turn_id);
+            if active_turn_id.as_deref() != Some(turn_id) {
+                return Err(StoreError::InvalidPlan(format!(
+                    "compaction event targets inactive RunTurn {turn_id} in {run_id}"
+                )));
+            }
+            let event_id = format!("{run_id}:{turn_id}:compact:{provider_event_id}");
+            let already_recorded = self.list_events(run_id, 0)?.iter().any(|event| {
+                event.event_type == RuntimeEventKind::RunTurnCompacted
+                    && event
+                        .payload
+                        .get("event_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(event_id.as_str())
+            });
+            if already_recorded {
+                return Ok(());
+            }
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunTurnCompacted,
+                serde_json::json!({
+                    "event_id": event_id,
+                    "turn_id": turn_id,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
+    }
+
+    /// Finish the active RunTurn exactly once and return the rebuilt state.
+    pub fn finish_run_turn(
+        &self,
+        run_id: &str,
+        completion: RunTurnCompletion<'_>,
+    ) -> Result<RunContinuationState, StoreError> {
+        self.with_run_lock(run_id, || {
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let events = self.list_events(run_id, 0)?;
+            let already_recorded = events.iter().any(|event| {
+                event.event_type == RuntimeEventKind::RunTurnFinished
+                    && event
+                        .payload
+                        .get("turn_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(completion.turn_id)
+            });
+            if already_recorded {
+                return self
+                    .get_run_state(run_id)?
+                    .and_then(|snapshot| snapshot.continuation)
+                    .ok_or_else(|| {
+                        StoreError::InvalidPlan(format!(
+                            "continuation projection missing after finishing {}",
+                            completion.turn_id
+                        ))
+                    });
+            }
+            let active_turn_id = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .and_then(|state| state.active_turn)
+                .map(|turn| turn.turn_id);
+            if active_turn_id.as_deref() != Some(completion.turn_id) {
+                return Err(StoreError::InvalidPlan(format!(
+                    "finish targets inactive RunTurn {} in {run_id}",
+                    completion.turn_id
+                )));
+            }
+            {
+                let progress_fingerprint = run_progress_fingerprint(&events);
+                let made_progress = run_turn_made_progress(&events, completion.turn_id);
+                let blocker_fingerprint = (!made_progress).then(|| {
+                    blocker_fingerprint(completion.error_fingerprint, &progress_fingerprint)
+                });
+                self.shadow.append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunTurnFinished,
+                    serde_json::json!({
+                        "event_id": format!("{run_id}:{}:finished", completion.turn_id),
+                        "turn_id": completion.turn_id,
+                        "status": completion.status.as_str(),
+                        "elapsed_seconds": completion.elapsed_seconds,
+                        "final_message_id": completion.final_message_id,
+                        "error_fingerprint": completion.error_fingerprint,
+                        "progress_fingerprint": progress_fingerprint,
+                        "made_progress": made_progress,
+                        "blocker_fingerprint": blocker_fingerprint,
+                    }),
+                )?;
+                self.shadow.rewrite_plan(run_id)?;
+            }
+            self.get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan(format!(
+                        "continuation projection missing after finishing {}",
+                        completion.turn_id
+                    ))
+                })
+        })
+    }
+
+    pub fn set_continuation_deferred(
+        &self,
+        run_id: &str,
+        deferred: bool,
+    ) -> Result<(), StoreError> {
+        self.with_run_lock(run_id, || {
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let current = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .is_some_and(|state| state.deferred);
+            if current == deferred {
+                return Ok(());
+            }
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                if deferred {
+                    RuntimeEventKind::RunContinuationDeferred
+                } else {
+                    RuntimeEventKind::RunContinuationResumed
+                },
+                serde_json::json!({ "deferred": deferred }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
+    }
+
+    pub fn record_run_pause_reason(
+        &self,
+        run_id: &str,
+        reason: RunPauseReason,
+        detail: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with_run_lock(run_id, || {
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunPauseReasonChanged,
+                serde_json::json!({
+                    "reason": reason.as_str(),
+                    "detail": detail.map(|text| text.chars().take(600).collect::<String>()),
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
+    }
+
+    /// Fold the append-only cell lifecycle events for one run.
+    pub fn list_background_cells(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<BackgroundCellState>, StoreError> {
+        let events = self.list_events(run_id, 0)?;
+        super::event_rebuild::rebuild_plan_from_events(&events)
+            .map(|rebuilt| rebuilt.background_cells)
+            .map_err(|error| StoreError::InvalidPlan(format!("cell event rebuild: {error}")))
+    }
+
+    /// Persist one cell launch exactly once. The framework registry remains
+    /// the execution authority; this event is the EKO recovery/UI projection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_background_cell_started(
+        &self,
+        run_id: &str,
+        cell_id: &str,
+        name: &str,
+        command_hash: &str,
+        turn_id: Option<&str>,
+        execution_id: Option<&str>,
+        call_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with_run_lock(run_id, || {
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let already_recorded = self.list_events(run_id, 0)?.iter().any(|event| {
+                event.event_type == RuntimeEventKind::BackgroundCellStarted
+                    && event
+                        .payload
+                        .get("cell_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(cell_id)
+            });
+            if already_recorded {
+                return Ok(());
+            }
+            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
+                max_string_chars: 240,
+                ..Default::default()
+            };
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                call_id,
+                RuntimeEventKind::BackgroundCellStarted,
+                serde_json::json!({
+                    "cell_id": cell_id,
+                    "name": retention.sanitize_text(name),
+                    "command_hash": command_hash,
+                    "turn_id": turn_id,
+                    "execution_id": execution_id,
+                    "call_id": call_id,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
+    }
+
+    /// Persist one terminal cell result exactly once. Durable excerpts are
+    /// redacted and bounded before they enter events.jsonl.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_background_cell_finished(
+        &self,
+        run_id: &str,
+        cell_id: &str,
+        name: &str,
+        phase: &str,
+        exit_code: Option<i32>,
+        total_output_bytes: u64,
+        output_truncated: bool,
+        output_excerpt: Option<&str>,
+        artifact_path: Option<&str>,
+        artifact_sha256: Option<&str>,
+        call_id: Option<&str>,
+    ) -> Result<(), StoreError> {
+        self.with_run_lock(run_id, || {
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let already_recorded = self.list_events(run_id, 0)?.iter().any(|event| {
+                event.event_type == RuntimeEventKind::BackgroundCellFinished
+                    && event
+                        .payload
+                        .get("cell_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(cell_id)
+            });
+            if already_recorded {
+                return Ok(());
+            }
+            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
+                max_string_chars: 1_200,
+                ..Default::default()
+            };
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                call_id,
+                RuntimeEventKind::BackgroundCellFinished,
+                serde_json::json!({
+                    "cell_id": cell_id,
+                    "name": retention.sanitize_text(name),
+                    "phase": phase,
+                    "exit_code": exit_code,
+                    "total_output_bytes": total_output_bytes,
+                    "output_truncated": output_truncated,
+                    "output_excerpt": output_excerpt.map(|text| retention.sanitize_text(text)),
+                    "artifact_path": artifact_path,
+                    "artifact_sha256": artifact_sha256,
+                    "call_id": call_id,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
     }
 
     pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, StoreError> {
@@ -5267,6 +6116,256 @@ mod tests {
     }
 
     #[test]
+    fn budget_update_requires_existing_continuation_and_preserves_policy() -> Result<(), StoreError>
+    {
+        let store = fresh();
+        seed_plan(&store);
+        assert!(
+            store
+                .update_run_continuation_budgets("r1", Some(100), Some(60))
+                .is_err()
+        );
+        store.configure_run_continuation("r1", true, true, None, None)?;
+        let updated = store.update_run_continuation_budgets("r1", Some(100), Some(60))?;
+        assert_eq!(updated.token_budget, Some(100));
+        assert_eq!(updated.time_budget_seconds, Some(60));
+        assert!(updated.auto_resume_after_restart);
+        assert!(
+            store
+                .update_run_continuation_budgets("r1", Some(0), None)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_run_turn_claim_has_one_authoritative_winner() -> Result<(), String> {
+        let store = std::sync::Arc::new(fresh());
+        seed_plan(&store);
+        store
+            .configure_run_continuation("r1", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let mut threads = Vec::new();
+        for index in 0..16 {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            threads.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.claim_run_turn(
+                    "r1",
+                    &format!("turn-{index}"),
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )
+            }));
+        }
+        let mut started = Vec::new();
+        let mut already_running = 0_usize;
+        for thread in threads {
+            let outcome = thread
+                .join()
+                .map_err(|_| "RunTurn claim thread panicked".to_string())?
+                .map_err(|error| error.to_string())?;
+            match outcome {
+                RunTurnClaimOutcome::Started(summary) => started.push(summary),
+                RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::AlreadyRunning,
+                ) => already_running = already_running.saturating_add(1),
+                other => return Err(format!("unexpected claim outcome: {other:?}")),
+            }
+        }
+        assert_eq!(started.len(), 1);
+        assert_eq!(already_running, 15);
+        assert_eq!(started.first().map(|turn| turn.ordinal), Some(1));
+        assert_eq!(
+            store
+                .get_run_state("r1")
+                .map_err(|error| error.to_string())?
+                .and_then(|state| state.continuation)
+                .and_then(|state| state.active_turn)
+                .map(|turn| turn.ordinal),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_turn_accounting_is_idempotent_and_rejects_cross_turn_events() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, Some(100), None)?;
+        assert!(matches!(
+            store.claim_run_turn("r1", "turn-1", RunTurnOrigin::User, TurnVisibility::Visible,)?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        assert!(
+            store
+                .account_run_turn_usage("r1", "wrong-turn", "usage-1", 10, 20)
+                .is_err()
+        );
+        assert!(
+            store
+                .record_run_turn_compaction("r1", "wrong-turn", "compact-1")
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_run_turn(
+                    "r1",
+                    RunTurnCompletion {
+                        turn_id: "wrong-turn",
+                        status: RunTurnStatus::Ended,
+                        elapsed_seconds: 7,
+                        final_message_id: None,
+                        error_fingerprint: None,
+                    },
+                )
+                .is_err()
+        );
+        assert!(!store.account_run_turn_usage("r1", "turn-1", "usage-1", 10, 20)?);
+        assert!(!store.account_run_turn_usage("r1", "turn-1", "usage-1", 10, 20)?);
+        store.record_run_turn_compaction("r1", "turn-1", "compact-1")?;
+        store.record_run_turn_compaction("r1", "turn-1", "compact-1")?;
+        let first = store.finish_run_turn(
+            "r1",
+            RunTurnCompletion {
+                turn_id: "turn-1",
+                status: RunTurnStatus::Ended,
+                elapsed_seconds: 7,
+                final_message_id: Some("message-1"),
+                error_fingerprint: None,
+            },
+        )?;
+        let replay = store.finish_run_turn(
+            "r1",
+            RunTurnCompletion {
+                turn_id: "turn-1",
+                status: RunTurnStatus::Failed,
+                elapsed_seconds: 99,
+                final_message_id: None,
+                error_fingerprint: Some("must-not-overwrite"),
+            },
+        )?;
+        assert_eq!(first, replay);
+        assert_eq!(replay.tokens_used, 30);
+        assert_eq!(replay.time_used_seconds, 7);
+        assert_eq!(replay.compaction_count, 1);
+        let last = replay
+            .last_turn
+            .ok_or_else(|| StoreError::InvalidPlan("finished RunTurn missing".to_string()))?;
+        assert_eq!(last.input_tokens, 10);
+        assert_eq!(last.output_tokens, 20);
+        assert_eq!(last.compaction_count, 1);
+        assert_eq!(last.status, RunTurnStatus::Ended);
+        assert_eq!(last.final_message_id.as_deref(), Some("message-1"));
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "turn-1",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            ),
+            Err(StoreError::InvalidPlan(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn time_budget_stops_at_exact_boundary_and_cannot_be_bypassed_by_resume()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, Some(7))?;
+        assert!(matches!(
+            store.claim_run_turn("r1", "turn-1", RunTurnOrigin::User, TurnVisibility::Visible)?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        let state = store.finish_run_turn(
+            "r1",
+            RunTurnCompletion {
+                turn_id: "turn-1",
+                status: RunTurnStatus::Ended,
+                elapsed_seconds: 7,
+                final_message_id: None,
+                error_fingerprint: None,
+            },
+        )?;
+        assert_eq!(state.time_budget_seconds, Some(7));
+        assert_eq!(state.time_used_seconds, 7);
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "turn-2",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )?,
+            RunTurnClaimOutcome::NotSubmitted(ContinuationNotSubmittedReason::TimeBudgetExhausted)
+        ));
+
+        assert!(store.request_pause_with_reason(
+            "r1",
+            RunPauseReason::TimeBudget,
+            Some("configured time budget exhausted"),
+        )?);
+        let error = store
+            .resume_task_run("r1")
+            .err()
+            .ok_or_else(|| StoreError::InvalidPlan("resume unexpectedly succeeded".to_string()))?;
+        assert!(error.to_string().contains("time budget"));
+        Ok(())
+    }
+
+    #[test]
+    fn one_hundred_turns_and_compactions_replay_without_double_accounting() -> Result<(), StoreError>
+    {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        for ordinal in 1..=100_u64 {
+            let turn_id = format!("soak-turn-{ordinal}");
+            assert!(matches!(
+                store.claim_run_turn(
+                    "r1",
+                    &turn_id,
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )?,
+                RunTurnClaimOutcome::Started(_)
+            ));
+            let provider_event_id = format!("usage-{ordinal}");
+            assert!(!store.account_run_turn_usage("r1", &turn_id, &provider_event_id, 1, 2,)?);
+            assert!(!store.account_run_turn_usage("r1", &turn_id, &provider_event_id, 1, 2,)?);
+            let compaction_event_id = format!("compact-{ordinal}");
+            store.record_run_turn_compaction("r1", &turn_id, &compaction_event_id)?;
+            store.record_run_turn_compaction("r1", &turn_id, &compaction_event_id)?;
+            store.finish_run_turn(
+                "r1",
+                RunTurnCompletion {
+                    turn_id: &turn_id,
+                    status: RunTurnStatus::Ended,
+                    elapsed_seconds: 1,
+                    final_message_id: None,
+                    error_fingerprint: None,
+                },
+            )?;
+        }
+
+        let events = store.list_events("r1", 0)?;
+        let replayed = super::super::event_rebuild::rebuild_plan_from_events(&events)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
+            .run_state()
+            .continuation
+            .ok_or_else(|| StoreError::InvalidPlan("soak continuation missing".to_string()))?;
+        assert_eq!(replayed.tokens_used, 300);
+        assert_eq!(replayed.time_used_seconds, 100);
+        assert_eq!(replayed.compaction_count, 100);
+        assert_eq!(replayed.next_turn_ordinal, 101);
+        assert!(replayed.active_turn.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn resume_task_run_transitions_paused_to_running() {
         let s = fresh();
         seed_plan(&s);
@@ -5286,6 +6385,171 @@ mod tests {
             .filter(|e| e.event_type == RuntimeEventKind::RunStatusChanged)
             .collect();
         assert!(status_changes.len() >= 2);
+    }
+
+    #[test]
+    fn idle_long_horizon_run_accepts_pause_resume_and_cancel() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        for ordinal in 1..=3 {
+            let turn_id = format!("turn-{ordinal}");
+            assert!(matches!(
+                store.claim_run_turn(
+                    "r1",
+                    &turn_id,
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )?,
+                RunTurnClaimOutcome::Started(_)
+            ));
+            store.finish_run_turn(
+                "r1",
+                RunTurnCompletion {
+                    turn_id: &turn_id,
+                    status: RunTurnStatus::Ended,
+                    elapsed_seconds: 1,
+                    final_message_id: None,
+                    error_fingerprint: None,
+                },
+            )?;
+        }
+        assert_eq!(
+            store
+                .get_run_state("r1")?
+                .and_then(|state| state.continuation)
+                .and_then(|state| state.blocker_audit)
+                .map(|audit| audit.consecutive_turns),
+            Some(3)
+        );
+
+        assert!(store.request_pause("r1")?);
+        let paused = store
+            .get_run_state("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        assert_eq!(paused.run.status, TaskRunStatus::Paused);
+        assert_eq!(
+            paused
+                .continuation
+                .as_ref()
+                .and_then(|state| state.pause.as_ref())
+                .map(|pause| pause.reason),
+            Some(RunPauseReason::User)
+        );
+
+        assert_eq!(store.resume_task_run("r1")?.status, TaskRunStatus::Running);
+        assert!(
+            store
+                .get_run_state("r1")?
+                .and_then(|state| state.continuation)
+                .and_then(|state| state.blocker_audit)
+                .is_none()
+        );
+        assert!(store.request_cancel("r1")?);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Cancelled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn blocker_audit_resets_on_progress_and_distinguishes_error_fingerprints()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "stalled-before-progress",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        let stalled = store.finish_run_turn(
+            "r1",
+            RunTurnCompletion {
+                turn_id: "stalled-before-progress",
+                status: RunTurnStatus::Ended,
+                elapsed_seconds: 1,
+                final_message_id: None,
+                error_fingerprint: None,
+            },
+        )?;
+        assert_eq!(
+            stalled
+                .blocker_audit
+                .as_ref()
+                .map(|audit| audit.consecutive_turns),
+            Some(1)
+        );
+
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "progress-turn",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        store.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Running,
+            Some("code_reviewer"),
+            Some("started review"),
+        )?;
+        let progressed = store.finish_run_turn(
+            "r1",
+            RunTurnCompletion {
+                turn_id: "progress-turn",
+                status: RunTurnStatus::Ended,
+                elapsed_seconds: 1,
+                final_message_id: None,
+                error_fingerprint: None,
+            },
+        )?;
+        assert!(progressed.blocker_audit.is_none());
+
+        for (turn_id, fingerprint, expected) in [
+            ("provider-a", "provider_a", 1_u32),
+            ("provider-b-1", "provider_b", 1_u32),
+            ("provider-b-2", "provider_b", 2_u32),
+            ("provider-b-3", "provider_b", 3_u32),
+        ] {
+            assert!(matches!(
+                store.claim_run_turn(
+                    "r1",
+                    turn_id,
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )?,
+                RunTurnClaimOutcome::Started(_)
+            ));
+            let state = store.finish_run_turn(
+                "r1",
+                RunTurnCompletion {
+                    turn_id,
+                    status: RunTurnStatus::Failed,
+                    elapsed_seconds: 1,
+                    final_message_id: None,
+                    error_fingerprint: Some(fingerprint),
+                },
+            )?;
+            let audit = state.blocker_audit.ok_or_else(|| {
+                StoreError::InvalidPlan(format!("blocker audit missing for {turn_id}"))
+            })?;
+            assert_eq!(audit.fingerprint, format!("error:{fingerprint}"));
+            assert_eq!(audit.consecutive_turns, expected);
+        }
+        Ok(())
     }
 
     #[test]
@@ -5416,6 +6680,93 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(task.status, TodoStatus::Completed);
         assert_eq!(task.summary.as_deref(), Some("verified"));
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_closes_orphan_turn_and_records_pause_reason() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "turn-before-restart",
+                RunTurnOrigin::User,
+                TurnVisibility::Visible,
+            )?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        store.account_run_turn_usage("r1", "turn-before-restart", "usage-1", 40, 2)?;
+
+        assert_eq!(store.recover_incomplete()?, 1);
+        let state = store
+            .get_run_state("r1")?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| StoreError::InvalidPlan("continuation missing".to_string()))?;
+        assert!(state.active_turn.is_none());
+        assert_eq!(state.tokens_used, 42);
+        assert_eq!(
+            state.last_turn.as_ref().map(|turn| turn.status),
+            Some(RunTurnStatus::Failed)
+        );
+        assert_eq!(
+            state
+                .last_turn
+                .as_ref()
+                .and_then(|turn| turn.error_fingerprint.as_deref()),
+            Some("process_interrupted")
+        );
+        assert_eq!(
+            state.pause.as_ref().map(|pause| pause.reason),
+            Some(RunPauseReason::BootRecovery)
+        );
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Paused
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_closes_orphan_cell_without_replaying_it() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.record_background_cell_started(
+            "r1",
+            "orphan-cell",
+            "cargo test --workspace",
+            "command-hash",
+            Some("turn-before-restart"),
+            None,
+            Some("call-before-restart"),
+        )?;
+
+        assert_eq!(store.recover_incomplete()?, 1);
+        let cells = store.list_background_cells("r1")?;
+        let cell = cells
+            .iter()
+            .find(|cell| cell.cell_id == "orphan-cell")
+            .ok_or_else(|| StoreError::InvalidPlan("orphan cell was not rebuilt".to_string()))?;
+        assert_eq!(cell.phase, "interrupted");
+        assert!(!cell.is_active());
+        let finished_count = store
+            .list_events("r1", 0)?
+            .iter()
+            .filter(|event| {
+                event.event_type == RuntimeEventKind::BackgroundCellFinished
+                    && event
+                        .payload
+                        .get("cell_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("orphan-cell")
+            })
+            .count();
+        assert_eq!(finished_count, 1);
+        assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
     }
 

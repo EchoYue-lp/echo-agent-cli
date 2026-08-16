@@ -231,6 +231,17 @@ pub struct TaskRuntimeView {
     pub run_id: String,
     pub goal: String,
     pub status: String,
+    pub continuation_enabled: bool,
+    pub turn_ordinal: Option<u64>,
+    pub tokens_used: u64,
+    pub token_budget: Option<u64>,
+    pub time_used_seconds: u64,
+    pub time_budget_seconds: Option<u64>,
+    pub compaction_count: u32,
+    pub pause_reason: Option<String>,
+    pub pause_detail: Option<String>,
+    pub deferred: bool,
+    pub active_cell_count: usize,
     pub tasks: Vec<TaskRuntimeTaskView>,
 }
 
@@ -359,6 +370,9 @@ pub struct TuiApp {
     pub selection_end: Option<(usize, usize)>,
     /// Pending approval request from the agent (TUI HITL provider).
     pub pending_approval: Option<echo_agent_app_core::hitl::PendingApprovalQueue>,
+    /// Session-owned HITL transport replayed onto continuation pool agents.
+    pub human_loop_provider:
+        Option<std::sync::Arc<echo_agent_app_core::hitl::TuiHumanLoopProvider>>,
     /// AgentPool for acquiring an isolated agent per background run (Phase B3).
     /// Set by `run_tui` at startup; `handle_enter` reads it to build
     /// `ChatResources` for `drive_chat`. `None` until set.
@@ -842,6 +856,7 @@ impl TuiApp {
             selection_start: None,
             selection_end: None,
             pending_approval: None,
+            human_loop_provider: None,
             pool: None,
             task_runtime_store: None,
             webhook_emitter: None,
@@ -1938,6 +1953,7 @@ pub async fn run_tui(
     tui_config: &echo_agent::config::TuiConfig,
     mode_display: &str,
     tui_pending: echo_agent_app_core::hitl::PendingApprovalQueue,
+    tui_provider: std::sync::Arc<echo_agent_app_core::hitl::TuiHumanLoopProvider>,
     pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
@@ -2002,6 +2018,7 @@ pub async fn run_tui(
         .await;
     app.max_display_chars = tui_config.max_display_chars;
     app.pending_approval = Some(tui_pending);
+    app.human_loop_provider = Some(tui_provider);
     app.pool = Some(pool);
     app.task_runtime_store = task_runtime_store;
     app.webhook_emitter = Some(webhook_emitter);

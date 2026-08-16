@@ -20,7 +20,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use tauri::Emitter;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 /// Event payload emitted to the frontend via `app.emit("chat://event", ...)`.
@@ -208,8 +208,8 @@ pub(crate) fn emit_tool_execution_summary(
 
 /// Global pending map for approval/input responses.
 #[allow(clippy::type_complexity)]
-static PENDING_RESPONSES: LazyLock<Arc<Mutex<HashMap<String, PendingRequest>>>> =
-    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+static PENDING_RESPONSES: LazyLock<Arc<StdMutex<HashMap<String, PendingRequest>>>> =
+    LazyLock::new(|| Arc::new(StdMutex::new(HashMap::new())));
 
 struct PendingRequest {
     message_key: String,
@@ -230,10 +230,46 @@ enum PendingResponse {
         selection: String,
         instructions: Option<String>,
     },
+    Cancelled {
+        reason: String,
+    },
+}
+
+/// Removes a pending GUI request synchronously if its provider future is
+/// dropped before a response or timeout consumes the entry.
+struct PendingResponseReservation {
+    pending: Arc<StdMutex<HashMap<String, PendingRequest>>>,
+    request_id: String,
+}
+
+impl PendingResponseReservation {
+    fn insert(
+        pending: Arc<StdMutex<HashMap<String, PendingRequest>>>,
+        request_id: String,
+        request: PendingRequest,
+    ) -> Self {
+        lock_std(&pending, "pending GUI HITL responses").insert(request_id.clone(), request);
+        Self {
+            pending,
+            request_id,
+        }
+    }
+}
+
+impl Drop for PendingResponseReservation {
+    fn drop(&mut self) {
+        let request =
+            lock_std(&self.pending, "pending GUI HITL responses").remove(&self.request_id);
+        if let Some(request) = request {
+            let _ = request.tx.send(PendingResponse::Cancelled {
+                reason: "HITL request owner was cancelled".to_string(),
+            });
+        }
+    }
 }
 
 pub(crate) async fn cancel_pending_hitl(message_key: Option<&str>, reason: &str) -> usize {
-    let mut pending = PENDING_RESPONSES.lock().await;
+    let mut pending = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses");
     let request_ids = pending
         .iter()
         .filter(|(_, request)| message_key.is_none_or(|key| request.message_key == key))
@@ -244,10 +280,8 @@ pub(crate) async fn cancel_pending_hitl(message_key: Option<&str>, reason: &str)
         let Some(request) = pending.remove(&request_id) else {
             continue;
         };
-        let _ = request.tx.send(PendingResponse::Approval {
-            approved: false,
-            reason: Some(reason.to_string()),
-            scope: None,
+        let _ = request.tx.send(PendingResponse::Cancelled {
+            reason: reason.to_string(),
         });
         cancelled = cancelled.saturating_add(1);
         tracing::debug!(%request_id, "cancelled pending HITL request");
@@ -257,15 +291,15 @@ pub(crate) async fn cancel_pending_hitl(message_key: Option<&str>, reason: &str)
 
 /// Tauri-based HumanLoopProvider — emits approval/input requests via Tauri events
 /// and awaits responses through the shared PENDING_RESPONSES map.
-struct TauriHumanLoopHandler {
+pub(crate) struct TauriHumanLoopHandler {
     app_handle: tauri::AppHandle,
-    pending: Arc<Mutex<HashMap<String, PendingRequest>>>,
+    pending: Arc<StdMutex<HashMap<String, PendingRequest>>>,
     conversation_id: Option<String>,
     message_key: String,
 }
 
 impl TauriHumanLoopHandler {
-    fn new(
+    pub(crate) fn new(
         app_handle: tauri::AppHandle,
         conversation_id: Option<String>,
         message_key: String,
@@ -309,7 +343,8 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         args,
                         prompt: req.prompt.clone(),
                     };
-                    pending.lock().await.insert(
+                    let _reservation = PendingResponseReservation::insert(
+                        pending.clone(),
                         request_id.clone(),
                         PendingRequest {
                             message_key: message_key.clone(),
@@ -343,11 +378,14 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                                         Ok(HumanLoopResponse::Rejected { reason })
                                     }
                                 }
+                                Ok(PendingResponse::Cancelled { reason }) => {
+                                    Ok(HumanLoopResponse::Rejected { reason: Some(reason) })
+                                }
                                 _ => Ok(HumanLoopResponse::Timeout),
                             }
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                    pending.lock().await.remove(&request_id);
+                            lock_std(&pending, "pending GUI HITL responses").remove(&request_id);
                             Ok(HumanLoopResponse::Timeout)
                         }
                     }
@@ -357,7 +395,8 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         request_id: request_id.clone(),
                         prompt: req.prompt.clone(),
                     };
-                    pending.lock().await.insert(
+                    let _reservation = PendingResponseReservation::insert(
+                        pending.clone(),
                         request_id.clone(),
                         PendingRequest {
                             message_key: message_key.clone(),
@@ -378,11 +417,14 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         response = rx_response => {
                             match response {
                                 Ok(PendingResponse::Input { text }) => Ok(HumanLoopResponse::Text(text)),
+                                Ok(PendingResponse::Cancelled { reason }) => {
+                                    Ok(HumanLoopResponse::Rejected { reason: Some(reason) })
+                                }
                                 _ => Ok(HumanLoopResponse::Text(String::new())),
                             }
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                            pending.lock().await.remove(&request_id);
+                            lock_std(&pending, "pending GUI HITL responses").remove(&request_id);
                             Ok(HumanLoopResponse::Text(String::new()))
                         }
                     }
@@ -396,7 +438,8 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         context: req.context.clone(),
                         phase: req.phase.clone(),
                     };
-                    pending.lock().await.insert(
+                    let _reservation = PendingResponseReservation::insert(
+                        pending.clone(),
                         request_id.clone(),
                         PendingRequest {
                             message_key: message_key.clone(),
@@ -419,11 +462,14 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                                 Ok(PendingResponse::Selection { selection, instructions }) => {
                                     Ok(HumanLoopResponse::Selection { selection, instructions })
                                 }
+                                Ok(PendingResponse::Cancelled { reason }) => {
+                                    Ok(HumanLoopResponse::Rejected { reason: Some(reason) })
+                                }
                                 _ => Ok(HumanLoopResponse::Timeout),
                             }
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                            pending.lock().await.remove(&request_id);
+                            lock_std(&pending, "pending GUI HITL responses").remove(&request_id);
                             Ok(HumanLoopResponse::Timeout)
                         }
                     }
@@ -491,6 +537,7 @@ pub async fn send_chat_message(
     if let Some(ref conv_id) = conversation_id
         && let Some(store) = state.app_state.tasks.runtime.as_ref()
         && let Ok(Some(existing)) = store.find_in_progress_run_by_conversation(conv_id)
+        && existing.status == echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Running
     {
         emit_chat_event(
             &app,
@@ -599,20 +646,13 @@ pub async fn send_chat_message(
     // (normal reply AND any complex runs the agent autonomously spins up via
     // create_complex_task) through the single shared `drive_chat` entry. The
     // agent decides complexity itself (Phase B3) — no code route pre-judgment.
-    let execution_projector = Arc::new(TauriExecutionProjector::new(
+    let sink = tauri_chat_sink(
         app.clone(),
+        message_key.clone(),
+        conversation_id.clone(),
         state.app_state.storage.tool_executions.clone(),
         state.app_state.tasks.runtime.clone(),
-    ));
-    let sink = std::sync::Arc::new(TauriChatSink {
-        app: app.clone(),
-        message_key: message_key.clone(),
-        conversation_id: conversation_id.clone(),
-        tool_executions: state.app_state.storage.tool_executions.clone(),
-        tool_completions: StdMutex::new(HashMap::new()),
-        active_tool_ids: StdMutex::new(HashSet::new()),
-        execution_projector,
-    });
+    );
     // Signal the chat-turn lifecycle so the GUI shows the spinner / terminal
     // badge. Ordinary chat turns are not TaskRuntime runs.
     let _ = sink.on_event(ChatDriverEvent::TurnStatus {
@@ -664,6 +704,7 @@ pub async fn send_chat_message(
         review_integration: state.app_state.review_integration.clone(),
         layer_manager: None,
         memory_generation: None,
+        human_loop_provider: Some(hitl_handler),
     });
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -871,7 +912,7 @@ pub async fn send_approval_response(
     reason: Option<String>,
     scope: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let req = PENDING_RESPONSES.lock().await.remove(&request_id);
+    let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
     if let Some(req) = req {
         let _ = req.tx.send(PendingResponse::Approval {
             approved,
@@ -893,7 +934,7 @@ pub async fn send_input_response(
     request_id: String,
     text: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let req = PENDING_RESPONSES.lock().await.remove(&request_id);
+    let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
     if let Some(req) = req {
         let _ = req.tx.send(PendingResponse::Input { text });
         Ok(serde_json::json!({"success": true}))
@@ -912,7 +953,7 @@ pub async fn send_selection_response(
     selection: String,
     instructions: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let req = PENDING_RESPONSES.lock().await.remove(&request_id);
+    let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
     if let Some(req) = req {
         let _ = req.tx.send(PendingResponse::Selection {
             selection,
@@ -1190,6 +1231,29 @@ struct TauriChatSink {
     tool_completions: StdMutex<HashMap<String, PendingToolCompletion>>,
     active_tool_ids: StdMutex<HashSet<String>>,
     execution_projector: Arc<TauriExecutionProjector>,
+}
+
+pub(crate) fn tauri_chat_sink(
+    app: tauri::AppHandle,
+    message_key: String,
+    conversation_id: Option<String>,
+    tool_executions: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
+    runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+) -> Arc<dyn ChatSink> {
+    let execution_projector = Arc::new(TauriExecutionProjector::new(
+        app.clone(),
+        tool_executions.clone(),
+        runtime_store,
+    ));
+    Arc::new(TauriChatSink {
+        app,
+        message_key,
+        conversation_id,
+        tool_executions,
+        tool_completions: StdMutex::new(HashMap::new()),
+        active_tool_ids: StdMutex::new(HashSet::new()),
+        execution_projector,
+    })
 }
 
 #[derive(Default)]
@@ -1607,6 +1671,65 @@ fn agent_event_to_chat_event(
             code: "unknown_agent_event".to_string(),
             message: format!("{other:?}"),
         },
+    }
+}
+
+#[cfg(test)]
+mod hitl_pending_tests {
+    use super::*;
+
+    #[test]
+    fn dropping_reservation_removes_pending_request_and_cancels_sender()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let pending = Arc::new(StdMutex::new(HashMap::new()));
+        let (sender, mut receiver) = oneshot::channel();
+        let reservation = PendingResponseReservation::insert(
+            pending.clone(),
+            "request-1".to_string(),
+            PendingRequest {
+                message_key: "root-message".to_string(),
+                tx: sender,
+            },
+        );
+        assert_eq!(
+            lock_std(&pending, "test pending GUI HITL responses").len(),
+            1
+        );
+
+        drop(reservation);
+
+        assert!(lock_std(&pending, "test pending GUI HITL responses").is_empty());
+        assert!(matches!(
+            receiver.try_recv()?,
+            PendingResponse::Cancelled { reason }
+                if reason == "HITL request owner was cancelled"
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_cancellation_rejects_matching_pending_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request_id = Uuid::new_v4().to_string();
+        let message_key = format!("root-{}", Uuid::new_v4());
+        let (sender, receiver) = oneshot::channel();
+        lock_std(&PENDING_RESPONSES, "test pending GUI HITL responses").insert(
+            request_id,
+            PendingRequest {
+                message_key: message_key.clone(),
+                tx: sender,
+            },
+        );
+
+        assert_eq!(
+            cancel_pending_hitl(Some(&message_key), "task run paused").await,
+            1
+        );
+        assert!(matches!(
+            receiver.await?,
+            PendingResponse::Cancelled { reason } if reason == "task run paused"
+        ));
+        Ok(())
     }
 }
 
