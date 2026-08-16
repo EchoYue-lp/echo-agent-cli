@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-08-15
+Last updated: 2026-08-16
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -77,9 +77,35 @@ evidence, and the next bounded step.
 | Provider default protocol convergence | Complete | Framework `ProviderMetadata.default_api_protocol` is the sole built-in authority; EKO preserves explicit overrides, infers custom complete endpoints, keeps a non-persistent session selection for every future pooled agent, and projects the provider wire contract through generated ts-rs DTOs without a second provider mapping. |
 | Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
 | Background command cells + awaiter role (Phase C1-C4) | Complete | Design: `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11 (C track). Framework commits `58e6733`, `7f66ff5`: one `CommandCellRegistry`, sandbox-preserving launch, durable output artifacts, retry-safe multi-waiter cursors, explicit owner cancellation, and UTF-8-safe bounded output. Application commit `5cf49c2`: process-wide registry, low-thinking `awaiter`, `watch_cell`, TaskRuntime start/finish events, recovery-capsule projection, active-cell completion blocker, explicit-cancel propagation, and boot recovery that closes orphaned cells without replaying external commands. Pause keeps cells alive; only explicit run cancellation stops them. |
-| Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; Phase 6 pending | One app-layer `TaskContinuationRuntime` now owns idle continuation without a second graph/executor/store. Finite RunTurns use event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, stable surface HITL replay, and GUI/TUI/CLI/channel controls. Continuation agents have an independent bounded capacity domain. Concurrency/shutdown regressions cover claim loser, pool admission/configuration cancellation, pending wake, pause/resume settlement, channel HITL retention, and `BootRecovery`. Remaining work is explicitly limited to safe cold-start auto-resume after a new surface launcher exists, requirement-to-evidence completion audit, 1k/10k performance thresholds, and real multi-hour kill/sleep/provider-failure evals. See `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §0. |
+| Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; superseded follow-up planned as M0-M5 | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns already have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, stable surface HITL replay, and cross-surface controls. Remaining correctness, Goal lifecycle, Subagent control, recovery, evidence, and performance work is now governed by `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; do not enable cold-start auto-resume before M1 closes. |
+| Long-horizon runtime M0-M5 implementation | R0 complete; framework M1a in progress | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; the exact Runtime Goal was explicitly created on 2026-08-16 and is active. Logical gates are R0 -> M0 -> M1 -> M2 -> M3 -> M4 -> M5, while dependency delivery is framework M1/M2 primitives -> application M0/M1-M4 -> M5. |
 
 ## Current Decisions
+
+### Long-horizon runtime M0-M5
+
+The governing implementation plan is
+`docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`. `TaskRun.goal`
+is the sole Goal authority; Plan revisions bind its revision and hash and do not
+persist a second Goal. The existing revisioned `task_create/task_update/task_list`
+graph, framework DAG validator, app-layer continuation runtime, file event store,
+completion blocker path, and `TurnSteerMailbox` remain authoritative. Do not add
+parallel Goal/Plan tools, a second mailbox, another completion evaluator, or
+SQLite.
+
+Logical product gates are `R0 -> M0 -> M1 -> M2 -> M3 -> M4 -> M5`. Repository
+delivery follows dependencies: land generic CommandCell and Subagent control
+primitives in `echo-agent`, then application Goal/correctness/control/recovery/
+evidence policy in `echo-agent-cli`, then checkpoint, performance, fault, and
+soak work. Framework prerequisite commits do not close product M1/M2 early. M1
+must be completely green before cold-start auto-resume can be enabled.
+
+R0 has persisted the plan and this cross-session record. After the planning
+turn, the user explicitly instructed implementation, and the exact Codex
+Runtime Goal was created on 2026-08-16. Every resumed session must verify that
+Goal, read the implementation plan, this file, both repositories' status, and
+recent logs before continuing, then update the milestone ledger with commits,
+commands, failures, and remaining work.
 
 ### Plugin and Hook production closure
 
@@ -589,6 +615,19 @@ the sole TaskRuntime/Memory/pool generation authority; TUI does not snapshot a
 legacy layer manager or add a framework lifecycle API.
 
 ## Next Step
+
+The Codex Runtime Goal is active with this exact objective:
+
+```text
+完整实现 EKO 长程任务运行时 M0-M5，包括 Goal 生命周期、正确性、
+Subagent 控制、恢复、完成证据和性能评测。
+```
+
+R0 is complete. Framework M1a is the active slice: CommandCell deadline must
+cover semaphore admission, invalid zero concurrency must be rejected, and
+terminal/artifact outcomes must be typed. Continue through framework M1b and M2
+before application M0. Do not enable `auto_resume_after_restart` until the entire
+M1 product gate, including application race and budget fixes, is green.
 
 Tool context optimization Phase 0-6 is closed in
 `docs/2026-07-29-tool-schema-budget-and-artifacts.md`. Operational follow-up is
