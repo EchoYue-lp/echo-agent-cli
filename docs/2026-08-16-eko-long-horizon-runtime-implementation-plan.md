@@ -1,7 +1,7 @@
 # EKO 长程任务运行时 M0-M5 实施计划
 
 > 日期：2026-08-16  
-> 状态：R0 Complete；Codex Runtime Goal 已于 2026-08-16 显式创建并处于 active  
+> 状态：R0 Complete；framework M1 complete；framework M2 in progress；Codex Runtime Goal active
 > 设计基线：[`2026-08-14-eko-long-horizon-task-runtime-design.md`](./2026-08-14-eko-long-horizon-task-runtime-design.md)  
 > 跨会话状态：[`MASTER-PLAN.md`](./MASTER-PLAN.md)
 
@@ -562,10 +562,10 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 
 | 阶段 | 状态 | 提交 | 已执行测试 | 失败/剩余 |
 |---|---|---|---|---|
-| R0 | Complete | `docs(runtime): plan M0-M5 implementation` | `git diff --check`; local-link `stat`; code-fence parity; forbidden-term scan：通过 | Runtime Goal 已显式创建；下一步 framework M1a |
+| R0 | Complete | app `62168ba` | `git diff --check`; local-link `stat`; code-fence parity; forbidden-term scan：通过 | Runtime Goal 已显式创建；研发控制门持续生效 |
 | M0 | Pending | - | - | 等待 framework M1/M2 原语提交后进入应用实现 |
-| M1 | Pending | - | - | framework slice 先行；产品 gate 必须在 M0 后关闭 |
-| M2 | Pending | - | - | 复用 `TurnSteerMailbox`，禁止第二 mailbox |
+| M1 | In progress | framework `cd4fccf` | CommandCell 定向 30 项；workspace all-features test；两组 clippy；fmt；no-default；11 个逐 feature check：全绿 | framework M1a/M1b 已合并交付；应用 wake race、exact TUI binding、usage budget、durable budget lowering 仍待 M0 后完成 |
+| M2 | In progress | - | - | 当前切片：attempt-scoped Subagent control registry；复用 `TurnSteerMailbox`，禁止第二 mailbox |
 | M3 | Pending | - | - | M1 完成前禁止 cold-start auto-resume |
 | M4 | Pending | - | - | 收归现有 completion blockers，不建第二完成门 |
 | M5 | Pending | - | - | seq 已存在；checkpoint 仅为可重建缓存 |
