@@ -77,8 +77,8 @@ evidence, and the next bounded step.
 | Provider default protocol convergence | Complete | Framework `ProviderMetadata.default_api_protocol` is the sole built-in authority; EKO preserves explicit overrides, infers custom complete endpoints, keeps a non-persistent session selection for every future pooled agent, and projects the provider wire contract through generated ts-rs DTOs without a second provider mapping. |
 | Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
 | Background command cells + awaiter role (Phase C1-C4) | Complete | Design: `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11 (C track). Framework commits `58e6733`, `7f66ff5`: one `CommandCellRegistry`, sandbox-preserving launch, durable output artifacts, retry-safe multi-waiter cursors, explicit owner cancellation, and UTF-8-safe bounded output. Application commit `5cf49c2`: process-wide registry, low-thinking `awaiter`, `watch_cell`, TaskRuntime start/finish events, recovery-capsule projection, active-cell completion blocker, explicit-cancel propagation, and boot recovery that closes orphaned cells without replaying external commands. Pause keeps cells alive; only explicit run cancellation stops them. |
-| Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; superseded follow-up planned as M0-M5 | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns already have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, stable surface HITL replay, and cross-surface controls. Remaining Goal control, recovery, evidence, and performance work is governed by `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; M1 is complete, but cold-start auto-resume remains disabled until M3 safe admission closes. |
-| Long-horizon runtime M0-M5 implementation | R0/M0/M1 complete; application M2 next; framework M2 complete | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal active. App `de09946` makes `TaskRun.goal` the revision/hash-bound authority. Framework `cd4fccf` and app `9d59a0b` close M1: CommandCell lifecycle correctness, atomic cell/deferred wakeup, exact TUI Resume binding, durable aggregate Subagent usage, and atomic budget pause. Framework `6d7d0cf` provides exact-attempt Subagent controls through `TurnSteerMailbox`; application persistence, hierarchy, idempotency, and surface parity are the next slice. |
+| Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; superseded follow-up planned as M0-M5 | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns already have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, stable surface HITL replay, and cross-surface controls. Remaining recovery, evidence, and performance work is governed by `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; M1/M2 are complete, but cold-start auto-resume remains disabled until M3 safe admission closes. |
+| Long-horizon runtime M0-M5 implementation | R0/M0/M1/M2 complete; application M3 next | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal active. App `de09946` makes `TaskRun.goal` the revision/hash-bound authority. Framework `cd4fccf` and app `9d59a0b` close M1. Framework `6d7d0cf` plus app `f4771f3` close M2 with exact-attempt controls through the existing `TurnSteerMailbox`, durable command identity/results, stale-attempt rejection, preserved control hierarchy, and GUI/TUI/CLI/channel parity. M3 must add persistent provider retry and safe boot admission before auto-resume is enabled. |
 
 ## Current Decisions
 
@@ -623,14 +623,15 @@ The Codex Runtime Goal is active with this exact objective:
 Subagent 控制、恢复、完成证据和性能评测。
 ```
 
-R0/M0/M1 and framework M2 are complete. Application `de09946`/`9d59a0b` and
+R0/M0/M1/M2 are complete. Application `de09946`/`9d59a0b`/`f4771f3` and
 framework `cd4fccf`/`6d7d0cf` passed their full workspace, no-default, lint, and
-applicable feature/GUI/frontend gates. The active slice is application M2:
-persist exact-attempt Subagent message/guidance/interrupt commands with stable
-command ids, reject stale plan/attempt identities, preserve the Pause/Cancel/
-Shutdown hierarchy, and expose the same service through GUI/TUI/CLI/channel.
-M1's prerequisite is now green; cold-start auto-resume remains disabled until
-M3 proves safe restart admission.
+applicable feature/GUI/frontend gates. The active slice is application M3:
+persist provider/network retry attempts, deadlines and fingerprints; pause as
+`ProviderUnavailable` when a durable budget is exhausted; reconstruct launcher
+and HITL ownership before boot auto-resume; preserve blockers for unsafe tool or
+Subagent boundaries; and keep interrupted command cells non-replayable. M1's
+prerequisite is green, but cold-start auto-resume remains disabled until this
+safe restart admission is implemented and tested.
 
 Tool context optimization Phase 0-6 is closed in
 `docs/2026-07-29-tool-schema-budget-and-artifacts.md`. Operational follow-up is

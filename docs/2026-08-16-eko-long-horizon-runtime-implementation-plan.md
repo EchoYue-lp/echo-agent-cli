@@ -565,7 +565,7 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | R0 | Complete | app `62168ba` | `git diff --check`; local-link `stat`; code-fence parity; forbidden-term scan：通过 | Runtime Goal 已显式创建；研发控制门持续生效 |
 | M0 | Complete | app `de09946` | Goal/CAS/quiescence/rebind 定向测试；workspace fmt、两组 clippy、all-features test、no-default；GUI check/test；frontend Prettier/test/build；浏览器 desktop/390px：全绿 | 已切换唯一 Goal 权威和四 surface 主路径；后续 M1 已完成 |
 | M1 | Complete | framework `cd4fccf`；app `9d59a0b` | Framework CommandCell 定向 30 项、完整门禁与 11 个逐 feature check；application 聚焦竞态/预算/TUI 测试、fmt、两组 clippy、workspace all-features test、no-default：全绿 | Framework 与 application 主路径均已切换；cold-start auto-resume 的 M1 前置门已关闭，但功能仍须在 M3 安全 admission 完成后才启用 |
-| M2 | In progress | framework `6d7d0cf` | Subagent 定向 122 项及 control/executor 7 项；`cargo fmt --all -- --check`；两组 workspace all-features clippy；workspace all-targets/all-features test；no-default；`sqlite/subagent/human-loop/mcp/lsp/a2a/git/database/rag/chart/web/media` 独立 feature check：全绿 | framework exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox` 交付；首次 all-targets/subagent clippy 暴露 `demo07/demo09/demo44/demo45/demo49` 缺失 `required-features`，已补齐并重验。应用持久命令、控制层级、幂等与 surface parity 仍待 M0/M1 后完成 |
+| M2 | Complete | framework `6d7d0cf`；app `f4771f3` | Framework Subagent 定向 122 项及 control/executor 7 项、完整门禁与 11 个逐 feature check；application exact control 5 项、层级回归、完整 Rust/GUI/frontend 门禁：全绿 | exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox`；应用 `events.jsonl` 持久 command identity/result，四 surface 共用同一 service。M3 前不得绕过安全 admission 开启 cold-start auto-resume |
 | M3 | Pending | - | - | M1 前置门已关闭；仅在本阶段安全 admission 全绿后启用 cold-start auto-resume |
 | M4 | Pending | - | - | 收归现有 completion blockers，不建第二完成门 |
 | M5 | Pending | - | - | seq 已存在；checkpoint 仅为可重建缓存 |
@@ -662,6 +662,47 @@ guidance 和 interrupt 接入 TaskRuntime 持久事件、幂等 command identity
 `SubagentInterruptRequested/Settled` 事件，也没有 EKO durable Subagent control service；可新增
 这些应用概念。框架 API、主 Turn steer、run pause/cancel、Task DAG 与 plan validator 均已存在，
 必须复用，禁止平行实现。
+
+### 15.6 M2 完成记录
+
+Framework `6d7d0cf` 的 attempt registry、`TurnSteerMailbox` safe-point 注入与 exact interrupt
+保持唯一实时控制权威。Application `f4771f3` 新增共享 `SubagentControlService`，在
+`events.jsonl` 中先持久化完整的 `run_id`、`task_id`、`execution_id`、`plan_revision`、
+`attempt` 和 `command_id`，再调用 framework executor；重复 command 幂等返回既有结果，迟到或身份不匹配
+的 message/interrupt 持久化 typed rejection，不能命中新 attempt。future guidance 精确绑定
+下一 attempt，只在 dispatcher admission 前转交一次。执行器 adapter 仅注册进程内 exact route
+并切换到 attempt-scoped delegation API，不拥有第二套 mailbox、scheduler、retry loop 或 DAG。
+
+控制层级保持原有权威：RunTurn steer 继续走 foreground owner；Subagent message/interrupt 只影响
+目标 attempt；Pause 保留 completed facts；Cancel 继续停止 run-owned command cells；Shutdown 继续
+持久化 `Paused/BootRecovery`。GUI、TUI、CLI 和 channel 均调用同一 app-core service；GUI 的
+Subagent detail 使用带 tooltip 的 message/follow-up/interrupt 图标，并从 durable projection
+取得 plan revision 与 attempt。
+
+提交：framework `6d7d0cf`；application `f4771f3`。
+
+Application 最终验证命令：
+
+- `cargo fmt --all` 与 `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- `cargo clippy --workspace --lib --bins --all-features --locked -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable`
+- `cargo test --workspace --all-features --locked`：app-core 891 passed、2 ignored；runtime
+  e2e 5 passed；CLI/TUI/Tauri library 141 passed；CLI main 10 passed；零失败
+- `cargo check -p echo-agent-app-core --no-default-features --locked`
+- `cargo check --no-default-features --features gui --bin echo-agent-tauri`
+- `cargo test --no-default-features --features gui`：90 passed；零失败
+- 聚焦回归：exact control 5 项、BootRecovery 保留完成事实、Pause 可恢复、Cancel 停止
+  run-owned cell、CLI/TUI exact identity parser：全绿
+- `npx prettier --check "src/**/*.{ts,tsx}"`
+- `npm test`：32 files、145 tests passed
+- `npm run build`：2143 modules transformed
+
+失败与修复：首次 strict gate 的 clippy 在创建 `target/debug/deps` 临时文件时，发现共享
+`target` 被外部并发清理而失败；确认无 Cargo 进程和源代码变化后，从空缓存重跑两组 clippy、
+workspace test、no-default 和 GUI 矩阵并全部通过。ts-rs 全量测试重写的生成文件格式已用项目
+Prettier 恢复并重验，仅保留新增类型与语义字段。验证后磁盘可用空间一度低于 50 GiB；共享
+环境随后清理 app target，可用空间恢复到约 72 GiB。下一切片为 application M3；安全 restart
+admission 完成前 `auto_resume_after_restart` 继续保持禁用。
 
 ## 16. 最终验收
 
