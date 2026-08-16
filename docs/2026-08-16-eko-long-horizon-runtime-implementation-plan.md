@@ -1,7 +1,7 @@
 # EKO 长程任务运行时 M0-M5 实施计划
 
 > 日期：2026-08-16  
-> 状态：R0 Complete；framework M1/M2 complete；application M0 in progress；Codex Runtime Goal active
+> 状态：R0/M0 Complete；framework M1/M2 complete；application M1 in progress；Codex Runtime Goal active
 > 设计基线：[`2026-08-14-eko-long-horizon-task-runtime-design.md`](./2026-08-14-eko-long-horizon-task-runtime-design.md)  
 > 跨会话状态：[`MASTER-PLAN.md`](./MASTER-PLAN.md)
 
@@ -563,7 +563,7 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | 阶段 | 状态 | 提交 | 已执行测试 | 失败/剩余 |
 |---|---|---|---|---|
 | R0 | Complete | app `62168ba` | `git diff --check`; local-link `stat`; code-fence parity; forbidden-term scan：通过 | Runtime Goal 已显式创建；研发控制门持续生效 |
-| M0 | In progress | - | - | 当前切片：TaskRun Goal revision/hash/event/update service；随后删除 Plan Goal 副本并完成 binding/surface parity |
+| M0 | Complete | app `de09946` | Goal/CAS/quiescence/rebind 定向测试；workspace fmt、两组 clippy、all-features test、no-default；GUI check/test；frontend Prettier/test/build；浏览器 desktop/390px：全绿 | 已切换唯一 Goal 权威和四 surface 主路径；M1 应用正确性为下一切片 |
 | M1 | In progress | framework `cd4fccf` | CommandCell 定向 30 项；workspace all-features test；两组 clippy；fmt；no-default；11 个逐 feature check：全绿 | framework M1a/M1b 已合并交付；应用 wake race、exact TUI binding、usage budget、durable budget lowering 仍待 M0 后完成 |
 | M2 | In progress | framework `6d7d0cf` | Subagent 定向 122 项及 control/executor 7 项；`cargo fmt --all -- --check`；两组 workspace all-features clippy；workspace all-targets/all-features test；no-default；`sqlite/subagent/human-loop/mcp/lsp/a2a/git/database/rag/chart/web/media` 独立 feature check：全绿 | framework exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox` 交付；首次 all-targets/subagent clippy 暴露 `demo07/demo09/demo44/demo45/demo49` 缺失 `required-features`，已补齐并重验。应用持久命令、控制层级、幂等与 surface parity 仍待 M0/M1 后完成 |
 | M3 | Pending | - | - | M1 完成前禁止 cold-start auto-resume |
@@ -572,6 +572,40 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 
 每次自动续跑或重启后仍须核对 Runtime Goal、本文、`MASTER-PLAN`、两个仓库状态和
 最近提交，再从第一个未完成阶段继续。
+
+### 15.1 M0 完成记录
+
+权威路径已切换到 `TaskRun.goal + goal_revision + goal_sha256`。`RunGoalUpdated` 是唯一
+修改事件，`update_run_goal` 在 per-run lock 下要求显式本地用户来源、精确 CAS、
+`Paused`、无 live driver/RunTurn/Subagent/cell，并原子保持 continuation deferred。
+`TaskPlan`/`PlanRevision` 不再持久 Goal 正文，只保存当前 Goal revision/hash；旧 binding
+不能 Resume，必须通过既有 `task_update(base_revision)` 提交新 Plan revision。GUI、TUI、
+CLI、channel 都调用同一 app-core service，模型没有 Goal 修改工具。
+
+提交：application `de09946`。框架无 M0 改动。
+
+最终验证命令：
+
+- `cargo fmt --all` 与 `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- `cargo clippy --workspace --lib --bins --all-features --locked -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable`
+- `cargo test --workspace --all-features --locked`：app-core 878 passed、2 ignored；runtime e2e 5 passed；CLI/TUI/Tauri 148 passed；零失败
+- `cargo check -p echo-agent-app-core --no-default-features --locked`
+- `cargo check --no-default-features --features gui --bin echo-agent-tauri`
+- `cargo test --no-default-features --features gui`：88 passed；零失败
+- `npx prettier --check "src/**/*.{ts,tsx}"`
+- `npm test`：32 files、143 tests passed
+- `npm run build`
+- in-app browser：desktop 与 390x844 工作区空态无重叠；无 Rust backend 的 Vite QA
+  只能显示 runtime 空态，Paused Goal 表单行为由 store/component contract 测试覆盖
+
+失败与修复：首次 app-core 全量测试发现 3 个旧 fixture 在 Resume 前未创建 Plan，已补
+最小 Goal-bound Plan；首次前端 build 发现 3 个 fixture 缺少新增字段，已补齐；首次
+Prettier check 发现 3 个本次文件格式不一致，已格式化并重验。提交前语义复核发现
+`Paused` 已持久但 live driver 未 settle 的短窗口，补充拒绝条件及确定性测试后重新跑完
+全部适用门禁。剩余事项从 application M1 开始：continuation wake race、exact TUI
+Resume、Subagent usage 总预算与动态降预算 durable pause；M1 关闭前仍禁止 cold-start
+auto-resume。
 
 ## 16. 最终验收
 
