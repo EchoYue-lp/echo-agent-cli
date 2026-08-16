@@ -640,8 +640,6 @@ pub async fn send_chat_message(
         .interaction_mode
         .load(std::sync::atomic::Ordering::Relaxed);
     let interaction_mode = InteractionMode::from_u8(raw);
-    let mode_hint = Some(interaction_mode.prompt_hint().to_string());
-
     // Build the GUI sink + per-turn resources, then drive the whole turn
     // (normal reply AND any complex runs the agent autonomously spins up via
     // create_complex_task) through the single shared `drive_chat` entry. The
@@ -660,17 +658,15 @@ pub async fn send_chat_message(
     });
 
     let agent_handle_clone = agent_handle.clone();
-    // Build the prepared turn (instruction + input resources, mode hint folded
-    // in, long pastes spilled to user-input artifacts). Replaces the old
+    // Build the prepared turn (instruction + input resources, with long pastes
+    // spilled to user-input artifacts). Replaces the old
     // (message, multimodal_message) pair handed to drive_chat.
-    let mode_hint_for_turn = interaction_mode.prompt_hint().to_string();
     let spill_dir =
         echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(ws_root.as_deref());
     let prepared_turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &message,
             attachments: &attachment_refs,
-            mode_hint: Some(&mode_hint_for_turn),
             spill_dir: &spill_dir,
             conversation_id: conversation_id.as_deref(),
             turn_id: Some(&message_key),
@@ -699,7 +695,6 @@ pub async fn send_chat_message(
         root_message_id: message_key.clone(),
         attachments: prepared_turn.inline_attachment_refs(),
         cancel: cancel_token.clone(),
-        mode_hint,
         interaction_mode,
         review_integration: state.app_state.review_integration.clone(),
         layer_manager: None,
@@ -791,7 +786,6 @@ pub async fn steer_chat_message(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &message,
             attachments: &attachment_refs,
-            mode_hint: None,
             spill_dir: &spill_dir,
             conversation_id: Some(&conversation_id),
             turn_id: Some(&expected_turn_id),

@@ -79,7 +79,6 @@ impl TaskContinuationRuntime {
             root_message_id: String::new(),
             attachments: resources.attachments.clone(),
             cancel: CancellationToken::new(),
-            mode_hint: Some(InteractionMode::Task.prompt_hint().to_string()),
             interaction_mode: InteractionMode::Task,
             review_integration: resources.review_integration.clone(),
             layer_manager: None,
@@ -191,19 +190,15 @@ impl TaskContinuationRuntime {
                 root_message_id: turn_id,
                 attachments: launcher.resources.attachments.clone(),
                 cancel: CancellationToken::new(),
-                mode_hint: launcher.resources.mode_hint.clone(),
                 interaction_mode: InteractionMode::Task,
                 review_integration: launcher.resources.review_integration.clone(),
                 layer_manager: None,
                 memory_generation: None,
                 human_loop_provider: launcher.resources.human_loop_provider.clone(),
             });
-            let turn = PreparedUserTurn {
-                instruction: format!(
-                    "Continue the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection, execute the next useful work, and use task_execute for the current revision when ready. This is internal continuation context, not a new user request."
-                ),
-                resources: Vec::new(),
-            };
+            let turn = PreparedUserTurn::runtime_instruction(format!(
+                "Continue the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection, execute the next useful work, and use task_execute for the current revision when ready. This is internal continuation context, not a new user request."
+            ));
             let human_loop_provider = resources.human_loop_provider.clone();
             let result = if let Some(pool) = resources.pool.clone() {
                 crate::chat_driver::drive_pooled_chat_turn(

@@ -45,6 +45,7 @@ mod surface_contract;
 pub mod tasks;
 pub mod tool_execution;
 pub(crate) mod tool_exposure;
+pub mod turn_context;
 pub mod types;
 pub mod unified_memory;
 pub mod utils;

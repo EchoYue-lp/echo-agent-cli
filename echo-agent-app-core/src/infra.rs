@@ -605,8 +605,9 @@ pub async fn create_agent_with_diagnostics(
     refresh_dynamic_context(&mut agent, subagent_project_root.as_deref()).await;
     configure_run_code_capability(&mut agent, run_code_available);
     agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
-        crate::tasks::task_runtime::compact_context::TaskRuntimeContextProjector::new(
+        crate::turn_context::EkoContextProjector::new(
             crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+            crate::turn_context::turn_prompt_context_registry(),
         ),
     )));
     let cache_user_id = load_or_create_cache_user_id();

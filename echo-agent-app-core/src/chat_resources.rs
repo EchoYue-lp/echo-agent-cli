@@ -36,11 +36,6 @@ pub struct ChatResources {
     /// The chat turn's cancel token. Foreground runs may share it; background
     /// runs MUST use an independent token (spec §5.5) — never this one.
     pub cancel: CancellationToken,
-    /// Per-turn mode hint prepended to the user message by `drive_chat`
-    /// (spec §8 / B4.3): e.g. Chat → "do NOT call create_complex_task, reply
-    /// directly"; Task → "lean towards create_complex_task for complex work".
-    /// None (Auto) adds nothing. Pure prompt — NO code route branch.
-    pub mode_hint: Option<String>,
     /// The interaction mode for this turn (Chat/Task/Auto). All modes retain
     /// the canonical task graph API; mode-specific policy controls other
     /// delegation tools and prompt guidance. Default is `Auto`.

@@ -975,7 +975,6 @@ where
         root_message_id: resources.root_message_id.clone(),
         attachments: resources.attachments.clone(),
         cancel,
-        mode_hint: resources.mode_hint.clone(),
         interaction_mode: resources.interaction_mode,
         review_integration: resources.review_integration.clone(),
         layer_manager: resources.layer_manager.clone(),

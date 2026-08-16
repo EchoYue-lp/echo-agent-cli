@@ -125,7 +125,6 @@ struct PreparedReplTurnStart {
     turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
     control: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
     lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
-    mode_hint: String,
 }
 
 struct ActiveReplTurn {
@@ -1772,7 +1771,6 @@ async fn route_active_input(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &input.message,
             attachments: &input.attachments,
-            mode_hint: None,
             spill_dir: &spill_dir,
             conversation_id: Some(&active.conversation_id),
             turn_id: Some(&active.turn_id),
@@ -1906,17 +1904,17 @@ async fn prepare_repl_turn_start(
     };
     let spill_dir =
         echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(workspace_root.as_deref());
-    let mode_hint = input.interaction_mode.prompt_hint().to_string();
+    let runtime_authored = input.task_run_resume.is_some();
     let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &input.message,
             attachments: &input.attachments,
-            mode_hint: Some(&mode_hint),
             spill_dir: &spill_dir,
             conversation_id: Some(&conversation_id),
             turn_id: Some(&turn_id),
         },
     ) {
+        Ok(turn) if runtime_authored => turn.runtime_authored(),
         Ok(turn) => turn,
         Err(error) => {
             let detail = format!("Failed to prepare user turn: {error}");
@@ -1932,7 +1930,6 @@ async fn prepare_repl_turn_start(
         turn,
         control,
         lease,
-        mode_hint,
     })
 }
 
@@ -1950,7 +1947,6 @@ fn spawn_prepared_repl_turn(
         turn,
         control,
         lease,
-        mode_hint,
     } = prepared;
     let cancel = lease.cancellation_token();
     let renderer = Arc::new(ReplChatSink::new(live_output.clone(), output.config()));
@@ -1965,7 +1961,6 @@ fn spawn_prepared_repl_turn(
         root_message_id: turn_id.clone(),
         attachments: turn.inline_attachment_refs(),
         cancel,
-        mode_hint: Some(mode_hint),
         interaction_mode: input.interaction_mode,
         review_integration: config.review_integration.clone(),
         layer_manager: None,
@@ -2339,7 +2334,6 @@ mod tests {
             echo_agent_app_core::prepared_turn::UserTurnInput {
                 text: &input.message,
                 attachments: &input.attachments,
-                mode_hint: None,
                 spill_dir: &artifacts,
                 conversation_id: Some("conversation"),
                 turn_id: Some("turn"),
@@ -2803,7 +2797,6 @@ mod tests {
             root_message_id: "closed-printer-turn".to_string(),
             attachments: Vec::new(),
             cancel: cancel.clone(),
-            mode_hint: None,
             interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             review_integration: None,
             layer_manager: None,
@@ -2813,6 +2806,7 @@ mod tests {
         let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn {
             instruction: "respond".to_string(),
             resources: Vec::new(),
+            authorship: echo_agent_app_core::prepared_turn::InstructionAuthorship::User,
         };
         let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat(
             lease, &agent, &turn, resources,

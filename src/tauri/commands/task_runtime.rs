@@ -447,12 +447,9 @@ async fn resume_continuation_run(
             status: "running".to_string(),
         },
     );
-    let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn {
-        instruction: format!(
-            "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative runtime projection and continue the next useful work."
-        ),
-        resources: Vec::new(),
-    };
+    let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn::runtime_instruction(format!(
+        "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative runtime projection and continue the next useful work."
+    ));
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: state.app_state.connection.pool.clone(),
         store: Some(store.clone()),
@@ -462,7 +459,6 @@ async fn resume_continuation_run(
         root_message_id: turn_id.clone(),
         attachments: snapshot.run.attachments,
         cancel: lease.cancellation_token(),
-        mode_hint: Some(InteractionMode::Task.prompt_hint().to_string()),
         interaction_mode: InteractionMode::Task,
         review_integration: state.app_state.review_integration.clone(),
         layer_manager: None,

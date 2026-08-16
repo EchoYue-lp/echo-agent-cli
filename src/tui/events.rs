@@ -1418,7 +1418,6 @@ async fn dispatch_turn(
     let turn_id = uuid::Uuid::new_v4().to_string();
     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
-    let mode_hint_str = turn.interaction_mode.prompt_hint().to_string();
     let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
         app.workspace_root.as_deref(),
     );
@@ -1426,7 +1425,6 @@ async fn dispatch_turn(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &turn.text,
             attachments: &turn.attachments,
-            mode_hint: Some(&mode_hint_str),
             spill_dir: &spill_dir,
             conversation_id: app.conversation_id.as_deref(),
             turn_id: Some(&turn_id),
@@ -1503,7 +1501,6 @@ async fn dispatch_turn(
         // Bind staged refs so subagents in an autonomous run see them too.
         attachments: task_attachments,
         cancel: lease.cancellation_token(),
-        mode_hint: Some(mode_hint_str),
         interaction_mode: turn.interaction_mode,
         review_integration: app.review_integration.clone(),
         layer_manager: None,
@@ -4552,7 +4549,6 @@ async fn handle_slash_command(
                 echo_agent_app_core::prepared_turn::UserTurnInput {
                     text: instruction,
                     attachments: &attachments,
-                    mode_hint: None,
                     spill_dir: &spill_dir,
                     conversation_id: app.conversation_id.as_deref(),
                     turn_id: Some(&snapshot.turn_id),

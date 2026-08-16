@@ -225,6 +225,25 @@ pub struct PreparedUserTurn {
     pub instruction: String,
     /// Input resources (images / documents / spilled text artifacts).
     pub resources: Vec<InputResourceRef>,
+    /// Whether the instruction came from the user or from EKO's continuation
+    /// runtime. This is independent of RunTurnOrigin: a user-authored message
+    /// can resume an existing run.
+    pub authorship: InstructionAuthorship,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstructionAuthorship {
+    User,
+    Runtime,
+}
+
+impl InstructionAuthorship {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Runtime => "runtime",
+        }
+    }
 }
 
 /// Inputs needed to build a turn. Grouped so entry points pass one value
@@ -234,8 +253,6 @@ pub struct UserTurnInput<'a> {
     pub text: &'a str,
     /// Already-persisted upload refs (images / documents).
     pub attachments: &'a [AttachmentRef],
-    /// Mode hint copied from `ChatResources`.
-    pub mode_hint: Option<&'a str>,
     /// Where to spill long pastes. Resolved from the active workspace via
     /// [`crate::workspace::layout::WorkspaceLayout::user_input_artifacts`]
     /// (workspace chats) or `~/.eko/artifacts/user-input` (global chats).
@@ -288,7 +305,7 @@ impl PreparedUserTurn {
                 instruction.push_str("\n\n");
                 instruction.push_str(&resource_references.join("\n\n"));
             }
-            fold_mode_hint(instruction, input.mode_hint)
+            instruction
         } else {
             let mut instruction = input.text.to_string();
             if !resource_references.is_empty() {
@@ -297,13 +314,27 @@ impl PreparedUserTurn {
                 }
                 instruction.push_str(&resource_references.join("\n\n"));
             }
-            fold_mode_hint(instruction, input.mode_hint)
+            instruction
         };
         cleanup_staged_paste_files(input.attachments, &resources);
         Ok(Self {
             instruction,
             resources,
+            authorship: InstructionAuthorship::User,
         })
+    }
+
+    pub fn runtime_instruction(instruction: impl Into<String>) -> Self {
+        Self {
+            instruction: instruction.into(),
+            resources: Vec::new(),
+            authorship: InstructionAuthorship::Runtime,
+        }
+    }
+
+    pub fn runtime_authored(mut self) -> Self {
+        self.authorship = InstructionAuthorship::Runtime;
+        self
     }
 
     /// Only inline resources belong on `TaskRun.attachments`. Tool-reference
@@ -572,13 +603,6 @@ fn spill_to_artifact(
     })
 }
 
-fn fold_mode_hint(instruction: String, mode_hint: Option<&str>) -> String {
-    match mode_hint {
-        Some(hint) if !hint.trim().is_empty() => format!("[Mode: {hint}]\n\n{instruction}"),
-        _ => instruction,
-    }
-}
-
 fn artifact_preview(original_text: &str) -> String {
     let preview_head: String = original_text.chars().take(PREVIEW_CHARS).collect();
     let total_chars = original_text.chars().count();
@@ -667,7 +691,6 @@ mod tests {
         UserTurnInput {
             text,
             attachments: &[],
-            mode_hint: None,
             spill_dir,
             conversation_id: Some("conv-1"),
             turn_id: Some("turn-1"),
@@ -680,19 +703,17 @@ mod tests {
         let turn = PreparedUserTurn::build(make_turn_input("hello", tmp.path()))?;
         assert!(turn.resources.is_empty());
         assert_eq!(turn.instruction, "hello");
+        assert_eq!(turn.authorship, InstructionAuthorship::User);
         let msg = turn.to_message()?;
         assert_eq!(msg.content.as_text(), Some("hello".to_string()));
         Ok(())
     }
 
     #[test]
-    fn mode_hint_is_folded_for_short_text() -> anyhow::Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let mut input = make_turn_input("hi", tmp.path());
-        input.mode_hint = Some("Chat");
-        let turn = PreparedUserTurn::build(input)?;
-        assert_eq!(turn.instruction, "[Mode: Chat]\n\nhi");
-        Ok(())
+    fn runtime_instruction_keeps_authorship_separate_from_text() {
+        let turn = PreparedUserTurn::runtime_instruction("continue the existing run");
+        assert_eq!(turn.instruction, "continue the existing run");
+        assert_eq!(turn.authorship, InstructionAuthorship::Runtime);
     }
 
     #[test]
@@ -772,7 +793,6 @@ mod tests {
         let input = UserTurnInput {
             text: "look at this",
             attachments: &[att],
-            mode_hint: None,
             spill_dir: tmp.path(),
             conversation_id: Some("conv-1"),
             turn_id: Some("turn-1"),
@@ -812,7 +832,6 @@ mod tests {
         let input = UserTurnInput {
             text: "",
             attachments: &[attachment],
-            mode_hint: None,
             spill_dir: tmp.path(),
             conversation_id: Some("conv-1"),
             turn_id: Some("turn-1"),
@@ -846,7 +865,6 @@ mod tests {
         let input = UserTurnInput {
             text: "找出根因",
             attachments: &[attachment],
-            mode_hint: None,
             spill_dir: tmp.path(),
             conversation_id: Some("conv-1"),
             turn_id: Some("turn-1"),

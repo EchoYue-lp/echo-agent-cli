@@ -799,17 +799,17 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         } else {
             *self.interaction_mode.read().await
         };
-        let mode_hint_str = interaction_mode.prompt_hint().to_string();
+        let runtime_authored = resume_task_run.is_some();
         let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
             echo_agent_app_core::prepared_turn::UserTurnInput {
                 text: &text,
                 attachments: &attachment_refs,
-                mode_hint: Some(&mode_hint_str),
                 spill_dir: &spill_dir,
                 conversation_id: Some(&conv),
                 turn_id: Some(&turn_id),
             },
         ) {
+            Ok(turn) if runtime_authored => turn.runtime_authored(),
             Ok(turn) => turn,
             Err(error) => {
                 tracing::warn!(%error, conv = %conv, "channel user-turn preparation failed");
@@ -864,7 +864,6 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                             root_message_id: turn_id,
                             attachments: turn.inline_attachment_refs(),
                             cancel: foreground_lease.cancellation_token(),
-                            mode_hint: Some(mode_hint_str),
                             interaction_mode,
                             review_integration,
                             layer_manager: None,
