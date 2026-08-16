@@ -78,7 +78,7 @@ evidence, and the next bounded step.
 | Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
 | Background command cells + awaiter role (Phase C1-C4) | Complete | Design: `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11 (C track). Framework commits `58e6733`, `7f66ff5`: one `CommandCellRegistry`, sandbox-preserving launch, durable output artifacts, retry-safe multi-waiter cursors, explicit owner cancellation, and UTF-8-safe bounded output. Application commit `5cf49c2`: process-wide registry, low-thinking `awaiter`, `watch_cell`, TaskRuntime start/finish events, recovery-capsule projection, active-cell completion blocker, explicit-cancel propagation, and boot recovery that closes orphaned cells without replaying external commands. Pause keeps cells alive; only explicit run cancellation stops them. |
 | Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; superseded follow-up planned as M0-M5 | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns already have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, stable surface HITL replay, and cross-surface controls. Remaining correctness, Goal lifecycle, Subagent control, recovery, evidence, and performance work is now governed by `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; do not enable cold-start auto-resume before M1 closes. |
-| Long-horizon runtime M0-M5 implementation | R0 and framework M1 complete; framework M2 in progress | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal active. Framework `cd4fccf` closes CommandCell admission deadlines, typed terminal/artifact outcomes, raw-byte incremental UTF-8 decoding, waiter leases, and strict retention. Logical gates remain R0 -> M0 -> M1 -> M2 -> M3 -> M4 -> M5; product M1 remains open until its post-M0 application fixes land. |
+| Long-horizon runtime M0-M5 implementation | R0 and framework M1/M2 complete; application M0 in progress | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal active. Framework `cd4fccf` closes CommandCell admission deadlines, typed terminal/artifact outcomes, raw-byte incremental UTF-8 decoding, waiter leases, and strict retention. Framework `6d7d0cf` adds exact-attempt Subagent message/guidance/interrupt control through the existing `TurnSteerMailbox`. Logical gates remain R0 -> M0 -> M1 -> M2 -> M3 -> M4 -> M5; product M1/M2 remain open until their post-M0 application fixes land. |
 
 ## Current Decisions
 
@@ -623,13 +623,13 @@ The Codex Runtime Goal is active with this exact objective:
 Subagent 控制、恢复、完成证据和性能评测。
 ```
 
-R0 and framework M1 are complete. Framework commit `cd4fccf` combines the M1a
-and M1b slices and passed the full workspace, no-default, lint, and independent
-feature gates. Framework M2 is now active: add exact-attempt Subagent messaging,
-queued next-attempt guidance, and interruption by wiring the existing
-`TurnSteerMailbox`; do not create a second mailbox. Continue to application M0
-after framework M2. Do not enable `auto_resume_after_restart` until the entire
-M1 product gate, including application race and budget fixes, is green.
+R0 and framework M1/M2 are complete. Framework commits `cd4fccf` and `6d7d0cf`
+passed the full workspace, no-default, lint, and independent feature gates. The
+active slice is application M0: make `TaskRun.goal` revisioned and hash-bound,
+add the explicit paused-only update protocol, remove the persisted Plan Goal
+copy, and bind Plan revisions to the current Goal. Continue to application M1
+after M0. Do not enable `auto_resume_after_restart` until the entire M1 product
+gate, including application race and budget fixes, is green.
 
 Tool context optimization Phase 0-6 is closed in
 `docs/2026-07-29-tool-schema-budget-and-artifacts.md`. Operational follow-up is
