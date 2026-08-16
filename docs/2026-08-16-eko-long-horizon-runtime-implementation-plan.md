@@ -1,7 +1,7 @@
 # EKO 长程任务运行时 M0-M5 实施计划
 
-> 日期：2026-08-16  
-> 状态：R0/M0 Complete；framework M1/M2 complete；application M1 in progress；Codex Runtime Goal active
+> 日期：2026-08-17
+> 状态：R0/M0/M1 Complete；framework M2 complete；application M2 next；Codex Runtime Goal active
 > 设计基线：[`2026-08-14-eko-long-horizon-task-runtime-design.md`](./2026-08-14-eko-long-horizon-task-runtime-design.md)  
 > 跨会话状态：[`MASTER-PLAN.md`](./MASTER-PLAN.md)
 
@@ -563,10 +563,10 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | 阶段 | 状态 | 提交 | 已执行测试 | 失败/剩余 |
 |---|---|---|---|---|
 | R0 | Complete | app `62168ba` | `git diff --check`; local-link `stat`; code-fence parity; forbidden-term scan：通过 | Runtime Goal 已显式创建；研发控制门持续生效 |
-| M0 | Complete | app `de09946` | Goal/CAS/quiescence/rebind 定向测试；workspace fmt、两组 clippy、all-features test、no-default；GUI check/test；frontend Prettier/test/build；浏览器 desktop/390px：全绿 | 已切换唯一 Goal 权威和四 surface 主路径；M1 应用正确性为下一切片 |
-| M1 | In progress | framework `cd4fccf` | CommandCell 定向 30 项；workspace all-features test；两组 clippy；fmt；no-default；11 个逐 feature check：全绿 | framework M1a/M1b 已合并交付；应用 wake race、exact TUI binding、usage budget、durable budget lowering 仍待 M0 后完成 |
+| M0 | Complete | app `de09946` | Goal/CAS/quiescence/rebind 定向测试；workspace fmt、两组 clippy、all-features test、no-default；GUI check/test；frontend Prettier/test/build；浏览器 desktop/390px：全绿 | 已切换唯一 Goal 权威和四 surface 主路径；后续 M1 已完成 |
+| M1 | Complete | framework `cd4fccf`；app `9d59a0b` | Framework CommandCell 定向 30 项、完整门禁与 11 个逐 feature check；application 聚焦竞态/预算/TUI 测试、fmt、两组 clippy、workspace all-features test、no-default：全绿 | Framework 与 application 主路径均已切换；cold-start auto-resume 的 M1 前置门已关闭，但功能仍须在 M3 安全 admission 完成后才启用 |
 | M2 | In progress | framework `6d7d0cf` | Subagent 定向 122 项及 control/executor 7 项；`cargo fmt --all -- --check`；两组 workspace all-features clippy；workspace all-targets/all-features test；no-default；`sqlite/subagent/human-loop/mcp/lsp/a2a/git/database/rag/chart/web/media` 独立 feature check：全绿 | framework exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox` 交付；首次 all-targets/subagent clippy 暴露 `demo07/demo09/demo44/demo45/demo49` 缺失 `required-features`，已补齐并重验。应用持久命令、控制层级、幂等与 surface parity 仍待 M0/M1 后完成 |
-| M3 | Pending | - | - | M1 完成前禁止 cold-start auto-resume |
+| M3 | Pending | - | - | M1 前置门已关闭；仅在本阶段安全 admission 全绿后启用 cold-start auto-resume |
 | M4 | Pending | - | - | 收归现有 completion blockers，不建第二完成门 |
 | M5 | Pending | - | - | seq 已存在；checkpoint 仅为可重建缓存 |
 
@@ -603,9 +603,41 @@ CLI、channel 都调用同一 app-core service，模型没有 Goal 修改工具�
 最小 Goal-bound Plan；首次前端 build 发现 3 个 fixture 缺少新增字段，已补齐；首次
 Prettier check 发现 3 个本次文件格式不一致，已格式化并重验。提交前语义复核发现
 `Paused` 已持久但 live driver 未 settle 的短窗口，补充拒绝条件及确定性测试后重新跑完
-全部适用门禁。剩余事项从 application M1 开始：continuation wake race、exact TUI
-Resume、Subagent usage 总预算与动态降预算 durable pause；M1 关闭前仍禁止 cold-start
-auto-resume。
+全部适用门禁。原剩余事项已由下节 application M1 完成记录关闭；cold-start
+auto-resume 继续等待 M3 的安全 admission。
+
+### 15.2 M1 完成记录
+
+Framework `cd4fccf` 已交付通用 CommandCell deadline、typed terminal/artifact 状态、共享
+增量 UTF-8 decoder、waiter lease/ack 与严格 retention。Application `9d59a0b` 把 cell
+active 检查与 continuation deferred 写入收归同一个 per-run lock，TUI Resume 携带精确
+`run_id + new turn_id + root_message_id` binding，PlanTask Subagent usage 以稳定 source event
+id 幂等计入 TaskRun token/time budget，并从同一事件流投影 `SubagentRun.usage`。动态降低
+预算与 provider/Subagent usage 边界都可在一个事件 fold 中同时得到 durable Paused 状态，
+持久成功后才取消 live driver。调度竞态测试改用 `Barrier`/`Notify`，不再依赖随机 sleep。
+
+提交：framework `cd4fccf`；application `9d59a0b`。
+
+Application 最终验证命令：
+
+- `cargo fmt --all` 与 `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
+- `cargo clippy --workspace --lib --bins --all-features --locked -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable`
+- `cargo test --workspace --all-features --locked`：app-core 881 passed、2 ignored；runtime
+  e2e 5 passed；CLI library 139 passed；CLI main 10 passed；零失败
+- `cargo check -p echo-agent-app-core --no-default-features --locked`
+- 聚焦回归：cell terminal/deferred、budget lowering、Subagent usage/projection、取消保留
+  completed facts、revision safe point、in-flight 防重复派发、TUI exact Resume binding：全绿
+- `df -h .` 与 target 大小检查：约 73 GiB 可用、app target 约 1.2 GiB，不清理缓存
+
+失败与修复：首次将取消竞态测试切换到通知屏障时，错误地等待了 wave 结束后才会写入的
+Todo terminal 状态；改为等待 dispatcher 精确返回计数后再取消。首次全 workspace 测试
+发现 `main_agent_task_streams_tool_events_to_subagent_trace` 直接调用内部执行函数而未建立
+生产路径必有的 TaskRun/Plan/SubagentAssigned 前置；补齐真实夹具后聚焦和全量重验通过。
+ts-rs 测试生成的非语义格式改写已用项目 Prettier 恢复，未进入提交。
+
+下一切片为 application M2：把 framework `6d7d0cf` 的 exact-attempt message、next-attempt
+guidance 和 interrupt 接入 TaskRuntime 持久事件、幂等 command identity、控制层级与四 surface。
 
 ## 16. 最终验收
 
