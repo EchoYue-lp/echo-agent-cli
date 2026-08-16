@@ -4815,6 +4815,106 @@ async fn handle_slash_command(
             });
             refresh_task_runtime_view(app);
         }
+        Some(
+            action @ (SlashCommand::SubagentMessage
+            | SlashCommand::SubagentFollowup
+            | SlashCommand::SubagentInterrupt),
+        ) => {
+            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let (usage, instruction_required) = match action {
+                SlashCommand::SubagentMessage => {
+                    (crate::task_run_control::SUBAGENT_MESSAGE_USAGE, true)
+                }
+                SlashCommand::SubagentFollowup => {
+                    (crate::task_run_control::SUBAGENT_FOLLOWUP_USAGE, true)
+                }
+                SlashCommand::SubagentInterrupt => {
+                    (crate::task_run_control::SUBAGENT_INTERRUPT_USAGE, false)
+                }
+                _ => return,
+            };
+            let values = args.split_whitespace().collect::<Vec<_>>();
+            let parsed = crate::task_run_control::parse_subagent_control_args(
+                &values,
+                usage,
+                instruction_required,
+            );
+            let result = match parsed {
+                Ok(parsed) => {
+                    let service =
+                        echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(
+                            store,
+                        );
+                    match action {
+                        SlashCommand::SubagentMessage => {
+                            let Some(instruction) = parsed.instruction.as_deref() else {
+                                app.messages.push(ChatMessage {
+                                    role: MessageRole::System,
+                                    content: format!("Usage: {usage}"),
+                                });
+                                return;
+                            };
+                            service
+                                .send_message(
+                                    parsed.identity,
+                                    instruction,
+                                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
+                                )
+                                .await
+                        }
+                        SlashCommand::SubagentFollowup => {
+                            let Some(instruction) = parsed.instruction.as_deref() else {
+                                app.messages.push(ChatMessage {
+                                    role: MessageRole::System,
+                                    content: format!("Usage: {usage}"),
+                                });
+                                return;
+                            };
+                            service.queue_guidance(
+                                parsed.identity,
+                                instruction,
+                                echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
+                            )
+                        }
+                        SlashCommand::SubagentInterrupt => {
+                            service
+                                .interrupt_subagent(
+                                    parsed.identity,
+                                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
+                                )
+                                .await
+                        }
+                        _ => return,
+                    }
+                }
+                Err(error) => {
+                    Err(echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(error))
+                }
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(receipt) => format!(
+                        "Subagent command {} is {}{}.",
+                        receipt.identity.command_id,
+                        receipt.status.as_str(),
+                        receipt
+                            .detail
+                            .as_deref()
+                            .map(|detail| format!(": {detail}"))
+                            .unwrap_or_default()
+                    ),
+                    Err(error) => format!("Subagent control failed: {error}"),
+                },
+            });
+            refresh_task_runtime_view(app);
+        }
         Some(SlashCommand::TaskRecovery) => {
             let Some(store) = app.task_runtime_store.as_ref() else {
                 app.messages.push(ChatMessage {

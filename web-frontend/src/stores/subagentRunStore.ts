@@ -55,6 +55,8 @@ export interface ExecutionEvent {
   agent: string;
   event: SubagentRunEventKind;
   task_id?: string;
+  plan_revision?: number;
+  attempt?: number;
   // event-specific fields (any of the below may be absent depending on `event`)
   parent?: string;
   task?: string;
@@ -98,6 +100,8 @@ export interface SubagentRunState {
   subagentRunId: string;
   runId: string;
   taskId?: string;
+  planRevision?: number;
+  attempt?: number;
   agent: string;
   parent?: string;
   task?: string;
@@ -367,6 +371,8 @@ export function taskRuntimeSubagentExecutionEvents(
         message_id: run.root_message_id,
         conversation_id: run.conversation_id,
         started_at: startedAt,
+        plan_revision: jsonNumber(payload?.plan_revision),
+        attempt: jsonNumber(payload?.attempt),
       });
       continue;
     }
@@ -387,6 +393,8 @@ export function taskRuntimeSubagentExecutionEvents(
       message_id: run.root_message_id,
       conversation_id: run.conversation_id,
       started_at: startedAt,
+      plan_revision: jsonNumber(payload?.plan_revision),
+      attempt: jsonNumber(payload?.attempt),
       output,
       error: terminalEvent === 'failed' ? (summary ?? output) : undefined,
       summary,
@@ -403,11 +411,12 @@ export function taskRuntimeSubagentExecutionEvents(
 }
 
 function executionAttempt(run: SubagentRunState): number | null {
-  const separator = run.subagentRunId.lastIndexOf(':');
-  if (separator <= 0) return null;
-  const suffix = run.subagentRunId.slice(separator + 1);
-  if (!/^\d+$/.test(suffix)) return null;
-  const attempt = Number(suffix);
+  if (run.attempt != null && Number.isSafeInteger(run.attempt)) return run.attempt;
+  const segments = run.subagentRunId.split(':');
+  const last = segments.at(-1) ?? '';
+  const candidate = /^\d+$/.test(last) ? last : (segments.at(-2) ?? '');
+  if (!/^\d+$/.test(candidate)) return null;
+  const attempt = Number(candidate);
   return Number.isSafeInteger(attempt) ? attempt : null;
 }
 
@@ -451,8 +460,8 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const prev = s.runs[storeKey];
       const newStatus = statusFromEvent(ev.event);
       // One execution id has one monotonic lifecycle. Retries use a new
-      // `{run_id}:{task_id}:{plan_revision}:{attempt}` id, so late/duplicate events must not reopen a
-      // terminal execution or overwrite its result.
+      // `{run_id}:{task_id}:{plan_revision}:{attempt}:{claim_id}` id, so late/duplicate events
+      // must not reopen a terminal execution or overwrite its result.
       if (prev && prev.status !== 'running') {
         return s;
       }
@@ -466,6 +475,8 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         subagentRunId: id,
         runId: ev.run_id,
         taskId: ev.task_id,
+        planRevision: ev.plan_revision,
+        attempt: ev.attempt,
         agent: ev.agent,
         parent: ev.parent,
         task: ev.task,
@@ -494,6 +505,8 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         ...run,
         // Preserve any field present on the event (overwrites prev).
         taskId: ev.task_id ?? run.taskId,
+        planRevision: ev.plan_revision ?? run.planRevision,
+        attempt: ev.attempt ?? run.attempt,
         parent: ev.parent ?? run.parent,
         task: ev.task ?? run.task,
         mode: ev.mode ?? run.mode,

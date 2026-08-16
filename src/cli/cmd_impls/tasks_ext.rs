@@ -252,6 +252,128 @@ cmd!(
     cmd_task_goal
 );
 
+#[derive(Clone, Copy)]
+enum SubagentControlAction {
+    Message,
+    Followup,
+    Interrupt,
+}
+
+async fn cmd_subagent_control(
+    ctx: &CommandContext,
+    args: &[&str],
+    action: SubagentControlAction,
+) -> CommandOutcome {
+    let (usage, instruction_required) = match action {
+        SubagentControlAction::Message => (crate::task_run_control::SUBAGENT_MESSAGE_USAGE, true),
+        SubagentControlAction::Followup => (crate::task_run_control::SUBAGENT_FOLLOWUP_USAGE, true),
+        SubagentControlAction::Interrupt => {
+            (crate::task_run_control::SUBAGENT_INTERRUPT_USAGE, false)
+        }
+    };
+    let parsed = match crate::task_run_control::parse_subagent_control_args(
+        args,
+        usage,
+        instruction_required,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            println!("\n  {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let (store, _) = match current_task_run(ctx, Some(&parsed.identity.run_id)) {
+        Ok(value) => value,
+        Err(error) => {
+            println!("\n  Subagent control error: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let service = echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store);
+    let result = match action {
+        SubagentControlAction::Message => {
+            let Some(instruction) = parsed.instruction.as_deref() else {
+                println!("\n  Usage: {usage}");
+                return CommandOutcome::Continue;
+            };
+            service
+                .send_message(
+                    parsed.identity,
+                    instruction,
+                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
+                )
+                .await
+        }
+        SubagentControlAction::Followup => {
+            let Some(instruction) = parsed.instruction.as_deref() else {
+                println!("\n  Usage: {usage}");
+                return CommandOutcome::Continue;
+            };
+            service.queue_guidance(
+                parsed.identity,
+                instruction,
+                echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
+            )
+        }
+        SubagentControlAction::Interrupt => {
+            service
+                .interrupt_subagent(
+                    parsed.identity,
+                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
+                )
+                .await
+        }
+    };
+    match result {
+        Ok(receipt) => println!(
+            "\n  Subagent command {} is {}{}.",
+            receipt.identity.command_id,
+            receipt.status.as_str(),
+            receipt
+                .detail
+                .as_deref()
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        ),
+        Err(error) => println!("\n  Subagent control failed: {error}"),
+    }
+    CommandOutcome::Continue
+}
+
+async fn cmd_subagent_message(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    cmd_subagent_control(ctx, args, SubagentControlAction::Message).await
+}
+
+async fn cmd_subagent_followup(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    cmd_subagent_control(ctx, args, SubagentControlAction::Followup).await
+}
+
+async fn cmd_subagent_interrupt(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    cmd_subagent_control(ctx, args, SubagentControlAction::Interrupt).await
+}
+
+cmd!(
+    SubagentMessageCommand,
+    "subagent-message",
+    CommandCategory::Advanced,
+    "Send guidance to one exact active Subagent attempt",
+    cmd_subagent_message
+);
+cmd!(
+    SubagentFollowupCommand,
+    "subagent-followup",
+    CommandCategory::Advanced,
+    "Queue guidance for one exact future Subagent attempt",
+    cmd_subagent_followup
+);
+cmd!(
+    SubagentInterruptCommand,
+    "subagent-interrupt",
+    CommandCategory::Advanced,
+    "Interrupt one exact Subagent attempt",
+    cmd_subagent_interrupt
+);
+
 // ── TaskProgressCommand ──────────────────────────────────────────────
 
 async fn cmd_task_progress(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
@@ -355,6 +477,9 @@ cmd!(
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(TaskRunCommand));
     registry.register(Arc::new(TaskGoalCommand));
+    registry.register(Arc::new(SubagentMessageCommand));
+    registry.register(Arc::new(SubagentFollowupCommand));
+    registry.register(Arc::new(SubagentInterruptCommand));
     registry.register(Arc::new(TaskProgressCommand));
     registry.register(Arc::new(TaskTreeCommand));
 }

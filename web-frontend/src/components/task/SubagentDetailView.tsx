@@ -5,11 +5,17 @@ import {
   CheckCircle2,
   Circle,
   ClipboardList,
+  Forward,
   Gauge,
   Loader2,
+  MessageSquareMore,
+  OctagonX,
   TerminalSquare,
 } from 'lucide-react';
+import { taskRuntimeApi } from '../../api/endpoints';
+import type { SubagentControlIdentity } from '../../generated';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
+import { useToastStore } from '../../stores/toastStore';
 import {
   toolExecutionIdsForOwner,
   toolExecutionOwnerKey,
@@ -46,11 +52,20 @@ function formatTime(epochMs: number): string {
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
+function commandId(action: string): string {
+  const randomId = globalThis.crypto?.randomUUID?.();
+  return randomId ?? `${action}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
 export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
   const [activeTab, setActiveTab] = useState<'task' | 'process' | 'result'>(
     run.status === 'running' ? 'process' : 'result'
   );
   const presentation = subagentResultPresentation(run);
+  const addToast = useToastStore((state) => state.addToast);
+  const [controlPending, setControlPending] = useState<'message' | 'followup' | 'interrupt' | null>(
+    null
+  );
   const cacheSummary = cacheUsageForRuns([run]);
   const ownerKey = toolExecutionOwnerKey(
     {
@@ -66,6 +81,53 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
   useEffect(() => {
     if (run.status !== 'running') setActiveTab('result');
   }, [run.status]);
+
+  const controlIdentity = (
+    action: 'message' | 'followup' | 'interrupt'
+  ): SubagentControlIdentity | null => {
+    if (!run.taskId || run.planRevision == null || run.attempt == null) return null;
+    const attempt = action === 'followup' ? run.attempt + 1 : run.attempt;
+    const executionId =
+      action === 'followup'
+        ? `pending:${run.runId}:${run.taskId}:${run.planRevision}:${attempt}`
+        : run.subagentRunId;
+    return {
+      run_id: run.runId,
+      task_id: run.taskId,
+      execution_id: executionId,
+      plan_revision: run.planRevision,
+      attempt,
+      command_id: commandId(action),
+    };
+  };
+
+  const runControl = async (action: 'message' | 'followup' | 'interrupt') => {
+    const identity = controlIdentity(action);
+    if (!identity) {
+      addToast('error', 'Subagent identity is not available yet');
+      return;
+    }
+    const instruction =
+      action === 'interrupt' ? null : window.prompt(action === 'message' ? 'Message' : 'Follow-up');
+    if (action !== 'interrupt' && !instruction?.trim()) return;
+    setControlPending(action);
+    try {
+      const receipt =
+        action === 'message'
+          ? await taskRuntimeApi.sendSubagentMessage(identity, instruction ?? '')
+          : action === 'followup'
+            ? await taskRuntimeApi.queueSubagentGuidance(identity, instruction ?? '')
+            : await taskRuntimeApi.interruptSubagent(identity);
+      addToast(
+        receipt.status === 'rejected' ? 'warning' : 'success',
+        `Subagent command ${receipt.status}`
+      );
+    } catch (error) {
+      addToast('error', error instanceof Error ? error.message : String(error));
+    } finally {
+      setControlPending(null);
+    }
+  };
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--bg-primary)]">
@@ -93,8 +155,58 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
               <span>started {formatTime(run.startedAt)}</span>
             </div>
           </div>
-          <div className="hidden w-72 shrink-0 md:block">
-            <CacheUsageCard summary={cacheSummary} compact />
+          <div className="flex shrink-0 items-start gap-2">
+            {run.status === 'running' && (
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  title="Message Subagent"
+                  aria-label="Message Subagent"
+                  disabled={controlPending !== null}
+                  onClick={() => void runControl('message')}
+                  className="grid size-8 place-items-center rounded-md border border-[var(--border-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+                >
+                  {controlPending === 'message' ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <MessageSquareMore size={14} />
+                  )}
+                </button>
+                <button
+                  type="button"
+                  title="Interrupt Subagent"
+                  aria-label="Interrupt Subagent"
+                  disabled={controlPending !== null}
+                  onClick={() => void runControl('interrupt')}
+                  className="grid size-8 place-items-center rounded-md border border-[var(--border-primary)] text-[var(--color-error)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+                >
+                  {controlPending === 'interrupt' ? (
+                    <Loader2 size={14} className="animate-spin" />
+                  ) : (
+                    <OctagonX size={14} />
+                  )}
+                </button>
+              </div>
+            )}
+            {run.status !== 'completed' && (
+              <button
+                type="button"
+                title="Queue guidance for next attempt"
+                aria-label="Queue guidance for next attempt"
+                disabled={controlPending !== null}
+                onClick={() => void runControl('followup')}
+                className="grid size-8 place-items-center rounded-md border border-[var(--border-primary)] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+              >
+                {controlPending === 'followup' ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Forward size={14} />
+                )}
+              </button>
+            )}
+            <div className="hidden w-72 md:block">
+              <CacheUsageCard summary={cacheSummary} compact />
+            </div>
           </div>
         </div>
 

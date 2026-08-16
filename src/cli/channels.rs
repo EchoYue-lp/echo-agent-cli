@@ -235,6 +235,79 @@ impl AppChannelMessageHandler {
     ) -> Option<ChannelTaskRunControl> {
         let mut parts = message.split_whitespace();
         let command = parts.next()?;
+        if matches!(
+            command,
+            "/subagent-message" | "/subagent-followup" | "/subagent-interrupt"
+        ) {
+            let (usage, instruction_required) = match command {
+                "/subagent-message" => (crate::task_run_control::SUBAGENT_MESSAGE_USAGE, true),
+                "/subagent-followup" => (crate::task_run_control::SUBAGENT_FOLLOWUP_USAGE, true),
+                "/subagent-interrupt" => (crate::task_run_control::SUBAGENT_INTERRUPT_USAGE, false),
+                _ => return None,
+            };
+            let values = parts.collect::<Vec<_>>();
+            let parsed = match crate::task_run_control::parse_subagent_control_args(
+                &values,
+                usage,
+                instruction_required,
+            ) {
+                Ok(parsed) => parsed,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
+            let (store, _) = match self.current_task_run(conv, Some(&parsed.identity.run_id)) {
+                Ok(value) => value,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
+            let service =
+                echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store);
+            let result = match command {
+                "/subagent-message" => {
+                    let Some(instruction) = parsed.instruction.as_deref() else {
+                        return Some(ChannelTaskRunControl::Reply(format!("Usage: {usage}")));
+                    };
+                    service
+                        .send_message(
+                            parsed.identity,
+                            instruction,
+                            echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Channel,
+                        )
+                        .await
+                }
+                "/subagent-followup" => {
+                    let Some(instruction) = parsed.instruction.as_deref() else {
+                        return Some(ChannelTaskRunControl::Reply(format!("Usage: {usage}")));
+                    };
+                    service.queue_guidance(
+                        parsed.identity,
+                        instruction,
+                        echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Channel,
+                    )
+                }
+                "/subagent-interrupt" => {
+                    service
+                        .interrupt_subagent(
+                            parsed.identity,
+                            echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Channel,
+                        )
+                        .await
+                }
+                _ => return None,
+            };
+            let reply = match result {
+                Ok(receipt) => format!(
+                    "Subagent command {} is {}{}.",
+                    receipt.identity.command_id,
+                    receipt.status.as_str(),
+                    receipt
+                        .detail
+                        .as_deref()
+                        .map(|detail| format!(": {detail}"))
+                        .unwrap_or_default()
+                ),
+                Err(error) => format!("Subagent control failed: {error}"),
+            };
+            return Some(ChannelTaskRunControl::Reply(reply));
+        }
         if command == "/task-goal" {
             let values = parts.collect::<Vec<_>>();
             let parsed = match crate::task_run_control::parse_run_goal_update_args(&values) {

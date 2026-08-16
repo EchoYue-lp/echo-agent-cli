@@ -82,6 +82,43 @@ pub async fn update_task_run_goal(
         .map_err(internal)
 }
 
+/// Send guidance through the safe point of one exact active Subagent attempt.
+#[tauri::command]
+pub async fn send_task_subagent_message(
+    state: tauri::State<'_, TauriState>,
+    identity: SubagentControlIdentity,
+    instruction: String,
+) -> Result<SubagentControlReceipt, IpcError> {
+    echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store(&state)?)
+        .send_message(identity, &instruction, SubagentControlActorSource::Gui)
+        .await
+        .map_err(internal)
+}
+
+/// Queue guidance for one exact future Subagent attempt.
+#[tauri::command]
+pub async fn queue_task_subagent_guidance(
+    state: tauri::State<'_, TauriState>,
+    identity: SubagentControlIdentity,
+    instruction: String,
+) -> Result<SubagentControlReceipt, IpcError> {
+    echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store(&state)?)
+        .queue_guidance(identity, &instruction, SubagentControlActorSource::Gui)
+        .map_err(internal)
+}
+
+/// Interrupt one exact Subagent attempt without pausing its parent TaskRun.
+#[tauri::command]
+pub async fn interrupt_task_subagent(
+    state: tauri::State<'_, TauriState>,
+    identity: SubagentControlIdentity,
+) -> Result<SubagentControlReceipt, IpcError> {
+    echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store(&state)?)
+        .interrupt_subagent(identity, SubagentControlActorSource::Gui)
+        .await
+        .map_err(internal)
+}
+
 /// Background command cells owned by the run, including bounded terminal facts.
 #[tauri::command]
 pub async fn list_task_background_cells(

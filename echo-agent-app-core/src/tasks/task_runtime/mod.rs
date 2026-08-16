@@ -44,6 +44,7 @@ pub mod register;
 pub mod review;
 pub mod revisioned_adapter;
 pub mod store;
+pub mod subagent_control;
 pub mod task_execute_tool;
 pub mod task_tools;
 pub mod types;
@@ -76,5 +77,6 @@ pub use store::{
     AbandonedRunSettlement, RunDriverReceiptOwner, StoreError, TaskRetryPreparation,
     TaskRunDriverShutdownError, TaskRuntimeStore,
 };
+pub use subagent_control::SubagentControlService;
 pub use task_execute_tool::ExecuteTaskTool;
 pub use types::*;

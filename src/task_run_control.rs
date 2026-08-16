@@ -1,5 +1,9 @@
 pub const TASK_GOAL_USAGE: &str =
     "/task-goal <expected-revision> [run-id] --reason <reason> --goal <new-goal>";
+pub const SUBAGENT_MESSAGE_USAGE: &str = "/subagent-message <run-id> <task-id> <execution-id> <plan-revision> <attempt> <command-id> <instruction>";
+pub const SUBAGENT_FOLLOWUP_USAGE: &str = "/subagent-followup <run-id> <task-id> <execution-id> <plan-revision> <attempt> <command-id> <instruction>";
+pub const SUBAGENT_INTERRUPT_USAGE: &str =
+    "/subagent-interrupt <run-id> <task-id> <execution-id> <plan-revision> <attempt> <command-id>";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedRunGoalUpdate {
@@ -7,6 +11,62 @@ pub struct ParsedRunGoalUpdate {
     pub requested_run_id: Option<String>,
     pub reason: String,
     pub new_goal: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedSubagentControl {
+    pub identity: echo_agent_app_core::tasks::task_runtime::SubagentControlIdentity,
+    pub instruction: Option<String>,
+}
+
+pub fn parse_subagent_control_args(
+    args: &[&str],
+    usage: &str,
+    instruction_required: bool,
+) -> Result<ParsedSubagentControl, String> {
+    let run_id = required_arg(args, 0, usage)?;
+    let task_id = required_arg(args, 1, usage)?;
+    let execution_id = required_arg(args, 2, usage)?;
+    let plan_revision = required_arg(args, 3, usage)?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid plan revision: {error}"))?;
+    let attempt = required_arg(args, 4, usage)?
+        .parse::<u32>()
+        .map_err(|error| format!("invalid Subagent attempt: {error}"))?;
+    let command_id = required_arg(args, 5, usage)?;
+    if plan_revision == 0 || attempt == 0 {
+        return Err("plan revision and Subagent attempt must be positive".to_string());
+    }
+    let instruction = args
+        .get(6..)
+        .unwrap_or_default()
+        .join(" ")
+        .trim()
+        .to_string();
+    if instruction_required && instruction.is_empty() {
+        return Err(format!("Usage: {usage}"));
+    }
+    if !instruction_required && !instruction.is_empty() {
+        return Err(format!("Usage: {usage}"));
+    }
+    Ok(ParsedSubagentControl {
+        identity: echo_agent_app_core::tasks::task_runtime::SubagentControlIdentity {
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            execution_id: execution_id.to_string(),
+            plan_revision,
+            attempt,
+            command_id: command_id.to_string(),
+        },
+        instruction: instruction_required.then_some(instruction),
+    })
+}
+
+fn required_arg<'a>(args: &'a [&str], index: usize, usage: &str) -> Result<&'a str, String> {
+    args.get(index)
+        .copied()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("Usage: {usage}"))
 }
 
 pub fn parse_run_goal_update_args(args: &[&str]) -> Result<ParsedRunGoalUpdate, String> {
@@ -90,5 +150,49 @@ mod tests {
         assert!(parse_run_goal_update_args(&["0", "--reason", "x", "--goal", "y"]).is_err());
         assert!(parse_run_goal_update_args(&["1", "--reason", "x"]).is_err());
         assert!(parse_run_goal_update_args(&["1", "--reason", "--goal", "y"]).is_err());
+    }
+
+    #[test]
+    fn parses_exact_subagent_control_identity_and_instruction() -> Result<(), String> {
+        let parsed = parse_subagent_control_args(
+            &[
+                "run-1",
+                "task-1",
+                "execution-1",
+                "3",
+                "2",
+                "command-1",
+                "inspect",
+                "the",
+                "diff",
+            ],
+            SUBAGENT_MESSAGE_USAGE,
+            true,
+        )?;
+        assert_eq!(parsed.identity.run_id, "run-1");
+        assert_eq!(parsed.identity.plan_revision, 3);
+        assert_eq!(parsed.identity.attempt, 2);
+        assert_eq!(parsed.instruction.as_deref(), Some("inspect the diff"));
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_interrupt_rejects_instruction_and_zero_attempt() {
+        assert!(
+            parse_subagent_control_args(
+                &["r", "t", "e", "1", "0", "c"],
+                SUBAGENT_INTERRUPT_USAGE,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            parse_subagent_control_args(
+                &["r", "t", "e", "1", "1", "c", "extra"],
+                SUBAGENT_INTERRUPT_USAGE,
+                false,
+            )
+            .is_err()
+        );
     }
 }

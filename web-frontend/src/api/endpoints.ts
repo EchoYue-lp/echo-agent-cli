@@ -55,6 +55,8 @@ import type {
   RecoveryBlocker,
   RunContinuationState,
   BackgroundCellState,
+  SubagentControlIdentity,
+  SubagentControlReceipt,
   WorkspaceTransitionReceipt,
   ConfiguredModelListResponse,
   LlmApiProtocol,
@@ -585,6 +587,33 @@ export const taskRuntimeApi = {
           new_goal: newGoal,
           reason,
         }),
+  sendSubagentMessage: (identity: SubagentControlIdentity, instruction: string) =>
+    isTauri()
+      ? apiInvoke<SubagentControlReceipt>('send_task_subagent_message', {
+          identity,
+          instruction,
+        })
+      : post<SubagentControlReceipt>(
+          `/task_runtime/runs/${identity.run_id}/subagents/${identity.execution_id}/message`,
+          { identity, instruction }
+        ),
+  queueSubagentGuidance: (identity: SubagentControlIdentity, instruction: string) =>
+    isTauri()
+      ? apiInvoke<SubagentControlReceipt>('queue_task_subagent_guidance', {
+          identity,
+          instruction,
+        })
+      : post<SubagentControlReceipt>(
+          `/task_runtime/runs/${identity.run_id}/subagents/${identity.task_id}/guidance`,
+          { identity, instruction }
+        ),
+  interruptSubagent: (identity: SubagentControlIdentity) =>
+    isTauri()
+      ? apiInvoke<SubagentControlReceipt>('interrupt_task_subagent', { identity })
+      : post<SubagentControlReceipt>(
+          `/task_runtime/runs/${identity.run_id}/subagents/${identity.execution_id}/interrupt`,
+          { identity }
+        ),
   listBackgroundCells: (runId: string) =>
     isTauri()
       ? apiInvoke<BackgroundCellState[]>('list_task_background_cells', { runId })

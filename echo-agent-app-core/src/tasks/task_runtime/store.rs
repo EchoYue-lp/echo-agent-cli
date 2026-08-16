@@ -189,6 +189,11 @@ pub struct TaskRuntimeStore {
     /// the token to stop that Subagent promptly.
     task_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
+    /// Exact execution-to-framework routing only. Durable commands and their
+    /// outcomes remain in events.jsonl; no message is stored in this map.
+    pub(super) active_subagent_controls: std::sync::Mutex<
+        std::collections::HashMap<String, super::subagent_control::ActiveSubagentControlTarget>,
+    >,
     /// Active TaskRun driver tokens. Every entry point registers here so pause
     /// and cancel target the real executor instead of a surface-local map.
     run_cancel_tokens:
@@ -218,7 +223,7 @@ pub struct TaskRuntimeStore {
     #[cfg(test)]
     fail_next_run_driver_registration: std::sync::atomic::AtomicBool,
     /// File-backed event authority and deterministic projections.
-    shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
+    pub(super) shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     shadow_generation: std::sync::Mutex<ShadowGeneration>,
     /// Owns the bounded task/subagent hook consumer so shutdown can drain it.
     hook_event_dispatcher:
@@ -837,6 +842,7 @@ impl TaskRuntimeStore {
         ));
         Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_subagent_controls: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
             run_driver_admission_idle: tokio::sync::Notify::new(),
@@ -882,6 +888,7 @@ impl TaskRuntimeStore {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
         Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active_subagent_controls: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
             run_driver_admission_idle: tokio::sync::Notify::new(),
@@ -1977,7 +1984,7 @@ impl TaskRuntimeStore {
     /// struct 在 Rust 里无法直接表达)。closure 把锁的获取与释放封装在内部,
     /// 闭包体内是临界区。revision compare-and-commit / transition_run 用它包裹
     /// "读事件 → 校验 → 追加 → 重建投影"全程。
-    fn with_run_lock<R>(
+    pub(super) fn with_run_lock<R>(
         &self,
         run_id: &str,
         f: impl FnOnce() -> Result<R, StoreError>,

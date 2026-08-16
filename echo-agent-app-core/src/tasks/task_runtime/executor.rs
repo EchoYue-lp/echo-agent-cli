@@ -2276,22 +2276,75 @@ async fn execute_task(
         .ok()
         .flatten()
         .map(|r| r.root_message_id);
-    if let Err(error) = store.record_subagent_assigned(
-        &run_id,
-        &task_id,
-        &execution_id,
-        &task.agent_role,
-        &task.title,
-        claim.revision,
-        attempt,
-        task.kind.is_read_only(),
-        app_owns_subagent_events,
-    ) {
-        return Err(TaskDispatchFailure::failed(
-            task_id,
-            format!("failed to persist Subagent start boundary: {error}"),
-        ));
-    }
+    let controlled_attempt = if is_read_only_task || is_writer_task {
+        let framework_executor = primary_agent
+            .read(|agent| agent.subagent_executor().clone())
+            .await;
+        let (control_identity, framework_identity) = super::subagent_control::attempt_identity(
+            &run_id,
+            &task_id,
+            &execution_id,
+            claim.revision,
+            attempt,
+        )
+        .map_err(|error| {
+            TaskDispatchFailure::failed(
+                task_id.clone(),
+                format!("invalid Subagent attempt identity: {error}"),
+            )
+        })?;
+        let guard = store
+            .record_controlled_subagent_assigned(
+                &run_id,
+                &task_id,
+                &execution_id,
+                &task.agent_role,
+                &task.title,
+                claim.revision,
+                attempt,
+                task.kind.is_read_only(),
+                app_owns_subagent_events,
+                framework_executor.clone(),
+            )
+            .map_err(|error| {
+                TaskDispatchFailure::failed(
+                    task_id.clone(),
+                    format!("failed to persist Subagent start boundary: {error}"),
+                )
+            })?;
+        store
+            .deliver_pending_subagent_guidance(&control_identity, &framework_executor)
+            .map_err(|error| {
+                TaskDispatchFailure::failed(
+                    task_id.clone(),
+                    format!("failed to deliver queued Subagent guidance: {error}"),
+                )
+            })?;
+        Some((framework_identity, guard))
+    } else {
+        store
+            .record_subagent_assigned(
+                &run_id,
+                &task_id,
+                &execution_id,
+                &task.agent_role,
+                &task.title,
+                claim.revision,
+                attempt,
+                task.kind.is_read_only(),
+                app_owns_subagent_events,
+            )
+            .map_err(|error| {
+                TaskDispatchFailure::failed(
+                    task_id.clone(),
+                    format!("failed to persist Subagent start boundary: {error}"),
+                )
+            })?;
+        None
+    };
+    let framework_attempt_identity = controlled_attempt
+        .as_ref()
+        .map(|(identity, _guard)| identity.clone());
     let result = if is_read_only_task {
         tracing::info!(
             run_id = %run_id,
@@ -2312,6 +2365,12 @@ async fn execute_task(
             task_cancel.clone(),
             delegation_policy,
             trace_sink.clone(),
+            framework_attempt_identity.clone().ok_or_else(|| {
+                TaskDispatchFailure::failed(
+                    task_id.clone(),
+                    "read-only Subagent is missing its attempt identity",
+                )
+            })?,
         )
         .await;
         match dispatch_result {
@@ -2361,6 +2420,12 @@ async fn execute_task(
             task_cancel.clone(),
             delegation_policy,
             trace_sink.clone(),
+            framework_attempt_identity.ok_or_else(|| {
+                TaskDispatchFailure::failed(
+                    task_id.clone(),
+                    "writer Subagent is missing its attempt identity",
+                )
+            })?,
         )
         .await;
         match dispatch_result {
@@ -2938,6 +3003,7 @@ async fn run_readonly_subagent(
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
+    attempt_identity: echo_agent::agent::subagent::SubagentAttemptIdentity,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
     primary_agent
         .read_async(|agent| {
@@ -2948,6 +3014,7 @@ async fn run_readonly_subagent(
             let execution_id = execution_id.to_string();
             let message_id = message_id.map(|s| s.to_string());
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
+            let attempt_identity = attempt_identity.clone();
             Box::pin(async move {
                 let runtime_context = Some(echo_core::tools::ExternalRunContext {
                     conversation_id: None,
@@ -2961,7 +3028,7 @@ async fn run_readonly_subagent(
                     delegation_policy: Some(delegation_policy),
                 });
                 agent
-                    .delegate_to_agent_with_prompt_payload(
+                    .delegate_to_agent_attempt_with_prompt_payload(
                         &role,
                         &task_input,
                         &run_id,
@@ -2970,6 +3037,7 @@ async fn run_readonly_subagent(
                         runtime_context,
                         Some(allowed_tools),
                         Some(prompt_payload),
+                        attempt_identity,
                     )
                     .await
                     .map_err(|error| {
@@ -3030,6 +3098,7 @@ async fn run_writer_subagent(
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
+    attempt_identity: echo_agent::agent::subagent::SubagentAttemptIdentity,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer Subagent sees the same images/files as the primary agent would
@@ -3055,6 +3124,7 @@ async fn run_writer_subagent(
             let isolation_id = isolation_id.to_string();
             let run_message = run_message.clone();
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
+            let attempt_identity = attempt_identity.clone();
             Box::pin(async move {
                 let runtime_context = Some(echo_core::tools::ExternalRunContext {
                     conversation_id: conversation_id.clone(),
@@ -3069,7 +3139,7 @@ async fn run_writer_subagent(
                 });
                 if let Some(msg) = run_message {
                     agent
-                        .delegate_to_agent_with_message_and_prompt_payload(
+                        .delegate_to_agent_attempt_with_message_and_prompt_payload(
                             &role,
                             &task_input,
                             msg,
@@ -3079,11 +3149,12 @@ async fn run_writer_subagent(
                             runtime_context,
                             Some(allowed_tools.clone()),
                             Some(prompt_payload.clone()),
+                            attempt_identity,
                         )
                         .await
                 } else {
                     agent
-                        .delegate_to_agent_with_prompt_payload(
+                        .delegate_to_agent_attempt_with_prompt_payload(
                             &role,
                             &task_input,
                             &run_id,
@@ -3092,6 +3163,7 @@ async fn run_writer_subagent(
                             runtime_context,
                             Some(allowed_tools),
                             Some(prompt_payload),
+                            attempt_identity,
                         )
                         .await
                 }

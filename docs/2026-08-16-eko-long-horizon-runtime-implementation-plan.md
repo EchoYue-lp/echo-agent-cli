@@ -639,6 +639,30 @@ ts-rs 测试生成的非语义格式改写已用项目 Prettier 恢复，未进�
 下一切片为 application M2：把 framework `6d7d0cf` 的 exact-attempt message、next-attempt
 guidance 和 interrupt 接入 TaskRuntime 持久事件、幂等 command identity、控制层级与四 surface。
 
+### 15.5 Application M2 实现前门禁（2026-08-17）
+
+全仓库按 API 名、identity 字段、事件、执行调用点和 surface 命令重新搜索后的结论：
+
+- 通用机制继续由 `echo-agent` 唯一拥有：`SubagentExecutor::{send_message,
+  queue_guidance,interrupt_subagent}`、`SubagentAttemptIdentity`、attempt registry 和既有
+  `TurnSteerMailbox` 已在 `6d7d0cf` 真实可达；应用不得复制 mailbox/registry。
+- EKO 产品策略由 `echo-agent-app-core` 唯一拥有：`TaskRuntimeStore` 的 `events.jsonl` 是
+  command identity、plan revision、attempt、actor source、幂等结果与控制层级的事实权威。
+- 薄适配点是 `tasks/task_runtime/executor.rs`：当前 read-only/writer 主路径仍调用非 attempt
+  delegation API；M2 必须切换到框架 attempt API，并把实际 `SubagentExecutor` 作为短生命周期
+  控制目标注册到同一 store。adapter 不拥有 safe-point、取消算法或第二套重试循环。
+- future guidance 先持久化，精确 attempt 被派发时再一次性送入框架 queue；live message 和
+  interrupt 只解析当前 `SubagentAssigned` 投影并调用已注册的 exact executor。迟到的 plan、
+  attempt、execution id 或重复 command id 在持久层判定，不得投递到新 attempt。
+- GUI/TUI/CLI/channel 已共享 `TaskRuntimeStore`，但尚没有 Subagent 控制入口。四个 surface
+  只增加薄命令适配，统一调用 app-core service；`Pause`/`Cancel` 继续调用既有 run control，
+  `Shutdown` 继续走既有 BootRecovery settlement，不另建控制状态机。
+
+重复性结论：仓库中没有 `SubagentGuidanceQueued/Delivered/Rejected` 或
+`SubagentInterruptRequested/Settled` 事件，也没有 EKO durable Subagent control service；可新增
+这些应用概念。框架 API、主 Turn steer、run pause/cancel、Task DAG 与 plan validator 均已存在，
+必须复用，禁止平行实现。
+
 ## 16. 最终验收
 
 - 100 次上下文压缩后 `TaskRun.goal_sha256` 不漂移。

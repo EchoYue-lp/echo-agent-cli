@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import type { RuntimeTaskEvent, TaskPlan, TaskRun } from '../generated';
 import {
   ingestTaskRuntimeSubagentEvents,
+  latestSubagentRunsByTask,
   subagentRunStoreKey,
   useSubagentRunStore,
   type ExecutionEvent,
@@ -105,6 +106,33 @@ describe('subagentRunStore terminal result', () => {
       subagentRunStoreKey('run-retry', 'task-retry:1'),
       subagentRunStoreKey('run-retry', 'task-retry:2'),
     ]);
+  });
+
+  it('orders physical claim ids by their exact projected attempt', () => {
+    const base = {
+      kind: 'subagent' as const,
+      run_id: 'run-retry',
+      task_id: 'task-retry',
+      agent: 'explorer',
+      event: 'started' as const,
+    };
+    useSubagentRunStore.getState().ingest({
+      ...base,
+      subagent_run_id: 'run-retry:task-retry:4:1:claim-newer-timestamp',
+      plan_revision: 4,
+      attempt: 1,
+      started_at: 20,
+    });
+    useSubagentRunStore.getState().ingest({
+      ...base,
+      subagent_run_id: 'run-retry:task-retry:4:2:claim-older-timestamp',
+      plan_revision: 4,
+      attempt: 2,
+      started_at: 10,
+    });
+    const latest = latestSubagentRunsByTask(Object.values(useSubagentRunStore.getState().runs));
+    expect(latest).toHaveLength(1);
+    expect(latest[0]?.attempt).toBe(2);
   });
 
   it('isolates the same legacy execution id across separate TaskRuns', () => {

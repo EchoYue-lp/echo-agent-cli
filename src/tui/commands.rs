@@ -96,6 +96,9 @@ pub enum SlashCommand {
     TaskResume,
     TaskBudget,
     TaskGoal,
+    SubagentMessage,
+    SubagentFollowup,
+    SubagentInterrupt,
     TaskRecovery,
     TaskRetry,
     TaskSkip,
@@ -178,6 +181,9 @@ impl SlashCommand {
             Self::TaskResume => "Resume the current or specified task run",
             Self::TaskBudget => "Set token and time budgets for a task run",
             Self::TaskGoal => "Update the paused task run Goal with optimistic concurrency",
+            Self::SubagentMessage => "Send guidance to one exact active Subagent attempt",
+            Self::SubagentFollowup => "Queue guidance for one exact future Subagent attempt",
+            Self::SubagentInterrupt => "Interrupt one exact Subagent attempt",
             Self::TaskRecovery => "Show unresolved recovery barriers",
             Self::TaskRetry => "Confirm retry for an indeterminate task",
             Self::TaskSkip => "Skip an indeterminate task",
@@ -252,6 +258,9 @@ impl SlashCommand {
             | Self::TaskResume
             | Self::TaskBudget
             | Self::TaskGoal
+            | Self::SubagentMessage
+            | Self::SubagentFollowup
+            | Self::SubagentInterrupt
             | Self::TaskRecovery
             | Self::TaskRetry
             | Self::TaskSkip
@@ -303,6 +312,15 @@ impl SlashCommand {
             Self::TaskCancel | Self::TaskPause | Self::TaskResume => "[run-id]",
             Self::TaskBudget => "<tokens|none> <seconds|none> [run-id]",
             Self::TaskGoal => "<expected-revision> [run-id] --reason <reason> --goal <new-goal>",
+            Self::SubagentMessage => {
+                "<run-id> <task-id> <execution-id> <plan-revision> <attempt> <command-id> <instruction>"
+            }
+            Self::SubagentFollowup => {
+                "<run-id> <task-id> <execution-id> <plan-revision> <attempt> <command-id> <instruction>"
+            }
+            Self::SubagentInterrupt => {
+                "<run-id> <task-id> <execution-id> <plan-revision> <attempt> <command-id>"
+            }
             Self::TaskRecovery => "[run-id]",
             Self::TaskRetry | Self::TaskSkip => "<task-id> [run-id]",
             Self::Steer => "<instruction>",

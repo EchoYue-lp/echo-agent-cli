@@ -639,6 +639,16 @@ pub enum RuntimeEventKind {
     TimedOut,
     SubagentAssigned,
     SubagentReleased,
+    /// A user instruction was durably accepted for one exact Subagent attempt.
+    SubagentGuidanceQueued,
+    /// The framework accepted the instruction for live or next-attempt delivery.
+    SubagentGuidanceDelivered,
+    /// The exact target rejected an instruction; it was not rerouted.
+    SubagentGuidanceRejected,
+    /// A user requested cancellation of one exact Subagent attempt.
+    SubagentInterruptRequested,
+    /// The exact-attempt interrupt reached a typed framework outcome.
+    SubagentInterruptSettled,
     IsolationObserved,
     ThinkingStarted,
     ThinkingDelta,
@@ -711,6 +721,11 @@ impl RuntimeEventKind {
             TimedOut => "timed_out",
             SubagentAssigned => "subagent_assigned",
             SubagentReleased => "subagent_released",
+            SubagentGuidanceQueued => "subagent_guidance_queued",
+            SubagentGuidanceDelivered => "subagent_guidance_delivered",
+            SubagentGuidanceRejected => "subagent_guidance_rejected",
+            SubagentInterruptRequested => "subagent_interrupt_requested",
+            SubagentInterruptSettled => "subagent_interrupt_settled",
             IsolationObserved => "isolation_observed",
             ThinkingStarted => "thinking_started",
             ThinkingDelta => "thinking_delta",
@@ -757,6 +772,8 @@ impl RuntimeEventKind {
                 | RuntimeEventKind::TaskFailed
                 | RuntimeEventKind::TaskCancelled
                 | RuntimeEventKind::TaskTimedOut
+                | RuntimeEventKind::SubagentGuidanceRejected
+                | RuntimeEventKind::SubagentInterruptSettled
                 | RuntimeEventKind::Failed
                 | RuntimeEventKind::Cancelled
                 | RuntimeEventKind::TimedOut
@@ -796,6 +813,11 @@ impl RuntimeEventKind {
             "timed_out" => TimedOut,
             "subagent_assigned" => SubagentAssigned,
             "subagent_released" => SubagentReleased,
+            "subagent_guidance_queued" => SubagentGuidanceQueued,
+            "subagent_guidance_delivered" => SubagentGuidanceDelivered,
+            "subagent_guidance_rejected" => SubagentGuidanceRejected,
+            "subagent_interrupt_requested" => SubagentInterruptRequested,
+            "subagent_interrupt_settled" => SubagentInterruptSettled,
             "isolation_observed" => IsolationObserved,
             "thinking_started" => ThinkingStarted,
             "thinking_delta" => ThinkingDelta,
@@ -1805,8 +1827,93 @@ pub struct Artifact {
 // 不持有 executions 字段(避免污染 plan artifact)。
 //
 // `subagent_run_id` 与框架 SubagentEvent.execution_id 对齐(正式 PlanTask 格式
-// "{run_id}:{task_id}:{plan_revision}:{attempt}"),由 TaskRuntime 派发时生成并经
+// "{run_id}:{task_id}:{plan_revision}:{attempt}:{claim_id}"),由 TaskRuntime 派发时生成并经
 // ExternalRunContext 透传,不再由 tauri bridge 临时分配(消除双账本)。
+
+/// Product surface that issued an explicit Subagent control command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentControlActorSource")]
+pub enum SubagentControlActorSource {
+    Gui,
+    Tui,
+    Cli,
+    Channel,
+}
+
+impl SubagentControlActorSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gui => "gui",
+            Self::Tui => "tui",
+            Self::Cli => "cli",
+            Self::Channel => "channel",
+        }
+    }
+}
+
+/// Durable identity for one user control command and one exact task attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentControlIdentity")]
+pub struct SubagentControlIdentity {
+    pub run_id: String,
+    pub task_id: String,
+    pub execution_id: String,
+    #[ts(type = "number")]
+    pub plan_revision: u64,
+    pub attempt: u32,
+    pub command_id: String,
+}
+
+/// Whether guidance targets an already-active mailbox or one future attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentGuidanceKind")]
+pub enum SubagentGuidanceKind {
+    LiveMessage,
+    NextAttempt,
+}
+
+impl SubagentGuidanceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LiveMessage => "live_message",
+            Self::NextAttempt => "next_attempt",
+        }
+    }
+}
+
+/// Stable command status returned identically by GUI/TUI/CLI/channel adapters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentControlStatus")]
+pub enum SubagentControlStatus {
+    Pending,
+    Delivered,
+    Rejected,
+    Settled,
+}
+
+impl SubagentControlStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Delivered => "delivered",
+            Self::Rejected => "rejected",
+            Self::Settled => "settled",
+        }
+    }
+}
+
+/// Idempotent projection returned for a durable Subagent command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentControlReceipt")]
+pub struct SubagentControlReceipt {
+    pub identity: SubagentControlIdentity,
+    pub status: SubagentControlStatus,
+    pub detail: Option<String>,
+    pub framework_turn_id: Option<String>,
+}
 
 /// Lifecycle status of a [`SubagentRun`]. Mirrors the coarse states the
 /// frontend already renders for the unified subagent concept, minus the
@@ -2028,7 +2135,7 @@ pub struct SubagentRunUsage {
 #[ts(export, rename = "SubagentRun")]
 pub struct SubagentRun {
     /// Stable execution id. Formal PlanTasks use
-    /// "{run_id}:{task_id}:{plan_revision}:{attempt}". Aligns with
+    /// "{run_id}:{task_id}:{plan_revision}:{attempt}:{claim_id}". Aligns with
     /// `SubagentEvent::execution_id`.
     pub subagent_run_id: String,
     /// Parent [`TaskRun`] id.
