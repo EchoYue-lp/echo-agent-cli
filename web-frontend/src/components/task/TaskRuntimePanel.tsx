@@ -620,6 +620,7 @@ export function TaskRuntimePanel() {
     refresh,
     cancel,
     pause,
+    updateGoal,
     updateContinuationBudgets,
     resumeTaskRun,
     retryBlockedTask,
@@ -628,12 +629,21 @@ export function TaskRuntimePanel() {
   const [tokenBudgetInput, setTokenBudgetInput] = useState('');
   const [timeBudgetInput, setTimeBudgetInput] = useState('');
   const [budgetError, setBudgetError] = useState<string | null>(null);
+  const [goalInput, setGoalInput] = useState('');
+  const [goalReasonInput, setGoalReasonInput] = useState('');
+  const [goalError, setGoalError] = useState<string | null>(null);
 
   useEffect(() => {
     setTokenBudgetInput(continuation?.token_budget?.toString() ?? '');
     setTimeBudgetInput(continuation?.time_budget_seconds?.toString() ?? '');
     setBudgetError(null);
   }, [activeRun?.run_id, continuation?.token_budget, continuation?.time_budget_seconds]);
+
+  useEffect(() => {
+    setGoalInput(activeRun?.goal ?? '');
+    setGoalReasonInput('');
+    setGoalError(null);
+  }, [activeRun?.run_id, activeRun?.goal_revision, activeRun?.goal]);
 
   const visibleTraceRuns = useMemo(
     () =>
@@ -674,6 +684,8 @@ export function TaskRuntimePanel() {
   const currentTurn = continuation?.active_turn ?? continuation?.last_turn;
   const activeCellCount = backgroundCells.filter((cell) => cell.phase === 'running').length;
   const budgetLabels = continuation?.enabled ? continuationBudgetLabels(continuation) : null;
+  const planGoalCurrent =
+    plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;
   const applyBudgets = async () => {
     try {
       const tokenBudget = parseContinuationBudgetInput(tokenBudgetInput, 'Token 预算');
@@ -685,6 +697,16 @@ export function TaskRuntimePanel() {
         budgetInputError instanceof Error ? budgetInputError.message : String(budgetInputError)
       );
     }
+  };
+  const applyGoal = async () => {
+    const goal = goalInput.trim();
+    const reason = goalReasonInput.trim();
+    if (!goal || !reason) {
+      setGoalError('目标和修改原因不能为空');
+      return;
+    }
+    setGoalError(null);
+    await updateGoal(runId, activeRun.goal_revision, goal, reason);
   };
 
   return (
@@ -708,12 +730,71 @@ export function TaskRuntimePanel() {
       </div>
 
       <div
-        className="mb-2 truncate rounded-md px-2 py-1.5 text-[11px]"
+        className="mb-2 rounded-md px-2 py-1.5 text-[11px]"
         style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
         title={activeRun.goal}
       >
-        {activeRun.goal}
+        <div className="line-clamp-2 break-words">{activeRun.goal}</div>
+        <div className="mt-0.5 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+          Goal r{activeRun.goal_revision}
+        </div>
       </div>
+
+      {activeRun.status === 'paused' && (
+        <form
+          className="mb-2 space-y-1"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void applyGoal();
+          }}
+        >
+          <label className="block">
+            <span className="sr-only">任务目标</span>
+            <textarea
+              rows={2}
+              value={goalInput}
+              onChange={(event) => setGoalInput(event.target.value)}
+              className="w-full resize-none rounded-md px-2 py-1.5 text-[10px] outline-none"
+              style={{
+                background: 'var(--bg-primary)',
+                border: '1px solid var(--border-primary)',
+                color: 'var(--text-primary)',
+              }}
+            />
+          </label>
+          <div className="grid grid-cols-[minmax(0,1fr)_28px] gap-1">
+            <label className="min-w-0">
+              <span className="sr-only">修改原因</span>
+              <input
+                value={goalReasonInput}
+                onChange={(event) => setGoalReasonInput(event.target.value)}
+                placeholder="修改原因"
+                className="h-7 w-full min-w-0 rounded-md px-2 text-[10px] outline-none"
+                style={{
+                  background: 'var(--bg-primary)',
+                  border: '1px solid var(--border-primary)',
+                  color: 'var(--text-primary)',
+                }}
+              />
+            </label>
+            <button
+              type="submit"
+              className="flex h-7 w-7 items-center justify-center rounded-md"
+              style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
+              title="更新任务目标"
+              aria-label="更新任务目标"
+            >
+              <Save size={12} />
+            </button>
+          </div>
+          {goalError && <div style={{ color: 'var(--color-error)' }}>{goalError}</div>}
+          {!planGoalCurrent && (
+            <div className="text-[10px]" style={{ color: 'var(--color-warning)' }}>
+              任务图待绑定 Goal r{activeRun.goal_revision}
+            </div>
+          )}
+        </form>
+      )}
 
       {continuation?.enabled && (
         <div className="mb-2 space-y-1 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
@@ -812,8 +893,13 @@ export function TaskRuntimePanel() {
         <div className="mb-2">
           <button
             onClick={() => resumeTaskRun()}
+            disabled={!planGoalCurrent}
             className="flex w-full items-center justify-center gap-1 rounded-md px-3 py-1.5 text-[11px] font-medium"
-            style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
+            style={{
+              background: planGoalCurrent ? 'var(--accent)' : 'var(--bg-hover)',
+              color: planGoalCurrent ? 'var(--text-on-accent)' : 'var(--text-tertiary)',
+            }}
+            title={planGoalCurrent ? '继续执行' : '任务图尚未绑定当前目标'}
           >
             <Play size={12} /> 继续执行
           </button>

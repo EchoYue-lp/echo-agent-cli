@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   pauseRun: vi.fn(),
+  updateGoal: vi.fn(),
   configureContinuation: vi.fn(),
   resumeRun: vi.fn(),
   retryBlockedTask: vi.fn(),
@@ -40,6 +41,8 @@ function run(status: TaskRun['status']): TaskRun {
     domain_profile: 'ai_coding',
     status,
     goal: 'analyze project',
+    goal_revision: 1,
+    goal_sha256: 'goal-sha256',
     plan_id: 'plan-1',
     route: 'formal_plan',
     attended_mode: 'attended',
@@ -62,6 +65,12 @@ describe('taskRuntimeStore recovery controls', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.pauseRun.mockResolvedValue({ success: true, run_id: 'run-1' });
+    mocks.updateGoal.mockResolvedValue({
+      ...run('paused'),
+      goal: 'revised goal',
+      goal_revision: 2,
+      goal_sha256: 'revised-goal-sha256',
+    });
     mocks.configureContinuation.mockResolvedValue({
       enabled: true,
       token_budget: 200_000,
@@ -94,6 +103,13 @@ describe('taskRuntimeStore recovery controls', () => {
     await useTaskRuntimeStore.getState().updateContinuationBudgets('run-1', 200_000, null);
 
     expect(mocks.configureContinuation).toHaveBeenCalledWith('run-1', 200_000, null);
+    expect(refresh).toHaveBeenCalledWith('run-1');
+  });
+
+  it('updates the Goal with the exact revision and refreshes the canonical projection', async () => {
+    await useTaskRuntimeStore.getState().updateGoal('run-1', 1, 'revised goal', 'scope changed');
+
+    expect(mocks.updateGoal).toHaveBeenCalledWith('run-1', 1, 'revised goal', 'scope changed');
     expect(refresh).toHaveBeenCalledWith('run-1');
   });
 
@@ -215,6 +231,7 @@ describe('taskRuntimeStore conversation loading', () => {
       pause: null,
       blocker_audit: null,
       deferred: false,
+      deferred_reason: null,
     } satisfies RunContinuationState;
     mocks.latestRunForConversation.mockResolvedValueOnce(run('completed'));
     mocks.getContinuation.mockResolvedValueOnce(continuation);

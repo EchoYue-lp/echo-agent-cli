@@ -102,6 +102,7 @@ const serializedContinuation = {
     consecutive_turns: 3,
   },
   deferred: false,
+  deferred_reason: null,
 } satisfies RunContinuationState;
 
 const serializedWorkspaceTransition = {

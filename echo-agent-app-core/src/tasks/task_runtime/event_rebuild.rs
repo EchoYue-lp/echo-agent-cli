@@ -39,7 +39,8 @@ impl RebuiltPlan {
             run_id: self.plan.run_id.clone(),
             revision: self.plan.revision,
             domain_profile: self.plan.domain_profile,
-            goal: self.plan.goal.clone(),
+            goal_revision: self.plan.goal_revision,
+            goal_sha256: self.plan.goal_sha256.clone(),
             assumptions: self.plan.assumptions.clone(),
             risks: self.plan.risks.clone(),
             execution_mode: self.plan.execution_mode,
@@ -80,6 +81,11 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
         match ev.event_type {
             K::RunCreated => {
                 let p = &ev.payload;
+                let goal = p
+                    .get("goal")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 run = Some(TaskRun {
                     run_id: ev.run_id.clone(),
                     workspace_id: p
@@ -103,11 +109,16 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         .and_then(DomainProfile::from_str)
                         .unwrap_or_default(),
                     status: TaskRunStatus::Pending,
-                    goal: p
-                        .get("goal")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
+                    goal_revision: p
+                        .get("goal_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(1),
+                    goal_sha256: p
+                        .get("goal_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or_else(|| super::types::task_goal_sha256(&goal)),
+                    goal,
                     plan_id: None, // set by PlanRevisionCommitted below
                     route: p
                         .get("route")
@@ -126,6 +137,25 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                     created_at: parse_event_dt(p, "created_at", ev.timestamp),
                     updated_at: ev.timestamp,
                 });
+            }
+            K::RunGoalUpdated => {
+                if let Some(r) = run.as_mut()
+                    && let (Some(new_goal), Some(new_revision), Some(new_sha256)) = (
+                        json_string(&ev.payload, "new_goal"),
+                        ev.payload
+                            .get("new_goal_revision")
+                            .and_then(serde_json::Value::as_u64),
+                        json_string(&ev.payload, "new_goal_sha256"),
+                    )
+                {
+                    r.goal = new_goal;
+                    r.goal_revision = new_revision;
+                    r.goal_sha256 = new_sha256;
+                    r.updated_at = parse_event_dt(&ev.payload, "updated_at", ev.timestamp);
+                }
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                state.deferred = true;
+                state.deferred_reason = json_string(&ev.payload, "continuation_deferred_reason");
             }
             K::RunStatusChanged => {
                 if let Some(r) = run.as_mut() {
@@ -209,7 +239,8 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         run_id: committed.run_id,
                         revision: committed.revision,
                         domain_profile: committed.domain_profile,
-                        goal: committed.goal,
+                        goal_revision: committed.goal_revision,
+                        goal_sha256: committed.goal_sha256,
                         assumptions: committed.assumptions,
                         risks: committed.risks,
                         execution_mode: committed.execution_mode,
@@ -520,13 +551,14 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                 }
             }
             K::RunContinuationDeferred => {
-                continuation
-                    .get_or_insert_with(RunContinuationState::default)
-                    .deferred = true;
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                state.deferred = true;
+                state.deferred_reason = json_string(&ev.payload, "reason");
             }
             K::RunContinuationResumed => {
                 let state = continuation.get_or_insert_with(RunContinuationState::default);
                 state.deferred = false;
+                state.deferred_reason = None;
                 state.blocker_audit = None;
             }
             K::RunPauseReasonChanged => {
@@ -592,7 +624,8 @@ fn empty_plan_for(run: &TaskRun) -> TaskPlan {
         run_id: run.run_id.clone(),
         revision: 0,
         domain_profile: run.domain_profile,
-        goal: run.goal.clone(),
+        goal_revision: run.goal_revision,
+        goal_sha256: run.goal_sha256.clone(),
         assumptions: Vec::new(),
         risks: Vec::new(),
         execution_mode: ExecutionMode::default(),
@@ -669,7 +702,8 @@ mod tests {
             run_id: "r1".to_string(),
             revision: 1,
             domain_profile: DomainProfile::AiCoding,
-            goal: "review runtime".to_string(),
+            goal_revision: 1,
+            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("review runtime"),
             assumptions: vec!["repo is small".to_string()],
             risks: vec!["flaky tests".to_string()],
             execution_mode: ExecutionMode::Parallel,
@@ -706,7 +740,8 @@ mod tests {
         // 8. Assert plan envelope parity.
         assert_eq!(rebuilt.plan.plan_id, sql_plan.plan_id);
         assert_eq!(rebuilt.plan.domain_profile, sql_plan.domain_profile);
-        assert_eq!(rebuilt.plan.goal, sql_plan.goal);
+        assert_eq!(rebuilt.plan.goal_revision, sql_plan.goal_revision);
+        assert_eq!(rebuilt.plan.goal_sha256, sql_plan.goal_sha256);
         assert_eq!(rebuilt.plan.assumptions, sql_plan.assumptions);
         assert_eq!(rebuilt.plan.risks, sql_plan.risks);
         assert_eq!(rebuilt.plan.execution_mode, sql_plan.execution_mode);
@@ -753,7 +788,8 @@ mod tests {
             run_id: "r1".to_string(),
             revision: 1,
             domain_profile: DomainProfile::General,
-            goal: "g".to_string(),
+            goal_revision: 1,
+            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("g"),
             assumptions: Vec::new(),
             risks: Vec::new(),
             execution_mode: ExecutionMode::Parallel,

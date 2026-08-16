@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod logging;
+pub mod task_run_control;
 
 #[cfg(feature = "gui")]
 // `#[tauri::command]` expands to dispatch glue containing `unreachable!()`.

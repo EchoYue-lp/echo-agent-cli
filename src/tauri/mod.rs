@@ -112,6 +112,7 @@ pub fn build_tauri_app(
             commands::task_runtime::get_task_run,
             commands::task_runtime::get_task_continuation,
             commands::task_runtime::configure_task_continuation,
+            commands::task_runtime::update_task_run_goal,
             commands::task_runtime::list_task_background_cells,
             commands::task_runtime::latest_task_run_for_conversation,
             commands::task_runtime::list_task_runs,

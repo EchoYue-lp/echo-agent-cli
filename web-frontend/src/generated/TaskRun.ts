@@ -15,6 +15,8 @@ export type TaskRun = {
   domain_profile: DomainProfile;
   status: TaskRunStatus;
   goal: string;
+  goal_revision: number;
+  goal_sha256: string;
   plan_id: string | null;
   route: string;
   /**

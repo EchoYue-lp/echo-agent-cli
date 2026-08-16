@@ -66,15 +66,15 @@ pub(crate) struct EkoCommandCellRegistry {
 }
 
 impl EkoCommandCellRegistry {
-    fn new(sandbox: Arc<SandboxManager>) -> Self {
+    fn new(sandbox: Arc<SandboxManager>) -> Result<Self, String> {
         let executor: Arc<dyn SandboxExecutor> = sandbox;
-        Self {
+        Ok(Self {
             inner: Arc::new(BackgroundCommandManager::new_with_sandbox(
                 BackgroundCommandManagerConfig::default(),
                 executor,
-            )),
+            )?),
             cells_by_run: Arc::new(RwLock::new(HashMap::new())),
-        }
+        })
     }
 
     fn track(&self, run_id: &str, cell_id: &str) {
@@ -114,23 +114,28 @@ impl EkoCommandCellRegistry {
     }
 }
 
-static SHARED_COMMAND_CELLS: OnceLock<Arc<EkoCommandCellRegistry>> = OnceLock::new();
+static SHARED_COMMAND_CELLS: OnceLock<Result<Arc<EkoCommandCellRegistry>, String>> =
+    OnceLock::new();
 
 /// One process-scoped registry shared by every primary/subagent generation.
 /// Model or workspace rebinding must not invalidate already-running cells.
-pub(crate) fn shared_command_cells(sandbox: Arc<SandboxManager>) -> Arc<dyn CommandCellRegistry> {
+pub(crate) fn shared_command_cells(
+    sandbox: Arc<SandboxManager>,
+) -> Result<Arc<dyn CommandCellRegistry>, String> {
     SHARED_COMMAND_CELLS
-        .get_or_init(|| Arc::new(EkoCommandCellRegistry::new(sandbox)))
+        .get_or_init(|| EkoCommandCellRegistry::new(sandbox).map(Arc::new))
         .clone()
+        .map(|registry| registry as Arc<dyn CommandCellRegistry>)
 }
 
 /// Explicit TaskRuntime cancellation kills every process-scoped cell owned by
 /// the run. Pause intentionally does not call this path.
-pub(crate) fn stop_cells_for_run(run_id: &str) -> usize {
-    SHARED_COMMAND_CELLS
-        .get()
-        .map(|registry| registry.stop_run(run_id))
-        .unwrap_or(0)
+pub(crate) fn stop_cells_for_run(run_id: &str) -> Result<usize, String> {
+    match SHARED_COMMAND_CELLS.get() {
+        Some(Ok(registry)) => Ok(registry.stop_run(run_id)),
+        Some(Err(error)) => Err(error.clone()),
+        None => Ok(0),
+    }
 }
 
 /// Install the Task/Auto-safe awaiter dispatch surface. It delegates to the

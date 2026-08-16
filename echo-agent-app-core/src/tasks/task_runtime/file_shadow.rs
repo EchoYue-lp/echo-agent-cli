@@ -248,6 +248,7 @@ impl FileTaskShadow {
         let affects_run_state = matches!(
             latest.event_type,
             RuntimeEventKind::RunCreated
+                | RuntimeEventKind::RunGoalUpdated
                 | RuntimeEventKind::RunStatusChanged
                 | RuntimeEventKind::RunAttachmentsUpdated
                 | RuntimeEventKind::RunCancelled
@@ -570,7 +571,8 @@ mod tests {
             run_id: "r1".to_string(),
             revision: 1,
             domain_profile: DomainProfile::AiCoding,
-            goal: "review runtime".to_string(),
+            goal_revision: 1,
+            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("review runtime"),
             assumptions: vec!["small repo".to_string()],
             risks: vec!["flaky tests".to_string()],
             execution_mode: ExecutionMode::Parallel,
@@ -737,7 +739,8 @@ mod tests {
             run_id: "r1".to_string(),
             revision: 1,
             domain_profile: DomainProfile::General,
-            goal: "g".to_string(),
+            goal_revision: 1,
+            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("g"),
             assumptions: Vec::new(),
             risks: Vec::new(),
             execution_mode: ExecutionMode::Parallel,
@@ -816,7 +819,8 @@ mod tests {
                 run_id: rid.to_string(),
                 revision: 1,
                 domain_profile: DomainProfile::AiCoding,
-                goal: format!("goal {rid}"),
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256(&format!("goal {rid}")),
                 assumptions: Vec::new(),
                 risks: Vec::new(),
                 execution_mode: ExecutionMode::Parallel,
@@ -904,7 +908,8 @@ mod tests {
                         run_id: "r1".to_string(),
                         revision: 1,
                         domain_profile: DomainProfile::General,
-                        goal: "g".to_string(),
+                        goal_revision: 1,
+                        goal_sha256: crate::tasks::task_runtime::task_goal_sha256("g"),
                         assumptions: Vec::new(),
                         risks: Vec::new(),
                         execution_mode: ExecutionMode::Parallel,

@@ -47,6 +47,16 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
         ],
     },
     CapabilityRow {
+        capability: "explicit_goal_update",
+        evidence: [
+            "paused TaskRuntime Goal editor",
+            "/task-goal",
+            "/task-goal",
+            "/task-goal",
+            "N/A: only an explicit interactive user may update a Goal",
+        ],
+    },
+    CapabilityRow {
         capability: "foreground_background_cron",
         evidence: [
             "task and scheduler panels",
@@ -141,7 +151,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
 #[test]
 fn capability_matrix_has_evidence_for_every_surface() {
     assert_eq!(ProductSurface::ALL.len(), 5);
-    assert_eq!(CAPABILITY_MATRIX.len(), 11);
+    assert_eq!(CAPABILITY_MATRIX.len(), 12);
     for row in CAPABILITY_MATRIX {
         assert!(!row.capability.trim().is_empty());
         assert_eq!(row.evidence.len(), ProductSurface::ALL.len());

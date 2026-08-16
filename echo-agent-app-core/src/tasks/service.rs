@@ -351,7 +351,8 @@ impl BackgroundTaskService {
                 run_id: run_id.clone(),
                 revision: 1,
                 domain_profile: DomainProfile::General,
-                goal: goal.to_string(),
+                goal_revision: 1,
+                goal_sha256: super::task_runtime::task_goal_sha256(goal),
                 assumptions: Vec::new(),
                 risks: Vec::new(),
                 execution_mode: ExecutionMode::default(),
@@ -1033,7 +1034,8 @@ mod tests {
                 run_id: run_id.to_string(),
                 revision: 1,
                 domain_profile: DomainProfile::General,
-                goal: "retry run".to_string(),
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256("retry run"),
                 assumptions: Vec::new(),
                 risks: Vec::new(),
                 execution_mode: ExecutionMode::Sequential,
@@ -1230,7 +1232,8 @@ mod tests {
                 run_id: "retry-run".to_string(),
                 revision: 1,
                 domain_profile: DomainProfile::General,
-                goal: "retry run".to_string(),
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256("retry run"),
                 assumptions: Vec::new(),
                 risks: Vec::new(),
                 execution_mode: ExecutionMode::Sequential,
@@ -1371,6 +1374,24 @@ mod tests {
                 "bg:kind:test",
                 AttendedMode::Unattended,
             )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: "run-plan".to_string(),
+                run_id: "run".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256("goal"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "run-task".to_string(),
+                    title: "Resume after recovery".to_string(),
+                    ..Default::default()
+                }],
+            })
             .map_err(|error| error.to_string())?;
         store
             .transition_run("run", TaskRunStatus::Running)

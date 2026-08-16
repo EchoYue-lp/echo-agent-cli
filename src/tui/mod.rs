@@ -230,6 +230,7 @@ pub struct QueuedTurn {
 pub struct TaskRuntimeView {
     pub run_id: String,
     pub goal: String,
+    pub goal_revision: u64,
     pub status: String,
     pub continuation_enabled: bool,
     pub turn_ordinal: Option<u64>,

@@ -235,6 +235,32 @@ impl AppChannelMessageHandler {
     ) -> Option<ChannelTaskRunControl> {
         let mut parts = message.split_whitespace();
         let command = parts.next()?;
+        if command == "/task-goal" {
+            let values = parts.collect::<Vec<_>>();
+            let parsed = match crate::task_run_control::parse_run_goal_update_args(&values) {
+                Ok(parsed) => parsed,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
+            let (store, snapshot) =
+                match self.current_task_run(conv, parsed.requested_run_id.as_deref()) {
+                    Ok(value) => value,
+                    Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+                };
+            let reply = match store.update_run_goal(
+                &snapshot.run.run_id,
+                parsed.expected_goal_revision,
+                &parsed.new_goal,
+                &parsed.reason,
+                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Channel,
+            ) {
+                Ok(run) => format!(
+                    "TaskRun {} Goal updated to revision {}; update its task graph before resuming.",
+                    run.run_id, run.goal_revision
+                ),
+                Err(error) => format!("Unable to update TaskRun Goal: {error}"),
+            };
+            return Some(ChannelTaskRunControl::Reply(reply));
+        }
         let (action, budget_values, requested_run_id) = match command {
             "/task-run" => {
                 let action = parts.next().unwrap_or("status");
@@ -535,7 +561,10 @@ fn format_channel_task_run_status(
             snapshot.run.run_id,
             snapshot.run.status.as_str()
         ),
-        format!("Goal: {}", snapshot.run.goal),
+        format!(
+            "Goal r{}: {}",
+            snapshot.run.goal_revision, snapshot.run.goal
+        ),
     ];
     if let Some(continuation) = snapshot.continuation.as_ref() {
         let token_budget = continuation

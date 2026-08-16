@@ -16,7 +16,8 @@ export type TaskPlan = {
    */
   revision: number;
   domain_profile: DomainProfile;
-  goal: string;
+  goal_revision: number;
+  goal_sha256: string;
   assumptions: Array<string>;
   risks: Array<string>;
   execution_mode: ExecutionMode;

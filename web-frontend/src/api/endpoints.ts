@@ -572,6 +572,19 @@ export const taskRuntimeApi = {
           token_budget: tokenBudget,
           time_budget_seconds: timeBudgetSeconds,
         }),
+  updateGoal: (runId: string, expectedGoalRevision: number, newGoal: string, reason: string) =>
+    isTauri()
+      ? apiInvoke<TaskRun>('update_task_run_goal', {
+          runId,
+          expectedGoalRevision,
+          newGoal,
+          reason,
+        })
+      : post<TaskRun>(`/task_runtime/runs/${runId}/goal`, {
+          expected_goal_revision: expectedGoalRevision,
+          new_goal: newGoal,
+          reason,
+        }),
   listBackgroundCells: (runId: string) =>
     isTauri()
       ? apiInvoke<BackgroundCellState[]>('list_task_background_cells', { runId })

@@ -419,7 +419,7 @@ pub async fn create_agent_with_diagnostics(
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
     let command_cells =
-        crate::tasks::task_runtime::command_cells::shared_command_cells(sandbox_manager.clone());
+        crate::tasks::task_runtime::command_cells::shared_command_cells(sandbox_manager.clone())?;
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
     let subagent_registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
@@ -2812,10 +2812,12 @@ mod resolve_subagent_model_tests {
     use echo_agent::sandbox::SandboxManager;
     use std::sync::Arc;
 
-    fn test_command_cells() -> Arc<dyn echo_agent::tools::cell::CommandCellRegistry> {
+    fn test_command_cells()
+    -> echo_agent::error::Result<Arc<dyn echo_agent::tools::cell::CommandCellRegistry>> {
         crate::tasks::task_runtime::command_cells::shared_command_cells(Arc::new(
             SandboxManager::local_sandbox(),
         ))
+        .map_err(echo_agent::error::ReactError::Other)
     }
 
     #[test]
@@ -2968,7 +2970,7 @@ mod resolve_subagent_model_tests {
             Arc::new(SubagentRegistry::new()),
             None,
             sandbox,
-            test_command_cells(),
+            test_command_cells()?,
             true,
         )?;
 
@@ -3011,7 +3013,7 @@ mod resolve_subagent_model_tests {
             Arc::new(SubagentRegistry::new()),
             None,
             Arc::new(SandboxManager::local_sandbox()),
-            test_command_cells(),
+            test_command_cells()?,
             true,
         )?;
 
@@ -3048,7 +3050,7 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
             Arc::new(SubagentRegistry::new()),
             None,
-            test_command_cells(),
+            test_command_cells()?,
         )?;
         assert_eq!(subagent.thinking(), Some(&low));
 
@@ -3071,14 +3073,14 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
             Arc::new(SubagentRegistry::new()),
             None,
-            test_command_cells(),
+            test_command_cells()?,
         )?;
         assert!(plain.thinking().is_none());
         Ok(())
     }
 
     #[test]
-    fn readonly_and_writer_subagents_share_cell_tools() {
+    fn readonly_and_writer_subagents_share_cell_tools() -> echo_agent::error::Result<()> {
         // C2b:两个构建路径都注入进程级共享 cell registry——readonly 子智能体
         // (如 awaiter)没有 shell,但必须拥有 wait/stop_cell/list_cells。
         let readonly = build_readonly_subagent_agent(
@@ -3099,9 +3101,8 @@ mod resolve_subagent_model_tests {
             Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
             Arc::new(SubagentRegistry::new()),
             None,
-            test_command_cells(),
-        )
-        .unwrap_or_else(|error| panic!("readonly build failed: {error}"));
+            test_command_cells()?,
+        )?;
         let readonly_names = readonly.tool_names();
         for expected in ["wait", "stop_cell", "list_cells"] {
             assert!(
@@ -3113,6 +3114,7 @@ mod resolve_subagent_model_tests {
             !readonly_names.contains(&"shell".to_string()),
             "readonly subagent must not gain shell: {readonly_names:?}"
         );
+        Ok(())
     }
 
     #[test]

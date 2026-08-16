@@ -4740,6 +4740,47 @@ async fn handle_slash_command(
             });
             refresh_task_runtime_view(app);
         }
+        Some(SlashCommand::TaskGoal) => {
+            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let values = args.split_whitespace().collect::<Vec<_>>();
+            let result =
+                crate::task_run_control::parse_run_goal_update_args(&values).and_then(|parsed| {
+                    let run_id = parsed.requested_run_id.or_else(|| {
+                        app.task_runtime_view
+                            .as_ref()
+                            .map(|view| view.run_id.clone())
+                    });
+                    let run_id = run_id.ok_or_else(|| {
+                        "No active task run. Supply a run id explicitly.".to_string()
+                    })?;
+                    store
+                        .update_run_goal(
+                            &run_id,
+                            parsed.expected_goal_revision,
+                            &parsed.new_goal,
+                            &parsed.reason,
+                            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                        )
+                        .map_err(|error| error.to_string())
+                });
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(run) => format!(
+                        "Task run {} Goal updated to revision {}; update its task graph before resuming.",
+                        run.run_id, run.goal_revision
+                    ),
+                    Err(error) => format!("Task Goal update failed: {error}"),
+                },
+            });
+            refresh_task_runtime_view(app);
+        }
         Some(SlashCommand::TaskRecovery) => {
             let Some(store) = app.task_runtime_store.as_ref() else {
                 app.messages.push(ChatMessage {
@@ -5415,6 +5456,7 @@ fn refresh_task_runtime_view(app: &mut TuiApp) {
     app.task_runtime_view = Some(TaskRuntimeView {
         run_id: run.run_id,
         goal: run.goal,
+        goal_revision: run.goal_revision,
         status: run.status.as_str().to_string(),
         continuation_enabled: continuation.as_ref().is_some_and(|state| state.enabled),
         turn_ordinal: continuation
@@ -5491,7 +5533,10 @@ fn format_pause_reason(reason: &str) -> &str {
 }
 
 fn format_task_runtime_view(view: &TaskRuntimeView) -> String {
-    let mut content = format!("Run {} [{}]\nGoal: {}", view.run_id, view.status, view.goal);
+    let mut content = format!(
+        "Run {} [{}]\nGoal r{}: {}",
+        view.run_id, view.status, view.goal_revision, view.goal
+    );
     if view.continuation_enabled {
         let turn = view
             .turn_ordinal
@@ -6119,7 +6164,10 @@ mod tests {
                 run_id: "tui-retry-closed".to_string(),
                 revision: 1,
                 domain_profile: DomainProfile::General,
-                goal: "preserve retry state".to_string(),
+                goal_revision: 1,
+                goal_sha256: echo_agent_app_core::tasks::task_runtime::task_goal_sha256(
+                    "preserve retry state",
+                ),
                 assumptions: Vec::new(),
                 risks: Vec::new(),
                 execution_mode: ExecutionMode::Sequential,
@@ -6674,6 +6722,7 @@ mod tests {
         let view = TaskRuntimeView {
             run_id: "run-1".to_string(),
             goal: "补齐 TUI".to_string(),
+            goal_revision: 3,
             status: "running".to_string(),
             continuation_enabled: true,
             turn_ordinal: Some(4),
@@ -6706,6 +6755,7 @@ mod tests {
         let view = TaskRuntimeView {
             run_id: "run-time-budget".to_string(),
             goal: "finish within the configured time".to_string(),
+            goal_revision: 1,
             status: "paused".to_string(),
             continuation_enabled: true,
             turn_ordinal: Some(8),

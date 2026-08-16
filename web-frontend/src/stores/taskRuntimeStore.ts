@@ -113,6 +113,12 @@ export interface TaskRuntimeState {
   loadByConversation: (conversationId: string) => Promise<void>;
   cancel: (runId: string) => Promise<void>;
   pause: (runId: string) => Promise<void>;
+  updateGoal: (
+    runId: string,
+    expectedRevision: number,
+    goal: string,
+    reason: string
+  ) => Promise<void>;
   updateContinuationBudgets: (
     runId: string,
     tokenBudget: number | null,
@@ -325,6 +331,16 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       await taskRuntimeApi.pauseRun(runId);
       await get().refresh(runId);
     } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  updateGoal: async (runId, expectedRevision, goal, reason) => {
+    try {
+      await taskRuntimeApi.updateGoal(runId, expectedRevision, goal, reason);
+      await get().refresh(runId);
+    } catch (e) {
+      await get().refresh(runId);
       set({ error: e instanceof Error ? e.message : String(e) });
     }
   },

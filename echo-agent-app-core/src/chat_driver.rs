@@ -553,7 +553,8 @@ impl PreparedChatExecution {
                     );
                     crate::tasks::task_runtime::command_cells::stop_cells_for_run(
                         &self.formal_run_id,
-                    );
+                    )
+                    .map_err(|error| error.to_string())?;
                     Ok(())
                 } else {
                     store
@@ -1088,7 +1089,8 @@ fn finalize_run_turn(
             store
                 .transition_run(run_id, TaskRunStatus::Cancelled)
                 .map_err(|error| error.to_string())?;
-            crate::tasks::task_runtime::command_cells::stop_cells_for_run(run_id);
+            crate::tasks::task_runtime::command_cells::stop_cells_for_run(run_id)
+                .map_err(|error| error.to_string())?;
             if let Some(trace_sink) = trace_sink {
                 trace_sink(ExecEvent::run(
                     run_id.to_string(),
@@ -2568,6 +2570,26 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         store
+            .attach_plan_for_test(&crate::tasks::task_runtime::TaskPlan {
+                plan_id: "existing-goal-plan".to_string(),
+                run_id: "existing-goal".to_string(),
+                revision: 1,
+                domain_profile: crate::tasks::task_runtime::DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256(
+                    "preserve this exact goal",
+                ),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: crate::tasks::task_runtime::ExecutionMode::Sequential,
+                tasks: vec![crate::tasks::task_runtime::PlanTask {
+                    id: "existing-goal-task".to_string(),
+                    title: "Continue the goal".to_string(),
+                    ..Default::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
             .transition_run(
                 "existing-goal",
                 crate::tasks::task_runtime::TaskRunStatus::Running,
@@ -3278,7 +3300,8 @@ mod tests {
                 run_id: run_id.clone(),
                 revision: 1,
                 domain_profile: DomainProfile::General,
-                goal: "boundary goal".to_string(),
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256("boundary goal"),
                 assumptions: Vec::new(),
                 risks: Vec::new(),
                 execution_mode: ExecutionMode::Sequential,

@@ -8,6 +8,7 @@
  */
 export type RuntimeEventKind =
   | 'run_created'
+  | 'run_goal_updated'
   | 'run_started'
   | 'run_completed'
   | 'run_failed'

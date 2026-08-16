@@ -47,6 +47,25 @@ pub enum StoreError {
         expected: u64,
         current: u64,
     },
+    #[error("goal revision conflict for run {run_id}: expected {expected}, current {current}")]
+    GoalConflict {
+        run_id: String,
+        expected: u64,
+        current: u64,
+    },
+    #[error("goal update rejected for run {run_id}: {reason}")]
+    GoalUpdateRejected { run_id: String, reason: String },
+    #[error(
+        "plan revision {plan_revision} for run {run_id} is bound to goal revision {plan_goal_revision}, current goal revision is {run_goal_revision}"
+    )]
+    PlanGoalMismatch {
+        run_id: String,
+        plan_revision: u64,
+        plan_goal_revision: u64,
+        run_goal_revision: u64,
+    },
+    #[error("command cell registry: {0}")]
+    CommandCell(String),
     #[error("file shadow: {0}")]
     Shadow(#[from] super::file_shadow::ShadowError),
     #[error("run {run_id} has unresolved recovery barriers: {details}")]
@@ -2129,6 +2148,7 @@ impl TaskRuntimeStore {
             }
 
             let now = Utc::now();
+            let goal_sha256 = task_goal_sha256(goal);
             let run = TaskRun {
                 run_id: run_id.to_string(),
                 workspace_id: workspace_id.to_string(),
@@ -2137,6 +2157,8 @@ impl TaskRuntimeStore {
                 domain_profile,
                 status: TaskRunStatus::Pending,
                 goal: goal.to_string(),
+                goal_revision: 1,
+                goal_sha256: goal_sha256.clone(),
                 plan_id: None,
                 route: route.to_string(),
                 attended_mode,
@@ -2155,6 +2177,8 @@ impl TaskRuntimeStore {
                 RuntimeEventKind::RunCreated,
                 serde_json::json!({
                     "goal": goal,
+                    "goal_revision": run.goal_revision,
+                    "goal_sha256": goal_sha256,
                     "domain_profile": domain_profile.as_str(),
                     "workspace_id": run.workspace_id,
                     "conversation_id": run.conversation_id,
@@ -2166,6 +2190,133 @@ impl TaskRuntimeStore {
             )?;
             self.shadow.rewrite_plan(&run.run_id)?;
             Ok(run)
+        })
+    }
+
+    /// Replace the sole authoritative Goal after an explicit local-user action.
+    ///
+    /// The event append is the transaction: its fold updates the Goal and keeps
+    /// continuation deferred until a new Plan revision binds the new Goal.
+    pub fn update_run_goal(
+        &self,
+        run_id: &str,
+        expected_goal_revision: u64,
+        new_goal: &str,
+        reason: &str,
+        actor_source: RunGoalActorSource,
+    ) -> Result<TaskRun, StoreError> {
+        let actor_user_id = crate::infra::load_or_create_cache_user_id();
+        self.with_run_lock(run_id, || {
+            if new_goal.trim().is_empty() {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "new goal must not be empty".to_string(),
+                });
+            }
+            if reason.trim().is_empty() {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "update reason must not be empty".to_string(),
+                });
+            }
+            if actor_user_id.trim().is_empty() {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "local user identity is unavailable".to_string(),
+                });
+            }
+
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if run.goal_revision != expected_goal_revision {
+                return Err(StoreError::GoalConflict {
+                    run_id: run_id.to_string(),
+                    expected: expected_goal_revision,
+                    current: run.goal_revision,
+                });
+            }
+            if run.status != TaskRunStatus::Paused {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: format!(
+                        "run must be paused, current status is {}",
+                        run.status.as_str()
+                    ),
+                });
+            }
+            if self.is_run_active(run_id) {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "run still has an active driver".to_string(),
+                });
+            }
+
+            let new_goal_sha256 = task_goal_sha256(new_goal);
+            if new_goal_sha256 == run.goal_sha256 {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "new goal is unchanged".to_string(),
+                });
+            }
+            let new_goal_revision =
+                run.goal_revision
+                    .checked_add(1)
+                    .ok_or_else(|| StoreError::GoalUpdateRejected {
+                        run_id: run_id.to_string(),
+                        reason: "goal revision overflow".to_string(),
+                    })?;
+
+            if self
+                .get_run_state(run_id)?
+                .and_then(|state| state.continuation)
+                .and_then(|state| state.active_turn)
+                .is_some()
+            {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "run still has an active RunTurn".to_string(),
+                });
+            }
+            if !self.active_subagent_boundaries(run_id)?.is_empty() {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "run still has an active Subagent attempt".to_string(),
+                });
+            }
+            if self
+                .list_background_cells(run_id)?
+                .iter()
+                .any(BackgroundCellState::is_active)
+            {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "run still has an active command cell".to_string(),
+                });
+            }
+
+            let updated_at = Utc::now();
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunGoalUpdated,
+                serde_json::json!({
+                    "old_goal_revision": run.goal_revision,
+                    "new_goal_revision": new_goal_revision,
+                    "old_goal_sha256": run.goal_sha256,
+                    "new_goal_sha256": new_goal_sha256,
+                    "new_goal": new_goal,
+                    "reason": reason,
+                    "actor_source": actor_source.as_str(),
+                    "actor_user_id": actor_user_id,
+                    "updated_at": echo_agent::utils::time::to_local(updated_at).to_rfc3339(),
+                    "continuation_deferred_reason": "goal_revision_unbound",
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            self.get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))
         })
     }
 
@@ -2311,6 +2462,10 @@ impl TaskRuntimeStore {
             let mut run = self
                 .get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            validate_plan_goal_binding(&run, &plan)?;
             if let Some(continuation) = self
                 .get_run_state(run_id)?
                 .and_then(|snapshot| snapshot.continuation)
@@ -2392,6 +2547,7 @@ impl TaskRuntimeStore {
             let plan = self
                 .get_plan(run_id)?
                 .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            validate_plan_goal_binding(&run, &plan)?;
             if plan
                 .tasks
                 .iter()
@@ -2535,7 +2691,7 @@ impl TaskRuntimeStore {
         let _operation = self.shadow_operation()?;
         if self.cancel_active_run(run_id) {
             super::continuation::clear_launcher(self, run_id);
-            super::command_cells::stop_cells_for_run(run_id);
+            super::command_cells::stop_cells_for_run(run_id).map_err(StoreError::CommandCell)?;
             return Ok(true);
         }
         let Some(run) = self.get_run(run_id)? else {
@@ -2545,13 +2701,15 @@ impl TaskRuntimeStore {
             TaskRunStatus::Pending | TaskRunStatus::Paused | TaskRunStatus::Failed => {
                 self.transition_run(run_id, TaskRunStatus::Cancelled)?;
                 super::continuation::clear_launcher(self, run_id);
-                super::command_cells::stop_cells_for_run(run_id);
+                super::command_cells::stop_cells_for_run(run_id)
+                    .map_err(StoreError::CommandCell)?;
                 Ok(true)
             }
             TaskRunStatus::Running => {
                 self.transition_run(run_id, TaskRunStatus::Cancelled)?;
                 super::continuation::clear_launcher(self, run_id);
-                super::command_cells::stop_cells_for_run(run_id);
+                super::command_cells::stop_cells_for_run(run_id)
+                    .map_err(StoreError::CommandCell)?;
                 Ok(true)
             }
             TaskRunStatus::Cancelled | TaskRunStatus::Completed => Ok(false),
@@ -2654,6 +2812,8 @@ impl TaskRuntimeStore {
             validate_runtime_plan(&plan.tasks)?;
             let mut committed = plan.clone();
             committed.revision = 1;
+            committed.goal_revision = run.goal_revision;
+            committed.goal_sha256 = run.goal_sha256;
             self.shadow.append_event_line(
                 plan.run_id.as_str(),
                 None,
@@ -2685,6 +2845,7 @@ impl TaskRuntimeStore {
             .shadow
             .read_run_state(run_id)?
             .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        let run = state.run.clone();
         let mut executions = state
             .tasks
             .into_iter()
@@ -2728,6 +2889,8 @@ impl TaskRuntimeStore {
         let context_metadata = serde_json::to_value(EkoPlanMetadata {
             plan_id: plan.plan_id,
             domain_profile: plan.domain_profile,
+            goal_revision: plan.goal_revision,
+            goal_sha256: plan.goal_sha256,
         })?;
         Ok(Some(echo_agent::tasks::RevisionedTaskGraph {
             snapshot: echo_agent::tasks::RuntimePlanSnapshot {
@@ -2735,7 +2898,7 @@ impl TaskRuntimeStore {
                 tasks,
             },
             context: echo_agent::tasks::TaskGraphContext {
-                goal: plan.goal,
+                goal: run.goal,
                 assumptions: plan.assumptions,
                 risks: plan.risks,
                 execution_mode: match plan.execution_mode {
@@ -2804,6 +2967,32 @@ impl TaskRuntimeStore {
             }
             let plan_metadata: EkoPlanMetadata =
                 serde_json::from_value(commit.next.context.metadata.clone())?;
+            if commit.next.context.goal != run.goal {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "TaskPlan cannot modify the authoritative TaskRun Goal".to_string(),
+                });
+            }
+            if let Some(current) = current.as_ref() {
+                let current_metadata: EkoPlanMetadata =
+                    serde_json::from_value(current.context.metadata.clone())?;
+                if plan_metadata.goal_revision != current_metadata.goal_revision
+                    || plan_metadata.goal_sha256 != current_metadata.goal_sha256
+                {
+                    return Err(StoreError::GoalUpdateRejected {
+                        run_id: run_id.to_string(),
+                        reason: "TaskPlan Goal binding can only advance through update_run_goal"
+                            .to_string(),
+                    });
+                }
+            } else if plan_metadata.goal_revision != run.goal_revision
+                || plan_metadata.goal_sha256 != run.goal_sha256
+            {
+                return Err(StoreError::GoalUpdateRejected {
+                    run_id: run_id.to_string(),
+                    reason: "initial TaskPlan Goal binding does not match TaskRun".to_string(),
+                });
+            }
             let mut specifications = Vec::with_capacity(commit.next.snapshot.tasks.len());
             for task in &commit.next.snapshot.tasks {
                 if task.spec.id != task.execution.task_id {
@@ -2848,7 +3037,8 @@ impl TaskRuntimeStore {
                 run_id: run_id.to_string(),
                 revision: commit.next.snapshot.revision,
                 domain_profile: plan_metadata.domain_profile,
-                goal: commit.next.context.goal,
+                goal_revision: run.goal_revision,
+                goal_sha256: run.goal_sha256,
                 assumptions: commit.next.context.assumptions,
                 risks: commit.next.context.risks,
                 execution_mode: match commit.next.context.execution_mode {
@@ -4832,6 +5022,18 @@ fn bounded_event_text(value: &str, max_chars: usize) -> String {
     text
 }
 
+fn validate_plan_goal_binding(run: &TaskRun, plan: &TaskPlan) -> Result<(), StoreError> {
+    if plan.goal_revision == run.goal_revision && plan.goal_sha256 == run.goal_sha256 {
+        return Ok(());
+    }
+    Err(StoreError::PlanGoalMismatch {
+        run_id: run.run_id.clone(),
+        plan_revision: plan.revision,
+        plan_goal_revision: plan.goal_revision,
+        run_goal_revision: run.goal_revision,
+    })
+}
+
 // The compile-time test that proves the transaction invariant:
 // a state change without an event would leave the DB inconsistent.
 // We assert both rows land together.
@@ -4875,6 +5077,21 @@ mod tests {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
     }
 
+    fn create_paused_run(store: &TaskRuntimeStore, run_id: &str) -> Result<TaskRun, StoreError> {
+        store.create_run(
+            run_id,
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "original goal",
+            "",
+            AttendedMode::Attended,
+        )?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
+        store.transition_run(run_id, TaskRunStatus::Paused)
+    }
+
     fn test_driver_admission(
         store: &std::sync::Arc<TaskRuntimeStore>,
         run_id: &str,
@@ -4907,7 +5124,8 @@ mod tests {
             run_id: run_id.to_string(),
             revision: 1,
             domain_profile: DomainProfile::General,
-            goal: "retry through the TUI facade".to_string(),
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("retry through the TUI facade"),
             assumptions: Vec::new(),
             risks: Vec::new(),
             execution_mode: ExecutionMode::Sequential,
@@ -5236,6 +5454,24 @@ mod tests {
                 "",
                 AttendedMode::Unattended,
             )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: "parked-prepare-plan".to_string(),
+                run_id: "parked-prepare".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: task_goal_sha256("settle an accepted preparation"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "parked-prepare-task".to_string(),
+                    title: "Settle preparation".to_string(),
+                    ..Default::default()
+                }],
+            })
             .map_err(|error| error.to_string())?;
         store
             .transition_run("parked-prepare", TaskRunStatus::Running)
@@ -5865,6 +6101,266 @@ mod tests {
     }
 
     #[test]
+    fn run_goal_update_is_revisioned_audited_and_deferred() -> Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        let created = store
+            .create_run(
+                "goal-run",
+                "ws",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "original goal",
+                "",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(created.goal_revision, 1);
+        assert_eq!(created.goal_sha256, task_goal_sha256("original goal"));
+        store
+            .transition_run("goal-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("goal-run", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+
+        let updated = store
+            .update_run_goal(
+                "goal-run",
+                1,
+                "revised goal",
+                "user narrowed the requested scope",
+                RunGoalActorSource::Cli,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(updated.goal, "revised goal");
+        assert_eq!(updated.goal_revision, 2);
+        assert_eq!(updated.goal_sha256, task_goal_sha256("revised goal"));
+
+        let event = store
+            .list_events("goal-run", 0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|event| event.event_type == RuntimeEventKind::RunGoalUpdated)
+            .ok_or_else(|| "RunGoalUpdated was not persisted".to_string())?;
+        assert_eq!(event.payload["old_goal_revision"], 1);
+        assert_eq!(event.payload["new_goal_revision"], 2);
+        assert_eq!(
+            event.payload["old_goal_sha256"],
+            task_goal_sha256("original goal")
+        );
+        assert_eq!(
+            event.payload["new_goal_sha256"],
+            task_goal_sha256("revised goal")
+        );
+        assert_eq!(event.payload["actor_source"], "cli");
+        assert!(
+            event
+                .payload
+                .get("actor_user_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        );
+
+        let continuation = store
+            .get_run_state("goal-run")
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| "continuation projection was not created".to_string())?;
+        assert!(continuation.deferred);
+        assert_eq!(
+            continuation.deferred_reason.as_deref(),
+            Some("goal_revision_unbound")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_goal_update_rejects_stale_revision_without_an_event() -> Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        create_paused_run(&store, "goal-conflict").map_err(|error| error.to_string())?;
+        let before = store
+            .list_events("goal-conflict", 0)
+            .map_err(|error| error.to_string())?
+            .len();
+
+        let error = store
+            .update_run_goal(
+                "goal-conflict",
+                9,
+                "revised goal",
+                "explicit correction",
+                RunGoalActorSource::Tui,
+            )
+            .err()
+            .ok_or_else(|| "stale goal revision was accepted".to_string())?;
+        assert!(matches!(error, StoreError::GoalConflict { .. }));
+        assert_eq!(
+            store
+                .list_events("goal-conflict", 0)
+                .map_err(|error| error.to_string())?
+                .len(),
+            before
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_goal_update_requires_a_quiescent_paused_run() -> Result<(), String> {
+        let active_turn = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        active_turn
+            .create_run(
+                "active-turn",
+                "ws",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "original goal",
+                "",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        active_turn
+            .configure_run_continuation("active-turn", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        active_turn
+            .transition_run("active-turn", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let claim = active_turn
+            .claim_run_turn(
+                "active-turn",
+                "turn-1",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(claim, RunTurnClaimOutcome::Started(_)));
+        active_turn
+            .transition_run("active-turn", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+
+        let active_subagent =
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        create_paused_run(&active_subagent, "active-subagent")
+            .map_err(|error| error.to_string())?;
+        active_subagent
+            .record_subagent_assigned(
+                "active-subagent",
+                "task-1",
+                "execution-1",
+                "researcher",
+                "research",
+                1,
+                1,
+                false,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let active_cell = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        create_paused_run(&active_cell, "active-cell").map_err(|error| error.to_string())?;
+        active_cell
+            .record_background_cell_started(
+                "active-cell",
+                "cell-1",
+                "test cell",
+                "command-hash",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let active_driver = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        create_paused_run(active_driver.as_ref(), "active-driver")
+            .map_err(|error| error.to_string())?;
+        let _driver_registration = active_driver
+            .register_run_cancellation("active-driver", echo_agent::agent::CancellationToken::new())
+            .map_err(|error| error.to_string())?;
+
+        for (store, run_id, expected_reason) in [
+            (&active_turn, "active-turn", "active RunTurn"),
+            (&active_subagent, "active-subagent", "active Subagent"),
+            (&active_cell, "active-cell", "active command cell"),
+            (active_driver.as_ref(), "active-driver", "active driver"),
+        ] {
+            let error = store
+                .update_run_goal(
+                    run_id,
+                    1,
+                    "revised goal",
+                    "explicit correction",
+                    RunGoalActorSource::Gui,
+                )
+                .err()
+                .ok_or_else(|| format!("goal update was accepted for {run_id}"))?;
+            assert!(matches!(
+                error,
+                StoreError::GoalUpdateRejected { reason, .. }
+                    if reason.contains(expected_reason)
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_update_rebinds_plan_before_goal_updated_run_can_resume() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.transition_run("r1", TaskRunStatus::Paused)?;
+        store.update_run_goal(
+            "r1",
+            1,
+            "revised goal",
+            "user changed the acceptance target",
+            RunGoalActorSource::Tui,
+        )?;
+
+        let stale_plan = store
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?;
+        assert_eq!(stale_plan.goal_revision, 1);
+        assert!(matches!(
+            store.resume_task_run("r1"),
+            Err(StoreError::PlanGoalMismatch {
+                plan_goal_revision: 1,
+                run_goal_revision: 2,
+                ..
+            })
+        ));
+
+        let rebound = store.apply_task_patch_for_test(
+            "r1",
+            &TaskUpdateRequest {
+                base_revision: 1,
+                reason: "align the task graph with goal revision 2".to_string(),
+                operations: vec![TaskUpdateOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        title: Some("Review revised runtime scope".to_string()),
+                        ..Default::default()
+                    },
+                }],
+            },
+        )?;
+        assert_eq!(rebound.revision, 2);
+        assert_eq!(rebound.goal_revision, 2);
+        assert_eq!(rebound.goal_sha256, task_goal_sha256("revised goal"));
+        assert_eq!(store.resume_task_run("r1")?.status, TaskRunStatus::Running);
+
+        let latest_plan_event = store
+            .list_events("r1", 0)?
+            .into_iter()
+            .rev()
+            .find(|event| event.event_type == RuntimeEventKind::PlanRevisionCommitted)
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?;
+        assert!(latest_plan_event.payload["plan"].get("goal").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn illegal_transition_is_rejected_and_leaves_no_event() {
         let s = fresh();
         s.create_run(
@@ -5911,7 +6407,8 @@ mod tests {
             run_id: "r1".into(),
             revision: 1,
             domain_profile: DomainProfile::General,
-            goal: "g".into(),
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("g"),
             assumptions: vec!["a".into()],
             risks: vec![],
             execution_mode: ExecutionMode::Parallel,
@@ -6099,7 +6596,8 @@ mod tests {
             run_id: "r1".into(),
             revision: 1,
             domain_profile: DomainProfile::General,
-            goal: "g".into(),
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("g"),
             assumptions: vec![],
             risks: vec![],
             execution_mode: ExecutionMode::Parallel,
@@ -6571,7 +7069,8 @@ mod tests {
             run_id: "retry-run".to_string(),
             revision: 1,
             domain_profile: DomainProfile::General,
-            goal: "retry a failed dependency chain".to_string(),
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("retry a failed dependency chain"),
             assumptions: Vec::new(),
             risks: Vec::new(),
             execution_mode: ExecutionMode::Sequential,
@@ -7563,7 +8062,8 @@ mod tests {
             run_id: "r1".to_string(),
             revision: 1,
             domain_profile: DomainProfile::General,
-            goal: "g".to_string(),
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("g"),
             assumptions: Vec::new(),
             risks: Vec::new(),
             execution_mode: ExecutionMode::Parallel,

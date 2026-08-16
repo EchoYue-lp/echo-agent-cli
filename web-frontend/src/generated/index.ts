@@ -55,6 +55,7 @@ export * from './RuntimeArtifact';
 export * from './RuntimeEventKind';
 export * from './RuntimeTaskEvent';
 export * from './RunContinuationState';
+export * from './RunGoalActorSource';
 export * from './RunPause';
 export * from './RunPauseReason';
 export * from './RunTurnOrigin';

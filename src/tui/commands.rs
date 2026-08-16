@@ -95,6 +95,7 @@ pub enum SlashCommand {
     TaskPause,
     TaskResume,
     TaskBudget,
+    TaskGoal,
     TaskRecovery,
     TaskRetry,
     TaskSkip,
@@ -176,6 +177,7 @@ impl SlashCommand {
             Self::TaskPause => "Pause the current or specified task run",
             Self::TaskResume => "Resume the current or specified task run",
             Self::TaskBudget => "Set token and time budgets for a task run",
+            Self::TaskGoal => "Update the paused task run Goal with optimistic concurrency",
             Self::TaskRecovery => "Show unresolved recovery barriers",
             Self::TaskRetry => "Confirm retry for an indeterminate task",
             Self::TaskSkip => "Skip an indeterminate task",
@@ -249,6 +251,7 @@ impl SlashCommand {
             | Self::TaskPause
             | Self::TaskResume
             | Self::TaskBudget
+            | Self::TaskGoal
             | Self::TaskRecovery
             | Self::TaskRetry
             | Self::TaskSkip
@@ -299,6 +302,7 @@ impl SlashCommand {
             Self::Mode => "[auto|chat|task]",
             Self::TaskCancel | Self::TaskPause | Self::TaskResume => "[run-id]",
             Self::TaskBudget => "<tokens|none> <seconds|none> [run-id]",
+            Self::TaskGoal => "<expected-revision> [run-id] --reason <reason> --goal <new-goal>",
             Self::TaskRecovery => "[run-id]",
             Self::TaskRetry | Self::TaskSkip => "<task-id> [run-id]",
             Self::Steer => "<instruction>",
@@ -387,6 +391,19 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(budget.category(), Category::Coding);
         assert_eq!(budget.usage(), "<tokens|none> <seconds|none> [run-id]");
+        Ok(())
+    }
+
+    #[test]
+    fn task_goal_is_a_first_class_coding_action() -> Result<(), String> {
+        let goal = "task-goal"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(goal.category(), Category::Coding);
+        assert_eq!(
+            goal.usage(),
+            "<expected-revision> [run-id] --reason <reason> --goal <new-goal>"
+        );
         Ok(())
     }
 

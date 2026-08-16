@@ -69,6 +69,11 @@ fn store_error(error: StoreError) -> RevisionedTaskStoreError {
         StoreError::InvalidPlan(message) | StoreError::TaskNotFound(message) => {
             RevisionedTaskStoreError::Rejected { message }
         }
+        error @ (StoreError::GoalConflict { .. }
+        | StoreError::GoalUpdateRejected { .. }
+        | StoreError::PlanGoalMismatch { .. }) => RevisionedTaskStoreError::Rejected {
+            message: error.to_string(),
+        },
         other => RevisionedTaskStoreError::Backend {
             message: other.to_string(),
         },
@@ -251,6 +256,8 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         let metadata = serde_json::to_value(EkoPlanMetadata {
             plan_id: format!("plan_{}", uuid::Uuid::new_v4().as_simple()),
             domain_profile: run.domain_profile,
+            goal_revision: run.goal_revision,
+            goal_sha256: run.goal_sha256.clone(),
         })
         .map_err(|error| TaskPolicyError::Backend {
             message: format!("Failed to encode EKO plan metadata: {error}"),
@@ -345,15 +352,25 @@ pub async fn commit_eko_task_plan(
     store: Arc<TaskRuntimeStore>,
     plan: super::types::TaskPlan,
 ) -> Result<super::types::TaskPlan, TaskRevisionError> {
+    let run = store
+        .get_run(&plan.run_id)
+        .map_err(|error| TaskRevisionError::Backend {
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| TaskRevisionError::GraphNotFound {
+            scope_id: plan.run_id.clone(),
+        })?;
     let context_metadata = serde_json::to_value(EkoPlanMetadata {
         plan_id: plan.plan_id,
         domain_profile: plan.domain_profile,
+        goal_revision: run.goal_revision,
+        goal_sha256: run.goal_sha256.clone(),
     })
     .map_err(|error| TaskRevisionError::InvalidInput {
         message: format!("Failed to encode EKO plan metadata: {error}"),
     })?;
     let context = TaskGraphContext {
-        goal: plan.goal,
+        goal: run.goal,
         assumptions: plan.assumptions,
         risks: plan.risks,
         execution_mode: match plan.execution_mode {

@@ -20,4 +20,5 @@ export type RunContinuationState = {
   pause: RunPause | null;
   blocker_audit: BlockerAudit | null;
   deferred: boolean;
+  deferred_reason: string | null;
 };

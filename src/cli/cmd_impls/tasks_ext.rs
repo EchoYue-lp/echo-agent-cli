@@ -62,7 +62,10 @@ fn current_task_run(
 fn print_task_run_status(snapshot: &echo_agent_app_core::tasks::task_runtime::RunStateSnapshot) {
     println!("\n--- TaskRun {} ---", snapshot.run.run_id);
     println!("  Status: {}", snapshot.run.status.as_str());
-    println!("  Goal: {}", snapshot.run.goal);
+    println!(
+        "  Goal r{}: {}",
+        snapshot.run.goal_revision, snapshot.run.goal
+    );
     if let Some(continuation) = snapshot.continuation.as_ref() {
         let token_budget = continuation
             .token_budget
@@ -211,6 +214,44 @@ cmd!(
     cmd_task_run
 );
 
+async fn cmd_task_goal(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let parsed = match crate::task_run_control::parse_run_goal_update_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            println!("\n  {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let (store, snapshot) = match current_task_run(ctx, parsed.requested_run_id.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            println!("\n  TaskRun error: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    match store.update_run_goal(
+        &snapshot.run.run_id,
+        parsed.expected_goal_revision,
+        &parsed.new_goal,
+        &parsed.reason,
+        echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
+    ) {
+        Ok(run) => println!(
+            "\n  TaskRun {} Goal updated to revision {}; submit task_update before resuming.",
+            run.run_id, run.goal_revision
+        ),
+        Err(error) => println!("\n  Unable to update TaskRun Goal: {error}"),
+    }
+    CommandOutcome::Continue
+}
+cmd!(
+    TaskGoalCommand,
+    "task-goal",
+    CommandCategory::Advanced,
+    "Update the paused TaskRun Goal with optimistic concurrency",
+    cmd_task_goal
+);
+
 // ── TaskProgressCommand ──────────────────────────────────────────────
 
 async fn cmd_task_progress(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
@@ -313,6 +354,7 @@ cmd!(
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(TaskRunCommand));
+    registry.register(Arc::new(TaskGoalCommand));
     registry.register(Arc::new(TaskProgressCommand));
     registry.register(Arc::new(TaskTreeCommand));
 }

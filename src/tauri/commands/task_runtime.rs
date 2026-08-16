@@ -61,6 +61,27 @@ pub async fn configure_task_continuation(
         .map_err(internal)
 }
 
+/// Update the authoritative Goal only from an explicit GUI action. The store
+/// enforces paused/quiescent state and optimistic Goal revision matching.
+#[tauri::command]
+pub async fn update_task_run_goal(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    expected_goal_revision: u64,
+    new_goal: String,
+    reason: String,
+) -> Result<TaskRun, IpcError> {
+    store(&state)?
+        .update_run_goal(
+            &run_id,
+            expected_goal_revision,
+            &new_goal,
+            &reason,
+            RunGoalActorSource::Gui,
+        )
+        .map_err(internal)
+}
+
 /// Background command cells owned by the run, including bounded terminal facts.
 #[tauri::command]
 pub async fn list_task_background_cells(
@@ -831,7 +852,10 @@ mod tests {
                 run_id: run_id.to_string(),
                 revision: 1,
                 domain_profile: DomainProfile::General,
-                goal: "retry from GUI".to_string(),
+                goal_revision: 1,
+                goal_sha256: echo_agent_app_core::tasks::task_runtime::task_goal_sha256(
+                    "retry from GUI",
+                ),
                 assumptions: Vec::new(),
                 risks: Vec::new(),
                 execution_mode: ExecutionMode::Sequential,
