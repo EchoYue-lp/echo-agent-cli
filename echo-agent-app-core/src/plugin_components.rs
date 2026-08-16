@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::scheduler::{CronTask, CronTaskStatus};
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ResolvedEkoComponents {
+    pub(crate) monitors_file: Option<PathBuf>,
+    pub(crate) theme_files: Vec<PathBuf>,
+    pub(crate) output_style_files: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PluginThemeDefinition {
     pub name: String,
@@ -108,6 +115,13 @@ pub(crate) fn prepare_application_components(
     let mut errors = Vec::new();
 
     for plugin in ordered {
+        let root = match registry.get(&plugin) {
+            Some(entry) => entry.root.clone(),
+            None => {
+                errors.push(format!("Plugin '{plugin}' disappeared during resolution"));
+                continue;
+            }
+        };
         let variables = match registry.variables_for(&plugin) {
             Ok(variables) => variables,
             Err(error) => {
@@ -122,10 +136,15 @@ pub(crate) fn prepare_application_components(
                 continue;
             }
         };
-        if let Some(path) = resolved.hooks_file.as_ref()
-            && let Err(error) = validate_hooks_with_variables(&plugin, path, Some(&variables))
-        {
-            errors.push(error);
+        let eko_components = match resolve_eko_components(&root) {
+            Ok(components) => components,
+            Err(error) => {
+                errors.push(format!("Plugin '{plugin}' EKO components: {error}"));
+                continue;
+            }
+        };
+        if let Some(path) = resolved.hooks_file.as_ref() {
+            validate_hooks_file(&plugin, path, &variables, &mut errors);
         }
         for path in resolved.agent_files {
             match read_plugin_agent_with_variables(&plugin, &path, Some(&variables)) {
@@ -168,7 +187,7 @@ pub(crate) fn prepare_application_components(
             }
         }
 
-        if let Some(path) = resolved.monitors_file {
+        if let Some(path) = eko_components.monitors_file {
             match read_monitors_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(monitors) => {
                     for monitor in monitors {
@@ -186,7 +205,7 @@ pub(crate) fn prepare_application_components(
             }
         }
 
-        for path in resolved.theme_files {
+        for path in eko_components.theme_files {
             match read_theme_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(theme) => {
                     if !theme_names.insert(theme.name.clone()) {
@@ -202,7 +221,7 @@ pub(crate) fn prepare_application_components(
             }
         }
 
-        for path in resolved.output_style_files {
+        for path in eko_components.output_style_files {
             match read_output_style_with_variables(&plugin, &path, Some(&variables)) {
                 Ok(style) => {
                     if !output_style_names.insert(style.name.clone()) {
@@ -228,47 +247,301 @@ pub(crate) fn prepare_application_components(
 
 pub(crate) fn validate_application_component_files(
     plugin: &str,
+    root: &Path,
     resolved: &ResolvedComponents,
+    variables: &PluginVariables,
 ) -> Vec<String> {
-    let mut errors = Vec::new();
+    let mut errors = resolved.diagnostics.clone();
+    for directory in &resolved.skill_dirs {
+        validate_skill_directory(plugin, directory, variables, &mut errors);
+    }
+    if let Some(path) = &resolved.hooks_file {
+        validate_hooks_file(plugin, path, variables, &mut errors);
+    }
+    if let Some(path) = &resolved.mcp_config_file {
+        validate_mcp_file(plugin, path, variables, &mut errors);
+    }
     for path in &resolved.agent_files {
-        if let Err(error) = read_plugin_agent(plugin, path) {
+        if let Err(error) = read_plugin_agent_with_variables(plugin, path, Some(variables)) {
             errors.push(error);
         }
     }
-    if let Some(path) = &resolved.hooks_file
-        && let Err(error) = validate_hooks_with_variables(plugin, path, None)
-    {
-        errors.push(error);
-    }
     if let Some(path) = &resolved.lsp_config_file
-        && let Err(error) = LspConfig::from_file(path)
+        && let Err(error) = read_component_text(path, Some(variables))
+            .and_then(|content| LspConfig::from_yaml(&content))
     {
         errors.push(format!(
             "Plugin '{plugin}' LSP config '{}': {error}",
             path.display()
         ));
     }
-    if let Some(path) = &resolved.monitors_file
-        && let Err(error) = read_monitors(plugin, path)
+    let eko_components = match resolve_eko_components(root) {
+        Ok(components) => components,
+        Err(error) => {
+            errors.push(format!("Plugin '{plugin}' EKO components: {error}"));
+            return errors;
+        }
+    };
+    if let Some(path) = &eko_components.monitors_file
+        && let Err(error) = read_monitors_with_variables(plugin, path, Some(variables))
     {
         errors.push(error);
     }
-    for path in &resolved.theme_files {
-        if let Err(error) = read_theme(plugin, path) {
+    for path in &eko_components.theme_files {
+        if let Err(error) = read_theme_with_variables(plugin, path, Some(variables)) {
             errors.push(error);
         }
     }
-    for path in &resolved.output_style_files {
-        if let Err(error) = read_output_style(plugin, path) {
+    for path in &eko_components.output_style_files {
+        if let Err(error) = read_output_style_with_variables(plugin, path, Some(variables)) {
             errors.push(error);
         }
     }
     errors
 }
 
-fn read_plugin_agent(plugin: &str, path: &Path) -> Result<PreparedPluginAgent, String> {
-    read_plugin_agent_with_variables(plugin, path, None)
+fn validate_skill_directory(
+    plugin: &str,
+    directory: &Path,
+    variables: &PluginVariables,
+    errors: &mut Vec<String>,
+) {
+    const MAX_DEPTH: usize = 4;
+    validate_skill_directory_at_depth(plugin, directory, variables, errors, 0, MAX_DEPTH);
+}
+
+fn validate_skill_directory_at_depth(
+    plugin: &str,
+    directory: &Path,
+    variables: &PluginVariables,
+    errors: &mut Vec<String>,
+    depth: usize,
+    max_depth: usize,
+) {
+    if depth > max_depth {
+        return;
+    }
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            errors.push(format!(
+                "Plugin '{plugin}' skills directory '{}': failed to scan: {error}",
+                directory.display()
+            ));
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!(
+                    "Plugin '{plugin}' skills directory '{}': failed to read entry: {error}",
+                    directory.display()
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                errors.push(format!(
+                    "Plugin '{plugin}' skill path '{}': failed to inspect: {error}",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if file_type.is_dir() {
+            validate_skill_directory_at_depth(
+                plugin,
+                &path,
+                variables,
+                errors,
+                depth.saturating_add(1),
+                max_depth,
+            );
+            continue;
+        }
+        if !file_type.is_file() {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some("SKILL.md") {
+            match read_component_text(&path, Some(variables)).and_then(|content| {
+                echo_agent::skills::external::parse_skill_md(&content)
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(descriptor) => {
+                    if let Some(definition) = descriptor.hooks {
+                        validate_hooks_definition(plugin, &path, definition, errors);
+                    }
+                }
+                Err(error) => errors.push(format!(
+                    "Plugin '{plugin}' skill '{}': {error}",
+                    path.display()
+                )),
+            }
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("hooks.json") {
+            validate_hooks_document(plugin, &path, variables, true, errors);
+        }
+    }
+}
+
+fn validate_hooks_file(
+    plugin: &str,
+    path: &Path,
+    variables: &PluginVariables,
+    errors: &mut Vec<String>,
+) {
+    validate_hooks_document(plugin, path, variables, false, errors);
+}
+
+fn validate_hooks_document(
+    plugin: &str,
+    path: &Path,
+    variables: &PluginVariables,
+    json: bool,
+    errors: &mut Vec<String>,
+) {
+    let content = match read_component_text(path, Some(variables)) {
+        Ok(content) => content,
+        Err(error) => {
+            errors.push(format!(
+                "Plugin '{plugin}' hooks '{}': failed to read: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let definition = if json {
+        serde_json::from_str::<echo_agent::skills::hooks::HooksDefinition>(&content)
+            .map_err(|error| error.to_string())
+    } else {
+        serde_yaml::from_str::<echo_agent::skills::hooks::HooksDefinition>(&content)
+            .map_err(|error| error.to_string())
+    };
+    let definition = match definition {
+        Ok(definition) => definition,
+        Err(error) => {
+            let format = if json { "JSON" } else { "YAML" };
+            errors.push(format!(
+                "Plugin '{plugin}' hooks {format} parse '{}': {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    validate_hooks_definition(plugin, path, definition, errors);
+}
+
+fn validate_hooks_definition(
+    plugin: &str,
+    path: &Path,
+    definition: echo_agent::skills::hooks::HooksDefinition,
+    errors: &mut Vec<String>,
+) {
+    for (event, rules) in definition.rules {
+        for rule in rules {
+            for action in rule.hooks {
+                if let Err(error) = action.validate() {
+                    errors.push(format!(
+                        "Plugin '{plugin}' hooks '{}' event {} action {}: {error}",
+                        path.display(),
+                        event.as_str(),
+                        action.kind()
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn validate_mcp_file(
+    plugin: &str,
+    path: &Path,
+    variables: &PluginVariables,
+    errors: &mut Vec<String>,
+) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) => {
+            errors.push(format!(
+                "Plugin '{plugin}' MCP config '{}': failed to read: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    if let Err(error) = echo_agent::mcp::McpConfigFile::parse_agent_plugin(
+        &content,
+        &variables.plugin_root,
+        &variables.plugin_data,
+    ) {
+        errors.push(format!(
+            "Plugin '{plugin}' MCP config '{}': {error}",
+            path.display()
+        ));
+    }
+}
+
+pub(crate) fn resolve_eko_components(root: &Path) -> Result<ResolvedEkoComponents, String> {
+    let mut resolved = ResolvedEkoComponents::default();
+    let monitors = root.join("monitors.yaml");
+    if monitors.is_file() {
+        resolved.monitors_file = Some(monitors);
+    } else if monitors.exists() {
+        return Err(format!(
+            "monitors path '{}' is not a regular file",
+            monitors.display()
+        ));
+    }
+    let themes = root.join("themes");
+    if themes.is_dir() {
+        resolved.theme_files = resolve_eko_files(&themes, "json", "themes")?;
+    } else if themes.exists() {
+        return Err(format!(
+            "themes path '{}' is not a directory",
+            themes.display()
+        ));
+    }
+    let output_styles = root.join("output-styles");
+    if output_styles.is_dir() {
+        resolved.output_style_files = resolve_eko_files(&output_styles, "md", "output styles")?;
+    } else if output_styles.exists() {
+        return Err(format!(
+            "output styles path '{}' is not a directory",
+            output_styles.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn resolve_eko_files(
+    directory: &Path,
+    suffix: &str,
+    component: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    let entries = std::fs::read_dir(directory).map_err(|error| {
+        format!(
+            "failed to scan {component} directory '{}': {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("failed to scan '{}': {error}", directory.display()))?;
+        let candidate = entry.path();
+        if candidate.is_file()
+            && candidate.extension().and_then(|value| value.to_str()) == Some(suffix)
+        {
+            files.push(candidate);
+        }
+    }
+    files.sort();
+    files.dedup();
+    Ok(files)
 }
 
 fn read_plugin_agent_with_variables(
@@ -289,22 +562,6 @@ fn read_plugin_agent_with_variables(
         plugin: plugin.to_string(),
         definition,
     })
-}
-
-fn validate_hooks_with_variables(
-    plugin: &str,
-    path: &Path,
-    variables: Option<&PluginVariables>,
-) -> Result<(), String> {
-    let content = read_component_text(path, variables)
-        .map_err(|error| format!("Plugin '{plugin}' hooks file '{}': {error}", path.display()))?;
-    serde_yaml::from_str::<echo_agent::prelude::HooksDefinition>(&content)
-        .map(|_| ())
-        .map_err(|error| format!("Plugin '{plugin}' hooks YAML parse: {error}"))
-}
-
-fn read_monitors(plugin: &str, path: &Path) -> Result<Vec<CronTask>, String> {
-    read_monitors_with_variables(plugin, path, None)
 }
 
 fn read_monitors_with_variables(
@@ -368,10 +625,6 @@ fn read_monitors_with_variables(
     Ok(tasks)
 }
 
-fn read_theme(plugin: &str, path: &Path) -> Result<PluginThemeDefinition, String> {
-    read_theme_with_variables(plugin, path, None)
-}
-
 fn read_theme_with_variables(
     plugin: &str,
     path: &Path,
@@ -406,10 +659,6 @@ fn read_theme_with_variables(
     }
     theme.plugin = plugin.to_string();
     Ok(theme)
-}
-
-fn read_output_style(plugin: &str, path: &Path) -> Result<PluginOutputStyle, String> {
-    read_output_style_with_variables(plugin, path, None)
 }
 
 fn read_output_style_with_variables(
@@ -586,7 +835,7 @@ mod tests {
             "---\nname: concise\ndescription: concise replies\n---\nUse clear Chinese: 你好。\n",
         )
         .map_err(|error| error.to_string())?;
-        let style = read_output_style("test", &path)?;
+        let style = read_output_style_with_variables("test", &path, None)?;
         assert_eq!(style.name, "concise");
         assert!(style.instructions.contains("你好"));
         Ok(())

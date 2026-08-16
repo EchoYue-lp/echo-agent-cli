@@ -69,9 +69,10 @@ evidence, and the next bounded step.
 | Iteration 2: webhook + HITL + config_watcher fixes | Complete | The dead webhook singleton was removed. One `Arc<WebhookEmitter>` is shared by chat, scheduler, and the active surface; lifecycle emission now lives in the common `drive_chat` path, giving GUI/TUI/CLI/channel the same `ToolCalled`/`ToolFailed`/`AgentError`/`ChatCompleted` behavior, while cron emits `CronTaskCompleted`. Config reload watches the parent directory, accepts create/modify/remove and atomic-save events, uses resettable debounce, and hot-reloads both hooks and webhook endpoints; deleting global/project `hooks.yaml` removes its live registrations. Model/MCP/runtime topology still requires restart. HITL snapshots providers before await, broadcasts concurrently under one shared deadline, and drops remaining futures after the first response. |
 | Iteration 3: migrate 3 file-backed storage impls down to framework | Complete | `FileRuntimeStateStore`, `FileConversationStore`, and `restore_message(s)` are framework capabilities; EKO uses them without enabling SQLite. File writes use unique temp names, file fsync, atomic rename, Unix parent-directory fsync, cleanup on failure, path-safe ids, and explicit corrupt-JSON errors. `FileConversationStore` serializes complete single-process read/modify/write operations, atomically implements `ensure_conversation`, reconciles stale counters from records on reopen, and normalizes stored message ownership. Message projection/restore now round-trips canonical roles, tool identity, multimodal content, and reasoning metadata. App-only `SessionSearchEngine`, path ownership, and UI persistence projections remain in EKO. |
 | Tool Schema budget and recoverable output Phase 0-6 | Complete | Framework commits `9fad29f`, `bbca516`; `docs/2026-07-29-tool-schema-budget-and-artifacts.md`; one framework registry, invocation-local Tool Search, query-and-result-bound cursor pagination, recoverable SQL/Web/task artifacts, and content-free metrics; current Schema gates are Chat 3,647 / Task 3,906 / Auto 3,929 estimated tokens |
-| Process-level shared PluginRuntimeService (P0-4) | Complete | `echo-agent-app-core/src/plugin_runtime.rs`; GUI/TUI/CLI share one serialized runtime owner. Bootstrap and every mutation stage a complete candidate, then replace plugin-owned components; failed wiring or lifecycle activation restores the previous live set and callbacks. Manifest config values and active theme/output-style preferences persist atomically, and plugin variables are substituted before parsing every component, including plugin Skill frontmatter Hooks. Native callbacks register explicitly; rewire is bracketed by deactivate/activate and uninstall unregisters them. |
-| Plugin component runtime wiring (P1) | Complete | Framework Skills/Hooks/MCP plus application-owned Agent/LSP/monitor/theme/output-style adapters are loaded and exactly unloaded. GUI/TUI/CLI expose the same live catalogs and output-style selection. GUI and TUI immediately synchronize plugin Theme activation and fallback after reload/disable/uninstall; built-in GUI selection deactivates the plugin preference. Theme and output-style preferences survive restart. |
-| Hook execution closure | Complete | The main registry exposes 31 emitted events and 7 Action types. Failed tool results emit `PostToolUseFailure`; the canonical call-scoped `permission_mode_override` participates in approval without mutating global mode; all Hook sources share strict registration filtering. CLI/TUI/GUI Hook tests use the same matcher-aware dry-run, and the watcher reloads app config plus global/project `hooks.yaml` on create/modify/remove. Evolution writes, layer changes, candidate detection, and health checks emit their declared events. Plain HTTP supports loopback/private/link-local IPs, localhost, single-label hosts, `.local`, and `.lan`; remote hosts require HTTPS. User-configured MCP tools have no deny-list. |
+| Process-level shared PluginRuntimeService (P0-4) | Complete | `echo-agent-app-core/src/plugin_runtime.rs`; GUI/TUI/CLI share one serialized runtime owner. Bootstrap and every mutation stage a complete candidate, then replace plugin-owned components; failed wiring or lifecycle activation restores the previous live set and callbacks. Plugin config values and active theme/output-style preferences persist atomically. Host applications may explicitly register native callbacks; once registered, rewire is bracketed by deactivate/activate and uninstall unregisters them. EKO's declarative package loader does not currently register native callbacks. |
+| Plugin component runtime wiring (P1) | Complete | Root `plugin.json` and fixed flat component locations are loaded and exactly unloaded. GUI/TUI/CLI expose the same live catalogs and output-style selection. GUI and TUI immediately synchronize plugin Theme activation and fallback after reload/disable/uninstall; built-in GUI selection deactivates the plugin preference. Theme and output-style preferences survive restart. |
+| Flat plugin package convergence | Complete | Old `.echo-plugin/manifest.yaml`, `.mcp.json`, namespaces, component path declarations, and duplicate discovery rules are removed from the authoritative path. The framework owns manifest/Skills/MCP/Subagent/Hook/LSP semantics; EKO converts root `monitors.yaml`, `themes/`, and `output-styles/`. Standard component errors isolate at the smallest practical boundary. |
+| Hook execution closure | Complete | The main registry exposes 31 emitted events and 7 Action types. `subagent` and `mcp_tool` actions are wired automatically to live runtime executors; plugin command hooks receive portable root/data environments; stderr and timeout/spawn failures are surfaced. Failed tool results emit `PostToolUseFailure`; the canonical call-scoped `permission_mode_override` participates in approval without mutating global mode; all Hook sources share strict registration filtering. CLI/TUI/GUI Hook tests use the same matcher-aware dry-run, and the watcher reloads app config plus global/project `hooks.yaml` on create/modify/remove. Evolution writes, layer changes, candidate detection, and health checks emit their declared events. Plain HTTP supports loopback/private/link-local IPs, localhost, single-label hosts, `.local`, and `.lan`; remote hosts require HTTPS. User-configured MCP tools have no deny-list. |
 | Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
 | Provider default protocol convergence | Complete | Framework `ProviderMetadata.default_api_protocol` is the sole built-in authority; EKO preserves explicit overrides, infers custom complete endpoints, keeps a non-persistent session selection for every future pooled agent, and projects the provider wire contract through generated ts-rs DTOs without a second provider mapping. |
 | Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
@@ -79,6 +80,34 @@ evidence, and the next bounded step.
 | Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; Phase 6 pending | One app-layer `TaskContinuationRuntime` now owns idle continuation without a second graph/executor/store. Finite RunTurns use event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, stable surface HITL replay, and GUI/TUI/CLI/channel controls. Continuation agents have an independent bounded capacity domain. Concurrency/shutdown regressions cover claim loser, pool admission/configuration cancellation, pending wake, pause/resume settlement, channel HITL retention, and `BootRecovery`. Remaining work is explicitly limited to safe cold-start auto-resume after a new surface launcher exists, requirement-to-evidence completion audit, 1k/10k performance thresholds, and real multi-hour kill/sleep/provider-failure evals. See `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §0. |
 
 ## Current Decisions
+
+### Plugin and Hook production closure
+
+The 2026-08-16 audit used OpenAI's
+[plugin packaging](https://developers.openai.com/plugins/build/plugins) and
+[Codex hooks](https://learn.chatgpt.com/docs/hooks) contracts as the primary
+industry reference, alongside the Agent Plugins 1.0 package contract already
+adopted by EKO. Codex establishes four useful production baselines: fixed
+package identity, portable plugin root/data paths, observable command-hook exit
+semantics, and install-time validation. EKO keeps those baselines while using
+its existing flat `plugin.json` layout and one atomic runtime instead of adding
+a parallel Codex-specific package loader.
+
+The framework owns the cross-product mechanisms: Hook parsing/execution,
+Subagent and MCP executor wiring, portable plugin environment values, and
+bounded failure output. EKO owns the product adapter: transactional
+install/enable/disable/uninstall, GUI/TUI/CLI catalogs, and validation of every
+fixed package component before activation. `plugins validate` now parses Skill,
+Hook, MCP, Subagent, LSP, monitor, theme, and output-style content instead of
+only confirming paths.
+
+Codex additionally provides public/repository marketplaces, UI metadata, and a
+managed trust-review flow. Those are distribution/governance capabilities, not
+runtime correctness. EKO remains directly installable from local paths and Git
+and deliberately does not add a trust approval gate: it is a local personal
+assistant whose user explicitly chooses extensions. A future marketplace can
+be an application-layer catalog over the same installer without changing the
+framework runtime.
 
 ### Data Analysis
 
@@ -386,16 +415,17 @@ on `AppState.plugin_runtime` as well as the TUI and CLI command contexts.
 
 All GUI/TUI/CLI plugin commands delegate to it. Each operation is serialized.
 Reload parses and validates a complete candidate before mutating the live
-runtime, validates and persists manifest config, and substitutes plugin
-variables before parsing every text component, including a plugin Skill's
-frontmatter Hooks. It starts required plugin LSP servers, replaces scheduled
+runtime, validates and persists plugin config, and substitutes EchoAgent
+variables before parsing fixed plugin components and plugin Skill
+content. It starts required plugin LSP servers, replaces scheduled
 monitors, and then swaps framework Skills/Hooks/MCP plus executable Subagent
-factories. Native/plugin-host lifecycle callbacks register explicitly; the
-runtime deactivates active callbacks before rewire and activates the candidate
-set only after successful wiring. Any deactivation, wiring, or activation
-failure unloads partial candidate wiring, restores the previous component set
-and callbacks, and leaves the published registry unchanged. Uninstall performs
-deactivate/shutdown and unregisters the callback. Runtime mutations acquire the
+factories. Optional host-provided lifecycle callbacks can be registered through
+the explicit runtime API; once registered, the runtime deactivates active
+callbacks before rewire and activates the candidate set only after successful
+wiring. Any deactivation, wiring, or activation failure unloads partial
+candidate wiring, restores the previous component set and callbacks, and leaves
+the published registry unchanged. Uninstall performs deactivate/shutdown and
+unregisters the callback. Runtime mutations acquire the
 serialized plugin state before scheduler replacement, so binding and reload use
 one lock order. Candidate LSP preparation treats every currently running base
 server as required, preventing a plugin reload from stopping unrelated language
@@ -424,21 +454,39 @@ also fails, the runtime publishes the target root after removing every
 plugin-owned live receipt and reports User-scope plugins as degraded instead of
 leaving any component bound to the previous workspace.
 
-Native `register_lifecycle` remains dormant (no production registration
-callsite) and its current name-only identity must not enter a production plugin
-host. Before activation, choose one authority: process-scoped callbacks that
-explicitly retire the previous current generation, or workspace-scoped
-callbacks keyed by scope + generation + exact ownership token. Do not extend
-the current name-only manager into a second lifecycle state machine.
+EKO has no production `register_lifecycle` callsite, so declarative packages do
+not claim native callback support. Before adding a native plugin host, choose one
+authority: process-scoped callbacks that explicitly retire the previous current
+generation, or workspace-scoped callbacks keyed by scope + generation + exact
+ownership token. Do not extend the current name-only manager into a second
+lifecycle state machine.
 
-The scaffold writes unique Agent and output-style names plus valid Skills,
-Hooks, MCP, LSP, monitor, theme, and output-style files. Strict validation uses
-the framework resolver for declared paths and the application parsers for all
-EKO-owned component formats. Real integration-style tests use an executable
-stdio JSON-RPC LSP fixture and a live scheduler instead of count-only mocks.
+The scaffold writes a root Agent Plugins 1.0 `plugin.json`, unique Subagent and
+output-style names, and valid Skills, Hooks, MCP, LSP, monitor, theme, and
+output-style files in the complete flat package layout. Strict validation uses
+the framework resolver for reusable EchoAgent components and the application
+parsers for every fixed EKO component format, including Hook action validation.
+Real integration-style tests use an executable stdio JSON-RPC LSP fixture and a
+live scheduler instead of count-only mocks.
 
-This lifecycle follows the separation between discovery and activation in the
-[VS Code extension model](https://code.visualstudio.com/api/references/activation-events).
+The package contract follows Agent Plugins 1.0 official
+[manifest](https://agent-plugins.org/plugin-authors/manifest),
+[MCP](https://agent-plugins.org/plugin-authors/mcp-servers),
+and [loading](https://agent-plugins.org/client-implementers/loading-and-discovery)
+guidance. Cursor's root Agent Plugin support provides an independent client
+reference; Cursor-specific `.cursor-plugin/plugin.json` remains a client-owned
+format rather than EKO's canonical package layout. EKO keeps one portable root
+manifest, one fixed location per supported component, and component-level
+failure isolation. It deliberately has no plugin namespace layer because it is
+a local personal assistant with one authoritative plugin runtime.
+
+Framework/application placement is explicit: portable manifest validation,
+fixed Skills/MCP, standard variables, failure isolation, scopes, and reusable
+EchoAgent Subagent/Hook/LSP primitives belong to `echo-agent`. EKO monitor
+policy, themes, output-style projections, GUI/TUI catalogs, and runtime
+preferences remain in `echo-agent-app-core`. The application adapter only
+discovers `monitors.yaml`, `themes/`, and `output-styles/` and converts them to existing product types;
+it does not duplicate registry, dependency, Skill, MCP, or lifecycle logic.
 Candidate preparation remains in EKO because Agent construction, monitor
 policy, themes, and output-style projections are product concerns; generic
 path resolution and reversible Subagent registration remain framework APIs.

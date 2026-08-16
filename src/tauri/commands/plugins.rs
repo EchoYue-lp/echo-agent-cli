@@ -41,9 +41,7 @@ pub struct DependencyInfo {
 }
 
 fn entry_to_info(entry: &PluginEntry) -> PluginInfo {
-    let caps = entry
-        .manifest
-        .inferred_capabilities()
+    let caps = echo_agent_app_core::plugin_runtime::plugin_capabilities(entry)
         .into_iter()
         .map(|c| c.display_name().to_string())
         .collect();
@@ -51,9 +49,13 @@ fn entry_to_info(entry: &PluginEntry) -> PluginInfo {
     PluginInfo {
         name: entry.manifest.name.clone(),
         display_name: entry.manifest.display_name().to_string(),
-        version: entry.manifest.version.clone(),
+        version: entry.manifest.version_label().to_string(),
         description: entry.manifest.description.clone(),
-        author: entry.manifest.author.as_ref().map(|a| a.name.clone()),
+        author: entry
+            .manifest
+            .author
+            .as_ref()
+            .and_then(|author| author.name.clone()),
         license: entry.manifest.license.clone(),
         scope: entry.scope.to_string(),
         enabled: entry.enabled,

@@ -421,7 +421,11 @@ pub trait HumanLoop: Send + Sync {
 
 ### 1. 插件系统
 
-通过 MCP 服务器添加新功能，无需修改核心代码。
+采用根 `plugin.json` 和固定扁平组件位置。框架负责 `skills/`、`mcp.json`、
+`agents/`、`hooks/hooks.yaml` 与 `lsp.yaml`；应用层只转换 `monitors.yaml`、
+`themes/` 和 `output-styles/`
+中的 monitors、themes 与 output styles。三种交互界面共享同一个
+`PluginRuntimeService`，插件启停和 reload 会精确替换其运行时组件。
 
 ### 2. 自定义工具
 

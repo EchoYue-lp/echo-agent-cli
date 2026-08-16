@@ -5640,7 +5640,7 @@ async fn handle_tui_plugin_command(
                     format!(
                         "{} v{} [{}] · {}",
                         entry.manifest.name,
-                        entry.manifest.version,
+                        entry.manifest.version_label(),
                         if entry.enabled { "enabled" } else { "disabled" },
                         entry.scope
                     )
@@ -5725,16 +5725,15 @@ async fn handle_tui_plugin_command(
             };
             match runtime.get(name).await {
                 Some(entry) => {
-                    let capabilities = entry
-                        .manifest
-                        .inferred_capabilities()
+                    let capabilities =
+                        echo_agent_app_core::plugin_runtime::plugin_capabilities(&entry)
                         .into_iter()
                         .map(|capability| capability.display_name().to_string())
                         .collect::<Vec<_>>();
                     format!(
                         "{} v{}\n{}\nScope: {}\nEnabled: {}\nPath: {}\nCapabilities: {}",
                         entry.manifest.name,
-                        entry.manifest.version,
+                        entry.manifest.version_label(),
                         entry.manifest.description,
                         entry.scope,
                         entry.enabled,

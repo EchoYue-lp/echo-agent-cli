@@ -7,8 +7,8 @@ use std::sync::Arc;
 use echo_agent::lsp::{LspConfig, LspManager};
 use echo_agent::mcp::McpConfigFile;
 use echo_agent::plugin::{
-    InstallSource, PluginEntry, PluginIntegrator, PluginLifecycle, PluginLifecycleManager,
-    PluginRegistry, PluginScope, PluginWiringResult, WiredPluginComponents,
+    AGENT_PLUGIN_SCHEMA_V1, InstallSource, PluginEntry, PluginIntegrator, PluginLifecycle,
+    PluginLifecycleManager, PluginRegistry, PluginScope, PluginWiringResult, WiredPluginComponents,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -138,7 +138,7 @@ impl ReloadSummary {
             monitors_loaded: application.monitors.len(),
             themes_loaded: application.themes.len(),
             output_styles_loaded: application.output_styles.len(),
-            errors: Vec::new(),
+            errors: wiring.warnings.clone(),
         }
     }
 }
@@ -155,6 +155,24 @@ pub struct PluginValidationReport {
     pub name: Option<String>,
     pub components: Vec<String>,
     pub errors: Vec<String>,
+}
+
+/// Capabilities visible to EKO, combining framework and application-owned
+/// components from the same fixed package layout.
+pub fn plugin_capabilities(entry: &PluginEntry) -> Vec<echo_agent::plugin::PluginCapability> {
+    let mut capabilities = entry.inferred_capabilities();
+    if let Ok(eko) = crate::plugin_components::resolve_eko_components(&entry.root) {
+        if eko.monitors_file.is_some() {
+            capabilities.push(echo_agent::plugin::PluginCapability::Monitor);
+        }
+        if !eko.theme_files.is_empty() {
+            capabilities.push(echo_agent::plugin::PluginCapability::Theme);
+        }
+        if !eko.output_style_files.is_empty() {
+            capabilities.push(echo_agent::plugin::PluginCapability::OutputStyle);
+        }
+    }
+    capabilities
 }
 
 #[derive(Clone)]
@@ -1173,11 +1191,33 @@ impl PluginRuntimeService {
         let directory = directory.as_ref();
         match PluginRegistry::validate_plugin_dir(directory) {
             Ok((manifest, resolved)) => {
-                let errors = validate_application_component_files(&manifest.name, &resolved);
+                let defaults = manifest
+                    .config
+                    .iter()
+                    .filter_map(|(name, entry)| {
+                        entry.default.clone().map(|value| (name.clone(), value))
+                    })
+                    .collect::<HashMap<_, _>>();
+                let project_dir =
+                    std::env::current_dir().unwrap_or_else(|_| directory.to_path_buf());
+                let variables = echo_agent::plugin::PluginVariables::new(
+                    &manifest.name,
+                    directory.to_path_buf(),
+                    project_dir,
+                )
+                .with_plugin_data(std::env::temp_dir())
+                .with_json_user_config(&defaults);
+                let errors = validate_application_component_files(
+                    &manifest.name,
+                    directory,
+                    &resolved,
+                    &variables,
+                );
+                let components = component_names(directory, &resolved);
                 PluginValidationReport {
                     valid: errors.is_empty(),
                     name: Some(manifest.name),
-                    components: component_names(&resolved),
+                    components,
                     errors,
                 }
             }
@@ -2205,36 +2245,57 @@ async fn fire_plugin_events(
 }
 
 fn validate_plugin_name(name: &str) -> anyhow::Result<()> {
-    if name.is_empty()
+    let length = name.chars().count();
+    if !(1..=64).contains(&length)
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
+        || !name
+            .chars()
+            .last()
+            .is_some_and(|character| character.is_ascii_alphanumeric())
         || !name.chars().all(|character| {
-            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-'
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '-'
+                || character == '.'
         })
-        || name.starts_with('-')
-        || name.ends_with('-')
+        || name.contains("--")
+        || name.contains("..")
     {
         return Err(anyhow::anyhow!(
-            "Plugin name must be lowercase kebab-case without leading or trailing hyphens"
+            "Plugin name must follow the Agent Plugins lowercase name format"
         ));
     }
     Ok(())
 }
 
 fn write_scaffold(directory: &Path, name: &str) -> anyhow::Result<()> {
-    for child in [
-        ".echo-plugin",
+    let children = [
         "skills/example",
         "agents",
         "hooks",
-        "monitors",
         "themes",
         "output-styles",
-    ] {
+        "scripts",
+    ];
+    for child in children {
         std::fs::create_dir_all(directory.join(child))?;
     }
-    let manifest = format!(
-        "name: {name}\ndisplay_name: {name}\nversion: \"0.1.0\"\ndescription: \"EKO plugin\"\nlicense: MIT\ndefault_enabled: true\ncomponents:\n  skills: ./skills\n  agents: ./agents\n  hooks: ./hooks/hooks.yaml\n  mcp_servers: ./.mcp.json\n  lsp_servers: ./.lsp.yaml\n  monitors: ./monitors/monitors.yaml\n  themes: ./themes\n  output_styles: ./output-styles\n"
-    );
-    std::fs::write(directory.join(".echo-plugin/manifest.yaml"), manifest)?;
+    let manifest = serde_json::json!({
+        "$schema": AGENT_PLUGIN_SCHEMA_V1,
+        "name": name,
+        "version": "0.1.0",
+        "description": "EKO plugin",
+        "license": "MIT",
+        "displayName": name,
+        "defaultEnabled": true
+    });
+    std::fs::write(
+        directory.join("plugin.json"),
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
     std::fs::write(
         directory.join("skills/example/SKILL.md"),
         format!(
@@ -2248,9 +2309,12 @@ fn write_scaffold(directory: &Path, name: &str) -> anyhow::Result<()> {
         ),
     )?;
     std::fs::write(directory.join("hooks/hooks.yaml"), "{}\n")?;
-    std::fs::write(directory.join(".mcp.json"), "{\"mcpServers\": {}}\n")?;
-    std::fs::write(directory.join(".lsp.yaml"), "languages: {}\n")?;
-    std::fs::write(directory.join("monitors/monitors.yaml"), "monitors: []\n")?;
+    std::fs::write(
+        directory.join("mcp.json"),
+        "{\n  \"$schema\": \"https://agent-plugins.org/schemas/1.0.0/mcp.schema.json\",\n  \"mcpServers\": {}\n}\n",
+    )?;
+    std::fs::write(directory.join("lsp.yaml"), "languages: {}\n")?;
+    std::fs::write(directory.join("monitors.yaml"), "monitors: []\n")?;
     std::fs::write(
         directory.join("themes/example.json"),
         format!(
@@ -2263,10 +2327,14 @@ fn write_scaffold(directory: &Path, name: &str) -> anyhow::Result<()> {
             "---\nname: {name}-concise\ndescription: Concise answers\n---\nAnswer directly, preserve important evidence, and avoid repetition.\n"
         ),
     )?;
+    std::fs::write(
+        directory.join("README.md"),
+        format!("# {name}\n\nEKO plugin package.\n"),
+    )?;
     Ok(())
 }
 
-fn component_names(resolved: &echo_agent::plugin::ResolvedComponents) -> Vec<String> {
+fn component_names(root: &Path, resolved: &echo_agent::plugin::ResolvedComponents) -> Vec<String> {
     let mut names = Vec::new();
     if !resolved.skill_dirs.is_empty() {
         names.push("skills".to_string());
@@ -2283,14 +2351,16 @@ fn component_names(resolved: &echo_agent::plugin::ResolvedComponents) -> Vec<Str
     if resolved.lsp_config_file.is_some() {
         names.push("lsp_servers".to_string());
     }
-    if resolved.monitors_file.is_some() {
-        names.push("monitors".to_string());
-    }
-    if !resolved.theme_files.is_empty() {
-        names.push("themes".to_string());
-    }
-    if !resolved.output_style_files.is_empty() {
-        names.push("output_styles".to_string());
+    if let Ok(eko) = crate::plugin_components::resolve_eko_components(root) {
+        if eko.monitors_file.is_some() {
+            names.push("monitors".to_string());
+        }
+        if !eko.theme_files.is_empty() {
+            names.push("themes".to_string());
+        }
+        if !eko.output_style_files.is_empty() {
+            names.push("output_styles".to_string());
+        }
     }
     names
 }
@@ -2363,7 +2433,7 @@ mod tests {
     fn write_fixture_at(plugin: PathBuf, name: &str) -> Result<PathBuf, String> {
         PluginRuntimeService::scaffold(&plugin, name).map_err(|error| error.to_string())?;
         std::fs::write(
-            plugin.join("monitors/monitors.yaml"),
+            plugin.join("monitors.yaml"),
             "monitors:\n  - name: daily-review\n    cron: \"0 0 * * * *\"\n    prompt: Review pending work\n",
         )
         .map_err(|error| error.to_string())?;
@@ -2414,7 +2484,7 @@ done
             }
         }))
         .map_err(|error| error.to_string())?;
-        std::fs::write(plugin.join(".lsp.yaml"), lsp).map_err(|error| error.to_string())
+        std::fs::write(plugin.join("lsp.yaml"), lsp).map_err(|error| error.to_string())
     }
 
     async fn service(root: &Path) -> Result<Arc<PluginRuntimeService>, String> {
@@ -3067,7 +3137,7 @@ done
         assert_eq!(scheduler.list_tasks().await.len(), 1);
 
         std::fs::write(
-            target_plugin.join("monitors/monitors.yaml"),
+            target_plugin.join("monitors.yaml"),
             "monitors: [not-a-monitor-definition]\n",
         )
         .map_err(|error| error.to_string())?;
@@ -3189,13 +3259,29 @@ done
     -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let plugin = write_fixture(temp.path())?;
-        let manifest_path = plugin.join(".echo-plugin/manifest.yaml");
-        let mut manifest =
+        let manifest_path = plugin.join("plugin.json");
+        let manifest_text =
             std::fs::read_to_string(&manifest_path).map_err(|error| error.to_string())?;
-        manifest.push_str(
-            "config:\n  label:\n    type: string\n    title: Label\n    default: initial\n",
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(&manifest_text).map_err(|error| error.to_string())?;
+        let manifest_object = manifest
+            .as_object_mut()
+            .ok_or_else(|| "fixture plugin manifest is not an object".to_string())?;
+        manifest_object.insert(
+            "config".to_string(),
+            serde_json::json!({
+                "label": {
+                    "type": "string",
+                    "title": "Label",
+                    "default": "initial"
+                }
+            }),
         );
-        std::fs::write(&manifest_path, manifest).map_err(|error| error.to_string())?;
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_string_pretty(&manifest).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
         let runtime = service(temp.path()).await?;
         let counts = Arc::new(LifecycleCounts::default());
         runtime
@@ -3406,6 +3492,26 @@ done
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let plugin = temp.path().join("scaffolded");
         PluginRuntimeService::scaffold(&plugin, "scaffolded").map_err(|error| error.to_string())?;
+        for expected_file in [
+            "plugin.json",
+            "skills/example/SKILL.md",
+            "agents/example.md",
+            "hooks/hooks.yaml",
+            "mcp.json",
+            "lsp.yaml",
+            "monitors.yaml",
+            "themes/example.json",
+            "output-styles/scaffolded-concise.md",
+            "README.md",
+        ] {
+            assert!(
+                plugin.join(expected_file).is_file(),
+                "missing scaffold file {expected_file}"
+            );
+        }
+        assert!(plugin.join("scripts").is_dir());
+        assert!(!plugin.join(".echo-plugin").exists());
+        assert!(!plugin.join(".mcp.json").exists());
         let report = PluginRuntimeService::validate(&plugin);
         assert!(report.valid, "{}", report.errors.join("; "));
         for expected in [
@@ -3425,6 +3531,52 @@ done
                     .any(|component| component == expected)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn validate_rejects_malformed_runtime_components() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let plugin = temp.path().join("invalid-components");
+        PluginRuntimeService::scaffold(&plugin, "invalid-components")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("hooks/hooks.yaml"),
+            "PreToolUse:\n  - matcher: '*'\n    hooks:\n      - type: command\n        command: ''\n",
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("mcp.json"),
+            r#"{"$schema":"invalid","mcpServers":{}}"#,
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
+            plugin.join("skills/example/SKILL.md"),
+            "This file has no frontmatter.\n",
+        )
+        .map_err(|error| error.to_string())?;
+
+        let report = PluginRuntimeService::validate(&plugin);
+
+        assert!(!report.valid);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("empty command"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("MCP config"))
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("must begin with YAML frontmatter"))
+        );
         Ok(())
     }
 }

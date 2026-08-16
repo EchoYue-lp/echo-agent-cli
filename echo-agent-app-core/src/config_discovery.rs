@@ -15,7 +15,7 @@
 //! | `user.md` | `~/.eko/` | User-level instructions |
 //! | `project.md` | `<project-root>/.eko/` | Project-level instructions |
 //! | `local.md` | `<cwd>/.eko/` | Local directory instructions |
-//! | `manifest.yaml` | Plugin directories | Plugin manifests |
+//! | `plugin.json` | Plugin directories | Agent Plugin manifests |
 //! | `.workspace.json` | Workspace directories | Workspace metadata |
 //! | `.lsp.yaml` | Project root | LSP server configuration |
 
@@ -341,13 +341,10 @@ impl ConfigDiscovery {
             }
             if let Ok(entries) = std::fs::read_dir(dir) {
                 for entry in entries.flatten() {
-                    let manifest = entry.path().join(".echo-plugin").join("manifest.yaml");
+                    let manifest = entry.path().join("plugin.json");
                     if manifest.exists() {
                         inv.plugin_manifests.push(ConfigFile {
-                            name: format!(
-                                "manifest.yaml ({})",
-                                entry.file_name().to_string_lossy()
-                            ),
+                            name: format!("plugin.json ({})", entry.file_name().to_string_lossy()),
                             path: manifest,
                             scope: *scope,
                             category: ConfigCategory::Plugin,
@@ -446,10 +443,10 @@ mod tests {
     }
 
     #[test]
-    fn test_with_explicit_paths() {
+    fn test_with_explicit_paths() -> Result<(), String> {
         let tmp = std::env::temp_dir().join("echo-config-test");
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
 
         let discovery = ConfigDiscovery::with_paths(tmp.clone(), tmp.clone(), Some(tmp.clone()));
 
@@ -458,5 +455,6 @@ mod tests {
         assert!(inv.total_count() > 0);
 
         let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
     }
 }

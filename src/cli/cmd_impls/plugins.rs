@@ -27,7 +27,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             println!("\n--- Installed Plugins ({}) ---", plugins.len());
             for entry in plugins {
                 let status = if entry.enabled { "enabled" } else { "disabled" };
-                let caps = entry.manifest.inferred_capabilities();
+                let caps = echo_agent_app_core::plugin_runtime::plugin_capabilities(&entry);
                 let cap_str = caps
                     .iter()
                     .map(|c| c.display_name())
@@ -35,7 +35,10 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     .join(", ");
                 println!(
                     "  * {} v{} [{}] — {}",
-                    entry.manifest.name, entry.manifest.version, status, entry.manifest.description
+                    entry.manifest.name,
+                    entry.manifest.version_label(),
+                    status,
+                    entry.manifest.description
                 );
                 if !cap_str.is_empty() {
                     println!("    Capabilities: {cap_str}");
@@ -69,8 +72,8 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     let mut enabled = false;
                     if let Some(entry) = runtime.get(&id).await {
                         enabled = entry.enabled;
-                        let caps = entry.manifest.inferred_capabilities();
-                        println!("  Version: {}", entry.manifest.version);
+                        let caps = echo_agent_app_core::plugin_runtime::plugin_capabilities(&entry);
+                        println!("  Version: {}", entry.manifest.version_label());
                         println!("  Description: {}", entry.manifest.description);
                         if !caps.is_empty() {
                             println!(
@@ -185,10 +188,12 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             match runtime.get(name).await {
                 Some(entry) => {
                     println!("\n--- Plugin: {} ---", entry.manifest.name);
-                    println!("  Version: {}", entry.manifest.version);
+                    println!("  Version: {}", entry.manifest.version_label());
                     println!("  Description: {}", entry.manifest.description);
-                    if let Some(ref author) = entry.manifest.author {
-                        println!("  Author: {}", author.name);
+                    if let Some(ref author) = entry.manifest.author
+                        && let Some(name) = author.name.as_deref()
+                    {
+                        println!("  Author: {name}");
                     }
                     if let Some(ref license) = entry.manifest.license {
                         println!("  License: {license}");
@@ -197,7 +202,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     println!("  Enabled: {}", entry.enabled);
                     println!("  Path: {}", entry.root.display());
 
-                    let caps = entry.manifest.inferred_capabilities();
+                    let caps = echo_agent_app_core::plugin_runtime::plugin_capabilities(&entry);
                     if !caps.is_empty() {
                         println!(
                             "\n  Capabilities: {}",

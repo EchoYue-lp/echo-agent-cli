@@ -355,6 +355,11 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 | `/mcp` | `m` | MCP 服务器管理 |
 | `/plugins` | `plugin` | 插件管理 |
 
+EKO 插件采用扁平包结构：根目录使用 `plugin.json`，Skills、MCP、Subagents、
+Hooks、LSP、monitors、themes 和 output styles 都从固定根位置发现，不使用
+namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持。
+完整格式见 [echo-agent 插件系统文档](../echo-agent/docs/zh/32-plugin-system.md)。
+
 #### Evolution 自我进化
 
 | 命令 | 别名 | 描述 |
