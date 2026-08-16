@@ -1050,10 +1050,100 @@ struct TaskDispatchSuccess {
     full_output: String,
 }
 
+#[derive(Debug, Clone, Default)]
+struct TaskExecutionUsage {
+    durable: SubagentRunUsage,
+    input_tokens: u64,
+    output_tokens: u64,
+}
+
+impl TaskExecutionUsage {
+    fn from_framework(result: &echo_agent::agent::subagent::SubagentResult) -> Self {
+        let duration_ms = u64::try_from(result.duration.as_millis()).unwrap_or(u64::MAX);
+        let iterations = u64::try_from(result.iterations).unwrap_or(u64::MAX);
+        let input_tokens = result
+            .usage
+            .as_ref()
+            .map(|usage| usage.prompt_tokens)
+            .unwrap_or(0);
+        let output_tokens = result
+            .usage
+            .as_ref()
+            .map(|usage| usage.completion_tokens)
+            .unwrap_or(0);
+        Self {
+            durable: SubagentRunUsage {
+                duration_ms: Some(duration_ms),
+                tokens_used: result
+                    .usage
+                    .as_ref()
+                    .map(|usage| usage.prompt_tokens.saturating_add(usage.completion_tokens)),
+                iterations: Some(iterations),
+            },
+            input_tokens,
+            output_tokens,
+        }
+    }
+
+    fn duration_ms(&self) -> u64 {
+        self.durable.duration_ms.unwrap_or(0)
+    }
+}
+
+fn persist_framework_subagent_usage(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+    execution_id: &str,
+    result: &echo_agent::agent::subagent::SubagentResult,
+) -> Result<TaskExecutionUsage, ExecutionFailure> {
+    let usage = TaskExecutionUsage::from_framework(result);
+    store
+        .account_subagent_usage(
+            run_id,
+            execution_id,
+            "framework_dispatch_total",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.duration_ms(),
+        )
+        .map_err(|error| {
+            ExecutionFailure::failed(format!(
+                "failed to persist Subagent usage for {execution_id}: {error}"
+            ))
+            .with_usage(usage.clone())
+        })?;
+    Ok(usage)
+}
+
+fn finalize_framework_subagent_result(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+    execution_id: &str,
+    result: echo_agent::agent::subagent::SubagentResult,
+) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
+    let usage = persist_framework_subagent_usage(store, run_id, execution_id, &result)?;
+    if result.outcome.status != echo_agent::agent::subagent::SubagentStatus::Completed {
+        let status = result.outcome.status.into();
+        let message = if result.outcome.summary.trim().is_empty() {
+            result.output
+        } else {
+            result.outcome.summary
+        };
+        return Err(ExecutionFailure {
+            status,
+            message,
+            usage: Some(usage),
+        });
+    }
+    let task_result = SubagentTaskResult::from_framework(&result);
+    Ok((task_result, result.output, usage))
+}
+
 #[derive(Debug, Clone)]
 struct ExecutionFailure {
     status: SubagentRunStatus,
     message: String,
+    usage: Option<TaskExecutionUsage>,
 }
 
 impl ExecutionFailure {
@@ -1061,6 +1151,7 @@ impl ExecutionFailure {
         Self {
             status: SubagentRunStatus::Failed,
             message: message.into(),
+            usage: None,
         }
     }
 
@@ -1068,6 +1159,7 @@ impl ExecutionFailure {
         Self {
             status: SubagentRunStatus::Cancelled,
             message: message.into(),
+            usage: None,
         }
     }
 
@@ -1084,6 +1176,7 @@ impl ExecutionFailure {
         Self {
             status,
             message: message.into(),
+            usage: None,
         }
     }
 
@@ -1092,7 +1185,13 @@ impl ExecutionFailure {
         Self {
             status,
             message: format!("{context}: {error}"),
+            usage: None,
         }
+    }
+
+    fn with_usage(mut self, usage: TaskExecutionUsage) -> Self {
+        self.usage = Some(usage);
+        self
     }
 }
 
@@ -2216,18 +2315,6 @@ async fn execute_task(
         )
         .await;
         match dispatch_result {
-            Ok(sub_result)
-                if sub_result.outcome.status
-                    != echo_agent::agent::subagent::SubagentStatus::Completed =>
-            {
-                let status = sub_result.outcome.status.into();
-                let message = if sub_result.outcome.summary.trim().is_empty() {
-                    sub_result.output.clone()
-                } else {
-                    sub_result.outcome.summary.clone()
-                };
-                Err(ExecutionFailure { status, message })
-            }
             Ok(sub_result) => {
                 tracing::info!(
                     run_id = %run_id,
@@ -2236,12 +2323,10 @@ async fn execute_task(
                     output_chars = sub_result.output.chars().count(),
                     iterations = sub_result.iterations,
                     usage_reported = sub_result.usage.is_some(),
-                    "task_runtime: read-only subagent completed"
+                    terminal_status = ?sub_result.outcome.status,
+                    "task_runtime: read-only subagent settled"
                 );
-                Ok((
-                    SubagentTaskResult::from_framework(&sub_result),
-                    sub_result.output.clone(),
-                ))
+                finalize_framework_subagent_result(&store, &run_id, &execution_id, sub_result)
             }
             Err(e) => {
                 tracing::warn!(
@@ -2279,18 +2364,6 @@ async fn execute_task(
         )
         .await;
         match dispatch_result {
-            Ok(sub_result)
-                if sub_result.outcome.status
-                    != echo_agent::agent::subagent::SubagentStatus::Completed =>
-            {
-                let status = sub_result.outcome.status.into();
-                let message = if sub_result.outcome.summary.trim().is_empty() {
-                    sub_result.output.clone()
-                } else {
-                    sub_result.outcome.summary.clone()
-                };
-                Err(ExecutionFailure { status, message })
-            }
             Ok(sub_result) => {
                 tracing::info!(
                     run_id = %run_id,
@@ -2300,12 +2373,10 @@ async fn execute_task(
                     summary_chars = sub_result.outcome.summary.chars().count(),
                     iterations = sub_result.iterations,
                     usage_reported = sub_result.usage.is_some(),
-                    "task_runtime: writer subagent completed"
+                    terminal_status = ?sub_result.outcome.status,
+                    "task_runtime: writer subagent settled"
                 );
-                Ok((
-                    SubagentTaskResult::from_framework(&sub_result),
-                    sub_result.output.clone(),
-                ))
+                finalize_framework_subagent_result(&store, &run_id, &execution_id, sub_result)
             }
             Err(error) => Err(if task_cancel.is_cancelled() {
                 ExecutionFailure::cancelled("task cancelled")
@@ -2353,7 +2424,7 @@ async fn execute_task(
     };
 
     match result {
-        Ok((task_result, full_output)) => {
+        Ok((task_result, full_output, usage)) => {
             // The parent consumes the bounded structured summary; extract
             // suggested_tasks from the full output because that optional block
             // appears before the terminal ## Result contract.
@@ -2392,6 +2463,7 @@ async fn execute_task(
                 status: task_result.status.as_str(),
                 result: Some(&task_result),
                 full_output: Some(&full_output),
+                usage: Some(&usage.durable),
                 dispatch_hook: app_owns_subagent_events,
             }) {
                 return Err(TaskDispatchFailure::failed(
@@ -2461,6 +2533,7 @@ async fn execute_task(
         Err(failure) => {
             let status = failure.status;
             let message = failure.message;
+            let usage = failure.usage;
             let task_result =
                 SubagentTaskResult::terminal(status, message.clone(), vec![message.clone()]);
             if let Err(error) = store.put_summary(&TaskExecutionSummary {
@@ -2486,6 +2559,7 @@ async fn execute_task(
                 status: status.as_str(),
                 result: Some(&task_result),
                 full_output: Some(&message),
+                usage: usage.as_ref().map(|value| &value.durable),
                 dispatch_hook: app_owns_subagent_events,
             }) {
                 tracing::warn!(
@@ -2554,7 +2628,11 @@ async fn execute_task(
             }
             Err(TaskDispatchFailure::from_execution(
                 task_id,
-                ExecutionFailure { status, message },
+                ExecutionFailure {
+                    status,
+                    message,
+                    usage,
+                },
             ))
         }
     }
@@ -3108,7 +3186,7 @@ async fn run_main_agent_task(
     prompt: &str,
     cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
-) -> Result<(SubagentTaskResult, String), ExecutionFailure> {
+) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
     let run_id = run_id.to_string();
     let task_id = task.id.clone();
     let agent_role = task.agent_role.clone();
@@ -3198,13 +3276,15 @@ async fn run_main_agent_task(
                 let mut observed_verification = Vec::new();
                 let mut observed_artifacts = Vec::new();
                 let mut touched_files = echo_agent::agent::subagent::SubagentTouchedFiles::default();
+                let started = std::time::Instant::now();
+                let mut usage = TaskExecutionUsage::default();
 
                 while let Some(event_result) = stream.next().await {
-                    let event = event_result
-                        .map_err(|error| {
+                    let envelope = event_result.map_err(|error| {
                             ExecutionFailure::from_react(error, "main agent stream failed")
-                        })?
-                        .payload;
+                        })?;
+                    let source_event_id = envelope.event_id.to_string();
+                    let event = envelope.payload;
                     match event {
                         AgentEvent::Token(content) => {
                             if in_thinking {
@@ -3277,6 +3357,30 @@ async fn run_main_agent_task(
                             cache_creation_prompt_tokens,
                             usage_reported,
                         } => {
+                            let input_tokens =
+                                u64::try_from(prompt_tokens).unwrap_or(u64::MAX);
+                            let output_tokens =
+                                u64::try_from(completion_tokens).unwrap_or(u64::MAX);
+                            usage.input_tokens =
+                                usage.input_tokens.saturating_add(input_tokens);
+                            usage.output_tokens =
+                                usage.output_tokens.saturating_add(output_tokens);
+                            store
+                                .account_subagent_usage(
+                                    &run_id,
+                                    &execution_id,
+                                    &source_event_id,
+                                    input_tokens,
+                                    output_tokens,
+                                    0,
+                                )
+                                .map_err(|error| {
+                                    event_cancel.cancel();
+                                    ExecutionFailure::failed(format!(
+                                        "failed to persist primary Subagent usage: {error}"
+                                    ))
+                                    .with_usage(usage.clone())
+                                })?;
                             let usage_payload = serde_json::json!({
                                 "model": model,
                                 "prompt_tokens": prompt_tokens,
@@ -3285,7 +3389,7 @@ async fn run_main_agent_task(
                                 "cached_prompt_tokens": cached_prompt_tokens,
                                 "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
                                 "usage_reported": usage_reported,
-                                "usage_event_id": uuid::Uuid::new_v4().to_string(),
+                                "usage_event_id": source_event_id,
                             });
                             emit_exec(
                                 trace_sink.as_ref(),
@@ -3545,9 +3649,34 @@ async fn run_main_agent_task(
                     touched_files,
                     observed_artifacts,
                 );
+                let duration_ms =
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                usage.durable = SubagentRunUsage {
+                    duration_ms: Some(duration_ms),
+                    tokens_used: Some(
+                        usage.input_tokens.saturating_add(usage.output_tokens),
+                    ),
+                    iterations: None,
+                };
+                store
+                    .account_subagent_usage(
+                        &run_id,
+                        &execution_id,
+                        "primary_subagent_duration",
+                        0,
+                        0,
+                        duration_ms,
+                    )
+                    .map_err(|error| {
+                        ExecutionFailure::failed(format!(
+                            "failed to persist primary Subagent duration: {error}"
+                        ))
+                        .with_usage(usage.clone())
+                    })?;
                 Ok((
                     SubagentTaskResult::from_framework_outcome(&outcome),
                     output,
+                    usage,
                 ))
             })
         })
@@ -4894,7 +5023,14 @@ Read the runtime path and found one missing branch.
         order: StdMutex<Vec<String>>,
         /// task_id → integration error returned after review.
         integration_failures: StdMutex<StdHashMap<String, String>>,
-        delays_ms: StdMutex<StdHashMap<String, u64>>,
+        gates: StdMutex<StdHashMap<String, Arc<ScriptedDispatchGate>>>,
+        returned_count: std::sync::atomic::AtomicUsize,
+        returned: tokio::sync::Notify,
+    }
+
+    struct ScriptedDispatchGate {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     impl ScriptedDispatcher {
@@ -4903,7 +5039,9 @@ Read the runtime path and found one missing branch.
                 results: StdMutex::new(StdHashMap::new()),
                 order: StdMutex::new(Vec::new()),
                 integration_failures: StdMutex::new(StdHashMap::new()),
-                delays_ms: StdMutex::new(StdHashMap::new()),
+                gates: StdMutex::new(StdHashMap::new()),
+                returned_count: std::sync::atomic::AtomicUsize::new(0),
+                returned: tokio::sync::Notify::new(),
             })
         }
         /// Script a success result for `id`.
@@ -4955,11 +5093,30 @@ Read the runtime path and found one missing branch.
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(id.to_string(), error.to_string());
         }
-        fn delay(self: &Arc<Self>, id: &str, delay_ms: u64) {
-            self.delays_ms
+        fn gate(self: &Arc<Self>, id: &str) -> Arc<ScriptedDispatchGate> {
+            let gate = Arc::new(ScriptedDispatchGate {
+                started: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            self.gates
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .insert(id.to_string(), delay_ms);
+                .insert(id.to_string(), gate.clone());
+            gate
+        }
+
+        async fn wait_for_returns(&self, expected: usize) {
+            loop {
+                let returned = self.returned.notified();
+                if self
+                    .returned_count
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    >= expected
+                {
+                    return;
+                }
+                returned.await;
+            }
         }
     }
 
@@ -4983,32 +5140,35 @@ Read the runtime path and found one missing branch.
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&task.id)
                 .cloned();
-            let delay_ms = self
-                .delays_ms
+            let gate = self
+                .gates
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&task.id)
-                .copied()
-                .unwrap_or(0);
+                .cloned();
             self.order
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(task.id.clone());
+            if let Some(gate) = gate.as_ref() {
+                gate.started.notify_one();
+            }
             let task_id = task.id.clone();
+            let dispatcher = self.clone();
             Box::pin(async move {
-                if delay_ms > 0 {
+                if let Some(gate) = gate {
                     tokio::select! {
                         _ = context.cancel.cancelled() => {
                             return Err(TaskDispatchFailure::cancelled(task_id, "cancelled"));
                         }
-                        _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                        _ = gate.release.notified() => {}
                     }
                 }
                 // Honor cancellation even in the mock.
                 if context.cancel.is_cancelled() {
                     return Err(TaskDispatchFailure::cancelled(task_id, "cancelled"));
                 }
-                match results {
+                let result = match results {
                     Some(Ok((result, full_output))) => Ok(TaskDispatchSuccess {
                         task_id,
                         result,
@@ -5021,7 +5181,12 @@ Read the runtime path and found one missing branch.
                         result: successful_task_result("ok"),
                         full_output: "ok".to_string(),
                     }),
-                }
+                };
+                dispatcher
+                    .returned_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+                dispatcher.returned.notify_waiters();
+                result
             })
         }
 
@@ -5516,11 +5681,11 @@ Read the runtime path and found one missing branch.
         let dispatcher = ScriptedDispatcher::new();
         for task in tasks.iter().take(4) {
             dispatcher.succeed(&task.id, "completed before cancellation");
-            dispatcher.delay(&task.id, 10);
         }
+        let mut cancelled_gates = Vec::new();
         for task in tasks.iter().skip(4) {
             dispatcher.succeed(&task.id, "should be cancelled");
-            dispatcher.delay(&task.id, 5_000);
+            cancelled_gates.push(dispatcher.gate(&task.id));
         }
         let cancel = CancellationToken::new();
         let run_cancel = cancel.clone();
@@ -5544,16 +5709,13 @@ Read the runtime path and found one missing branch.
         });
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
-            loop {
-                if dispatcher.order().len() == 8 {
-                    break;
-                }
-                tokio::task::yield_now().await;
+            for gate in &cancelled_gates {
+                gate.started.notified().await;
             }
+            dispatcher.wait_for_returns(4).await;
         })
         .await
-        .map_err(|_| "all tasks were not dispatched".to_string())?;
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        .map_err(|_| "dispatch/cancellation boundary was not reached".to_string())?;
         cancel.cancel();
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
@@ -5622,6 +5784,7 @@ Read the runtime path and found one missing branch.
                 status: "completed",
                 result: Some(&recovered_result),
                 full_output: Some("recovered full output"),
+                usage: None,
                 dispatch_hook: true,
             })
             .map_err(|error| error.to_string())?;
@@ -5705,7 +5868,7 @@ Read the runtime path and found one missing branch.
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("first", "first done");
         dispatcher.succeed("second", "second done");
-        dispatcher.delay("first", 300);
+        let first_gate = dispatcher.gate("first");
 
         let execution_store = store.clone();
         let execution_dispatcher = dispatcher.clone();
@@ -5723,17 +5886,12 @@ Read the runtime path and found one missing branch.
             .await
         });
 
-        let mut first_started = false;
-        for _ in 0..100 {
-            if dispatcher.order().iter().any(|task_id| task_id == "first") {
-                first_started = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        if !first_started {
-            return Err("first task did not enter the active wave".to_string());
-        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            first_gate.started.notified(),
+        )
+        .await
+        .map_err(|_| "first task did not enter the active wave".to_string())?;
 
         store
             .apply_task_patch_for_test(
@@ -5748,6 +5906,7 @@ Read the runtime path and found one missing branch.
                 },
             )
             .map_err(|error| error.to_string())?;
+        first_gate.release.notify_one();
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
             .await
@@ -5982,41 +6141,45 @@ Read the runtime path and found one missing branch.
         in_flight.status = TodoStatus::Running;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("pending", "done");
+        let pending_gate = dispatcher.gate("pending");
 
-        // Simulate the sibling runtime instance finishing `in_flight` shortly
-        // after `pending` is dispatched. Without this, the in-flight
-        // wait loop would never observe Completed and the test would time out
-        // (correctly — it means the task really is still in-flight).
-        let store_bg = store.clone();
-        let run_id_bg = run_id.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let _ = store_bg.set_task_status(
-                &run_id_bg,
+        let execution_store = store.clone();
+        let execution_dispatcher = dispatcher.clone();
+        let execution_run_id = run_id.clone();
+        let execution = tokio::spawn(async move {
+            execute_runtime_plan(
+                execution_store,
+                execution_dispatcher,
+                None,
+                &execution_run_id,
+                EkoExecutionLimits::default(),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            pending_gate.started.notified(),
+        )
+        .await
+        .map_err(|_| "pending task was not dispatched".to_string())?;
+        store
+            .set_task_status(
+                &run_id,
                 "in_flight",
                 TodoStatus::Completed,
                 Some("explorer"),
                 Some("sibling done"),
-            );
-        });
+            )
+            .map_err(|error| error.to_string())?;
+        pending_gate.release.notify_one();
 
-        let outcome = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            execute_runtime_plan(
-                store.clone(),
-                dispatcher.clone(),
-                None,
-                &run_id,
-                EkoExecutionLimits::default(),
-                CancellationToken::new(),
-                None,
-            ),
-        )
-        .await
-        .map_err(|_| {
-            "runtime plan did not complete within 10s (in_flight wait loop stuck)".to_string()
-        })?
-        .map_err(|error| error.to_string())?;
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), execution)
+            .await
+            .map_err(|_| "runtime plan did not complete within 10s".to_string())?
+            .map_err(|error| format!("runtime task failed to join: {error}"))?
+            .map_err(|error| error.to_string())?;
 
         // `in_flight` (Running) must NOT have been re-dispatched; only
         // `pending` should appear in the dispatch order.
@@ -6077,13 +6240,28 @@ Read the runtime path and found one missing branch.
             TaskRuntimeStore::new_in_memory()
                 .map_err(|error| format!("in-memory store should initialize: {error}"))?,
         );
+        let run_id = seed_run(&store, vec![task.clone()])?;
+        let execution_id = format!("{run_id}:implementation-a:1:1");
+        store
+            .record_subagent_assigned(
+                &run_id,
+                &task.id,
+                &execution_id,
+                &task.agent_role,
+                &task.title,
+                1,
+                1,
+                false,
+                false,
+            )
+            .map_err(|error| format!("Subagent boundary should persist: {error}"))?;
 
         let output = run_main_agent_task(
             &handle,
             store,
-            "run-trace",
+            &run_id,
             &task,
-            "run-trace:implementation-a:1:1",
+            &execution_id,
             "What is 6 times 7?",
             CancellationToken::new(),
             Some(sink),
@@ -6101,7 +6279,7 @@ Read the runtime path and found one missing branch.
                 event.event == RuntimeEventKind::ToolStarted
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
-                    && event.subagent_run_id.as_deref() == Some("run-trace:implementation-a:1:1")
+                    && event.subagent_run_id.as_deref() == Some(execution_id.as_str())
                     && event.payload.get("name").and_then(|v| v.as_str()) == Some("run_code")
             }),
             "expected tool_started for run_code, got {events:?}"
@@ -6111,7 +6289,7 @@ Read the runtime path and found one missing branch.
                 event.event == RuntimeEventKind::ToolCompleted
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
-                    && event.subagent_run_id.as_deref() == Some("run-trace:implementation-a:1:1")
+                    && event.subagent_run_id.as_deref() == Some(execution_id.as_str())
                     && event.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
                     && event
                         .payload

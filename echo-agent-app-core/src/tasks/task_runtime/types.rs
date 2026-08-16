@@ -1128,6 +1128,22 @@ pub struct RunTurnBinding {
     pub transcript_visibility: TurnVisibility,
 }
 
+impl RunTurnBinding {
+    pub fn resume(
+        run_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        root_message_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            run_id: Some(run_id.into()),
+            turn_id: turn_id.into(),
+            root_message_id: root_message_id.into(),
+            origin: RunTurnOrigin::Resume,
+            transcript_visibility: TurnVisibility::Visible,
+        }
+    }
+}
+
 /// Terminal execution state of one finite RunTurn. `Ended` is not Goal completion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]

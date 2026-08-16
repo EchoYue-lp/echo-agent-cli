@@ -389,6 +389,20 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         .get("time_budget_seconds")
                         .and_then(serde_json::Value::as_u64);
                 }
+                if let Some(reason) = json_string(&ev.payload, "pause_reason")
+                    .as_deref()
+                    .and_then(RunPauseReason::from_wire)
+                {
+                    state.pause = Some(RunPause {
+                        reason,
+                        detail: json_string(&ev.payload, "pause_detail"),
+                        changed_at: ev.timestamp,
+                    });
+                    if let Some(run) = run.as_mut() {
+                        run.status = TaskRunStatus::Paused;
+                        run.updated_at = ev.timestamp;
+                    }
+                }
             }
             K::RunTurnStarted => {
                 let state = continuation.get_or_insert_with(RunContinuationState::default);
@@ -450,12 +464,32 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                 state.tokens_used = state
                     .tokens_used
                     .saturating_add(input_tokens.saturating_add(output_tokens));
+                let elapsed_seconds = ev
+                    .payload
+                    .get("elapsed_seconds")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                state.time_used_seconds = state.time_used_seconds.saturating_add(elapsed_seconds);
                 let turn_id = json_string(&ev.payload, "turn_id");
                 if let Some(active) = state.active_turn.as_mut()
                     && turn_id.as_deref() == Some(active.turn_id.as_str())
                 {
                     active.input_tokens = active.input_tokens.saturating_add(input_tokens);
                     active.output_tokens = active.output_tokens.saturating_add(output_tokens);
+                }
+                if let Some(reason) = json_string(&ev.payload, "pause_reason")
+                    .as_deref()
+                    .and_then(RunPauseReason::from_wire)
+                {
+                    state.pause = Some(RunPause {
+                        reason,
+                        detail: json_string(&ev.payload, "pause_detail"),
+                        changed_at: ev.timestamp,
+                    });
+                    if let Some(run) = run.as_mut() {
+                        run.status = TaskRunStatus::Paused;
+                        run.updated_at = ev.timestamp;
+                    }
                 }
             }
             K::RunTurnCompacted => {

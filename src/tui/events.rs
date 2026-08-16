@@ -1385,6 +1385,7 @@ async fn handle_enter(
         text,
         attachments: std::mem::take(&mut app.pending_attachments),
         interaction_mode: app.interaction_mode,
+        run_resume: None,
     };
     if app.is_processing {
         let preview: String = turn.text.chars().take(60).collect();
@@ -1416,6 +1417,7 @@ async fn dispatch_turn(
     turn: QueuedTurn,
 ) -> TurnDispatchResult {
     let turn_id = uuid::Uuid::new_v4().to_string();
+    let run_turn_binding = run_turn_binding_for_queued_turn(&turn, &turn_id);
     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
     let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
@@ -1512,17 +1514,22 @@ async fn dispatch_turn(
     let agent_owned = agent.clone();
     let settled_turn_id = turn_id.clone();
     if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
-        let outcome =
-            match std::panic::AssertUnwindSafe(send_to_agent(&agent_owned, prepared, res, lease))
-                .catch_unwind()
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(_) => {
-                    tracing::error!(turn_id = %settled_turn_id, "TUI foreground driver panicked");
-                    TurnOutcome::Cancelled
-                }
-            };
+        let outcome = match std::panic::AssertUnwindSafe(send_to_agent(
+            &agent_owned,
+            prepared,
+            res,
+            lease,
+            run_turn_binding,
+        ))
+        .catch_unwind()
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::error!(turn_id = %settled_turn_id, "TUI foreground driver panicked");
+                TurnOutcome::Cancelled
+            }
+        };
         let _ = agent_tx.send(AgentEvent::TurnSettled {
             turn_id: settled_turn_id,
             outcome,
@@ -1648,6 +1655,7 @@ fn queue_steer_follow_up(
         text: instruction.to_string(),
         attachments,
         interaction_mode: app.interaction_mode,
+        run_resume: None,
     });
     app.status_msg = format!(
         "Current stage is not steerable; queued {} follow-up(s)",
@@ -2411,21 +2419,38 @@ async fn send_to_agent(
     turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
     lease: ForegroundTurnLease,
+    run_turn_binding: Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding>,
 ) -> TurnOutcome {
-    use echo_agent_app_core::foreground_turn::drive_foreground_chat;
+    use echo_agent_app_core::foreground_turn::{drive_foreground_chat, drive_foreground_chat_turn};
 
     // TUI does not classify chat versus task locally. The shared foreground
     // driver owns TaskRuntime, memory-generation, and pool admission, while
     // PreparedUserTurn preserves the same staged attachment path as GUI.
-    drive_foreground_chat(lease, agent, &turn, res)
-        .await
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "TUI foreground chat failed");
-            TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-                "foreground_turn",
-                error,
-            ))
-        })
+    let result = if let Some(binding) = run_turn_binding {
+        drive_foreground_chat_turn(lease, agent, &turn, res, binding).await
+    } else {
+        drive_foreground_chat(lease, agent, &turn, res).await
+    };
+    result.unwrap_or_else(|error| {
+        tracing::warn!(%error, "TUI foreground chat failed");
+        TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+            "foreground_turn",
+            error,
+        ))
+    })
+}
+
+fn run_turn_binding_for_queued_turn(
+    turn: &QueuedTurn,
+    turn_id: &str,
+) -> Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding> {
+    turn.run_resume.as_ref().map(|resume| {
+        echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume(
+            resume.run_id.clone(),
+            turn_id.to_string(),
+            resume.root_message_id.clone(),
+        )
+    })
 }
 
 async fn handle_tui_cron(app: &TuiApp, args: &str) -> String {
@@ -4644,13 +4669,18 @@ async fn handle_slash_command(
                             .ok_or_else(|| "run is not actively pausable".to_string())
                     }),
                 SlashCommand::TaskResume => {
-                    let is_continuation = store
+                    let continuation_run = store
                         .get_run_state(&run_id)
                         .ok()
                         .flatten()
-                        .and_then(|state| state.continuation)
-                        .is_some_and(|continuation| continuation.enabled);
-                    if is_continuation {
+                        .filter(|state| {
+                            state
+                                .continuation
+                                .as_ref()
+                                .is_some_and(|continuation| continuation.enabled)
+                        })
+                        .map(|state| state.run);
+                    if let Some(continuation_run) = continuation_run {
                         match dispatch_turn(
                             app,
                             agent,
@@ -4661,6 +4691,10 @@ async fn handle_slash_command(
                                 ),
                                 attachments: Vec::new(),
                                 interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
+                                run_resume: Some(crate::tui::QueuedRunResume {
+                                    run_id: continuation_run.run_id,
+                                    root_message_id: continuation_run.root_message_id,
+                                }),
                             },
                         )
                         .await
@@ -5054,6 +5088,7 @@ async fn handle_slash_command(
                     text: prompt,
                     attachments: Vec::new(),
                     interaction_mode: app.interaction_mode,
+                    run_resume: None,
                 },
             )
             .await;
@@ -6107,11 +6142,11 @@ mod tests {
         move_cursor_vertical, parse_interaction_mode, project_queued_dispatch,
         queue_steer_follow_up, render_cancelled_event, render_error_event,
         resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
-        slash_command_allowed_while_busy, update_subagent_runs,
+        run_turn_binding_for_queued_turn, slash_command_allowed_while_busy, update_subagent_runs,
     };
     use crate::tui::{
-        ChatMessage, MessageRole, QueuedTurn, TaskRuntimeTaskView, TaskRuntimeView, Theme,
-        ToolExecutionMessage, ToolExecutionStatus, TuiApp,
+        ChatMessage, MessageRole, QueuedRunResume, QueuedTurn, TaskRuntimeTaskView,
+        TaskRuntimeView, Theme, ToolExecutionMessage, ToolExecutionStatus, TuiApp,
     };
     use echo_agent_app_core::chat_driver::TurnOutcome;
     use echo_agent_app_core::tasks::task_runtime::{
@@ -6292,6 +6327,7 @@ mod tests {
             text: "next".to_string(),
             attachments: Vec::new(),
             interaction_mode: InteractionMode::Auto,
+            run_resume: None,
         });
 
         assert!(!apply_turn_settlement(
@@ -6322,6 +6358,34 @@ mod tests {
     }
 
     #[test]
+    fn queued_resume_builds_exact_run_turn_binding() -> Result<(), String> {
+        let turn = QueuedTurn {
+            text: "continue".to_string(),
+            attachments: Vec::new(),
+            interaction_mode: InteractionMode::Task,
+            run_resume: Some(QueuedRunResume {
+                run_id: "exact-run".to_string(),
+                root_message_id: "exact-root-message".to_string(),
+            }),
+        };
+
+        let binding = run_turn_binding_for_queued_turn(&turn, "new-turn")
+            .ok_or_else(|| "resume binding missing".to_string())?;
+        assert_eq!(binding.run_id.as_deref(), Some("exact-run"));
+        assert_eq!(binding.turn_id, "new-turn");
+        assert_eq!(binding.root_message_id, "exact-root-message");
+        assert_eq!(
+            binding.origin,
+            echo_agent_app_core::tasks::task_runtime::RunTurnOrigin::Resume
+        );
+        assert_eq!(
+            binding.transcript_visibility,
+            echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible
+        );
+        Ok(())
+    }
+
+    #[test]
     fn retryable_fifo_rejection_preserves_head_attachments_and_editor_draft() {
         let mut app = app();
         app.input = "draft still being edited".to_string();
@@ -6336,11 +6400,13 @@ mod tests {
             text: "first".to_string(),
             attachments: vec![attachment],
             interaction_mode: InteractionMode::Auto,
+            run_resume: None,
         };
         let second = QueuedTurn {
             text: "second".to_string(),
             attachments: Vec::new(),
             interaction_mode: InteractionMode::Auto,
+            run_resume: None,
         };
         app.queued_turns.push_back(second);
 

@@ -1147,15 +1147,9 @@ fn finalize_run_turn(
         return Ok(RunTurnDecision::Stop);
     }
     let active_cells = store
-        .list_background_cells(run_id)
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter(crate::tasks::task_runtime::BackgroundCellState::is_active)
-        .count();
+        .defer_continuation_for_active_cells(run_id)
+        .map_err(|error| error.to_string())?;
     if active_cells > 0 {
-        store
-            .set_continuation_deferred(run_id, true)
-            .map_err(|error| error.to_string())?;
         tracing::info!(
             run_id,
             active_cells,

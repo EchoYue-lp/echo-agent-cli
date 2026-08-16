@@ -217,12 +217,20 @@ pub struct TaskProgressEntry {
     pub elapsed_label: String,
 }
 
+/// Exact TaskRun identity retained while a TUI resume turn is queued.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedRunResume {
+    pub run_id: String,
+    pub root_message_id: String,
+}
+
 /// A user turn submitted while the foreground agent is still busy.
 #[derive(Clone, Debug)]
 pub struct QueuedTurn {
     pub text: String,
     pub attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
     pub interaction_mode: InteractionMode,
+    pub run_resume: Option<QueuedRunResume>,
 }
 
 /// Read-only TUI projection of the authoritative TaskRuntime state.
