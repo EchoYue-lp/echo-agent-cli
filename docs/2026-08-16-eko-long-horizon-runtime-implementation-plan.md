@@ -1003,6 +1003,11 @@ ledger、TaskRun 或事件，因此不计为 soak 失败或有效时长。launch
 `launchctl submit`，为每个时长记录独立 service label、PID、stdout/stderr，并显式切换到仓库目录
 后执行。运行位置和检查命令固定在 `docs/2026-08-17-eko-m5-soak-runs.md`。
 
+固定提交 `61a3e389` 于 `2026-08-17T08:50:35Z` 同时启动三个 run。初始 PID 为
+12h `94572`、24h `94583`、48h `94595`；首个 heartbeat 均持久化约 30.6 秒 active time、8 个连续
+事件、1 个 ended RunTurn、3 tokens 且无 failure fingerprint，第二次观测均达到约 60.6 秒、
+12 个事件和 2 个 ended RunTurn。Markdown 只保存启动快照；实时状态和最终证据以三个 ledger 为准。
+
 ## 16. 最终验收
 
 - 100 次上下文压缩后 `TaskRun.goal_sha256` 不漂移。

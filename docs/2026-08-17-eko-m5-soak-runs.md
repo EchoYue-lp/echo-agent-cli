@@ -1,8 +1,9 @@
 # EKO M5 Real Soak Runs
 
-> Launch mode: concurrent detached processes, explicitly approved on 2026-08-17
+> Launch mode: concurrent launchd processes, explicitly approved on 2026-08-17
 > Runtime authority: each run's `ledger.json` and TaskRuntime `events.jsonl`
 > Harness: `echo-agent-app-core/examples/task_runtime_soak.rs`
+> Launch commit: `61a3e389dde16b8cdf80b5e71489a388303d8748`
 
 The 12, 24, and 48 hour runs use one release binary and one clean commit, but
 write to isolated directories. Running them concurrently shortens wall-clock
@@ -11,9 +12,14 @@ ledgers, PIDs, or process output.
 
 | Duration | Run record | Runtime directory | Initial status |
 |---:|---|---|---|
-| 12 hours | `docs/2026-08-17-eko-m5-soak-12h.md` | `.eko/soak/m5-12h` | Authoritative status in ledger |
-| 24 hours | `docs/2026-08-17-eko-m5-soak-24h.md` | `.eko/soak/m5-24h` | Authoritative status in ledger |
-| 48 hours | `docs/2026-08-17-eko-m5-soak-48h.md` | `.eko/soak/m5-48h` | Authoritative status in ledger |
+| 12 hours | `docs/2026-08-17-eko-m5-soak-12h.md` | `.eko/soak/m5-12h` | Running; first heartbeat verified |
+| 24 hours | `docs/2026-08-17-eko-m5-soak-24h.md` | `.eko/soak/m5-24h` | Running; first heartbeat verified |
+| 48 hours | `docs/2026-08-17-eko-m5-soak-48h.md` | `.eko/soak/m5-48h` | Running; first heartbeat verified |
+
+All three ledgers started at `2026-08-17T08:50:35Z`. The first common
+observation showed about 30.6 seconds active time, 8 contiguous events, one
+ended RunTurn, 3 tokens, and no failure fingerprint per run. The next durable
+heartbeat reached about 60.6 seconds, 12 events and two ended RunTurns for each.
 
 ## Launch
 
@@ -71,6 +77,7 @@ A stopped process with `running` or `interrupted` can resume using the same
 binary, duration, output directory, and commit. `failed` requires a fix and a
 new output directory for that duration; a longer run never hides the failure.
 
-After all processes stop, copy the three final ledger summaries into
+The Markdown status above is only the verified launch snapshot; consult each
+ledger for live state. After all processes stop, copy the three final summaries into
 `docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`, run the final
 repository gates, and only then mark M5 and the Runtime Goal complete.

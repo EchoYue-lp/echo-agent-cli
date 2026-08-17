@@ -636,9 +636,10 @@ store-owned completion report to GUI/TUI/CLI/channel without a second state or
 `goal_complete` tool. M5a keeps `events.jsonl` authoritative while a compact,
 schema-versioned and hash-verified checkpoint retains the sole fold state and
 deduplication keys; reads detect a durable suffix before trusting snapshots. The
-automated M5b fault matrix is all green. The active slice is the committed soak
-harness on one fixed clean commit for concurrent, isolated real 12/24/48-hour
-runs, recording evidence in `docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`
+automated M5b fault matrix is all green. Commit `61a3e389` launched concurrent,
+isolated real 12/24/48-hour runs through user launchd on 2026-08-17; their first
+two heartbeats advanced with no failure fingerprint. Evidence is recorded in
+`docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`
 and the run index `docs/2026-08-17-eko-m5-soak-runs.md`.
 
 Tool context optimization Phase 0-6 is closed in

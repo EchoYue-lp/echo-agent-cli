@@ -134,6 +134,6 @@ duration in a new directory after the fix; a passing longer run cannot waive it.
 
 | Duration | Commit | Configuration/provider | Events/compactions/recoveries | Failure fingerprints | Final evidence | Status |
 |---:|---|---|---|---|---|---|
-| 12 hours | - | - | - | - | - | Pending |
-| 24 hours | - | - | - | - | - | Pending |
-| 48 hours | - | - | - | - | - | Pending |
+| 12 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | launch: 12 events / 0 compactions / 0 recoveries | none at launch | pending final hashes | Running |
+| 24 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | launch: 12 events / 0 compactions / 0 recoveries | none at launch | pending final hashes | Running |
+| 48 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | launch: 12 events / 0 compactions / 0 recoveries | none at launch | pending final hashes | Running |
