@@ -11,9 +11,9 @@ ledgers, PIDs, or process output.
 
 | Duration | Run record | Runtime directory | Initial status |
 |---:|---|---|---|
-| 12 hours | `docs/2026-08-17-eko-m5-soak-12h.md` | `.eko/soak/m5-12h` | Launch pending |
-| 24 hours | `docs/2026-08-17-eko-m5-soak-24h.md` | `.eko/soak/m5-24h` | Launch pending |
-| 48 hours | `docs/2026-08-17-eko-m5-soak-48h.md` | `.eko/soak/m5-48h` | Launch pending |
+| 12 hours | `docs/2026-08-17-eko-m5-soak-12h.md` | `.eko/soak/m5-12h` | Authoritative status in ledger |
+| 24 hours | `docs/2026-08-17-eko-m5-soak-24h.md` | `.eko/soak/m5-24h` | Authoritative status in ledger |
+| 48 hours | `docs/2026-08-17-eko-m5-soak-48h.md` | `.eko/soak/m5-48h` | Authoritative status in ledger |
 
 ## Launch
 
@@ -25,10 +25,11 @@ cargo build -p echo-agent-app-core --release \
 ./scripts/start-m5-soaks.sh
 ```
 
-The launcher refuses a dirty worktree, a missing release binary, or an already
-live PID for any target duration. It never removes or overwrites an existing
-TaskRuntime ledger. The harness itself validates the current commit and rejects
-an incompatible resume.
+The launcher refuses a dirty worktree, a missing release binary, an existing
+launchd service, or an already live PID for any target duration. Each process
+is submitted to the macOS user launchd domain so it survives the Codex terminal.
+It never removes or overwrites an existing TaskRuntime ledger. The harness itself
+validates the current commit and rejects an incompatible resume.
 
 ## Inspect
 
@@ -37,8 +38,10 @@ Each duration directory contains:
 | File | Meaning |
 |---|---|
 | `ledger.json` | Atomically replaced progress, configuration, commit, metrics, failures, and final evidence |
-| `process.log` | Process stderr plus the final pretty-printed ledger or fatal error |
+| `process.log` | Process stdout, including the final pretty-printed ledger |
+| `process.err.log` | Fatal error and diagnostic stderr |
 | `process.pid` | Detached process identity captured by the launcher |
+| `process.label` | User launchd service label captured by the launcher |
 | `tasks/<run-id>/events.jsonl` | Sole TaskRuntime event authority |
 | `tasks/<run-id>/checkpoint.json` | Discardable schema/hash-validated fold cache |
 | `tasks/<run-id>/run-state.json` | Validated run-state projection |
@@ -59,6 +62,7 @@ for hours in 12 24 48; do
   pid=$(tr -d '[:space:]' < ".eko/soak/m5-${hours}h/process.pid")
   ps -p "$pid" -o pid=,etime=,state=,command=
   tail -n 20 ".eko/soak/m5-${hours}h/process.log"
+  tail -n 20 ".eko/soak/m5-${hours}h/process.err.log"
 done
 ```
 

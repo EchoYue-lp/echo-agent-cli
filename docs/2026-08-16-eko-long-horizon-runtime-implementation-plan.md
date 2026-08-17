@@ -998,6 +998,11 @@ unsafe-boundary 2、checkpoint 5、disk/torn-tail/projection 3、HITL 3、Subage
 剩余事项是收集三个真实 ledger 并把最终证据写回评测文档；任一时长失败仍必须修复并用新目录
 从该时长重新开始，不能由其它更长运行覆盖。
 
+首次 detached 启动使用 `nohup`，三个子进程在 Codex 终端命令返回时被执行器回收，尚未创建
+ledger、TaskRun 或事件，因此不计为 soak 失败或有效时长。launcher 随即改为 macOS 用户域
+`launchctl submit`，为每个时长记录独立 service label、PID、stdout/stderr，并显式切换到仓库目录
+后执行。运行位置和检查命令固定在 `docs/2026-08-17-eko-m5-soak-runs.md`。
+
 ## 16. 最终验收
 
 - 100 次上下文压缩后 `TaskRun.goal_sha256` 不漂移。
