@@ -15,21 +15,32 @@
 use std::sync::Arc;
 
 use echo_agent::agent::Agent;
-use echo_agent::config::AppConfig;
+use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
 use echo_agent::state::{FileRuntimeStateStore, RuntimeStateStore};
 use echo_agent_app_core::infra::{self, AgentCreateParams};
 
 fn make_app_config() -> AppConfig {
     let mut c = AppConfig::default();
-    // Pin a known model name and small token limit so create_agent doesn't
-    // try to load an external model registry.
     c.agent.name = "rt-test-agent".to_string();
     c.agent.system_prompt = "You are a test runtime agent.".to_string();
     c.agent.max_iterations = 1;
     c.agent.token_limit = 4096;
-    c.model.provider = "ollama".to_string();
-    c.model.name = "test-model".to_string();
-    c.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());
+    c.model_providers.insert(
+        "test-provider".to_string(),
+        ModelProviderConfig {
+            name: "Test Provider".to_string(),
+            base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+            requires_api_key: false,
+            ..ModelProviderConfig::default()
+        },
+    );
+    c.configured_models.push(ConfiguredModel {
+        id: "test-model".to_string(),
+        display_name: "Test Model".to_string(),
+        provider: "test-provider".to_string(),
+        model: "test-model".to_string(),
+        ..ConfiguredModel::default()
+    });
     c
 }
 

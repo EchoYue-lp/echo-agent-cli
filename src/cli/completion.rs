@@ -78,30 +78,7 @@ impl EnhancedCompleter {
         Self {
             commands,
             tool_names: BTreeSet::new(),
-            model_names: BTreeSet::from_iter(
-                [
-                    // OpenAI
-                    "gpt-5.5",
-                    // Anthropic
-                    "claude-opus-4-8",
-                    "claude-opus-4-7",
-                    // DeepSeek
-                    "deepseek-v4-flash",
-                    "deepseek-v4-pro",
-                    // DashScope (Qwen)
-                    "qwen3.7-max",
-                    "qwen3.6-plus",
-                    "qwen3.7-plus",
-                    // Moonshot
-                    "kimi-k2.6",
-                    // Zhipu
-                    "glm-5.1",
-                    // Gemini
-                    "gemini-3.5-flash",
-                ]
-                .iter()
-                .map(|s| s.to_string()),
-            ),
+            model_names: BTreeSet::new(),
             mcp_servers: BTreeSet::new(),
             skill_names: BTreeSet::new(),
         }
@@ -238,9 +215,12 @@ mod tests {
 
     #[test]
     fn test_model_completion() {
-        let completer = EnhancedCompleter::new();
+        let mut completer = EnhancedCompleter::new();
+        assert!(completer.get_candidates("/model qw").is_empty());
+
+        completer.model_names.insert("qwen3.5-plus".to_string());
         let candidates = completer.get_candidates("/model qw");
-        assert!(!candidates.is_empty());
+        assert_eq!(candidates, vec!["qwen3.5-plus"]);
     }
 
     #[test]

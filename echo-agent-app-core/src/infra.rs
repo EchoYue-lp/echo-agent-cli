@@ -49,13 +49,13 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
 /// then EKO's documented fallback.
 pub fn effective_token_limit(
     app_config: &AppConfig,
-    runtime: &model_config::ModelRuntimeConfig,
+    runtime: Option<&model_config::ModelRuntimeConfig>,
 ) -> usize {
     if app_config.agent.token_limit > 0 {
         return app_config.agent.token_limit;
     }
     runtime
-        .context_window
+        .and_then(|runtime| runtime.context_window)
         .and_then(|window| usize::try_from(window).ok())
         .filter(|window| *window > 0)
         .unwrap_or(DEFAULT_CONTEXT_WINDOW)
@@ -337,7 +337,7 @@ pub struct CreatedAgent {
     pub agent: ReactAgent,
     pub prompt_assembly: crate::project::prompt::PromptAssembly,
     pub model_consumers: AgentModelConsumers,
-    pub runtime_model: model_config::ModelRuntimeConfig,
+    pub runtime_model: Option<model_config::ModelRuntimeConfig>,
 }
 
 /// Create an Agent instance without retaining build diagnostics.
@@ -358,16 +358,30 @@ pub async fn create_agent_with_diagnostics(
     if let Some(store) = &params.task_runtime_store {
         crate::tasks::task_runtime::command_cells::register_task_runtime_store(store);
     }
-    // Resolve the product-level configured model first. The legacy `model`
-    // section is only a persisted mirror/fallback; GUI/CLI/TUI should all
-    // converge on configured_models for actual runtime wiring.
+    // EKO can boot before the user configures a provider. An explicit selector
+    // must still resolve, while an absent selector leaves the Agent detached
+    // from LLM transport until the first model mutation is published.
     let runtime_model =
-        model_config::resolve_runtime_model_selector(app_config, params.model.as_deref())
-            .map_err(|error| error.to_string())?;
-    model_config::validate_runtime_model_requirements(&runtime_model)?;
-    let model = runtime_model.model.as_str();
-    let temperature = runtime_model.temperature.or(app_config.model.temperature);
-    let max_tokens = runtime_model.max_tokens.or(app_config.model.max_tokens);
+        match model_config::resolve_runtime_model_selector(app_config, params.model.as_deref()) {
+            Ok(runtime) => {
+                model_config::validate_runtime_model_requirements(&runtime)?;
+                Some(runtime)
+            }
+            Err(model_config::ModelSelectionError::NotConfigured) if params.model.is_none() => None,
+            Err(error) => return Err(error.to_string()),
+        };
+    let model = runtime_model
+        .as_ref()
+        .map(|runtime| runtime.model.as_str())
+        .unwrap_or_default();
+    let temperature = runtime_model
+        .as_ref()
+        .and_then(|runtime| runtime.temperature)
+        .or(app_config.model.temperature);
+    let max_tokens = runtime_model
+        .as_ref()
+        .and_then(|runtime| runtime.max_tokens)
+        .or(app_config.model.max_tokens);
 
     let base_system_prompt = params
         .system_prompt
@@ -375,7 +389,7 @@ pub async fn create_agent_with_diagnostics(
         .unwrap_or(&app_config.agent.system_prompt);
 
     // Use PromptAssembler for modular, budget-aware prompt construction
-    let model_window = effective_token_limit(app_config, &runtime_model);
+    let model_window = effective_token_limit(app_config, runtime_model.as_ref());
     let mut assembler = PromptAssembler::default(
         base_system_prompt,
         Some(TASK_MANAGEMENT_GUIDE),
@@ -414,7 +428,7 @@ pub async fn create_agent_with_diagnostics(
     let system_prompt = prompt_assembly.prompt.clone();
 
     // Determine config values from AppConfig
-    let token_limit = effective_token_limit(app_config, &runtime_model);
+    let token_limit = effective_token_limit(app_config, runtime_model.as_ref());
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
@@ -462,19 +476,26 @@ pub async fn create_agent_with_diagnostics(
     // ── Pass the resolved configured model to the LLM client ──
     // Without this, the agent falls back to env vars + echo-agent-models.yaml,
     // which may not exist (especially in GUI apps where shell env vars aren't inherited).
-    let provider = runtime_model.provider.as_str();
-    let base_url_override = runtime_model.base_url.as_deref();
-    let prepared_llm = prepare_runtime_llm(&runtime_model)?;
-    let llm_config = prepared_llm.config.clone();
-    tracing::info!(
-        provider = provider,
-        model = model,
-        auth_source = %runtime_model.auth_source,
-        has_base_url = base_url_override.is_some(),
-        "Injecting LlmConfig from configured model"
-    );
-    let injected_llm_config = Some(llm_config.clone());
-    builder = builder.llm_config(llm_config);
+    let prepared_llm = runtime_model
+        .as_ref()
+        .map(prepare_runtime_llm)
+        .transpose()?;
+    let injected_llm_config = prepared_llm
+        .as_ref()
+        .map(|prepared| prepared.config.clone());
+    if let (Some(runtime), Some(llm_config)) = (runtime_model.as_ref(), injected_llm_config.clone())
+    {
+        tracing::info!(
+            provider = %runtime.provider,
+            model = %runtime.model,
+            auth_source = %runtime.auth_source,
+            has_base_url = runtime.base_url.is_some(),
+            "Injecting LlmConfig from configured model"
+        );
+        builder = builder.llm_config(llm_config);
+    } else {
+        tracing::info!("Starting without an LLM; waiting for the first configured model");
+    }
 
     // Set session_id if provided (used by background tasks for checkpoint isolation)
     if let Some(ref sid) = params.session_id {
@@ -596,7 +617,9 @@ pub async fn create_agent_with_diagnostics(
     // `prepare_runtime_llm` already constructed this exact client before any
     // runtime state was accepted. Install it explicitly so agent bootstrap can
     // never fall back to an environment/YAML client after a swallowed rebuild.
-    agent.set_llm_client(prepared_llm.client.clone());
+    if let Some(prepared) = prepared_llm.as_ref() {
+        agent.set_llm_client(prepared.client.clone());
+    }
     refresh_dynamic_context(&mut agent, subagent_project_root.as_deref()).await;
     configure_run_code_capability(&mut agent, run_code_available);
     agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
@@ -619,16 +642,20 @@ pub async fn create_agent_with_diagnostics(
     // it never re-resolves global config or assumes Chat Completions.
     // Fail-open on errors (verify.rs:91-93) ensures the main flow is never
     // blocked if the critic LLM call fails.
-    agent.set_owned_critic(
-        EKO_MODEL_CRITIC_OWNER,
-        std::sync::Arc::new(
-            echo_agent::agent::critic::LlmCritic::new(prepared_llm.client.clone())
-                .with_pass_threshold(7.0)
-                .with_cache_user_id(cache_user_id.clone()),
-        ),
-    );
-    agent.config_mut().set_verifier_enabled(true);
-    tracing::info!("main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)");
+    if let Some(prepared) = prepared_llm.as_ref() {
+        agent.set_owned_critic(
+            EKO_MODEL_CRITIC_OWNER,
+            std::sync::Arc::new(
+                echo_agent::agent::critic::LlmCritic::new(prepared.client.clone())
+                    .with_pass_threshold(7.0)
+                    .with_cache_user_id(cache_user_id.clone()),
+            ),
+        );
+        agent.config_mut().set_verifier_enabled(true);
+        tracing::info!(
+            "main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)"
+        );
+    }
 
     tracing::info!(
         has_llm_config = injected_llm_config.is_some(),
@@ -641,11 +668,15 @@ pub async fn create_agent_with_diagnostics(
         SubagentRuntimeGeneration {
             model: model.to_string(),
             llm_config: injected_llm_config,
-            llm_client: Some(prepared_llm.client.clone()),
+            llm_client: prepared_llm
+                .as_ref()
+                .map(|prepared| prepared.client.clone()),
             temperature,
             max_tokens,
             token_limit,
-            thinking: prepared_llm.thinking.clone(),
+            thinking: prepared_llm
+                .as_ref()
+                .and_then(|prepared| prepared.thinking.clone()),
         },
         app_config.agent.tool_timeout_ms,
         max_tool_output_tokens,
@@ -1802,7 +1833,7 @@ pub enum LogTarget {
 ///
 /// Only imports known API key variables to avoid polluting the environment
 /// with unrelated shell state.
-pub fn load_shell_env() {
+pub fn load_shell_env(app_config: &AppConfig) {
     #[cfg(target_os = "macos")]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
@@ -1829,35 +1860,18 @@ pub fn load_shell_env() {
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Whitelist of env vars to import — known API keys and config paths
-        // that EKO needs. These are provider-specific standard names
-        // (DEEPSEEK_API_KEY etc.) plus EKO product aliases and MCP path.
-        //
-        // Note: the framework (echo-agent) does NOT read LLM credential env
-        // vars itself — EKO's `resolve_runtime_model` reads them and injects
-        // the values into ModelConfig fields before passing to the framework.
-        // EKO_AUTH_TOKEN / EKO_BASE_URL / EKO_MODEL are EKO product aliases
-        // kept for backwards compatibility with existing user setups.
-        const API_KEY_VARS: &[&str] = &[
-            "DEEPSEEK_API_KEY",
-            "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            "DASHSCOPE_API_KEY",
-            "QWEN_API_KEY",
-            "MOONSHOT_API_KEY",
-            "KIMI_API_KEY",
-            "ZHIPU_API_KEY",
-            "GLM_API_KEY",
-            "GEMINI_API_KEY",
-            "GOOGLE_API_KEY",
-            // EKO product aliases (backwards compat).
-            "EKO_AUTH_TOKEN",
-            "EKO_BASE_URL",
-            "EKO_MODEL",
-            "MCP_CONFIG_PATH",
-        ];
+        // Import only credential names the user explicitly assigned to a
+        // provider. MCP_CONFIG_PATH is application configuration, not a model
+        // vendor assumption.
+        let mut imported_names = app_config
+            .model_providers
+            .values()
+            .filter_map(|provider| provider.api_key_env.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect::<std::collections::BTreeSet<_>>();
+        imported_names.insert("MCP_CONFIG_PATH".to_string());
 
         // SAFETY: `std::env::set_var` is not thread-safe in Rust. We use a
         // `std::sync::Once` to guarantee this block runs at most once per
@@ -1868,7 +1882,7 @@ pub fn load_shell_env() {
         SHELL_ENV_LOADED.call_once(|| {
             for line in stdout.lines() {
                 if let Some((key, value)) = line.split_once('=')
-                    && API_KEY_VARS.contains(&key)
+                    && imported_names.contains(key)
                     && std::env::var(key).is_err()
                     && !value.is_empty()
                 {
@@ -2507,6 +2521,24 @@ mod llm_config_tests {
     use echo_agent::agent::Agent;
     use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
     use echo_agent::llm::LlmApiProtocol;
+
+    #[tokio::test]
+    async fn agent_boots_without_a_configured_provider() -> Result<(), String> {
+        let created = create_agent_with_diagnostics(
+            &AgentCreateParams {
+                system_prompt: Some("deferred model setup test".to_string()),
+                ..Default::default()
+            },
+            &AppConfig::default(),
+        )
+        .await?;
+
+        assert!(created.runtime_model.is_none());
+        assert!(created.agent.model_name().is_empty());
+        assert!(created.agent.llm_config().is_none());
+        assert!(created.agent.llm_client().is_none());
+        Ok(())
+    }
 
     #[test]
     fn provider_neutral_builder_uses_explicit_protocol_and_modalities() -> Result<(), String> {

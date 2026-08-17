@@ -39,7 +39,7 @@ pub struct AgentRuntime {
     pub app_config: AppConfig,
     /// Exact model generation selected for this process. This may differ from
     /// the durable default when startup used `--model`.
-    pub active_runtime_model: crate::model_config::ModelRuntimeConfig,
+    pub active_runtime_model: Option<crate::model_config::ModelRuntimeConfig>,
     /// Non-persistent session view used when creating future pooled agents.
     /// A CLI/TUI `--model` selector updates this view without changing the
     /// durable application default consumed by configuration mutations.
@@ -139,9 +139,11 @@ impl AgentRuntime {
         let prompt_assembly = created.prompt_assembly;
         let model_consumers = created.model_consumers;
         let active_runtime_model = created.runtime_model;
-        let session_app_config =
-            crate::model_config::session_config_for_runtime(app_config, &active_runtime_model)
-                .map_err(anyhow::Error::msg)?;
+        let session_app_config = match active_runtime_model.as_ref() {
+            Some(runtime) => crate::model_config::session_config_for_runtime(app_config, runtime)
+                .map_err(anyhow::Error::msg)?,
+            None => app_config.clone(),
+        };
 
         // ── 2. Connect the same snapshot exposed to application state. ──
         tracing::info!(path = %mcp_config_path.display(), "Canonical MCP config selected");
@@ -432,18 +434,21 @@ impl AgentRuntime {
         self,
         conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
     ) -> AppState {
-        let state = AppState::from_shared(
+        let mut state = AppState::from_shared(
             self.agent_handle.clone(),
             Some(self.model_consumers.clone()),
             self.hitl_dispatcher.clone(),
             conversation_store,
             self.app_config.clone(),
             self.mcp_config_runtime.clone(),
-        )
-        .with_active_model_id(self.active_runtime_model.id.clone())
-        .with_review_integration(self.review_integration.clone())
-        .with_prompt_assembly(self.prompt_assembly.clone())
-        .with_plugin_runtime(Some(self.plugin_runtime.clone()));
+        );
+        if let Some(runtime) = self.active_runtime_model.as_ref() {
+            state = state.with_active_model_id(runtime.id.clone());
+        }
+        state = state
+            .with_review_integration(self.review_integration.clone())
+            .with_prompt_assembly(self.prompt_assembly.clone())
+            .with_plugin_runtime(Some(self.plugin_runtime.clone()));
         // Note: task_service and scheduler are started separately by the caller
         // because they need a Store which may be created differently per entry.
         state

@@ -20,7 +20,7 @@ fn configured_model_names(cfg: &echo_agent::config::AppConfig) -> Vec<String> {
 
 fn full_config_response(cfg: &echo_agent::config::AppConfig) -> FullConfigResponse {
     let runtime = model_config::resolve_runtime_model(cfg, cfg.model.default_model_id.as_deref());
-    let token_limit = echo_agent_app_core::infra::effective_token_limit(cfg, &runtime);
+    let token_limit = echo_agent_app_core::infra::effective_token_limit(cfg, Some(&runtime));
     let available_models = configured_model_names(cfg);
     FullConfigResponse {
         model: ModelConfigResponse {

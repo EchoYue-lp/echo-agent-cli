@@ -809,7 +809,7 @@ impl AgentPool {
             .await
             .map_err(|error| error.to_string())?;
         let agents = self.agents.write().await;
-        let token_limit = infra::effective_token_limit(&app_config, &runtime);
+        let token_limit = infra::effective_token_limit(&app_config, Some(&runtime));
         let mut publications = Vec::with_capacity(agents.len());
         let mut pooled_agents: Vec<(&String, &PooledAgent)> = agents.iter().collect();
         pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
@@ -1952,11 +1952,24 @@ mod tests {
 
         let prepared = infra::prepare_runtime_llm(&runtime)?;
         let mut candidate = pool.app_config.read().await.clone();
-        candidate.model.provider = runtime.provider.clone();
-        candidate.model.name = runtime.model.clone();
-        candidate.model.auth_token = runtime.auth_token.clone();
-        candidate.model.base_url = runtime.base_url.clone();
-        candidate.model.api_protocol = Some(runtime.api_protocol);
+        candidate.model_providers.insert(
+            runtime.provider.clone(),
+            echo_agent::config::ModelProviderConfig {
+                base_url: runtime.base_url.clone(),
+                ..Default::default()
+            },
+        );
+        candidate
+            .configured_models
+            .push(echo_agent::config::ConfiguredModel {
+                id: runtime.id.clone(),
+                display_name: runtime.display_name.clone(),
+                provider: runtime.provider.clone(),
+                model: runtime.model.clone(),
+                api_protocol: runtime.api_protocol,
+                ..Default::default()
+            });
+        crate::model_config::set_default_model(&mut candidate, &runtime.id)?;
         pool.prepare_model_publication(candidate, runtime, prepared)
             .await?
             .commit()

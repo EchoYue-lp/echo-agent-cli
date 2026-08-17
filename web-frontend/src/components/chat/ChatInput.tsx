@@ -620,6 +620,11 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const handleSend = async () => {
     const trimmed = text.trim();
     if (!trimmed && pendingFiles.length === 0) return;
+    if (!displayModel) {
+      openModelSettings();
+      useToastStore.getState().addToast('info', '请先添加 Provider 和模型');
+      return;
+    }
 
     // If palette is open and there are filtered commands, select the highlighted one
     if (showPalette && filteredCommands.length > 0) {
@@ -869,7 +874,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               rows={1}
-              placeholder="Send follow-up"
+              placeholder={displayModel ? 'Send follow-up' : '请先配置模型'}
               className="max-h-[200px] min-h-[24px] flex-1 resize-none bg-transparent text-sm leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {isStreaming ? (
@@ -883,7 +888,8 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
             ) : (
               <button
                 onClick={handleSend}
-                disabled={!hasContent}
+                disabled={!hasContent || !displayModel}
+                title={displayModel ? '发送' : '请先配置模型'}
                 className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--text-on-accent)] transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
               >
                 <ArrowUp size={16} strokeWidth={2.5} />

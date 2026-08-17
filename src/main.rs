@@ -285,7 +285,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &app_config,
             cli::HeadlessServiceResources {
                 model_consumers: runtime.model_consumers.clone(),
-                active_model_id: runtime.active_runtime_model.id.clone(),
+                active_model_id: runtime
+                    .active_runtime_model
+                    .as_ref()
+                    .map(|model| model.id.clone())
+                    .unwrap_or_default(),
                 pool: pool.clone(),
                 task_runtime_store: task_runtime_store.clone(),
                 webhook_emitter: webhook_emitter.clone(),
@@ -410,7 +414,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         &app_config,
         cli::HeadlessServiceResources {
             model_consumers: runtime.model_consumers.clone(),
-            active_model_id: runtime.active_runtime_model.id.clone(),
+            active_model_id: runtime
+                .active_runtime_model
+                .as_ref()
+                .map(|model| model.id.clone())
+                .unwrap_or_default(),
             pool: pool.clone(),
             task_runtime_store: task_runtime_store.clone(),
             webhook_emitter: webhook_emitter.clone(),

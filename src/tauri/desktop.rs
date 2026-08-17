@@ -126,14 +126,13 @@ async fn run_desktop() -> anyhow::Result<()> {
     // Load project-local .env file (standard dotenvy behavior)
     dotenvy::dotenv().ok();
 
-    // On macOS, GUI apps launched from Dock/Finder don't inherit shell env vars.
-    // Spawn the user's login shell to pick up API keys from ~/.zshrc etc.
-    infra::load_shell_env();
-
     // The desktop binary accepts the same model/project/config overrides as
     // TUI/CLI, including the canonical `--mcp-config` source.
     let args = parse_desktop_args(std::env::args_os())?;
     let mut app_config = config::load_config(args.config.as_deref());
+    // On macOS, GUI apps launched from Dock/Finder don't inherit shell env
+    // vars. Import only names explicitly declared by configured providers.
+    infra::load_shell_env(&app_config);
     let configured_mcp_path = app_config.mcp.config_path.clone();
     // Resolve MCP before the generic environment overlay copies
     // MCP_CONFIG_PATH into AppConfig. This preserves CLI > YAML > env.
@@ -206,13 +205,16 @@ async fn run_desktop() -> anyhow::Result<()> {
         conversation_store,
         app_config.clone(),
         runtime.mcp_config_runtime.clone(),
-    )
-    .with_active_model_id(runtime.active_runtime_model.id.clone())
-    .with_config_path(config_save_path)
-    .with_review_integration(runtime.review_integration.clone())
-    .with_prompt_assembly(runtime.prompt_assembly.clone())
-    .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
-    .with_config_watcher(Some(config_watcher.clone()));
+    );
+    if let Some(active_model) = runtime.active_runtime_model.as_ref() {
+        state_inner = state_inner.with_active_model_id(active_model.id.clone());
+    }
+    state_inner = state_inner
+        .with_config_path(config_save_path)
+        .with_review_integration(runtime.review_integration.clone())
+        .with_prompt_assembly(runtime.prompt_assembly.clone())
+        .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
+        .with_config_watcher(Some(config_watcher.clone()));
     state_inner.webhook.emitter = webhook_emitter;
 
     // Build task tools before the pool extracts the shared ToolManager, and

@@ -731,11 +731,24 @@ impl AppState {
             })
             .unwrap_or_default();
 
-        let active_model_id = crate::model_config::resolve_runtime_model(
-            &app_config,
-            app_config.model.default_model_id.as_deref(),
-        )
-        .id;
+        let active_model_id = app_config
+            .model
+            .default_model_id
+            .as_deref()
+            .and_then(|id| {
+                app_config
+                    .configured_models
+                    .iter()
+                    .find(|model| model.id == id && model.enabled)
+            })
+            .or_else(|| {
+                app_config
+                    .configured_models
+                    .iter()
+                    .find(|model| model.enabled)
+            })
+            .map(|model| model.id.clone())
+            .unwrap_or_default();
         let webhook_emitter = Arc::new(crate::webhook::WebhookEmitter::from_config(&app_config));
 
         Self {
@@ -1027,17 +1040,21 @@ impl AppState {
         let active_model_id = self.config.active_model_id.read().await.clone();
         let mutation = prepare_model_mutation(&current, &active_model_id, request)?;
         let next_active_runtime = if mutation.activated {
-            mutation.runtime.clone().ok_or_else(|| {
+            Some(mutation.runtime.clone().ok_or_else(|| {
                 ModelMutationError::Publication(
                     "active model mutation lost its runtime candidate".to_string(),
                 )
-            })?
+            })?)
         } else {
             resolve_active_model_runtime(&mutation.config, &active_model_id)?
         };
-        let pool_session_config =
-            crate::model_config::session_config_for_runtime(&mutation.config, &next_active_runtime)
-                .map_err(ModelMutationError::Publication)?;
+        let pool_session_config = match next_active_runtime.as_ref() {
+            Some(runtime) => {
+                crate::model_config::session_config_for_runtime(&mutation.config, runtime)
+                    .map_err(ModelMutationError::Publication)?
+            }
+            None => mutation.config.clone(),
+        };
         let _foreground = if mutation.activated {
             Some(
                 self.session
@@ -1092,7 +1109,7 @@ impl AppState {
                         consumers,
                         runtime,
                         prepared,
-                        crate::infra::effective_token_limit(&mutation.config, runtime),
+                        crate::infra::effective_token_limit(&mutation.config, Some(runtime)),
                     )
                     .await
                     .map_err(ModelMutationError::Publication)?,
@@ -2137,7 +2154,9 @@ fn prepare_model_mutation(
                 crate::model_config::set_default_model(&mut config, &model_id)
                     .map_err(ModelMutationError::Validation)?;
             }
-            let updates_active_model = active_before.id == model_id;
+            let updates_active_model = active_before
+                .as_ref()
+                .is_some_and(|runtime| runtime.id == model_id);
             let activates_upserted_model =
                 mutation.set_default || updates_active_model || became_first_default;
             let runtime = crate::model_config::resolve_runtime_model(&config, Some(&model_id));
@@ -2165,9 +2184,15 @@ fn prepare_model_mutation(
             let provider_id =
                 crate::model_config::upsert_model_provider(&mut config, &mutation.id, provider)
                     .map_err(ModelMutationError::Validation)?;
-            let activated = active_before.provider == provider_id;
+            let activated = active_before
+                .as_ref()
+                .is_some_and(|runtime| runtime.provider == provider_id);
             let runtime = if activated {
-                Some(resolve_active_model_runtime(&config, &active_before.id)?)
+                let active_id = active_before
+                    .as_ref()
+                    .map(|runtime| runtime.id.as_str())
+                    .unwrap_or_default();
+                resolve_active_model_runtime(&config, active_id)?
             } else {
                 None
             };
@@ -2210,7 +2235,12 @@ fn prepare_model_mutation(
             {
                 crate::model_config::DeleteConfiguredModelOutcome::RemovedNonDefault => {
                     if active_model_id == model_id {
-                        let runtime = resolve_active_model_runtime(&config, active_model_id)?;
+                        let runtime = resolve_active_model_runtime(&config, active_model_id)?
+                            .ok_or_else(|| {
+                                ModelMutationError::Validation(
+                                    "Deleted active model has no enabled successor".to_string(),
+                                )
+                            })?;
                         let prepared = crate::infra::prepare_runtime_llm(&runtime)
                             .map_err(ModelMutationError::Validation)?;
                         Ok(PreparedModelMutation {
@@ -2266,7 +2296,7 @@ fn prepare_model_mutation(
             let mut config = current.clone();
             update(&mut config).map_err(ModelMutationError::Validation)?;
             let runtime = if reapply_active_model {
-                Some(resolve_active_model_runtime(&config, active_model_id)?)
+                resolve_active_model_runtime(&config, active_model_id)?
             } else {
                 None
             };
@@ -2299,7 +2329,10 @@ fn prepare_model_mutation(
 fn resolve_active_model_runtime(
     config: &echo_agent::config::AppConfig,
     active_model_id: &str,
-) -> Result<crate::model_config::ModelRuntimeConfig, ModelMutationError> {
+) -> Result<Option<crate::model_config::ModelRuntimeConfig>, ModelMutationError> {
+    if !config.configured_models.iter().any(|model| model.enabled) {
+        return Ok(None);
+    }
     let active_is_available = config
         .configured_models
         .iter()
@@ -2310,6 +2343,7 @@ fn resolve_active_model_runtime(
         config.model.default_model_id.as_deref()
     };
     crate::model_config::resolve_runtime_model_selector(config, selector)
+        .map(Some)
         .map_err(|error| ModelMutationError::Validation(error.to_string()))
 }
 
@@ -2327,6 +2361,40 @@ mod model_mutation_tests {
     const RESPONSES_ENDPOINT: &str = "http://127.0.0.1:11435/v1/responses";
     const WINDOW_A: usize = 120_000;
     const WINDOW_B: usize = 240_000;
+
+    #[test]
+    fn first_configured_model_becomes_the_active_generation() -> Result<(), String> {
+        let mut config = echo_agent::config::AppConfig::default();
+        config.model_providers.insert(
+            "local".to_string(),
+            ModelProviderConfig {
+                base_url: Some(ENDPOINT_A.to_string()),
+                ..Default::default()
+            },
+        );
+        let mutation = prepare_model_mutation(
+            &config,
+            "",
+            ModelMutationRequest::UpsertModel(ConfiguredModelMutation {
+                model: model(MODEL_A, "local", "runtime-a", WINDOW_A as u32),
+                set_default: false,
+            }),
+        )
+        .map_err(|error| error.to_string())?;
+
+        assert!(mutation.activated);
+        assert_eq!(mutation.model_id, MODEL_A);
+        assert_eq!(
+            mutation.config.model.default_model_id.as_deref(),
+            Some(MODEL_A)
+        );
+        assert_eq!(
+            mutation.runtime.as_ref().map(|runtime| runtime.id.as_str()),
+            Some(MODEL_A)
+        );
+        assert!(mutation.prepared.is_some());
+        Ok(())
+    }
 
     struct ModelMutationFixture {
         _temp: tempfile::TempDir,
@@ -2466,7 +2534,9 @@ mod model_mutation_tests {
             &config,
         )
         .await?;
-        let active_runtime = created.runtime_model;
+        let active_runtime = created
+            .runtime_model
+            .ok_or_else(|| "model mutation fixture did not resolve its active model".to_string())?;
         let primary_consumers = created.model_consumers;
         let primary = AgentHandle::new(created.agent);
         let session_config =

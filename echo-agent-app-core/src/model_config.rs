@@ -117,6 +117,7 @@ pub struct ModelRuntimeConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSelectionError {
+    NotConfigured,
     Unknown { selector: String },
     Disabled { selector: String },
     AmbiguousName { selector: String },
@@ -125,6 +126,10 @@ pub enum ModelSelectionError {
 impl std::fmt::Display for ModelSelectionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::NotConfigured => write!(
+                formatter,
+                "No model is configured. Add a provider and at least one enabled model"
+            ),
             Self::Unknown { selector } => write!(
                 formatter,
                 "Model '{selector}' is not configured. Select a configured model id or model name"
@@ -200,44 +205,7 @@ pub fn configured_provider_views(config: &AppConfig) -> Vec<ModelProviderView> {
 
 pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
     if config.configured_models.is_empty() {
-        let legacy = ConfiguredModel {
-            id: stable_model_id(&config.model.provider, &config.model.name),
-            display_name: display_name_from_model(&config.model.name),
-            provider: config.model.provider.clone(),
-            model: config.model.name.clone(),
-            api_protocol: config
-                .model
-                .api_protocol
-                .unwrap_or(LlmApiProtocol::ChatCompletions),
-            input_modalities: ModelInputModality::text_only(),
-            enabled: true,
-            max_tokens: config.model.max_tokens,
-            temperature: config.model.temperature,
-            context_window: config.model.context_window,
-        };
-        let runtime = resolve_runtime_model(config, None);
-        return vec![ConfiguredModelView {
-            id: legacy.id.clone(),
-            display_name: legacy.display_name.clone(),
-            provider: legacy.provider.clone(),
-            model: legacy.model.clone(),
-            api_protocol: runtime.api_protocol.into(),
-            input_modalities: legacy
-                .input_modalities
-                .iter()
-                .copied()
-                .map(Into::into)
-                .collect(),
-            thinking_levels: thinking_level_specs(runtime.thinking_profile),
-            enabled: true,
-            is_default: true,
-            has_auth_token: runtime.auth_token.is_some(),
-            auth_source: runtime.auth_source,
-            base_url: runtime.base_url,
-            temperature: legacy.temperature,
-            max_tokens: legacy.max_tokens,
-            context_window: Some(effective_context_window(&legacy)),
-        }];
+        return Vec::new();
     }
 
     let default_id = config.model.default_model_id.clone();
@@ -600,18 +568,13 @@ pub fn resolve_runtime_model_selector(
     selector: Option<&str>,
 ) -> Result<ModelRuntimeConfig, ModelSelectionError> {
     let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(resolve_runtime_model(
-            config,
-            config.model.default_model_id.as_deref(),
-        ));
+        return config
+            .configured_models
+            .iter()
+            .any(|model| model.enabled)
+            .then(|| resolve_runtime_model(config, config.model.default_model_id.as_deref()))
+            .ok_or(ModelSelectionError::NotConfigured);
     };
-
-    let legacy_id = stable_model_id(&config.model.provider, &config.model.name);
-    if config.configured_models.is_empty()
-        && (selector == config.model.name || selector == legacy_id)
-    {
-        return Ok(resolve_runtime_model(config, None));
-    }
 
     if let Some(selected) = config
         .configured_models
@@ -1279,29 +1242,33 @@ configured_models:
     }
 
     #[test]
-    fn legacy_model_is_projected_as_the_default_configured_model() -> Result<(), String> {
+    fn empty_configuration_has_no_synthetic_model() {
         let mut config = AppConfig::default();
-        config.model.provider = "deepseek".to_string();
-        config.model.name = "deepseek-v4-flash".to_string();
-        config.model.context_window = Some(128_000);
+        config.model.provider = "ignored-legacy-provider".to_string();
+        config.model.name = "ignored-legacy-model".to_string();
 
         let views = configured_model_views(&config);
-        let view = views
-            .first()
-            .ok_or_else(|| "legacy model view was not created".to_string())?;
-        assert_eq!(views.len(), 1);
-        assert_eq!(view.model, "deepseek-v4-flash");
-        assert!(view.is_default);
-        assert_eq!(view.context_window, Some(128_000));
-        Ok(())
+        assert!(views.is_empty());
+        assert!(matches!(
+            resolve_runtime_model_selector(&config, None),
+            Err(ModelSelectionError::NotConfigured)
+        ));
     }
 
     #[test]
     fn model_views_expose_only_effective_thinking_levels() -> Result<(), String> {
-        let mut config = AppConfig::default();
-        config.model.provider = "openai".to_string();
-        config.model.name = "gpt-5.6-sol".to_string();
-        config.model.api_protocol = Some(LlmApiProtocol::Responses);
+        let mut config = AppConfig {
+            configured_models: vec![ConfiguredModel {
+                id: "openai:gpt-5.6-sol".to_string(),
+                display_name: "GPT-5.6 Sol".to_string(),
+                provider: "openai".to_string(),
+                model: "gpt-5.6-sol".to_string(),
+                api_protocol: LlmApiProtocol::Responses,
+                ..ConfiguredModel::default()
+            }],
+            ..AppConfig::default()
+        };
+        config.model.default_model_id = Some("openai:gpt-5.6-sol".to_string());
 
         let views = configured_model_views(&config);
         let view = views
@@ -1312,16 +1279,28 @@ configured_models:
             ["none", "low", "medium", "high", "xhigh", "max"]
         );
 
-        config.model.provider = "zhipu".to_string();
-        config.model.name = "glm-4.6".to_string();
-        config.model.api_protocol = Some(LlmApiProtocol::ChatCompletions);
+        let configured = config
+            .configured_models
+            .first_mut()
+            .ok_or_else(|| "configured model disappeared".to_string())?;
+        configured.id = "zhipu:glm-4.6".to_string();
+        configured.provider = "zhipu".to_string();
+        configured.model = "glm-4.6".to_string();
+        configured.api_protocol = LlmApiProtocol::ChatCompletions;
+        config.model.default_model_id = Some("zhipu:glm-4.6".to_string());
         let older = configured_model_views(&config);
         let older_view = older
             .first()
             .ok_or_else(|| "GLM-4.6 model view was not created".to_string())?;
         assert!(older_view.thinking_levels.is_empty());
 
-        config.model.name = "glm-5.2".to_string();
+        let configured = config
+            .configured_models
+            .first_mut()
+            .ok_or_else(|| "configured model disappeared".to_string())?;
+        configured.id = "zhipu:glm-5.2".to_string();
+        configured.model = "glm-5.2".to_string();
+        config.model.default_model_id = Some("zhipu:glm-5.2".to_string());
         let current = configured_model_views(&config);
         let current_view = current
             .first()
