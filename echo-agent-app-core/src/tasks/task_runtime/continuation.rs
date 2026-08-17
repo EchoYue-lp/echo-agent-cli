@@ -47,6 +47,7 @@ struct ContinuationState {
 pub(crate) struct TaskContinuationRuntime {
     store: Weak<TaskRuntimeStore>,
     state: Mutex<ContinuationState>,
+    shutdown: CancellationToken,
 }
 
 impl TaskContinuationRuntime {
@@ -54,6 +55,7 @@ impl TaskContinuationRuntime {
         Self {
             store,
             state: Mutex::new(ContinuationState::default()),
+            shutdown: CancellationToken::new(),
         }
     }
 
@@ -139,7 +141,6 @@ impl TaskContinuationRuntime {
             self.finish_dispatch(&run_id, dispatch_generation, true);
             return;
         };
-        let mut consecutive_failures = 0_u8;
         loop {
             if !store.is_run_driver_admission_open() {
                 self.finish_dispatch(&run_id, dispatch_generation, true);
@@ -152,6 +153,17 @@ impl TaskContinuationRuntime {
             }
             match continuation_eligibility(&store, &run_id) {
                 ContinuationEligibility::Ready => {}
+                ContinuationEligibility::RetryAt(deadline) => {
+                    let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+                    tokio::select! {
+                        _ = self.shutdown.cancelled() => {
+                            self.finish_dispatch(&run_id, dispatch_generation, true);
+                            return;
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
                 ContinuationEligibility::Deferred => {
                     self.finish_dispatch(&run_id, dispatch_generation, false);
                     return;
@@ -243,32 +255,8 @@ impl TaskContinuationRuntime {
             };
             if let Err(error) = result {
                 tracing::warn!(run_id, %error, "long-horizon continuation turn failed");
-                if !store.is_run_driver_admission_open() {
-                    self.finish_dispatch(&run_id, dispatch_generation, true);
-                    return;
-                }
-                consecutive_failures = consecutive_failures.saturating_add(1);
-                if consecutive_failures >= 3 {
-                    if store
-                        .get_run(&run_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|run| run.status == TaskRunStatus::Running)
-                    {
-                        let _paused = store.request_pause_with_reason(
-                            &run_id,
-                            super::types::RunPauseReason::ProviderUnavailable,
-                            Some("three consecutive continuation turn admissions failed"),
-                        );
-                    }
-                    self.finish_dispatch(&run_id, dispatch_generation, true);
-                    return;
-                }
-                let backoff_millis = 250_u64.saturating_mul(1_u64 << consecutive_failures);
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_millis.min(2_000)))
-                    .await;
-            } else {
-                consecutive_failures = 0;
+                self.finish_dispatch(&run_id, dispatch_generation, true);
+                return;
             }
             origin = RunTurnOrigin::Continuation;
             tokio::task::yield_now().await;
@@ -327,6 +315,7 @@ impl TaskContinuationRuntime {
     }
 
     fn clear_all_launchers(&self) {
+        self.shutdown.cancel();
         let mut state = self
             .state
             .lock()
@@ -359,6 +348,7 @@ fn settle_dispatch_state(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContinuationEligibility {
     Ready,
+    RetryAt(chrono::DateTime<chrono::Utc>),
     Deferred,
     Stop,
 }
@@ -378,6 +368,14 @@ fn continuation_eligibility(store: &TaskRuntimeStore, run_id: &str) -> Continuat
     }
     if continuation.deferred {
         return ContinuationEligibility::Deferred;
+    }
+    if let Some(retry) = continuation.provider_retry {
+        if retry.exhausted {
+            return ContinuationEligibility::Stop;
+        }
+        if retry.next_retry_at > chrono::Utc::now() {
+            return ContinuationEligibility::RetryAt(retry.next_retry_at);
+        }
     }
     if continuation
         .token_budget

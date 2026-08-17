@@ -151,7 +151,7 @@ struct ReviewGenerationReceipt {
 }
 
 impl ReviewGenerationLease {
-    pub fn create_layer_manager(&self) -> MemoryLayerManager {
+    pub fn create_layer_manager(&self) -> echo_agent::error::Result<MemoryLayerManager> {
         let mut builder = MemoryRuntimeIntegrationBuilder::new(
             self.receipt.binding.echo_agent_dir.clone(),
             self.receipt.binding.store.clone(),
@@ -618,7 +618,9 @@ impl ReviewIntegration {
         let store = lease.receipt.binding.store.clone();
         let typed_store = TypedMemoryStore::new(store.clone());
         let runtime_builder = MemoryRuntimeIntegrationBuilder::new(echo_agent_dir.clone(), store);
-        let change_log = runtime_builder.create_change_log();
+        let change_log = runtime_builder
+            .create_change_log()
+            .map_err(|error| format!("Failed to open evolution change log: {error}"))?;
         let reviewer = MemoryReviewer::new();
         let mut report = reviewer
             .review(&typed_store, &self.config)
@@ -690,7 +692,7 @@ impl ReviewIntegration {
     ///
     /// Reads one atomic `(echo_agent_dir, store, generation)` binding, so after
     /// a workspace `rebind` this manager uses the new workspace.
-    pub fn create_layer_manager(&self) -> MemoryLayerManager {
+    pub fn create_layer_manager(&self) -> echo_agent::error::Result<MemoryLayerManager> {
         self.runtime_builder().build_layer_manager()
     }
 
@@ -699,7 +701,7 @@ impl ReviewIntegration {
     pub fn create_layer_manager_with_observer(
         &self,
         observer: Arc<dyn EvolutionObserver>,
-    ) -> MemoryLayerManager {
+    ) -> echo_agent::error::Result<MemoryLayerManager> {
         self.runtime_builder()
             .evolution_observer(observer)
             .build_layer_manager()
@@ -1173,7 +1175,9 @@ mod tests {
         let store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let ri = ReviewIntegration::new(ReviewConfig::default(), temp.path().join(".eko"), store);
-        let layer_manager = ri.create_layer_manager();
+        let layer_manager = ri
+            .create_layer_manager()
+            .map_err(|error| error.to_string())?;
         let high = MemoryMeta::new(MemoryType::ProjectFact, MemorySource::ExplicitSave, "build")
             .with_confidence(0.9);
         let low = MemoryMeta::new(
@@ -1236,6 +1240,7 @@ mod tests {
             .with_confidence(0.6)
         };
         ri.create_layer_manager()
+            .map_err(|error| error.to_string())?
             .write_memory("first", "first write", meta())
             .await
             .map_err(|error| error.to_string())?;
@@ -1247,6 +1252,7 @@ mod tests {
         assert_eq!(permit.commit().generation, 1);
         drop(permit);
         ri.create_layer_manager()
+            .map_err(|error| error.to_string())?
             .write_memory("second", "second write", meta())
             .await
             .map_err(|error| error.to_string())?;

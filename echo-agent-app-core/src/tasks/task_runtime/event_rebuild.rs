@@ -15,9 +15,10 @@ use serde::Serialize;
 
 use super::types::{
     AttendedMode, BackgroundCellState, BlockerAudit, DomainProfile, EkoTaskExecution,
-    ExecutionMode, PlanRevision, PlanTask, RunContinuationState, RunPause, RunPauseReason,
-    RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
-    RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus, TurnVisibility,
+    ExecutionMode, PlanRevision, PlanTask, ProviderRetryState, RunContinuationState, RunPause,
+    RunPauseReason, RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary,
+    RuntimeEventKind, RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus,
+    TurnVisibility,
 };
 
 /// Rebuilt plan snapshot — the shape `plan.json` will take.
@@ -528,6 +529,9 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         .as_deref()
                         .and_then(RunTurnStatus::from_wire)
                         .unwrap_or(RunTurnStatus::Failed);
+                    if summary.status == RunTurnStatus::Ended {
+                        state.provider_retry = None;
+                    }
                     summary.ended_at = Some(ev.timestamp);
                     summary.elapsed_seconds = ev
                         .payload
@@ -584,6 +588,41 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                     }
                 }
             }
+            K::RunProviderRetryScheduled => {
+                let state = continuation.get_or_insert_with(RunContinuationState::default);
+                let attempt_count = ev
+                    .payload
+                    .get("attempt_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or(1);
+                state.provider_retry = Some(ProviderRetryState {
+                    attempt_count,
+                    next_retry_at: parse_event_dt(&ev.payload, "next_retry_at", ev.timestamp),
+                    error_fingerprint: json_string(&ev.payload, "error_fingerprint")
+                        .unwrap_or_else(|| "provider:unknown".to_string()),
+                    first_failure_at: parse_event_dt(&ev.payload, "first_failure_at", ev.timestamp),
+                    exhausted: ev
+                        .payload
+                        .get("exhausted")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false),
+                });
+                if let Some(reason) = json_string(&ev.payload, "pause_reason")
+                    .as_deref()
+                    .and_then(RunPauseReason::from_wire)
+                {
+                    state.pause = Some(RunPause {
+                        reason,
+                        detail: json_string(&ev.payload, "pause_detail"),
+                        changed_at: ev.timestamp,
+                    });
+                    if let Some(run) = run.as_mut() {
+                        run.status = TaskRunStatus::Paused;
+                        run.updated_at = ev.timestamp;
+                    }
+                }
+            }
             K::RunContinuationDeferred => {
                 let state = continuation.get_or_insert_with(RunContinuationState::default);
                 state.deferred = true;
@@ -594,6 +633,14 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                 state.deferred = false;
                 state.deferred_reason = None;
                 state.blocker_audit = None;
+                if ev
+                    .payload
+                    .get("reset_provider_retry")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    state.provider_retry = None;
+                }
             }
             K::RunPauseReasonChanged => {
                 let state = continuation.get_or_insert_with(RunContinuationState::default);

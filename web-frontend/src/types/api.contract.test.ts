@@ -101,6 +101,7 @@ const serializedContinuation = {
     fingerprint: 'no-task-progress',
     consecutive_turns: 3,
   },
+  provider_retry: null,
   deferred: false,
   deferred_reason: null,
 } satisfies RunContinuationState;

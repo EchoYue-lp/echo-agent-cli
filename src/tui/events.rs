@@ -2276,12 +2276,11 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 echo_agent::agent::AgentEvent::Cancelled => AgentEvent::Cancelled,
                 echo_agent::agent::AgentEvent::ToolCall {
                     call_id,
-                    name,
-                    args,
+                    invocation,
                 } => AgentEvent::ToolCall {
                     call_id,
-                    name,
-                    args: args.to_string(),
+                    name: invocation.name,
+                    args: invocation.args.to_string(),
                 },
                 echo_agent::agent::AgentEvent::ToolStream {
                     call_id,
@@ -2317,23 +2316,12 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                     failure: result.failure,
                 },
                 echo_agent::agent::AgentEvent::ToolResult {
-                    call_id, output, ..
+                    call_id, result, ..
                 } => AgentEvent::ToolResult {
                     call_id,
-                    output,
-                    success: true,
-                    failure: None,
-                },
-                echo_agent::agent::AgentEvent::ToolError {
-                    call_id,
-                    error,
-                    failure,
-                    ..
-                } => AgentEvent::ToolResult {
-                    call_id,
-                    output: error,
-                    success: false,
-                    failure: Some(failure),
+                    output: result.error.unwrap_or(result.output),
+                    success: result.success,
+                    failure: result.failure,
                 },
                 echo_agent::agent::AgentEvent::ContextCompressed {
                     before_count,
@@ -3063,7 +3051,15 @@ async fn handle_slash_command(
                     );
                 }
             };
-            let layer_manager = Arc::new(memory_generation.create_layer_manager());
+            let layer_manager = match memory_generation.create_layer_manager() {
+                Ok(manager) => Arc::new(manager),
+                Err(error) => {
+                    return push_system_message(
+                        app,
+                        format!("Failed to initialize layered memory: {error}"),
+                    );
+                }
+            };
             let key = uuid::Uuid::new_v4().to_string();
             let meta = echo_agent::memory::MemoryMeta::new(
                 echo_agent::memory::MemoryType::ProjectFact,
@@ -3117,7 +3113,15 @@ async fn handle_slash_command(
                     );
                 }
             };
-            let layer_manager = Arc::new(memory_generation.create_layer_manager());
+            let layer_manager = match memory_generation.create_layer_manager() {
+                Ok(manager) => Arc::new(manager),
+                Err(error) => {
+                    return push_system_message(
+                        app,
+                        format!("Failed to initialize layered memory: {error}"),
+                    );
+                }
+            };
             let query = args.trim();
             let key = if layer_manager.locate(query).await.is_some() {
                 Some(query.to_string())
@@ -4030,8 +4034,17 @@ async fn handle_slash_command(
                 Some(review_lease.memory_store()),
                 Some(run_store),
             );
-            let reviewer =
-                reviewer.with_layer_manager(Arc::new(review_lease.create_layer_manager()));
+            let layer_manager = match review_lease.create_layer_manager() {
+                Ok(manager) => Arc::new(manager),
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Review memory initialization failed: {error}"),
+                    });
+                    return;
+                }
+            };
+            let reviewer = reviewer.with_layer_manager(layer_manager);
 
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -4239,7 +4252,15 @@ async fn handle_slash_command(
                 "accept" | "undo" => match candidate_id {
                     Some(id) => match memory_generation.as_ref() {
                         Some(lease) => {
-                            let layer_manager = Arc::new(lease.create_layer_manager());
+                            let layer_manager = match lease.create_layer_manager() {
+                                Ok(manager) => Arc::new(manager),
+                                Err(error) => {
+                                    return push_system_message(
+                                        app,
+                                        format!("Failed to initialize layered memory: {error}"),
+                                    );
+                                }
+                            };
                             let action = if sub == "accept" {
                                 store.accept(id, content, &layer_manager).await
                             } else {
@@ -4279,9 +4300,17 @@ async fn handle_slash_command(
                 .as_ref()
                 .map(|integration| integration.echo_agent_dir())
                 .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
-            let change_log = echo_agent::evolution::JsonlChangeLog::new(
+            let change_log = match echo_agent::evolution::JsonlChangeLog::new(
                 echo_agent_dir.join("evolution").join("change-log.jsonl"),
-            );
+            ) {
+                Ok(change_log) => change_log,
+                Err(error) => {
+                    return push_system_message(
+                        app,
+                        format!("Failed to open evolution change log: {error}"),
+                    );
+                }
+            };
             let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
                 .with_run_store(run_store);
             let metrics = dashboard.generate_metrics().await;
@@ -5279,7 +5308,13 @@ async fn start_tui_task_retry_driver(
                 })?;
             let layer_manager = memory_generation
                 .as_ref()
-                .map(|generation| Arc::new(generation.create_layer_manager()));
+                .map(|generation| generation.create_layer_manager().map(Arc::new))
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "layered memory unavailable: {error}"
+                    ))
+                })?;
             Ok((memory_generation, layer_manager))
         },
         move |(memory_generation, layer_manager), mut receipt_owner| async move {
@@ -5340,7 +5375,13 @@ where
                 })?;
             let layer_manager = memory_generation
                 .as_ref()
-                .map(|generation| Arc::new(generation.create_layer_manager()));
+                .map(|generation| generation.create_layer_manager().map(Arc::new))
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "layered memory unavailable: {error}"
+                    ))
+                })?;
             if validation_store.get_plan(&validation_run_id)?.is_none() {
                 return Err(
                     echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
@@ -6969,8 +7010,13 @@ mod tests {
                 parent: "main".to_string(),
                 agent: "explorer".to_string(),
                 call_id: "call-1".to_string(),
-                name: "read_file".to_string(),
-                args: serde_json::json!({}),
+                invocation: echo_agent::agent::ToolInvocation {
+                    requested_name: "read_file".to_string(),
+                    requested_args: serde_json::json!({}),
+                    name: "read_file".to_string(),
+                    args: serde_json::json!({}),
+                    rewrites: Vec::new(),
+                },
                 execution_id: Some("task-1:1".to_string()),
                 run_id: Some("run-1".to_string()),
             },

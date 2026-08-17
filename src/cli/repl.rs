@@ -541,25 +541,33 @@ impl ReplChatSink {
                 let preview: String = spec.to_string().chars().take(500).collect();
                 self.output.emit(format!("Chart specification: {preview}"))
             }
-            AgentEvent::ToolCall { name, args, .. } => {
+            AgentEvent::ToolCall { invocation, .. } => {
                 state.first_chunk = true;
                 state.tool_call_count = state.tool_call_count.saturating_add(1);
                 TOTAL_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
-                if matches!(name.as_str(), "shell" | "delete_file" | "git_commit") {
-                    let warning = nu_ansi_term::Color::Red
-                        .paint(format!("DANGER: {name} — irreversible operation"));
+                if matches!(
+                    invocation.name.as_str(),
+                    "shell" | "delete_file" | "git_commit"
+                ) {
+                    let warning = nu_ansi_term::Color::Red.paint(format!(
+                        "DANGER: {} — irreversible operation",
+                        invocation.name
+                    ));
                     if !self.output.emit(warning.to_string()) {
                         return false;
                     }
-                    if name == "shell"
-                        && let Some(command) =
-                            args.get("command").and_then(serde_json::Value::as_str)
+                    if invocation.name == "shell"
+                        && let Some(command) = invocation
+                            .args
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
                         && !self.output.emit(format!("Command: {command}"))
                     {
                         return false;
                     }
                 }
-                self.output.print_tool_call(&name, &args)
+                self.output
+                    .print_tool_call(&invocation.name, &invocation.args)
             }
             AgentEvent::ToolStream {
                 event: echo_agent::tools::ToolStreamEvent::Complete(result),
@@ -582,11 +590,7 @@ impl ReplChatSink {
                 self.output.emit(format!("{status}{size}: {path}"))
             }
             AgentEvent::ToolStream { .. } => true,
-            AgentEvent::ToolResult {
-                name,
-                output: tool_output,
-                ..
-            } => {
+            AgentEvent::ToolResult { name, result, .. } => {
                 if matches!(
                     name.as_str(),
                     "write_file"
@@ -600,22 +604,23 @@ impl ReplChatSink {
                     FILE_CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 state.first_chunk = true;
-                self.output.print_tool_result(&name, &tool_output)
-            }
-            AgentEvent::ToolError {
-                name,
-                error,
-                failure,
-                ..
-            } => {
-                state.first_chunk = true;
-                let text = format!(
-                    "✗ {name} [{} → {}]: {error}",
-                    failure.category.as_str(),
-                    failure.recovery.as_str()
-                );
-                self.output
-                    .emit(nu_ansi_term::Color::Red.paint(text).to_string())
+                if result.success {
+                    self.output.print_tool_result(&name, &result.output)
+                } else {
+                    let error = result.error.as_deref().unwrap_or(&result.output);
+                    let detail = result.failure.as_ref().map_or_else(
+                        || format!("✗ {name}: {error}"),
+                        |failure| {
+                            format!(
+                                "✗ {name} [{} → {}]: {error}",
+                                failure.category.as_str(),
+                                failure.recovery.as_str()
+                            )
+                        },
+                    );
+                    self.output
+                        .emit(nu_ansi_term::Color::Red.paint(detail).to_string())
+                }
             }
             AgentEvent::FinalAnswer(_) => {
                 let accepted = self.output.flush_tokens();

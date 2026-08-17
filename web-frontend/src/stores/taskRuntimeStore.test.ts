@@ -230,6 +230,7 @@ describe('taskRuntimeStore conversation loading', () => {
       last_turn: null,
       pause: null,
       blocker_audit: null,
+      provider_retry: null,
       deferred: false,
       deferred_reason: null,
     } satisfies RunContinuationState;

@@ -74,7 +74,8 @@ pub use revisioned_adapter::{
     apply_eko_task_update, build_eko_task_revision_service, commit_eko_task_plan,
 };
 pub use store::{
-    AbandonedRunSettlement, RunDriverReceiptOwner, StoreError, TaskRetryPreparation,
+    AbandonedRunSettlement, BootAutoResumeBlocker, BootAutoResumeDecision, BootAutoResumeOutcome,
+    ProviderRetryDisposition, RunDriverReceiptOwner, StoreError, TaskRetryPreparation,
     TaskRunDriverShutdownError, TaskRuntimeStore,
 };
 pub use subagent_control::SubagentControlService;

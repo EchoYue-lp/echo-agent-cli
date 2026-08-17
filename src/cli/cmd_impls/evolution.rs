@@ -133,7 +133,14 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         Some(review_lease.memory_store()),
         Some(run_store),
     );
-    let reviewer = reviewer.with_layer_manager(Arc::new(review_lease.create_layer_manager()));
+    let layer_manager = match review_lease.create_layer_manager() {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            println!("Review memory initialization failed: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let reviewer = reviewer.with_layer_manager(layer_manager);
 
     let handle = match reviewer.review(&run) {
         Ok(handle) => handle,
@@ -952,7 +959,13 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+    let change_log = match echo_agent::evolution::JsonlChangeLog::new(log_path) {
+        Ok(change_log) => change_log,
+        Err(error) => {
+            println!("Failed to open evolution change log: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
     let generator = echo_agent::evolution::SkillDraftGenerator::new(
         echo_agent_dir,
         &change_log as &dyn echo_agent::evolution::ChangeLog,
@@ -1035,7 +1048,13 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+        let change_log = match echo_agent::evolution::JsonlChangeLog::new(log_path) {
+            Ok(change_log) => change_log,
+            Err(error) => {
+                println!("Failed to open evolution change log: {error}");
+                return CommandOutcome::Continue;
+            }
+        };
 
         match detector.scan_and_propose(&descriptors, &change_log).await {
             Ok(proposals) if !proposals.is_empty() => {
@@ -1136,7 +1155,13 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 if let Some(parent) = log_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+                let change_log = match echo_agent::evolution::JsonlChangeLog::new(log_path) {
+                    Ok(change_log) => change_log,
+                    Err(error) => {
+                        println!("Failed to open evolution change log: {error}");
+                        return CommandOutcome::Continue;
+                    }
+                };
 
                 let merger = echo_agent::evolution::SkillMerger::new(curator);
 
@@ -1461,7 +1486,13 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+        let change_log = match echo_agent::evolution::JsonlChangeLog::new(log_path) {
+            Ok(change_log) => change_log,
+            Err(error) => {
+                println!("Failed to open evolution change log: {error}");
+                return CommandOutcome::Continue;
+            }
+        };
 
         let patch = match patch.bind_to_source(&descriptor.location).await {
             Ok(patch) => patch,
@@ -1606,9 +1637,15 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
                         .as_ref()
                         .map(|generation| generation.echo_agent_dir().to_path_buf())
                         .unwrap_or_else(|| current_echo_agent_dir(ctx));
-                    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+                    let change_log = match echo_agent::evolution::JsonlChangeLog::new(
                         echo_agent_dir.join("evolution").join("change-log.jsonl"),
-                    );
+                    ) {
+                        Ok(change_log) => change_log,
+                        Err(error) => {
+                            println!("Failed to open evolution change log: {error}");
+                            return CommandOutcome::Continue;
+                        }
+                    };
 
                     match promoter.promote_rule(prop, &change_log).await {
                         Ok(()) => {
@@ -1678,11 +1715,17 @@ async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> Comman
         }
     };
 
-    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+    let change_log = match echo_agent::evolution::JsonlChangeLog::new(
         current_echo_agent_dir(ctx)
             .join("evolution")
             .join("change-log.jsonl"),
-    );
+    ) {
+        Ok(change_log) => change_log,
+        Err(error) => {
+            println!("Failed to open evolution change log: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
 
     let dashboard =
         echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
@@ -1978,7 +2021,13 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                     return CommandOutcome::Continue;
                 }
             };
-            let layer_manager = Arc::new(memory_lease.create_layer_manager());
+            let layer_manager = match memory_lease.create_layer_manager() {
+                Ok(manager) => Arc::new(manager),
+                Err(error) => {
+                    println!("Failed to initialize layered memory: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
             let result = if sub == "accept" {
                 let edited = args
                     .get(2..)

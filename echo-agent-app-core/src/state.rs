@@ -1636,7 +1636,7 @@ impl AppState {
                         store_for_mgr.clone(),
                     )
                     .build_layer_manager()
-                });
+                })?;
             self.connection
                 .agent
                 .write_async(|a| {
@@ -1929,7 +1929,7 @@ impl AppState {
                         store_for_mgr.clone(),
                     )
                     .build_layer_manager()
-                });
+                })?;
             self.connection
                 .agent
                 .write_async(|a| {
@@ -3411,6 +3411,13 @@ mod workspace_transition_tests {
             .switch_workspace(workspace("a", canonical_root_a.clone()))
             .await
             .map_err(|error| error.to_string())?;
+
+        // Acquire the parking execution while the generation is healthy. The
+        // fault below intentionally makes new layer-manager construction fail.
+        let pool_execution = pool
+            .acquire("memory-transition-parking-run")
+            .await
+            .map_err(|error| error.to_string())?;
         let blocked_evolution = canonical_root_a.join(".eko/evolution");
         if blocked_evolution.is_dir() {
             std::fs::remove_dir_all(&blocked_evolution).map_err(|error| error.to_string())?;
@@ -3420,10 +3427,6 @@ mod workspace_transition_tests {
 
         // The pool lease holds transition settlement after memory prepare, so
         // the trigger deterministically arrives inside the rebind admission.
-        let pool_execution = pool
-            .acquire("memory-transition-parking-run")
-            .await
-            .map_err(|error| error.to_string())?;
         let switch_state = state.clone();
         let switch_root = canonical_root_b.clone();
         let switch = tokio::spawn(async move {

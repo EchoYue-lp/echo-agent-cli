@@ -1290,8 +1290,7 @@ impl TauriChatSink {
         match event {
             AgentEvent::ToolCall {
                 call_id,
-                name,
-                args,
+                invocation,
             } => {
                 let _ = emit_chat_event(
                     &self.app,
@@ -1306,12 +1305,12 @@ impl TauriChatSink {
                     self.conversation_id.as_deref(),
                     Some(&self.message_key),
                     call_id,
-                    name,
-                    args,
+                    &invocation.name,
+                    &invocation.args,
                 ) {
                     Ok(summary) => summary,
                     Err(error) => {
-                        tracing::warn!(%error, %call_id, %name, "failed to persist tool start");
+                        tracing::warn!(%error, %call_id, name = %invocation.name, "failed to persist tool start");
                         return Some(true);
                     }
                 };
@@ -1357,55 +1356,26 @@ impl TauriChatSink {
             }
             AgentEvent::ToolStream { .. } => Some(true),
             AgentEvent::ToolResult {
-                call_id, output, ..
+                call_id, result, ..
             } => {
                 let completion = lock_std(&self.tool_completions, "GUI tool completions")
                     .remove(call_id)
                     .unwrap_or_default();
+                let mut metadata = result.metadata.clone();
+                metadata.extend(completion.metadata);
+                let terminal_text = result.error.as_deref().unwrap_or(&result.output);
                 let summary = match self.tool_executions.finish(
                     &owner,
                     call_id,
-                    true,
-                    output,
-                    None,
-                    completion.metadata,
-                    completion.truncated,
+                    result.success,
+                    terminal_text,
+                    result.failure.clone(),
+                    metadata,
+                    result.truncated || completion.truncated,
                 ) {
                     Ok(summary) => summary,
                     Err(error) => {
                         tracing::warn!(%error, %call_id, "failed to persist tool completion");
-                        return Some(true);
-                    }
-                };
-                lock_std(&self.active_tool_ids, "active GUI tools").remove(call_id);
-                Some(emit_tool_execution_summary(
-                    &self.app,
-                    "finished",
-                    "echo-assistant",
-                    &summary,
-                ))
-            }
-            AgentEvent::ToolError {
-                call_id,
-                error,
-                failure,
-                ..
-            } => {
-                let completion = lock_std(&self.tool_completions, "GUI tool completions")
-                    .remove(call_id)
-                    .unwrap_or_default();
-                let summary = match self.tool_executions.finish(
-                    &owner,
-                    call_id,
-                    false,
-                    error,
-                    Some(failure.clone()),
-                    completion.metadata,
-                    completion.truncated,
-                ) {
-                    Ok(summary) => summary,
-                    Err(persist_error) => {
-                        tracing::warn!(%persist_error, %call_id, "failed to persist tool failure");
                         return Some(true);
                     }
                 };
@@ -1597,8 +1567,7 @@ fn agent_event_to_chat_event(
         },
         AgentEvent::ToolCall { .. }
         | AgentEvent::ToolStream { .. }
-        | AgentEvent::ToolResult { .. }
-        | AgentEvent::ToolError { .. } => ChatEvent::Notice {
+        | AgentEvent::ToolResult { .. } => ChatEvent::Notice {
             level: "warning".to_string(),
             code: "tool_event_projection_bypassed".to_string(),
             message: "Tool event bypassed the durable execution projection".to_string(),

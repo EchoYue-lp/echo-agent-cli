@@ -351,6 +351,19 @@ mod tests {
             }
         }
 
+        fn record_idempotent(
+            &self,
+            _entry: echo_agent::evolution::ChangeEntry,
+        ) -> echo_agent::error::Result<echo_agent::evolution::ChangeRecordOutcome> {
+            if self.fail {
+                Err(echo_agent::error::ReactError::Other(
+                    "injected audit failure".to_string(),
+                ))
+            } else {
+                Ok(echo_agent::evolution::ChangeRecordOutcome::Appended)
+            }
+        }
+
         fn query(
             &self,
             _filter: &echo_agent::evolution::ChangeFilter,

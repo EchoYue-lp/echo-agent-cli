@@ -13,9 +13,10 @@ use echo_agent::tasks::progress::TaskProgress;
 
 use super::background::BackgroundTaskKind;
 use super::task_runtime::{
-    AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanTask,
-    RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun, TaskRunStatus,
-    TaskRuntimeStore, TodoStatus, UnattendedWriteMode,
+    AttendedMode, BootAutoResumeDecision, BootAutoResumeOutcome, DomainProfile, ExecuteTaskTool,
+    ExecutionMode, MemoryPolicy, PlanTask, RecoveryBlocker, RecoveryDecision, TaskPlan,
+    TaskRetryPreparation, TaskRun, TaskRunStatus, TaskRuntimeStore, TodoStatus,
+    UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 
@@ -283,6 +284,11 @@ impl BackgroundTaskService {
                 AttendedMode::Unattended,
             )
             .and_then(|_| {
+                self.task_runtime_store
+                    .configure_run_continuation(&run_id, true, true, None, None)
+                    .map(|_| ())
+            })
+            .and_then(|_| {
                 self.task_runtime_store.record_trigger_metadata(
                     &run_id,
                     request.source,
@@ -360,6 +366,13 @@ impl BackgroundTaskService {
             },
         )
         .await
+        {
+            registration.fail_preparation(error.to_string());
+            return Err(error.into());
+        }
+        if let Err(error) = self
+            .task_runtime_store
+            .configure_run_continuation(&run_id, true, true, None, None)
         {
             registration.fail_preparation(error.to_string());
             return Err(error.into());
@@ -553,18 +566,40 @@ impl BackgroundTaskService {
     }
 
     pub async fn resume_pending(&self) -> anyhow::Result<usize> {
-        let runs = self
+        let mut runs = self
             .task_runtime_store
             .list_runs_in(&[TaskRunStatus::Pending, TaskRunStatus::Paused])?;
+        runs.sort_by_key(|run| run.status == TaskRunStatus::Paused);
         let mut resumed = 0usize;
         for run in runs
             .into_iter()
             .filter(|run| run.conversation_id.starts_with("background:"))
-            .filter(|run| {
-                run.status == TaskRunStatus::Pending
-                    || was_recovered_at_boot(&self.task_runtime_store, &run.run_id)
-            })
         {
+            if run.status == TaskRunStatus::Paused {
+                match self
+                    .task_runtime_store
+                    .boot_auto_resume_decision(&run.run_id, true, false)?
+                {
+                    BootAutoResumeDecision::Blocked(blockers) => {
+                        tracing::info!(
+                            run_id = %run.run_id,
+                            blockers = ?blockers.iter().map(|blocker| blocker.as_str()).collect::<Vec<_>>(),
+                            "background run remains paused after boot admission"
+                        );
+                        continue;
+                    }
+                    BootAutoResumeDecision::Ready {
+                        retry_not_before: Some(deadline),
+                    } => {
+                        let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+                        tokio::select! {
+                            _ = self.cancel.cancelled() => return Ok(resumed),
+                            _ = tokio::time::sleep(delay) => {}
+                        }
+                    }
+                    BootAutoResumeDecision::Ready { .. } => {}
+                }
+            }
             let cancel = self.cancel.child_token();
             let admission = self
                 .task_runtime_store
@@ -575,29 +610,36 @@ impl BackgroundTaskService {
             let mut registration = self
                 .task_runtime_store
                 .register_run_driver::<()>(admission, generation_lease)?;
-            let blockers = self
-                .task_runtime_store
-                .list_recovery_blockers(&run.run_id)?;
-            if !blockers.is_empty() {
-                registration.reject(format!(
-                    "background run {} requires a recovery decision",
-                    run.run_id
-                ));
-                tracing::warn!(
-                    run_id = %run.run_id,
-                    blocker_count = blockers.len(),
-                    "background run requires recovery decision before resume"
-                );
-                continue;
-            }
             let metadata = trigger_metadata(&self.task_runtime_store, &run.run_id);
             let prompt = metadata.prompt.unwrap_or(run.goal);
             registration.mark_preparation_started();
-            if run.status == TaskRunStatus::Paused
-                && let Err(error) = self.task_runtime_store.resume_task_run(&run.run_id)
-            {
-                registration.fail_preparation(error.to_string());
-                return Err(error.into());
+            if run.status == TaskRunStatus::Paused {
+                match self.task_runtime_store.resume_task_run_after_boot(
+                    &run.run_id,
+                    true,
+                    false,
+                )? {
+                    BootAutoResumeOutcome::Resumed(_) => {}
+                    BootAutoResumeOutcome::WaitingUntil(deadline) => {
+                        registration.reject(format!(
+                            "provider retry for {} is not due until {deadline}",
+                            run.run_id
+                        ));
+                        continue;
+                    }
+                    BootAutoResumeOutcome::Blocked(blockers) => {
+                        registration.reject(format!(
+                            "boot auto-resume rejected for {}: {}",
+                            run.run_id,
+                            blockers
+                                .iter()
+                                .map(|blocker| blocker.as_str())
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ));
+                        continue;
+                    }
+                }
             }
             self.start_run_driver(
                 run.run_id,
@@ -716,7 +758,9 @@ async fn drive_background_run(
     }
     let layer_manager = memory_generation
         .as_ref()
-        .map(|generation| Arc::new(generation.create_layer_manager()));
+        .map(|generation| generation.create_layer_manager().map(Arc::new))
+        .transpose()
+        .map_err(|error| format!("memory layer unavailable: {error}"))?;
     let lease = match agent_provider.acquire_for_task(&run_id).await {
         Ok(lease) => lease,
         Err(error) => {
@@ -773,19 +817,6 @@ async fn drive_background_run(
         return Err(message);
     }
     Ok(())
-}
-
-fn was_recovered_at_boot(store: &TaskRuntimeStore, run_id: &str) -> bool {
-    let Ok(events) = store.list_events(run_id, 0) else {
-        return false;
-    };
-    events.iter().rev().any(|event| {
-        event
-            .payload
-            .get("message")
-            .and_then(|value| value.as_str())
-            .is_some_and(|message| message.starts_with("recovered from running"))
-    })
 }
 
 #[derive(Default)]
@@ -1135,6 +1166,13 @@ mod tests {
             .ok_or_else(|| "run missing".to_string())?;
         assert!(run.conversation_id.starts_with("background:"));
         assert_eq!(run.route, "bg:kind:research");
+        let continuation = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|snapshot| snapshot.continuation)
+            .ok_or_else(|| "background continuation policy missing".to_string())?;
+        assert!(continuation.enabled);
+        assert!(continuation.auto_resume_after_restart);
         Ok(())
     }
 
@@ -1360,13 +1398,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn auto_resume_only_accepts_boot_recovery_pause() -> Result<(), String> {
+    #[tokio::test]
+    async fn auto_resume_only_accepts_boot_recovery_pause() -> Result<(), String> {
         let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        let workspace_id = store.active_workspace_id();
         store
             .create_run(
                 "run",
-                "default",
+                &workspace_id,
                 "background:test:run",
                 "",
                 DomainProfile::General,
@@ -1397,9 +1436,18 @@ mod tests {
             .transition_run("run", TaskRunStatus::Running)
             .map_err(|error| error.to_string())?;
         store
+            .configure_run_continuation("run", true, true, None, None)
+            .map_err(|error| error.to_string())?;
+        store
             .transition_run("run", TaskRunStatus::Paused)
             .map_err(|error| error.to_string())?;
-        assert!(!was_recovered_at_boot(&store, "run"));
+        assert!(matches!(
+            store
+                .boot_auto_resume_decision("run", true, false)
+                .map_err(|error| error.to_string())?,
+            BootAutoResumeDecision::Blocked(blockers)
+                if blockers.contains(&crate::tasks::task_runtime::store::BootAutoResumeBlocker::NotBootRecovery)
+        ));
 
         store
             .resume_task_run("run")
@@ -1410,7 +1458,31 @@ mod tests {
                 .map_err(|error| error.to_string())?,
             1
         );
-        assert!(was_recovered_at_boot(&store, "run"));
+        assert!(matches!(
+            store
+                .boot_auto_resume_decision("run", true, false)
+                .map_err(|error| error.to_string())?,
+            BootAutoResumeDecision::Ready { .. }
+        ));
+        let store = Arc::new(store);
+        let service = BackgroundTaskService::new(
+            test_agent()?,
+            CancellationToken::new(),
+            Some(store.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            service
+                .resume_pending()
+                .await
+                .map_err(|error| error.to_string())?,
+            1
+        );
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 }

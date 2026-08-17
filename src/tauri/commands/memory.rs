@@ -114,7 +114,11 @@ pub async fn add_memory(
     let memory_lease = integration
         .lease_generation()
         .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let layer_manager = std::sync::Arc::new(memory_lease.create_layer_manager());
+    let layer_manager = std::sync::Arc::new(
+        memory_lease
+            .create_layer_manager()
+            .map_err(|error| IpcError::Internal(error.to_string()))?,
+    );
     let meta = MemoryMeta::new(
         MemoryType::ProjectFact,
         MemorySource::ExplicitSave,
@@ -205,7 +209,11 @@ pub async fn delete_memory(
     let memory_lease = integration
         .lease_generation()
         .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let layer_manager = std::sync::Arc::new(memory_lease.create_layer_manager());
+    let layer_manager = std::sync::Arc::new(
+        memory_lease
+            .create_layer_manager()
+            .map_err(|error| IpcError::Internal(error.to_string()))?,
+    );
     let layer = layer_manager
         .locate(key.trim())
         .await

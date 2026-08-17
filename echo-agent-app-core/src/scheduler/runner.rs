@@ -149,7 +149,9 @@ fn build_fire_fn_with_cancel(
                 }
                 let layer_manager = memory_generation
                     .as_ref()
-                    .map(|generation| Arc::new(generation.create_layer_manager()));
+                    .map(|generation| generation.create_layer_manager().map(Arc::new))
+                    .transpose()
+                    .map_err(|error| format!("cron memory layer unavailable: {error}"))?;
 
                 // Pool admission follows TaskRuntime and memory generation admission.
                 let run_agent = match &pool {

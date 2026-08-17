@@ -1198,7 +1198,8 @@ mod tests {
         let memory_store = Arc::new(echo_agent::memory::InMemoryStore::new());
         let change_log = echo_agent::evolution::JsonlChangeLog::new(
             temp.path().join(".eko/evolution/change-log.jsonl"),
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let layer_manager = Arc::new(echo_agent::evolution::MemoryLayerManager::new(
             temp.path().join(".eko"),
             memory_store,
@@ -1233,7 +1234,8 @@ mod tests {
         let memory_store = Arc::new(echo_agent::memory::InMemoryStore::new());
         let change_log = echo_agent::evolution::JsonlChangeLog::new(
             temp.path().join(".eko/evolution/change-log.jsonl"),
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let layer_manager = Arc::new(echo_agent::evolution::MemoryLayerManager::new(
             temp.path().join(".eko"),
             memory_store,
@@ -1279,7 +1281,8 @@ mod tests {
         let memory_store = Arc::new(echo_agent::memory::InMemoryStore::new());
         let change_log = echo_agent::evolution::JsonlChangeLog::new(
             temp.path().join(".eko/evolution/change-log.jsonl"),
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let layer_manager = Arc::new(echo_agent::evolution::MemoryLayerManager::new(
             temp.path().join(".eko"),
             memory_store,

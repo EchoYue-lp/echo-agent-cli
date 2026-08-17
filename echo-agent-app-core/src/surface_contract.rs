@@ -179,12 +179,12 @@ fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
                 &identity,
                 7,
                 identity.parent_event_id.clone(),
-                AgentEvent::ToolError {
+                AgentEvent::ToolResult {
                     call_id: "call-1".to_string(),
                     name: "shell".to_string(),
-                    error: "timed out".to_string(),
-                    failure: echo_agent::tools::ToolFailure::new(
+                    result: echo_agent::tools::ToolResult::failure(
                         echo_agent::tools::ToolFailureCategory::Timeout,
+                        "timed out",
                     ),
                 },
             )
@@ -277,11 +277,11 @@ fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
         agent
             .pointer("/event/payload/type")
             .and_then(serde_json::Value::as_str),
-        Some("tool_error")
+        Some("tool_result")
     );
     assert_eq!(
         agent
-            .pointer("/event/payload/data/error")
+            .pointer("/event/payload/data/result/error")
             .and_then(serde_json::Value::as_str),
         Some("timed out")
     );

@@ -356,7 +356,13 @@ pub async fn resume_task_run(
                 })?;
             let layer_manager = memory_generation
                 .as_ref()
-                .map(|generation| Arc::new(generation.create_layer_manager()));
+                .map(|generation| generation.create_layer_manager().map(Arc::new))
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "layered memory unavailable: {error}"
+                    ))
+                })?;
             if validation_store.get_plan(&validation_run_id)?.is_none() {
                 return Err(
                     echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
@@ -667,7 +673,13 @@ fn spawn_tauri_task_retry(
                 })?;
             let layer_manager = memory_generation
                 .as_ref()
-                .map(|generation| Arc::new(generation.create_layer_manager()));
+                .map(|generation| generation.create_layer_manager().map(Arc::new))
+                .transpose()
+                .map_err(|error| {
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "layered memory unavailable: {error}"
+                    ))
+                })?;
             Ok((memory_generation, layer_manager))
         },
         move |(memory_generation, layer_manager), mut receipt_owner| async move {

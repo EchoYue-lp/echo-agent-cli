@@ -513,13 +513,6 @@ pub async fn create_agent_with_diagnostics(
         builder = builder.store(store);
     }
 
-    // Inject the shared runtime state store. When the product layer supplies a
-    // store and a conversation_id, every iteration of `run_core_loop` writes an
-    // `AgentCheckpoint` so the conversation can be resumed across restarts.
-    if let Some(ref store) = params.state_store {
-        builder = builder.state_store(store.clone());
-    }
-
     // Set React loop checkpoint interval if provided (used by background tasks
     // to enable crash recovery — saves conversation history every N iterations)
     if let Some(interval) = params.react_checkpoint_interval
@@ -582,14 +575,16 @@ pub async fn create_agent_with_diagnostics(
     > = std::sync::Arc::new(crate::tasks::task_runtime::worktree::EkoDataWorkspaceFactory::new());
     let builder = builder.subagent_data_workspace_factory(data_workspace_factory);
 
-    // Sprint 11: inject a RuntimeStateStore for team-mode checkpoint/resume.
-    // `dispatch_team` plumbs it into TeamAgent so a timed-out team run can
-    // resume by skipping completed plan/subagent/synthesis phases (DAG
-    // skip-on-resume). Reuses the same FileRuntimeStateStore the runtime
-    // checkpoint path uses. None if the store couldn't be constructed (teams
-    // then run in-memory).
-    let builder = if let Some(state_store) = create_runtime_state_store() {
-        builder.subagent_runtime_state_store(state_store)
+    // Reuse one canonical checkpoint store for ReAct and compiled team task
+    // graphs. A caller-provided store is authoritative; otherwise EKO installs
+    // its durable file-backed default. Without a conversation id the framework
+    // has no checkpoint key, so the default store remains inert.
+    let state_store = params
+        .state_store
+        .clone()
+        .or_else(create_runtime_state_store);
+    let builder = if let Some(state_store) = state_store {
+        builder.state_store(state_store)
     } else {
         builder
     };
@@ -1135,7 +1130,6 @@ fn build_writer_subagent_agent(
         // NO .readonly_tools() → full tool set (write capability).
         .enable_memory()
         .enable_cot()
-        .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
@@ -1148,6 +1142,10 @@ fn build_writer_subagent_agent(
         // 与主智能体共享同一进程级 registry；cell 自身通过同一个 sandbox
         // executor 执行，不会从前台策略静默降级为宿主机直连。
         .command_cells(command_cells);
+
+    if max_iterations > 0 {
+        builder = builder.max_iterations(max_iterations);
+    }
 
     if can_delegate {
         builder = builder
@@ -1225,7 +1223,6 @@ fn build_readonly_subagent_agent(
         .readonly_tools() // SA-2: physical enforcement — no shell/write tools
         .enable_memory()
         .enable_cot()
-        .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
@@ -1237,6 +1234,10 @@ fn build_readonly_subagent_agent(
         // readonly 子智能体没有 shell,但注入共享 cell registry 后仍获得
         // wait/stop_cell/list_cells——awaiter 角色正是靠这组工具等待后台命令。
         .command_cells(command_cells);
+
+    if max_iterations > 0 {
+        builder = builder.max_iterations(max_iterations);
+    }
 
     if can_delegate {
         builder = builder
@@ -1412,7 +1413,7 @@ async fn run_dreaming_pass(
     let generation_lease = review_integration
         .lease_generation()
         .map_err(anyhow::Error::from)?;
-    let layer_manager = std::sync::Arc::new(generation_lease.create_layer_manager());
+    let layer_manager = std::sync::Arc::new(generation_lease.create_layer_manager()?);
     let dreaming = echo_agent::evolution::Dreaming::new(
         layer_manager,
         echo_agent::evolution::DreamingConfig::default(),

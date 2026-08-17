@@ -1,6 +1,7 @@
 //! Thin EKO adapters for the framework-owned task revision service.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use echo_agent::tasks::{
@@ -85,6 +86,7 @@ fn store_error(error: StoreError) -> RevisionedTaskStoreError {
 pub struct EkoTaskToolPolicy {
     store: Arc<TaskRuntimeStore>,
     capabilities: Arc<TaskCapabilityCatalog>,
+    staged_scopes: Mutex<HashSet<String>>,
 }
 
 impl EkoTaskToolPolicy {
@@ -92,6 +94,7 @@ impl EkoTaskToolPolicy {
         Self {
             store,
             capabilities,
+            staged_scopes: Mutex::new(HashSet::new()),
         }
     }
 
@@ -134,7 +137,13 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         context: &ToolContext,
     ) -> Result<(), TaskPolicyError> {
         match self.store.get_run(scope_id) {
-            Ok(Some(_)) => return Ok(()),
+            Ok(Some(_)) => {
+                self.staged_scopes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(scope_id);
+                return Ok(());
+            }
             Ok(None) => {}
             Err(error) => {
                 return Err(TaskPolicyError::Backend {
@@ -197,11 +206,21 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         {
             tracing::warn!(run_id = scope_id, %error, "failed to bind attachments to task run");
         }
-        self.store
-            .transition_run(scope_id, TaskRunStatus::Running)
-            .map_err(|error| TaskPolicyError::Backend {
-                message: format!("Failed to start task run before creating task: {error}"),
-            })?;
+        if let Err(error) = self.store.transition_run(scope_id, TaskRunStatus::Running) {
+            let cleanup = self.store.abort_unpublished_run_creation(scope_id);
+            return Err(TaskPolicyError::Backend {
+                message: match cleanup {
+                    Ok(_) => format!("Failed to start task run before creating task: {error}"),
+                    Err(cleanup_error) => format!(
+                        "Failed to start task run before creating task: {error}; cleanup failed: {cleanup_error}"
+                    ),
+                },
+            });
+        }
+        self.staged_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(scope_id.to_string());
         if let Some(sink) = trace_sink {
             sink(ExecEvent::run(
                 scope_id.to_string(),
@@ -214,6 +233,33 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
             ));
         }
         Ok(())
+    }
+
+    async fn abort_scope_preparation(&self, scope_id: &str) -> Result<(), TaskPolicyError> {
+        let was_staged = self
+            .staged_scopes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(scope_id);
+        if !was_staged {
+            return Ok(());
+        }
+        if self
+            .store
+            .load_revisioned_task_graph(scope_id)
+            .map_err(|error| TaskPolicyError::Backend {
+                message: format!("Failed to inspect staged task scope: {error}"),
+            })?
+            .is_some()
+        {
+            return Ok(());
+        }
+        self.store
+            .abort_unpublished_run_creation(scope_id)
+            .map(|_| ())
+            .map_err(|error| TaskPolicyError::Backend {
+                message: format!("Failed to roll back staged task scope: {error}"),
+            })
     }
 
     async fn prepare_task(
@@ -402,4 +448,71 @@ pub async fn commit_eko_task_plan(
             message: error.to_string(),
         })?
         .ok_or(TaskRevisionError::GraphNotFound { scope_id: run_id })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use echo_agent::tasks::{TaskGraphExecutionMode, TaskKind};
+
+    #[tokio::test]
+    async fn failed_initial_graph_validation_rolls_back_staged_run() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        let service = build_eko_task_revision_service(
+            store.clone(),
+            Arc::new(TaskCapabilityCatalog::new(
+                Arc::new(crate::subagent_loader::SubagentCatalogSnapshot::default()),
+                Vec::<String>::new(),
+            )),
+        );
+        let context = ToolContext {
+            run_id: Some("rollback-run".to_string()),
+            conversation_id: Some("rollback-conversation".to_string()),
+            turn_id: Some("rollback-turn".to_string()),
+            message_id: Some("rollback-message".to_string()),
+            ..ToolContext::default()
+        };
+        let result = service
+            .create_from_tool(
+                TaskCreateInput {
+                    tasks: vec![TaskDraft {
+                        id: "task-1".to_string(),
+                        title: "Rejected task".to_string(),
+                        description: "Unknown Subagent must fail validation".to_string(),
+                        kind: TaskKind::Implementation,
+                        subagent: Some("missing-subagent".to_string()),
+                        depends_on: Vec::new(),
+                        files: Vec::new(),
+                        allowed_tools: Vec::new(),
+                        required_artifacts: Vec::new(),
+                        execution_checks: vec!["cargo test".to_string()],
+                        acceptance_criteria: vec!["validation passes".to_string()],
+                        max_retries: 1,
+                        extensions: serde_json::Value::Null,
+                    }],
+                    base_revision: None,
+                    reason: None,
+                    assumptions: Vec::new(),
+                    risks: Vec::new(),
+                    execution_mode: TaskGraphExecutionMode::Sequential,
+                },
+                &context,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            store
+                .get_run("rollback-run")
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(!root.join("rollback-run").exists());
+        Ok(())
+    }
 }

@@ -10,7 +10,8 @@
 
 use std::path::PathBuf;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
 use super::types::*;
 
@@ -101,6 +102,77 @@ pub enum ContinuationNotSubmittedReason {
     RunNotRunning,
     TokenBudgetExhausted,
     TimeBudgetExhausted,
+    ProviderRetryBackoff,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRetryDisposition {
+    Scheduled(ProviderRetryState),
+    Exhausted(ProviderRetryState),
+}
+
+impl ProviderRetryDisposition {
+    pub fn state(&self) -> &ProviderRetryState {
+        match self {
+            Self::Scheduled(state) | Self::Exhausted(state) => state,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootAutoResumeBlocker {
+    RunNotPaused,
+    NotBootRecovery,
+    ContinuationDisabled,
+    AutoResumeDisabled,
+    LauncherUnavailable,
+    InteractiveOwnerUnavailable,
+    WorkspaceMismatch,
+    PlanUnavailable,
+    GoalPlanMismatch,
+    TokenBudgetExhausted,
+    TimeBudgetExhausted,
+    ActiveRunTurn,
+    ActiveSubagent,
+    ActiveCommandCell,
+    RecoveryBlocker,
+}
+
+impl BootAutoResumeBlocker {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RunNotPaused => "run_not_paused",
+            Self::NotBootRecovery => "not_boot_recovery",
+            Self::ContinuationDisabled => "continuation_disabled",
+            Self::AutoResumeDisabled => "auto_resume_disabled",
+            Self::LauncherUnavailable => "launcher_unavailable",
+            Self::InteractiveOwnerUnavailable => "interactive_owner_unavailable",
+            Self::WorkspaceMismatch => "workspace_mismatch",
+            Self::PlanUnavailable => "plan_unavailable",
+            Self::GoalPlanMismatch => "goal_plan_mismatch",
+            Self::TokenBudgetExhausted => "token_budget_exhausted",
+            Self::TimeBudgetExhausted => "time_budget_exhausted",
+            Self::ActiveRunTurn => "active_run_turn",
+            Self::ActiveSubagent => "active_subagent",
+            Self::ActiveCommandCell => "active_command_cell",
+            Self::RecoveryBlocker => "recovery_blocker",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootAutoResumeDecision {
+    Ready {
+        retry_not_before: Option<DateTime<Utc>>,
+    },
+    Blocked(Vec<BootAutoResumeBlocker>),
+}
+
+#[derive(Debug, Clone)]
+pub enum BootAutoResumeOutcome {
+    Resumed(Box<TaskRun>),
+    WaitingUntil(DateTime<Utc>),
+    Blocked(Vec<BootAutoResumeBlocker>),
 }
 
 /// Bounded control-plane facts produced by one finite primary-Agent turn.
@@ -110,6 +182,30 @@ pub struct RunTurnCompletion<'a> {
     pub elapsed_seconds: u64,
     pub final_message_id: Option<&'a str>,
     pub error_fingerprint: Option<&'a str>,
+}
+
+const MAX_PROVIDER_RETRY_ATTEMPTS: u32 = 5;
+const PROVIDER_RETRY_BASE_MILLIS: u64 = 1_000;
+const PROVIDER_RETRY_MAX_MILLIS: u64 = 60_000;
+
+fn stable_provider_retry_delay_millis(
+    run_id: &str,
+    error_fingerprint: &str,
+    attempt_count: u32,
+) -> u64 {
+    let exponent = attempt_count.saturating_sub(1).min(20);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let ceiling = PROVIDER_RETRY_BASE_MILLIS
+        .saturating_mul(multiplier)
+        .min(PROVIDER_RETRY_MAX_MILLIS);
+    let seed = format!("{run_id}\0{error_fingerprint}\0{attempt_count}");
+    let sample = Sha256::digest(seed.as_bytes())
+        .iter()
+        .take(8)
+        .fold(0_u64, |value, byte| {
+            value.wrapping_shl(8) | u64::from(*byte)
+        });
+    sample % ceiling + 1
 }
 
 fn is_run_progress_event(event: &RuntimeTaskEvent) -> bool {
@@ -814,6 +910,24 @@ impl Drop for RunCancellationRegistration {
 }
 
 impl TaskRuntimeStore {
+    pub(crate) fn abort_unpublished_run_creation(&self, run_id: &str) -> Result<bool, StoreError> {
+        let _operation = self.shadow_operation()?;
+        let removed = self.shadow.remove_unpublished_run(run_id)?;
+        if removed {
+            let task_prefix = format!("{run_id}::");
+            self.task_cancel_tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|key, _| !key.starts_with(&task_prefix));
+            self.run_cancel_tokens
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(run_id);
+            self.plan_locks.remove(run_id);
+        }
+        Ok(removed)
+    }
+
     /// Whether the process runtime still accepts new finite TaskRun drivers.
     /// Long-horizon coordinators use this to stop cleanly during application
     /// shutdown and leave durable recovery to the next process.
@@ -2507,35 +2621,195 @@ impl TaskRuntimeStore {
                     to: TaskRunStatus::Running.as_str().to_string(),
                 });
             }
-            self.shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::RunStatusChanged,
-                serde_json::json!({
-                    "from": run.status.as_str(),
-                    "to": TaskRunStatus::Running.as_str(),
-                }),
-            )?;
-            self.shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::RunPauseReasonChanged,
-                serde_json::json!({ "reason": serde_json::Value::Null }),
-            )?;
-            self.shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::RunContinuationResumed,
-                serde_json::json!({ "deferred": false, "reset_blocker_audit": true }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.append_resume_events(run_id, &run, true)?;
             run.status = TaskRunStatus::Running;
             run.updated_at = Utc::now();
             Ok(run)
         })
+    }
+
+    /// Evaluate cold-start admission without changing state. The actual
+    /// transition re-runs this policy under the per-run lock.
+    pub fn boot_auto_resume_decision(
+        &self,
+        run_id: &str,
+        launcher_ready: bool,
+        interactive_owner_ready: bool,
+    ) -> Result<BootAutoResumeDecision, StoreError> {
+        self.boot_auto_resume_decision_at(
+            run_id,
+            launcher_ready,
+            interactive_owner_ready,
+            Utc::now(),
+        )
+    }
+
+    /// Atomically re-check and resume a boot-recovered run. This preserves a
+    /// persisted provider retry schedule; explicit user resume uses
+    /// `resume_task_run` and resets it instead.
+    pub fn resume_task_run_after_boot(
+        &self,
+        run_id: &str,
+        launcher_ready: bool,
+        interactive_owner_ready: bool,
+    ) -> Result<BootAutoResumeOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            let now = Utc::now();
+            match self.boot_auto_resume_decision_at(
+                run_id,
+                launcher_ready,
+                interactive_owner_ready,
+                now,
+            )? {
+                BootAutoResumeDecision::Blocked(blockers) => {
+                    Ok(BootAutoResumeOutcome::Blocked(blockers))
+                }
+                BootAutoResumeDecision::Ready {
+                    retry_not_before: Some(deadline),
+                } if deadline > now => Ok(BootAutoResumeOutcome::WaitingUntil(deadline)),
+                BootAutoResumeDecision::Ready { .. } => {
+                    let mut run = self
+                        .get_run(run_id)?
+                        .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+                    self.append_resume_events(run_id, &run, false)?;
+                    run.status = TaskRunStatus::Running;
+                    run.updated_at = now;
+                    Ok(BootAutoResumeOutcome::Resumed(Box::new(run)))
+                }
+            }
+        })
+    }
+
+    fn append_resume_events(
+        &self,
+        run_id: &str,
+        run: &TaskRun,
+        reset_provider_retry: bool,
+    ) -> Result<(), StoreError> {
+        self.shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunStatusChanged,
+            serde_json::json!({
+                "from": run.status.as_str(),
+                "to": TaskRunStatus::Running.as_str(),
+            }),
+        )?;
+        self.shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunPauseReasonChanged,
+            serde_json::json!({ "reason": serde_json::Value::Null }),
+        )?;
+        self.shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunContinuationResumed,
+            serde_json::json!({
+                "deferred": false,
+                "reset_blocker_audit": true,
+                "reset_provider_retry": reset_provider_retry,
+            }),
+        )?;
+        self.shadow.rewrite_plan(run_id)?;
+        Ok(())
+    }
+
+    fn boot_auto_resume_decision_at(
+        &self,
+        run_id: &str,
+        launcher_ready: bool,
+        interactive_owner_ready: bool,
+        now: DateTime<Utc>,
+    ) -> Result<BootAutoResumeDecision, StoreError> {
+        let run = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        let state = self
+            .get_run_state(run_id)?
+            .and_then(|snapshot| snapshot.continuation);
+        let plan = self.get_plan(run_id)?;
+        let mut blockers = Vec::new();
+        if run.status != TaskRunStatus::Paused {
+            blockers.push(BootAutoResumeBlocker::RunNotPaused);
+        }
+        if state
+            .as_ref()
+            .and_then(|state| state.pause.as_ref())
+            .map(|pause| pause.reason)
+            != Some(RunPauseReason::BootRecovery)
+        {
+            blockers.push(BootAutoResumeBlocker::NotBootRecovery);
+        }
+        if !state.as_ref().is_some_and(|state| state.enabled) {
+            blockers.push(BootAutoResumeBlocker::ContinuationDisabled);
+        }
+        if !state
+            .as_ref()
+            .is_some_and(|state| state.auto_resume_after_restart)
+        {
+            blockers.push(BootAutoResumeBlocker::AutoResumeDisabled);
+        }
+        if !launcher_ready {
+            blockers.push(BootAutoResumeBlocker::LauncherUnavailable);
+        }
+        if run.attended_mode == AttendedMode::Attended && !interactive_owner_ready {
+            blockers.push(BootAutoResumeBlocker::InteractiveOwnerUnavailable);
+        }
+        if run.workspace_id != self.active_workspace_id() {
+            blockers.push(BootAutoResumeBlocker::WorkspaceMismatch);
+        }
+        match plan.as_ref() {
+            None => blockers.push(BootAutoResumeBlocker::PlanUnavailable),
+            Some(plan)
+                if plan.goal_revision != run.goal_revision
+                    || plan.goal_sha256 != run.goal_sha256 =>
+            {
+                blockers.push(BootAutoResumeBlocker::GoalPlanMismatch);
+            }
+            Some(_) => {}
+        }
+        if let Some(state) = state.as_ref() {
+            if state
+                .token_budget
+                .is_some_and(|budget| state.tokens_used >= budget)
+            {
+                blockers.push(BootAutoResumeBlocker::TokenBudgetExhausted);
+            }
+            if state
+                .time_budget_seconds
+                .is_some_and(|budget| state.time_used_seconds >= budget)
+            {
+                blockers.push(BootAutoResumeBlocker::TimeBudgetExhausted);
+            }
+            if state.active_turn.is_some() {
+                blockers.push(BootAutoResumeBlocker::ActiveRunTurn);
+            }
+        }
+        if !self.active_subagent_boundaries(run_id)?.is_empty() {
+            blockers.push(BootAutoResumeBlocker::ActiveSubagent);
+        }
+        if self
+            .list_background_cells(run_id)?
+            .iter()
+            .any(BackgroundCellState::is_active)
+        {
+            blockers.push(BootAutoResumeBlocker::ActiveCommandCell);
+        }
+        if !self.list_recovery_blockers(run_id)?.is_empty() {
+            blockers.push(BootAutoResumeBlocker::RecoveryBlocker);
+        }
+        if !blockers.is_empty() {
+            return Ok(BootAutoResumeDecision::Blocked(blockers));
+        }
+        let retry_not_before = state
+            .and_then(|state| state.provider_retry)
+            .filter(|retry| !retry.exhausted && retry.next_retry_at > now)
+            .map(|retry| retry.next_retry_at);
+        Ok(BootAutoResumeDecision::Ready { retry_not_before })
     }
 
     /// Atomically mark a running run completed only when the latest committed
@@ -4113,6 +4387,32 @@ impl TaskRuntimeStore {
                             }
                         }
                     }
+                    // A process-scoped Subagent attempt cannot remain live
+                    // across boot. Close the exact orphan boundary without
+                    // calling it a user cancellation. Unsafe attempts already
+                    // produced a recovery blocker above; replay-safe attempts
+                    // may be dispatched again from their Pending task.
+                    for boundary in active_subagents {
+                        if let Err(error) = self.shadow.append_event_line(
+                            &run.run_id,
+                            Some(&boundary.task_id),
+                            Some(&boundary.execution_id),
+                            RuntimeEventKind::SubagentReleased,
+                            serde_json::json!({
+                                "execution_id": boundary.execution_id,
+                                "status": SubagentRunStatus::Failed.as_str(),
+                                "terminal_cause": "process_interrupted",
+                                "recovered_at_boot": true,
+                            }),
+                        ) {
+                            tracing::warn!(
+                                run_id = %run.run_id,
+                                task_id = %boundary.task_id,
+                                %error,
+                                "recover_incomplete: failed to close orphan Subagent attempt"
+                            );
+                        }
+                    }
                     tracing::info!(
                         run_id = %run.run_id,
                         from = %run.status.as_str(),
@@ -4215,6 +4515,147 @@ impl TaskRuntimeStore {
                     ))
                 })
         })
+    }
+
+    /// Persist a deterministic cross-RunTurn retry schedule for one typed
+    /// transient provider failure. Provider display text is deliberately not
+    /// stored here; callers pass a stable, non-sensitive fingerprint.
+    pub fn schedule_provider_retry(
+        &self,
+        run_id: &str,
+        error_fingerprint: &str,
+    ) -> Result<ProviderRetryDisposition, StoreError> {
+        self.schedule_provider_retry_at(run_id, error_fingerprint, Utc::now())
+    }
+
+    fn schedule_provider_retry_at(
+        &self,
+        run_id: &str,
+        error_fingerprint: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProviderRetryDisposition, StoreError> {
+        if error_fingerprint.trim().is_empty() {
+            return Err(StoreError::InvalidPlan(
+                "provider retry fingerprint must not be empty".to_string(),
+            ));
+        }
+        let token = self
+            .run_cancel_tokens
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?
+            .get(run_id)
+            .cloned();
+        let disposition = self.with_run_lock(run_id, || {
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let continuation = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .filter(|state| state.enabled)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan(format!(
+                        "run {run_id} is not configured for long-horizon continuation"
+                    ))
+                })?;
+            let budget_pause = continuation.pause.as_ref().is_some_and(|pause| {
+                matches!(
+                    pause.reason,
+                    RunPauseReason::TokenBudget | RunPauseReason::TimeBudget
+                )
+            });
+            if run.status != TaskRunStatus::Running
+                && !(run.status == TaskRunStatus::Paused && budget_pause)
+            {
+                return Err(StoreError::InvalidPlan(format!(
+                    "provider retry requires a Running or budget-paused run, current status is {}",
+                    run.status.as_str()
+                )));
+            }
+            if continuation.active_turn.is_some() {
+                return Err(StoreError::InvalidPlan(format!(
+                    "provider retry cannot be scheduled while run {run_id} has an active RunTurn"
+                )));
+            }
+            let previous_retry = continuation.provider_retry.as_ref();
+            let attempt_count = previous_retry
+                .map(|retry| retry.attempt_count.saturating_add(1))
+                .unwrap_or(1);
+            let first_failure_at = previous_retry
+                .map(|retry| retry.first_failure_at)
+                .unwrap_or(now);
+            let delay_millis = stable_provider_retry_delay_millis(
+                run_id,
+                error_fingerprint,
+                attempt_count,
+            );
+            let delay_i64 = i64::try_from(delay_millis).unwrap_or(i64::MAX);
+            let next_retry_at = now
+                .checked_add_signed(chrono::Duration::milliseconds(delay_i64))
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan("provider retry deadline overflow".to_string())
+                })?;
+            let attempts_exhausted = attempt_count >= MAX_PROVIDER_RETRY_ATTEMPTS;
+            let token_budget_exhausted = continuation
+                .token_budget
+                .is_some_and(|budget| continuation.tokens_used >= budget);
+            let time_budget_exhausted = continuation
+                .time_budget_seconds
+                .is_some_and(|budget| continuation.time_used_seconds >= budget);
+            let exhausted =
+                attempts_exhausted || token_budget_exhausted || time_budget_exhausted;
+            let pause_detail = exhausted.then(|| {
+                if attempts_exhausted {
+                    format!(
+                        "provider remained unavailable after {attempt_count} durable attempts"
+                    )
+                } else if token_budget_exhausted {
+                    "provider retry stopped because the TaskRun token budget is exhausted"
+                        .to_string()
+                } else {
+                    "provider retry stopped because the TaskRun time budget is exhausted"
+                        .to_string()
+                }
+            });
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunProviderRetryScheduled,
+                serde_json::json!({
+                    "error_fingerprint": error_fingerprint,
+                    "attempt_count": attempt_count,
+                    "delay_millis": delay_millis,
+                    "next_retry_at": echo_agent::utils::time::to_local(next_retry_at).to_rfc3339(),
+                    "first_failure_at": echo_agent::utils::time::to_local(first_failure_at).to_rfc3339(),
+                    "exhausted": exhausted,
+                    "pause_reason": exhausted.then(|| RunPauseReason::ProviderUnavailable.as_str()),
+                    "pause_detail": pause_detail,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            let state = self
+                .get_run_state(run_id)?
+                .and_then(|snapshot| snapshot.continuation)
+                .and_then(|state| state.provider_retry)
+                .ok_or_else(|| {
+                    StoreError::InvalidPlan(format!(
+                        "provider retry projection missing after schedule for {run_id}"
+                    ))
+                })?;
+            Ok(if exhausted {
+                ProviderRetryDisposition::Exhausted(state)
+            } else {
+                ProviderRetryDisposition::Scheduled(state)
+            })
+        })?;
+        if matches!(disposition, ProviderRetryDisposition::Exhausted(_)) {
+            if let Some(token) = token {
+                token.cancel();
+            }
+            super::continuation::clear_launcher(self, run_id);
+        }
+        Ok(disposition)
     }
 
     /// Update only the budgets of an already-enabled continuation. Product
@@ -4338,6 +4779,15 @@ impl TaskRuntimeStore {
             if state.deferred {
                 return Ok(RunTurnClaimOutcome::NotSubmitted(
                     ContinuationNotSubmittedReason::Deferred,
+                ));
+            }
+            if state
+                .provider_retry
+                .as_ref()
+                .is_some_and(|retry| retry.exhausted || retry.next_retry_at > Utc::now())
+            {
+                return Ok(RunTurnClaimOutcome::NotSubmitted(
+                    ContinuationNotSubmittedReason::ProviderRetryBackoff,
                 ));
             }
             if state.active_turn.is_some() {
@@ -7420,6 +7870,357 @@ mod tests {
     }
 
     #[test]
+    fn provider_retry_schedule_rebuilds_and_counts_across_fingerprints() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        let base = Utc::now() - chrono::Duration::hours(1);
+
+        for (turn_id, fingerprint, expected_attempt, offset) in [
+            ("retry-turn-1", "provider-a", 1_u32, 0_i64),
+            ("retry-turn-2", "provider-a", 2_u32, 1_i64),
+            ("retry-turn-3", "provider-b", 3_u32, 2_i64),
+        ] {
+            assert!(matches!(
+                store.claim_run_turn(
+                    "r1",
+                    turn_id,
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )?,
+                RunTurnClaimOutcome::Started(_)
+            ));
+            store.finish_run_turn(
+                "r1",
+                RunTurnCompletion {
+                    turn_id,
+                    status: RunTurnStatus::Failed,
+                    elapsed_seconds: 1,
+                    final_message_id: None,
+                    error_fingerprint: Some(fingerprint),
+                },
+            )?;
+            let scheduled = store.schedule_provider_retry_at(
+                "r1",
+                fingerprint,
+                base + chrono::Duration::seconds(offset),
+            )?;
+            assert_eq!(scheduled.state().attempt_count, expected_attempt);
+            assert_eq!(scheduled.state().error_fingerprint, fingerprint);
+        }
+
+        let events = store.list_events("r1", 0)?;
+        let replayed = super::super::event_rebuild::rebuild_plan_from_events(&events)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
+            .run_state()
+            .continuation
+            .and_then(|state| state.provider_retry)
+            .ok_or_else(|| StoreError::InvalidPlan("provider retry did not rebuild".to_string()))?;
+        assert_eq!(replayed.attempt_count, 3);
+        assert_eq!(replayed.error_fingerprint, "provider-b");
+        assert_eq!(replayed.first_failure_at, base);
+        assert_eq!(
+            stable_provider_retry_delay_millis("r1", "provider-b", 1),
+            stable_provider_retry_delay_millis("r1", "provider-b", 1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn abort_unpublished_run_creation_never_removes_a_published_plan() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+
+        assert!(!store.abort_unpublished_run_creation("r1")?);
+        assert!(store.get_run("r1")?.is_some());
+        assert!(store.get_plan("r1")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_retry_claim_waits_then_success_clears_schedule() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "failed-turn",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        store.finish_run_turn(
+            "r1",
+            RunTurnCompletion {
+                turn_id: "failed-turn",
+                status: RunTurnStatus::Failed,
+                elapsed_seconds: 1,
+                final_message_id: None,
+                error_fingerprint: Some("provider-a"),
+            },
+        )?;
+        store.schedule_provider_retry_at("r1", "provider-a", Utc::now())?;
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "too-early",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )?,
+            RunTurnClaimOutcome::NotSubmitted(ContinuationNotSubmittedReason::ProviderRetryBackoff)
+        ));
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        store.schedule_provider_retry_at("r1", "provider-b", past)?;
+        assert!(matches!(
+            store.claim_run_turn(
+                "r1",
+                "successful-retry",
+                RunTurnOrigin::Continuation,
+                TurnVisibility::Internal,
+            )?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        let state = store.finish_run_turn(
+            "r1",
+            RunTurnCompletion {
+                turn_id: "successful-retry",
+                status: RunTurnStatus::Ended,
+                elapsed_seconds: 1,
+                final_message_id: None,
+                error_fingerprint: None,
+            },
+        )?;
+        assert!(state.provider_retry.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn fifth_provider_failure_atomically_pauses_and_explicit_resume_resets_retry()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, true, None, None)?;
+        let base = Utc::now() - chrono::Duration::hours(1);
+        for attempt in 1..=MAX_PROVIDER_RETRY_ATTEMPTS {
+            let turn_id = format!("retry-exhaustion-{attempt}");
+            assert!(matches!(
+                store.claim_run_turn(
+                    "r1",
+                    &turn_id,
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )?,
+                RunTurnClaimOutcome::Started(_)
+            ));
+            store.finish_run_turn(
+                "r1",
+                RunTurnCompletion {
+                    turn_id: &turn_id,
+                    status: RunTurnStatus::Failed,
+                    elapsed_seconds: 1,
+                    final_message_id: None,
+                    error_fingerprint: Some("provider-a"),
+                },
+            )?;
+            let disposition = store.schedule_provider_retry_at(
+                "r1",
+                "provider-a",
+                base + chrono::Duration::seconds(i64::from(attempt)),
+            )?;
+            assert_eq!(disposition.state().attempt_count, attempt);
+        }
+        let snapshot = store
+            .get_run_state("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        assert_eq!(snapshot.run.status, TaskRunStatus::Paused);
+        let continuation = snapshot
+            .continuation
+            .ok_or_else(|| StoreError::InvalidPlan("continuation missing".to_string()))?;
+        assert!(
+            continuation
+                .provider_retry
+                .as_ref()
+                .is_some_and(|retry| retry.exhausted)
+        );
+        assert_eq!(
+            continuation.pause.map(|pause| pause.reason),
+            Some(RunPauseReason::ProviderUnavailable)
+        );
+
+        store.resume_task_run("r1")?;
+        let resumed = store
+            .get_run_state("r1")?
+            .and_then(|snapshot| snapshot.continuation)
+            .ok_or_else(|| StoreError::InvalidPlan("resumed continuation missing".to_string()))?;
+        assert!(resumed.provider_retry.is_none());
+        Ok(())
+    }
+
+    fn prepare_boot_auto_resume_run(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+        attended_mode: AttendedMode,
+    ) -> Result<(), StoreError> {
+        let workspace_id = store.active_workspace_id();
+        store.create_run(
+            run_id,
+            &workspace_id,
+            &format!("background:test:{run_id}"),
+            "root",
+            DomainProfile::General,
+            "boot goal",
+            "bg:kind:test",
+            attended_mode,
+        )?;
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: format!("{run_id}-plan"),
+            run_id: run_id.to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("boot goal"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: format!("{run_id}-task"),
+                title: "Resume safely".to_string(),
+                ..PlanTask::default()
+            }],
+        })?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
+        store.configure_run_continuation(run_id, true, true, None, None)?;
+        store.record_run_pause_reason(
+            run_id,
+            RunPauseReason::BootRecovery,
+            Some("test process interruption"),
+        )?;
+        store.transition_run(run_id, TaskRunStatus::Paused)?;
+        Ok(())
+    }
+
+    #[test]
+    fn boot_auto_resume_admission_rejects_missing_owner_workspace_and_unsafe_boundary()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        prepare_boot_auto_resume_run(&store, "attended", AttendedMode::Attended)?;
+        let attended = store.boot_auto_resume_decision("attended", true, false)?;
+        assert!(matches!(
+            attended,
+            BootAutoResumeDecision::Blocked(blockers)
+                if blockers.contains(&BootAutoResumeBlocker::InteractiveOwnerUnavailable)
+        ));
+
+        prepare_boot_auto_resume_run(&store, "disabled", AttendedMode::Unattended)?;
+        store.configure_run_continuation("disabled", true, false, None, None)?;
+        assert!(matches!(
+            store.boot_auto_resume_decision("disabled", true, false)?,
+            BootAutoResumeDecision::Blocked(blockers)
+                if blockers.contains(&BootAutoResumeBlocker::AutoResumeDisabled)
+        ));
+
+        prepare_boot_auto_resume_run(&store, "launcher", AttendedMode::Unattended)?;
+        assert!(matches!(
+            store.boot_auto_resume_decision("launcher", false, false)?,
+            BootAutoResumeDecision::Blocked(blockers)
+                if blockers.contains(&BootAutoResumeBlocker::LauncherUnavailable)
+        ));
+
+        prepare_boot_auto_resume_run(&store, "unsafe", AttendedMode::Unattended)?;
+        store.record_recovery_blocker(
+            "unsafe",
+            "unsafe-task",
+            Some("execution"),
+            Some("call"),
+            Some("shell"),
+            "indeterminate side effect",
+        )?;
+        let unsafe_decision = store.boot_auto_resume_decision("unsafe", true, false)?;
+        assert!(matches!(
+            unsafe_decision,
+            BootAutoResumeDecision::Blocked(blockers)
+                if blockers.contains(&BootAutoResumeBlocker::RecoveryBlocker)
+        ));
+
+        let mismatched = fresh();
+        mismatched.create_run(
+            "mismatch",
+            "different-workspace",
+            "background:test:mismatch",
+            "root",
+            DomainProfile::General,
+            "boot goal",
+            "bg:kind:test",
+            AttendedMode::Unattended,
+        )?;
+        mismatched.attach_plan_for_test(&TaskPlan {
+            plan_id: "mismatch-plan".to_string(),
+            run_id: "mismatch".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("boot goal"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "mismatch-task".to_string(),
+                title: "Stay paused".to_string(),
+                ..PlanTask::default()
+            }],
+        })?;
+        mismatched.transition_run("mismatch", TaskRunStatus::Running)?;
+        mismatched.configure_run_continuation("mismatch", true, true, None, None)?;
+        mismatched.record_run_pause_reason(
+            "mismatch",
+            RunPauseReason::BootRecovery,
+            Some("test process interruption"),
+        )?;
+        mismatched.transition_run("mismatch", TaskRunStatus::Paused)?;
+        assert!(matches!(
+            mismatched.boot_auto_resume_decision("mismatch", true, false)?,
+            BootAutoResumeDecision::Blocked(blockers)
+                if blockers.contains(&BootAutoResumeBlocker::WorkspaceMismatch)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn competing_boot_launchers_have_one_atomic_resume_winner() -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        prepare_boot_auto_resume_run(&store, "race", AttendedMode::Unattended)
+            .map_err(|error| error.to_string())?;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for _ in 0..2 {
+            let thread_store = std::sync::Arc::clone(&store);
+            let thread_barrier = std::sync::Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || {
+                thread_barrier.wait();
+                thread_store.resume_task_run_after_boot("race", true, false)
+            }));
+        }
+        barrier.wait();
+        let mut resumed = 0_usize;
+        for thread in threads {
+            let outcome = thread
+                .join()
+                .map_err(|_| "boot resume thread panicked".to_string())?
+                .map_err(|error| error.to_string())?;
+            if matches!(outcome, BootAutoResumeOutcome::Resumed(_)) {
+                resumed = resumed.saturating_add(1);
+            }
+        }
+        assert_eq!(resumed, 1);
+        Ok(())
+    }
+
+    #[test]
     fn resume_task_run_transitions_paused_to_running() {
         let s = fresh();
         seed_plan(&s);
@@ -7925,6 +8726,63 @@ mod tests {
     }
 
     #[test]
+    fn boot_recovery_terminalizes_replay_safe_orphan_subagent_without_blocker()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let task = store
+            .get_plan("r1")?
+            .and_then(|plan| plan.tasks.into_iter().next())
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let claim = match store.claim_task("r1", &task.to_task(), 1)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "fresh task claim unexpectedly required reload".to_string(),
+                ));
+            }
+        };
+        let execution_id = claim.execution_id("r1", "t1");
+        store.record_subagent_assigned(
+            "r1",
+            "t1",
+            &execution_id,
+            "subagent",
+            "Task 1",
+            claim.revision,
+            claim.attempt,
+            true,
+            true,
+        )?;
+
+        assert_eq!(store.recover_incomplete()?, 1);
+        assert!(store.active_subagent_boundaries("r1")?.is_empty());
+        assert!(store.list_recovery_blockers("r1")?.is_empty());
+        let subagent = store
+            .list_subagent_runs("r1")?
+            .into_iter()
+            .find(|run| run.subagent_run_id == execution_id)
+            .ok_or_else(|| StoreError::InvalidPlan("orphan Subagent missing".to_string()))?;
+        assert_eq!(subagent.status, SubagentRunStatus::Failed);
+        let terminal = store
+            .list_events("r1", 0)?
+            .into_iter()
+            .find(|event| {
+                event.event_type == RuntimeEventKind::SubagentReleased
+                    && event.step_id.as_deref() == Some(execution_id.as_str())
+            })
+            .ok_or_else(|| StoreError::InvalidPlan("orphan terminal event missing".to_string()))?;
+        assert_eq!(
+            terminal
+                .payload
+                .get("terminal_cause")
+                .and_then(serde_json::Value::as_str),
+            Some("process_interrupted")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn boot_recovery_reuses_completed_subagent_without_redispatch() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
@@ -8027,6 +8885,7 @@ mod tests {
         store.record_tool_started("r1", "t1", "t1:1", "call-write", "write_file", false)?;
 
         assert_eq!(store.recover_incomplete()?, 1);
+        assert!(store.active_subagent_boundaries("r1")?.is_empty());
         let blockers = store.list_recovery_blockers("r1")?;
         assert_eq!(blockers.len(), 1);
         assert_eq!(

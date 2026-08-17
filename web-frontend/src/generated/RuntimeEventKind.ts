@@ -63,6 +63,7 @@ export type RuntimeEventKind =
   | 'run_turn_usage_accounted'
   | 'run_turn_compacted'
   | 'run_turn_finished'
+  | 'run_provider_retry_scheduled'
   | 'run_continuation_deferred'
   | 'run_continuation_resumed'
   | 'run_pause_reason_changed'

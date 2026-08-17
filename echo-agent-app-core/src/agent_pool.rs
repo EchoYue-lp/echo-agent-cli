@@ -1045,7 +1045,7 @@ impl AgentPool {
                 .review_integration
                 .as_ref()
                 .map(|integration| integration.curator());
-            let layer_manager = self
+            let layer_manager = match self
                 .shared
                 .review_integration
                 .as_ref()
@@ -1058,7 +1058,13 @@ impl AgentPool {
                         store_clone.clone(),
                     )
                     .build_layer_manager()
-                });
+                }) {
+                Ok(manager) => manager,
+                Err(error) => {
+                    tracing::error!(%error, "failed to rebuild pooled agent memory layer");
+                    continue;
+                }
+            };
             handle
                 .write_async(|agent| {
                     Box::pin(async move {
@@ -1408,8 +1414,9 @@ impl AgentPool {
                 agent.config().get_session_id().unwrap_or(""),
                 agent.config().get_agent_name(),
             ));
-            let layer_manager =
-                Arc::new(review_integration.create_layer_manager_with_observer(evolution_observer));
+            let layer_manager = Arc::new(
+                review_integration.create_layer_manager_with_observer(evolution_observer)?,
+            );
             agent.install_memory_layer_manager(layer_manager);
             agent.set_memory_trigger_sink(Some(review_integration.clone()));
             agent.set_skill_load_policy(Some(review_integration.clone()));

@@ -435,7 +435,11 @@ mod tests {
         let memory_generation = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
-        let lm = Arc::new(memory_generation.create_layer_manager());
+        let lm = Arc::new(
+            memory_generation
+                .create_layer_manager()
+                .map_err(|error| error.to_string())?,
+        );
 
         // Seeded TaskRuntimeStore: run "r1", goal "Review runtime", one
         // Completed todo ("Review chat.rs" / "found gap").

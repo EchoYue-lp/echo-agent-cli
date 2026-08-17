@@ -120,7 +120,13 @@ async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    let layer_manager = Arc::new(memory_lease.create_layer_manager());
+    let layer_manager = match memory_lease.create_layer_manager() {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            println!("Failed to initialize layered memory: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
     let key = uuid::Uuid::new_v4().to_string();
     let meta = echo_agent::memory::MemoryMeta::new(
         echo_agent::memory::MemoryType::ProjectFact,
@@ -176,7 +182,13 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    let layer_manager = Arc::new(memory_lease.create_layer_manager());
+    let layer_manager = match memory_lease.create_layer_manager() {
+        Ok(manager) => Arc::new(manager),
+        Err(error) => {
+            println!("Failed to initialize layered memory: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
     let key = if layer_manager.locate(query.trim()).await.is_some() {
         Some(query.trim().to_string())
     } else {

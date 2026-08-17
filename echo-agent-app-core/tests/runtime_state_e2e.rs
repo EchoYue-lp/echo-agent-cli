@@ -85,7 +85,7 @@ async fn create_agent_threads_state_store_and_conversation_id() {
 }
 
 #[tokio::test]
-async fn create_agent_without_state_store_leaves_it_none() {
+async fn create_agent_without_explicit_state_store_uses_product_default() {
     let params = AgentCreateParams {
         model: Some("test-model".to_string()),
         system_prompt: Some("base".to_string()),
@@ -105,8 +105,8 @@ async fn create_agent_without_state_store_leaves_it_none() {
         .expect("create_agent should succeed in e2e test — check model/provider config");
 
     assert!(
-        agent.state_store().is_none(),
-        "state_store stays None when caller doesn't supply one"
+        agent.state_store().is_some(),
+        "EKO installs its durable default when the caller doesn't supply a state store"
     );
     assert!(
         agent.conversation_id().is_none(),

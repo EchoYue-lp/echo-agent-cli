@@ -998,10 +998,19 @@ impl CreateComplexTaskTool {
                 )));
             }
         };
-        let layer_manager = memory_generation
+        let layer_manager = match memory_generation
             .as_ref()
-            .map(|generation| Arc::new(generation.create_layer_manager()))
-            .or_else(|| res.layer_manager.clone());
+            .map(|generation| generation.create_layer_manager().map(Arc::new))
+            .transpose()
+        {
+            Ok(manager) => manager.or_else(|| res.layer_manager.clone()),
+            Err(error) => {
+                registration.reject(error.to_string());
+                return Ok(ToolResult::error(format!(
+                    "Memory layer unavailable: {error}"
+                )));
+            }
+        };
         registration.mark_preparation_started();
         if let Err(e) = store.create_run_for_active_workspace(
             &run_id,

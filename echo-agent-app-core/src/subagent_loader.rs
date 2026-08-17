@@ -151,7 +151,7 @@ pub struct SubagentDefinition {
     /// Sprint 11: if Some, this subagent is a team-mode dispatcher (not a
     /// normal subagent). The registration path sets `execution_mode = Team` and
     /// attaches this TeamSpec. manager + subagent team members are name-references.
-    pub team: Option<echo_agent::agent::subagent::types::TeamSpec>,
+    pub team: Option<echo_agent::agent::subagent::TeamSpec>,
     /// Whether this subagent may receive the framework `agent_tool` and spawn
     /// child subagents. Defaults false.
     pub can_delegate: bool,
@@ -487,8 +487,8 @@ pub fn parse_subagent_md(
                 "subagent `{name}`: team_strategy set but team_subagents empty"
             ));
         }
-        Some(echo_agent::agent::subagent::types::TeamSpec {
-            strategy: echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerSubagent,
+        Some(echo_agent::agent::subagent::TeamSpec {
+            strategy: echo_agent::agent::subagent::TeamStrategy::ManagerSubagent,
             manager,
             subagents: fm.team_subagents.clone(),
             config: echo_agent::agent::subagent::team::TeamConfig::default(),
@@ -829,7 +829,7 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
         );
         assert_eq!(
             spec.strategy,
-            echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerSubagent
+            echo_agent::agent::subagent::TeamStrategy::ManagerSubagent
         );
     }
 

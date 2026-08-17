@@ -122,6 +122,40 @@ impl FileTaskShadow {
         self.run_dir(run_id).join("run-state.json")
     }
 
+    /// Remove a scope created only for a failed task-graph preparation.
+    /// Published plans are never deleted, even if the caller misclassifies the
+    /// scope as staged.
+    pub(crate) fn remove_unpublished_run(&self, run_id: &str) -> Result<bool, ShadowError> {
+        let mut components = Path::new(run_id).components();
+        let valid_component = matches!(components.next(), Some(std::path::Component::Normal(_)))
+            && components.next().is_none();
+        if run_id.trim().is_empty() || !valid_component {
+            return Err(ShadowError::Io(format!(
+                "refusing to remove invalid task run id: {run_id}"
+            )));
+        }
+        let lock = self.run_write_lock(run_id);
+        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let events = self.read_events(run_id)?;
+        if events
+            .iter()
+            .any(|event| event.event_type == RuntimeEventKind::PlanRevisionCommitted)
+        {
+            return Ok(false);
+        }
+        let run_dir = self.run_dir(run_id);
+        match std::fs::remove_dir_all(&run_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ShadowError::Io(error.to_string())),
+        }
+        self.seq_cache
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(run_id);
+        Ok(true)
+    }
+
     // ── 0bc step-2: file-authority write path (replaces SQL INSERT + flush) ──
 
     /// Append one enriched event to `events.jsonl` for `run_id`, assigning it
@@ -268,6 +302,7 @@ impl FileTaskShadow {
                 | RuntimeEventKind::RunTurnUsageAccounted
                 | RuntimeEventKind::RunTurnCompacted
                 | RuntimeEventKind::RunTurnFinished
+                | RuntimeEventKind::RunProviderRetryScheduled
                 | RuntimeEventKind::RunContinuationDeferred
                 | RuntimeEventKind::RunContinuationResumed
                 | RuntimeEventKind::RunPauseReasonChanged

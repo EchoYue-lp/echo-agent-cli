@@ -212,37 +212,47 @@ impl WebhookTurnObserver {
             AgentEvent::LlmUsage { .. } => {}
             AgentEvent::ToolCall {
                 call_id,
-                name,
-                args,
+                invocation,
             } => {
-                let args_summary = args.to_string().chars().take(240).collect::<String>();
+                let args_summary = invocation
+                    .args
+                    .to_string()
+                    .chars()
+                    .take(240)
+                    .collect::<String>();
                 self.tools.insert(
                     call_id.clone(),
-                    (name.clone(), args_summary, std::time::Instant::now()),
+                    (
+                        invocation.name.clone(),
+                        args_summary,
+                        std::time::Instant::now(),
+                    ),
                 );
             }
-            AgentEvent::ToolResult { call_id, name, .. } => {
+            AgentEvent::ToolResult {
+                call_id,
+                name,
+                result,
+            } => {
                 let (tool_name, args_summary, started) = self
                     .tools
                     .remove(call_id)
                     .unwrap_or_else(|| (name.clone(), String::new(), std::time::Instant::now()));
-                emitter.emit(crate::webhook::WebhookEvent::ToolCalled {
-                    name: tool_name,
-                    args_summary,
-                    elapsed_ms: duration_millis(started.elapsed()),
-                });
-            }
-            AgentEvent::ToolError {
-                call_id,
-                name,
-                error,
-                ..
-            } => {
-                self.tools.remove(call_id);
-                emitter.emit(crate::webhook::WebhookEvent::ToolFailed {
-                    name: name.clone(),
-                    error: error.clone(),
-                });
+                if result.success {
+                    emitter.emit(crate::webhook::WebhookEvent::ToolCalled {
+                        name: tool_name,
+                        args_summary,
+                        elapsed_ms: duration_millis(started.elapsed()),
+                    });
+                } else {
+                    emitter.emit(crate::webhook::WebhookEvent::ToolFailed {
+                        name: tool_name,
+                        error: result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| result.output.clone()),
+                    });
+                }
             }
             AgentEvent::Error { message, .. } => {
                 emitter.emit(crate::webhook::WebhookEvent::AgentError {
@@ -485,8 +495,9 @@ struct PreparedChatExecution {
 impl PreparedChatExecution {
     /// A pool/configuration rejection happens after the RunTurn claim but
     /// before model execution. Preserve the controlling intent: application
-    /// shutdown is boot-recoverable, explicit cancellation is terminal, and
-    /// only a live provider failure becomes `ProviderUnavailable`.
+    /// shutdown is boot-recoverable and explicit cancellation is terminal.
+    /// Untyped admission failures require input; only typed LLM failures enter
+    /// durable provider retry.
     fn reject_before_driver_start(mut self, detail: &str) -> Result<(), String> {
         if !self.drives_task_run {
             if let Some(registration) = self.task_driver_registration.take() {
@@ -560,7 +571,7 @@ impl PreparedChatExecution {
                     store
                         .request_pause_with_reason(
                             &self.formal_run_id,
-                            RunPauseReason::ProviderUnavailable,
+                            RunPauseReason::NeedsInput,
                             Some(detail),
                         )
                         .map(|_| ())
@@ -687,7 +698,9 @@ fn prepare_chat_execution(
     };
     let layer_manager = memory_generation
         .as_ref()
-        .map(|lease| std::sync::Arc::new(lease.create_layer_manager()))
+        .map(|lease| lease.create_layer_manager().map(std::sync::Arc::new))
+        .transpose()
+        .map_err(|error| format!("Memory layer unavailable: {error}"))?
         .or_else(|| res.layer_manager.clone());
     let res = std::sync::Arc::new(crate::chat_resources::ChatResources {
         pool: res.pool.clone(),
@@ -1051,8 +1064,11 @@ fn finalize_run_turn(
 
     let (status, error_fingerprint) = match &outcome.terminal {
         TurnOutcome::Completed => (RunTurnStatus::Ended, None),
-        TurnOutcome::Cancelled => (RunTurnStatus::Cancelled, Some("cancelled")),
-        TurnOutcome::Failed(failure) => (RunTurnStatus::Failed, Some(failure.code.as_str())),
+        TurnOutcome::Cancelled => (RunTurnStatus::Cancelled, Some("cancelled".to_string())),
+        TurnOutcome::Failed(failure) => (
+            RunTurnStatus::Failed,
+            Some(agent_failure_fingerprint(failure)),
+        ),
     };
     let continuation = store
         .finish_run_turn(
@@ -1062,7 +1078,7 @@ fn finalize_run_turn(
                 status,
                 elapsed_seconds: outcome.elapsed_seconds,
                 final_message_id: outcome.final_message_id.as_deref(),
-                error_fingerprint,
+                error_fingerprint: error_fingerprint.as_deref(),
             },
         )
         .map_err(|error| error.to_string())?;
@@ -1070,17 +1086,38 @@ fn finalize_run_turn(
         .get_run(run_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("TaskRun disappeared while finishing RunTurn: {run_id}"))?;
-    if run.status != TaskRunStatus::Running {
+    if continuation.enabled && !store.is_run_driver_admission_open() {
+        if run.status == TaskRunStatus::Running {
+            let _paused = store
+                .request_pause_with_reason(
+                    run_id,
+                    RunPauseReason::BootRecovery,
+                    Some("application shutdown interrupted an active continuation turn"),
+                )
+                .map_err(|error| error.to_string())?;
+        }
         return Ok(RunTurnDecision::Stop);
     }
-    if continuation.enabled && !store.is_run_driver_admission_open() {
-        let _paused = store
-            .request_pause_with_reason(
-                run_id,
-                RunPauseReason::BootRecovery,
-                Some("application shutdown interrupted an active continuation turn"),
-            )
-            .map_err(|error| error.to_string())?;
+    if let TurnOutcome::Failed(failure) = &outcome.terminal
+        && failure.retryable
+        && failure.category == echo_agent::error::AgentFailureCategory::Llm
+    {
+        let fingerprint = error_fingerprint
+            .as_deref()
+            .ok_or_else(|| "typed provider failure lost its stable fingerprint".to_string())?;
+        return store
+            .schedule_provider_retry(run_id, fingerprint)
+            .map(|disposition| match disposition {
+                crate::tasks::task_runtime::store::ProviderRetryDisposition::Scheduled(_) => {
+                    RunTurnDecision::Continue
+                }
+                crate::tasks::task_runtime::store::ProviderRetryDisposition::Exhausted(_) => {
+                    RunTurnDecision::Stop
+                }
+            })
+            .map_err(|error| error.to_string());
+    }
+    if run.status != TaskRunStatus::Running {
         return Ok(RunTurnDecision::Stop);
     }
 
@@ -1102,13 +1139,12 @@ fn finalize_run_turn(
         }
         TurnOutcome::Failed(failure) => {
             if failure.retryable {
-                let reason = if failure.category == echo_agent::error::AgentFailureCategory::Llm {
-                    RunPauseReason::ProviderUnavailable
-                } else {
-                    RunPauseReason::NeedsInput
-                };
                 let _paused = store
-                    .request_pause_with_reason(run_id, reason, Some(&failure.message))
+                    .request_pause_with_reason(
+                        run_id,
+                        RunPauseReason::NeedsInput,
+                        Some(&failure.message),
+                    )
                     .map_err(|error| error.to_string())?;
             } else {
                 store
@@ -1193,6 +1229,20 @@ fn finalize_run_turn(
         ));
     }
     Ok(RunTurnDecision::Stop)
+}
+
+fn agent_failure_fingerprint(failure: &echo_agent::error::AgentFailure) -> String {
+    let typed_identity = format!(
+        "{:?}|{:?}|{}|{}",
+        failure.category,
+        failure.terminal_kind,
+        failure.code,
+        failure
+            .http_status
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "none".to_string())
+    );
+    crate::tasks::task_runtime::task_goal_sha256(&typed_identity)
 }
 
 fn observe_execution_path(
@@ -1364,6 +1414,7 @@ async fn drive_chat_inner(
                         error: e.to_string(),
                     });
                 }
+                let failure = echo_agent::error::AgentFailure::from_react_error(&e);
                 match EventEnvelope::new(
                     &event_identity,
                     1,
@@ -1380,7 +1431,7 @@ async fn drive_chat_inner(
                         );
                     }
                 }
-                return Err(e.to_string());
+                return Ok(ChatTurnOutcome::failed(turn_id.clone(), failure));
             }
         };
         let mut stream = envelope_event_stream(raw_stream, event_identity);
@@ -1557,6 +1608,247 @@ mod tests {
             resources: vec![],
             authorship: crate::prepared_turn::InstructionAuthorship::User,
         }
+    }
+
+    fn prepare_run_turn_for_finalization(
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>, String> {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, ExecutionMode, PlanTask, RunTurnOrigin, TaskPlan,
+            TaskRunStatus, TurnVisibility,
+        };
+        let store = std::sync::Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let workspace_id = store.active_workspace_id();
+        store
+            .create_run(
+                run_id,
+                &workspace_id,
+                "failure-conversation",
+                "failure-root",
+                DomainProfile::General,
+                "survive provider failure",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: format!("{run_id}-plan"),
+                run_id: run_id.to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256(
+                    "survive provider failure",
+                ),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: format!("{run_id}-task"),
+                    title: "Continue safely".to_string(),
+                    ..PlanTask::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            store
+                .claim_run_turn(
+                    run_id,
+                    turn_id,
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )
+                .map_err(|error| error.to_string())?,
+            crate::tasks::task_runtime::store::RunTurnClaimOutcome::Started(_)
+        ) {
+            return Err("test RunTurn was not claimed".to_string());
+        }
+        Ok(store)
+    }
+
+    #[test]
+    fn typed_retryable_llm_failure_schedules_without_persisting_provider_message()
+    -> Result<(), String> {
+        let store = prepare_run_turn_for_finalization("provider-retry", "provider-turn")?;
+        let failure = echo_agent::error::AgentFailure {
+            category: echo_agent::error::AgentFailureCategory::Llm,
+            terminal_kind: echo_agent::error::AgentTerminalKind::Failed,
+            retryable: true,
+            code: "llm_api".to_string(),
+            http_status: Some(503),
+            message: "provider secret response body".to_string(),
+        };
+        let outcome = ChatTurnOutcome::failed("provider-turn".to_string(), failure);
+        assert_eq!(
+            finalize_run_turn(&store, "provider-retry", &outcome, None)?,
+            RunTurnDecision::Continue
+        );
+        let snapshot = store
+            .get_run_state("provider-retry")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "provider retry snapshot missing".to_string())?;
+        assert_eq!(
+            snapshot.run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Running
+        );
+        let retry = snapshot
+            .continuation
+            .and_then(|state| state.provider_retry)
+            .ok_or_else(|| "provider retry projection missing".to_string())?;
+        assert_eq!(retry.attempt_count, 1);
+        let retry_event = store
+            .list_events("provider-retry", 0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|event| {
+                event.event_type
+                    == crate::tasks::task_runtime::RuntimeEventKind::RunProviderRetryScheduled
+            })
+            .ok_or_else(|| "provider retry event missing".to_string())?;
+        assert!(!retry_event.payload.to_string().contains("secret response"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stream_setup_network_failure_preserves_typed_retry_contract() -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use echo_agent::testing::MockLlmClient;
+        use std::sync::Arc;
+
+        let store = prepare_run_turn_for_finalization("setup-retry", "setup-turn")?;
+        let mut raw_agent = echo_agent::agent::ReactAgent::new(
+            echo_agent::agent::AgentConfig::minimal("setup-retry", "setup-retry")
+                .llm_max_retries(0),
+        );
+        raw_agent.set_llm_client(Arc::new(
+            MockLlmClient::new()
+                .with_model_name("setup-retry")
+                .with_network_error("provider socket unavailable"),
+        ));
+        let agent = AgentHandle::new(raw_agent);
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("setup-conversation".to_string()),
+            root_message_id: "setup-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Task,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let outcome = drive_chat_inner(
+            &agent,
+            &make_turn("continue"),
+            resources,
+            ChatTurnModelScope {
+                turn_id: "setup-turn".to_string(),
+                bound_run_id: Some("setup-retry".to_string()),
+                driver_execution_context: None,
+                origin: crate::tasks::task_runtime::RunTurnOrigin::Continuation,
+                transcript_visibility: crate::tasks::task_runtime::TurnVisibility::Internal,
+            },
+        )
+        .await?;
+        let TurnOutcome::Failed(failure) = &outcome.terminal else {
+            return Err(format!("expected typed setup failure, got {outcome:?}"));
+        };
+        assert_eq!(
+            failure.category,
+            echo_agent::error::AgentFailureCategory::Llm
+        );
+        assert!(failure.retryable);
+        assert_eq!(
+            finalize_run_turn(&store, "setup-retry", &outcome, None)?,
+            RunTurnDecision::Continue
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retryable_non_llm_failure_requires_input_instead_of_provider_retry() -> Result<(), String> {
+        let store = prepare_run_turn_for_finalization("io-failure", "io-turn")?;
+        let failure = echo_agent::error::AgentFailure {
+            category: echo_agent::error::AgentFailureCategory::Io,
+            terminal_kind: echo_agent::error::AgentTerminalKind::Failed,
+            retryable: true,
+            code: "io".to_string(),
+            http_status: None,
+            message: "local file unavailable".to_string(),
+        };
+        let outcome = ChatTurnOutcome::failed("io-turn".to_string(), failure);
+        assert_eq!(
+            finalize_run_turn(&store, "io-failure", &outcome, None)?,
+            RunTurnDecision::Stop
+        );
+        let continuation = store
+            .get_run_state("io-failure")
+            .map_err(|error| error.to_string())?
+            .and_then(|snapshot| snapshot.continuation)
+            .ok_or_else(|| "IO failure continuation missing".to_string())?;
+        assert!(continuation.provider_retry.is_none());
+        assert_eq!(
+            continuation.pause.map(|pause| pause.reason),
+            Some(crate::tasks::task_runtime::RunPauseReason::NeedsInput)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_failure_at_token_limit_pauses_as_provider_unavailable() -> Result<(), String> {
+        let store = prepare_run_turn_for_finalization("provider-budget", "budget-turn")?;
+        store
+            .update_run_continuation_budgets("provider-budget", Some(1), None)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            store
+                .account_run_turn_usage("provider-budget", "budget-turn", "budget-usage", 1, 0,)
+                .map_err(|error| error.to_string())?
+        );
+        let failure = echo_agent::error::AgentFailure {
+            category: echo_agent::error::AgentFailureCategory::Llm,
+            terminal_kind: echo_agent::error::AgentTerminalKind::Failed,
+            retryable: true,
+            code: "llm_network".to_string(),
+            http_status: None,
+            message: "network unavailable".to_string(),
+        };
+        let outcome = ChatTurnOutcome::failed("budget-turn".to_string(), failure);
+        assert_eq!(
+            finalize_run_turn(&store, "provider-budget", &outcome, None)?,
+            RunTurnDecision::Stop
+        );
+        let continuation = store
+            .get_run_state("provider-budget")
+            .map_err(|error| error.to_string())?
+            .and_then(|snapshot| snapshot.continuation)
+            .ok_or_else(|| "provider budget continuation missing".to_string())?;
+        assert!(
+            continuation
+                .provider_retry
+                .as_ref()
+                .is_some_and(|retry| retry.exhausted)
+        );
+        assert_eq!(
+            continuation.pause.map(|pause| pause.reason),
+            Some(crate::tasks::task_runtime::RunPauseReason::ProviderUnavailable)
+        );
+        Ok(())
     }
 
     #[test]
@@ -1939,7 +2231,7 @@ mod tests {
         assert!(continuation.active_turn.is_none());
         assert_eq!(
             continuation.pause.map(|pause| pause.reason),
-            Some(crate::tasks::task_runtime::RunPauseReason::ProviderUnavailable)
+            Some(crate::tasks::task_runtime::RunPauseReason::NeedsInput)
         );
         Ok(())
     }

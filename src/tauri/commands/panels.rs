@@ -1294,8 +1294,11 @@ pub async fn review_run(
         Some(review_lease.memory_store()),
         Some(run_store),
     );
-    let reviewer =
-        reviewer.with_layer_manager(std::sync::Arc::new(review_lease.create_layer_manager()));
+    let reviewer = reviewer.with_layer_manager(std::sync::Arc::new(
+        review_lease
+            .create_layer_manager()
+            .map_err(|error| IpcError::Internal(error.to_string()))?,
+    ));
     let handle = reviewer
         .review_by_run_id(&run_id)
         .map_err(|e| IpcError::Internal(e.to_string()))?;
@@ -1382,7 +1385,11 @@ pub async fn evidence_candidate_action(
             .map_err(IpcError::Internal)?,
         "reject" => store.reject(&candidate_id).map_err(IpcError::Internal)?,
         "accept" | "undo" => {
-            let layer_manager = std::sync::Arc::new(evidence_lease.create_layer_manager());
+            let layer_manager = std::sync::Arc::new(
+                evidence_lease
+                    .create_layer_manager()
+                    .map_err(|error| IpcError::Internal(error.to_string()))?,
+            );
             if action == "accept" {
                 store
                     .accept(&candidate_id, content.as_deref(), &layer_manager)
@@ -1522,7 +1529,8 @@ pub async fn get_evolution_dashboard(
         .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
         echo_agent_dir.join("evolution").join("change-log.jsonl"),
-    );
+    )
+    .map_err(|error| IpcError::Internal(error.to_string()))?;
 
     let dashboard =
         echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
@@ -1599,7 +1607,8 @@ pub async fn promote_rule(
 
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
         echo_agent_dir.join("evolution").join("change-log.jsonl"),
-    );
+    )
+    .map_err(|error| IpcError::Internal(error.to_string()))?;
 
     promoter
         .promote_rule(&proposal, &change_log)
@@ -1730,7 +1739,8 @@ pub async fn generate_skill_draft(
     let echo_agent_dir = generation.echo_agent_dir().to_path_buf();
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
         echo_agent_dir.join("evolution").join("change-log.jsonl"),
-    );
+    )
+    .map_err(|error| IpcError::Internal(error.to_string()))?;
     let typed = echo_agent::memory::TypedMemoryStore::new(store);
 
     let curator = echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir);

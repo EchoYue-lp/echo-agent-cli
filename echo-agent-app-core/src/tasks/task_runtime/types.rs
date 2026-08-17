@@ -683,6 +683,8 @@ pub enum RuntimeEventKind {
     RunTurnCompacted,
     /// One finite primary-Agent turn reached a terminal outcome.
     RunTurnFinished,
+    /// A retryable provider failure scheduled the next finite RunTurn.
+    RunProviderRetryScheduled,
     /// Automatic continuation is temporarily yielding to user/control input.
     RunContinuationDeferred,
     /// A previous continuation deferral was cleared.
@@ -753,6 +755,7 @@ impl RuntimeEventKind {
             RunTurnUsageAccounted => "run_turn_usage_accounted",
             RunTurnCompacted => "run_turn_compacted",
             RunTurnFinished => "run_turn_finished",
+            RunProviderRetryScheduled => "run_provider_retry_scheduled",
             RunContinuationDeferred => "run_continuation_deferred",
             RunContinuationResumed => "run_continuation_resumed",
             RunPauseReasonChanged => "run_pause_reason_changed",
@@ -845,6 +848,7 @@ impl RuntimeEventKind {
             "run_turn_usage_accounted" => RunTurnUsageAccounted,
             "run_turn_compacted" => RunTurnCompacted,
             "run_turn_finished" => RunTurnFinished,
+            "run_provider_retry_scheduled" => RunProviderRetryScheduled,
             "run_continuation_deferred" => RunContinuationDeferred,
             "run_continuation_resumed" => RunContinuationResumed,
             "run_pause_reason_changed" => RunPauseReasonChanged,
@@ -1265,6 +1269,23 @@ pub struct BlockerAudit {
     pub consecutive_turns: u32,
 }
 
+/// Durable retry schedule for transient provider failures between finite
+/// primary-Agent turns. The concrete deadline is persisted so event replay
+/// never draws a new jitter value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "ProviderRetryState")]
+pub struct ProviderRetryState {
+    pub attempt_count: u32,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
+    pub next_retry_at: DateTime<Utc>,
+    pub error_fingerprint: String,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
+    pub first_failure_at: DateTime<Utc>,
+    pub exhausted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, rename = "RunTurnSummary")]
 pub struct RunTurnSummary {
@@ -1312,6 +1333,8 @@ pub struct RunContinuationState {
     pub last_turn: Option<RunTurnSummary>,
     pub pause: Option<RunPause>,
     pub blocker_audit: Option<BlockerAudit>,
+    #[serde(default)]
+    pub provider_retry: Option<ProviderRetryState>,
     pub deferred: bool,
     pub deferred_reason: Option<String>,
 }
@@ -1331,6 +1354,7 @@ impl Default for RunContinuationState {
             last_turn: None,
             pause: None,
             blocker_audit: None,
+            provider_retry: None,
             deferred: false,
             deferred_reason: None,
         }

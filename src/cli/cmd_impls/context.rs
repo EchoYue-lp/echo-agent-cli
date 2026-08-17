@@ -14,7 +14,10 @@ async fn cmd_think(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "high" => 25,
         _ => 10,
     };
-    ctx.agent.write(|a| a.set_max_iterations(max)).await;
+    if let Err(error) = ctx.agent.write(|a| a.set_max_iterations(max)).await {
+        println!("Failed to update thinking depth: {error}");
+        return CommandOutcome::Continue;
+    }
     println!("Thinking depth: {level} (max {max} iterations)");
     CommandOutcome::Continue
 }
@@ -36,7 +39,10 @@ async fn cmd_reasoning(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "high" => (25, "thorough"),
         _ => (10, "standard"),
     };
-    ctx.agent.write(|a| a.set_max_iterations(iter)).await;
+    if let Err(error) = ctx.agent.write(|a| a.set_max_iterations(iter)).await {
+        println!("Failed to update reasoning effort: {error}");
+        return CommandOutcome::Continue;
+    }
     println!("Reasoning effort: {level} ({desc}, max {iter} iterations)");
     CommandOutcome::Continue
 }

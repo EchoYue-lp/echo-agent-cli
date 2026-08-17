@@ -3477,9 +3477,10 @@ async fn run_main_agent_task(
                         }
                         AgentEvent::ToolCall {
                             call_id,
-                            name,
-                            args,
+                            invocation,
                         } => {
+                            let name = invocation.name;
+                            let args = invocation.args;
                             if let Some(check) = verification_check_from_agent_tool(&name, &args) {
                                 pending_verification.insert(call_id.clone(), check);
                             }
@@ -3519,24 +3520,40 @@ async fn run_main_agent_task(
                         AgentEvent::ToolResult {
                             call_id,
                             name,
-                            output: result,
+                            result,
                         } => {
+                            let result_text = if result.success {
+                                result.output.clone()
+                            } else {
+                                result
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| result.output.clone())
+                            };
                             if let Some(check) = pending_verification.remove(&call_id) {
                                 observed_verification.push(
                                     echo_agent::agent::subagent::SubagentVerification {
                                         check,
-                                        status: echo_agent::agent::subagent::SubagentVerificationStatus::Passed,
-                                        details: result.chars().take(500).collect(),
+                                        status: if result.success {
+                                            echo_agent::agent::subagent::SubagentVerificationStatus::Passed
+                                        } else {
+                                            echo_agent::agent::subagent::SubagentVerificationStatus::Failed
+                                        },
+                                        details: result_text.chars().take(500).collect(),
                                         source: echo_agent::agent::subagent::SubagentVerificationSource::Observed,
                                     },
                                 );
                             }
-                            if let Some((write, path)) = pending_file_access.remove(&call_id) {
+                            if result.success
+                                && let Some((write, path)) = pending_file_access.remove(&call_id)
+                            {
                                 if write {
                                     push_unique_path(&mut touched_files.written, path);
                                 } else {
                                     push_unique_path(&mut touched_files.read, path);
                                 }
+                            } else {
+                                pending_file_access.remove(&call_id);
                             }
                             if let Err(error) = store.record_tool_finished(
                                 &run_id,
@@ -3544,13 +3561,13 @@ async fn run_main_agent_task(
                                 &execution_id,
                                 &call_id,
                                 &name,
-                                true,
-                                &result,
-                                None,
+                                result.success,
+                                &result_text,
+                                result.failure.as_ref(),
                             ) {
                                 event_cancel.cancel();
                                 return Err(ExecutionFailure::failed(format!(
-                                    "tool {name} completed but its terminal boundary was not persisted: {error}"
+                                    "tool {name} settled but its terminal boundary was not persisted: {error}"
                                 )));
                             }
                             emit_exec(
@@ -3563,58 +3580,9 @@ async fn run_main_agent_task(
                                     serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
-                                        "result": result,
-                                        "success": true,
-                                    }),
-                                )
-                                .with_agent(agent_role.clone()),
-                            );
-                        }
-                        AgentEvent::ToolError {
-                            call_id,
-                            name,
-                            error,
-                            failure,
-                        } => {
-                            if let Some(check) = pending_verification.remove(&call_id) {
-                                observed_verification.push(
-                                    echo_agent::agent::subagent::SubagentVerification {
-                                        check,
-                                        status: echo_agent::agent::subagent::SubagentVerificationStatus::Failed,
-                                        details: error.chars().take(500).collect(),
-                                        source: echo_agent::agent::subagent::SubagentVerificationSource::Observed,
-                                    },
-                                );
-                            }
-                            pending_file_access.remove(&call_id);
-                            if let Err(store_error) = store.record_tool_finished(
-                                &run_id,
-                                &task_id,
-                                &execution_id,
-                                &call_id,
-                                &name,
-                                false,
-                                &error,
-                                Some(&failure),
-                            ) {
-                                event_cancel.cancel();
-                                return Err(ExecutionFailure::failed(format!(
-                                    "tool {name} failed but its terminal boundary was not persisted: {store_error}"
-                                )));
-                            }
-                            emit_exec(
-                                trace_sink.as_ref(),
-                                ExecEvent::subagent(
-                                    run_id.clone(),
-                                    task_id.clone(),
-                                    execution_id.clone(),
-                                    RuntimeEventKind::ToolCompleted,
-                                    serde_json::json!({
-                                        "call_id": call_id,
-                                        "name": name,
-                                        "result": error,
-                                        "success": false,
-                                        "failure": failure,
+                                        "result": result_text,
+                                        "success": result.success,
+                                        "failure": result.failure,
                                     }),
                                 )
                                 .with_agent(agent_role.clone()),

@@ -415,8 +415,7 @@ pub fn build_tauri_app(
                                     SubagentEvent::DispatchToolStarted {
                                         agent,
                                         call_id,
-                                        name,
-                                        args,
+                                        invocation,
                                         execution_id,
                                         run_id,
                                         ..
@@ -445,8 +444,8 @@ pub fn build_tauri_app(
                                             conversation_id.as_deref(),
                                             run_id.as_deref(),
                                             call_id,
-                                            name,
-                                            args,
+                                            &invocation.name,
+                                            &invocation.args,
                                         ) {
                                             Ok(summary) => {
                                                 active_tool_ids_by_execution
@@ -461,7 +460,7 @@ pub fn build_tauri_app(
                                                 );
                                             }
                                             Err(error) => {
-                                                tracing::warn!(%error, %call_id, %name, "failed to persist subagent tool start");
+                                                tracing::warn!(%error, %call_id, name = %invocation.name, "failed to persist subagent tool start");
                                             }
                                         }
                                         continue;
@@ -470,10 +469,6 @@ pub fn build_tauri_app(
                                         agent,
                                         call_id,
                                         result,
-                                        success,
-                                        failure,
-                                        metadata,
-                                        truncated,
                                         execution_id,
                                         ..
                                     } => {
@@ -486,11 +481,11 @@ pub fn build_tauri_app(
                                         match tool_executions.finish(
                                             &owner,
                                             call_id,
-                                            *success,
-                                            result,
-                                            failure.clone(),
-                                            metadata.clone(),
-                                            *truncated,
+                                            result.success,
+                                            result.error.as_deref().unwrap_or(&result.output),
+                                            result.failure.clone(),
+                                            result.metadata.clone(),
+                                            result.truncated,
                                         ) {
                                             Ok(summary) => {
                                                 if let Some(call_ids) = active_tool_ids_by_execution
