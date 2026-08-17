@@ -568,7 +568,7 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | M2 | Complete | framework `6d7d0cf`；app `f4771f3` | Framework Subagent 定向 122 项及 control/executor 7 项、完整门禁与 11 个逐 feature check；application exact control 5 项、层级回归、完整 Rust/GUI/frontend 门禁：全绿 | exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox`；应用 `events.jsonl` 持久 command identity/result，四 surface 共用同一 service。M3 前不得绕过安全 admission 开启 cold-start auto-resume |
 | M3 | Complete | app `aa92178` | provider retry、boot admission、orphan recovery 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | provider retry schedule/deadline/fingerprint 已进入唯一事件 fold；cold-start 仅对满足 typed admission 的 `Paused/BootRecovery` unattended run 自动恢复；M4 已收归 completion blocker 路径 |
 | M4 | Complete | app `54d8bc4` | requirement/evidence、Goal revalidation、artifact rehash、direct Plan、四 surface 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | 完成权威仍在 TaskRuntime store；无第二状态/store/tool。M5 须增加可丢弃 checkpoint 缓存、基准和故障/soak 矩阵 |
-| M5 | Pending | - | - | seq 已存在；checkpoint 仅为可重建缓存 |
+| M5 | In progress (M5a complete; M5b active) | app `3e409d0` | checkpoint/fold 等价、损坏恢复、强杀窗口、1k/10k/100 release benchmark；完整 Rust 门禁：全绿 | canonical fault matrix 与真实 12/24/48h soak 尚未完成 |
 
 每次自动续跑或重启后仍须核对 Runtime Goal、本文、`MASTER-PLAN`、两个仓库状态和
 最近提交，再从第一个未完成阶段继续。
@@ -943,6 +943,32 @@ M5 仍未完成。剩余 M5b：执行并记录 provider/network、process kill/p
 HITL suspended、Subagent/cell race 和 Goal drift 的 canonical fault matrix；实现可提交、可恢复、
 有结构化 ledger 的真实 soak harness，并按顺序完成 12/24/48 小时运行。M1 已完成，因此该阶段
 可以验证冷启动自动续跑，但不得绕过 blocker、预算、workspace generation、launcher/HITL owner 门。
+
+### 15.12 Application M5b 实现前门禁（2026-08-17）
+
+恢复核对确认 Runtime Goal 仍 active，app `5966790`/`3e409d0` 与 framework 状态干净。全仓按
+soak、fault matrix、ledger、recover、RunTurn 和 benchmark 搜索后，仅存在 100-turn 语义回归、
+M5a opt-in performance fixture 与各故障域的 canonical deterministic tests；没有可运行、可恢复、
+按真实 wall-active time 计时的长时 harness。
+
+分层与唯一权威结论：
+
+- framework 不改。soak 时长、ledger 字段、EKO Goal/Plan/recovery 验收是产品评测策略，不是
+  任意 echo-agent 复用方都需要的通用原语。
+- app-core example 只编排公开的 `TaskRuntimeStore`、`commit_eko_task_plan`、RunTurn accounting、
+  `recover_incomplete` 与 `resume_task_run_after_boot`；不拥有 event fold、retry、DAG、completion
+  gate 或第二个 store。每轮事实仍只写同一 `events.jsonl`。
+- fault matrix 直接执行表中已有 canonical tests；harness 不复制 provider/network、HITL、
+  Subagent 或 CommandCell fault injection。这样故障断言仍由真实产品/框架主路径拥有。
+- harness 严格只接受 12/24/48 小时，固定 30 秒 heartbeat/RunTurn 与每 120 个成功 turn 一次
+  production boot-recovery cycle。持续时间累计当前进程实际 active monotonic time；进程停机时间
+  不计入，ledger 每轮原子 fsync，强杀后最多保守丢失一个 heartbeat 的计时而不会虚增时长。
+- provider 记录为 deterministic local soak，不发外部 LLM 请求；网络/provider 故障另由 canonical
+  matrix 验证。每轮写 usage、artifact progress、可选 compaction 和 terminal fact，验证 checkpoint
+  suffix、full event rebuild、snapshot、Goal hash、seq 连续性与无 active RunTurn 一致。
+- harness 启动要求 git worktree clean，并把当前 commit/configuration 写入 ledger；失败写稳定 SHA-256
+  fingerprint 并停止，同一时长修复后必须从新 run root 重跑。成功前把 TaskRun durable pause，禁止
+  进程退出后留下 Running zombie。
 
 ## 16. 最终验收
 
