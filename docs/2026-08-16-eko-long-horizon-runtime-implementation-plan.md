@@ -1,7 +1,7 @@
 # EKO 长程任务运行时 M0-M5 实施计划
 
 > 日期：2026-08-17
-> 状态：R0/M0/M1 Complete；framework M2 complete；application M2 next；Codex Runtime Goal active
+> 状态：R0/M0/M1/M2/M3 Complete；application M4 next；Codex Runtime Goal active
 > 设计基线：[`2026-08-14-eko-long-horizon-task-runtime-design.md`](./2026-08-14-eko-long-horizon-task-runtime-design.md)  
 > 跨会话状态：[`MASTER-PLAN.md`](./MASTER-PLAN.md)
 
@@ -566,7 +566,7 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | M0 | Complete | app `de09946` | Goal/CAS/quiescence/rebind 定向测试；workspace fmt、两组 clippy、all-features test、no-default；GUI check/test；frontend Prettier/test/build；浏览器 desktop/390px：全绿 | 已切换唯一 Goal 权威和四 surface 主路径；后续 M1 已完成 |
 | M1 | Complete | framework `cd4fccf`；app `9d59a0b` | Framework CommandCell 定向 30 项、完整门禁与 11 个逐 feature check；application 聚焦竞态/预算/TUI 测试、fmt、两组 clippy、workspace all-features test、no-default：全绿 | Framework 与 application 主路径均已切换；cold-start auto-resume 的 M1 前置门已关闭，但功能仍须在 M3 安全 admission 完成后才启用 |
 | M2 | Complete | framework `6d7d0cf`；app `f4771f3` | Framework Subagent 定向 122 项及 control/executor 7 项、完整门禁与 11 个逐 feature check；application exact control 5 项、层级回归、完整 Rust/GUI/frontend 门禁：全绿 | exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox`；应用 `events.jsonl` 持久 command identity/result，四 surface 共用同一 service。M3 前不得绕过安全 admission 开启 cold-start auto-resume |
-| M3 | Pending | - | - | M1 前置门已关闭；仅在本阶段安全 admission 全绿后启用 cold-start auto-resume |
+| M3 | Complete | app `aa92178` | provider retry、boot admission、orphan recovery 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | provider retry schedule/deadline/fingerprint 已进入唯一事件 fold；cold-start 仅对满足 typed admission 的 `Paused/BootRecovery` unattended run 自动恢复。M4 开始前须收归现有 completion blocker 路径 |
 | M4 | Pending | - | - | 收归现有 completion blockers，不建第二完成门 |
 | M5 | Pending | - | - | seq 已存在；checkpoint 仅为可重建缓存 |
 
@@ -703,6 +703,93 @@ workspace test、no-default 和 GUI 矩阵并全部通过。ts-rs 全量测试�
 Prettier 恢复并重验，仅保留新增类型与语义字段。验证后磁盘可用空间一度低于 50 GiB；共享
 环境随后清理 app target，可用空间恢复到约 72 GiB。下一切片为 application M3；安全 restart
 admission 完成前 `auto_resume_after_restart` 继续保持禁用。
+
+### 15.7 Application M3 实现与完成记录（2026-08-17）
+
+恢复时已重新核对 active Runtime Goal、本文、`MASTER-PLAN.md`、两仓 `git status` 和最近
+提交；两仓均干净，M0-M2 的框架与应用提交都在当前分支。
+
+全仓库按 retry 类型、事件、continuation fold、boot recovery、launcher、HITL、workspace
+identity、budget 和真实后台启动路径搜索后的分层结论如下：
+
+- 通用机制继续由 `echo-agent` 唯一拥有：`AgentFailure` 已提供 category、terminal kind、
+  retryable、code 和 HTTP status；provider 单次调用已有短时 retry；取消 token、Subagent
+  attempt identity 与 command-cell interrupted terminal 也均真实可达。M3 不修改框架，不在
+  应用复制 LLM transport retry 或另建通用 retry crate。
+- EKO 产品策略由 `echo-agent-cli` 唯一拥有：跨有限 RunTurn 的退避、TaskRun token/time
+  上限、`events.jsonl` retry projection、workspace identity、attended owner、recovery blocker
+  和 cold-start admission 都依赖 EKO TaskRuntime，必须留在 app-core。
+- 薄适配边界是 `chat_driver::finalize_run_turn`：它把框架 typed `AgentFailure` 转为一个
+  不含 provider message/secret 的稳定 fingerprint，再调用 store 原子 schedule；
+  `TaskContinuationRuntime` 只消费 event-folded `next_retry_at` 并等待，不拥有第二套计数。
+- `TaskService::resume_pending` 是当前唯一真实 cold-start background launcher。普通 Pending
+  任务仍按原路径启动；只有 `Paused/BootRecovery` 才进入新的 typed admission，并且必须是
+  Unattended、显式开启 auto-resume、Goal/Plan binding 一致、workspace 一致、预算有效、无
+  active RunTurn/Subagent/cell/recovery blocker。Attended run 缺 interactive owner 时保持 Paused，
+  绝不以拒绝 HITL 的方式继续。
+
+重复性审计确认：`RunContinuationState` 尚无 provider retry projection，事件集中没有 retry
+schedule，`finalize_run_turn` 对 retryable LLM failure 立即暂停，continuation admission 仍使用
+进程内 `consecutive_failures + sleep`，后台恢复仍通过 Note 文本猜测是否 BootRecovery。
+这些是待替换的唯一旧路径；现有 `recover_incomplete` 已正确关闭 orphan RunTurn/cell、保留
+完成事实并为不可重放 tool/Subagent 建 blocker，必须复用而不能平行实现。
+
+关键恢复决策补充核对了官方实现：
+
+- [AWS SDK retry behavior](https://docs.aws.amazon.com/sdkref/latest/guide/feature-retry-behavior.html)
+  采用错误分类、最大尝试数、指数退避与 jitter，并用 retry quota 限制持续失败；EKO 对应为
+  typed provider-only retry、稳定 jitter 和 TaskRun attempts/token/time 三重上限。
+- [Temporal Retry Policies](https://docs.temporal.io/encyclopedia/retry-policies) 把 initial
+  interval、coefficient、maximum interval/attempts 和 non-retryable errors 声明为可恢复策略，
+  同时依赖 durable history 确定性 replay；EKO 把 schedule 参数直接写入事件，rebuild 不重抽
+  随机数。
+- [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence) 把 durable
+  checkpointer 作为 fault tolerance/HITL 基础，内存 checkpointer 不能跨重启；EKO 因此只从
+  `events.jsonl` 重建 retry/admission 事实，进程内 launcher 仅是可重建执行资源。
+
+本阶段 policy 固定为：同一 Run 的连续 provider failures 统一递增 attempt，fingerprint
+记录最新 typed error identity，不能因 503/timeout 交替而重置上限；稳定 full-jitter 由
+`run_id + fingerprint + attempt` 派生并把实际
+`next_retry_at` 落盘；到达最大 attempt 或既有 token/time budget 时原子持久化
+`Paused/ProviderUnavailable`。认证、配置、invalid request 和非 LLM retryable failure 不进入
+provider retry。
+
+实现结果：`RuntimeEventKind::RunProviderRetryScheduled` 和 `ProviderRetryState` 已成为
+`events.jsonl` fold 的持久事实；continuation 只等待已落盘 deadline，成功 Turn 或用户显式 Resume
+重置连续失败。第五次 provider failure 或 token/time budget 耗尽会在同一 store 操作中进入
+`Paused/ProviderUnavailable`。后台 launcher 通过 typed boot admission 检查 workspace generation、
+Goal/Plan binding、budget、active RunTurn/Subagent/cell、recovery blocker、launcher 和 attended
+owner；并发 launcher 只有一个恢复赢家。启动恢复会关闭 orphan Subagent attempt；不可安全重放的
+边界继续生成 blocker，command cell 仍只标记 interrupted。TaskRun 创建改为 staged publish，失败时
+仅允许回滚尚无 PlanRevisionCommitted 的 run，避免留下半创建事实。
+
+提交：application `aa92178`。该提交同时适配 framework `356866c` 的 typed AgentEvent、fallible
+constructor/state-store API，并让 GUI/TUI/CLI/channel 都消费同一个 typed tool terminal contract；
+没有增加 surface-local 恢复路径。
+
+最终验证命令：
+
+- `cargo fmt --all` 与 `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets --all-features --locked --offline -- -D warnings`
+- `cargo clippy --workspace --lib --bins --all-features --locked --offline -- -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::unreachable`
+- `cargo test --workspace --all-features --locked --offline`：app-core 906 passed、2 ignored；runtime
+  state e2e 5 passed；CLI/TUI/Tauri library 141 passed；CLI main 10 passed；零失败
+- `cargo check -p echo-agent-app-core --no-default-features --locked --offline`
+- `cargo check --no-default-features --features gui --bin echo-agent-tauri --locked --offline`
+- `cargo test --no-default-features --features gui --locked --offline`：90 passed；零失败
+- 聚焦回归覆盖：跨 fingerprint retry 计数、持久 deadline、success/user-resume reset、第五次失败、
+  token exhaustion、typed stream setup failure、non-LLM failure、全部 boot blocker、并发 boot winner、
+  replay-safe/unsafe orphan Subagent、staged rollback 与已发布 Plan 保护
+- `npx prettier --check "src/**/*.{ts,tsx}"`
+- `npm test`：32 files、145 tests passed
+- `npm run build`：2143 modules transformed
+
+失败与修复：第一次全 workspace 测试暴露 framework 新 builder 对 `max_turns = 0` 的严格校验、
+state-store 默认覆盖 caller 注入、旧 tool wire contract 和 fault-injection 测试顺序问题；均修复后
+全量重跑通过。第一次最终 Clippy 因任务专用 target 的外部清理留下缺失 rmeta；恢复标准
+`CACHEDIR.TAG` 后由 Cargo 安全清理，并在仓库 target 从空缓存重跑全部门禁。期间共享 Cargo
+进程通过目录锁串行等待，没有终止或覆盖其工作。最终磁盘可用空间低于 50 GiB，全部验证结束后
+按规则执行 `cargo clean`，回收 20.2 GiB。
 
 ## 16. 最终验收
 
