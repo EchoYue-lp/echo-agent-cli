@@ -3,7 +3,7 @@
 > Date: 2026-08-17
 > Runtime Goal: M0-M5 implementation
 > Authority: `events.jsonl`; `checkpoint.json` is a discardable projection
-> Status: M5a checkpoint/performance committed as `3e409d0`; M5b automated fault matrix and real soak pending
+> Status: M5a checkpoint/performance `3e409d0` and M5b harness/fault matrix `82d8eda` complete; real 12/24/48-hour soak active
 
 ## Checkpoint Contract
 
@@ -74,8 +74,57 @@ instead of an empty padding object.
 | 100 compactions/Goal drift | `one_hundred_turns_and_compactions_replay_without_double_accounting` | exact usage/compaction accounting and unchanged Goal SHA-256 |
 
 The table identifies the canonical tests rather than duplicating fault logic in
-a second harness. M5b must run the complete named matrix after the M5a commit
-and record the commands and results below.
+a second harness. The complete matrix was executed on 2026-08-17 after commit
+`82d8eda`, with all commands run `--locked --offline` and zero failures:
+
+```bash
+# echo-agent-cli
+cargo test -p echo-agent-app-core --all-features provider_retry
+cargo test -p echo-agent-app-core --all-features boot_recovery
+cargo test -p echo-agent-app-core --all-features checkpoint
+cargo test -p echo-agent-app-core --all-features \
+  tasks::task_runtime::subagent_control::tests
+cargo test -p echo-agent-app-core --all-features \
+  cell_terminal_and_defer_race_cannot_leave_lost_wakeup
+cargo test -p echo-agent-app-core --all-features \
+  one_hundred_turns_and_compactions_replay_without_double_accounting
+
+# echo-agent
+cargo test -p echo_orchestration --all-features command_cell::tests
+cargo test -p echo_agent --all-features subagent::control::tests
+cargo test -p echo_agent --all-features controlled_
+```
+
+Exact single-test commands additionally covered provider limit pause/reset,
+corrupt snapshot rebuild, unsafe Subagent recovery blocker, torn event tail,
+mid-log corruption, committed projection degradation, boot auto-resume admission,
+and both TUI HITL queue transitions. Results were application provider 4,
+BootRecovery 8, snapshot/unsafe-boundary 2, checkpoint 5, disk 3, HITL 3,
+Subagent control 5, cell race 1, Goal-drift 1; framework CommandCell 24,
+Subagent mailbox 5, and controlled executor 2.
+
+## Soak Harness Contract
+
+`echo-agent-app-core/examples/task_runtime_soak.rs` is the committed M5b runner.
+It uses only public production TaskRuntime APIs and the sole file event store.
+It accepts exactly 12, 24, or 48 hours, records active monotonic time in an
+atomically fsync'd ledger, drives one RunTurn every 30 seconds, executes a real
+boot-recovery cycle every 120 completed turns, and validates event continuity,
+checkpoint/full-fold/snapshot equality, Goal and Plan hashes, budgets, active
+facts, and blockers on every cycle. The deterministic local provider avoids
+external availability as a confounder; provider/network failures are covered by
+the canonical matrix above.
+
+Release invocation for each sequential gate:
+
+```bash
+cargo run -p echo-agent-app-core --release \
+  --example task_runtime_soak --locked --offline -- --hours 12
+```
+
+Replace `12` with `24` and then `48` only after the preceding ledger passes.
+The runner rejects a dirty worktree and pins the current commit and configuration
+into each ledger.
 
 ## Real Soak Ledger
 
