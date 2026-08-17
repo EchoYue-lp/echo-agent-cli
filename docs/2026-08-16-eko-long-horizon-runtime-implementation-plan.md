@@ -568,7 +568,7 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | M2 | Complete | framework `6d7d0cf`；app `f4771f3` | Framework Subagent 定向 122 项及 control/executor 7 项、完整门禁与 11 个逐 feature check；application exact control 5 项、层级回归、完整 Rust/GUI/frontend 门禁：全绿 | exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox`；应用 `events.jsonl` 持久 command identity/result，四 surface 共用同一 service。M3 前不得绕过安全 admission 开启 cold-start auto-resume |
 | M3 | Complete | app `aa92178` | provider retry、boot admission、orphan recovery 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | provider retry schedule/deadline/fingerprint 已进入唯一事件 fold；cold-start 仅对满足 typed admission 的 `Paused/BootRecovery` unattended run 自动恢复；M4 已收归 completion blocker 路径 |
 | M4 | Complete | app `54d8bc4` | requirement/evidence、Goal revalidation、artifact rehash、direct Plan、四 surface 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | 完成权威仍在 TaskRuntime store；无第二状态/store/tool。M5 须增加可丢弃 checkpoint 缓存、基准和故障/soak 矩阵 |
-| M5 | In progress (M5a and M5b automation complete; real soak active) | app `3e409d0`、`82d8eda` | checkpoint/fold 等价、损坏恢复、强杀窗口、1k/10k/100 release benchmark；resumable soak harness；canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix；完整 Rust 门禁：全绿 | 真实 12/24/48h soak 尚未完成，必须按顺序通过 |
+| M5 | In progress (M5a and M5b automation complete; real soak active) | app `3e409d0`、`82d8eda` | checkpoint/fold 等价、损坏恢复、强杀窗口、1k/10k/100 release benchmark；resumable soak harness；canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix；完整 Rust 门禁：全绿 | 真实 12/24/48h soak 尚未完成；用户已明确改为隔离目录并行运行，任一失败仍须单独修复重跑 |
 
 每次自动续跑或重启后仍须核对 Runtime Goal、本文、`MASTER-PLAN`、两个仓库状态和
 最近提交，再从第一个未完成阶段继续。
@@ -993,8 +993,10 @@ unsafe-boundary 2、checkpoint 5、disk/torn-tail/projection 3、HITL 3、Subage
 所有命令与逐项结果记录于 M5 evaluation 文档。没有新增第二套 fault injection 或 runtime/store。
 
 自动矩阵后磁盘仅余 20 GiB，两个 target 合计 37 GiB，低于仓库 50 GiB 可用空间门槛；按规则清理
-调试缓存后仅构建固定提交的 release soak example。剩余事项只有按顺序完成真实 12/24/48 小时
-ledger，并把三次最终证据写回评测文档；任一时长失败必须修复并从该时长重新开始。
+调试缓存后仅构建固定提交的 release soak example。用户随后明确批准 12/24/48 小时使用三个隔离
+目录并行运行，避免 Codex 前台等待数十小时；这一执行方式替代原顺序门禁，但不降低单次验收。
+剩余事项是收集三个真实 ledger 并把最终证据写回评测文档；任一时长失败仍必须修复并用新目录
+从该时长重新开始，不能由其它更长运行覆盖。
 
 ## 16. 最终验收
 

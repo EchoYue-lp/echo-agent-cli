@@ -115,21 +115,22 @@ facts, and blockers on every cycle. The deterministic local provider avoids
 external availability as a confounder; provider/network failures are covered by
 the canonical matrix above.
 
-Release invocation for each sequential gate:
+Release invocation for an individual duration:
 
 ```bash
 cargo run -p echo-agent-app-core --release \
   --example task_runtime_soak --locked --offline -- --hours 12
 ```
 
-Replace `12` with `24` and then `48` only after the preceding ledger passes.
-The runner rejects a dirty worktree and pins the current commit and configuration
-into each ledger.
+The user explicitly approved launching 12, 24, and 48 hours concurrently in
+isolated output directories on 2026-08-17. `scripts/start-m5-soaks.sh` starts the
+three detached processes from one clean commit. The runner rejects a dirty
+worktree and pins the current commit and configuration into each ledger.
 
 ## Real Soak Ledger
 
-Soaks are sequential gates. A failure restarts the same duration after the fix;
-it cannot be skipped in favor of a longer run.
+Soaks run concurrently in isolated directories. A failure restarts the same
+duration in a new directory after the fix; a passing longer run cannot waive it.
 
 | Duration | Commit | Configuration/provider | Events/compactions/recoveries | Failure fingerprints | Final evidence | Status |
 |---:|---|---|---|---|---|---|
