@@ -61,7 +61,8 @@ import type {
   WorkspaceTransitionReceipt,
   ConfiguredModelListResponse,
   LlmApiProtocol,
-  ProviderTemplateListResponse,
+  ModelInputModality,
+  ModelProviderListResponse,
 } from '../generated';
 
 export type {
@@ -1707,10 +1708,26 @@ export const evolutionApi = {
 // ── Provider API ──────────────────────────────────────────────────────────
 
 export const providerApi = {
-  listTemplates: () =>
+  listProviders: () =>
     isTauri()
-      ? apiInvoke<ProviderTemplateListResponse>('list_model_templates')
-      : get<ProviderTemplateListResponse>('/models/templates'),
+      ? apiInvoke<ModelProviderListResponse>('list_model_providers')
+      : get<ModelProviderListResponse>('/models/providers'),
+  upsertProvider: (req: {
+    id: string;
+    name: string;
+    api_key?: string;
+    api_key_env?: string;
+    base_url: string;
+    default_api_protocol: LlmApiProtocol;
+    requires_api_key: boolean;
+  }) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; provider_id: string }>('upsert_model_provider', { req })
+      : post<{ success: boolean; provider_id: string }>('/models/providers', req),
+  deleteProvider: (providerId: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean }>('delete_model_provider', { providerId })
+      : del<{ success: boolean }>(`/models/providers/${encodeURIComponent(providerId)}`),
   listConfigured: () =>
     isTauri()
       ? apiInvoke<ConfiguredModelListResponse>('list_configured_models')
@@ -1736,16 +1753,13 @@ export const providerApi = {
     display_name?: string;
     provider: string;
     model: string;
-    api_protocol?: LlmApiProtocol;
-    api_key?: string;
-    base_url?: string;
+    api_protocol: LlmApiProtocol;
+    input_modalities: ModelInputModality[];
     temperature?: number;
     max_tokens?: number;
     context_window?: number | null;
     enabled?: boolean;
     set_default?: boolean;
-    /** 思考深度:`auto`/`disabled`/`minimal`/`low`/`medium`/`high`/`<number>` */
-    thinking?: string;
   }) =>
     isTauri()
       ? apiInvoke<{
@@ -1765,7 +1779,8 @@ export const providerApi = {
   test: (req: {
     provider: string;
     model: string;
-    api_protocol?: LlmApiProtocol;
+    api_protocol: LlmApiProtocol;
+    input_modalities: ModelInputModality[];
     api_key?: string;
     base_url?: string;
   }) =>
@@ -1774,36 +1789,12 @@ export const providerApi = {
           provider: req.provider,
           model: req.model,
           apiProtocol: req.api_protocol,
+          inputModalities: req.input_modalities,
           apiKey: req.api_key,
           baseUrl: req.base_url,
         })
       : post<TestConnectionResponse>('/providers/test', req),
-  /** Query whether a (provider, model) supports a thinking-depth control.
-   *  Used to show/hide the 思考深度 dropdown. */
-  getThinkingSupport: (req: { provider: string; model: string }) =>
-    isTauri()
-      ? apiInvoke<{
-          supports: boolean;
-          protocol: string;
-          levels: string[];
-          model: string;
-          provider: string;
-        }>('get_thinking_support', {
-          provider: req.provider,
-          model: req.model,
-        })
-      : get<{
-          supports: boolean;
-          protocol: string;
-          levels: string[];
-          model: string;
-          provider: string;
-        }>(
-          `/models/thinking-support?provider=${encodeURIComponent(req.provider)}&model=${encodeURIComponent(req.model)}`
-        ),
-  /** Dynamically set the active agent's thinking-depth at runtime. Decoupled
-   *  from model config — the user toggles it from the chat input toolbar.
-   *  Models that don't support thinking silently ignore it. */
+  /** Set one centrally verified thinking level for the active model. */
   setThinking: (spec: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; spec: string; applied: boolean }>('set_thinking', { spec })

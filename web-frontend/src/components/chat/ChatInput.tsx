@@ -22,6 +22,7 @@ import type { Attachment } from '../../types/api';
 import type { ConfiguredModel } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
+import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
 import {
   filterCommands,
   groupByCategory,
@@ -35,20 +36,6 @@ import {
   notifyPermissionsChanged,
 } from '../../lib/permissionModes';
 
-/**
- * 思考深度选项。与模型解耦:所有模型都展示这个下拉,后端按
- * ThinkingProtocol 决定是否真正下发(不支持的模型静默忽略 + warn),
- * 所以控制始终安全暴露。
- *
- * 持久化在 localStorage,默认 'auto'(模型默认行为,不发 thinking 字段)。
- */
-const THINKING_LEVELS = [
-  { id: 'auto', label: '自动' },
-  { id: 'minimal', label: '最低' },
-  { id: 'low', label: '低' },
-  { id: 'medium', label: '中' },
-  { id: 'high', label: '高' },
-] as const;
 const THINKING_STORAGE_KEY = 'echo_thinking_level';
 const INTERACTION_MODES = [
   { id: 1, label: 'Chat', description: '直接对话' },
@@ -58,7 +45,7 @@ const INTERACTION_MODES = [
 function loadThinkingLevel(): string {
   try {
     const v = localStorage.getItem(THINKING_STORAGE_KEY);
-    if (v && THINKING_LEVELS.some((l) => l.id === v)) return v;
+    if (v && isKnownThinkingLevel(v)) return v;
   } catch {
     /* localStorage may be unavailable */
   }
@@ -364,6 +351,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const activeModel = configuredModels.find((model) => model.is_default);
   const visibleModels = configuredModels.filter((model) => model.enabled);
   const displayModel = activeModel ?? visibleModels[0] ?? null;
+  const thinkingLevels = thinkingLevelOptions(displayModel?.thinking_levels ?? []);
   // 上下文窗口占用（来自 llm_usage 事件 → chatStore）。
   const contextWindow = useChatStore((s) => s.contextWindow);
   const usageAccumulator = useChatStore((s) => s.usageAccumulator);
@@ -494,8 +482,19 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
     [interactionMode, switchingInteractionMode]
   );
 
-  // Switch the active agent's thinking-depth at runtime. Decoupled from model
-  // config — every model exposes this; unsupported ones silently ignore it.
+  useEffect(() => {
+    if (thinkingLevels.some((level) => level.id === thinkingLevel)) return;
+    setThinkingLevel('auto');
+    setThinkingMenuOpen(false);
+    try {
+      localStorage.setItem(THINKING_STORAGE_KEY, 'auto');
+    } catch {
+      /* ignore persistence failure */
+    }
+    void providerApi.setThinking('auto');
+  }, [thinkingLevel, thinkingLevels]);
+
+  // The backend returns only the levels verified for the active model.
   const switchThinkingLevel = useCallback(
     async (level: string) => {
       if (level === thinkingLevel || switchingThinking) return;
@@ -1010,52 +1009,52 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
                   </button>
                 ))}
               </div>
-              {/* 思考深度 — 运行时每会话控制,与模型解耦。所有模型都展示;
-                  不支持的模型后端静默忽略(框架会 warn)。 */}
-              <div className="relative">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setPermissionMenuOpen(false);
-                    setModelMenuOpen(false);
-                    setThinkingMenuOpen((open) => !open);
-                  }}
-                  className="flex max-w-[140px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                  title="切换思考深度"
-                >
-                  <Brain size={13} />
-                  <span className="truncate">
-                    {THINKING_LEVELS.find((l) => l.id === thinkingLevel)?.label ?? '自动'}
-                  </span>
-                  <ChevronDown size={12} />
-                </button>
-                {thinkingMenuOpen && (
-                  <MenuOverlay title="思考深度" width="w-56">
-                    <div className="p-1">
-                      {THINKING_LEVELS.map((lvl) => (
-                        <button
-                          key={lvl.id}
-                          type="button"
-                          onClick={() => switchThinkingLevel(lvl.id)}
-                          disabled={switchingThinking}
-                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
-                        >
-                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                            {lvl.id === thinkingLevel && <Check size={13} />}
-                          </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block text-xs text-[var(--text-primary)]">
-                              {switchingThinking && lvl.id === thinkingLevel
-                                ? '切换中...'
-                                : lvl.label}
+              {displayModel && displayModel.thinking_levels.length > 0 && (
+                <div className="relative">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPermissionMenuOpen(false);
+                      setModelMenuOpen(false);
+                      setThinkingMenuOpen((open) => !open);
+                    }}
+                    className="flex max-w-[140px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                    title="切换思考深度"
+                  >
+                    <Brain size={13} />
+                    <span className="truncate">
+                      {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
+                    </span>
+                    <ChevronDown size={12} />
+                  </button>
+                  {thinkingMenuOpen && (
+                    <MenuOverlay title="思考深度" width="w-56">
+                      <div className="p-1">
+                        {thinkingLevels.map((lvl) => (
+                          <button
+                            key={lvl.id}
+                            type="button"
+                            onClick={() => switchThinkingLevel(lvl.id)}
+                            disabled={switchingThinking}
+                            className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
+                          >
+                            <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                              {lvl.id === thinkingLevel && <Check size={13} />}
                             </span>
-                          </span>
-                        </button>
-                      ))}
-                    </div>
-                  </MenuOverlay>
-                )}
-              </div>
+                            <span className="min-w-0 flex-1">
+                              <span className="block text-xs text-[var(--text-primary)]">
+                                {switchingThinking && lvl.id === thinkingLevel
+                                  ? '切换中...'
+                                  : lvl.label}
+                              </span>
+                            </span>
+                          </button>
+                        ))}
+                      </div>
+                    </MenuOverlay>
+                  )}
+                </div>
+              )}
             </div>
             <div className="ml-auto flex shrink-0 items-center gap-2">
               <ContextRingIndicator

@@ -78,14 +78,14 @@ struct SubagentRuntimeGeneration {
 #[derive(Clone)]
 enum SubagentModelBinding {
     Inherit(Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>),
-    Fixed(SubagentRuntimeGeneration),
+    Fixed(Box<SubagentRuntimeGeneration>),
 }
 
 impl SubagentModelBinding {
     async fn snapshot(&self) -> SubagentRuntimeGeneration {
         match self {
             Self::Inherit(generation) => generation.read().await.clone(),
-            Self::Fixed(generation) => generation.clone(),
+            Self::Fixed(generation) => generation.as_ref().clone(),
         }
     }
 }
@@ -131,7 +131,7 @@ fn subagent_model_binding(
     } else {
         // Fixed: resolve the role's thinking spec once; without one keep the
         // parent's thinking as of registration (mirrors temperature/max_tokens).
-        SubagentModelBinding::Fixed(SubagentRuntimeGeneration {
+        SubagentModelBinding::Fixed(Box::new(SubagentRuntimeGeneration {
             model: model.clone(),
             llm_config: parent_generation.llm_config.clone().map(|mut config| {
                 config.model = model;
@@ -142,7 +142,7 @@ fn subagent_model_binding(
             max_tokens: parent_generation.max_tokens,
             token_limit: parent_generation.token_limit,
             thinking: subagent_build_thinking(thinking_spec, parent_generation),
-        })
+        }))
     }
 }
 
@@ -2063,59 +2063,29 @@ pub enum DoctorConnectivity {
     Probe,
 }
 
-fn provider_from_model(model: &str) -> &str {
-    model
-        .split_once(':')
-        .map(|(provider, _)| provider)
-        .unwrap_or_else(|| {
-            let lower = model.to_ascii_lowercase();
-            if lower.starts_with("gpt-") {
-                "openai"
-            } else if lower.starts_with("claude-") {
-                "anthropic"
-            } else if lower.starts_with("deepseek-") {
-                "deepseek"
-            } else if lower.starts_with("qwen-") || lower.starts_with("qwen3") {
-                "qwen"
-            } else if lower.starts_with("glm-") {
-                "zhipu"
-            } else if lower.starts_with("moonshot-") || lower.starts_with("kimi-") {
-                "moonshot"
-            } else {
-                "unknown"
-            }
-        })
-}
-
 /// Send a minimal chat request to verify the model is reachable and responding.
 async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> {
     use echo_agent::error::ReactError;
-    use echo_agent::llm::core::types::Message;
+    let mut app_config = echo_agent::config::load_config(None);
+    echo_agent::config::apply_env_overrides(&mut app_config);
+    let runtime = model_config::resolve_runtime_model_selector(&app_config, Some(model))
+        .map_err(|error| ReactError::Other(error.to_string()))?;
+    let prepared = prepare_runtime_llm(&runtime).map_err(ReactError::Other)?;
+    let response = prepared
+        .client
+        .chat(echo_agent::llm::ChatRequest {
+            messages: vec![echo_agent::prelude::Message::user("hi".to_string())],
+            temperature: Some(0.0),
+            max_tokens: Some(1),
+            ..Default::default()
+        })
+        .await?;
 
-    let config = echo_agent::llm::config::LlmConfig::from_model(model)?;
-
-    let http_client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| ReactError::Other(format!("Failed to create HTTP client: {e}")))?;
-
-    let messages = vec![Message::user("hi".to_string())];
-
-    let response = echo_agent::llm::chat(
-        std::sync::Arc::new(http_client),
-        &config.model,
-        &messages,
-        Some(0.0),
-        Some(1),
-        Some(false),
-        None,
-        None,
-        None,
-        None,
-    )
-    .await?;
-
-    if response.choices.is_empty() {
+    if response
+        .content()
+        .map(|content| content.is_empty())
+        .unwrap_or(true)
+    {
         return Err(ReactError::Other(
             "Model returned empty response".to_string(),
         ));
@@ -2147,47 +2117,7 @@ pub fn run_base_doctor_for_model_with_connectivity(
     let base = echo_agent::paths::user_data_dir();
     let base_display = base.display();
 
-    let provider = provider_from_model(model);
-    let required_keys = model_config::provider_env_vars(provider);
-    if required_keys.is_empty() {
-        checks.push(format!(
-            "ℹ️  当前模型: {} (provider: {}, 无需或未知 API Key)",
-            model, provider
-        ));
-    } else if required_keys.iter().any(|key| std::env::var(key).is_ok()) {
-        checks.push(format!(
-            "✅ 当前模型: {} (provider: {}, API Key: {})",
-            model,
-            provider,
-            required_keys.join("/")
-        ));
-    } else {
-        issues.push(format!(
-            "❌ 当前模型 {} 需要设置 API Key: {}",
-            model,
-            required_keys.join(" 或 ")
-        ));
-    }
-
-    let api_keys = [
-        ("DASHSCOPE_API_KEY", "阿里通义千问"),
-        ("QWEN_API_KEY", "通义千问 (别名)"),
-        ("OPENAI_API_KEY", "OpenAI"),
-        ("ANTHROPIC_API_KEY", "Anthropic"),
-        ("DEEPSEEK_API_KEY", "DeepSeek"),
-        ("ZHIPU_API_KEY", "智谱 GLM"),
-        ("MOONSHOT_API_KEY", "月之暗面 Kimi"),
-    ];
-    let mut has_any_key = false;
-    for (key, name) in &api_keys {
-        if std::env::var(key).is_ok() {
-            checks.push(format!("✅ 已检测到 API Key: {} ({})", name, key));
-            has_any_key = true;
-        }
-    }
-    if !has_any_key {
-        checks.push("ℹ️  未检测到其他 LLM API Key".to_string());
-    }
+    checks.push(format!("ℹ️  当前模型: {model}"));
 
     if connectivity == DoctorConnectivity::Probe {
         // block_in_place is required when called from within a tokio task
@@ -2371,50 +2301,13 @@ pub fn build_llm_config(
     provider: &str,
     auth_token: &str,
     model: &str,
-    base_url_override: Option<&str>,
-    api_protocol: Option<LlmApiProtocol>,
-) -> LlmConfig {
-    let default_base_url = echo_agent::llm::config::provider_base_url(provider)
-        .unwrap_or(echo_agent::llm::config::provider_urls::OPENAI_CHAT_COMPLETIONS);
-    let mut config = match provider.to_lowercase().as_str() {
-        "anthropic" => LlmConfig::anthropic(auth_token, model),
-        "deepseek" => LlmConfig::deepseek(auth_token, model),
-        "dashscope" | "qwen" | "aliyun" => LlmConfig::dashscope(auth_token, model),
-        _ => {
-            // 兜底：按 OpenAI 兼容处理。gemini/azure/ollama 等暂不支持的
-            // provider 会落到这里，其 auth 差异可能导致请求失败。
-            if matches!(
-                provider.to_lowercase().as_str(),
-                "gemini" | "google" | "ollama" | "azure" | "azure_openai"
-            ) {
-                tracing::warn!(
-                    provider = %provider,
-                    "provider 暂不支持，按 OpenAI 兼容处理（auth 差异可能导致失败）"
-                );
-            }
-            let url = base_url_override.unwrap_or(default_base_url);
-            LlmConfig::new(url, auth_token, model)
-        }
-    };
-    // Apply base_url override for non-default providers
-    if let Some(url) = base_url_override {
-        config.base_url = url.to_string();
-    }
-    config.api_protocol = api_protocol
-        .or_else(|| base_url_override.and_then(LlmApiProtocol::try_from_endpoint))
-        .or_else(|| {
-            echo_agent::llm::config::provider_metadata(provider)
-                .map(|metadata| metadata.default_api_protocol)
-        })
-        .unwrap_or_else(|| LlmApiProtocol::from_endpoint(&config.base_url));
-    // Ensure provider_name is set so the thinking-protocol resolver picks the
-    // right wire field (e.g. enable_thinking for dashscope vs reasoning_effort
-    // for deepseek). The named constructors already set it; the generic
-    // fallback (`LlmConfig::new`) does not, so set it here uniformly.
-    if config.provider_name.is_none() && !provider.trim().is_empty() {
-        config.provider_name = Some(provider.to_string());
-    }
-    config
+    base_url: &str,
+    api_protocol: LlmApiProtocol,
+    input_modalities: Vec<echo_agent::llm::ModelInputModality>,
+) -> Result<LlmConfig, String> {
+    LlmConfig::for_provider(provider, base_url, auth_token, model, api_protocol)
+        .map(|config| config.with_input_modalities(input_modalities))
+        .map_err(|error| error.to_string())
 }
 
 /// Convert one fully resolved EKO model into the framework wire configuration.
@@ -2424,13 +2317,18 @@ pub fn build_runtime_llm_config(
     runtime: &model_config::ModelRuntimeConfig,
 ) -> Result<LlmConfig, String> {
     model_config::validate_runtime_model_endpoint(runtime)?;
-    Ok(build_llm_config(
+    let base_url = runtime
+        .base_url
+        .as_deref()
+        .ok_or_else(|| format!("Provider '{}' requires a base_url", runtime.provider))?;
+    build_llm_config(
         &runtime.provider,
         runtime.auth_token.as_deref().unwrap_or_default(),
         &runtime.model,
-        runtime.base_url.as_deref(),
-        Some(runtime.api_protocol),
-    ))
+        base_url,
+        runtime.api_protocol,
+        runtime.input_modalities.clone(),
+    )
 }
 
 /// One fully validated EKO runtime model and the client built from it.
@@ -2486,10 +2384,6 @@ pub fn prepare_runtime_llm(
 ) -> Result<PreparedRuntimeLlm, String> {
     model_config::validate_runtime_model_requirements(runtime)?;
     let config = build_runtime_llm_config(runtime)?;
-    let thinking = match runtime.thinking.as_deref() {
-        Some(spec) => echo_agent::llm::ThinkingConfig::parse_spec(spec)?,
-        None => None,
-    };
     let client: Arc<dyn LlmClient> = config
         .build_client()
         .map(Arc::from)
@@ -2497,7 +2391,33 @@ pub fn prepare_runtime_llm(
     Ok(PreparedRuntimeLlm {
         config,
         client,
-        thinking,
+        thinking: None,
+    })
+}
+
+/// Result of the shared EKO connection probe used by GUI, TUI, and CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeLlmConnectionTest {
+    pub response: String,
+    pub model: String,
+}
+
+/// Send one minimal request through the exact client configuration used by the
+/// live agent. Surface-specific code only resolves user input and renders this
+/// result; protocol behavior remains identical across GUI, TUI, and CLI.
+pub async fn test_runtime_llm_connection(
+    runtime: &model_config::ModelRuntimeConfig,
+) -> Result<RuntimeLlmConnectionTest, String> {
+    let prepared = prepare_runtime_llm(runtime)?;
+    let messages = vec![Message::user("Hi, respond with just 'OK'.".to_string())];
+    let response = prepared
+        .client
+        .chat_simple(messages)
+        .await
+        .map_err(|error| format!("API call failed: {error}"))?;
+    Ok(RuntimeLlmConnectionTest {
+        response,
+        model: prepared.client.model_name().to_string(),
     })
 }
 
@@ -2581,7 +2501,7 @@ pub(crate) async fn prepare_agent_model_publication(
 mod llm_config_tests {
     use super::{
         AgentCreateParams, build_llm_config, build_runtime_llm_config,
-        create_agent_with_diagnostics, prepare_runtime_llm,
+        create_agent_with_diagnostics, prepare_runtime_llm, test_runtime_llm_connection,
     };
     use crate::model_config::ModelRuntimeConfig;
     use echo_agent::agent::Agent;
@@ -2589,66 +2509,22 @@ mod llm_config_tests {
     use echo_agent::llm::LlmApiProtocol;
 
     #[test]
-    fn builtin_protocol_defaults_come_from_framework_config() {
-        for (provider, expected) in [
-            ("openai", LlmApiProtocol::Responses),
-            ("anthropic", LlmApiProtocol::Anthropic),
-            ("deepseek", LlmApiProtocol::ChatCompletions),
-        ] {
-            assert_eq!(
-                build_llm_config(provider, "test-key", "test-model", None, None).api_protocol,
-                expected,
-                "unexpected builder protocol for {provider}"
-            );
-        }
-    }
-
-    #[test]
-    fn custom_endpoint_inference_preserves_explicit_override_priority() {
-        let endpoint = "https://gateway.example/v1/responses";
+    fn provider_neutral_builder_uses_explicit_protocol_and_modalities() -> Result<(), String> {
+        let config = build_llm_config(
+            "gateway",
+            "test-key",
+            "test-model",
+            "https://gateway.example/v1",
+            LlmApiProtocol::Responses,
+            echo_agent::llm::ModelInputModality::text_only(),
+        )?;
+        assert_eq!(config.api_protocol, LlmApiProtocol::Responses);
+        assert_eq!(config.base_url, "https://gateway.example/v1/responses");
         assert_eq!(
-            build_llm_config("custom", "test-key", "test-model", Some(endpoint), None).api_protocol,
-            LlmApiProtocol::Responses
+            config.input_modalities,
+            echo_agent::llm::ModelInputModality::text_only()
         );
-        assert_eq!(
-            build_llm_config(
-                "custom",
-                "test-key",
-                "test-model",
-                Some(endpoint),
-                Some(LlmApiProtocol::ChatCompletions),
-            )
-            .api_protocol,
-            LlmApiProtocol::ChatCompletions
-        );
-    }
-
-    #[test]
-    fn named_provider_constructors_infer_complete_endpoint_overrides() {
-        for (provider, endpoint, expected) in [
-            (
-                "anthropic",
-                "https://gateway.example/v1/responses",
-                LlmApiProtocol::Responses,
-            ),
-            (
-                "deepseek",
-                "https://gateway.example/v1/messages",
-                LlmApiProtocol::Anthropic,
-            ),
-            (
-                "dashscope",
-                "https://gateway.example/v1/responses",
-                LlmApiProtocol::Responses,
-            ),
-        ] {
-            assert_eq!(
-                build_llm_config(provider, "test-key", "test-model", Some(endpoint), None,)
-                    .api_protocol,
-                expected,
-                "unexpected endpoint override for {provider}"
-            );
-        }
+        Ok(())
     }
 
     #[test]
@@ -2659,14 +2535,16 @@ mod llm_config_tests {
             provider: "local".to_string(),
             model: "model".to_string(),
             api_protocol: LlmApiProtocol::ChatCompletions,
-            api_protocol_explicit: false,
+            input_modalities: echo_agent::llm::ModelInputModality::text_only(),
             auth_token: None,
             auth_source: "none".to_string(),
             base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            api_key_env: None,
+            requires_api_key: false,
             temperature: None,
             max_tokens: None,
             context_window: None,
-            thinking: None,
+            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
         };
 
         let config = build_runtime_llm_config(&runtime)?;
@@ -2687,17 +2565,46 @@ mod llm_config_tests {
             provider: "openai".to_string(),
             model: "gpt-test".to_string(),
             api_protocol: LlmApiProtocol::Responses,
-            api_protocol_explicit: true,
+            input_modalities: echo_agent::llm::ModelInputModality::text_only(),
             auth_token: Some("invalid\nheader".to_string()),
             auth_source: "input".to_string(),
             base_url: Some("https://api.openai.com/v1/responses".to_string()),
+            api_key_env: None,
+            requires_api_key: true,
             temperature: None,
             max_tokens: None,
             context_window: None,
-            thinking: None,
+            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
         };
 
         assert!(prepare_runtime_llm(&runtime).is_err());
+    }
+
+    #[tokio::test]
+    async fn shared_connection_probe_uses_runtime_key_policy() {
+        let runtime = ModelRuntimeConfig {
+            id: "gateway:model".to_string(),
+            display_name: "Model".to_string(),
+            provider: "gateway".to_string(),
+            model: "model".to_string(),
+            api_protocol: LlmApiProtocol::Responses,
+            input_modalities: echo_agent::llm::ModelInputModality::text_only(),
+            auth_token: None,
+            auth_source: "none".to_string(),
+            base_url: Some("https://gateway.example/v1".to_string()),
+            api_key_env: Some("GATEWAY_API_KEY".to_string()),
+            requires_api_key: true,
+            temperature: None,
+            max_tokens: None,
+            context_window: None,
+            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
+        };
+
+        let error = test_runtime_llm_connection(&runtime)
+            .await
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("requires an API key"));
     }
 
     fn selectable_model_config(agent_token_limit: usize) -> Result<AppConfig, String> {
@@ -2708,6 +2615,7 @@ mod llm_config_tests {
             ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+                ..Default::default()
             },
         );
         config.configured_models = vec![
@@ -2716,7 +2624,7 @@ mod llm_config_tests {
                 display_name: "Default".to_string(),
                 provider: "local".to_string(),
                 model: "default-runtime".to_string(),
-                api_protocol: Some(LlmApiProtocol::ChatCompletions),
+                api_protocol: LlmApiProtocol::ChatCompletions,
                 context_window: Some(16_384),
                 ..ConfiguredModel::default()
             },
@@ -2725,7 +2633,7 @@ mod llm_config_tests {
                 display_name: "Selected".to_string(),
                 provider: "local".to_string(),
                 model: "selected-runtime".to_string(),
-                api_protocol: Some(LlmApiProtocol::ChatCompletions),
+                api_protocol: LlmApiProtocol::ChatCompletions,
                 context_window: Some(65_536),
                 ..ConfiguredModel::default()
             },

@@ -439,14 +439,17 @@ impl Default for ModelMutationOwnerState {
     }
 }
 
-/// Application input for one configured-model upsert. Provider credentials
-/// remain part of the same candidate config and commit atomically with it.
 #[derive(Debug, Clone)]
 pub struct ConfiguredModelMutation {
     pub model: echo_agent::config::ConfiguredModel,
-    pub auth_token: Option<String>,
-    pub base_url: Option<String>,
     pub set_default: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelProviderMutation {
+    pub id: String,
+    pub provider: echo_agent::config::ModelProviderConfig,
+    pub preserve_auth_token: bool,
 }
 
 /// Linearized result returned only after disk, snapshot, primary, and pool
@@ -478,9 +481,11 @@ type OwnedConfigUpdate =
     Box<dyn FnOnce(&mut echo_agent::config::AppConfig) -> Result<(), String> + Send + 'static>;
 
 enum ModelMutationRequest {
-    Upsert(ConfiguredModelMutation),
+    UpsertModel(ConfiguredModelMutation),
+    UpsertProvider(ModelProviderMutation),
     SetDefault(String),
-    Delete(String),
+    DeleteModel(String),
+    DeleteProvider(String),
     UpdateConfig {
         update: OwnedConfigUpdate,
         reapply_active_model: bool,
@@ -903,7 +908,17 @@ impl AppState {
         self: &Arc<Self>,
         mutation: ConfiguredModelMutation,
     ) -> Result<ModelMutationReceipt, ModelMutationError> {
-        self.run_owned_model_mutation(ModelMutationRequest::Upsert(mutation))
+        self.run_owned_model_mutation(ModelMutationRequest::UpsertModel(mutation))
+            .await
+    }
+
+    /// Upsert one provider and refresh the active generation when it uses the
+    /// edited provider.
+    pub async fn upsert_model_provider_owned(
+        self: &Arc<Self>,
+        mutation: ModelProviderMutation,
+    ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        self.run_owned_model_mutation(ModelMutationRequest::UpsertProvider(mutation))
             .await
     }
 
@@ -923,7 +938,16 @@ impl AppState {
         self: &Arc<Self>,
         model_id: impl Into<String>,
     ) -> Result<ModelMutationReceipt, ModelMutationError> {
-        self.run_owned_model_mutation(ModelMutationRequest::Delete(model_id.into()))
+        self.run_owned_model_mutation(ModelMutationRequest::DeleteModel(model_id.into()))
+            .await
+    }
+
+    /// Delete a provider after all of its models have been removed.
+    pub async fn delete_model_provider_owned(
+        self: &Arc<Self>,
+        provider_id: impl Into<String>,
+    ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        self.run_owned_model_mutation(ModelMutationRequest::DeleteProvider(provider_id.into()))
             .await
     }
 
@@ -2097,38 +2121,13 @@ fn prepare_model_mutation(
     request: ModelMutationRequest,
 ) -> Result<PreparedModelMutation, ModelMutationError> {
     match request {
-        ModelMutationRequest::Upsert(mutation) => {
+        ModelMutationRequest::UpsertModel(mutation) => {
             let mut config = current.clone();
-            let provider = mutation.model.provider.clone();
             let active_before = resolve_active_model_runtime(current, active_model_id)?;
-            let provider_before = config.model_providers.get(&provider).cloned();
-            let provider_config = config.model_providers.entry(provider.clone()).or_default();
-            if let Some(auth_token) = mutation
-                .auth_token
-                .map(|token| token.trim().to_string())
-                .filter(|token| !token.is_empty())
-            {
-                provider_config.auth_token = Some(auth_token);
-            }
-            if let Some(base_url) = mutation
-                .base_url
-                .map(|url| url.trim().to_string())
-                .filter(|url| !url.is_empty())
-            {
-                provider_config.base_url = Some(base_url);
-            }
-            let provider_config_changed = provider_before
-                .as_ref()
-                .map(|before| {
-                    before.auth_token != provider_config.auth_token
-                        || before.base_url != provider_config.base_url
-                })
-                .unwrap_or_else(|| {
-                    provider_config.auth_token.is_some() || provider_config.base_url.is_some()
-                });
             let previous_default = current.model.default_model_id.clone();
             let model_id =
-                crate::model_config::upsert_configured_model(&mut config, mutation.model);
+                crate::model_config::upsert_configured_model(&mut config, mutation.model)
+                    .map_err(ModelMutationError::Validation)?;
             let became_first_default = previous_default.is_none()
                 && config.model.default_model_id.as_deref() == Some(model_id.as_str());
             let updates_persisted_default = mutation.set_default
@@ -2141,17 +2140,7 @@ fn prepare_model_mutation(
             let updates_active_model = active_before.id == model_id;
             let activates_upserted_model =
                 mutation.set_default || updates_active_model || became_first_default;
-            let refreshes_active_provider = !activates_upserted_model
-                && provider_config_changed
-                && active_before.provider == provider;
-            let activated = activates_upserted_model || refreshes_active_provider;
-            let runtime = if activates_upserted_model {
-                crate::model_config::resolve_runtime_model(&config, Some(&model_id))
-            } else if refreshes_active_provider {
-                resolve_active_model_runtime(&config, &active_before.id)?
-            } else {
-                crate::model_config::resolve_runtime_model(&config, Some(&model_id))
-            };
+            let runtime = crate::model_config::resolve_runtime_model(&config, Some(&model_id));
             let prepared = crate::infra::prepare_runtime_llm(&runtime)
                 .map_err(ModelMutationError::Validation)?;
             Ok(PreparedModelMutation {
@@ -2159,6 +2148,39 @@ fn prepare_model_mutation(
                 model_id,
                 runtime: Some(runtime),
                 prepared: Some(prepared),
+                activated: activates_upserted_model,
+                deleted: false,
+            })
+        }
+        ModelMutationRequest::UpsertProvider(mutation) => {
+            let mut config = current.clone();
+            let active_before = resolve_active_model_runtime(current, active_model_id)?;
+            let mut provider = mutation.provider;
+            if mutation.preserve_auth_token && provider.auth_token.is_none() {
+                provider.auth_token = current
+                    .model_providers
+                    .get(&mutation.id)
+                    .and_then(|current| current.auth_token.clone());
+            }
+            let provider_id =
+                crate::model_config::upsert_model_provider(&mut config, &mutation.id, provider)
+                    .map_err(ModelMutationError::Validation)?;
+            let activated = active_before.provider == provider_id;
+            let runtime = if activated {
+                Some(resolve_active_model_runtime(&config, &active_before.id)?)
+            } else {
+                None
+            };
+            let prepared = runtime
+                .as_ref()
+                .map(crate::infra::prepare_runtime_llm)
+                .transpose()
+                .map_err(ModelMutationError::Validation)?;
+            Ok(PreparedModelMutation {
+                config,
+                model_id: provider_id,
+                runtime,
+                prepared,
                 activated,
                 deleted: false,
             })
@@ -2181,7 +2203,7 @@ fn prepare_model_mutation(
                 deleted: false,
             })
         }
-        ModelMutationRequest::Delete(model_id) => {
+        ModelMutationRequest::DeleteModel(model_id) => {
             let mut config = current.clone();
             match crate::model_config::delete_configured_model(&mut config, &model_id)
                 .map_err(ModelMutationError::Validation)?
@@ -2223,6 +2245,19 @@ fn prepare_model_mutation(
                     })
                 }
             }
+        }
+        ModelMutationRequest::DeleteProvider(provider_id) => {
+            let mut config = current.clone();
+            crate::model_config::delete_model_provider(&mut config, &provider_id)
+                .map_err(ModelMutationError::Validation)?;
+            Ok(PreparedModelMutation {
+                config,
+                model_id: provider_id,
+                runtime: None,
+                prepared: None,
+                activated: false,
+                deleted: true,
+            })
         }
         ModelMutationRequest::UpdateConfig {
             update,
@@ -2316,10 +2351,23 @@ mod model_mutation_tests {
             display_name: id.to_string(),
             provider: provider.to_string(),
             model: model.to_string(),
-            api_protocol: Some(LlmApiProtocol::ChatCompletions),
+            api_protocol: LlmApiProtocol::ChatCompletions,
             enabled: true,
             context_window: Some(context_window),
             ..ConfiguredModel::default()
+        }
+    }
+
+    fn provider_mutation(id: &str, base_url: &str) -> ModelProviderMutation {
+        ModelProviderMutation {
+            id: id.to_string(),
+            provider: ModelProviderConfig {
+                name: id.to_string(),
+                base_url: Some(base_url.to_string()),
+                default_api_protocol: Some(LlmApiProtocol::ChatCompletions),
+                ..Default::default()
+            },
+            preserve_auth_token: false,
         }
     }
 
@@ -2330,6 +2378,7 @@ mod model_mutation_tests {
             ModelProviderConfig {
                 auth_token: None,
                 base_url: Some(ENDPOINT_A.to_string()),
+                ..Default::default()
             },
         );
         config.model_providers.insert(
@@ -2337,6 +2386,7 @@ mod model_mutation_tests {
             ModelProviderConfig {
                 auth_token: None,
                 base_url: Some(ENDPOINT_B.to_string()),
+                ..Default::default()
             },
         );
         config.configured_models = vec![
@@ -2355,12 +2405,13 @@ mod model_mutation_tests {
             .find(|model| model.id == MODEL_B)
             .ok_or_else(|| "missing invalid successor candidate".to_string())?;
         invalid.provider = "openai".to_string();
-        invalid.api_protocol = Some(LlmApiProtocol::Responses);
+        invalid.api_protocol = LlmApiProtocol::Responses;
         config.model_providers.insert(
             "openai".to_string(),
             ModelProviderConfig {
                 auth_token: Some("invalid\nheader".to_string()),
                 base_url: Some("https://api.openai.com/v1/responses".to_string()),
+                ..Default::default()
             },
         );
         Ok(config)
@@ -2373,6 +2424,7 @@ mod model_mutation_tests {
             ModelProviderConfig {
                 auth_token: None,
                 base_url: Some(ENDPOINT_A.to_string()),
+                ..Default::default()
             },
         );
         config.configured_models = vec![
@@ -2973,8 +3025,6 @@ mod model_mutation_tests {
         let fixture = fixture(valid_config()?, false).await?;
         let mutation = ConfiguredModelMutation {
             model: model(MODEL_A, "local-a", "runtime-a", 0),
-            auth_token: None,
-            base_url: None,
             set_default: false,
         };
 
@@ -2985,23 +3035,18 @@ mod model_mutation_tests {
     }
 
     #[tokio::test]
-    async fn nondefault_upsert_refreshes_active_generation_when_provider_config_is_shared()
+    async fn provider_upsert_refreshes_active_generation_when_provider_is_shared()
     -> Result<(), String> {
         let fixture = fixture(shared_provider_config()?, false).await?;
         let inherited = inherited_handle(&fixture)?;
         let receipt = fixture
             .state
-            .upsert_configured_model_owned(ConfiguredModelMutation {
-                model: model(MODEL_B, "local-shared", "runtime-b", WINDOW_B as u32),
-                auth_token: None,
-                base_url: Some(ENDPOINT_B.to_string()),
-                set_default: false,
-            })
+            .upsert_model_provider_owned(provider_mutation("local-shared", ENDPOINT_B))
             .await
             .map_err(|error| error.to_string())?;
 
         assert!(receipt.activated);
-        assert_eq!(receipt.model_id, MODEL_B);
+        assert_eq!(receipt.model_id, "local-shared");
         assert_eq!(
             receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
             Some(MODEL_A)
@@ -3047,17 +3092,12 @@ mod model_mutation_tests {
         let fixture = fixture_with_active(shared_provider_config()?, false, MODEL_B).await?;
         let receipt = fixture
             .state
-            .upsert_configured_model_owned(ConfiguredModelMutation {
-                model: model(MODEL_A, "local-shared", "runtime-a", WINDOW_A as u32),
-                auth_token: None,
-                base_url: Some(ENDPOINT_C.to_string()),
-                set_default: false,
-            })
+            .upsert_model_provider_owned(provider_mutation("local-shared", ENDPOINT_C))
             .await
             .map_err(|error| error.to_string())?;
 
         assert!(receipt.activated);
-        assert_eq!(receipt.model_id, MODEL_A);
+        assert_eq!(receipt.model_id, "local-shared");
         assert_eq!(
             receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
             Some(MODEL_B)
@@ -3114,15 +3154,9 @@ mod model_mutation_tests {
     async fn invalid_shared_provider_upsert_rolls_back_every_layer() -> Result<(), String> {
         let fixture = fixture(shared_provider_config()?, false).await?;
         let inherited = inherited_handle(&fixture)?;
-        let result = fixture
-            .state
-            .upsert_configured_model_owned(ConfiguredModelMutation {
-                model: model(MODEL_B, "local-shared", "runtime-b", WINDOW_B as u32),
-                auth_token: None,
-                base_url: Some(RESPONSES_ENDPOINT.to_string()),
-                set_default: false,
-            })
-            .await;
+        let mut mutation = provider_mutation("local-shared", RESPONSES_ENDPOINT);
+        mutation.provider.auth_token = Some("invalid\nheader".to_string());
+        let result = fixture.state.upsert_model_provider_owned(mutation).await;
 
         assert!(matches!(result, Err(ModelMutationError::Validation(_))));
         let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
@@ -3166,12 +3200,7 @@ mod model_mutation_tests {
         invalidate_model_budget(&fixture.state.connection.agent).await;
         let receipt = fixture
             .state
-            .upsert_configured_model_owned(ConfiguredModelMutation {
-                model: model(MODEL_B, "local-b", "runtime-b", WINDOW_B as u32),
-                auth_token: None,
-                base_url: Some(ENDPOINT_C.to_string()),
-                set_default: false,
-            })
+            .upsert_model_provider_owned(provider_mutation("local-b", ENDPOINT_C))
             .await
             .map_err(|error| error.to_string())?;
 

@@ -182,13 +182,14 @@ pub fn build_tauri_app(
             commands::hooks::reload_hooks,
             commands::hooks::test_hook,
             // Providers
-            commands::providers::list_model_templates,
+            commands::providers::list_model_providers,
+            commands::providers::upsert_model_provider,
+            commands::providers::delete_model_provider,
             commands::providers::list_configured_models,
             commands::providers::upsert_configured_model,
             commands::providers::delete_configured_model,
             commands::providers::set_default_model,
             commands::providers::test_connection,
-            commands::providers::get_thinking_support,
             commands::providers::set_thinking,
             // Scheduler
             commands::scheduler::list_scheduler_tasks,

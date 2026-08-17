@@ -11,12 +11,12 @@ EKO 按以下优先级查找配置文件：
 
 ## 快速配置
 
-GUI 用户不需要手写 YAML。打开 **设置 → 模型供应商**：
+GUI 用户不需要手写 YAML。打开 **设置 → 模型 Provider**：
 
-1. 选择厂商。
-2. 填写模型名；云厂商填写 API Key，本地/自定义兼容端点可留空。
-3. “自动”协议会先识别完整 endpoint，再使用框架中的厂商默认值；provider 根地址也可以保留。显式选择协议时，必须同时填写与之匹配的完整 API endpoint。
-4. 点击“保存并使用”。
+1. 添加 Provider，填写名称、API 根地址和认证方式。
+2. 在该 Provider 下添加一个或多个模型。
+3. 每个模型明确选择 Chat Completions、Responses 或 Anthropic 协议。
+4. 纯文本能力默认启用；按需勾选图像、音频、视频能力，然后保存或保存并启用。
 5. 在聊天输入框底部的“默认模型”下拉框中切换已配置模型。
 
 用户填写的 API Key 优先级高于系统环境变量。CLI/TUI 会读取同一份已配置默认模型。
@@ -30,10 +30,9 @@ CLI 的 `--model` 接受已启用的配置模型 ID 或唯一模型名称，不�
 ```yaml
 # ── 模型配置 ─────────────────────────────────────────────────────
 # GUI、TUI 和 CLI 共享同一模型配置。
-# api_protocol 是可选 override；省略时先识别完整 endpoint，再使用框架 provider 默认值。
-# Auto 可保留 provider 根地址；完整 endpoint 会自动推断协议。
-# 显式协议要求 endpoint 以 /responses、/messages 或 /chat/completions 结尾，且两者必须匹配。
-# 本地、兼容 override 或 unknown provider 可省略 auth_token。
+# Provider 保存连接和认证；模型显式保存协议和输入能力。
+# base_url 可以是根地址，也可以是完整协议 endpoint。
+# 本地服务可设置 requires_api_key: false 并省略 auth_token/api_key_env。
 model:
   default_model_id: "deepseek:deepseek-v4-flash"
   provider: "deepseek"        # 运行时镜像字段，由“模型供应商”保存默认模型时同步
@@ -43,14 +42,19 @@ model:
 
 model_providers:
   deepseek:
-    auth_token: "your-api-key"
-    base_url: "https://api.deepseek.com/chat/completions"
+    name: "DeepSeek"
+    api_key_env: "DEEPSEEK_API_KEY"
+    base_url: "https://api.deepseek.com"
+    default_api_protocol: "chat_completions"
+    requires_api_key: true
 
 configured_models:
   - id: "deepseek:deepseek-v4-flash"
     display_name: "Deepseek V4 Flash"
     provider: "deepseek"
     model: "deepseek-v4-flash"
+    api_protocol: "chat_completions"
+    input_modalities: ["text"]
     enabled: true
     max_tokens: 8192
     temperature: 0.7
@@ -235,111 +239,41 @@ localhost 仍默认使用托管 Chromium。
 
 ## 模型配置详解
 
-### 支持的模型提供商
-
-| 提供商 | 模型名称示例 | 环境变量 |
-|--------|-------------|---------|
-| DeepSeek | deepseek-v4-flash, deepseek-v4-pro | DEEPSEEK_API_KEY |
-| OpenAI | gpt-5.5 | OPENAI_API_KEY |
-| Anthropic | claude-opus-4-8, claude-opus-4-7 | ANTHROPIC_API_KEY |
-| 阿里通义 | qwen3.7-max, qwen3.6-plus | DASHSCOPE_API_KEY |
-| Moonshot | kimi-k2.6 | MOONSHOT_API_KEY |
-| 智谱 | glm-5.1 | ZHIPU_API_KEY |
-| Gemini | gemini-3.5-flash | GEMINI_API_KEY |
-| Ollama (本地) | llama3.1, codellama, mistral | 无需 API Key |
-
-### 切换模型示例
-
 ### 模型供应商配置
 
-GUI、TUI 和 CLI 使用同一份 `model_providers` 和 `configured_models`。`configured_models[].api_protocol` 是可选 override，可选值为 `responses`、`chat_completions`、`anthropic`。省略时，OpenAI 使用 Responses、Anthropic 使用 Messages，其余内置供应商使用 Chat Completions；自定义完整端点按 URL 推断。显式值始终优先。
+GUI、TUI 和 CLI 使用同一份 `model_providers` 和 `configured_models`。Provider ID 是用户定义的，不存在连接厂商白名单。`configured_models[].api_protocol` 必须明确为 `responses`、`chat_completions` 或 `anthropic`；`input_modalities` 可包含 `text`、`image`、`audio`、`video`，其中 `text` 是默认能力。Provider 的 `default_api_protocol` 只作为新建模型时的界面默认值。
 
-**DeepSeek：**
+模型配置不保存 `thinking_protocol`、思考等级或厂商原始字段。EKO 根据 Provider endpoint、API 协议和模型名从中央 `ThinkingProfile` 注册表解析能力。GUI 的思考菜单以及 TUI/CLI 的 `/think` 只显示当前模型的有效等级；`auto` 表示不发送思考字段。未知模型照常使用，但只有 `auto`。当前注册范围、版本门槛和官方依据见[动态 Provider 架构](architecture/providers.md)。
+
+下面的单个网关同时承载 Responses 文本模型和 Chat Completions 多模态模型：
+
 ```yaml
 model:
-  default_model_id: "deepseek:deepseek-v4-flash"
+  default_model_id: "team-gateway:vision-model"
 
 model_providers:
-  deepseek:
-    auth_token: "your-api-key"
-    base_url: "https://api.deepseek.com/chat/completions"
+  team-gateway:
+    name: "Team Gateway"
+    api_key_env: "TEAM_LLM_KEY"
+    base_url: "https://gateway.example/v1"
+    default_api_protocol: "responses"
+    requires_api_key: true
 
 configured_models:
-  - id: "deepseek:deepseek-v4-flash"
-    display_name: "Deepseek V4 Flash"
-    provider: "deepseek"
-    model: "deepseek-v4-flash"
+  - id: "team-gateway:text-model"
+    display_name: "Text Model"
+    provider: "team-gateway"
+    model: "text-model"
+    api_protocol: "responses"
+    input_modalities: ["text"]
     enabled: true
-```
 
-**OpenAI：**
-```yaml
-model:
-  default_model_id: "openai:gpt-5.5"
-
-model_providers:
-  openai:
-    auth_token: "your-api-key"
-    base_url: "https://api.openai.com/v1/responses"
-
-configured_models:
-  - id: "openai:gpt-5.5"
-    display_name: "Gpt 5.5"
-    provider: "openai"
-    model: "gpt-5.5"
-    enabled: true
-```
-
-**Anthropic Claude：**
-```yaml
-model:
-  default_model_id: "anthropic:claude-opus-4-8"
-
-model_providers:
-  anthropic:
-    auth_token: "your-api-key"
-    base_url: "https://api.anthropic.com/v1/messages"
-
-configured_models:
-  - id: "anthropic:claude-opus-4-8"
-    display_name: "Claude Opus 4 8"
-    provider: "anthropic"
-    model: "claude-opus-4-8"
-    enabled: true
-```
-
-**自定义 Provider：**
-```yaml
-model:
-  default_model_id: "custom:your-model-name"
-
-model_providers:
-  custom:
-    auth_token: "your-api-key"
-    base_url: "https://your-api-endpoint.com/v1/chat/completions"
-
-configured_models:
-  - id: "custom:your-model-name"
-    display_name: "Your Model Name"
-    provider: "custom"
-    model: "your-model-name"
-    enabled: true
-```
-
-若要覆盖默认协议，例如让 OpenAI 使用兼容的 Chat Completions 端点，请同时显式配置完整端点和协议：
-
-```yaml
-model_providers:
-  openai:
-    auth_token: "your-api-key"
-    base_url: "https://api.openai.com/v1/chat/completions"
-
-configured_models:
-  - id: "openai:gpt-5.5-chat"
-    display_name: "Gpt 5.5 Chat"
-    provider: "openai"
-    model: "gpt-5.5"
+  - id: "team-gateway:vision-model"
+    display_name: "Vision Model"
+    provider: "team-gateway"
+    model: "vision-model"
     api_protocol: "chat_completions"
+    input_modalities: ["text", "image", "audio", "video"]
     enabled: true
 ```
 
@@ -349,15 +283,24 @@ configured_models:
 model:
   default_model_id: "ollama:llama3.1"
 
+model_providers:
+  ollama:
+    name: "Ollama"
+    base_url: "http://localhost:11434/v1"
+    default_api_protocol: "chat_completions"
+    requires_api_key: false
+
 configured_models:
   - id: "ollama:llama3.1"
     display_name: "Llama3.1"
     provider: "ollama"
     model: "llama3.1"
+    api_protocol: "chat_completions"
+    input_modalities: ["text"]
     enabled: true
 ```
 
-Ollama 使用默认地址 `http://localhost:11434/api/chat`，无需 API Key。
+Ollama 使用用户配置的 OpenAI-compatible 根地址，无需 API Key。
 
 确保 Ollama 已启动：
 

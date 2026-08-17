@@ -74,6 +74,7 @@ pub enum SlashCommand {
 
     // -- Context --
     Model,
+    Provider,
     Think,
     System,
     Memory,
@@ -162,8 +163,9 @@ impl SlashCommand {
             Self::OpenArtifact => "Open the latest or specified tool-output artifact",
             Self::Workspace => "Manage workspaces",
 
-            Self::Model => "Switch or show current model",
-            Self::Think => "Toggle reasoning/thinking display",
+            Self::Model => "List, add, test, select, or delete models",
+            Self::Provider => "List, add, update, or delete model providers",
+            Self::Think => "Show or set the active model's thinking level",
             Self::System => "Show or set system prompt",
             Self::Memory => "Show memory contents",
             Self::Remember => "Save a fact to memory",
@@ -243,6 +245,7 @@ impl SlashCommand {
             | Self::OpenArtifact
             | Self::Workspace => Category::Session,
             Self::Model
+            | Self::Provider
             | Self::Think
             | Self::System
             | Self::Memory
@@ -299,7 +302,12 @@ impl SlashCommand {
     /// Example usage string (arguments portion).
     pub fn usage(self) -> &'static str {
         match self {
-            Self::Model => "[model-name]",
+            Self::Model => {
+                "[list|use <model>|test <model>|add <provider> <model> <protocol> [image] [audio] [video] [default]|delete <id>]"
+            }
+            Self::Provider => {
+                "[list|add <id> <base-url> <protocol> [api-key-env] [requires-key]|update ...|delete <id>]"
+            }
             Self::System => "[prompt text]",
             Self::Remember => "<fact>",
             Self::Forget => "<fact>",
@@ -457,6 +465,21 @@ mod tests {
             "[list|cleanup|merge <run-id>|discard <run-id>]"
         );
         assert!(SlashCommand::complete("/work").contains(&worktrees));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_and_model_commands_expose_dynamic_configuration() -> Result<(), String> {
+        let provider = "provider"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        let model = "model"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(provider.category(), Category::Context);
+        assert!(provider.usage().contains("add <id> <base-url>"));
+        assert!(model.usage().contains("[image] [audio] [video]"));
         Ok(())
     }
 }

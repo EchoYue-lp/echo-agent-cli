@@ -4,173 +4,126 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ProviderPanel } from './ProviderPanel';
 
 const mocks = vi.hoisted(() => ({
-  listTemplates: vi.fn(),
+  listProviders: vi.fn(),
   listConfigured: vi.fn(),
-  test: vi.fn(),
+  upsertProvider: vi.fn(),
+  deleteProvider: vi.fn(),
   upsertConfigured: vi.fn(),
-  setDefault: vi.fn(),
   deleteConfigured: vi.fn(),
+  setDefault: vi.fn(),
+  test: vi.fn(),
 }));
 
-vi.mock('../../api/endpoints', () => ({
-  providerApi: mocks,
-}));
+vi.mock('../../api/endpoints', () => ({ providerApi: mocks }));
 
-const openAiTemplate = {
-  id: 'openai',
-  name: 'OpenAI',
-  base_url: 'https://api.openai.com/v1/responses',
-  api_key_env: 'OPENAI_API_KEY',
-  default_models: ['gpt-test'],
+const provider = {
+  id: 'team-gateway',
+  name: 'Team Gateway',
+  base_url: 'https://gateway.example/v1',
+  api_key_env: 'TEAM_LLM_KEY',
   requires_api_key: true,
   default_api_protocol: 'responses' as const,
+  has_auth_token: true,
+  auth_source: 'config',
+  model_count: 1,
 };
 
-const configuredModel = {
-  id: 'openai:gpt-test',
-  display_name: 'GPT Test',
-  provider: 'openai',
-  model: 'gpt-test',
+const model = {
+  id: 'team-gateway:model-a',
+  display_name: 'Model A',
+  provider: 'team-gateway',
+  model: 'model-a',
   api_protocol: 'responses' as const,
+  input_modalities: ['text', 'image'] as const,
   enabled: true,
   is_default: false,
   has_auth_token: true,
   auth_source: 'config',
-  base_url: 'https://api.openai.com/v1/responses',
+  base_url: provider.base_url,
   temperature: null,
   max_tokens: null,
   context_window: null,
 };
 
-describe('ProviderPanel protocol selection', () => {
+describe('ProviderPanel', () => {
   afterEach(cleanup);
 
   beforeEach(() => {
     for (const mock of Object.values(mocks)) mock.mockReset();
-    mocks.listTemplates.mockResolvedValue({ providers: [openAiTemplate] });
-    mocks.listConfigured.mockResolvedValue({ models: [], default_model_id: null });
-    mocks.test.mockResolvedValue({ success: true, model: 'gpt-test', auth_source: 'none' });
-  });
-
-  it('keeps the initial provider protocol automatic until the user explicitly selects one', async () => {
-    const { getByRole } = render(<ProviderPanel />);
-    const automatic = await waitFor(() => getByRole('button', { name: 'Auto' }));
-    const responses = getByRole('button', { name: 'Responses' });
-
-    expect(automatic.getAttribute('aria-pressed')).toBe('true');
-    expect(responses.getAttribute('aria-pressed')).toBe('false');
-
-    fireEvent.click(responses);
-    expect(automatic.getAttribute('aria-pressed')).toBe('false');
-    expect(responses.getAttribute('aria-pressed')).toBe('true');
-
-    fireEvent.click(getByRole('button', { name: '测试连接' }));
-    await waitFor(() => {
-      expect(mocks.test).toHaveBeenCalledWith(
-        expect.objectContaining({ api_protocol: 'responses', base_url: undefined })
-      );
+    mocks.listProviders.mockResolvedValue({ providers: [provider] });
+    mocks.listConfigured.mockResolvedValue({ models: [model], default_model_id: null });
+    mocks.upsertProvider.mockResolvedValue({ success: true, provider_id: provider.id });
+    mocks.upsertConfigured.mockResolvedValue({ success: true, model_id: model.id });
+    mocks.setDefault.mockResolvedValue({
+      success: true,
+      model_id: model.id,
+      display_name: model.display_name,
+      model: model.model,
+      provider: provider.id,
     });
   });
 
-  it('surfaces backend validation when an explicit protocol conflicts with the endpoint', async () => {
-    mocks.test.mockRejectedValueOnce(
-      new Error('Configured protocol ChatCompletions does not match endpoint Responses')
-    );
-    const { findByText, getByRole } = render(<ProviderPanel />);
-    await waitFor(() => getByRole('button', { name: 'Auto' }));
-
-    fireEvent.click(getByRole('button', { name: 'Chat Completions' }));
-    fireEvent.click(getByRole('button', { name: '测试连接' }));
-
-    expect(
-      await findByText(
-        '请求失败: Configured protocol ChatCompletions does not match endpoint Responses'
-      )
-    ).toBeTruthy();
-    expect(mocks.test).toHaveBeenCalledWith(
-      expect.objectContaining({ api_protocol: 'chat_completions', base_url: undefined })
-    );
-  });
-
-  it('passes custom complete endpoints to the backend instead of duplicating its parser', async () => {
-    mocks.upsertConfigured.mockRejectedValueOnce({
-      kind: 'validation',
-      message: 'Configured protocol Responses does not match endpoint Anthropic',
+  it('saves an arbitrary provider instead of selecting a built-in template', async () => {
+    const { getByLabelText, getByRole } = render(<ProviderPanel />);
+    await waitFor(() => getByRole('button', { name: '添加 Provider' }));
+    fireEvent.click(getByRole('button', { name: '添加 Provider' }));
+    fireEvent.change(getByLabelText('Provider ID'), { target: { value: 'local-lab' } });
+    fireEvent.change(getByLabelText('名称'), { target: { value: 'Local Lab' } });
+    fireEvent.change(getByLabelText('API 根地址'), {
+      target: { value: 'http://127.0.0.1:11434/v1' },
     });
-    const { findByText, getByDisplayValue, getByRole } = render(<ProviderPanel />);
-    await waitFor(() => getByRole('button', { name: 'Auto' }));
+    fireEvent.click(getByRole('button', { name: 'Anthropic' }));
+    fireEvent.click(getByRole('button', { name: '保存 Provider' }));
 
-    fireEvent.change(getByDisplayValue(openAiTemplate.base_url), {
-      target: { value: 'https://gateway.example/v1/messages' },
-    });
-    fireEvent.click(getByRole('button', { name: 'Responses' }));
-    fireEvent.click(getByRole('button', { name: '保存并使用' }));
-
-    expect(
-      await findByText('切换失败: Configured protocol Responses does not match endpoint Anthropic')
-    ).toBeTruthy();
-    expect(mocks.upsertConfigured).toHaveBeenCalledWith(
-      expect.objectContaining({
-        api_protocol: 'responses',
-        base_url: 'https://gateway.example/v1/messages',
-        set_default: true,
-      })
-    );
-  });
-
-  it('keeps Auto neutral and allows an incomplete provider root to reach backend metadata resolution', async () => {
-    const { getByDisplayValue, getByRole } = render(<ProviderPanel />);
-    const automatic = await waitFor(() => getByRole('button', { name: 'Auto' }));
-
-    fireEvent.change(getByDisplayValue(openAiTemplate.base_url), {
-      target: { value: 'https://gateway.example/v1' },
-    });
-    fireEvent.click(getByRole('button', { name: '测试连接' }));
-
-    expect(automatic.getAttribute('aria-pressed')).toBe('true');
-    await waitFor(() => {
-      expect(mocks.test).toHaveBeenCalledWith(
+    await waitFor(() =>
+      expect(mocks.upsertProvider).toHaveBeenCalledWith(
         expect.objectContaining({
-          api_protocol: undefined,
-          base_url: 'https://gateway.example/v1',
+          id: 'local-lab',
+          base_url: 'http://127.0.0.1:11434/v1',
+          default_api_protocol: 'anthropic',
         })
-      );
-    });
+      )
+    );
   });
 
-  it('shows a structured set-default failure without reporting a successful switch', async () => {
-    mocks.listConfigured.mockResolvedValue({
-      models: [configuredModel],
-      default_model_id: null,
-    });
-    mocks.setDefault.mockRejectedValueOnce({
+  it('persists per-model protocol and multimodal capabilities', async () => {
+    const { getAllByRole, getByLabelText, getByRole } = render(<ProviderPanel />);
+    await waitFor(() => getByLabelText('模型 ID'));
+    fireEvent.change(getByLabelText('模型 ID'), { target: { value: 'vision-model' } });
+    const protocolButtons = getAllByRole('button', { name: 'Chat Completions' });
+    const modelProtocolButton = protocolButtons.find(
+      (button) => button.getAttribute('aria-pressed') === 'true'
+    );
+    if (!modelProtocolButton) throw new Error('model protocol control not found');
+    fireEvent.click(modelProtocolButton);
+    fireEvent.click(getByLabelText('图像'));
+    fireEvent.click(getByLabelText('音频'));
+    fireEvent.click(getByLabelText('视频'));
+    fireEvent.click(getByRole('button', { name: '保存并启用' }));
+
+    await waitFor(() =>
+      expect(mocks.upsertConfigured).toHaveBeenCalledWith(
+        expect.objectContaining({
+          provider: provider.id,
+          model: 'vision-model',
+          api_protocol: 'chat_completions',
+          input_modalities: ['text', 'image', 'audio', 'video'],
+          set_default: true,
+        })
+      )
+    );
+  });
+
+  it('surfaces provider deletion validation from the linearized backend path', async () => {
+    mocks.deleteProvider.mockRejectedValueOnce({
       kind: 'validation',
-      message: 'Invalid Authorization header value',
+      message: "Provider 'team-gateway' still has configured models",
     });
     const { findByText, getByRole } = render(<ProviderPanel />);
-    const setDefault = await waitFor(() => getByRole('button', { name: '设为默认' }));
-
-    fireEvent.click(setDefault);
-
-    expect(await findByText('切换失败: Invalid Authorization header value')).toBeTruthy();
-    expect(mocks.setDefault).toHaveBeenCalledWith(configuredModel.id);
-  });
-
-  it('shows a structured delete failure and keeps the configured model visible', async () => {
-    mocks.listConfigured.mockResolvedValue({
-      models: [configuredModel],
-      default_model_id: null,
-    });
-    mocks.deleteConfigured.mockRejectedValueOnce({
-      kind: 'internal',
-      message: 'Config file is read-only',
-    });
-    const { findByText, getByRole } = render(<ProviderPanel />);
-    const deleteModel = await waitFor(() => getByRole('button', { name: '删除' }));
-
-    fireEvent.click(deleteModel);
-
-    expect(await findByText('删除失败: Config file is read-only')).toBeTruthy();
-    expect(await findByText('GPT Test')).toBeTruthy();
+    const remove = await waitFor(() => getByRole('button', { name: '删除 Provider' }));
+    fireEvent.click(remove);
+    expect(
+      await findByText("删除失败: Provider 'team-gateway' still has configured models")
+    ).toBeTruthy();
   });
 });

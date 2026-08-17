@@ -1,622 +1,667 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Check, Plus, Save, Server, Trash2, Zap } from 'lucide-react';
 import { providerApi } from '../../api/endpoints';
 import { errorMessage } from '../../lib/tauri-bridge';
-import type { ConfiguredModel, LlmApiProtocol, ProviderTemplate } from '../../generated';
-import { Card } from '../common/Card';
+import type {
+  ConfiguredModel,
+  LlmApiProtocol,
+  ModelInputModality,
+  ModelProviderView,
+} from '../../generated';
 
 const MODELS_CHANGED_EVENT = 'eko:models-changed';
-const API_PROTOCOLS = [
+const PROTOCOLS: ReadonlyArray<[LlmApiProtocol, string]> = [
   ['chat_completions', 'Chat Completions'],
   ['responses', 'Responses'],
   ['anthropic', 'Anthropic'],
-] as const;
+];
 
-function notifyModelsChanged() {
-  window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+interface ProviderDraft {
+  id: string;
+  name: string;
+  baseUrl: string;
+  apiKey: string;
+  apiKeyEnv: string;
+  requiresApiKey: boolean;
+  protocol: LlmApiProtocol;
+}
+
+interface ModelDraft {
+  id?: string;
+  displayName: string;
+  model: string;
+  protocol: LlmApiProtocol;
+  imageInput: boolean;
+  audioInput: boolean;
+  videoInput: boolean;
+  temperature: string;
+  maxTokens: string;
+  contextWindow: string;
+}
+
+type Notice = { success: boolean; message: string } | null;
+
+const emptyProvider = (): ProviderDraft => ({
+  id: '',
+  name: '',
+  baseUrl: '',
+  apiKey: '',
+  apiKeyEnv: '',
+  requiresApiKey: false,
+  protocol: 'chat_completions',
+});
+
+const providerDraft = (provider: ModelProviderView): ProviderDraft => ({
+  id: provider.id,
+  name: provider.name,
+  baseUrl: provider.base_url,
+  apiKey: '',
+  apiKeyEnv: provider.api_key_env ?? '',
+  requiresApiKey: provider.requires_api_key,
+  protocol: provider.default_api_protocol,
+});
+
+const emptyModel = (protocol: LlmApiProtocol = 'chat_completions'): ModelDraft => ({
+  displayName: '',
+  model: '',
+  protocol,
+  imageInput: false,
+  audioInput: false,
+  videoInput: false,
+  temperature: '',
+  maxTokens: '',
+  contextWindow: '',
+});
+
+const modelDraft = (model: ConfiguredModel): ModelDraft => ({
+  id: model.id,
+  displayName: model.display_name,
+  model: model.model,
+  protocol: model.api_protocol,
+  imageInput: model.input_modalities.includes('image'),
+  audioInput: model.input_modalities.includes('audio'),
+  videoInput: model.input_modalities.includes('video'),
+  temperature: model.temperature == null ? '' : String(model.temperature),
+  maxTokens: model.max_tokens == null ? '' : String(model.max_tokens),
+  contextWindow: model.context_window == null ? '' : String(model.context_window),
+});
+
+function ProtocolControl({
+  value,
+  onChange,
+}: {
+  value: LlmApiProtocol;
+  onChange: (protocol: LlmApiProtocol) => void;
+}) {
+  return (
+    <div className="grid grid-cols-3 rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] p-0.5">
+      {PROTOCOLS.map(([protocol, label]) => (
+        <button
+          key={protocol}
+          type="button"
+          aria-pressed={value === protocol}
+          onClick={() => onChange(protocol)}
+          className={`min-h-8 min-w-0 rounded px-2 text-xs transition-colors ${
+            value === protocol
+              ? 'bg-[var(--accent)] text-white'
+              : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
+          }`}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
 }
 
 export function ProviderPanel() {
-  const [providers, setProviders] = useState<ProviderTemplate[]>([]);
-  const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
-  const [currentModel, setCurrentModel] = useState<string>('');
+  const [providers, setProviders] = useState<ModelProviderView[]>([]);
+  const [models, setModels] = useState<ConfiguredModel[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [apiKey, setApiKey] = useState('');
-  const [baseUrl, setBaseUrl] = useState('');
-  const [selectedModel, setSelectedModel] = useState('');
-  const [apiProtocol, setApiProtocol] = useState<LlmApiProtocol | undefined>(undefined);
-  const [customModel, setCustomModel] = useState('');
-  const [temperature, setTemperature] = useState('');
-  const [maxTokens, setMaxTokens] = useState('');
-  const [contextWindow, setContextWindow] = useState('');
-  const [contextWindowPreset, setContextWindowPreset] = useState('auto');
+  const [providerForm, setProviderForm] = useState<ProviderDraft>(emptyProvider);
+  const [modelForm, setModelForm] = useState<ModelDraft>(emptyModel);
   const [loading, setLoading] = useState(true);
-  const [testing, setTesting] = useState(false);
-  const [switching, setSwitching] = useState(false);
-  const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
-  const [switchResult, setSwitchResult] = useState<{ success: boolean; message: string } | null>(
-    null
-  );
-  const [modelActionId, setModelActionId] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<Notice>(null);
 
-  const loadConfiguredModels = useCallback(async () => {
-    const res = await providerApi.listConfigured();
-    setConfiguredModels(res.models);
-    const active = res.models.find((model) => model.is_default);
-    setCurrentModel(active?.display_name || active?.model || '');
-  }, []);
+  const reload = useCallback(
+    async (preferredId?: string) => {
+      const [providerResult, modelResult] = await Promise.all([
+        providerApi.listProviders(),
+        providerApi.listConfigured(),
+      ]);
+      setProviders(providerResult.providers);
+      setModels(modelResult.models);
+      const nextId =
+        preferredId ??
+        providerResult.providers.find((provider) => provider.id === selectedId)?.id ??
+        providerResult.providers[0]?.id ??
+        null;
+      setSelectedId(nextId);
+      const next = providerResult.providers.find((provider) => provider.id === nextId);
+      if (next) setProviderForm(providerDraft(next));
+    },
+    [selectedId]
+  );
 
   useEffect(() => {
-    Promise.all([providerApi.listTemplates(), providerApi.listConfigured()])
-      .then(([templateRes, modelRes]) => {
-        setProviders(templateRes.providers);
-        setConfiguredModels(modelRes.models);
-        const active = modelRes.models.find((model) => model.is_default);
-        setCurrentModel(active?.display_name || active?.model || '');
-        // Backfill context_window from the active configured model so that
-        // re-saving (e.g. after changing temperature) does not silently
-        // overwrite the stored value with null.
-        if (active?.context_window != null && active.context_window > 0) {
-          setContextWindow(String(active.context_window));
-        }
-        const firstProvider = templateRes.providers[0];
-        if (firstProvider) {
-          setSelectedId(firstProvider.id);
-          setSelectedModel((firstProvider.default_models ?? [])[0] ?? '');
-          setBaseUrl(firstProvider.base_url);
-          setApiProtocol(undefined);
-        }
-        setLoading(false);
-      })
-      .catch((e) => {
-        console.error(e);
-        setLoading(false);
-      });
-  }, []);
+    void reload()
+      .catch((error: unknown) => setNotice({ success: false, message: errorMessage(error) }))
+      .finally(() => setLoading(false));
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const selected = providers.find((p) => p.id === selectedId) ?? null;
-  const isCustom = selectedId === 'custom';
-  const providerHasModels = (providerId: string) =>
-    configuredModels.some((model) => model.provider === providerId);
-  const authSourceLabel = (source?: string) => {
-    switch (source) {
-      case 'input':
-        return '本次输入的 API Key';
-      case 'config':
-        return '已保存的 API Key';
-      case 'env':
-        return '环境变量 API Key';
-      case 'none':
-        return '未找到 API Key';
-      default:
-        return source || '未知来源';
+  const selectedProvider = providers.find((provider) => provider.id === selectedId) ?? null;
+  const selectedModels = useMemo(
+    () => models.filter((model) => model.provider === selectedId),
+    [models, selectedId]
+  );
+  const fieldClass =
+    'mt-1 min-h-9 w-full rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]';
+
+  const selectProvider = (provider: ModelProviderView) => {
+    setSelectedId(provider.id);
+    setProviderForm(providerDraft(provider));
+    setModelForm(emptyModel(provider.default_api_protocol));
+    setNotice(null);
+  };
+
+  const modalities = (): ModelInputModality[] => [
+    'text',
+    ...(modelForm.imageInput ? (['image'] as ModelInputModality[]) : []),
+    ...(modelForm.audioInput ? (['audio'] as ModelInputModality[]) : []),
+    ...(modelForm.videoInput ? (['video'] as ModelInputModality[]) : []),
+  ];
+
+  const saveProvider = async () => {
+    setBusy('provider');
+    setNotice(null);
+    try {
+      const result = await providerApi.upsertProvider({
+        id: providerForm.id.trim(),
+        name: providerForm.name.trim(),
+        base_url: providerForm.baseUrl.trim(),
+        api_key: providerForm.apiKey.trim() || undefined,
+        api_key_env: providerForm.apiKeyEnv.trim() || undefined,
+        requires_api_key: providerForm.requiresApiKey,
+        default_api_protocol: providerForm.protocol,
+      });
+      await reload(result.provider_id);
+      setNotice({ success: true, message: `Provider ${result.provider_id} 已保存` });
+    } catch (error: unknown) {
+      setNotice({ success: false, message: `保存失败: ${errorMessage(error)}` });
+    } finally {
+      setBusy(null);
     }
   };
 
-  const handleSelectProvider = (p: ProviderTemplate) => {
-    setSelectedId(p.id);
-    setSelectedModel((p.default_models ?? [])[0] ?? '');
-    setCustomModel('');
-    setBaseUrl(p.base_url);
-    setApiProtocol(undefined);
-    setApiKey('');
-    setTemperature('');
-    setMaxTokens('');
-    setContextWindow('');
-    setContextWindowPreset('auto');
-    setTestResult(null);
-    setSwitchResult(null);
+  const removeProvider = async () => {
+    if (!selectedProvider) return;
+    setBusy(selectedProvider.id);
+    try {
+      await providerApi.deleteProvider(selectedProvider.id);
+      setSelectedId(null);
+      setProviderForm(emptyProvider());
+      await reload();
+      setNotice({ success: true, message: `${selectedProvider.name} 已删除` });
+    } catch (error: unknown) {
+      setNotice({ success: false, message: `删除失败: ${errorMessage(error)}` });
+    } finally {
+      setBusy(null);
+    }
   };
 
-  const handleTest = async () => {
-    if (!selected) return;
-    setTesting(true);
-    setTestResult(null);
+  const saveModel = async (setDefault: boolean) => {
+    if (!selectedProvider) return;
+    setBusy('model');
+    setNotice(null);
     try {
-      const model = customModel.trim() || selectedModel;
-      const res = await providerApi.test({
-        provider: selected.id,
-        model,
-        api_protocol: apiProtocol,
-        api_key: apiKey || undefined,
-        base_url: baseUrl && baseUrl !== selected.base_url ? baseUrl : undefined,
+      await providerApi.upsertConfigured({
+        id: modelForm.id,
+        display_name: modelForm.displayName.trim() || undefined,
+        provider: selectedProvider.id,
+        model: modelForm.model.trim(),
+        api_protocol: modelForm.protocol,
+        input_modalities: modalities(),
+        temperature: modelForm.temperature ? Number(modelForm.temperature) : undefined,
+        max_tokens: modelForm.maxTokens ? Number(modelForm.maxTokens) : undefined,
+        context_window: modelForm.contextWindow ? Number(modelForm.contextWindow) : undefined,
+        set_default: setDefault,
       });
-      setTestResult({
-        success: res.success,
-        message: res.success
-          ? `连接成功！模型: ${res.model}，使用: ${authSourceLabel(res.auth_source)}，响应: ${res.response?.slice(0, 100)}`
-          : `连接失败: ${res.error}（使用: ${authSourceLabel(res.auth_source)}）`,
+      await reload(selectedProvider.id);
+      setModelForm(emptyModel(selectedProvider.default_api_protocol));
+      window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+      setNotice({ success: true, message: setDefault ? '模型已保存并启用' : '模型已保存' });
+    } catch (error: unknown) {
+      setNotice({ success: false, message: `保存失败: ${errorMessage(error)}` });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const testConnection = async () => {
+    setBusy('test');
+    setNotice(null);
+    try {
+      const result = await providerApi.test({
+        provider: providerForm.id.trim(),
+        model: modelForm.model.trim(),
+        api_protocol: modelForm.protocol,
+        input_modalities: modalities(),
+        api_key: providerForm.apiKey.trim() || undefined,
+        base_url: providerForm.baseUrl.trim(),
+      });
+      setNotice({
+        success: result.success,
+        message: result.success
+          ? `连接成功: ${result.model}`
+          : `连接失败: ${result.error ?? '未知错误'}`,
       });
     } catch (error: unknown) {
-      setTestResult({ success: false, message: `请求失败: ${errorMessage(error)}` });
+      setNotice({ success: false, message: `连接失败: ${errorMessage(error)}` });
     } finally {
-      setTesting(false);
+      setBusy(null);
     }
   };
 
-  const handleSwitch = async () => {
-    if (!selected) return;
-    setSwitching(true);
-    setSwitchResult(null);
+  const setDefaultModel = async (model: ConfiguredModel) => {
+    setBusy(model.id);
     try {
-      const model = customModel.trim() || selectedModel;
-      const trimmedApiKey = apiKey.trim();
-      const trimmedBaseUrl = baseUrl.trim();
-      const hasCustomApiKey = trimmedApiKey.length > 0;
-      const hasCustomBaseUrl = trimmedBaseUrl.length > 0 && trimmedBaseUrl !== selected.base_url;
-      const res = await providerApi.upsertConfigured({
-        model,
-        provider: selected.id,
-        api_protocol: apiProtocol,
-        api_key: hasCustomApiKey ? trimmedApiKey : undefined,
-        base_url: hasCustomBaseUrl || isCustom ? trimmedBaseUrl : undefined,
-        temperature: temperature ? Number(temperature) : undefined,
-        max_tokens: maxTokens ? Number(maxTokens) : undefined,
-        context_window: contextWindow ? Number(contextWindow) : undefined,
-        set_default: true,
-      });
-      setSwitchResult({
-        success: res.success,
-        message: `已保存并设为默认模型（使用: ${authSourceLabel(res.auth_source)}）`,
-      });
-      if (res.success) {
-        await loadConfiguredModels();
-        notifyModelsChanged();
-      }
+      await providerApi.setDefault(model.id);
+      await reload(model.provider);
+      window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+      setNotice({ success: true, message: `${model.display_name || model.model} 已启用` });
     } catch (error: unknown) {
-      setSwitchResult({ success: false, message: `切换失败: ${errorMessage(error)}` });
+      setNotice({ success: false, message: `切换失败: ${errorMessage(error)}` });
     } finally {
-      setSwitching(false);
+      setBusy(null);
     }
   };
 
-  const handleSetDefault = async (model: ConfiguredModel) => {
-    setModelActionId(model.id);
-    setSwitchResult(null);
-    try {
-      const res = await providerApi.setDefault(model.id);
-      setCurrentModel(res.display_name || res.model);
-      await loadConfiguredModels();
-      notifyModelsChanged();
-      setSwitchResult({
-        success: true,
-        message: `已将 ${res.display_name || res.model} 设为默认模型`,
-      });
-    } catch (error: unknown) {
-      setSwitchResult({ success: false, message: `切换失败: ${errorMessage(error)}` });
-    } finally {
-      setModelActionId(null);
-    }
-  };
-
-  const handleDeleteModel = async (model: ConfiguredModel) => {
-    setModelActionId(model.id);
-    setSwitchResult(null);
+  const removeModel = async (model: ConfiguredModel) => {
+    setBusy(model.id);
     try {
       await providerApi.deleteConfigured(model.id);
-      await loadConfiguredModels();
-      notifyModelsChanged();
-      setSwitchResult({ success: true, message: `已删除 ${model.display_name || model.model}` });
+      await reload(model.provider);
+      window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+      setNotice({ success: true, message: `${model.display_name || model.model} 已删除` });
     } catch (error: unknown) {
-      setSwitchResult({ success: false, message: `删除失败: ${errorMessage(error)}` });
+      setNotice({ success: false, message: `删除失败: ${errorMessage(error)}` });
     } finally {
-      setModelActionId(null);
+      setBusy(null);
     }
   };
 
-  if (loading) return <div className="p-3 text-sm text-[var(--text-tertiary)]">加载中...</div>;
+  if (loading) return <div className="p-4 text-sm text-[var(--text-tertiary)]">加载中...</div>;
 
   return (
-    <div className="space-y-4 p-3">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+    <div className="p-3">
+      <div className="mb-3 flex items-center justify-between">
         <div>
-          <h3 className="text-sm font-semibold text-[var(--text-primary)]">模型供应商</h3>
-          <p className="mt-0.5 text-xs text-[var(--text-tertiary)]">
-            当前模型:{' '}
-            <span className="font-medium text-[var(--accent)]">{currentModel || '未设置'}</span>
+          <h3 className="text-sm font-semibold text-[var(--text-primary)]">模型 Provider</h3>
+          <p className="text-xs text-[var(--text-tertiary)]">
+            {providers.length} providers · {models.length} models
           </p>
         </div>
+        <button
+          type="button"
+          onClick={() => {
+            setSelectedId(null);
+            setProviderForm(emptyProvider());
+            setModelForm(emptyModel());
+          }}
+          className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white"
+        >
+          <Plus size={14} /> 添加 Provider
+        </button>
       </div>
 
-      <Card variant="elevated">
-        <div className="flex items-center justify-between border-b border-[var(--border-secondary)] px-3 py-2">
-          <h4 className="text-xs font-semibold text-[var(--text-primary)]">已添加模型</h4>
-          <span className="text-[10px] text-[var(--text-tertiary)]">
-            {configuredModels.length} 个
-          </span>
+      {notice && (
+        <div
+          role="status"
+          className={`mb-3 rounded-md border px-3 py-2 text-xs ${
+            notice.success
+              ? 'border-emerald-500/35 bg-emerald-500/10 text-emerald-600'
+              : 'border-red-500/35 bg-red-500/10 text-red-600'
+          }`}
+        >
+          {notice.message}
         </div>
-        {configuredModels.length === 0 ? (
-          <div className="px-3 py-4 text-xs text-[var(--text-tertiary)]">
-            还没有添加模型。选择下方厂商并保存后，会出现在输入框的模型切换里。
-          </div>
-        ) : (
-          <div className="divide-y divide-[var(--border-secondary)]">
-            {configuredModels.map((model) => (
-              <div key={model.id} className="flex items-center gap-3 px-3 py-2">
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-medium text-[var(--text-primary)]">
-                    {model.display_name || model.model}
-                  </div>
-                  <div className="truncate text-[10px] text-[var(--text-tertiary)]">
-                    {model.provider}
-                    <span className="ml-2">
-                      {model.api_protocol === 'responses'
-                        ? 'Responses'
-                        : model.api_protocol === 'anthropic'
-                          ? 'Anthropic Messages'
-                          : 'Chat Completions'}
-                    </span>
-                    {model.is_default && <span className="ml-2 text-[var(--accent)]">默认</span>}
-                  </div>
-                </div>
-                {!model.is_default && (
-                  <button
-                    onClick={() => handleSetDefault(model)}
-                    disabled={modelActionId === model.id}
-                    className="rounded-md border border-[var(--border-primary)] px-2 py-1 text-[11px] text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-40"
-                  >
-                    设为默认
-                  </button>
-                )}
-                <button
-                  onClick={() => handleDeleteModel(model)}
-                  disabled={modelActionId === model.id}
-                  className="rounded-md px-2 py-1 text-[11px] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40"
-                >
-                  删除
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </Card>
+      )}
 
-      {/* Provider grid */}
-      <div className="grid grid-cols-2 gap-2">
-        {providers.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => handleSelectProvider(p)}
-            className={`flex items-center gap-3 rounded-lg border p-3 text-left transition-all
-              ${
-                selectedId === p.id
-                  ? 'border-[var(--accent)] bg-[var(--accent)]/5 shadow-[var(--shadow-sm)]'
-                  : 'border-[var(--border-primary)] bg-[var(--bg-primary)] hover:border-[var(--border-focus)] hover:bg-[var(--bg-hover)]'
-              }`}
-          >
-            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-[var(--bg-secondary)] text-xs font-semibold text-[var(--text-secondary)]">
-              {p.name.slice(0, 1).toUpperCase()}
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium text-[var(--text-primary)]">
-                {p.name}
-              </div>
-              {p.id !== 'custom' && (
-                <div className="flex items-center gap-1.5 mt-0.5">
-                  <span
-                    className={`inline-block h-1.5 w-1.5 rounded-full ${
-                      providerHasModels(p.id) ? 'bg-emerald-500' : 'bg-[var(--text-tertiary)]'
-                    }`}
-                  />
-                  <span className="text-[10px] text-[var(--text-tertiary)]">
-                    {providerHasModels(p.id) ? '已配置' : '未配置'}
-                  </span>
-                </div>
-              )}
-              {p.id === 'custom' && (
-                <div className="text-[10px] text-[var(--text-tertiary)] mt-0.5">自定义端点</div>
-              )}
+      <div className="grid min-h-[520px] grid-cols-1 border-y border-[var(--border-primary)] md:grid-cols-[210px_minmax(0,1fr)]">
+        <aside className="border-b border-[var(--border-primary)] py-2 md:border-b-0 md:border-r">
+          {providers.length === 0 ? (
+            <div className="px-3 py-6 text-center text-xs text-[var(--text-tertiary)]">
+              暂无 Provider
             </div>
-          </button>
-        ))}
-      </div>
-
-      {/* Selected provider config */}
-      {selected && (
-        <Card variant="elevated" className="p-4 space-y-3">
-          <div className="flex items-center gap-2">
-            <span className="flex h-7 w-7 items-center justify-center rounded-md bg-[var(--bg-secondary)] text-xs font-semibold text-[var(--text-secondary)]">
-              {selected.name.slice(0, 1).toUpperCase()}
-            </span>
-            <h4 className="text-sm font-semibold text-[var(--text-primary)]">{selected.name}</h4>
-          </div>
-
-          {/* API Key */}
-          {(selected.requires_api_key || isCustom) && (
-            <div>
-              <label className="mb-1 block text-xs text-[var(--text-secondary)]">
-                API Key
-                {!isCustom && selected.api_key_env && (
-                  <span className="ml-1 text-[var(--text-tertiary)]">
-                    (环境变量: {selected.api_key_env})
-                  </span>
-                )}
-              </label>
-              <input
-                type="password"
-                value={apiKey}
-                onChange={(e) => setApiKey(e.target.value)}
-                placeholder={
-                  isCustom
-                    ? '可选，本地端点通常无需 API Key'
-                    : providerHasModels(selected.id)
-                      ? '已配置 (留空使用已保存配置或环境变量)'
-                      : '输入 API Key'
-                }
-                className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
-              />
-              <p className="mt-1 text-[10px] text-[var(--text-tertiary)]">
-                留空时会使用已保存配置，其次使用环境变量；本地/自定义端点也可以不使用 API Key。
-              </p>
-            </div>
-          )}
-
-          {/* API protocol */}
-          <fieldset>
-            <legend className="mb-1 block text-xs text-[var(--text-secondary)]">API 协议</legend>
-            <div className="grid w-full grid-cols-2 rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] p-0.5">
-              <button
-                type="button"
-                aria-pressed={apiProtocol === undefined}
-                onClick={() => setApiProtocol(undefined)}
-                className={`min-w-0 rounded px-3 py-1.5 text-xs transition-colors ${
-                  apiProtocol === undefined
-                    ? 'bg-[var(--accent)] text-white'
-                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
-                }`}
-              >
-                Auto
-              </button>
-              {API_PROTOCOLS.map(([value, label]) => (
+          ) : (
+            <div className="space-y-1 px-2">
+              {providers.map((provider) => (
                 <button
-                  key={value}
+                  key={provider.id}
                   type="button"
-                  aria-pressed={apiProtocol === value}
-                  onClick={() => setApiProtocol(value)}
-                  className={`min-w-0 rounded px-3 py-1.5 text-xs transition-colors ${
-                    apiProtocol === value
-                      ? 'bg-[var(--accent)] text-white'
+                  onClick={() => selectProvider(provider)}
+                  className={`flex min-h-11 w-full items-center gap-2 rounded-md px-2 text-left ${
+                    selectedId === provider.id
+                      ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]'
                       : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]'
                   }`}
                 >
-                  {label}
+                  <Server size={15} className="shrink-0" />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-xs font-medium">{provider.name}</span>
+                    <span className="block text-[10px] text-[var(--text-tertiary)]">
+                      {provider.model_count} models
+                    </span>
+                  </span>
                 </button>
               ))}
             </div>
-          </fieldset>
+          )}
+        </aside>
 
-          {/* Base URL */}
-          <div>
-            <label className="mb-1 block text-xs text-[var(--text-secondary)]">
-              API 地址
-              {!isCustom && (
-                <span className="ml-1 text-[var(--text-tertiary)]">(可选，覆盖默认)</span>
+        <main className="min-w-0 divide-y divide-[var(--border-primary)]">
+          <section className="space-y-3 p-4">
+            <div className="flex items-center justify-between">
+              <h4 className="text-xs font-semibold text-[var(--text-primary)]">
+                {selectedProvider ? 'Provider 配置' : '新 Provider'}
+              </h4>
+              {selectedProvider && (
+                <button
+                  type="button"
+                  title="删除 Provider"
+                  aria-label="删除 Provider"
+                  onClick={() => void removeProvider()}
+                  disabled={busy === selectedProvider.id}
+                  className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-red-500/10 hover:text-red-600 disabled:opacity-40"
+                >
+                  <Trash2 size={15} />
+                </button>
               )}
-            </label>
-            <input
-              type="text"
-              value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
-              placeholder={
-                isCustom ? 'https://api.example.com/v1/chat/completions' : selected.base_url
-              }
-              className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
-            />
-          </div>
-
-          {/* Model selection */}
-          <div>
-            <label
-              htmlFor="provider-model"
-              className="mb-1 block text-xs text-[var(--text-secondary)]"
-            >
-              模型
-            </label>
-            {isCustom || (selected.default_models ?? []).length === 0 ? (
-              <input
-                id="provider-model"
-                type="text"
-                value={isCustom ? customModel || selectedModel : customModel}
-                onChange={(e) => {
-                  if (isCustom) {
-                    setSelectedModel(e.target.value);
-                    setCustomModel('');
-                  } else {
-                    setCustomModel(e.target.value);
-                  }
-                }}
-                placeholder="输入模型名称"
-                className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
-              />
-            ) : (
-              <>
-                <div className="flex gap-2">
-                  <select
-                    id="provider-model"
-                    value={customModel.trim() ? '__custom__' : selectedModel}
-                    onChange={(e) => {
-                      if (e.target.value === '__custom__') {
-                        setCustomModel(selectedModel);
-                      } else {
-                        setSelectedModel(e.target.value);
-                        setCustomModel('');
-                      }
-                    }}
-                    className="flex-1 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
-                  >
-                    {(selected.default_models ?? []).map((m) => (
-                      <option key={m} value={m}>
-                        {m}
-                      </option>
-                    ))}
-                    <option value="__custom__">自定义模型...</option>
-                  </select>
-                </div>
-                {customModel.trim() && (
-                  <input
-                    type="text"
-                    value={customModel}
-                    onChange={(e) => setCustomModel(e.target.value)}
-                    placeholder="输入自定义模型名称"
-                    className="mt-2 w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
-                  />
-                )}
-              </>
-            )}
-          </div>
-
-          {/* Temperature & Max Tokens */}
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label
-                htmlFor="provider-temperature"
-                className="mb-1 block text-xs text-[var(--text-secondary)]"
-              >
-                温度
-                <span className="ml-1 text-[var(--text-tertiary)]">(可选)</span>
-              </label>
-              <input
-                id="provider-temperature"
-                type="number"
-                step="0.1"
-                min="0"
-                max="2"
-                value={temperature}
-                onChange={(e) => setTemperature(e.target.value)}
-                placeholder="默认"
-                className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
-              />
             </div>
-            <div>
-              <label
-                htmlFor="provider-max-tokens"
-                className="mb-1 block text-xs text-[var(--text-secondary)]"
-              >
-                最大输出 Token
-                <span className="ml-1 text-[var(--text-tertiary)]">(可选)</span>
-              </label>
-              <input
-                id="provider-max-tokens"
-                type="number"
-                min="1"
-                value={maxTokens}
-                onChange={(e) => setMaxTokens(e.target.value)}
-                placeholder="默认（由模型决定）"
-                className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
-              />
-            </div>
-          </div>
 
-          {/* Thinking depth — only rendered for models that support a thinking
-              control (queried via get_thinking_support). The dropdown's options
-              come from the backend so they match the resolved ThinkingProtocol. */}
-          {/* NOTE: thinking-depth was moved to the chat input toolbar as a
-              runtime per-session control (see ChatInput.tsx). It is decoupled
-              from model config so every model exposes it. */}
-
-          {/* Context Window */}
-          <div>
-            <label
-              htmlFor="provider-context-window"
-              className="mb-1 block text-xs text-[var(--text-secondary)]"
-            >
-              模型上下文窗口
-              <span className="ml-1 text-[var(--text-tertiary)]">(可选，留空自动推断)</span>
-            </label>
-            <div className="flex gap-2">
-              <select
-                id="provider-context-window"
-                value={contextWindowPreset}
-                onChange={(e) => {
-                  const val = e.target.value;
-                  setContextWindowPreset(val);
-                  if (val === 'auto') {
-                    setContextWindow('');
-                  } else if (val !== 'custom') {
-                    setContextWindow(val);
-                  }
-                }}
-                className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
-              >
-                <option value="auto">自动</option>
-                <option value="4096">4K</option>
-                <option value="8192">8K</option>
-                <option value="16384">16K</option>
-                <option value="32768">32K</option>
-                <option value="65536">64K</option>
-                <option value="131072">128K</option>
-                <option value="200000">200K</option>
-                <option value="500000">500K</option>
-                <option value="1000000">1M</option>
-                <option value="2000000">2M</option>
-                <option value="custom">自定义</option>
-              </select>
-              {contextWindowPreset === 'custom' && (
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="text-xs text-[var(--text-secondary)]">
+                Provider ID
                 <input
-                  type="number"
-                  min="1"
-                  step="1000"
-                  value={contextWindow}
-                  onChange={(e) => setContextWindow(e.target.value)}
-                  placeholder="输入 token 数"
-                  className="flex-1 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
+                  value={providerForm.id}
+                  disabled={selectedProvider != null}
+                  onChange={(event) =>
+                    setProviderForm((value) => ({ ...value, id: event.target.value }))
+                  }
+                  placeholder="company-gateway"
+                  className={`${fieldClass} disabled:opacity-60`}
                 />
+              </label>
+              <label className="text-xs text-[var(--text-secondary)]">
+                名称
+                <input
+                  value={providerForm.name}
+                  onChange={(event) =>
+                    setProviderForm((value) => ({ ...value, name: event.target.value }))
+                  }
+                  placeholder="Company Gateway"
+                  className={fieldClass}
+                />
+              </label>
+            </div>
+
+            <label className="block text-xs text-[var(--text-secondary)]">
+              API 根地址
+              <input
+                value={providerForm.baseUrl}
+                onChange={(event) =>
+                  setProviderForm((value) => ({ ...value, baseUrl: event.target.value }))
+                }
+                placeholder="https://gateway.example.com/v1"
+                className={fieldClass}
+              />
+            </label>
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label className="text-xs text-[var(--text-secondary)]">
+                API Key
+                <input
+                  type="password"
+                  value={providerForm.apiKey}
+                  onChange={(event) =>
+                    setProviderForm((value) => ({ ...value, apiKey: event.target.value }))
+                  }
+                  placeholder={selectedProvider?.has_auth_token ? '已配置' : '可选'}
+                  className={fieldClass}
+                />
+              </label>
+              <label className="text-xs text-[var(--text-secondary)]">
+                环境变量
+                <input
+                  value={providerForm.apiKeyEnv}
+                  onChange={(event) =>
+                    setProviderForm((value) => ({ ...value, apiKeyEnv: event.target.value }))
+                  }
+                  placeholder="COMPANY_LLM_API_KEY"
+                  className={fieldClass}
+                />
+              </label>
+            </div>
+
+            <div>
+              <div className="mb-1 text-xs text-[var(--text-secondary)]">新模型默认协议</div>
+              <ProtocolControl
+                value={providerForm.protocol}
+                onChange={(protocol) => setProviderForm((value) => ({ ...value, protocol }))}
+              />
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
+                <input
+                  type="checkbox"
+                  checked={providerForm.requiresApiKey}
+                  onChange={(event) =>
+                    setProviderForm((value) => ({
+                      ...value,
+                      requiresApiKey: event.target.checked,
+                    }))
+                  }
+                />
+                必须提供 API Key
+              </label>
+              <button
+                type="button"
+                onClick={() => void saveProvider()}
+                disabled={
+                  busy === 'provider' || !providerForm.id.trim() || !providerForm.baseUrl.trim()
+                }
+                className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white disabled:opacity-40"
+              >
+                <Save size={14} /> {busy === 'provider' ? '保存中...' : '保存 Provider'}
+              </button>
+            </div>
+          </section>
+
+          {selectedProvider && (
+            <section className="space-y-3 p-4">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-semibold text-[var(--text-primary)]">模型</h4>
+                <button
+                  type="button"
+                  title="添加模型"
+                  aria-label="添加模型"
+                  onClick={() => setModelForm(emptyModel(selectedProvider.default_api_protocol))}
+                  className="flex h-8 w-8 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+                >
+                  <Plus size={15} />
+                </button>
+              </div>
+
+              {selectedModels.length > 0 && (
+                <div className="divide-y divide-[var(--border-secondary)] border-y border-[var(--border-secondary)]">
+                  {selectedModels.map((model) => (
+                    <div key={model.id} className="flex min-h-12 items-center gap-2 py-2">
+                      <button
+                        type="button"
+                        onClick={() => setModelForm(modelDraft(model))}
+                        className="min-w-0 flex-1 text-left"
+                      >
+                        <span className="block truncate text-xs font-medium text-[var(--text-primary)]">
+                          {model.display_name || model.model}
+                        </span>
+                        <span className="block truncate text-[10px] text-[var(--text-tertiary)]">
+                          {model.model} · {model.api_protocol} · {model.input_modalities.join(', ')}
+                        </span>
+                      </button>
+                      {model.is_default ? (
+                        <span className="flex items-center gap-1 text-[10px] text-emerald-600">
+                          <Check size={12} /> 使用中
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => void setDefaultModel(model)}
+                          disabled={busy === model.id}
+                          className="min-h-7 rounded-md border border-[var(--border-primary)] px-2 text-[10px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40"
+                        >
+                          启用
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        title="删除模型"
+                        aria-label={`删除 ${model.display_name || model.model}`}
+                        onClick={() => void removeModel(model)}
+                        disabled={busy === model.id}
+                        className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-red-500/10 hover:text-red-600 disabled:opacity-40"
+                      >
+                        <Trash2 size={13} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
               )}
-            </div>
-            <p className="mt-1 text-[10px] text-[var(--text-tertiary)]">
-              用于压缩触发、TokenBudget 分配和自适应压缩调优。自动模式下根据模型名称推断。
-            </p>
-          </div>
 
-          {/* Action buttons */}
-          <div className="flex items-center gap-2 pt-1">
-            <button
-              onClick={handleTest}
-              disabled={
-                testing ||
-                (isCustom && (!baseUrl.trim() || !(customModel.trim() || selectedModel.trim())))
-              }
-              className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {testing ? '测试中...' : '测试连接'}
-            </button>
-            <button
-              onClick={handleSwitch}
-              disabled={
-                switching ||
-                (isCustom && (!baseUrl.trim() || !(customModel.trim() || selectedModel.trim())))
-              }
-              className="rounded-lg bg-[var(--accent)] px-4 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {switching ? '保存中...' : '保存并使用'}
-            </button>
-          </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <label className="text-xs text-[var(--text-secondary)]">
+                  模型 ID
+                  <input
+                    value={modelForm.model}
+                    onChange={(event) =>
+                      setModelForm((value) => ({ ...value, model: event.target.value }))
+                    }
+                    placeholder="model-name"
+                    className={fieldClass}
+                  />
+                </label>
+                <label className="text-xs text-[var(--text-secondary)]">
+                  显示名称
+                  <input
+                    value={modelForm.displayName}
+                    onChange={(event) =>
+                      setModelForm((value) => ({ ...value, displayName: event.target.value }))
+                    }
+                    placeholder="Model Name"
+                    className={fieldClass}
+                  />
+                </label>
+              </div>
 
-          {/* Results */}
-          {testResult && (
-            <div
-              className={`rounded-lg px-3 py-2 text-xs ${
-                testResult.success
-                  ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                  : 'bg-red-500/10 text-red-600 dark:text-red-400'
-              }`}
-            >
-              {testResult.message}
-            </div>
+              <div>
+                <div className="mb-1 text-xs text-[var(--text-secondary)]">API 协议</div>
+                <ProtocolControl
+                  value={modelForm.protocol}
+                  onChange={(protocol) => setModelForm((value) => ({ ...value, protocol }))}
+                />
+              </div>
+
+              <div>
+                <div className="mb-1 text-xs text-[var(--text-secondary)]">输入能力</div>
+                <div className="flex min-h-9 flex-wrap items-center gap-4 rounded-md border border-[var(--border-primary)] px-3 text-xs text-[var(--text-secondary)]">
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" checked disabled /> 纯文本（默认）
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={modelForm.imageInput}
+                      onChange={(event) =>
+                        setModelForm((value) => ({ ...value, imageInput: event.target.checked }))
+                      }
+                    />{' '}
+                    图像
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={modelForm.audioInput}
+                      onChange={(event) =>
+                        setModelForm((value) => ({ ...value, audioInput: event.target.checked }))
+                      }
+                    />{' '}
+                    音频
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input
+                      type="checkbox"
+                      checked={modelForm.videoInput}
+                      onChange={(event) =>
+                        setModelForm((value) => ({ ...value, videoInput: event.target.checked }))
+                      }
+                    />{' '}
+                    视频
+                  </label>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                {[
+                  ['Temperature', 'temperature'],
+                  ['Max tokens', 'maxTokens'],
+                  ['Context window', 'contextWindow'],
+                ].map(([label, key]) => (
+                  <label key={key} className="text-xs text-[var(--text-secondary)]">
+                    {label}
+                    <input
+                      type="number"
+                      step={key === 'temperature' ? '0.1' : '1'}
+                      value={modelForm[key as 'temperature' | 'maxTokens' | 'contextWindow']}
+                      onChange={(event) =>
+                        setModelForm((value) => ({ ...value, [key]: event.target.value }))
+                      }
+                      className={fieldClass}
+                    />
+                  </label>
+                ))}
+              </div>
+
+              <div className="flex flex-wrap justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => void testConnection()}
+                  disabled={busy === 'test' || !modelForm.model.trim()}
+                  className="flex min-h-8 items-center gap-1.5 rounded-md border border-[var(--border-primary)] px-3 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40"
+                >
+                  <Zap size={14} /> {busy === 'test' ? '测试中...' : '测试连接'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void saveModel(false)}
+                  disabled={busy === 'model' || !modelForm.model.trim()}
+                  className="min-h-8 rounded-md border border-[var(--border-primary)] px-3 text-xs text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-40"
+                >
+                  保存
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void saveModel(true)}
+                  disabled={busy === 'model' || !modelForm.model.trim()}
+                  className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white disabled:opacity-40"
+                >
+                  <Check size={14} /> 保存并启用
+                </button>
+              </div>
+            </section>
           )}
-          {switchResult && (
-            <div
-              className={`rounded-lg px-3 py-2 text-xs ${
-                switchResult.success
-                  ? 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400'
-                  : 'bg-red-500/10 text-red-600 dark:text-red-400'
-              }`}
-            >
-              {switchResult.message}
-            </div>
-          )}
-        </Card>
-      )}
+        </main>
+      </div>
     </div>
   );
 }

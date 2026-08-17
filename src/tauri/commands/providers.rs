@@ -3,12 +3,13 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::config::{ConfiguredModel, ModelProviderConfig};
-use echo_agent::llm::LlmApiProtocol;
-use echo_agent::prelude::Message;
+use echo_agent::llm::{LlmApiProtocol, ModelInputModality};
 use echo_agent_app_core::AppState;
-use echo_agent_app_core::infra::prepare_runtime_llm;
+use echo_agent_app_core::infra::test_runtime_llm_connection;
 use echo_agent_app_core::model_config::{self, ModelRuntimeConfig};
-use echo_agent_app_core::state::{ConfiguredModelMutation, ModelMutationError};
+use echo_agent_app_core::state::{
+    ConfiguredModelMutation, ModelMutationError, ModelProviderMutation,
+};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -18,16 +19,24 @@ pub struct UpsertConfiguredModelRequest {
     pub display_name: Option<String>,
     pub provider: String,
     pub model: String,
-    pub api_protocol: Option<LlmApiProtocol>,
-    pub api_key: Option<String>,
-    pub base_url: Option<String>,
+    pub api_protocol: LlmApiProtocol,
+    pub input_modalities: Option<Vec<ModelInputModality>>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
     pub enabled: Option<bool>,
     pub set_default: Option<bool>,
-    /// 思考深度(`auto`/`disabled`/`minimal`/`low`/`medium`/`high`/`<number>`)。
-    pub thinking: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct UpsertModelProviderRequest {
+    pub id: String,
+    pub name: String,
+    pub api_key: Option<String>,
+    pub api_key_env: Option<String>,
+    pub base_url: String,
+    pub default_api_protocol: LlmApiProtocol,
+    pub requires_api_key: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -44,7 +53,6 @@ struct ConnectionProbe {
 fn resolve_auth_token(
     user_key: Option<&str>,
     provider_config: Option<&ModelProviderConfig>,
-    provider: &str,
 ) -> ResolvedAuth {
     if let Some(token) = user_key.map(str::trim).filter(|token| !token.is_empty()) {
         return ResolvedAuth {
@@ -64,7 +72,7 @@ fn resolve_auth_token(
         };
     }
 
-    if let Some(token) = model_config::find_env_api_key(provider) {
+    if let Some(token) = provider_config.and_then(model_config::find_env_api_key) {
         return ResolvedAuth {
             token,
             source: "env",
@@ -85,14 +93,14 @@ fn configured_model_mutation(req: UpsertConfiguredModelRequest) -> ConfiguredMod
             provider: req.provider,
             model: req.model,
             api_protocol: req.api_protocol,
+            input_modalities: req
+                .input_modalities
+                .unwrap_or_else(ModelInputModality::text_only),
             enabled: req.enabled.unwrap_or(true),
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             context_window: req.context_window,
-            thinking: req.thinking,
         },
-        auth_token: req.api_key,
-        base_url: req.base_url,
         set_default: req.set_default.unwrap_or(false),
     }
 }
@@ -110,22 +118,21 @@ fn resolve_connection_probe(
     model: String,
     api_key: Option<String>,
     base_url: Option<String>,
-    api_protocol: Option<LlmApiProtocol>,
+    api_protocol: LlmApiProtocol,
+    input_modalities: Vec<ModelInputModality>,
 ) -> ConnectionProbe {
     let provider_config = app_config.model_providers.get(&provider);
-    let auth = resolve_auth_token(api_key.as_deref(), provider_config, &provider);
+    let auth = resolve_auth_token(api_key.as_deref(), provider_config);
     let base_url = base_url
         .filter(|url| !url.trim().is_empty())
-        .or_else(|| provider_config.and_then(|config| config.base_url.clone()))
-        .or_else(|| model_config::default_base_url(&provider));
+        .or_else(|| provider_config.and_then(|config| config.base_url.clone()));
     let mut probe_config = app_config.clone();
-    probe_config.model_providers.insert(
-        provider.clone(),
-        ModelProviderConfig {
-            auth_token: (!auth.token.is_empty()).then(|| auth.token.clone()),
-            base_url,
-        },
-    );
+    let mut probe_provider = provider_config.cloned().unwrap_or_default();
+    probe_provider.auth_token = (!auth.token.is_empty()).then(|| auth.token.clone());
+    probe_provider.base_url = base_url;
+    probe_config
+        .model_providers
+        .insert(provider.clone(), probe_provider);
     let probe_id = format!("__connection_test__:{provider}:{model}");
     probe_config.configured_models = vec![ConfiguredModel {
         id: probe_id.clone(),
@@ -133,6 +140,7 @@ fn resolve_connection_probe(
         provider,
         model,
         api_protocol,
+        input_modalities,
         enabled: true,
         ..ConfiguredModel::default()
     }];
@@ -143,11 +151,51 @@ fn resolve_connection_probe(
 }
 
 #[tauri::command]
-pub async fn list_model_templates() -> Result<model_config::ProviderTemplateListResponse, IpcError>
-{
-    Ok(model_config::ProviderTemplateListResponse {
-        providers: model_config::provider_templates(),
+pub async fn list_model_providers(
+    state: tauri::State<'_, TauriState>,
+) -> Result<model_config::ModelProviderListResponse, IpcError> {
+    let config = state.app_state.config.app_config.read().await;
+    Ok(model_config::ModelProviderListResponse {
+        providers: model_config::configured_provider_views(&config),
     })
+}
+
+#[tauri::command]
+pub async fn upsert_model_provider(
+    state: tauri::State<'_, TauriState>,
+    req: UpsertModelProviderRequest,
+) -> Result<serde_json::Value, IpcError> {
+    let preserve_auth_token = req.api_key.is_none();
+    let receipt = state
+        .app_state
+        .upsert_model_provider_owned(ModelProviderMutation {
+            id: req.id,
+            provider: ModelProviderConfig {
+                name: req.name,
+                auth_token: req.api_key,
+                api_key_env: req.api_key_env,
+                base_url: Some(req.base_url),
+                default_api_protocol: Some(req.default_api_protocol),
+                requires_api_key: req.requires_api_key,
+            },
+            preserve_auth_token,
+        })
+        .await
+        .map_err(model_mutation_ipc_error)?;
+    Ok(serde_json::json!({ "success": true, "provider_id": receipt.model_id }))
+}
+
+#[tauri::command]
+pub async fn delete_model_provider(
+    state: tauri::State<'_, TauriState>,
+    provider_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    state
+        .app_state
+        .delete_model_provider_owned(provider_id)
+        .await
+        .map_err(model_mutation_ipc_error)?;
+    Ok(serde_json::json!({ "success": true }))
 }
 
 #[tauri::command]
@@ -231,73 +279,32 @@ async fn set_default_model_inner(
     }))
 }
 
-/// Query whether a given (provider, model) supports a thinking-depth control,
-/// and which protocol it speaks. The frontend uses this to show/hide the
-/// "思考深度" dropdown next to the model selector.
-///
-/// Returns:
-/// - `supports`: bool — whether a thinking field would be honored (not None /
-///   not AnthropicAdaptive, since adaptive models silently ignore it).
-/// - `protocol`: one of "none" | "openai_reasoning_effort" |
-///   "anthropic_thinking_budget" | "anthropic_adaptive" | "enable_thinking_flag".
-/// - `levels`: list of user-facing level strings valid for this protocol.
-#[tauri::command]
-pub async fn get_thinking_support(
-    provider: String,
-    model: String,
-) -> Result<serde_json::Value, IpcError> {
-    use echo_agent::llm::{ModelProfile, ProviderCapabilities, ThinkingProtocol};
-    let caps = ProviderCapabilities::from_provider_name(&provider);
-    let profile = ModelProfile::new(&model, &provider, caps);
-    let protocol = match profile.thinking_protocol {
-        ThinkingProtocol::None => "none",
-        ThinkingProtocol::OpenaiReasoningEffort => "openai_reasoning_effort",
-        ThinkingProtocol::AnthropicEffort => "anthropic_effort",
-        ThinkingProtocol::AnthropicThinkingBudget => "anthropic_thinking_budget",
-        ThinkingProtocol::AnthropicAdaptive => "anthropic_adaptive",
-        ThinkingProtocol::EnableThinkingFlag => "enable_thinking_flag",
-        ThinkingProtocol::GlmThinkingType => "glm_thinking_type",
-        ThinkingProtocol::GlmReasoningEffort => "glm_reasoning_effort",
-    };
-    let supports = profile.thinking_protocol.emits_field();
-    // Levels offered by the UI dropdown. Adaptive/None show no levels.
-    let levels: Vec<&str> = if supports {
-        vec!["auto", "minimal", "low", "medium", "high"]
-    } else {
-        vec!["auto"]
-    };
-    Ok(serde_json::json!({
-        "supports": supports,
-        "protocol": protocol,
-        "levels": levels,
-        "model": model,
-        "provider": provider,
-    }))
-}
-
 /// Dynamically set the thinking-depth for the active agent at runtime.
 ///
-/// Unlike the model-config `thinking` field, this is a per-session toggle the
-/// user changes from the chat input toolbar (next to "审批模式"/"模型管理"),
-/// independent of which model is configured. Every model offers the dropdown;
-/// the spec is translated to a `ThinkingConfig` and applied via
-/// `agent.set_thinking()`. Models that don't support a thinking protocol
-/// silently ignore it (the framework already warns in that case), so the
-/// control is always safe to expose.
-///
-/// `spec` accepts: `"auto"`/`""` (reset to model default), `"disabled"`,
-/// `"minimal"`/`"low"`/`"medium"`/`"high"`, or a bare number (token budget).
-/// Invalid specs return an error so the UI can surface a typo.
+/// This is a per-session control. The requested value must be one of the
+/// centrally resolved effective levels for the active runtime model; `auto`
+/// always resets to the model default.
 #[tauri::command]
 pub async fn set_thinking(
     state: tauri::State<'_, crate::tauri::TauriState>,
     spec: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let cfg = match echo_agent::llm::ThinkingConfig::parse_spec(&spec) {
+    let requested = spec.trim().to_ascii_lowercase();
+    let available = {
+        let config = state.app_state.config.app_config.read().await;
+        let runtime = echo_agent_app_core::model_config::resolve_runtime_model(&config, None);
+        echo_agent_app_core::model_config::thinking_level_specs(runtime.thinking_profile)
+    };
+    if requested != "auto" && !available.iter().any(|level| level == &requested) {
+        return Err(IpcError::Validation(format!(
+            "thinking level '{requested}' is not available for the active model"
+        )));
+    }
+    let cfg = match echo_agent::llm::ThinkingConfig::parse_spec(&requested) {
         Ok(cfg) => cfg,
         Err(e) => {
             return Err(IpcError::Validation(format!(
-                "invalid thinking spec '{spec}': {e}"
+                "invalid thinking spec '{requested}': {e}"
             )));
         }
     };
@@ -316,7 +323,7 @@ pub async fn set_thinking(
 
     Ok(serde_json::json!({
         "success": true,
-        "spec": spec,
+        "spec": requested,
         "applied": applied,
     }))
 }
@@ -328,7 +335,8 @@ pub async fn test_connection(
     model: String,
     api_key: Option<String>,
     base_url: Option<String>,
-    api_protocol: Option<LlmApiProtocol>,
+    api_protocol: LlmApiProtocol,
+    input_modalities: Option<Vec<ModelInputModality>>,
 ) -> Result<serde_json::Value, IpcError> {
     test_connection_inner(
         &state.app_state,
@@ -337,6 +345,7 @@ pub async fn test_connection(
         api_key,
         base_url,
         api_protocol,
+        input_modalities.unwrap_or_else(ModelInputModality::text_only),
     )
     .await
 }
@@ -347,7 +356,8 @@ async fn test_connection_inner(
     model: String,
     api_key: Option<String>,
     base_url: Option<String>,
-    api_protocol: Option<LlmApiProtocol>,
+    api_protocol: LlmApiProtocol,
+    input_modalities: Vec<ModelInputModality>,
 ) -> Result<serde_json::Value, IpcError> {
     let app_config = app_state.config.app_config.read().await.clone();
     let probe = resolve_connection_probe(
@@ -357,8 +367,9 @@ async fn test_connection_inner(
         api_key,
         base_url,
         api_protocol,
+        input_modalities,
     );
-    if model_config::runtime_requires_api_key(&probe.runtime) && probe.auth.token.is_empty() {
+    if probe.runtime.requires_api_key && probe.auth.token.is_empty() {
         return Ok(serde_json::json!({
             "success": false,
             "error": "没有可用的 API Key。请填写 API Key，或设置对应环境变量后重试。",
@@ -366,19 +377,17 @@ async fn test_connection_inner(
             "has_auth_token": false,
         }));
     }
-    let prepared = prepare_runtime_llm(&probe.runtime).map_err(IpcError::Validation)?;
-    let messages = vec![Message::user("Hi, respond with just 'OK'.".to_string())];
-    match prepared.client.chat_simple(messages).await {
-        Ok(response) => Ok(serde_json::json!({
+    match test_runtime_llm_connection(&probe.runtime).await {
+        Ok(result) => Ok(serde_json::json!({
             "success": true,
-            "response": response,
-            "model": prepared.client.model_name(),
+            "response": result.response,
+            "model": result.model,
             "auth_source": probe.auth.source,
             "has_auth_token": !probe.auth.token.is_empty(),
         })),
-        Err(e) => Ok(serde_json::json!({
+        Err(error) => Ok(serde_json::json!({
             "success": false,
-            "error": format!("API call failed: {e}"),
+            "error": error,
             "auth_source": probe.auth.source,
             "has_auth_token": !probe.auth.token.is_empty(),
         })),
@@ -400,6 +409,7 @@ mod tests {
             ModelProviderConfig {
                 auth_token: Some("invalid\nauthorization".to_string()),
                 base_url: Some("https://api.openai.com/v1/responses".to_string()),
+                ..Default::default()
             },
         );
         let probe = resolve_connection_probe(
@@ -408,7 +418,8 @@ mod tests {
             "gpt-test".to_string(),
             Some("invalid\nauthorization".to_string()),
             Some("https://api.openai.com/v1/responses".to_string()),
-            Some(LlmApiProtocol::Responses),
+            LlmApiProtocol::Responses,
+            echo_agent::llm::ModelInputModality::text_only(),
         );
         let probe_error = prepare_runtime_llm(&probe.runtime)
             .err()

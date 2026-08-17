@@ -90,7 +90,7 @@ cd web-frontend && npm install && cd ..
 
 ### 配置
 
-GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_model_id`。GUI 用户可以在 **设置 → 模型供应商** 中添加模型；`api_protocol` 省略时，OpenAI 使用 Responses、Anthropic 使用 Messages，其余内置供应商使用 Chat Completions，自定义完整端点按 URL 推断。用户填写的 API Key 优先级高于系统环境变量。
+GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_model_id`。用户可以创建多个 Provider，并在每个 Provider 下创建多个模型；每个模型明确选择 Chat Completions、Responses 或 Anthropic 协议，纯文本能力默认启用，并可追加图像、音频、视频能力。用户填写的 API Key 优先级高于 Provider 配置的环境变量。
 
 也可以通过 `echo-agent.yaml` 设置模型。完整配置参考：
 
@@ -287,8 +287,8 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 |------|------|------|
 | `/mode <mode>` | | 切换模式（general/coding/research/medical/data/writing） |
 | `/model <name>` | | 切换模型 |
-| `/think` | | 切换推理/思考显示 |
-| `/reasoning` | | 切换推理过程显示 |
+| `/think [level]` | | 查看或设置当前模型支持的思考等级 |
+| `/reasoning [level]` | | `/think` 的别名 |
 | `/system [prompt]` | `sys` | 查看或设置系统提示词 |
 | `/memory` | | 查看记忆内容 |
 | `/remember <fact>` | | 保存一条记忆 |

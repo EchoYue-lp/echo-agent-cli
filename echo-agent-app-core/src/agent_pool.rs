@@ -1938,14 +1938,16 @@ mod tests {
             provider: "local".to_string(),
             model: "model".to_string(),
             api_protocol: echo_agent::llm::LlmApiProtocol::ChatCompletions,
-            api_protocol_explicit: false,
+            input_modalities: echo_agent::llm::ModelInputModality::text_only(),
             auth_token: None,
             auth_source: "none".to_string(),
             base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            api_key_env: None,
+            requires_api_key: false,
             temperature: None,
             max_tokens: None,
             context_window: None,
-            thinking: None,
+            thinking_profile: echo_agent::llm::core::capabilities::ThinkingProfile::unknown(),
         };
 
         let prepared = infra::prepare_runtime_llm(&runtime)?;
@@ -2008,6 +2010,7 @@ mod tests {
             echo_agent::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+                ..Default::default()
             },
         );
         let selected = crate::model_config::resolve_runtime_model(&config, Some("local:b"));

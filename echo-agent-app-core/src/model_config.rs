@@ -1,9 +1,8 @@
-use echo_agent::config::{AppConfig, ConfiguredModel};
-use echo_agent::llm::LlmApiProtocol;
-use echo_agent::llm::config::{
-    all_provider_metadata, provider_base_url, provider_env_var_names, provider_metadata,
+use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
+use echo_agent::llm::core::capabilities::{
+    ThinkingProfile, infer_context_window, resolve_thinking_profile,
 };
-use echo_agent::llm::core::capabilities::infer_context_window;
+use echo_agent::llm::{LlmApiProtocol, ModelInputModality, resolve_protocol_endpoint};
 use serde::Serialize;
 use ts_rs::TS;
 
@@ -28,16 +27,39 @@ impl From<LlmApiProtocol> for LlmApiProtocolWire {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ModelInputModality")]
+pub enum ModelInputModalityWire {
+    Text,
+    Image,
+    Audio,
+    Video,
+}
+
+impl From<ModelInputModality> for ModelInputModalityWire {
+    fn from(modality: ModelInputModality) -> Self {
+        match modality {
+            ModelInputModality::Text => Self::Text,
+            ModelInputModality::Image => Self::Image,
+            ModelInputModality::Audio => Self::Audio,
+            ModelInputModality::Video => Self::Video,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
-pub struct ProviderTemplate {
+pub struct ModelProviderView {
     pub id: String,
     pub name: String,
     pub base_url: String,
-    pub api_key_env: String,
-    pub default_models: Vec<String>,
+    pub api_key_env: Option<String>,
     pub requires_api_key: bool,
     pub default_api_protocol: LlmApiProtocolWire,
+    pub has_auth_token: bool,
+    pub auth_source: String,
+    pub model_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -48,6 +70,9 @@ pub struct ConfiguredModelView {
     pub provider: String,
     pub model: String,
     pub api_protocol: LlmApiProtocolWire,
+    pub input_modalities: Vec<ModelInputModalityWire>,
+    /// Effective manual choices. `auto` is always implicit and is not repeated.
+    pub thinking_levels: Vec<String>,
     pub enabled: bool,
     pub is_default: bool,
     pub has_auth_token: bool,
@@ -60,8 +85,8 @@ pub struct ConfiguredModelView {
 
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export)]
-pub struct ProviderTemplateListResponse {
-    pub providers: Vec<ProviderTemplate>,
+pub struct ModelProviderListResponse {
+    pub providers: Vec<ModelProviderView>,
 }
 
 #[derive(Debug, Clone, Serialize, TS)]
@@ -78,19 +103,16 @@ pub struct ModelRuntimeConfig {
     pub provider: String,
     pub model: String,
     pub api_protocol: LlmApiProtocol,
-    /// Whether the protocol was explicitly configured instead of resolved by
-    /// endpoint inference/provider metadata.
-    pub api_protocol_explicit: bool,
+    pub input_modalities: Vec<ModelInputModality>,
+    pub thinking_profile: ThinkingProfile,
     pub auth_token: Option<String>,
     pub auth_source: String,
     pub base_url: Option<String>,
+    pub api_key_env: Option<String>,
+    pub requires_api_key: bool,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
-    /// 思考深度配置（可选）。可读值:`"auto"`/`""`(默认)、`"disabled"`、
-    /// `"minimal"`/`"low"`/`"medium"`/`"high"`、或裸数字(token 预算)。
-    /// 由前端 UI 设置,运行时翻译成 `ThinkingConfig` 注入到 agent。
-    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,84 +143,59 @@ impl std::fmt::Display for ModelSelectionError {
 
 impl std::error::Error for ModelSelectionError {}
 
-pub fn provider_env_vars(provider: &str) -> &'static [&'static str] {
-    provider_env_var_names(provider)
-}
-
-pub fn find_env_api_key(provider: &str) -> Option<String> {
-    provider_env_vars(provider).iter().find_map(|var| {
-        std::env::var(var)
-            .ok()
-            .map(|val| val.trim().to_string())
-            .filter(|val| !val.is_empty())
-    })
-}
-
-pub fn env_vars_display(provider: &str) -> String {
-    provider_env_vars(provider).join(" / ")
-}
-
-pub fn default_base_url(provider: &str) -> Option<String> {
-    provider_base_url(provider).map(ToString::to_string)
-}
-
-pub fn provider_templates() -> Vec<ProviderTemplate> {
-    all_provider_metadata()
-        .iter()
-        .map(|metadata| ProviderTemplate {
-            id: metadata.id.to_string(),
-            name: metadata.name.to_string(),
-            base_url: metadata.base_url.to_string(),
-            api_key_env: metadata.env_vars.join(" / "),
-            default_models: metadata
-                .default_models
-                .iter()
-                .map(|model| model.to_string())
-                .collect(),
-            requires_api_key: metadata.requires_api_key,
-            default_api_protocol: metadata.default_api_protocol.into(),
-        })
-        .chain(std::iter::once(ProviderTemplate {
-            id: "custom".to_string(),
-            name: "自定义".to_string(),
-            base_url: String::new(),
-            api_key_env: String::new(),
-            default_models: Vec::new(),
-            requires_api_key: false,
-            default_api_protocol: LlmApiProtocol::ChatCompletions.into(),
-        }))
-        .collect()
-}
-
-pub fn provider_requires_api_key(provider: &str) -> bool {
-    provider_metadata(provider)
-        .map(|metadata| metadata.requires_api_key)
-        .unwrap_or(false)
-}
-
-/// EKO only requires a token for a built-in provider's own hosted endpoint.
-/// Compatible gateways (including local endpoints) and unknown providers may
-/// accept an empty bearer token and must still receive a complete `LlmConfig`.
-pub fn runtime_requires_api_key(runtime: &ModelRuntimeConfig) -> bool {
-    let Some(metadata) = provider_metadata(&runtime.provider) else {
-        return false;
-    };
-    if !metadata.requires_api_key {
-        return false;
-    }
-    runtime
-        .base_url
+pub fn find_env_api_key(provider: &ModelProviderConfig) -> Option<String> {
+    provider
+        .api_key_env
         .as_deref()
         .map(str::trim)
-        .map(|endpoint| {
-            endpoint
-                .split(['?', '#'])
-                .next()
-                .unwrap_or(endpoint)
-                .trim_end_matches('/')
-                == metadata.base_url.trim_end_matches('/')
+        .filter(|name| !name.is_empty())
+        .and_then(|name| std::env::var(name).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+pub fn configured_provider_views(config: &AppConfig) -> Vec<ModelProviderView> {
+    config
+        .model_providers
+        .iter()
+        .map(|(id, provider)| {
+            let env_token = find_env_api_key(provider);
+            let name = if provider.name.trim().is_empty() {
+                id.clone()
+            } else {
+                provider.name.clone()
+            };
+            let has_config_token = provider
+                .auth_token
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|token| !token.is_empty());
+            ModelProviderView {
+                id: id.clone(),
+                name,
+                base_url: provider.base_url.clone().unwrap_or_default(),
+                api_key_env: provider.api_key_env.clone(),
+                requires_api_key: provider.requires_api_key,
+                default_api_protocol: provider
+                    .default_api_protocol
+                    .unwrap_or(LlmApiProtocol::ChatCompletions)
+                    .into(),
+                has_auth_token: has_config_token || env_token.is_some(),
+                auth_source: if has_config_token {
+                    "config".to_string()
+                } else if env_token.is_some() {
+                    "env".to_string()
+                } else {
+                    "none".to_string()
+                },
+                model_count: config
+                    .configured_models
+                    .iter()
+                    .filter(|model| model.provider == *id)
+                    .count(),
+            }
         })
-        .unwrap_or(true)
+        .collect()
 }
 
 pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
@@ -208,12 +205,15 @@ pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
             display_name: display_name_from_model(&config.model.name),
             provider: config.model.provider.clone(),
             model: config.model.name.clone(),
-            api_protocol: config.model.api_protocol,
+            api_protocol: config
+                .model
+                .api_protocol
+                .unwrap_or(LlmApiProtocol::ChatCompletions),
+            input_modalities: ModelInputModality::text_only(),
             enabled: true,
             max_tokens: config.model.max_tokens,
             temperature: config.model.temperature,
             context_window: config.model.context_window,
-            thinking: config.model.thinking.clone(),
         };
         let runtime = resolve_runtime_model(config, None);
         return vec![ConfiguredModelView {
@@ -222,6 +222,13 @@ pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
             provider: legacy.provider.clone(),
             model: legacy.model.clone(),
             api_protocol: runtime.api_protocol.into(),
+            input_modalities: legacy
+                .input_modalities
+                .iter()
+                .copied()
+                .map(Into::into)
+                .collect(),
+            thinking_levels: thinking_level_specs(runtime.thinking_profile),
             enabled: true,
             is_default: true,
             has_auth_token: runtime.auth_token.is_some(),
@@ -245,6 +252,13 @@ pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
                 provider: model.provider.clone(),
                 model: model.model.clone(),
                 api_protocol: runtime.api_protocol.into(),
+                input_modalities: model
+                    .input_modalities
+                    .iter()
+                    .copied()
+                    .map(Into::into)
+                    .collect(),
+                thinking_levels: thinking_level_specs(runtime.thinking_profile),
                 enabled: model.enabled,
                 is_default: Some(model.id.as_str()) == default_id.as_deref(),
                 has_auth_token: runtime.auth_token.is_some(),
@@ -254,6 +268,25 @@ pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
                 max_tokens: model.max_tokens,
                 context_window: Some(effective_context_window(model)),
             }
+        })
+        .collect()
+}
+
+pub fn thinking_level_specs(profile: ThinkingProfile) -> Vec<String> {
+    profile
+        .levels
+        .iter()
+        .map(|level| {
+            match level {
+                echo_agent::llm::ThinkingLevel::None => "none",
+                echo_agent::llm::ThinkingLevel::Minimal => "minimal",
+                echo_agent::llm::ThinkingLevel::Low => "low",
+                echo_agent::llm::ThinkingLevel::Medium => "medium",
+                echo_agent::llm::ThinkingLevel::High => "high",
+                echo_agent::llm::ThinkingLevel::Xhigh => "xhigh",
+                echo_agent::llm::ThinkingLevel::Max => "max",
+            }
+            .to_string()
         })
         .collect()
 }
@@ -270,18 +303,84 @@ fn effective_context_window(model: &ConfiguredModel) -> u32 {
     }
 }
 
-pub fn upsert_configured_model(config: &mut AppConfig, mut model: ConfiguredModel) -> String {
+pub fn upsert_model_provider(
+    config: &mut AppConfig,
+    provider_id: &str,
+    mut provider: ModelProviderConfig,
+) -> Result<String, String> {
+    let provider_id = slug(provider_id);
+    if provider_id.is_empty() {
+        return Err("Provider id must not be empty".to_string());
+    }
+    let base_url = provider
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("Provider '{provider_id}' requires a base_url"))?;
+    let protocol = provider
+        .default_api_protocol
+        .unwrap_or(LlmApiProtocol::ChatCompletions);
+    resolve_protocol_endpoint(base_url, protocol).map_err(|error| error.to_string())?;
+    provider.name = provider.name.trim().to_string();
+    if provider.name.is_empty() {
+        provider.name = provider_id.clone();
+    }
+    provider.base_url = Some(base_url.to_string());
+    provider.auth_token = provider
+        .auth_token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    provider.api_key_env = provider
+        .api_key_env
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    provider.default_api_protocol = Some(protocol);
+    config.model_providers.insert(provider_id.clone(), provider);
+    Ok(provider_id)
+}
+
+pub fn delete_model_provider(config: &mut AppConfig, provider_id: &str) -> Result<(), String> {
+    if config
+        .configured_models
+        .iter()
+        .any(|model| model.provider == provider_id)
+    {
+        return Err(format!(
+            "Provider '{provider_id}' still has configured models; delete them first"
+        ));
+    }
+    if config.model_providers.remove(provider_id).is_none() {
+        return Err(format!("Provider '{provider_id}' is not configured"));
+    }
+    Ok(())
+}
+
+pub fn upsert_configured_model(
+    config: &mut AppConfig,
+    mut model: ConfiguredModel,
+) -> Result<String, String> {
+    model.provider = slug(&model.provider);
+    if !config.model_providers.contains_key(&model.provider) {
+        return Err(format!(
+            "Provider '{}' is not configured; add the provider before adding models",
+            model.provider
+        ));
+    }
+    if model.model.trim().is_empty() {
+        return Err("Model name must not be empty".to_string());
+    }
     if model.id.trim().is_empty() {
         model.id = stable_model_id(&model.provider, &model.model);
     }
     if model.display_name.trim().is_empty() {
         model.display_name = display_name_from_model(&model.model);
     }
-    if model.provider.trim().is_empty() {
-        model.provider = "custom".to_string();
+    if model.input_modalities.is_empty() {
+        model.input_modalities = ModelInputModality::text_only();
     }
-    if !model.enabled {
-        model.enabled = true;
+    if !model.input_modalities.contains(&ModelInputModality::Text) {
+        model.input_modalities.insert(0, ModelInputModality::Text);
     }
 
     let id = model.id.clone();
@@ -293,7 +392,7 @@ pub fn upsert_configured_model(config: &mut AppConfig, mut model: ConfiguredMode
     if config.model.default_model_id.is_none() {
         config.model.default_model_id = Some(id.clone());
     }
-    id
+    Ok(id)
 }
 
 pub fn set_default_model(
@@ -310,12 +409,10 @@ pub fn set_default_model(
     config.model.default_model_id = Some(model.id.clone());
     config.model.provider = model.provider.clone();
     config.model.name = model.model.clone();
-    config.model.api_protocol = model.api_protocol;
+    config.model.api_protocol = Some(model.api_protocol);
     config.model.temperature = model.temperature;
     config.model.max_tokens = model.max_tokens;
     config.model.context_window = model.context_window;
-    config.model.thinking = model.thinking.clone();
-
     let provider_config = config.model_providers.get(&model.provider);
     config.model.auth_token = provider_config.and_then(|provider| provider.auth_token.clone());
     config.model.base_url = provider_config.and_then(|provider| provider.base_url.clone());
@@ -406,10 +503,10 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
         provider,
         model,
         api_protocol,
+        input_modalities,
         temperature,
         max_tokens,
         context_window,
-        thinking,
     ) = if let Some(selected) = selected {
         (
             selected.id.clone(),
@@ -417,10 +514,10 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
             selected.provider.clone(),
             selected.model.clone(),
             selected.api_protocol,
+            selected.input_modalities.clone(),
             selected.temperature,
             selected.max_tokens,
             Some(effective_context_window(selected)),
-            selected.thinking.clone(),
         )
     } else {
         (
@@ -428,7 +525,11 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
             display_name_from_model(&config.model.name),
             config.model.provider.clone(),
             config.model.name.clone(),
-            config.model.api_protocol,
+            config
+                .model
+                .api_protocol
+                .unwrap_or(LlmApiProtocol::ChatCompletions),
+            ModelInputModality::text_only(),
             config.model.temperature,
             config.model.max_tokens,
             Some({
@@ -443,7 +544,6 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
                     context_window.min(10_000_000)
                 }
             }),
-            config.model.thinking.clone(),
         )
     };
 
@@ -458,13 +558,13 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
         .filter(|token| !token.is_empty());
     let (auth_token, auth_source) = if let Some(token) = config_token {
         (Some(token), "config".to_string())
-    } else if let Some(token) = find_env_api_key(&provider) {
+    } else if let Some(token) = provider_config.and_then(find_env_api_key) {
         (Some(token), "env".to_string())
     } else {
         (None, "none".to_string())
     };
 
-    let configured_base_url = provider_config
+    let base_url = provider_config
         .and_then(|p| p.base_url.clone())
         .or_else(|| {
             (provider == config.model.provider)
@@ -472,32 +572,24 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
                 .flatten()
         })
         .filter(|url| !url.trim().is_empty());
-    let base_url = configured_base_url
-        .clone()
-        .or_else(|| default_base_url(&provider));
-
-    let api_protocol_explicit = api_protocol.is_some();
-    let api_protocol = api_protocol.unwrap_or_else(|| {
-        configured_base_url
-            .as_deref()
-            .and_then(LlmApiProtocol::try_from_endpoint)
-            .or_else(|| provider_metadata(&provider).map(|metadata| metadata.default_api_protocol))
-            .unwrap_or(LlmApiProtocol::ChatCompletions)
-    });
+    let thinking_profile =
+        resolve_thinking_profile(&provider, &model, api_protocol, base_url.as_deref());
     ModelRuntimeConfig {
         id,
         display_name,
         provider,
         model,
         api_protocol,
-        api_protocol_explicit,
+        input_modalities,
+        thinking_profile,
         auth_token,
         auth_source,
         base_url,
+        api_key_env: provider_config.and_then(|provider| provider.api_key_env.clone()),
+        requires_api_key: provider_config.is_some_and(|provider| provider.requires_api_key),
         temperature,
         max_tokens,
         context_window,
-        thinking,
     }
 }
 
@@ -562,32 +654,15 @@ pub fn resolve_runtime_model_selector(
     Ok(resolve_runtime_model(config, Some(&selected.id)))
 }
 
-/// Validate the final application-level endpoint/protocol pair before an agent
-/// or connectivity probe is allowed to use it. Auto mode may retain a provider
-/// root that cannot identify a protocol; in that case provider metadata remains
-/// authoritative. Explicit protocols require a recognized complete endpoint.
+/// Validate that the provider root can resolve to the selected model protocol.
 pub fn validate_runtime_model_endpoint(runtime: &ModelRuntimeConfig) -> Result<(), String> {
-    let endpoint = runtime
+    let base_url = runtime
         .base_url
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("Provider '{}' requires a model endpoint", runtime.provider))?;
-    let Some(endpoint_protocol) = LlmApiProtocol::try_from_endpoint(endpoint) else {
-        if runtime.api_protocol_explicit {
-            return Err(format!(
-                "Explicit protocol '{:?}' requires a complete endpoint ending in /responses, /messages, or /chat/completions (got '{endpoint}')",
-                runtime.api_protocol
-            ));
-        }
-        return Ok(());
-    };
-    if endpoint_protocol != runtime.api_protocol {
-        return Err(format!(
-            "Configured protocol '{:?}' does not match model endpoint '{endpoint}' ({endpoint_protocol:?})",
-            runtime.api_protocol
-        ));
-    }
+    resolve_protocol_endpoint(base_url, runtime.api_protocol).map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -606,17 +681,13 @@ pub fn validate_runtime_model_requirements(runtime: &ModelRuntimeConfig) -> Resu
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .is_some();
-    if runtime_requires_api_key(runtime) && !has_token {
-        let env_vars = env_vars_display(&runtime.provider);
+    if runtime.requires_api_key && !has_token {
+        let env_var = runtime.api_key_env.as_deref().unwrap_or("not configured");
         return Err(format!(
-            "Provider '{}' requires an API key for endpoint '{}'. Configure auth_token or one of: {}",
+            "Provider '{}' requires an API key for endpoint '{}'. Configure auth_token or environment variable {}",
             runtime.provider,
             runtime.base_url.as_deref().unwrap_or_default(),
-            if env_vars.is_empty() {
-                "the provider API key environment variable"
-            } else {
-                env_vars.as_str()
-            }
+            env_var
         ));
     }
     Ok(())
@@ -757,6 +828,7 @@ mod tests {
             echo_agent::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+                ..Default::default()
             },
         );
         let runtime = resolve_runtime_model(&config, Some("local:zero"));
@@ -766,6 +838,45 @@ mod tests {
             .err()
             .ok_or_else(|| "zero context window unexpectedly passed preflight".to_string())?;
         assert!(error.contains("context_window"));
+        Ok(())
+    }
+
+    #[test]
+    fn model_capabilities_keep_text_default_and_preserve_friendly_modalities() -> Result<(), String>
+    {
+        let mut config = AppConfig::default();
+        upsert_model_provider(
+            &mut config,
+            "gateway",
+            ModelProviderConfig {
+                base_url: Some("https://gateway.example/v1".to_string()),
+                ..Default::default()
+            },
+        )?;
+        let model_id = upsert_configured_model(
+            &mut config,
+            ConfiguredModel {
+                provider: "gateway".to_string(),
+                model: "omni".to_string(),
+                input_modalities: vec![
+                    ModelInputModality::Image,
+                    ModelInputModality::Audio,
+                    ModelInputModality::Video,
+                ],
+                ..ConfiguredModel::default()
+            },
+        )?;
+        let runtime = resolve_runtime_model(&config, Some(&model_id));
+
+        assert_eq!(
+            runtime.input_modalities,
+            vec![
+                ModelInputModality::Text,
+                ModelInputModality::Image,
+                ModelInputModality::Audio,
+                ModelInputModality::Video,
+            ]
+        );
         Ok(())
     }
 
@@ -874,118 +985,105 @@ mod tests {
 
     #[test]
     fn api_key_requirement_is_explicit_not_assumed() {
-        assert!(provider_requires_api_key("openai"));
-        assert!(provider_requires_api_key("ANTHROPIC"));
-        assert!(provider_requires_api_key("qwen"));
-        assert_eq!(
-            provider_env_vars("qwen"),
-            &["DASHSCOPE_API_KEY", "QWEN_API_KEY"]
+        let mut config = AppConfig::default();
+        config.model_providers.insert(
+            "gateway".to_string(),
+            ModelProviderConfig {
+                requires_api_key: true,
+                ..Default::default()
+            },
         );
-        assert!(!provider_requires_api_key("ollama"));
-        assert!(!provider_requires_api_key("custom-local-provider"));
-        assert_eq!(
-            provider_templates()
-                .iter()
-                .find(|template| template.id == "custom")
-                .map(|template| template.requires_api_key),
-            Some(false)
-        );
+        let view = configured_provider_views(&config).into_iter().next();
+        assert!(view.is_some_and(|provider| provider.requires_api_key));
     }
 
     #[test]
-    fn hosted_builtin_requires_key_but_compatible_override_does_not() {
+    fn provider_key_policy_is_applied_without_provider_name_inference() {
         let mut config = AppConfig {
             configured_models: vec![ConfiguredModel {
-                id: "openai:model".to_string(),
-                provider: "openai".to_string(),
+                id: "gateway:model".to_string(),
+                provider: "gateway".to_string(),
                 model: "model".to_string(),
                 enabled: true,
                 ..ConfiguredModel::default()
             }],
             ..AppConfig::default()
         };
-        let mut hosted = resolve_runtime_model(&config, Some("openai:model"));
-        hosted.auth_token = None;
-        assert!(runtime_requires_api_key(&hosted));
-
         config.model_providers.insert(
-            "openai".to_string(),
+            "gateway".to_string(),
             echo_agent::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("http://127.0.0.1:11434/v1/responses".to_string()),
+                requires_api_key: true,
+                ..Default::default()
             },
         );
-        let compatible = resolve_runtime_model(&config, Some("openai:model"));
-        assert!(!runtime_requires_api_key(&compatible));
-        assert!(validate_runtime_model_requirements(&compatible).is_ok());
-        assert!(validate_runtime_model_requirements(&hosted).is_err());
+        let runtime = resolve_runtime_model(&config, Some("gateway:model"));
+        assert!(validate_runtime_model_requirements(&runtime).is_err());
     }
 
     #[test]
-    fn gui_provider_templates_project_framework_protocol_defaults() {
-        let templates = provider_templates();
-        for (provider, expected) in [
-            ("openai", LlmApiProtocol::Responses),
-            ("anthropic", LlmApiProtocol::Anthropic),
-            ("deepseek", LlmApiProtocol::ChatCompletions),
-            ("dashscope", LlmApiProtocol::ChatCompletions),
-            ("moonshot", LlmApiProtocol::ChatCompletions),
-            ("zhipu", LlmApiProtocol::ChatCompletions),
-            ("custom", LlmApiProtocol::ChatCompletions),
-        ] {
-            assert_eq!(
-                templates
-                    .iter()
-                    .find(|template| template.id == provider)
-                    .map(|template| template.default_api_protocol),
-                Some(expected.into()),
-                "unexpected template protocol for {provider}"
-            );
-        }
+    fn configured_provider_views_project_user_protocol_defaults() -> Result<(), String> {
+        let mut config = AppConfig::default();
+        upsert_model_provider(
+            &mut config,
+            "my-gateway",
+            ModelProviderConfig {
+                name: "My Gateway".to_string(),
+                base_url: Some("https://gateway.example/v1".to_string()),
+                default_api_protocol: Some(LlmApiProtocol::Responses),
+                ..Default::default()
+            },
+        )?;
+        let provider = configured_provider_views(&config).into_iter().next();
+        assert!(matches!(
+            provider,
+            Some(ModelProviderView {
+                id,
+                default_api_protocol: LlmApiProtocolWire::Responses,
+                ..
+            }) if id == "my-gateway"
+        ));
+        Ok(())
     }
 
     #[test]
-    fn omitted_protocol_uses_framework_provider_metadata() {
-        for (provider, expected) in [
-            ("openai", LlmApiProtocol::Responses),
-            ("anthropic", LlmApiProtocol::Anthropic),
-            ("deepseek", LlmApiProtocol::ChatCompletions),
-            ("qwen", LlmApiProtocol::ChatCompletions),
-            ("custom", LlmApiProtocol::ChatCompletions),
-        ] {
+    fn model_protocol_is_explicit_and_independent_of_provider_name() {
+        for provider in ["openai", "anthropic", "custom"] {
             let mut config = AppConfig::default();
             let model_id = stable_model_id(provider, "model");
             config.configured_models = vec![ConfiguredModel {
                 id: model_id.clone(),
                 provider: provider.to_string(),
                 model: "model".to_string(),
-                api_protocol: None,
+                api_protocol: LlmApiProtocol::Responses,
                 ..ConfiguredModel::default()
             }];
 
             assert_eq!(
                 resolve_runtime_model(&config, Some(&model_id)).api_protocol,
-                expected,
+                LlmApiProtocol::Responses,
                 "unexpected runtime protocol for {provider}"
             );
         }
     }
 
     #[test]
-    fn custom_endpoint_is_inferred_unless_protocol_is_explicit() -> Result<(), String> {
+    fn one_provider_root_supports_models_with_different_protocols() -> Result<(), String> {
         let mut config = AppConfig::default();
         config.model_providers.insert(
             "custom".to_string(),
             echo_agent::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("https://gateway.example/v1/responses".to_string()),
+                ..Default::default()
             },
         );
         config.configured_models = vec![ConfiguredModel {
             id: "custom:inferred".to_string(),
             provider: "custom".to_string(),
             model: "inferred".to_string(),
-            api_protocol: None,
+            api_protocol: LlmApiProtocol::Responses,
             ..ConfiguredModel::default()
         }];
         assert_eq!(
@@ -997,54 +1095,55 @@ mod tests {
             .configured_models
             .first_mut()
             .ok_or_else(|| "configured model fixture is missing".to_string())?;
-        configured.api_protocol = Some(LlmApiProtocol::Anthropic);
+        configured.api_protocol = LlmApiProtocol::Anthropic;
         let explicit = resolve_runtime_model(&config, Some("custom:inferred"));
         assert_eq!(explicit.api_protocol, LlmApiProtocol::Anthropic);
-        assert!(explicit.api_protocol_explicit);
-        assert!(validate_runtime_model_endpoint(&explicit).is_err());
+        assert!(validate_runtime_model_endpoint(&explicit).is_ok());
         Ok(())
     }
 
     #[test]
-    fn auto_provider_root_uses_framework_metadata_without_false_rejection() {
+    fn provider_root_accepts_explicit_responses_protocol() {
         let mut config = AppConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
             echo_agent::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("https://gateway.example/v1".to_string()),
+                ..Default::default()
             },
         );
         config.configured_models = vec![ConfiguredModel {
             id: "openai:root-only".to_string(),
             provider: "openai".to_string(),
             model: "root-only".to_string(),
+            api_protocol: LlmApiProtocol::Responses,
             enabled: true,
             ..ConfiguredModel::default()
         }];
 
         let runtime = resolve_runtime_model(&config, Some("openai:root-only"));
         assert_eq!(runtime.api_protocol, LlmApiProtocol::Responses);
-        assert!(!runtime.api_protocol_explicit);
         assert!(validate_runtime_model_endpoint(&runtime).is_ok());
 
         let configured = config.configured_models.first_mut();
         if let Some(configured) = configured {
-            configured.api_protocol = Some(LlmApiProtocol::Responses);
+            configured.api_protocol = LlmApiProtocol::Anthropic;
         }
         let explicit = resolve_runtime_model(&config, Some("openai:root-only"));
-        assert!(explicit.api_protocol_explicit);
-        assert!(validate_runtime_model_endpoint(&explicit).is_err());
+        assert_eq!(explicit.api_protocol, LlmApiProtocol::Anthropic);
+        assert!(validate_runtime_model_endpoint(&explicit).is_ok());
     }
 
     #[test]
-    fn complete_endpoint_overrides_provider_metadata_and_must_match_explicit_protocol() {
+    fn complete_endpoint_is_rewritten_for_each_explicit_protocol() {
         let mut config = AppConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
             echo_agent::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("https://gateway.example/v1/chat/completions".to_string()),
+                ..Default::default()
             },
         );
         config.configured_models = vec![ConfiguredModel {
@@ -1057,17 +1156,15 @@ mod tests {
 
         let inferred = resolve_runtime_model(&config, Some("openai:compatible"));
         assert_eq!(inferred.api_protocol, LlmApiProtocol::ChatCompletions);
-        assert!(!inferred.api_protocol_explicit);
         assert!(validate_runtime_model_endpoint(&inferred).is_ok());
 
         let configured = config.configured_models.first_mut();
         if let Some(configured) = configured {
-            configured.api_protocol = Some(LlmApiProtocol::Responses);
+            configured.api_protocol = LlmApiProtocol::Responses;
         }
         let mismatched = resolve_runtime_model(&config, Some("openai:compatible"));
         assert_eq!(mismatched.api_protocol, LlmApiProtocol::Responses);
-        assert!(mismatched.api_protocol_explicit);
-        assert!(validate_runtime_model_endpoint(&mismatched).is_err());
+        assert!(validate_runtime_model_endpoint(&mismatched).is_ok());
     }
 
     #[test]
@@ -1078,6 +1175,7 @@ mod tests {
             echo_agent::config::ModelProviderConfig {
                 auth_token: Some("openai-key".to_string()),
                 base_url: Some("https://api.openai.com/v1/responses".to_string()),
+                ..Default::default()
             },
         );
         config.model_providers.insert(
@@ -1085,6 +1183,7 @@ mod tests {
             echo_agent::config::ModelProviderConfig {
                 auth_token: Some("anthropic-key".to_string()),
                 base_url: Some("https://api.anthropic.com/v1/messages".to_string()),
+                ..Default::default()
             },
         );
         config.configured_models = vec![
@@ -1106,6 +1205,7 @@ mod tests {
                 id: "anthropic:shared".to_string(),
                 provider: "anthropic".to_string(),
                 model: "shared".to_string(),
+                api_protocol: LlmApiProtocol::Anthropic,
                 enabled: true,
                 ..ConfiguredModel::default()
             },
@@ -1142,8 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn yaml_protocol_omission_override_and_endpoint_inference_remain_distinct() -> Result<(), String>
-    {
+    fn yaml_protocol_defaults_to_chat_and_honors_explicit_override() -> Result<(), String> {
         let config: AppConfig = serde_yaml::from_str(
             r#"
 model_providers:
@@ -1166,7 +1265,7 @@ configured_models:
 
         assert_eq!(
             resolve_runtime_model(&config, Some("openai:default")).api_protocol,
-            LlmApiProtocol::Responses
+            LlmApiProtocol::ChatCompletions
         );
         assert_eq!(
             resolve_runtime_model(&config, Some("anthropic:chat-override")).api_protocol,
@@ -1174,7 +1273,7 @@ configured_models:
         );
         assert_eq!(
             resolve_runtime_model(&config, Some("custom:inferred")).api_protocol,
-            LlmApiProtocol::Responses
+            LlmApiProtocol::ChatCompletions
         );
         Ok(())
     }
@@ -1194,6 +1293,40 @@ configured_models:
         assert_eq!(view.model, "deepseek-v4-flash");
         assert!(view.is_default);
         assert_eq!(view.context_window, Some(128_000));
+        Ok(())
+    }
+
+    #[test]
+    fn model_views_expose_only_effective_thinking_levels() -> Result<(), String> {
+        let mut config = AppConfig::default();
+        config.model.provider = "openai".to_string();
+        config.model.name = "gpt-5.6-sol".to_string();
+        config.model.api_protocol = Some(LlmApiProtocol::Responses);
+
+        let views = configured_model_views(&config);
+        let view = views
+            .first()
+            .ok_or_else(|| "GPT-5.6 model view was not created".to_string())?;
+        assert_eq!(
+            view.thinking_levels,
+            ["none", "low", "medium", "high", "xhigh", "max"]
+        );
+
+        config.model.provider = "zhipu".to_string();
+        config.model.name = "glm-4.6".to_string();
+        config.model.api_protocol = Some(LlmApiProtocol::ChatCompletions);
+        let older = configured_model_views(&config);
+        let older_view = older
+            .first()
+            .ok_or_else(|| "GLM-4.6 model view was not created".to_string())?;
+        assert!(older_view.thinking_levels.is_empty());
+
+        config.model.name = "glm-5.2".to_string();
+        let current = configured_model_views(&config);
+        let current_view = current
+            .first()
+            .ok_or_else(|| "GLM-5.2 model view was not created".to_string())?;
+        assert_eq!(current_view.thinking_levels, ["none", "high", "max"]);
         Ok(())
     }
 }

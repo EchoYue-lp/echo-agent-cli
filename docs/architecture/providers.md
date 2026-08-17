@@ -1,107 +1,144 @@
-# LLM Provider 与协议架构
+# 动态 LLM Provider 与模型协议架构
 
 > **状态**：已采纳（2026-08）
 > **适用范围**：`echo-agent` / `echo-integration` / `echo-agent-cli`
-> **决策性质**：架构约束，偏离需显式评审
 
 ## 决策
 
-供应商身份和 wire protocol 是两个不同维度：
+EKO 不再用 OpenAI、Anthropic、DeepSeek、Ollama 等品牌白名单决定连接、认证、
+API 协议或端点。用户可以创建任意数量的 Provider；每个 Provider 可以拥有任意
+数量的模型。
 
-- `provider` 表示供应商身份，用于默认端点、认证来源、模型能力和 thinking 策略。
-- `LlmApiProtocol` 表示端点实际使用的协议，目前为 `responses`、`chat_completions`、`anthropic`。
-- `ProviderMetadata.default_api_protocol` 是内置供应商默认协议的唯一权威。
-- `LlmConfig::build_client()` 只按 `api_protocol` 选择协议适配器，不再按供应商名称硬编码客户端。
+- Provider 是连接与认证配置：`id`、显示名、API 根地址、可选 API Key、可选
+  API Key 环境变量、是否要求密钥，以及添加模型时的默认协议。
+- 模型是调用契约：模型名、明确的 wire protocol、输入模态、token/context 参数。
+- 每个模型必须明确选择 `chat_completions`、`responses` 或 `anthropic`。
+- 每个模型明确声明 `text`、`image`、`audio`、`video` 输入能力；纯文本是默认且始终保留。
+- 同一个 Provider 下的不同模型可以使用不同协议和不同输入能力。
+- Provider 保存根地址即可。框架按模型协议规范化为 `/chat/completions`、
+  `/responses` 或 `/messages`；若输入已经是完整端点，会校验并规范化后缀。
 
-内置默认值：
+Provider 的 `default_api_protocol` 只用于新建模型表单的初始值，不替代模型自己的
+显式协议。Provider 删除前必须先删除其模型，避免无意制造悬空配置。
 
-| Provider | 默认协议 | 默认端点 |
+思考能力是唯一的模型名注册表：它不是连接配置，也不要求用户理解厂商 wire 字段。
+框架根据 Provider/endpoint、模型名和已选 API 协议解析一个 `ThinkingProfile`。用户
+只在会话中选择当前模型返回的有效等级；`auto` 不发送字段。切换模型时回到 `auto`。
+未知模型仍可正常调用，只是不显示手动思考控件。
+
+| 模型范围 | 用户可选项（另有 `auto`） | 说明 |
 |---|---|---|
-| OpenAI | Responses | `https://api.openai.com/v1/responses` |
-| Anthropic | Anthropic Messages | `https://api.anthropic.com/v1/messages` |
-| DeepSeek / Qwen / Kimi / GLM 等 | Chat Completions | 各自兼容端点 |
-| Custom | 由 URL 推断，也可显式指定 | 用户配置 |
+| GPT-5.6 | `none/low/medium/high/xhigh/max` | `max` 与 `xhigh` 是独立等级 |
+| DeepSeek V4（直连） | `none/low/high/max` | Chat 与 Responses 分别翻译 |
+| GLM 5.2+ | `none/high/max` | 旧于 5.2 不注册 |
+| Claude 4.6 | `low/medium/high/xhigh/max` | 仅 Anthropic 协议发送 Anthropic 字段 |
+| Claude 4.7+ | 仅 `auto` | 模型自行决定 |
+| Kimi K3 / K2.7 / K2.6 | `low/high/max` / 仅 `auto` / `none/high` | 分别是等级、模型自行决定、开关 |
+| Qwen3 | `none/high` | UI 只暴露真实的开关语义，不伪造等级 |
+| Gemini 3 / 2.5 | `minimal/low/medium/high` / `none/low/medium/high` | OpenAI-compatible 入口 |
+| Ollama GPT-OSS / 已知思考模型 | `low/medium/high` / `none/high` | 使用 Ollama `think` 扩展；未知模型仅 `auto` |
 
 ## 分层判定
 
-### 通用机制：框架层
+### 通用机制：`echo-agent`
 
-以下能力对任何使用 `echo-agent` 的应用都成立，放在 `echo-agent`：
+- `LlmApiProtocol`、`ModelInputModality` 及其序列化契约。
+- 从 Provider 根地址按协议解析规范端点。
+- 三种 wire protocol 的客户端、请求、响应和 SSE 适配。
+- 在发送请求前按图片内容和音视频附件类型校验模型声明的输入能力。
+- `ThinkingProfile`、中央模型范围解析和各协议 wire 字段翻译。
+- Provider 和模型的通用配置结构；不包含 EKO UI 或持久化策略。
 
-- 三种 wire protocol 的请求、响应和 SSE 适配器。
-- 文本、图片、文件、结构化输出、function call、并行 tool call、reasoning、usage 与取消。
-- Responses 加密 reasoning item 的保存和后续回放。
-- 完整 raw Responses create/stream 接口，保留未知字段和语义事件。
-- `ProviderMetadata` 中的供应商身份、默认端点、环境变量和默认协议。
+### EKO 产品策略：`echo-agent-cli`
 
-### EKO 产品策略：应用层
+- Provider/模型的 CRUD、默认模型选择和文件持久化。
+- API Key 与环境变量优先级、连接测试、活动模型的原子发布。
+- GUI 表单、TUI slash command、CLI slash command 和错误呈现。
+- GUI/TUI/CLI 从同一个 profile 生成可选等级并校验会话选择。
+- 本地会话、Task/Subagent 与模型切换的运行时联动。
 
-以下是本地个人助理的产品选择，留在 `echo-agent-cli`：
+### 适配边界：`echo-agent-app-core`
 
-- GUI/TUI/CLI 的模型选择与配置持久化。
-- 把框架 provider metadata 和用户显式 override 无损投影到 GUI/TUI/CLI。
-- EKO 以本地会话历史为权威，不依赖远端 conversation 状态。
-- EKO 的工具和 Task/Subagent 运行时仍在本地执行。
+`echo-agent-app-core` 将用户 Provider 与模型合成为一个
+`ModelRuntimeConfig`，再无损转换为框架 `LlmConfig`。适配器不维护第二份思考或协议
+映射，也不重新实现 endpoint 解析。GUI、TUI 和 CLI 的保存、切换及连接测试都经过
+同一个 AppState 所有权路径；SQLite 不参与模型配置。
 
-### 适配边界
-
-`echo-agent-app-core` 只把模型配置转换为 `LlmConfig`，不维护 provider-to-protocol 映射。解析顺序固定为：用户显式 `api_protocol`、框架可识别的完整 endpoint 协议推断、框架 `ProviderMetadata.default_api_protocol`、unknown provider 的 Chat Completions fallback。协议语义、默认值和 endpoint 推断全部由框架提供。Auto 模式允许保留无法单独识别协议的 provider 根地址；显式协议则要求完整 endpoint，且后缀必须匹配。应用在启动/保存/测试连接前执行这一校验；本地、兼容 override 或 unknown provider 不强制 API Key，但仍注入同一份运行时配置。
-
-## Responses 支持范围
-
-### Agent 高层路径
-
-`ResponsesClient` 把 provider-neutral `ChatRequest` 映射为 Responses：
-
-- 完整本地消息历史映射为 `input` items，system/developer/user/assistant/tool role 不丢失。
-- 图片映射为 `input_image`，文件映射为 `input_file`。
-- function tools 使用 Responses 的扁平定义；tool output 使用 `function_call_output`。
-- `max_tokens`、temperature、tool choice、JSON schema、reasoning effort 和 prompt cache key 使用 Responses 对应字段。
-- 请求固定 `store:false`，并请求 `reasoning.encrypted_content`；加密 reasoning item 会存入消息并在下一轮回放。
-- 非流式响应保留原始 `Response` 对象；流式按语义事件解析，不依赖 Chat Completions 的 `[DONE]`。
-- input/output/total、cached/cache-write 和 reasoning token usage 均归一到框架 `Usage`。
-
-这条路径刻意不使用 `previous_response_id` 或远端 conversation，因此不会改变 EKO 本地历史、压缩和恢复模型。
-
-### 完整低层路径
-
-`ResponsesClient::create_raw()` 和 `create_raw_stream()` 接受完整 JSON 请求并返回完整 JSON 响应/语义事件，不裁剪 schema。调用方可使用 Responses 的 hosted tools、background、conversation、metadata、service tier、moderation、context management 及后续新增字段，而无需把这些协议专属概念塞进 `ChatRequest`。
-
-## 为什么 Responses 不破坏缓存
-
-Responses 并不要求使用服务端状态。`input` 可以携带完整历史，`store:false` 可关闭存储，`reasoning.encrypted_content` 支持无状态 reasoning 回放，`prompt_cache_key` 继续提供缓存分区。因而 EKO 可以同时保持本地历史权威、稳定前缀和 provider prompt cache。
-
-## 参考实现与取舍
-
-- [OpenAI Responses create reference](https://developers.openai.com/api/reference/resources/responses/methods/create)：确认完整请求/响应 schema、`store`、`input`、tools、reasoning、usage 和流事件模型。
-- [OpenAI Node SDK Responses resource](https://github.com/openai/openai-node/tree/master/src/resources/responses)：交叉核对官方 SDK 的请求类型、输出 item 和 streaming event union。
-- [DeepSeek Responses API 指南](https://api-docs.deepseek.com/zh-cn/guides/responses_api)：仅用于独立验证兼容协议的 input item、function call、usage 和语义 SSE 事件；本项目没有 DeepSeek Responses 专属分支。
-
-跨实现的共同模式是：Responses 是独立 wire protocol，流使用具名语义事件，工具调用由 output item 与 call ID 串联。项目据此保留一个 provider-neutral `LlmClient` 高层接口，再提供 raw 接口承载协议完整能力。
-
-## 文件结构
+## 数据流
 
 ```text
-echo-integration/src/providers/
-├── responses.rs          # OpenAI Responses 高层映射 + 完整 raw API
-├── openai.rs             # OpenAI-compatible Chat Completions
-├── anthropic.rs          # Anthropic Messages
-├── client.rs             # 共享 HTTP 与 UTF-8-safe SSE transport
-├── thinking_translate.rs # thinking 配置翻译
-└── config.rs             # provider 默认值、协议选择与 client factory
+GUI / TUI / CLI
+       |
+       v
+AppState linearized mutation -> AppConfig file
+       |
+       v
+ModelRuntimeConfig (provider root + model protocol + modalities)
+       |
+       v
+ThinkingProfile + LlmConfig::for_provider -> protocol endpoint -> LlmClient
 ```
 
-## 新供应商接入
+## 实现前重复性审计
 
-1. 确认供应商实际 wire protocol，而不是根据品牌猜测。
-2. 兼容现有协议时只在框架 `ProviderMetadata` 增加 provider/default，不在 EKO 复制映射或新增 client。
-3. 自定义服务可显式设置 `api_protocol`；省略时按完整 endpoint URL 推断。
-4. 只有协议结构无法被三种现有适配器表达，且不是单一厂商扩展字段时，才评估新增协议。
+全仓库检查发现框架已经有三种协议客户端、`LlmApiProtocol` 和唯一的客户端工厂，
+应用也已经有配置文件持久化与活动模型线性化发布路径。因此本次扩展这些权威实现，
+没有新增第二套 client、store、mutation owner 或 provider registry。旧的
+`ProviderTemplate`、provider 名称推断和 GUI 模板选择路径被直接删除。
+
+## 多模式命令
+
+GUI 在“设置 -> 模型 Provider”中管理 Provider 和模型。TUI 与 CLI 提供相同的
+slash command：
+
+```text
+/provider list
+/provider add <id> <base-url> <chat|responses|anthropic> [api-key-env] [requires-key]
+/provider update <id> <base-url> <chat|responses|anthropic> [api-key-env] [requires-key]
+/provider delete <id>
+
+/model list
+/model add <provider-id> <model> <chat|responses|anthropic> [image] [audio] [video] [default]
+/model update <provider-id> <model> <chat|responses|anthropic> [image] [audio] [video] [default]
+/model use <model-id|model-name>
+/model test <model-id|model-name>
+/model delete <model-id>
+
+/think
+/think <auto|当前模型返回的等级>
+```
+
+CLI/TUI 不接收明文 API Key 参数，避免密钥进入 shell/history；它们使用 Provider
+配置中的 `api_key_env`。GUI 可以把密钥写入本地配置，并且更新时默认保留已有密钥。
+
+## 行业参考与取舍
+
+- [OpenAI Codex model provider source](https://github.com/openai/codex/blob/main/codex-rs/model-provider-info/src/lib.rs)
+  将连接、认证、headers 和重试放在可配置 provider 中，模型目录另行承载输入模态。
+  EKO 采用相同的 provider/model 分离，但因为同时支持三种协议，把协议放到模型上。
+- [Continue model config schema](https://github.com/continuedev/continue/blob/main/packages/config-yaml/src/schemas/models.ts)
+  允许每个模型选择 provider、model、API base 与能力列表。EKO 将共享连接上提到
+  Provider，避免同一网关的密钥和根地址在多个模型中重复。
+- Claude Code 官方文档在调研时不可访问，因此没有把无法核验的行为当作设计依据。
+
+连接配置与模型能力是不同维度。EKO 的取舍是“协议归模型、根地址归 Provider”，
+这支持一个网关下混合 Chat Completions、Responses 和 Anthropic 模型。输入模态由
+用户显式声明；思考 wire 由维护者依据官方文档集中维护，避免让每个用户重复配置
+`reasoning_effort`、`thinking.type`、`enable_thinking` 等内部字段。
+
+思考注册表依据：[OpenAI 模型目录](https://developers.openai.com/api/docs/models)、
+[DeepSeek 思考模式](https://api-docs.deepseek.com/zh-cn/guides/thinking_mode)、
+[智谱参数说明](https://docs.bigmodel.cn/cn/guide/start/concept-param)、
+[Kimi 文档](https://platform.kimi.com/docs/overview)、
+[Qwen 深度思考](https://www.alibabacloud.com/help/en/model-studio/deep-thinking)、
+[Gemini thinking cookbook](https://github.com/google-gemini/cookbook/blob/main/quickstarts/Get_started_thinking.ipynb)、
+[Ollama thinking](https://docs.ollama.com/capabilities/thinking)。
 
 ## 反模式
 
-- 不得按 provider 名称复制 Responses/Chat/Anthropic 客户端。
-- 不得在 EKO 增加第二套 provider 默认协议 helper/switch。
-- 不得把 `previous_response_id` 作为 EKO 本地多轮对话的必需状态。
-- 不得把 hosted tool、background 等协议专属字段逐个塞进 provider-neutral `ChatRequest`；使用 raw Responses API。
-- 不得在应用 adapter 重做 SSE、tool-call frontier 或 reasoning 回放。
+- 不得用 provider/model 名称推断 API 协议、端点或环境变量。
+- 思考模型规则只能加入中央 `ThinkingProfile` 解析器，不得散落到 GUI/TUI/CLI。
+- 不得让应用层复制三种协议客户端或 endpoint resolver。
+- 不得让 Provider 默认协议覆盖模型显式协议。
+- 不得绕过 AppState 直接写配置并单独刷新 GUI、TUI 或 CLI。
+- 不得只给 GUI 增加 Provider/模型能力而遗漏 TUI、CLI。

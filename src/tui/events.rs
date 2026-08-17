@@ -2822,6 +2822,256 @@ async fn refresh_workspace_generation(
     app.rebuild_message_groups();
 }
 
+fn parse_tui_llm_protocol(value: &str) -> Option<echo_agent::llm::LlmApiProtocol> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "chat" | "chat_completions" | "chat-completions" => {
+            Some(echo_agent::llm::LlmApiProtocol::ChatCompletions)
+        }
+        "responses" => Some(echo_agent::llm::LlmApiProtocol::Responses),
+        "anthropic" | "messages" => Some(echo_agent::llm::LlmApiProtocol::Anthropic),
+        _ => None,
+    }
+}
+
+fn push_tui_system_message(app: &mut TuiApp, content: impl Into<String>) {
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: content.into(),
+    });
+}
+
+fn refresh_tui_models(app: &mut TuiApp, config: &echo_agent::config::AppConfig) {
+    app.configured_models = echo_agent_app_core::model_config::configured_model_views(config)
+        .into_iter()
+        .map(|view| {
+            echo_agent_app_core::model_config::resolve_runtime_model(config, Some(&view.id))
+        })
+        .collect();
+    app.model = echo_agent_app_core::model_config::resolve_runtime_model(config, None).model;
+}
+
+async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
+    let Some(app_state) = app.app_state.clone() else {
+        push_tui_system_message(app, "Model configuration is unavailable in this runtime.");
+        return;
+    };
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    match parts.first().copied().unwrap_or("list") {
+        "list" => {
+            let config = app_state.config.app_config.read().await;
+            let models = echo_agent_app_core::model_config::configured_model_views(&config)
+                .into_iter()
+                .map(|model| {
+                    let active = if model.is_default { "*" } else { " " };
+                    format!(
+                        "{active} {}  {}  {:?}  {:?}",
+                        model.id, model.model, model.api_protocol, model.input_modalities
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let content = if models.is_empty() {
+                format!("Current model: {}\nNo configured models.", app.model)
+            } else {
+                format!("Current model: {}\nConfigured models:\n{models}", app.model)
+            };
+            push_tui_system_message(app, content);
+        }
+        "use" => {
+            let Some(selector) = parts.get(1) else {
+                push_tui_system_message(app, "Usage: /model use <model-id|model-name>");
+                return;
+            };
+            match app_state.set_default_model_owned(*selector).await {
+                Ok(receipt) => {
+                    refresh_tui_models(app, &receipt.config);
+                    push_tui_system_message(app, format!("Active model: {}", receipt.model_id));
+                }
+                Err(error) => push_tui_system_message(app, error.to_string()),
+            }
+        }
+        "delete" => {
+            let Some(model_id) = parts.get(1) else {
+                push_tui_system_message(app, "Usage: /model delete <model-id>");
+                return;
+            };
+            match app_state.delete_configured_model_owned(*model_id).await {
+                Ok(receipt) => {
+                    refresh_tui_models(app, &receipt.config);
+                    push_tui_system_message(app, format!("Deleted model: {model_id}"));
+                }
+                Err(error) => push_tui_system_message(app, error.to_string()),
+            }
+        }
+        "test" => {
+            let Some(selector) = parts.get(1) else {
+                push_tui_system_message(app, "Usage: /model test <model-id|model-name>");
+                return;
+            };
+            let config = app_state.config.app_config.read().await.clone();
+            let runtime = match echo_agent_app_core::model_config::resolve_runtime_model_selector(
+                &config,
+                Some(selector),
+            ) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    push_tui_system_message(app, error.to_string());
+                    return;
+                }
+            };
+            match echo_agent_app_core::infra::test_runtime_llm_connection(&runtime).await {
+                Ok(result) => push_tui_system_message(
+                    app,
+                    format!(
+                        "Connection succeeded: {} ({})",
+                        result.model, result.response
+                    ),
+                ),
+                Err(error) => {
+                    push_tui_system_message(app, format!("Connection failed: {error}"));
+                }
+            }
+        }
+        "add" | "update" => {
+            let (Some(provider), Some(model), Some(protocol)) = (
+                parts.get(1),
+                parts.get(2),
+                parts.get(3).and_then(|value| parse_tui_llm_protocol(value)),
+            ) else {
+                push_tui_system_message(
+                    app,
+                    "Usage: /model add <provider-id> <model> <chat|responses|anthropic> [image] [audio] [video] [default]",
+                );
+                return;
+            };
+            let flags = parts.get(4..).unwrap_or(&[]);
+            let mut input_modalities = echo_agent::llm::ModelInputModality::text_only();
+            if flags.contains(&"image") {
+                input_modalities.push(echo_agent::llm::ModelInputModality::Image);
+            }
+            if flags.contains(&"audio") {
+                input_modalities.push(echo_agent::llm::ModelInputModality::Audio);
+            }
+            if flags.contains(&"video") {
+                input_modalities.push(echo_agent::llm::ModelInputModality::Video);
+            }
+            let mutation = echo_agent_app_core::state::ConfiguredModelMutation {
+                model: echo_agent::config::ConfiguredModel {
+                    provider: (*provider).to_string(),
+                    model: (*model).to_string(),
+                    api_protocol: protocol,
+                    input_modalities,
+                    ..Default::default()
+                },
+                set_default: flags.contains(&"default"),
+            };
+            match app_state.upsert_configured_model_owned(mutation).await {
+                Ok(receipt) => {
+                    refresh_tui_models(app, &receipt.config);
+                    push_tui_system_message(app, format!("Saved model: {}", receipt.model_id));
+                }
+                Err(error) => push_tui_system_message(app, error.to_string()),
+            }
+        }
+        selector => match app_state.set_default_model_owned(selector).await {
+            Ok(receipt) => {
+                refresh_tui_models(app, &receipt.config);
+                push_tui_system_message(app, format!("Active model: {}", receipt.model_id));
+            }
+            Err(error) => push_tui_system_message(app, error.to_string()),
+        },
+    }
+}
+
+async fn handle_tui_provider_command(app: &mut TuiApp, args: &str) {
+    let Some(app_state) = app.app_state.clone() else {
+        push_tui_system_message(
+            app,
+            "Provider configuration is unavailable in this runtime.",
+        );
+        return;
+    };
+    let parts = args.split_whitespace().collect::<Vec<_>>();
+    match parts.first().copied().unwrap_or("list") {
+        "list" => {
+            let config = app_state.config.app_config.read().await;
+            let providers = echo_agent_app_core::model_config::configured_provider_views(&config)
+                .into_iter()
+                .map(|provider| {
+                    format!(
+                        "{}  {}  {}  {:?}  {} models",
+                        provider.id,
+                        provider.name,
+                        provider.base_url,
+                        provider.default_api_protocol,
+                        provider.model_count
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            push_tui_system_message(
+                app,
+                if providers.is_empty() {
+                    "No model providers configured.".to_string()
+                } else {
+                    format!("Model providers:\n{providers}")
+                },
+            );
+        }
+        "delete" => {
+            let Some(provider_id) = parts.get(1) else {
+                push_tui_system_message(app, "Usage: /provider delete <provider-id>");
+                return;
+            };
+            match app_state.delete_model_provider_owned(*provider_id).await {
+                Ok(receipt) => {
+                    refresh_tui_models(app, &receipt.config);
+                    push_tui_system_message(app, format!("Deleted provider: {provider_id}"));
+                }
+                Err(error) => push_tui_system_message(app, error.to_string()),
+            }
+        }
+        "add" | "update" => {
+            let (Some(id), Some(base_url), Some(protocol)) = (
+                parts.get(1),
+                parts.get(2),
+                parts.get(3).and_then(|value| parse_tui_llm_protocol(value)),
+            ) else {
+                push_tui_system_message(
+                    app,
+                    "Usage: /provider add <id> <base-url> <chat|responses|anthropic> [api-key-env] [requires-key]",
+                );
+                return;
+            };
+            let api_key_env = parts
+                .get(4)
+                .filter(|value| !value.trim().is_empty() && **value != "-")
+                .map(|value| (*value).to_string());
+            let requires_api_key = parts.get(5).is_some_and(|value| *value == "requires-key");
+            let mutation = echo_agent_app_core::state::ModelProviderMutation {
+                id: (*id).to_string(),
+                provider: echo_agent::config::ModelProviderConfig {
+                    name: (*id).to_string(),
+                    api_key_env,
+                    base_url: Some((*base_url).to_string()),
+                    default_api_protocol: Some(protocol),
+                    requires_api_key,
+                    ..Default::default()
+                },
+                preserve_auth_token: true,
+            };
+            match app_state.upsert_model_provider_owned(mutation).await {
+                Ok(receipt) => {
+                    refresh_tui_models(app, &receipt.config);
+                    push_tui_system_message(app, format!("Saved provider: {}", receipt.model_id));
+                }
+                Err(error) => push_tui_system_message(app, error.to_string()),
+            }
+        }
+        _ => push_tui_system_message(app, "Usage: /provider [list|add|update|delete]"),
+    }
+}
+
 async fn handle_slash_command(
     app: &mut TuiApp,
     agent: &AgentHandle,
@@ -2883,74 +3133,17 @@ async fn handle_slash_command(
                 content: help,
             });
         }
-        Some(SlashCommand::Model) => {
-            if args.is_empty() {
-                let configured = app
-                    .configured_models
-                    .iter()
-                    .map(|model| {
-                        format!("  {}  {} ({})", model.id, model.display_name, model.model)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: if configured.is_empty() {
-                        format!(
-                            "Current model: {}\nNo configured model alternatives.",
-                            app.model
-                        )
-                    } else {
-                        format!(
-                            "Current model: {}\nConfigured models:\n{}",
-                            app.model, configured
-                        )
-                    },
-                });
-            } else {
-                let requested = args.trim().to_string();
-                let Some(app_state) = app.app_state.clone() else {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: "Model selection is unavailable in this runtime.".to_string(),
-                    });
-                    return;
-                };
-                let mutation = match app_state.set_default_model_owned(requested).await {
-                    Ok(mutation) => mutation,
-                    Err(error) => {
-                        app.messages.push(ChatMessage {
-                            role: MessageRole::System,
-                            content: error.to_string(),
-                        });
-                        return;
-                    }
-                };
-                let Some(runtime) = mutation.runtime else {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: "Model mutation completed without an active runtime.".to_string(),
-                    });
-                    return;
-                };
-                app.configured_models =
-                    echo_agent_app_core::model_config::configured_model_views(&mutation.config)
-                        .into_iter()
-                        .map(|view| {
-                            echo_agent_app_core::model_config::resolve_runtime_model(
-                                &mutation.config,
-                                Some(&view.id),
-                            )
-                        })
-                        .collect();
-                app.model = runtime.model;
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!("Active model switched to: {}", app.model),
-                });
-            }
-        }
+        Some(SlashCommand::Model) => handle_tui_model_command(app, args).await,
+        Some(SlashCommand::Provider) => handle_tui_provider_command(app, args).await,
         Some(SlashCommand::Think) => {
+            let available = if let Some(app_state) = app.app_state.as_ref() {
+                let config = app_state.config.app_config.read().await;
+                let runtime =
+                    echo_agent_app_core::model_config::resolve_runtime_model(&config, None);
+                echo_agent_app_core::model_config::thinking_level_specs(runtime.thinking_profile)
+            } else {
+                Vec::new()
+            };
             if args.trim().is_empty() {
                 let current = agent
                     .read(|value| {
@@ -2962,10 +3155,32 @@ async fn handle_slash_command(
                     .await;
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
-                    content: format!("Thinking configuration: {current}"),
+                    content: format!(
+                        "Thinking configuration: {current}\nAvailable: {}",
+                        if available.is_empty() {
+                            "auto (model managed)".to_string()
+                        } else {
+                            format!("auto, {}", available.join(", "))
+                        }
+                    ),
                 });
             } else {
-                match echo_agent::llm::ThinkingConfig::parse_spec(args.trim()) {
+                let requested = args.trim().to_ascii_lowercase();
+                if requested != "auto" && !available.iter().any(|level| level == &requested) {
+                    push_tui_system_message(
+                        app,
+                        format!(
+                            "Thinking level '{requested}' is not available for the active model. Available: {}",
+                            if available.is_empty() {
+                                "auto".to_string()
+                            } else {
+                                format!("auto, {}", available.join(", "))
+                            }
+                        ),
+                    );
+                    return;
+                }
+                match echo_agent::llm::ThinkingConfig::parse_spec(&requested) {
                     Ok(config) => {
                         agent.write(|value| value.set_thinking(config)).await;
                         app.messages.push(ChatMessage {
