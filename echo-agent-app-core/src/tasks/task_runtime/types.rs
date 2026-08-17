@@ -609,6 +609,12 @@ pub enum RuntimeEventKind {
     RunCreated,
     /// The user explicitly replaced the sole authoritative TaskRun Goal.
     RunGoalUpdated,
+    /// Existing evidence was detached from an older Goal revision.
+    RequirementEvidenceInvalidated,
+    /// Unchanged evidence was explicitly rebound after a Goal-aware plan update.
+    RequirementEvidenceRevalidated,
+    /// A local user explicitly accepted skipping one exact Goal requirement.
+    RequirementSkipped,
     RunStarted,
     RunCompleted,
     RunFailed,
@@ -701,6 +707,9 @@ impl RuntimeEventKind {
         match self {
             RunCreated => "run_created",
             RunGoalUpdated => "run_goal_updated",
+            RequirementEvidenceInvalidated => "requirement_evidence_invalidated",
+            RequirementEvidenceRevalidated => "requirement_evidence_revalidated",
+            RequirementSkipped => "requirement_skipped",
             RunStarted => "run_started",
             RunCompleted => "run_completed",
             RunFailed => "run_failed",
@@ -770,6 +779,8 @@ impl RuntimeEventKind {
         matches!(
             self,
             RuntimeEventKind::RunGoalUpdated
+                | RuntimeEventKind::RequirementEvidenceInvalidated
+                | RuntimeEventKind::RequirementSkipped
                 | RuntimeEventKind::RunFailed
                 | RuntimeEventKind::RunCancelled
                 | RuntimeEventKind::TaskFailed
@@ -794,6 +805,9 @@ impl RuntimeEventKind {
         Some(match s {
             "run_created" => RunCreated,
             "run_goal_updated" => RunGoalUpdated,
+            "requirement_evidence_invalidated" => RequirementEvidenceInvalidated,
+            "requirement_evidence_revalidated" => RequirementEvidenceRevalidated,
+            "requirement_skipped" => RequirementSkipped,
             "run_started" => RunStarted,
             "run_completed" => RunCompleted,
             "run_failed" => RunFailed,
@@ -967,6 +981,143 @@ impl TaskPlan {
             tasks: self.tasks.iter().map(PlanTask::spec).collect(),
         }
     }
+}
+
+/// One stable, versioned completion obligation derived from a PlanTask.
+///
+/// The authoritative Goal remains on TaskRun. This projection only binds a
+/// task's declared work and acceptance evidence to that Goal revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "GoalRequirement")]
+pub struct GoalRequirement {
+    pub requirement_id: String,
+    #[ts(type = "number")]
+    pub goal_revision: u64,
+    #[ts(type = "number")]
+    pub plan_revision: u64,
+    pub task_id: String,
+    pub title: String,
+    pub description: String,
+    pub requirement_sha256: String,
+    pub required_artifacts: Vec<String>,
+    pub execution_checks: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RequirementEvidenceKind")]
+pub enum RequirementEvidenceKind {
+    TaskExecution,
+    Artifact,
+    Test,
+    Review,
+    Revalidation,
+    UserSkip,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RequirementEvidenceStatus")]
+pub enum RequirementEvidenceStatus {
+    Passed,
+    Failed,
+    Stale,
+}
+
+/// One evidence fact linked back to its source event sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RequirementEvidence")]
+pub struct RequirementEvidence {
+    pub evidence_id: String,
+    pub requirement_id: String,
+    #[ts(type = "number")]
+    pub goal_revision: u64,
+    #[ts(type = "number")]
+    pub plan_revision: u64,
+    pub task_id: String,
+    pub kind: RequirementEvidenceKind,
+    pub source_event_seq: String,
+    pub status: RequirementEvidenceStatus,
+    pub producer_identity: Option<String>,
+    pub subject: String,
+    pub sha256: Option<String>,
+    pub details: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RequirementStatus")]
+pub enum RequirementStatus {
+    Pending,
+    Accepted,
+    Skipped,
+    Stale,
+    Failed,
+}
+
+impl RequirementStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Accepted => "accepted",
+            Self::Skipped => "skipped",
+            Self::Stale => "stale",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RequirementAssessment")]
+pub struct RequirementAssessment {
+    pub requirement: GoalRequirement,
+    pub status: RequirementStatus,
+    pub evidence: Vec<RequirementEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "CompletionBlockerCode")]
+pub enum CompletionBlockerCode {
+    NoPlan,
+    EmptyPlan,
+    PlanGoalMismatch,
+    TaskNotComplete,
+    RequirementUncovered,
+    RequirementEvidenceMissing,
+    ArtifactMissing,
+    ArtifactHashMismatch,
+    TestFailed,
+    ReviewMissing,
+    ReviewFailed,
+    StaleEvidence,
+    ActiveSubagent,
+    ActiveCommandCell,
+    RecoveryBlocker,
+    StoreReadFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RunCompletionBlocker")]
+pub struct RunCompletionBlocker {
+    pub code: CompletionBlockerCode,
+    pub requirement_id: Option<String>,
+    pub task_id: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "CompletionGateReport")]
+pub struct CompletionGateReport {
+    pub run_id: String,
+    #[ts(type = "number")]
+    pub goal_revision: u64,
+    #[ts(type = "number")]
+    pub plan_revision: u64,
+    pub ready: bool,
+    pub requirements: Vec<RequirementAssessment>,
+    pub blockers: Vec<RunCompletionBlocker>,
 }
 
 /// EKO file/UI projection of the immutable framework task specification.

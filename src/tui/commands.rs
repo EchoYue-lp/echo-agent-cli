@@ -96,6 +96,8 @@ pub enum SlashCommand {
     TaskResume,
     TaskBudget,
     TaskGoal,
+    TaskRequirements,
+    TaskRequirementSkip,
     SubagentMessage,
     SubagentFollowup,
     SubagentInterrupt,
@@ -181,6 +183,8 @@ impl SlashCommand {
             Self::TaskResume => "Resume the current or specified task run",
             Self::TaskBudget => "Set token and time budgets for a task run",
             Self::TaskGoal => "Update the paused task run Goal with optimistic concurrency",
+            Self::TaskRequirements => "Show the Goal Requirement/Evidence completion gate",
+            Self::TaskRequirementSkip => "Confirm a Skip for one exact Goal requirement",
             Self::SubagentMessage => "Send guidance to one exact active Subagent attempt",
             Self::SubagentFollowup => "Queue guidance for one exact future Subagent attempt",
             Self::SubagentInterrupt => "Interrupt one exact Subagent attempt",
@@ -258,6 +262,8 @@ impl SlashCommand {
             | Self::TaskResume
             | Self::TaskBudget
             | Self::TaskGoal
+            | Self::TaskRequirements
+            | Self::TaskRequirementSkip
             | Self::SubagentMessage
             | Self::SubagentFollowup
             | Self::SubagentInterrupt
@@ -312,6 +318,10 @@ impl SlashCommand {
             Self::TaskCancel | Self::TaskPause | Self::TaskResume => "[run-id]",
             Self::TaskBudget => "<tokens|none> <seconds|none> [run-id]",
             Self::TaskGoal => "<expected-revision> [run-id] --reason <reason> --goal <new-goal>",
+            Self::TaskRequirements => "[run-id]",
+            Self::TaskRequirementSkip => {
+                "<expected-goal-revision> <requirement-id> [run-id] --reason <reason>"
+            }
             Self::SubagentMessage => {
                 "<run-id> <task-id> <execution-id> <plan-revision> <attempt> <command-id> <instruction>"
             }

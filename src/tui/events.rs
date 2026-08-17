@@ -1,8 +1,8 @@
 //! TUI event loop — handles keyboard input, terminal resize, and agent streaming.
 
 use super::{
-    ChatMessage, MessageRole, QueuedTurn, SubagentRuntimeView, TaskRuntimeTaskView,
-    TaskRuntimeView, ToolExecutionMessage, ToolExecutionStatus, TuiApp,
+    ChatMessage, MessageRole, QueuedTurn, SubagentRuntimeView, TaskRuntimeRequirementView,
+    TaskRuntimeTaskView, TaskRuntimeView, ToolExecutionMessage, ToolExecutionStatus, TuiApp,
 };
 use crate::agent_handle::AgentHandle;
 use crate::tui::clipboard;
@@ -4844,6 +4844,76 @@ async fn handle_slash_command(
             });
             refresh_task_runtime_view(app);
         }
+        Some(SlashCommand::TaskRequirements) => {
+            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let run_id = args
+                .split_whitespace()
+                .next()
+                .map(str::to_string)
+                .or_else(|| {
+                    app.task_runtime_view
+                        .as_ref()
+                        .map(|view| view.run_id.clone())
+                });
+            let result = run_id
+                .ok_or_else(|| "No active task run. Supply a run id explicitly.".to_string())
+                .and_then(|run_id| {
+                    store
+                        .completion_gate_report(&run_id)
+                        .map_err(|error| error.to_string())
+                });
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(report) => format_completion_gate(&report),
+                    Err(error) => format!("Completion gate read failed: {error}"),
+                },
+            });
+        }
+        Some(SlashCommand::TaskRequirementSkip) => {
+            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let values = args.split_whitespace().collect::<Vec<_>>();
+            let result =
+                crate::task_run_control::parse_requirement_skip_args(&values).and_then(|parsed| {
+                    let run_id = parsed.requested_run_id.or_else(|| {
+                        app.task_runtime_view
+                            .as_ref()
+                            .map(|view| view.run_id.clone())
+                    });
+                    let run_id = run_id.ok_or_else(|| {
+                        "No active task run. Supply a run id explicitly.".to_string()
+                    })?;
+                    store
+                        .skip_goal_requirement(
+                            &run_id,
+                            parsed.expected_goal_revision,
+                            &parsed.requirement_id,
+                            &parsed.reason,
+                            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                        )
+                        .map_err(|error| error.to_string())
+                });
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(report) => format_completion_gate(&report),
+                    Err(error) => format!("Requirement Skip failed: {error}"),
+                },
+            });
+            refresh_task_runtime_view(app);
+        }
         Some(
             action @ (SlashCommand::SubagentMessage
             | SlashCommand::SubagentFollowup
@@ -5629,6 +5699,21 @@ fn refresh_task_runtime_view(app: &mut TuiApp) {
         .list_background_cells(&run.run_id)
         .map(|cells| cells.iter().filter(|cell| cell.is_active()).count())
         .unwrap_or(0);
+    let completion = store.completion_gate_report(&run.run_id).ok();
+    let completion_ready = completion.as_ref().is_some_and(|report| report.ready);
+    let requirements = completion
+        .map(|report| {
+            report
+                .requirements
+                .into_iter()
+                .map(|item| TaskRuntimeRequirementView {
+                    requirement_id: item.requirement.requirement_id,
+                    title: item.requirement.title,
+                    status: item.status.as_str().to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     app.task_runtime_view = Some(TaskRuntimeView {
         run_id: run.run_id,
         goal: run.goal,
@@ -5666,6 +5751,8 @@ fn refresh_task_runtime_view(app: &mut TuiApp) {
         deferred: continuation.as_ref().is_some_and(|state| state.deferred),
         active_cell_count,
         tasks,
+        completion_ready,
+        requirements,
     });
 }
 
@@ -5762,6 +5849,43 @@ fn format_task_runtime_view(view: &TaskRuntimeView) -> String {
             "\n  [{}] {} ({})",
             task.status, task.title, task.agent_role
         ));
+    }
+    content.push_str(&format!(
+        "\nCompletion gate: {}",
+        if view.completion_ready {
+            "ready"
+        } else {
+            "blocked"
+        }
+    ));
+    for requirement in &view.requirements {
+        content.push_str(&format!(
+            "\n  [{}] {}: {}",
+            requirement.status, requirement.requirement_id, requirement.title
+        ));
+    }
+    content
+}
+
+fn format_completion_gate(
+    report: &echo_agent_app_core::tasks::task_runtime::CompletionGateReport,
+) -> String {
+    let mut content = format!(
+        "Completion gate: Goal r{}, Plan r{} ({})",
+        report.goal_revision,
+        report.plan_revision,
+        if report.ready { "ready" } else { "blocked" }
+    );
+    for requirement in &report.requirements {
+        content.push_str(&format!(
+            "\n[{}] {}: {}",
+            requirement.status.as_str(),
+            requirement.requirement.requirement_id,
+            requirement.requirement.title
+        ));
+    }
+    for blocker in &report.blockers {
+        content.push_str(&format!("\nBLOCK {:?}: {}", blocker.code, blocker.detail));
     }
     content
 }
@@ -6286,8 +6410,9 @@ mod tests {
         run_turn_binding_for_queued_turn, slash_command_allowed_while_busy, update_subagent_runs,
     };
     use crate::tui::{
-        ChatMessage, MessageRole, QueuedRunResume, QueuedTurn, TaskRuntimeTaskView,
-        TaskRuntimeView, Theme, ToolExecutionMessage, ToolExecutionStatus, TuiApp,
+        ChatMessage, MessageRole, QueuedRunResume, QueuedTurn, TaskRuntimeRequirementView,
+        TaskRuntimeTaskView, TaskRuntimeView, Theme, ToolExecutionMessage, ToolExecutionStatus,
+        TuiApp,
     };
     use echo_agent_app_core::chat_driver::TurnOutcome;
     use echo_agent_app_core::tasks::task_runtime::{
@@ -6947,6 +7072,12 @@ mod tests {
                 status: "completed".to_string(),
                 agent_role: "implementer".to_string(),
             }],
+            completion_ready: true,
+            requirements: vec![TaskRuntimeRequirementView {
+                requirement_id: "req:tui".to_string(),
+                title: "TUI 功能对等".to_string(),
+                status: "accepted".to_string(),
+            }],
         };
 
         let text = format_task_runtime_view(&view);
@@ -6955,6 +7086,8 @@ mod tests {
         assert!(text.contains("Tokens: 12345 used | 50000 budget | 37655 remaining"));
         assert!(text.contains("Time: 90s used | 300s budget | 210s remaining"));
         assert!(text.contains("[completed] 实现队列 (implementer)"));
+        assert!(text.contains("Completion gate: ready"));
+        assert!(text.contains("[accepted] req:tui: TUI 功能对等"));
     }
 
     #[test]
@@ -6976,6 +7109,8 @@ mod tests {
             deferred: false,
             active_cell_count: 0,
             tasks: Vec::new(),
+            completion_ready: false,
+            requirements: Vec::new(),
         };
 
         let text = format_task_runtime_view(&view);

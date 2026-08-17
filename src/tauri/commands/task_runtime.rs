@@ -34,6 +34,37 @@ pub async fn get_task_run(
     store(&state)?.get_run(&run_id).map_err(internal)
 }
 
+/// The one Requirement/Evidence completion report shared by every surface.
+#[tauri::command]
+pub async fn get_task_completion_gate(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+) -> Result<CompletionGateReport, IpcError> {
+    store(&state)?
+        .completion_gate_report(&run_id)
+        .map_err(internal)
+}
+
+/// Confirm a Skip for one exact current-Goal requirement from the GUI.
+#[tauri::command]
+pub async fn skip_task_goal_requirement(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    expected_goal_revision: u64,
+    requirement_id: String,
+    reason: String,
+) -> Result<CompletionGateReport, IpcError> {
+    store(&state)?
+        .skip_goal_requirement(
+            &run_id,
+            expected_goal_revision,
+            &requirement_id,
+            &reason,
+            RunGoalActorSource::Gui,
+        )
+        .map_err(internal)
+}
+
 /// Event-folded long-horizon control state for the existing TaskRun.
 #[tauri::command]
 pub async fn get_task_continuation(

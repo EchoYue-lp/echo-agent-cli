@@ -252,6 +252,86 @@ cmd!(
     cmd_task_goal
 );
 
+fn print_completion_gate(report: &echo_agent_app_core::tasks::task_runtime::CompletionGateReport) {
+    println!(
+        "\n--- Completion gate: Goal r{}, Plan r{} ({}) ---",
+        report.goal_revision,
+        report.plan_revision,
+        if report.ready { "ready" } else { "blocked" }
+    );
+    for item in &report.requirements {
+        println!(
+            "  [{}] {}  {} ({})",
+            item.status.as_str(),
+            item.requirement.requirement_id,
+            item.requirement.title,
+            item.requirement.task_id
+        );
+    }
+    for blocker in &report.blockers {
+        println!("  BLOCK {:?}: {}", blocker.code, blocker.detail);
+    }
+}
+
+async fn cmd_task_requirements(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let requested_run_id = args.first().copied();
+    let (store, snapshot) = match current_task_run(ctx, requested_run_id) {
+        Ok(value) => value,
+        Err(error) => {
+            println!("\n  TaskRun error: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    match store.completion_gate_report(&snapshot.run.run_id) {
+        Ok(report) => print_completion_gate(&report),
+        Err(error) => println!("\n  Unable to read completion gate: {error}"),
+    }
+    CommandOutcome::Continue
+}
+
+async fn cmd_task_requirement_skip(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let parsed = match crate::task_run_control::parse_requirement_skip_args(args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            println!("\n  {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let (store, snapshot) = match current_task_run(ctx, parsed.requested_run_id.as_deref()) {
+        Ok(value) => value,
+        Err(error) => {
+            println!("\n  TaskRun error: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    match store.skip_goal_requirement(
+        &snapshot.run.run_id,
+        parsed.expected_goal_revision,
+        &parsed.requirement_id,
+        &parsed.reason,
+        echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
+    ) {
+        Ok(report) => print_completion_gate(&report),
+        Err(error) => println!("\n  Unable to confirm requirement Skip: {error}"),
+    }
+    CommandOutcome::Continue
+}
+
+cmd!(
+    TaskRequirementsCommand,
+    "task-requirements",
+    CommandCategory::Advanced,
+    "Show the current Goal Requirement/Evidence completion gate",
+    cmd_task_requirements
+);
+cmd!(
+    TaskRequirementSkipCommand,
+    "task-requirement-skip",
+    CommandCategory::Advanced,
+    "Confirm a Skip for one exact current-Goal requirement",
+    cmd_task_requirement_skip
+);
+
 #[derive(Clone, Copy)]
 enum SubagentControlAction {
     Message,
@@ -477,6 +557,8 @@ cmd!(
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(TaskRunCommand));
     registry.register(Arc::new(TaskGoalCommand));
+    registry.register(Arc::new(TaskRequirementsCommand));
+    registry.register(Arc::new(TaskRequirementSkipCommand));
     registry.register(Arc::new(SubagentMessageCommand));
     registry.register(Arc::new(SubagentFollowupCommand));
     registry.register(Arc::new(SubagentInterruptCommand));

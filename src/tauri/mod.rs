@@ -110,6 +110,8 @@ pub fn build_tauri_app(
             commands::tasks::get_task_dag,
             // TaskRuntime (complex-task runs, plans, todos, events, artifacts, reviews)
             commands::task_runtime::get_task_run,
+            commands::task_runtime::get_task_completion_gate,
+            commands::task_runtime::skip_task_goal_requirement,
             commands::task_runtime::get_task_continuation,
             commands::task_runtime::configure_task_continuation,
             commands::task_runtime::update_task_run_goal,

@@ -57,6 +57,7 @@ import type {
   BackgroundCellState,
   SubagentControlIdentity,
   SubagentControlReceipt,
+  CompletionGateReport,
   WorkspaceTransitionReceipt,
   ConfiguredModelListResponse,
   LlmApiProtocol,
@@ -555,6 +556,27 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<TaskRun | null>('get_task_run', { runId })
       : get<TaskRun | null>(`/task_runtime/runs/${runId}`),
+  getCompletionGate: (runId: string) =>
+    isTauri()
+      ? apiInvoke<CompletionGateReport>('get_task_completion_gate', { runId })
+      : get<CompletionGateReport>(`/task_runtime/runs/${runId}/completion_gate`),
+  skipGoalRequirement: (
+    runId: string,
+    expectedGoalRevision: number,
+    requirementId: string,
+    reason: string
+  ) =>
+    isTauri()
+      ? apiInvoke<CompletionGateReport>('skip_task_goal_requirement', {
+          runId,
+          expectedGoalRevision,
+          requirementId,
+          reason,
+        })
+      : post<CompletionGateReport>(
+          `/task_runtime/runs/${runId}/requirements/${requirementId}/skip`,
+          { expected_goal_revision: expectedGoalRevision, reason }
+        ),
   getContinuation: (runId: string) =>
     isTauri()
       ? apiInvoke<RunContinuationState | null>('get_task_continuation', { runId })

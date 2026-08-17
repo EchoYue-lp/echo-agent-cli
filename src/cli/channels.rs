@@ -334,6 +334,41 @@ impl AppChannelMessageHandler {
             };
             return Some(ChannelTaskRunControl::Reply(reply));
         }
+        if command == "/task-requirements" {
+            let requested_run_id = parts.next();
+            let (store, snapshot) = match self.current_task_run(conv, requested_run_id) {
+                Ok(value) => value,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
+            let reply = match store.completion_gate_report(&snapshot.run.run_id) {
+                Ok(report) => format_channel_completion_gate(&report),
+                Err(error) => format!("Unable to read completion gate: {error}"),
+            };
+            return Some(ChannelTaskRunControl::Reply(reply));
+        }
+        if command == "/task-requirement-skip" {
+            let values = parts.collect::<Vec<_>>();
+            let parsed = match crate::task_run_control::parse_requirement_skip_args(&values) {
+                Ok(parsed) => parsed,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
+            let (store, snapshot) =
+                match self.current_task_run(conv, parsed.requested_run_id.as_deref()) {
+                    Ok(value) => value,
+                    Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+                };
+            let reply = match store.skip_goal_requirement(
+                &snapshot.run.run_id,
+                parsed.expected_goal_revision,
+                &parsed.requirement_id,
+                &parsed.reason,
+                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Channel,
+            ) {
+                Ok(report) => format_channel_completion_gate(&report),
+                Err(error) => format!("Unable to confirm requirement Skip: {error}"),
+            };
+            return Some(ChannelTaskRunControl::Reply(reply));
+        }
         let (action, budget_values, requested_run_id) = match command {
             "/task-run" => {
                 let action = parts.next().unwrap_or("status");
@@ -691,6 +726,33 @@ fn format_channel_task_run_status(
             ));
         }
     }
+    lines.join("\n")
+}
+
+#[cfg(feature = "channels")]
+fn format_channel_completion_gate(
+    report: &echo_agent_app_core::tasks::task_runtime::CompletionGateReport,
+) -> String {
+    let mut lines = vec![format!(
+        "Completion gate: Goal r{}, Plan r{} ({})",
+        report.goal_revision,
+        report.plan_revision,
+        if report.ready { "ready" } else { "blocked" }
+    )];
+    lines.extend(report.requirements.iter().map(|item| {
+        format!(
+            "[{}] {}: {}",
+            item.status.as_str(),
+            item.requirement.requirement_id,
+            item.requirement.title
+        )
+    }));
+    lines.extend(
+        report
+            .blockers
+            .iter()
+            .map(|item| format!("BLOCK {:?}: {}", item.code, item.detail)),
+    );
     lines.join("\n")
 }
 

@@ -64,6 +64,14 @@ const TODO_LABEL: Record<string, string> = {
   skipped: '已跳过',
 };
 
+const REQUIREMENT_LABEL: Record<string, string> = {
+  pending: '待验收',
+  accepted: '已验收',
+  skipped: '已确认跳过',
+  stale: '证据已失效',
+  failed: '验收失败',
+};
+
 const PAUSE_REASON_LABEL: Record<RunPauseReason, string> = {
   user: '用户暂停',
   needs_input: '等待补充信息',
@@ -616,6 +624,7 @@ export function TaskRuntimePanel() {
     recoveryBlockers,
     continuation,
     backgroundCells,
+    completionGate,
     error,
     refresh,
     cancel,
@@ -625,6 +634,7 @@ export function TaskRuntimePanel() {
     resumeTaskRun,
     retryBlockedTask,
     resolveRecoveryTask,
+    skipGoalRequirement,
   } = useTaskRuntimeStore();
   const [tokenBudgetInput, setTokenBudgetInput] = useState('');
   const [timeBudgetInput, setTimeBudgetInput] = useState('');
@@ -632,6 +642,8 @@ export function TaskRuntimePanel() {
   const [goalInput, setGoalInput] = useState('');
   const [goalReasonInput, setGoalReasonInput] = useState('');
   const [goalError, setGoalError] = useState<string | null>(null);
+  const [requirementSkipId, setRequirementSkipId] = useState<string | null>(null);
+  const [requirementSkipReason, setRequirementSkipReason] = useState('');
 
   useEffect(() => {
     setTokenBudgetInput(continuation?.token_budget?.toString() ?? '');
@@ -643,6 +655,8 @@ export function TaskRuntimePanel() {
     setGoalInput(activeRun?.goal ?? '');
     setGoalReasonInput('');
     setGoalError(null);
+    setRequirementSkipId(null);
+    setRequirementSkipReason('');
   }, [activeRun?.run_id, activeRun?.goal_revision, activeRun?.goal]);
 
   const visibleTraceRuns = useMemo(
@@ -707,6 +721,13 @@ export function TaskRuntimePanel() {
     }
     setGoalError(null);
     await updateGoal(runId, activeRun.goal_revision, goal, reason);
+  };
+  const confirmRequirementSkip = async () => {
+    const reason = requirementSkipReason.trim();
+    if (!requirementSkipId || !reason) return;
+    await skipGoalRequirement(requirementSkipId, reason);
+    setRequirementSkipId(null);
+    setRequirementSkipReason('');
   };
 
   return (
@@ -953,6 +974,102 @@ export function TaskRuntimePanel() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {completionGate && completionGate.requirements.length > 0 && (
+        <div className="mb-2 border-t border-[var(--border-primary)] pt-2">
+          <div className="mb-1 flex items-center justify-between text-[10px]">
+            <span className="font-medium" style={{ color: 'var(--text-tertiary)' }}>
+              Goal 验收 · r{completionGate.goal_revision}
+            </span>
+            <span
+              style={{
+                color: completionGate.ready ? 'var(--color-success)' : 'var(--color-warning)',
+              }}
+            >
+              {completionGate.ready ? '通过' : `${completionGate.blockers.length} 项阻塞`}
+            </span>
+          </div>
+          <div className="space-y-1" data-testid="completion-gate-requirements">
+            {completionGate.requirements.map((assessment) => {
+              const requirement = assessment.requirement;
+              const taskStatus = todos.find((todo) => todo.task_id === requirement.task_id)?.status;
+              const canConfirmSkip =
+                taskStatus === 'skipped' && assessment.status !== 'skipped' && planGoalCurrent;
+              const editingSkip = requirementSkipId === requirement.requirement_id;
+              return (
+                <div key={requirement.requirement_id} className="min-w-0 px-1 py-0.5">
+                  <div className="flex min-w-0 items-center gap-1">
+                    <span
+                      className="min-w-0 flex-1 truncate text-[10px]"
+                      style={{ color: 'var(--text-primary)' }}
+                      title={requirement.description}
+                    >
+                      {requirement.title}
+                    </span>
+                    <span className="shrink-0 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+                      {REQUIREMENT_LABEL[assessment.status] ?? assessment.status}
+                    </span>
+                    {canConfirmSkip && !editingSkip && (
+                      <button
+                        type="button"
+                        className="rounded-md p-0.5 hover:bg-[var(--bg-hover)]"
+                        title="确认跳过该 Goal requirement"
+                        aria-label="确认跳过该 Goal requirement"
+                        onClick={() => {
+                          setRequirementSkipId(requirement.requirement_id);
+                          setRequirementSkipReason('');
+                        }}
+                      >
+                        <SkipForward size={10} style={{ color: 'var(--color-warning)' }} />
+                      </button>
+                    )}
+                  </div>
+                  {editingSkip && (
+                    <div className="mt-1 grid grid-cols-[minmax(0,1fr)_24px_24px] gap-1">
+                      <input
+                        autoFocus
+                        value={requirementSkipReason}
+                        onChange={(event) => setRequirementSkipReason(event.target.value)}
+                        placeholder="跳过原因"
+                        className="h-6 min-w-0 rounded-md px-1.5 text-[9px] outline-none"
+                        style={{
+                          background: 'var(--bg-primary)',
+                          border: '1px solid var(--border-primary)',
+                          color: 'var(--text-primary)',
+                        }}
+                      />
+                      <button
+                        type="button"
+                        disabled={!requirementSkipReason.trim()}
+                        className="flex h-6 w-6 items-center justify-center rounded-md"
+                        style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
+                        title="保存跳过原因"
+                        aria-label="保存跳过原因"
+                        onClick={() => void confirmRequirementSkip()}
+                      >
+                        <Save size={10} />
+                      </button>
+                      <button
+                        type="button"
+                        className="flex h-6 w-6 items-center justify-center rounded-md"
+                        style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}
+                        title="取消"
+                        aria-label="取消"
+                        onClick={() => {
+                          setRequirementSkipId(null);
+                          setRequirementSkipReason('');
+                        }}
+                      >
+                        <X size={10} />
+                      </button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 

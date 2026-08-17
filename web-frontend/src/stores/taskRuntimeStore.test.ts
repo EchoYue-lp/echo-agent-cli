@@ -15,6 +15,8 @@ const mocks = vi.hoisted(() => ({
   listRecoveryBlockers: vi.fn(),
   getContinuation: vi.fn(),
   listBackgroundCells: vi.fn(),
+  getCompletionGate: vi.fn(),
+  skipGoalRequirement: vi.fn(),
   getRun: vi.fn(),
   listEvents: vi.fn(),
   listToolExecutions: vi.fn(),
@@ -79,6 +81,14 @@ describe('taskRuntimeStore recovery controls', () => {
     mocks.resumeRun.mockResolvedValue({ kind: 'resumed', run_id: 'run-1' });
     mocks.retryBlockedTask.mockResolvedValue({ kind: 'recovery_retry_recorded' });
     mocks.resolveRecoveryTask.mockResolvedValue(undefined);
+    mocks.skipGoalRequirement.mockResolvedValue({
+      run_id: 'run-1',
+      goal_revision: 1,
+      plan_revision: 1,
+      ready: true,
+      requirements: [],
+      blockers: [],
+    });
     mocks.updateTasks.mockResolvedValue({ run_id: 'run-1', revision: 4 });
     useTaskRuntimeStore.getState().reset();
     useTaskRuntimeStore.setState({
@@ -137,6 +147,25 @@ describe('taskRuntimeStore recovery controls', () => {
     expect(refresh).toHaveBeenCalledWith('run-1');
   });
 
+  it('binds a requirement skip to the current Goal revision and refreshes the gate', async () => {
+    useTaskRuntimeStore.setState({
+      activeRun: run('paused'),
+    });
+
+    await useTaskRuntimeStore
+      .getState()
+      .skipGoalRequirement('req:manual-review', '用户确认该项不适用');
+
+    expect(mocks.skipGoalRequirement).toHaveBeenCalledWith(
+      'run-1',
+      1,
+      'req:manual-review',
+      '用户确认该项不适用'
+    );
+    expect(useTaskRuntimeStore.getState().completionGate?.ready).toBe(true);
+    expect(refresh).toHaveBeenCalledWith('run-1');
+  });
+
   it('surfaces rejected supervised recovery retry without refreshing', async () => {
     mocks.retryBlockedTask.mockRejectedValueOnce(new Error('TaskRuntime admission is closed'));
 
@@ -191,6 +220,14 @@ describe('taskRuntimeStore conversation loading', () => {
     mocks.listRecoveryBlockers.mockResolvedValue([]);
     mocks.getContinuation.mockResolvedValue(null);
     mocks.listBackgroundCells.mockResolvedValue([]);
+    mocks.getCompletionGate.mockResolvedValue({
+      run_id: 'run-1',
+      goal_revision: 1,
+      plan_revision: 0,
+      ready: false,
+      requirements: [],
+      blockers: [],
+    });
     mocks.listEvents.mockResolvedValue([]);
     mocks.listToolExecutions.mockResolvedValue([]);
     useSubagentRunStore.getState().clear();

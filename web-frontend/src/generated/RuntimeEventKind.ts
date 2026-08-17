@@ -9,6 +9,9 @@
 export type RuntimeEventKind =
   | 'run_created'
   | 'run_goal_updated'
+  | 'requirement_evidence_invalidated'
+  | 'requirement_evidence_revalidated'
+  | 'requirement_skipped'
   | 'run_started'
   | 'run_completed'
   | 'run_failed'

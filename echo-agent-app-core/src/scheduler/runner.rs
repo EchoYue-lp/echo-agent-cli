@@ -7,8 +7,8 @@
 //! Phase 3.1: ALL cron tasks route through the unified TaskRuntime executor
 //! (`drive_existing_cron_run`). The legacy `[plan]` prefix is stripped for backward
 //! compatibility but no longer selects a separate path — simple prompts are
-//! answered directly by the agent (auto-Completed when task_execute isn't
-//! called); complex prompts drive task_create + task_execute.
+//! answered directly by the agent and materialized as a one-task Plan with
+//! completion evidence; complex prompts drive task_create + task_execute.
 
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
@@ -33,7 +33,8 @@ const PLAN_MARKER: &str = "[plan]";
 /// Phase 3.1+: ALL cron prompts route through the unified supervised
 /// TaskRuntime executor, `Unattended`). The `[plan]` prefix is stripped for
 /// backward compatibility. Simple prompts are answered directly by the agent
-/// (auto-Completed); complex prompts drive task_create + task_execute.
+/// and materialized as a one-task Plan with completion evidence; complex prompts
+/// drive task_create + task_execute.
 ///
 /// Phase 3.5: the dead-in-practice `runtime_store=None` fallback (legacy
 /// `BackgroundTaskService::submit` + `execute_direct`) has been removed —

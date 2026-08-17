@@ -41,6 +41,7 @@ use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use futures::StreamExt;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
+use super::completion_gate::{artifact_matches, verification_matches};
 use super::store::{ClaimWriteOutcome, StoreError, SubagentReleaseRecord, TaskRuntimeStore};
 use super::types::*;
 
@@ -224,6 +225,12 @@ pub enum RunPlanPolicy {
     AllowDirect,
 }
 
+#[derive(Debug, Default)]
+struct AgentDriveStreamResult {
+    failure: Option<String>,
+    final_answer: Option<String>,
+}
+
 /// Workspace-mutating tools that an unattended primary Agent must not call
 /// directly unless the user explicitly selected `InPlace` mode.
 ///
@@ -383,11 +390,22 @@ pub async fn execute_run(
             })
             .count();
         if unresolved_count == 0 {
-            let blockers = run_completion_blockers(&store, run_id);
-            if !blockers.is_empty() {
-                break Ok(RunOutcome::Failed {
+            let report = store.completion_gate_report(run_id)?;
+            if !report.ready {
+                let error = report
+                    .blockers
+                    .iter()
+                    .map(|item| format!("{:?}: {}", item.code, item.detail))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                store.request_pause_with_reason(
+                    run_id,
+                    RunPauseReason::NeedsInput,
+                    Some(&error),
+                )?;
+                break Ok(RunOutcome::Paused {
                     failed_task_id: "<completion_gate>".to_string(),
-                    error: blockers.join("; "),
+                    error,
                 });
             }
             if store.complete_run_if_quiescent(run_id)? {
@@ -588,71 +606,18 @@ pub async fn execute_run(
     outcome
 }
 
+#[cfg(test)]
 fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String> {
-    let mut blockers = Vec::new();
-    let Some(plan) = store.get_plan(run_id).ok().flatten() else {
-        blockers.push("run has no plan".to_string());
-        return blockers;
-    };
-    if plan.tasks.is_empty() {
-        blockers.push("run plan has no tasks".to_string());
-        return blockers;
-    }
-    for task in &plan.tasks {
-        match task.status {
-            TodoStatus::Completed => match store.get_summary(run_id, &task.id) {
-                Ok(Some(summary)) => match assess_task_execution(task, &summary.result) {
-                    CompletionAssessment::Executed => {}
-                    CompletionAssessment::ExecutionFailed { reason } => {
-                        blockers.push(format!(
-                            "task '{}' execution incomplete: {reason}",
-                            task.title
-                        ));
-                    }
-                    CompletionAssessment::AcceptancePending {
-                        missing_checks,
-                        missing_artifacts,
-                    } => {
-                        blockers.push(format!(
-                            "task '{}' acceptance pending: missing checks [{}], missing artifacts [{}]",
-                            task.title,
-                            missing_checks.join(", "),
-                            missing_artifacts.join(", "),
-                        ));
-                    }
-                },
-                Ok(None) => blockers.push(format!(
-                    "task '{}' completed without a structured result",
-                    task.title
-                )),
-                Err(error) => blockers.push(format!(
-                    "task '{}' result could not be read: {error}",
-                    task.title
-                )),
-            },
-            TodoStatus::Skipped => {}
-            status => blockers.push(format!("task '{}' is {}", task.title, status.as_str())),
-        }
-    }
-    match store.list_recovery_blockers(run_id) {
-        Ok(recovery) if !recovery.is_empty() => {
-            blockers.push(format!("{} unresolved recovery blocker(s)", recovery.len()))
-        }
-        Err(error) => blockers.push(format!("recovery blockers could not be read: {error}")),
-        _ => {}
-    }
-    match store.list_background_cells(run_id) {
-        Ok(cells) => {
-            for cell in cells.into_iter().filter(BackgroundCellState::is_active) {
-                blockers.push(format!(
-                    "background cell '{}' ({}) is still running",
-                    cell.name, cell.cell_id
-                ));
-            }
-        }
-        Err(error) => blockers.push(format!("background cells could not be read: {error}")),
-    }
-    blockers
+    store
+        .completion_gate_report(run_id)
+        .map(|report| {
+            report
+                .blockers
+                .into_iter()
+                .map(|item| item.detail)
+                .collect()
+        })
+        .unwrap_or_else(|error| vec![error.to_string()])
 }
 
 fn finalize_cancelled_run_state(store: &TaskRuntimeStore, run_id: &str) -> Result<(), StoreError> {
@@ -776,23 +741,6 @@ fn assess_task_execution(task: &PlanTask, result: &SubagentTaskResult) -> Comple
             missing_artifacts,
         }
     }
-}
-
-fn verification_matches(required: &str, observed: &str) -> bool {
-    let required = required.split_whitespace().collect::<Vec<_>>().join(" ");
-    let observed = observed.split_whitespace().collect::<Vec<_>>().join(" ");
-    !required.is_empty() && required.eq_ignore_ascii_case(&observed)
-}
-
-fn artifact_matches(required: &str, actual: &str) -> bool {
-    let required = required.trim().replace('\\', "/");
-    let actual = actual.trim().replace('\\', "/");
-    !required.is_empty()
-        && (actual == required
-            || actual.ends_with(&format!("/{required}"))
-            || std::path::Path::new(&actual)
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy() == required))
 }
 
 /// Abstraction over how a single ready task is dispatched in the EKO runtime.
@@ -3787,7 +3735,8 @@ fn save_trace(
 /// Creates a run, then drives the agent's ReAct loop in the run's context so
 /// the agent itself calls `task_create` (to materialise the plan) and
 /// `task_execute` (which internally calls `execute_run`). Simple prompts that
-/// the agent answers directly (without `task_execute`) auto-Complete.
+/// the agent answers directly (without `task_execute`) are materialized as a
+/// one-task Plan and must pass the same requirement/evidence completion gate.
 ///
 /// **Why not call `execute_run` directly?** `execute_run` requires a plan to
 /// already exist (`store.get_plan → NoPlan` if absent). The plan is created
@@ -3928,7 +3877,7 @@ pub async fn drive_agent_run(
     let trace_sink_for_scope = trace_sink.clone();
     let core_trace_sink = exec_trace_sink_to_core(trace_sink);
 
-    let stream_failure = super::task_tools::with_run_context(
+    let stream_result = super::task_tools::with_run_context(
         run_id_for_scope.clone(),
         cancel_for_scope.clone(),
         trace_sink_for_scope,
@@ -3974,7 +3923,10 @@ pub async fn drive_agent_run(
                         error = %error,
                         "Run agent event identity is invalid"
                     );
-                    return Some(error.to_string());
+                    return AgentDriveStreamResult {
+                        failure: Some(error.to_string()),
+                        final_answer: None,
+                    };
                 }
             };
 
@@ -3992,6 +3944,7 @@ pub async fn drive_agent_run(
                 Ok(raw_stream) => {
                     let mut stream =
                         echo_core::agent::envelope_event_stream(raw_stream, event_identity);
+                    let mut final_answer = None;
                     // Drain the stream to completion. Interactive callers may
                     // receive events through the invocation trace sink; every
                     // caller must still consume the stream to finish the Run.
@@ -4000,11 +3953,10 @@ pub async fn drive_agent_run(
                             break;
                         }
                         match event_result {
-                            Ok(event) => {
-                                if let AgentEvent::Error {
+                            Ok(event) => match event.payload {
+                                AgentEvent::Error {
                                     source, message, ..
-                                } = event.payload
-                                {
+                                } => {
                                     let error = format!("{source}: {message}");
                                     tracing::warn!(
                                         source_id = %source_id,
@@ -4012,9 +3964,16 @@ pub async fn drive_agent_run(
                                         %error,
                                         "Run agent emitted terminal error"
                                     );
-                                    return Some(error);
+                                    return AgentDriveStreamResult {
+                                        failure: Some(error),
+                                        final_answer,
+                                    };
                                 }
-                            }
+                                AgentEvent::FinalAnswer(answer) if !answer.trim().is_empty() => {
+                                    final_answer = Some(answer);
+                                }
+                                _ => {}
+                            },
                             Err(e) => {
                                 tracing::warn!(
                                     source_id = %source_id,
@@ -4022,11 +3981,17 @@ pub async fn drive_agent_run(
                                     error = %e,
                                     "Run agent stream error"
                                 );
-                                return Some(e.to_string());
+                                return AgentDriveStreamResult {
+                                    failure: Some(e.to_string()),
+                                    final_answer,
+                                };
                             }
                         }
                     }
-                    None
+                    AgentDriveStreamResult {
+                        failure: None,
+                        final_answer,
+                    }
                 }
                 Err(e) => {
                     tracing::error!(
@@ -4035,17 +4000,31 @@ pub async fn drive_agent_run(
                         error = %e,
                         "Run agent failed to start stream"
                     );
-                    Some(e.to_string())
+                    AgentDriveStreamResult {
+                        failure: Some(e.to_string()),
+                        final_answer: None,
+                    }
                 }
             }
         },
     )
     .await;
 
-    if let Some(error) = stream_failure
+    if let Some(error) = stream_result.failure.as_deref()
         && !child_cancel.is_cancelled()
     {
         let message = format!("run agent stream failed: {error}");
+        store.finalize_run(run_id, TaskRunStatus::Failed, Some(&message))?;
+    }
+
+    if stream_result.failure.is_none()
+        && !child_cancel.is_cancelled()
+        && plan_policy == RunPlanPolicy::AllowDirect
+        && store.get_plan(run_id)?.is_none()
+        && let Some(final_answer) = stream_result.final_answer.as_deref()
+        && let Err(error) = materialize_direct_completion(&store, run_id, final_answer).await
+    {
+        let message = format!("failed to persist direct completion evidence: {error}");
         store.finalize_run(run_id, TaskRunStatus::Failed, Some(&message))?;
     }
 
@@ -4103,24 +4082,21 @@ pub async fn drive_agent_run(
             if child_cancel.is_cancelled() {
                 store.finalize_run(run_id, TaskRunStatus::Cancelled, None)?;
             } else {
-                let has_materialized_plan = store
-                    .get_plan(run_id)?
-                    .is_some_and(|plan| !plan.tasks.is_empty());
-                let blockers =
-                    if plan_policy == RunPlanPolicy::AllowDirect && !has_materialized_plan {
-                        Vec::new()
-                    } else {
-                        run_completion_blockers(&store, run_id)
-                    };
-                if blockers.is_empty() {
-                    store.finalize_run(run_id, TaskRunStatus::Completed, None)?;
+                let report = store.completion_gate_report(run_id)?;
+                if report.ready {
+                    let _completed = store.complete_run_if_quiescent(run_id)?;
                 } else {
-                    store.finalize_run(
+                    let blockers = report
+                        .blockers
+                        .iter()
+                        .map(|item| format!("{:?}: {}", item.code, item.detail))
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    store.request_pause_with_reason(
                         run_id,
-                        TaskRunStatus::Failed,
+                        RunPauseReason::NeedsInput,
                         Some(&format!(
-                            "completion gate rejected agent-driven run: {}",
-                            blockers.join("; ")
+                            "completion gate rejected agent-driven run: {blockers}"
                         )),
                     )?;
                 }
@@ -4152,6 +4128,77 @@ pub async fn drive_agent_run(
     }
 
     Ok(run_id.to_string())
+}
+
+async fn materialize_direct_completion(
+    store: &Arc<TaskRuntimeStore>,
+    run_id: &str,
+    final_answer: &str,
+) -> Result<(), ExecError> {
+    let run = store
+        .get_run(run_id)?
+        .ok_or_else(|| ExecError::RunNotFound(run_id.to_string()))?;
+    let title = {
+        let value = run.goal.chars().take(120).collect::<String>();
+        if value.trim().is_empty() {
+            "Complete the requested task".to_string()
+        } else {
+            value
+        }
+    };
+    let task_id = "direct-answer";
+    let plan = TaskPlan {
+        plan_id: format!("plan:{run_id}"),
+        run_id: run_id.to_string(),
+        revision: 0,
+        domain_profile: run.domain_profile,
+        goal_revision: run.goal_revision,
+        goal_sha256: run.goal_sha256,
+        assumptions: Vec::new(),
+        risks: Vec::new(),
+        execution_mode: ExecutionMode::Sequential,
+        tasks: vec![PlanTask {
+            id: task_id.to_string(),
+            title,
+            description: run.goal,
+            kind: PlanTaskKind::Summary,
+            agent_role: "primary-agent".to_string(),
+            domain_profile: run.domain_profile,
+            ..PlanTask::default()
+        }],
+    };
+    super::revisioned_adapter::commit_eko_task_plan(store.clone(), plan)
+        .await
+        .map_err(|error| ExecError::Other(format!("commit direct TaskPlan: {error}")))?;
+    store.set_task_status(
+        run_id,
+        task_id,
+        TodoStatus::Running,
+        Some("primary-agent"),
+        None,
+    )?;
+    store.put_summary(&TaskExecutionSummary {
+        run_id: run_id.to_string(),
+        task_id: task_id.to_string(),
+        subagent_name: "primary-agent".to_string(),
+        result: SubagentTaskResult::terminal(
+            SubagentRunStatus::Completed,
+            final_answer,
+            Vec::new(),
+        ),
+        decisions: Vec::new(),
+        next_implications: Vec::new(),
+        suggested_tasks: Vec::new(),
+        created_at: chrono::Utc::now(),
+    })?;
+    store.set_task_status(
+        run_id,
+        task_id,
+        TodoStatus::Completed,
+        Some("primary-agent"),
+        Some(final_answer),
+    )?;
+    Ok(())
 }
 
 pub(crate) async fn drive_existing_cron_run(
@@ -4762,7 +4809,8 @@ Read the runtime path and found one missing branch.
     async fn launch_unattended_run_returns_run_id() -> Result<(), String> {
         // Phase 3.4-1: launch_unattended_run must return the run_id so callers
         // (submit) can hand it to the Tauri layer. A simple prompt (mock returns
-        // "ok", agent never calls task_execute) auto-Completes (Q5).
+        // "ok", agent never calls task_execute) is materialized as a one-task
+        // Plan and completes through the shared evidence gate (Q5).
         use echo_agent::testing::MockLlmClient;
         use std::sync::Arc;
         let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -4795,15 +4843,26 @@ Read the runtime path and found one missing branch.
         )
         .await
         .map_err(|error| error.to_string())?;
-        // The returned id must key a real run that auto-Completed (the mock
-        // returns a direct answer, so task_execute never runs and the finalize
-        // branch auto-Completes — this verifies the contract survived the
-        // extraction: a non-empty id that maps to a Completed run).
+        // The returned id must key a real run whose direct answer was promoted
+        // into the same revisioned Plan + Evidence contract as a delegated run.
         let run = store
             .get_run(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "run should exist".to_string())?;
         assert_eq!(run.status, TaskRunStatus::Completed);
+        let plan = store
+            .get_plan(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "direct completion plan should exist".to_string())?;
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(
+            plan.tasks.first().map(|task| task.id.as_str()),
+            Some("direct-answer")
+        );
+        let report = store
+            .completion_gate_report(&run_id)
+            .map_err(|error| error.to_string())?;
+        assert!(report.ready, "direct completion evidence: {report:?}");
         Ok(())
     }
 
@@ -4863,7 +4922,16 @@ Read the runtime path and found one missing branch.
             .get_run(run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "run should exist".to_string())?;
-        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert_eq!(run.status, TaskRunStatus::Paused);
+        let report = store
+            .completion_gate_report(run_id)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.code == CompletionBlockerCode::NoPlan)
+        );
         Ok(())
     }
 
@@ -5444,7 +5512,7 @@ Read the runtime path and found one missing branch.
         assert!(
             blockers
                 .iter()
-                .any(|blocker| blocker.contains("without a structured result"))
+                .any(|blocker| blocker.contains("no structured execution result"))
         );
 
         store

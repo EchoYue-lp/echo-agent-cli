@@ -252,6 +252,8 @@ pub struct TaskRuntimeView {
     pub deferred: bool,
     pub active_cell_count: usize,
     pub tasks: Vec<TaskRuntimeTaskView>,
+    pub completion_ready: bool,
+    pub requirements: Vec<TaskRuntimeRequirementView>,
 }
 
 #[derive(Clone, Debug)]
@@ -259,6 +261,13 @@ pub struct TaskRuntimeTaskView {
     pub title: String,
     pub status: String,
     pub agent_role: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskRuntimeRequirementView {
+    pub requirement_id: String,
+    pub title: String,
+    pub status: String,
 }
 
 /// Live, in-memory projection of one framework subagent dispatch.

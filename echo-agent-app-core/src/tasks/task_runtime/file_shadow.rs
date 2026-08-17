@@ -278,11 +278,18 @@ impl FileTaskShadow {
             return Ok(());
         };
         let note_kind = latest.payload.get("kind").and_then(|value| value.as_str());
-        let affects_plan = latest.event_type == RuntimeEventKind::PlanRevisionCommitted;
+        let affects_plan = matches!(
+            latest.event_type,
+            RuntimeEventKind::PlanRevisionCommitted
+                | RuntimeEventKind::RequirementEvidenceRevalidated
+        );
         let affects_run_state = matches!(
             latest.event_type,
             RuntimeEventKind::RunCreated
                 | RuntimeEventKind::RunGoalUpdated
+                | RuntimeEventKind::RequirementEvidenceInvalidated
+                | RuntimeEventKind::RequirementEvidenceRevalidated
+                | RuntimeEventKind::RequirementSkipped
                 | RuntimeEventKind::RunStatusChanged
                 | RuntimeEventKind::RunAttachmentsUpdated
                 | RuntimeEventKind::RunCancelled

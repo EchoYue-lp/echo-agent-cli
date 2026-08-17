@@ -56,6 +56,8 @@ pub enum StoreError {
     },
     #[error("goal update rejected for run {run_id}: {reason}")]
     GoalUpdateRejected { run_id: String, reason: String },
+    #[error("requirement skip rejected for run {run_id}: {reason}")]
+    RequirementSkipRejected { run_id: String, reason: String },
     #[error(
         "plan revision {plan_revision} for run {run_id} is bound to goal revision {plan_goal_revision}, current goal revision is {run_goal_revision}"
     )]
@@ -835,9 +837,9 @@ fn validate_runtime_plan(tasks: &[PlanTask]) -> Result<(), StoreError> {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveSubagentBoundary {
-    task_id: String,
-    execution_id: String,
+pub(crate) struct ActiveSubagentBoundary {
+    pub(crate) task_id: String,
+    pub(crate) execution_id: String,
     replay_safe: bool,
 }
 
@@ -2418,6 +2420,11 @@ impl TaskRuntimeStore {
             }
 
             let updated_at = Utc::now();
+            let old_requirements = self
+                .get_plan(run_id)?
+                .as_ref()
+                .map(super::completion_gate::requirements_for_plan)
+                .unwrap_or_default();
             self.shadow.append_event_line(
                 run_id,
                 None,
@@ -2436,9 +2443,118 @@ impl TaskRuntimeStore {
                     "continuation_deferred_reason": "goal_revision_unbound",
                 }),
             )?;
+            for requirement in old_requirements {
+                self.shadow.append_event_line(
+                    run_id,
+                    Some(requirement.task_id.as_str()),
+                    None,
+                    RuntimeEventKind::RequirementEvidenceInvalidated,
+                    serde_json::json!({
+                        "requirement_id": requirement.requirement_id,
+                        "requirement_sha256": requirement.requirement_sha256,
+                        "old_goal_revision": run.goal_revision,
+                        "new_goal_revision": new_goal_revision,
+                        "old_plan_revision": requirement.plan_revision,
+                        "reason": reason,
+                    }),
+                )?;
+            }
             self.shadow.rewrite_plan(run_id)?;
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))
+        })
+    }
+
+    /// Record an explicit local-user decision to skip one exact requirement.
+    /// The task must already be Skipped through the canonical revisioned graph.
+    pub fn skip_goal_requirement(
+        &self,
+        run_id: &str,
+        expected_goal_revision: u64,
+        requirement_id: &str,
+        reason: &str,
+        actor_source: RunGoalActorSource,
+    ) -> Result<CompletionGateReport, StoreError> {
+        let actor_user_id = crate::infra::load_or_create_cache_user_id();
+        self.with_run_lock(run_id, || {
+            if reason.trim().is_empty() || requirement_id.trim().is_empty() {
+                return Err(StoreError::RequirementSkipRejected {
+                    run_id: run_id.to_string(),
+                    reason: "requirement id and Skip reason must not be empty".to_string(),
+                });
+            }
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if run.goal_revision != expected_goal_revision {
+                return Err(StoreError::GoalConflict {
+                    run_id: run_id.to_string(),
+                    expected: expected_goal_revision,
+                    current: run.goal_revision,
+                });
+            }
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            validate_plan_goal_binding(&run, &plan)?;
+            let requirement = super::completion_gate::requirements_for_plan(&plan)
+                .into_iter()
+                .find(|item| item.requirement_id == requirement_id)
+                .ok_or_else(|| StoreError::RequirementSkipRejected {
+                    run_id: run_id.to_string(),
+                    reason: format!("unknown requirement '{requirement_id}'"),
+                })?;
+            let task = plan
+                .tasks
+                .iter()
+                .find(|item| item.id == requirement.task_id)
+                .ok_or_else(|| StoreError::TaskNotFound(requirement.task_id.clone()))?;
+            if task.status != TodoStatus::Skipped {
+                return Err(StoreError::RequirementSkipRejected {
+                    run_id: run_id.to_string(),
+                    reason: format!(
+                        "task '{}' must first be skipped through task_update(base_revision)",
+                        task.id
+                    ),
+                });
+            }
+            let duplicate = self.list_events(run_id, 0)?.into_iter().any(|event| {
+                event.event_type == RuntimeEventKind::RequirementSkipped
+                    && event
+                        .payload
+                        .get("requirement_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(requirement.requirement_id.as_str())
+                    && event
+                        .payload
+                        .get("requirement_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(requirement.requirement_sha256.as_str())
+                    && event
+                        .payload
+                        .get("goal_revision")
+                        .and_then(serde_json::Value::as_u64)
+                        == Some(run.goal_revision)
+            });
+            if !duplicate {
+                self.shadow.append_event_line(
+                    run_id,
+                    Some(task.id.as_str()),
+                    None,
+                    RuntimeEventKind::RequirementSkipped,
+                    serde_json::json!({
+                        "requirement_id": requirement.requirement_id,
+                        "requirement_sha256": requirement.requirement_sha256,
+                        "goal_revision": run.goal_revision,
+                        "plan_revision": plan.revision,
+                        "reason": reason,
+                        "actor_source": actor_source.as_str(),
+                        "actor_user_id": actor_user_id,
+                    }),
+                )?;
+                self.shadow.rewrite_plan(run_id)?;
+            }
+            self.completion_gate_report(run_id)
         })
     }
 
@@ -2826,22 +2942,8 @@ impl TaskRuntimeStore {
             if run.status != TaskRunStatus::Running {
                 return Ok(false);
             }
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-            validate_plan_goal_binding(&run, &plan)?;
-            if plan
-                .tasks
-                .iter()
-                .any(|task| !matches!(task.status, TodoStatus::Completed | TodoStatus::Skipped))
-            {
-                return Ok(false);
-            }
-            if self
-                .list_background_cells(run_id)?
-                .iter()
-                .any(BackgroundCellState::is_active)
-            {
+            let report = self.completion_gate_report(run_id)?;
+            if !report.ready {
                 return Ok(false);
             }
             self.shadow.append_event_line(
@@ -2852,7 +2954,9 @@ impl TaskRuntimeStore {
                 serde_json::json!({
                     "from": TaskRunStatus::Running.as_str(),
                     "to": TaskRunStatus::Completed.as_str(),
-                    "plan_revision": plan.revision,
+                    "plan_revision": report.plan_revision,
+                    "goal_revision": report.goal_revision,
+                    "requirement_count": report.requirements.len(),
                 }),
             )?;
             self.shadow.rewrite_plan(run_id)?;
@@ -3207,6 +3311,11 @@ impl TaskRuntimeStore {
             let run = self
                 .get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let previous_plan = self.get_plan(run_id)?;
+            let previous_requirements = previous_plan
+                .as_ref()
+                .map(super::completion_gate::requirements_for_plan)
+                .unwrap_or_default();
             if matches!(
                 run.status,
                 TaskRunStatus::Completed | TaskRunStatus::Cancelled
@@ -3337,6 +3446,28 @@ impl TaskRuntimeStore {
                 .filter(|task| !previous_task_ids.contains(task.id.as_str()))
                 .map(|task| task.id.clone())
                 .collect::<Vec<_>>();
+            let revalidated_requirements = previous_plan
+                .as_ref()
+                .filter(|previous| previous.goal_revision != run.goal_revision)
+                .map(|_previous| {
+                    let current = super::completion_gate::requirements_for_revision(&plan);
+                    current
+                        .into_iter()
+                        .filter_map(|requirement| {
+                            previous_requirements
+                                .iter()
+                                .find(|old| {
+                                    old.requirement_id == requirement.requirement_id
+                                        && old.requirement_sha256 == requirement.requirement_sha256
+                                })
+                                .map(|old| (old.clone(), requirement))
+                        })
+                        .map(|(old, requirement)| {
+                            (old.goal_revision, old.plan_revision, requirement)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             self.shadow.append_event_line(
                 run_id,
                 None,
@@ -3351,6 +3482,22 @@ impl TaskRuntimeStore {
                     "plan": plan,
                 }),
             )?;
+            for (old_goal_revision, old_plan_revision, requirement) in revalidated_requirements {
+                self.shadow.append_event_line(
+                    run_id,
+                    Some(requirement.task_id.as_str()),
+                    None,
+                    RuntimeEventKind::RequirementEvidenceRevalidated,
+                    serde_json::json!({
+                        "requirement_id": requirement.requirement_id,
+                        "requirement_sha256": requirement.requirement_sha256,
+                        "old_goal_revision": old_goal_revision,
+                        "new_goal_revision": run.goal_revision,
+                        "old_plan_revision": old_plan_revision,
+                        "new_plan_revision": requirement.plan_revision,
+                    }),
+                )?;
+            }
             self.shadow.rewrite_plan(run_id)?;
             self.load_revisioned_task_graph(run_id)?
                 .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))
@@ -4090,7 +4237,7 @@ impl TaskRuntimeStore {
         Ok(runs.into_values().collect())
     }
 
-    fn active_subagent_boundaries(
+    pub(crate) fn active_subagent_boundaries(
         &self,
         run_id: &str,
     ) -> Result<Vec<ActiveSubagentBoundary>, StoreError> {
@@ -7108,14 +7255,21 @@ mod tests {
             .get_plan("r1")?
             .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?;
         assert_eq!(stale_plan.goal_revision, 1);
-        assert!(matches!(
-            store.resume_task_run("r1"),
-            Err(StoreError::PlanGoalMismatch {
-                plan_goal_revision: 1,
-                run_goal_revision: 2,
-                ..
-            })
-        ));
+        let resume_error = store
+            .resume_task_run("r1")
+            .err()
+            .ok_or_else(|| StoreError::InvalidPlan("stale plan resumed".to_string()))?;
+        assert!(
+            matches!(
+                &resume_error,
+                StoreError::PlanGoalMismatch {
+                    plan_goal_revision: 1,
+                    run_goal_revision: 2,
+                    ..
+                }
+            ),
+            "unexpected resume error: {resume_error}"
+        );
 
         let rebound = store.apply_task_patch_for_test(
             "r1",
@@ -9373,6 +9527,23 @@ mod tests {
     fn completion_gate_rechecks_latest_plan_revision() -> Result<(), StoreError> {
         let s = fresh();
         seed_plan(&s);
+        let persist_summary = |task_id: &str| {
+            s.put_summary(&TaskExecutionSummary {
+                run_id: "r1".to_string(),
+                task_id: task_id.to_string(),
+                subagent_name: "explorer".to_string(),
+                result: SubagentTaskResult::terminal(
+                    SubagentRunStatus::Completed,
+                    "verified task result",
+                    Vec::new(),
+                ),
+                decisions: Vec::new(),
+                next_implications: Vec::new(),
+                suggested_tasks: Vec::new(),
+                created_at: Utc::now(),
+            })
+        };
+        persist_summary("t1")?;
         s.set_task_status("r1", "t1", TodoStatus::Completed, Some("explorer"), None)?;
         let follow_up = PlanTask {
             id: "t2".to_string(),
@@ -9395,6 +9566,7 @@ mod tests {
             },
         )?;
         assert!(!s.complete_run_if_quiescent("r1")?);
+        persist_summary("t2")?;
         s.set_task_status("r1", "t2", TodoStatus::Completed, Some("explorer"), None)?;
         assert!(s.complete_run_if_quiescent("r1")?);
         assert_eq!(

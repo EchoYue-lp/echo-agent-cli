@@ -39,6 +39,7 @@ import type {
   TaskUpdateOperation,
   RunContinuationState,
   BackgroundCellState,
+  CompletionGateReport,
 } from '../generated';
 
 type RunSnapshot = {
@@ -49,10 +50,11 @@ type RunSnapshot = {
   recoveryBlockers: RecoveryBlocker[];
   continuation: RunContinuationState | null;
   backgroundCells: BackgroundCellState[];
+  completionGate: CompletionGateReport;
 };
 
 async function loadRunSnapshot(run: TaskRun): Promise<RunSnapshot> {
-  const [plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells] =
+  const [plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells, completionGate] =
     await Promise.all([
       taskRuntimeApi.getPlan(run.run_id),
       taskRuntimeApi.listTodos(run.run_id),
@@ -60,8 +62,18 @@ async function loadRunSnapshot(run: TaskRun): Promise<RunSnapshot> {
       taskRuntimeApi.listRecoveryBlockers(run.run_id),
       taskRuntimeApi.getContinuation(run.run_id),
       taskRuntimeApi.listBackgroundCells(run.run_id),
+      taskRuntimeApi.getCompletionGate(run.run_id),
     ]);
-  return { run, plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells };
+  return {
+    run,
+    plan,
+    todos,
+    artifacts,
+    recoveryBlockers,
+    continuation,
+    backgroundCells,
+    completionGate,
+  };
 }
 
 function completeTaskPatch(patch: Partial<TaskPatch>): TaskPatch {
@@ -91,6 +103,7 @@ export interface TaskRuntimeState {
   recoveryBlockers: RecoveryBlocker[];
   continuation: RunContinuationState | null;
   backgroundCells: BackgroundCellState[];
+  completionGate: CompletionGateReport | null;
   /// Highest event seq we've already ingested (string per the seq-as-string
   /// transport contract). Used for incremental polling.
   lastSeq: string;
@@ -134,6 +147,7 @@ export interface TaskRuntimeState {
   resumeTaskRun: () => Promise<void>;
   retryBlockedTask: (taskId: string) => Promise<void>;
   resolveRecoveryTask: (taskId: string, decision: 'skip') => Promise<void>;
+  skipGoalRequirement: (requirementId: string, reason: string) => Promise<void>;
   reset: () => void;
 }
 
@@ -146,6 +160,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   recoveryBlockers: [],
   continuation: null,
   backgroundCells: [],
+  completionGate: null,
   lastSeq: '0',
   error: null,
   generatingPlan: false,
@@ -209,13 +224,21 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           recoveryBlockers: [],
           continuation: null,
           backgroundCells: [],
+          completionGate: null,
           lastSeq,
           error: `TaskRuntime run ${runId} 暂时不可用`,
         });
         return;
       }
-      const { plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells } =
-        await loadRunSnapshot(run);
+      const {
+        plan,
+        todos,
+        artifacts,
+        recoveryBlockers,
+        continuation,
+        backgroundCells,
+        completionGate,
+      } = await loadRunSnapshot(run);
       if (generation !== loadGeneration || requestGeneration !== refreshRequestGeneration) {
         return;
       }
@@ -232,6 +255,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         recoveryBlockers,
         continuation,
         backgroundCells,
+        completionGate,
         lastSeq,
         error: null,
       });
@@ -261,7 +285,15 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         // Reset event cursor when switching runs so we don't cross streams.
         set({ events: [], lastSeq: '0' });
         const [
-          { plan, todos, artifacts, recoveryBlockers, continuation, backgroundCells },
+          {
+            plan,
+            todos,
+            artifacts,
+            recoveryBlockers,
+            continuation,
+            backgroundCells,
+            completionGate,
+          },
           events,
           persistedTools,
         ] = await Promise.all([
@@ -290,6 +322,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           recoveryBlockers,
           continuation,
           backgroundCells,
+          completionGate,
           lastSeq,
           error: null,
         });
@@ -306,6 +339,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           recoveryBlockers: [],
           continuation: null,
           backgroundCells: [],
+          completionGate: null,
           lastSeq: '0',
           error: null,
         });
@@ -425,6 +459,23 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       set({ error: e instanceof Error ? e.message : String(e) });
     }
   },
+  skipGoalRequirement: async (requirementId, reason) => {
+    const run = get().activeRun;
+    if (!run) return;
+    try {
+      const completionGate = await taskRuntimeApi.skipGoalRequirement(
+        run.run_id,
+        run.goal_revision,
+        requirementId,
+        reason
+      );
+      set({ completionGate, error: null });
+      await get().refresh(run.run_id);
+    } catch (e) {
+      await get().refresh(run.run_id);
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
 
   reset: () => {
     loadGeneration += 1;
@@ -440,6 +491,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       recoveryBlockers: [],
       continuation: null,
       backgroundCells: [],
+      completionGate: null,
       lastSeq: '0',
       error: null,
       generatingPlan: false,

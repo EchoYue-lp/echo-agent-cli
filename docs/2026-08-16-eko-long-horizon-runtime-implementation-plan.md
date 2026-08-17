@@ -791,6 +791,50 @@ state-store 默认覆盖 caller 注入、旧 tool wire contract 和 fault-inject
 进程通过目录锁串行等待，没有终止或覆盖其工作。最终磁盘可用空间低于 50 GiB，全部验证结束后
 按规则执行 `cargo clean`，回收 20.2 GiB。
 
+### 15.8 Application M4 实现前门禁（2026-08-17）
+
+恢复后已再次核对 active Runtime Goal、本文、`MASTER-PLAN.md`、两仓 `git status` 和最近提交。
+全仓库按 GoalRequirement、evidence、artifact hash、review、skip、completion blocker、TaskPlan
+revision、surface read path 和真实 executor 完成路径搜索后的分层结论如下：
+
+- 通用机制继续由 `echo-agent` 唯一拥有：revisioned `TaskSpec`/DAG、task execution fact、
+  artifact/check 声明和 metadata 扩展已经真实可达。Requirement/Evidence 是否足以宣告 EKO Goal
+  完成是产品策略，不能下沉为框架状态机或第二套 task validator。
+- EKO 产品策略由 `echo-agent-app-core` 唯一拥有：每个 current PlanTask 确定性派生一个稳定
+  `GoalRequirement`，并用 requirement content hash、Goal revision 和 Plan revision 约束 evidence；
+  artifact 必须重新读取并校验 SHA-256，required check 与 semantic review 必须有可追溯事实，Skip
+  只能由显式用户 surface 写入。所有事实继续进入同一 `events.jsonl`，不引入 SQLite。
+- 薄适配边界是 executor、GUI/TUI/CLI/channel：executor 只请求 store 的同一 typed completion
+  report；四个 surface 只展示 report 并调用 user-only Skip service，不拥有本地完成判断或
+  `goal_complete` 工具。
+- Goal 更新先使旧 Goal revision evidence 失效；新 plan 通过既有 `task_update(base_revision)`
+  绑定新 Goal revision。只有 requirement stable ID 与 content hash 均未变化的非 Skip evidence，
+  才能由 plan commit 产生显式 revalidation fact。完全无关 Goal 继续创建新 TaskRun。
+
+重复性审计确认：现有唯一语义校验函数是 executor 私有 `run_completion_blockers`，它调用
+`assess_task_execution` 检查 summary、声明的 artifact/check、active cell 和 recovery blocker；
+store 的 `complete_run_if_quiescent` 另有一份较弱的 task/cell 检查。现有
+`Note(summary_persisted)`、`SubagentReleased`、`ReviewPassed/NeedsFix/Blocked`、
+`ArtifactProduced` 和 `BackgroundCellFinished` 已是 evidence source facts，必须复用。仓库中没有
+`GoalRequirement`、versioned Requirement/Evidence report、user-confirmed requirement Skip 或
+Goal-change revalidation，可在应用层新增。M4 会删除 executor 私有完成算法，并让 store 的原子
+完成路径和所有读侧共用同一 report，禁止长期保留双实现。
+
+关键完成门决策补充核对了成熟官方实现：
+
+- [OpenAI Agents SDK Human-in-the-loop](https://openai.github.io/openai-agents-python/human_in_the_loop/)
+  将审批绑定到精确 tool-call identity 并持久化在 resumable state；未解决项继续暂停。EKO 对应为
+  Skip 绑定精确 run/Goal/requirement identity、reason 和本地用户来源，模型没有写入口。
+- [GitHub artifact attestations](https://github.com/github/docs/blob/main/content/actions/concepts/security/artifact-attestations.md)
+  将 artifact 与 source/build identity 关联，并强调 attestation 仍需验证；EKO 不把记录过的 hash
+  当成存在性证明，而是在完成门重新读取文件并比较 SHA-256。
+- [SLSA build provenance v1.2](https://slsa.dev/spec/v1.2/build-provenance) 使用 subject digest、
+  builder identity 和 external parameters 建立可验证来源；EKO evidence 同样保留 source event、
+  producer、Goal/Plan revision 与 digest。
+- [Temporal Workflow Definition](https://docs.temporal.io/workflow-definition) 要求 history replay
+  确定且变更可版本化；EKO 的 report 只 fold 已持久事件和当前 artifact bytes，不依赖内存顺序或
+  随机重算。
+
 ## 16. 最终验收
 
 - 100 次上下文压缩后 `TaskRun.goal_sha256` 不漂移。
