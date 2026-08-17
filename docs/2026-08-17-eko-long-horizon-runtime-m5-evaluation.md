@@ -3,7 +3,7 @@
 > Date: 2026-08-17
 > Runtime Goal: M0-M5 implementation
 > Authority: `events.jsonl`; `checkpoint.json` is a discardable projection
-> Status: M5a checkpoint/performance implemented; M5b automated fault matrix and real soak pending
+> Status: M5a checkpoint/performance committed as `3e409d0`; M5b automated fault matrix and real soak pending
 
 ## Checkpoint Contract
 

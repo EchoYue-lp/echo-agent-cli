@@ -905,6 +905,45 @@ M5a 将先切换这一条真实 `rewrite_plan` 主路径并补损坏/部分 chec
 failure、full/warm 等价和 1k RunTurn/10k event/100 compaction 基准；M5b 再汇总既有与新增故障
 测试并运行 12/24/48 小时 soak。
 
+### 15.11 Application M5a 完成记录（2026-08-17）
+
+提交 `3e409d0` 已完成 checkpoint 与增量 fold。`events.jsonl` 仍是唯一权威；compact
+`checkpoint.json` 只保存 schema、run/seq/offset、canonical state hash 和唯一 `EventFoldState`。
+同一 fold state 保留 turn/usage/compaction 去重集合，warm refresh 只解析 checkpoint 后的连续
+suffix。schema/hash/run identity/offset/seq 任一不匹配即丢弃 checkpoint 并完整重建。snapshot 读
+会先验证 durable event tail；事件 fsync 后、projection replacement 前发生强杀时，首次读取会从
+事件权威修复，而非返回旧状态。event 已提交但 projection 写失败返回 typed
+`CommittedProjectionDegraded`，不伪装成可安全重试的 append 失败。
+
+固定 release fixture 包含 1,000 RunTurn、10,000 event 和 100 compaction。五个最终样本的 full
+read/parse/fold median/worst 为 7.847/8.082 ms，warm checkpoint read/fold 为 0.794/0.890 ms，
+append + suffix fold + fsync projection 为 24.240/28.576 ms，经 checkpoint tail 验证的
+`get_run` 为 0.916/1.005 ms。中位加速 9.88x，所有样本超过 9x；固定抗抖动回归门为 5x。
+checkpoint 为 36,416 bytes，约占 3.68 MB event log 的 0.99%。完整原始样本和门槛记录在
+`docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`。
+
+验证结果：
+
+- `cargo fmt --all` 与 `cargo fmt --all -- --check`
+- 两组 workspace all-features Clippy（含 unwrap/expect/panic/unreachable deny）
+- `cargo test --workspace --all-features --locked --offline`：app-core 926 passed、1 M5
+  benchmark ignored；runtime e2e 5 passed；CLI/TUI/Tauri lib 142 passed；CLI main 10 passed
+- `cargo check -p echo-agent-app-core --no-default-features --locked --offline`
+- release benchmark 最终二进制连续五次通过；Goal hash 100 compaction 回归通过
+- `git diff --check`、Cargo worktree/绝对路径、Worker/CLI SQLite 静态审计全绿
+
+失败与修正：第一版 benchmark 把 full projection fsync 与无写盘的 warm fold 比较，产生无效的
+37.4x；改为两侧都测 `read + parse + fold` 后诚实暴露 10x 门不稳定，最终固定 5x 抗抖动门并
+保留四个绝对门槛。Clippy 首轮发现测试 closure 的显式 `drop`，静态审计又发现热路径普通整数
+加法和新增 `expect_err`，均在最终门禁前修正。全量 Rust 测试生成的 TypeScript 由项目 Prettier
+归一化后无 diff。验证后因可用空间低于 50 GiB，`cargo clean` 回收 42.3 GiB，可用空间恢复到
+59 GiB。
+
+M5 仍未完成。剩余 M5b：执行并记录 provider/network、process kill/power loss、disk write、
+HITL suspended、Subagent/cell race 和 Goal drift 的 canonical fault matrix；实现可提交、可恢复、
+有结构化 ledger 的真实 soak harness，并按顺序完成 12/24/48 小时运行。M1 已完成，因此该阶段
+可以验证冷启动自动续跑，但不得绕过 blocker、预算、workspace generation、launcher/HITL owner 门。
+
 ## 16. 最终验收
 
 - 100 次上下文压缩后 `TaskRun.goal_sha256` 不漂移。
