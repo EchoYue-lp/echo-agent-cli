@@ -1,7 +1,7 @@
 # EKO 长程任务运行时 M0-M5 实施计划
 
 > 日期：2026-08-17
-> 状态：R0/M0/M1/M2/M3 Complete；application M4 next；Codex Runtime Goal active
+> 状态：R0/M0/M1/M2/M3/M4 Complete；M5 next；Codex Runtime Goal active
 > 设计基线：[`2026-08-14-eko-long-horizon-task-runtime-design.md`](./2026-08-14-eko-long-horizon-task-runtime-design.md)  
 > 跨会话状态：[`MASTER-PLAN.md`](./MASTER-PLAN.md)
 
@@ -566,8 +566,8 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | M0 | Complete | app `de09946` | Goal/CAS/quiescence/rebind 定向测试；workspace fmt、两组 clippy、all-features test、no-default；GUI check/test；frontend Prettier/test/build；浏览器 desktop/390px：全绿 | 已切换唯一 Goal 权威和四 surface 主路径；后续 M1 已完成 |
 | M1 | Complete | framework `cd4fccf`；app `9d59a0b` | Framework CommandCell 定向 30 项、完整门禁与 11 个逐 feature check；application 聚焦竞态/预算/TUI 测试、fmt、两组 clippy、workspace all-features test、no-default：全绿 | Framework 与 application 主路径均已切换；cold-start auto-resume 的 M1 前置门已关闭，但功能仍须在 M3 安全 admission 完成后才启用 |
 | M2 | Complete | framework `6d7d0cf`；app `f4771f3` | Framework Subagent 定向 122 项及 control/executor 7 项、完整门禁与 11 个逐 feature check；application exact control 5 项、层级回归、完整 Rust/GUI/frontend 门禁：全绿 | exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox`；应用 `events.jsonl` 持久 command identity/result，四 surface 共用同一 service。M3 前不得绕过安全 admission 开启 cold-start auto-resume |
-| M3 | Complete | app `aa92178` | provider retry、boot admission、orphan recovery 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | provider retry schedule/deadline/fingerprint 已进入唯一事件 fold；cold-start 仅对满足 typed admission 的 `Paused/BootRecovery` unattended run 自动恢复。M4 开始前须收归现有 completion blocker 路径 |
-| M4 | Pending | - | - | 收归现有 completion blockers，不建第二完成门 |
+| M3 | Complete | app `aa92178` | provider retry、boot admission、orphan recovery 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | provider retry schedule/deadline/fingerprint 已进入唯一事件 fold；cold-start 仅对满足 typed admission 的 `Paused/BootRecovery` unattended run 自动恢复；M4 已收归 completion blocker 路径 |
+| M4 | Complete | app `54d8bc4` | requirement/evidence、Goal revalidation、artifact rehash、direct Plan、四 surface 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | 完成权威仍在 TaskRuntime store；无第二状态/store/tool。M5 须增加可丢弃 checkpoint 缓存、基准和故障/soak 矩阵 |
 | M5 | Pending | - | - | seq 已存在；checkpoint 仅为可重建缓存 |
 
 每次自动续跑或重启后仍须核对 Runtime Goal、本文、`MASTER-PLAN`、两个仓库状态和
@@ -834,6 +834,37 @@ Goal-change revalidation，可在应用层新增。M4 会删除 executor 私有�
 - [Temporal Workflow Definition](https://docs.temporal.io/workflow-definition) 要求 history replay
   确定且变更可版本化；EKO 的 report 只 fold 已持久事件和当前 artifact bytes，不依赖内存顺序或
   随机重算。
+
+### 15.9 Application M4 完成记录（2026-08-17）
+
+提交 `54d8bc4` 已将 Requirement/Evidence 完成门收归现有 TaskRuntime store。每个 current
+PlanTask 确定性派生带 stable ID、Goal revision 和 content hash 的 `GoalRequirement`；task、
+Subagent、command cell、artifact、check、review 与显式用户 Skip 事实折叠为版本化 evidence。
+artifact 在验收时重新读取并校验 SHA-256，Goal 更新使旧 evidence 失效，只有 stable ID 与
+content hash 均未变化的事实可在新 Plan revision 中显式 revalidate。
+
+executor 和 store 不再各自拥有完成算法：正常执行、quiescent completion 与 GUI/TUI/CLI/channel
+读侧全部调用同一个原子 completion report。直接回答但未调用 `task_execute` 的 AllowDirect
+路径会先通过既有 `task_create` 语义物化一个单任务 Summary Plan，再把 FinalAnswer 作为结构化
+evidence 进入相同门；RequirePlan 仍以 `NoPlan` blocker 暂停。没有新增 `goal_complete` 工具、
+TaskRun 状态、TaskPlan store 或并行 validator。
+
+验证结果：
+
+- `cargo fmt --all` 与 `cargo fmt --all -- --check`
+- 两组 workspace all-features Clippy（含 unwrap/expect/panic/unreachable deny）
+- `cargo test --workspace --all-features --locked --offline`：app-core 916 passed、2 opt-in
+  ignored；runtime e2e 5 passed；CLI/TUI/Tauri lib 142 passed；CLI main 10 passed
+- `cargo check -p echo-agent-app-core --no-default-features --locked --offline`
+- GUI check 与 GUI test：91 passed
+- frontend Prettier、`npm test`：32 files/146 tests、`npm run build`：2143 modules
+- requirement/evidence、Goal revalidation、TUI/CLI/channel parser、GUI store 聚焦回归与
+  `git diff --check`：全绿
+
+第一次 Clippy 发现 evidence helper 参数过多，已收敛为 `EvidencePayload`。第一次完整测试发现
+四个旧 direct/cron 用例绕过 Plan；生产路径改为物化单任务 Plan 后完整重跑全绿。共享仓库
+`target` 两次被外部过程删除，因此最终门禁在任务专用临时 target 中完成；验证后先回收 7.3 GiB
+incremental，再删除完整 40 GiB 临时 target，可用空间恢复到 58 GiB，未清理仍可复用的框架缓存。
 
 ## 16. 最终验收
 
