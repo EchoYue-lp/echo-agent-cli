@@ -6,7 +6,8 @@
 //! dependency.
 //!
 //! Every state mutation appends a [`RuntimeTaskEvent`] to `events.jsonl` and
-//! refreshes only the affected projection from the full event stream.
+//! refreshes only the affected projection through the shared checkpoint-aware
+//! event fold.
 
 use std::path::PathBuf;
 
@@ -7979,6 +7980,10 @@ mod tests {
     {
         let store = fresh();
         seed_plan(&store);
+        let initial_goal_sha256 = store
+            .get_run("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+            .goal_sha256;
         store.configure_run_continuation("r1", true, false, None, None)?;
         for ordinal in 1..=100_u64 {
             let turn_id = format!("soak-turn-{ordinal}");
@@ -8020,6 +8025,13 @@ mod tests {
         assert_eq!(replayed.compaction_count, 100);
         assert_eq!(replayed.next_turn_ordinal, 101);
         assert!(replayed.active_turn.is_none());
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .goal_sha256,
+            initial_goal_sha256
+        );
         Ok(())
     }
 

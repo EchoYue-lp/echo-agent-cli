@@ -866,6 +866,45 @@ TaskRun 状态、TaskPlan store 或并行 validator。
 `target` 两次被外部过程删除，因此最终门禁在任务专用临时 target 中完成；验证后先回收 7.3 GiB
 incremental，再删除完整 40 GiB 临时 target，可用空间恢复到 58 GiB，未清理仍可复用的框架缓存。
 
+### 15.10 Application M5a 实现前门禁（2026-08-17）
+
+恢复后已核对 active Runtime Goal、本文、`MASTER-PLAN.md`、两仓状态和最近提交。官方搜索
+服务本次返回 HTTP 404，因此没有用未核验的新资料代替架构依据；继续复用本文已持久化并在
+R0 审核过的 [LangGraph persistence](https://github.com/langchain-ai/docs/blob/c26a7ab8aea6c871b0c9c9f79e0a2544d57c7d1d/src/oss/langgraph/persistence.mdx)
+checkpoint-as-projection 模式，以及
+[Temporal Workflow Definition](https://docs.temporal.io/workflow-definition) 的确定性、
+版本化 history replay 约束。EKO 的取舍保持不变：snapshot/checkpoint 只加速 replay，不能成为
+可独立推进事实的第二权威。
+
+全仓库按 checkpoint、seq、fold/rebuild、events.jsonl、projection、compaction、benchmark、
+fault injection、disk failure 和 soak 搜索后的分层与重复性结论如下：
+
+- 通用框架不改：`echo-agent` 不知道 EKO 的 JSONL 布局、run-state/plan shadow 或产品故障矩阵。
+  checkpoint、基准和 soak 全部属于 `echo-agent-cli/echo-agent-app-core` 应用策略。
+- 已存在且真实可达：`RuntimeTaskEvent.seq`、per-run seq cache、torn-tail repair、fsync append、
+  unique-temp atomic projection write、`rebuild_plan_from_events`、100 turn/compaction replay 回归、
+  provider retry/boot/HITL/recovery fault tests。不得新增第二个事件格式、TaskRun state 或 store。
+- 唯一缺口：`event_rebuild.rs` 把初始化、逐事件 fold 和最终 projection 写在一个全量函数中；
+  `FileTaskShadow::rewrite_plan` 每次重新读取并折叠全部 history，形成累计 O(n²)。现有 seq cache
+  只优化 append sequence，不优化 projection fold。
+- 唯一 fold 将拆成可序列化的 `initial_state + apply_event + snapshot`。checkpoint state 除 run、
+  plan、task、cell、continuation 外，必须保存 started/finished turn、usage 和 compaction 的去重集合，
+  否则 checkpoint 后到达的重复 source event 会被二次计费。
+- checkpoint 至少保存 `schema_version + seq + state_hash + state`，并增加只用于定位 suffix 的
+  `event_byte_offset`。warm path 从该 offset 读取 `seq + 1..tail`；schema、hash、run identity、
+  offset、seq 连续性任一失败即丢弃缓存并从 `events.jsonl` 完整重建。hash 对递归排序后的 canonical
+  JSON 计算，不能依赖 map iteration order。
+- 写入顺序保持 event fsync 在前，projection/checkpoint 原子写在后。后者失败必须返回 typed
+  `CommittedProjectionDegraded(seq, detail)`，明确告诉调用方 authority 已前移，不能把同一外部
+  command 当新事实重试；下一次读取/刷新从 event authority 修复缓存。
+- `FileTaskStore::get_run/get_plan` 应直接读取对应 snapshot，不再为了不需要 event metadata 的
+  查询扫描完整 JSONL。需要 todo display metadata、evidence 或审计的 API 仍显式读取事件，避免
+  用 checkpoint 隐藏 authority。
+
+M5a 将先切换这一条真实 `rewrite_plan` 主路径并补损坏/部分 checkpoint、durable-event + projection
+failure、full/warm 等价和 1k RunTurn/10k event/100 compaction 基准；M5b 再汇总既有与新增故障
+测试并运行 12/24/48 小时 soak。
+
 ## 16. 最终验收
 
 - 100 次上下文压缩后 `TaskRun.goal_sha256` 不漂移。

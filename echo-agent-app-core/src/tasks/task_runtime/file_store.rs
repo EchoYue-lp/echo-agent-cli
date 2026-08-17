@@ -1,9 +1,8 @@
 //! File-based task store read API (U1c phase-0/0b step 1).
 //!
-//! Read-side equivalent of `TaskRuntimeStore` backed by `plan.json` +
-//! `events.jsonl` (the file mirror produced by `FileTaskShadow`). In 0b this
-//! replaces SQL as the read authority; SQL stays as a write mirror until 0c
-//! retires it.
+//! Read-side equivalent of `TaskRuntimeStore` backed by `events.jsonl` plus
+//! rebuildable `plan.json` and `run-state.json` projections. A discardable
+//! checkpoint accelerates projection refresh without replacing the event log.
 //!
 //! Runtime-only fields not on `PlanTask` (`owner_agent`/`started_at`/
 //! `completed_at`/`summary` — the former `tr_todos` columns) are derived from
@@ -34,15 +33,39 @@ impl FileTaskStore {
         Self::new(FileTaskShadow::new(root))
     }
 
+    fn read_run_state_resilient(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunStateSnapshot>, FileReadError> {
+        self.shadow.ensure_projections_current(run_id)?;
+        match self.shadow.read_run_state(run_id) {
+            Ok(Some(state)) => Ok(Some(state)),
+            Ok(None) | Err(super::file_shadow::ShadowError::Decode(_)) => {
+                self.shadow.rewrite_plan(run_id)?;
+                self.shadow.read_run_state(run_id).map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn read_plan_resilient(&self, run_id: &str) -> Result<Option<PlanRevision>, FileReadError> {
+        self.shadow.ensure_projections_current(run_id)?;
+        match self.shadow.read_plan(run_id) {
+            Ok(Some(plan)) => Ok(Some(plan)),
+            Ok(None) | Err(super::file_shadow::ShadowError::Decode(_)) => {
+                self.shadow.rewrite_plan(run_id)?;
+                self.shadow.read_plan(run_id).map_err(Into::into)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     fn load(&self, run_id: &str) -> Result<Option<Loaded>, FileReadError> {
-        let plan = self
-            .shadow
-            .read_plan(run_id)
-            .map_err(FileReadError::Shadow)?;
-        let state = self
-            .shadow
-            .read_run_state(run_id)
-            .map_err(FileReadError::Shadow)?;
+        let state = self.read_run_state_resilient(run_id)?;
+        let plan = match state.as_ref().and_then(|state| state.run.plan_id.as_ref()) {
+            Some(_) => self.read_plan_resilient(run_id)?,
+            None => None,
+        };
         let events = self
             .shadow
             .read_events(run_id)
@@ -55,7 +78,9 @@ impl FileTaskStore {
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, FileReadError> {
-        Ok(self.load(run_id)?.map(|l| l.state.run))
+        Ok(self
+            .read_run_state_resilient(run_id)?
+            .map(|state| state.run))
     }
 
     /// Enumerate every run under root, returning the run headers ordered by
@@ -69,7 +94,7 @@ impl FileTaskStore {
     pub fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
         let mut runs = Vec::new();
         for run_id in self.shadow.list_run_ids()? {
-            if let Some(state) = self.shadow.read_run_state(&run_id)? {
+            if let Some(state) = self.read_run_state_resilient(&run_id)? {
                 runs.push(state.run);
             }
         }
@@ -123,14 +148,16 @@ impl FileTaskStore {
     }
 
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, FileReadError> {
-        let Some(loaded) = self.load(run_id)? else {
+        let Some(state) = self.read_run_state_resilient(run_id)? else {
             return Ok(None);
         };
-        let Some(plan) = loaded.plan else {
+        if state.run.plan_id.is_none() {
+            return Ok(None);
+        }
+        let Some(plan) = self.read_plan_resilient(run_id)? else {
             return Ok(None);
         };
-        let execution = loaded
-            .state
+        let execution = state
             .tasks
             .into_iter()
             .map(|task| (task.task_id.clone(), task))
@@ -445,6 +472,74 @@ mod tests {
             claim: None,
             sort_order: 0,
         }
+    }
+
+    #[test]
+    fn missing_or_corrupt_snapshots_rebuild_from_event_authority() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())
+            .map_err(|error| error.to_string())?;
+        store
+            .create_run(
+                "rebuild-run",
+                "ws",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "rebuild projections",
+                "complex_runtime",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: "rebuild-plan".to_string(),
+                run_id: "rebuild-run".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256("rebuild projections"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![task("rebuild-task", PlanTaskKind::Summary)],
+            })
+            .map_err(|error| error.to_string())?;
+        let file = FileTaskStore::from_root(tmp.path());
+
+        std::fs::remove_file(tmp.path().join("rebuild-run/run-state.json"))
+            .map_err(|error| error.to_string())?;
+        let run = file
+            .get_run("rebuild-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run did not rebuild".to_string())?;
+        assert_eq!(run.goal, "rebuild projections");
+
+        std::fs::write(tmp.path().join("rebuild-run/plan.json"), b"{partial")
+            .map_err(|error| error.to_string())?;
+        let plan = file
+            .get_plan("rebuild-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "plan did not rebuild".to_string())?;
+        assert_eq!(plan.plan_id, "rebuild-plan");
+        assert_eq!(plan.tasks.len(), 1);
+
+        let shadow = FileTaskShadow::new(tmp.path());
+        shadow
+            .append_event_line(
+                "rebuild-run",
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({"from": "pending", "to": "running"}),
+            )
+            .map_err(|error| error.to_string())?;
+        let recovered = file
+            .get_run("rebuild-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run did not recover the durable event tail".to_string())?;
+        assert_eq!(recovered.status, TaskRunStatus::Running);
+        Ok(())
     }
 
     /// FileTaskStore read API must match SQL read after a full lifecycle,

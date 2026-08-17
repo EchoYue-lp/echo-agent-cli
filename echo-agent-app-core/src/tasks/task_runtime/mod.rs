@@ -28,6 +28,7 @@
 //! The framework already re-exports a `TaskEvent` from `echo_agent::tasks`.
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
+mod checkpoint;
 pub mod command_cells;
 pub mod compact_context;
 pub mod completion_gate;

@@ -3,12 +3,14 @@
 //! The file system (`events.jsonl` + `plan.json`) is the read/write authority
 //! for all task data. SQL was retired in 0bc step 5.
 //!
-//! Layout: `{root}/{run_id}/events.jsonl` (append-only) + `plan.json` (snapshot).
+//! Layout: `{root}/{run_id}/events.jsonl` (append-only authority), `plan.json`
+//! and `run-state.json` (snapshots), plus discardable `checkpoint.json`.
 //! `root` defaults to `~/.eko/tasks/` (global, spec §2 path A).
 
 use std::path::{Path, PathBuf};
 
-use super::event_rebuild::rebuild_plan_from_events;
+use super::checkpoint::RuntimeCheckpoint;
+use super::event_rebuild::EventFoldState;
 use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
 
 /// Shadow writer for one root directory. Cheap to clone (wraps a root path; the
@@ -16,11 +18,11 @@ use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTask
 #[derive(Clone)]
 pub struct FileTaskShadow {
     root: std::sync::Arc<std::sync::RwLock<PathBuf>>,
-    /// In-memory seq cache (run_id → last assigned seq) to avoid re-reading
-    /// the whole `events.jsonl` on every append (O(n) per write → O(n²) per
-    /// run). Seeded lazily from the file's line count on first append per run,
-    /// so it self-heals across restarts. Shared across clones via `Arc` so all
-    /// clones of this shadow agree on seq. Contention is low: the store holds
+    /// In-memory seq cache (run_id → last assigned seq) to avoid reading the
+    /// tail of `events.jsonl` on every append. Seeded lazily from the final
+    /// durable event on first append per run, so it self-heals across restarts.
+    /// Shared across clones via `Arc` so all clones of this shadow agree on seq.
+    /// Contention is low: the store holds
     /// a single `Mutex` serializing all writes (the in-memory usage/conv-event
     /// mutexes, not a DB connection).
     seq_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
@@ -122,6 +124,10 @@ impl FileTaskShadow {
         self.run_dir(run_id).join("run-state.json")
     }
 
+    fn checkpoint_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("checkpoint.json")
+    }
+
     /// Remove a scope created only for a failed task-graph preparation.
     /// Published plans are never deleted, even if the caller misclassifies the
     /// scope as staged.
@@ -159,18 +165,18 @@ impl FileTaskShadow {
     // ── 0bc step-2: file-authority write path (replaces SQL INSERT + flush) ──
 
     /// Append one enriched event to `events.jsonl` for `run_id`, assigning it
-    /// the next seq (1-based, = current line count + 1). Returns the fully
+    /// the next seq (1-based). Returns the fully
     /// formed `RuntimeTaskEvent` (with seq + timestamp) that was written.
     ///
     /// This is the file-authority write primitive: store write methods call
-    /// this instead of `INSERT INTO tr_events`, then call [`rewrite_plan`] to
-    /// refresh the `plan.json` snapshot. seq is per-run (each run has its own
+    /// this instead of a database insert, then call [`rewrite_plan`] to
+    /// incrementally refresh the snapshots. seq is per-run (each run has its own
     /// `events.jsonl`), so appending to run B does not advance run A's seq.
     ///
     /// Atomicity: the append is serialized by the store mutex (single writer),
     /// and the line is written with a trailing newline. A crash mid-append can
-    /// at worst lose the last partial line — `read_events` skips empty lines
-    /// and a future hardening pass (gate 2) will truncate a partial tail.
+    /// at worst leave the last partial line; the next append repairs that torn
+    /// tail before allocating its sequence.
     pub fn append_event_line(
         &self,
         run_id: &str,
@@ -193,8 +199,8 @@ impl FileTaskShadow {
         repair_torn_tail(&self.events_path(run_id))?;
 
         // seq = last assigned + 1 (1-based). Cached in memory per run to avoid
-        // re-reading events.jsonl on every append; seeded from the file's line
-        // count on first touch per run so it self-heals across restarts.
+        // reading the events.jsonl tail on every append; seeded from the final
+        // durable event on first touch per run so it self-heals across restarts.
         let next_seq = self.next_seq(run_id)?;
 
         let event = RuntimeTaskEvent {
@@ -263,6 +269,32 @@ impl FileTaskShadow {
     /// plan to snapshot, so this is a no-op rather than an error. The events
     /// themselves are still durably appended to `events.jsonl`.
     pub fn rewrite_plan(&self, run_id: &str) -> Result<(), ShadowError> {
+        self.refresh_projections(run_id, false).map(|_| ())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rewrite_plan_with_stats(
+        &self,
+        run_id: &str,
+    ) -> Result<ProjectionRefreshStats, ShadowError> {
+        self.refresh_projections(run_id, false)
+    }
+
+    /// Ensure snapshots include the complete durable event tail.
+    ///
+    /// A valid checkpoint with no suffix proves that snapshots written before
+    /// it reached the same event seq, so the common read path performs no
+    /// projection writes. A missing/invalid checkpoint or non-empty suffix is
+    /// repaired from `events.jsonl` before the caller reads a snapshot.
+    pub(crate) fn ensure_projections_current(&self, run_id: &str) -> Result<(), ShadowError> {
+        self.refresh_projections(run_id, true).map(|_| ())
+    }
+
+    fn refresh_projections(
+        &self,
+        run_id: &str,
+        skip_write_when_checkpoint_is_current: bool,
+    ) -> Result<ProjectionRefreshStats, ShadowError> {
         // `append_event_line` releases its guard before returning, so this is
         // not a re-entrant lock acquisition. Wait for any same-run append or
         // rewrite to finish; proceeding after `try_lock` returns WouldBlock
@@ -270,55 +302,40 @@ impl FileTaskShadow {
         let lock = self.run_write_lock(run_id);
         let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
 
-        let events = self.read_events(run_id)?;
-        if events.is_empty() {
-            return Ok(());
-        }
-        let Some(latest) = events.last() else {
-            return Ok(());
+        let (mut state, events, used_checkpoint) = match self.load_checkpoint_suffix(run_id) {
+            Some(Ok((checkpoint, suffix))) => (checkpoint.state, suffix, true),
+            Some(Err(error)) => {
+                tracing::warn!(run_id, %error, "discarding invalid TaskRuntime checkpoint");
+                (EventFoldState::default(), self.read_events(run_id)?, false)
+            }
+            None => (EventFoldState::default(), self.read_events(run_id)?, false),
         };
-        let note_kind = latest.payload.get("kind").and_then(|value| value.as_str());
-        let affects_plan = matches!(
-            latest.event_type,
-            RuntimeEventKind::PlanRevisionCommitted
-                | RuntimeEventKind::RequirementEvidenceRevalidated
-        );
-        let affects_run_state = matches!(
-            latest.event_type,
-            RuntimeEventKind::RunCreated
-                | RuntimeEventKind::RunGoalUpdated
-                | RuntimeEventKind::RequirementEvidenceInvalidated
-                | RuntimeEventKind::RequirementEvidenceRevalidated
-                | RuntimeEventKind::RequirementSkipped
-                | RuntimeEventKind::RunStatusChanged
-                | RuntimeEventKind::RunAttachmentsUpdated
-                | RuntimeEventKind::RunCancelled
-                | RuntimeEventKind::PlanRevisionCommitted
-                | RuntimeEventKind::TaskStarted
-                | RuntimeEventKind::TaskCompleted
-                | RuntimeEventKind::TaskFailed
-                | RuntimeEventKind::TaskCancelled
-                | RuntimeEventKind::TaskTimedOut
-                | RuntimeEventKind::TaskSkipped
-                | RuntimeEventKind::TaskBlocked
-                | RuntimeEventKind::TodoUpdated
-                | RuntimeEventKind::BackgroundCellStarted
-                | RuntimeEventKind::BackgroundCellFinished
-                | RuntimeEventKind::RunContinuationConfigured
-                | RuntimeEventKind::RunTurnStarted
-                | RuntimeEventKind::RunTurnUsageAccounted
-                | RuntimeEventKind::RunTurnCompacted
-                | RuntimeEventKind::RunTurnFinished
-                | RuntimeEventKind::RunProviderRetryScheduled
-                | RuntimeEventKind::RunContinuationDeferred
-                | RuntimeEventKind::RunContinuationResumed
-                | RuntimeEventKind::RunPauseReasonChanged
-        ) || (latest.event_type == RuntimeEventKind::Note
-            && matches!(note_kind, Some("summary_persisted")));
-        if !affects_plan && !affects_run_state {
-            return Ok(());
+        if events.is_empty() && !used_checkpoint {
+            return Ok(ProjectionRefreshStats {
+                used_checkpoint,
+                folded_events: 0,
+                seq: state.last_seq(),
+            });
         }
-        let rebuilt = match rebuild_plan_from_events(&events) {
+        if skip_write_when_checkpoint_is_current && used_checkpoint && events.is_empty() {
+            return Ok(ProjectionRefreshStats {
+                used_checkpoint,
+                folded_events: 0,
+                seq: state.last_seq(),
+            });
+        }
+        if !used_checkpoint {
+            validate_event_suffix(run_id, 0, &events)?;
+        }
+        let affects_plan = events.iter().any(event_affects_plan)
+            || (events.is_empty()
+                && state
+                    .rebuilt_plan()
+                    .is_ok_and(|plan| plan.plan.revision > 0));
+        let affects_run_state = events.iter().any(event_affects_run_state)
+            || (events.is_empty() && state.run_id().is_some());
+        state.apply_events(&events);
+        let rebuilt = match state.rebuilt_plan() {
             Ok(r) => r,
             Err(super::event_rebuild::RebuildError::NoRunCreated) => {
                 // No RunCreated in the stream. On the live file path every
@@ -335,43 +352,98 @@ impl FileTaskShadow {
                     "rewrite_plan: no RunCreated in event stream, skipping plan.json snapshot \
                      (orphan write or corrupted events.jsonl)"
                 );
-                return Ok(());
+                return Ok(ProjectionRefreshStats {
+                    used_checkpoint,
+                    folded_events: events.len(),
+                    seq: state.last_seq(),
+                });
             }
         };
         std::fs::create_dir_all(self.run_dir(run_id))
-            .map_err(|e| ShadowError::Io(e.to_string()))?;
+            .map_err(|error| projection_degraded(state.last_seq(), error))?;
         if affects_plan {
             let plan_json = serde_json::to_string_pretty(&rebuilt.plan_revision())
-                .map_err(|e| ShadowError::Encode(e.to_string()))?;
+                .map_err(|error| projection_degraded(state.last_seq(), error))?;
             atomic_write(&self.plan_path(run_id), plan_json.as_bytes())
-                .map_err(|e| ShadowError::Io(e.to_string()))?;
+                .map_err(|error| projection_degraded(state.last_seq(), error))?;
         }
         if affects_run_state {
             let state_json = serde_json::to_string_pretty(&rebuilt.run_state())
-                .map_err(|e| ShadowError::Encode(e.to_string()))?;
+                .map_err(|error| projection_degraded(state.last_seq(), error))?;
             atomic_write(&self.run_state_path(run_id), state_json.as_bytes())
-                .map_err(|e| ShadowError::Io(e.to_string()))?;
+                .map_err(|error| projection_degraded(state.last_seq(), error))?;
         }
-        Ok(())
+        let event_byte_offset = std::fs::metadata(self.events_path(run_id))
+            .map_err(|error| projection_degraded(state.last_seq(), error))?
+            .len();
+        let checkpoint_seq = state.last_seq();
+        let checkpoint = RuntimeCheckpoint::new(run_id, event_byte_offset, state)
+            .map_err(|error| projection_degraded(checkpoint_seq, error))?;
+        let checkpoint_json = serde_json::to_vec(&checkpoint)
+            .map_err(|error| projection_degraded(checkpoint.seq, error))?;
+        atomic_write(&self.checkpoint_path(run_id), &checkpoint_json)
+            .map_err(|error| projection_degraded(checkpoint.seq, error))?;
+        Ok(ProjectionRefreshStats {
+            used_checkpoint,
+            folded_events: events.len(),
+            seq: checkpoint.seq,
+        })
+    }
+
+    fn load_checkpoint_suffix(
+        &self,
+        run_id: &str,
+    ) -> Option<Result<(RuntimeCheckpoint, Vec<RuntimeTaskEvent>), ShadowError>> {
+        let path = self.checkpoint_path(run_id);
+        if !path.exists() {
+            return None;
+        }
+        Some((|| {
+            let bytes = std::fs::read(&path).map_err(|error| {
+                ShadowError::Rebuild(format!("checkpoint read failed: {error}"))
+            })?;
+            let checkpoint =
+                serde_json::from_slice::<RuntimeCheckpoint>(&bytes).map_err(|error| {
+                    ShadowError::Rebuild(format!("checkpoint decode failed: {error}"))
+                })?;
+            checkpoint.validate(run_id).map_err(|error| {
+                ShadowError::Rebuild(format!("checkpoint validation failed: {error}"))
+            })?;
+            let suffix = self.read_events_from_offset(run_id, checkpoint.event_byte_offset)?;
+            validate_event_suffix(run_id, checkpoint.seq, &suffix)?;
+            Ok((checkpoint, suffix))
+        })())
     }
 
     /// Compute the next seq for `run_id`: last assigned + 1 (1-based).
     ///
-    /// Uses the in-memory `seq_cache` to avoid re-reading `events.jsonl` on
-    /// every append. On first touch per run (cache miss) it seeds from the
-    /// file's line count, so the cache self-heals across restarts or when a
-    /// different process wrote to the same file. Returns 1 if the file does
-    /// not exist yet.
+    /// Uses the in-memory `seq_cache` on the steady path. On first touch after
+    /// restart, reads only the final complete JSONL event rather than parsing
+    /// the entire history. Returns 1 if the file does not exist yet.
     fn next_seq(&self, run_id: &str) -> Result<i64, ShadowError> {
         // Fast path: cached.
         if let Ok(cache) = self.seq_cache.lock()
             && let Some(&last) = cache.get(run_id)
         {
-            return Ok(last + 1);
+            return last
+                .checked_add(1)
+                .ok_or_else(|| ShadowError::Rebuild("event seq overflow".to_string()));
         }
-        // Slow path: seed from file line count (self-healing).
-        let file_len = self.read_events(run_id)?.len() as i64;
-        Ok(file_len + 1)
+        // Restart path: seed from the final durable event in bounded backwards
+        // reads. Event lines may be large, so the scan continues by block until
+        // it finds the preceding newline without assuming a maximum line size.
+        let last = read_last_event(&self.events_path(run_id))?;
+        match last {
+            Some(event) if event.run_id != run_id => Err(ShadowError::Rebuild(format!(
+                "last event belongs to run {}, expected {run_id}",
+                event.run_id
+            ))),
+            Some(event) => event
+                .seq
+                .checked_add(1)
+                .ok_or_else(|| ShadowError::Rebuild("event seq overflow".to_string())),
+            None => Ok(1),
+        }
     }
 
     /// Enumerate every run_id known to the file store: the directory names
@@ -436,62 +508,277 @@ impl FileTaskShadow {
             return Ok(Vec::new());
         }
         let text = std::fs::read_to_string(&path).map_err(|e| ShadowError::Io(e.to_string()))?;
-        let mut out = Vec::new();
-        let has_terminal_newline = text.ends_with('\n');
-        let lines: Vec<&str> = text.split('\n').collect();
-        let line_count = lines.len();
-        for (i, line) in lines.into_iter().enumerate() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let ev: RuntimeTaskEvent = match serde_json::from_str(line) {
-                Ok(event) => event,
-                Err(_) if !has_terminal_newline && i.saturating_add(1) == line_count => break,
-                Err(error) => {
-                    return Err(ShadowError::Decode(format!(
-                        "line {}: {}",
-                        i.saturating_add(1),
-                        error
-                    )));
-                }
-            };
-            out.push(ev);
+        decode_event_text(&text)
+    }
+
+    fn read_events_from_offset(
+        &self,
+        run_id: &str,
+        offset: u64,
+    ) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let path = self.events_path(run_id);
+        let mut file = std::fs::File::open(&path).map_err(|error| {
+            ShadowError::Rebuild(format!("checkpoint event read failed: {error}"))
+        })?;
+        let file_len = file
+            .metadata()
+            .map_err(|error| ShadowError::Rebuild(error.to_string()))?
+            .len();
+        if offset > file_len {
+            return Err(ShadowError::Rebuild(format!(
+                "checkpoint offset {offset} exceeds event length {file_len}"
+            )));
         }
-        Ok(out)
+        if offset > 0 {
+            file.seek(SeekFrom::Start(offset.saturating_sub(1)))
+                .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+            let mut boundary = [0_u8; 1];
+            file.read_exact(&mut boundary)
+                .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+            if boundary.first().copied() != Some(b'\n') {
+                return Err(ShadowError::Rebuild(
+                    "checkpoint offset is not an event boundary".to_string(),
+                ));
+            }
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+        let mut text = String::new();
+        file.read_to_string(&mut text)
+            .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+        decode_event_text(&text)
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectionRefreshStats {
+    pub(crate) used_checkpoint: bool,
+    pub(crate) folded_events: usize,
+    pub(crate) seq: i64,
+}
+
+fn event_affects_plan(event: &RuntimeTaskEvent) -> bool {
+    matches!(
+        event.event_type,
+        RuntimeEventKind::PlanRevisionCommitted | RuntimeEventKind::RequirementEvidenceRevalidated
+    )
+}
+
+fn event_affects_run_state(event: &RuntimeTaskEvent) -> bool {
+    let note_kind = event
+        .payload
+        .get("kind")
+        .and_then(serde_json::Value::as_str);
+    matches!(
+        event.event_type,
+        RuntimeEventKind::RunCreated
+            | RuntimeEventKind::RunGoalUpdated
+            | RuntimeEventKind::RequirementEvidenceInvalidated
+            | RuntimeEventKind::RequirementEvidenceRevalidated
+            | RuntimeEventKind::RequirementSkipped
+            | RuntimeEventKind::RunStatusChanged
+            | RuntimeEventKind::RunAttachmentsUpdated
+            | RuntimeEventKind::RunCancelled
+            | RuntimeEventKind::PlanRevisionCommitted
+            | RuntimeEventKind::TaskStarted
+            | RuntimeEventKind::TaskCompleted
+            | RuntimeEventKind::TaskFailed
+            | RuntimeEventKind::TaskCancelled
+            | RuntimeEventKind::TaskTimedOut
+            | RuntimeEventKind::TaskSkipped
+            | RuntimeEventKind::TaskBlocked
+            | RuntimeEventKind::TodoUpdated
+            | RuntimeEventKind::BackgroundCellStarted
+            | RuntimeEventKind::BackgroundCellFinished
+            | RuntimeEventKind::RunContinuationConfigured
+            | RuntimeEventKind::RunTurnStarted
+            | RuntimeEventKind::RunTurnUsageAccounted
+            | RuntimeEventKind::RunTurnCompacted
+            | RuntimeEventKind::RunTurnFinished
+            | RuntimeEventKind::RunProviderRetryScheduled
+            | RuntimeEventKind::RunContinuationDeferred
+            | RuntimeEventKind::RunContinuationResumed
+            | RuntimeEventKind::RunPauseReasonChanged
+    ) || (event.event_type == RuntimeEventKind::Note
+        && matches!(note_kind, Some("summary_persisted")))
+}
+
+fn validate_event_suffix(
+    run_id: &str,
+    checkpoint_seq: i64,
+    events: &[RuntimeTaskEvent],
+) -> Result<(), ShadowError> {
+    let mut expected = checkpoint_seq
+        .checked_add(1)
+        .ok_or_else(|| ShadowError::Rebuild("checkpoint seq overflow".to_string()))?;
+    for event in events {
+        if event.run_id != run_id {
+            return Err(ShadowError::Rebuild(format!(
+                "event {} belongs to run {}, expected {run_id}",
+                event.seq, event.run_id
+            )));
+        }
+        if event.seq != expected {
+            return Err(ShadowError::Rebuild(format!(
+                "event suffix is not contiguous: expected {expected}, got {}",
+                event.seq
+            )));
+        }
+        expected = expected
+            .checked_add(1)
+            .ok_or_else(|| ShadowError::Rebuild("event seq overflow".to_string()))?;
+    }
+    Ok(())
+}
+
+fn decode_event_text(text: &str) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
+    let mut events = Vec::new();
+    let has_terminal_newline = text.ends_with('\n');
+    let lines = text.split('\n').collect::<Vec<_>>();
+    let line_count = lines.len();
+    for (index, line) in lines.into_iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event = match serde_json::from_str(line) {
+            Ok(event) => event,
+            Err(_) if !has_terminal_newline && index.saturating_add(1) == line_count => break,
+            Err(error) => {
+                return Err(ShadowError::Decode(format!(
+                    "line {}: {}",
+                    index.saturating_add(1),
+                    error
+                )));
+            }
+        };
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn projection_degraded(seq: i64, error: impl std::fmt::Display) -> ShadowError {
+    ShadowError::CommittedProjectionDegraded {
+        seq,
+        detail: error.to_string(),
+    }
+}
+
+fn read_last_event(path: &Path) -> Result<Option<RuntimeTaskEvent>, ShadowError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(ShadowError::Io(error.to_string())),
+    };
+    let file_len = file
+        .metadata()
+        .map_err(|error| ShadowError::Io(error.to_string()))?
+        .len();
+    if file_len == 0 {
+        return Ok(None);
+    }
+    file.seek(SeekFrom::Start(file_len.saturating_sub(1)))
+        .map_err(|error| ShadowError::Io(error.to_string()))?;
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)
+        .map_err(|error| ShadowError::Io(error.to_string()))?;
+    let line_end = if final_byte.first().copied() == Some(b'\n') {
+        file_len.saturating_sub(1)
+    } else {
+        file_len
+    };
+    if line_end == 0 {
+        return Ok(None);
+    }
+    let (_, line) = read_line_ending_at(&mut file, line_end)?;
+    serde_json::from_slice(&line)
+        .map(Some)
+        .map_err(|error| ShadowError::Decode(format!("last event: {error}")))
+}
+
+fn read_line_ending_at(
+    file: &mut std::fs::File,
+    line_end: u64,
+) -> Result<(u64, Vec<u8>), ShadowError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const BLOCK_BYTES: u64 = 8 * 1024;
+    let mut search_end = line_end;
+    let line_start = loop {
+        let block_start = search_end.saturating_sub(BLOCK_BYTES);
+        let block_len = search_end.saturating_sub(block_start);
+        let block_len =
+            usize::try_from(block_len).map_err(|error| ShadowError::Read(error.to_string()))?;
+        let mut block = vec![0_u8; block_len];
+        file.seek(SeekFrom::Start(block_start))
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+        file.read_exact(&mut block)
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+        if let Some(position) = block.iter().rposition(|byte| *byte == b'\n') {
+            let position =
+                u64::try_from(position).map_err(|error| ShadowError::Read(error.to_string()))?;
+            break block_start.saturating_add(position).saturating_add(1);
+        }
+        if block_start == 0 {
+            break 0;
+        }
+        search_end = block_start;
+    };
+    let line_len = line_end.saturating_sub(line_start);
+    let line_len =
+        usize::try_from(line_len).map_err(|error| ShadowError::Read(error.to_string()))?;
+    let mut line = vec![0_u8; line_len];
+    file.seek(SeekFrom::Start(line_start))
+        .map_err(|error| ShadowError::Io(error.to_string()))?;
+    file.read_exact(&mut line)
+        .map_err(|error| ShadowError::Io(error.to_string()))?;
+    Ok((line_start, line))
+}
+
 fn repair_torn_tail(path: &Path) -> Result<(), ShadowError> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(ShadowError::Io(error.to_string())),
     };
-    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+    let file_len = file
+        .metadata()
+        .map_err(|error| ShadowError::Io(error.to_string()))?
+        .len();
+    if file_len == 0 {
         return Ok(());
     }
-    let tail_start = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |position| position.saturating_add(1));
-    let tail = bytes
-        .get(tail_start..)
-        .ok_or_else(|| ShadowError::Decode("failed to inspect final event segment".to_string()))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(path)
+    file.seek(SeekFrom::Start(file_len.saturating_sub(1)))
         .map_err(|error| ShadowError::Io(error.to_string()))?;
-    if serde_json::from_slice::<RuntimeTaskEvent>(tail).is_ok() {
-        use std::io::Write;
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)
+        .map_err(|error| ShadowError::Io(error.to_string()))?;
+    if final_byte.first().copied() == Some(b'\n') {
+        return Ok(());
+    }
+    let (tail_start, tail) = read_line_ending_at(&mut file, file_len)?;
+    if serde_json::from_slice::<RuntimeTaskEvent>(&tail).is_ok() {
+        file.seek(SeekFrom::End(0))
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
         file.write_all(b"\n")
             .map_err(|error| ShadowError::Io(error.to_string()))?;
     } else {
-        file.set_len(u64::try_from(tail_start).unwrap_or(u64::MAX))
+        file.set_len(tail_start)
             .map_err(|error| ShadowError::Io(error.to_string()))?;
     }
     file.sync_all()
-        .map_err(|error| ShadowError::Io(error.to_string()))
+        .map_err(|error| ShadowError::Io(error.to_string()))?;
+    sync_parent(path).map_err(|error| ShadowError::Io(error.to_string()))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -506,6 +793,8 @@ pub enum ShadowError {
     Decode(String),
     #[error("shadow rebuild: {0}")]
     Rebuild(String),
+    #[error("event seq {seq} committed but projection refresh degraded: {detail}")]
+    CommittedProjectionDegraded { seq: i64, detail: String },
 }
 
 /// Write `bytes` to `path` atomically: write to a unique tmp file, fsync,
@@ -532,8 +821,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    sync_parent(path)
 }
 
 /// Append `bytes` (one JSONL line, including trailing newline) to `path`.
@@ -547,12 +839,21 @@ fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .open(path)?;
     f.write_all(bytes)?;
     f.sync_all()?;
-    Ok(())
+    sync_parent(path)
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::task_runtime::event_rebuild::rebuild_plan_from_events;
+    use crate::tasks::task_runtime::file_store::FileTaskStore;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
         AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, PlanTaskKind,
@@ -584,6 +885,524 @@ mod tests {
             claim: None,
             sort_order: 0,
         }
+    }
+
+    fn append_run_created(shadow: &FileTaskShadow, run_id: &str) -> Result<(), String> {
+        shadow
+            .append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": "checkpoint goal",
+                    "goal_revision": 1,
+                    "goal_sha256": crate::tasks::task_runtime::task_goal_sha256("checkpoint goal"),
+                    "domain_profile": "general",
+                    "workspace_id": "ws",
+                    "conversation_id": "conversation",
+                    "root_message_id": "message",
+                    "route": "complex_runtime",
+                    "attended_mode": "unattended",
+                    "created_at": "2026-08-17T00:00:00Z",
+                }),
+            )
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn checkpoint_warm_suffix_matches_full_rebuild() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        append_run_created(&shadow, "checkpoint-run")?;
+
+        let cold = shadow
+            .rewrite_plan_with_stats("checkpoint-run")
+            .map_err(|error| error.to_string())?;
+        assert!(!cold.used_checkpoint);
+        assert_eq!(cold.folded_events, 1);
+        assert_eq!(cold.seq, 1);
+
+        shadow
+            .append_event_line(
+                "checkpoint-run",
+                None,
+                None,
+                RuntimeEventKind::RunContinuationConfigured,
+                serde_json::json!({
+                    "enabled": true,
+                    "token_budget": 500,
+                    "time_budget_seconds": 60,
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+        let warm = shadow
+            .rewrite_plan_with_stats("checkpoint-run")
+            .map_err(|error| error.to_string())?;
+        assert!(warm.used_checkpoint);
+        assert_eq!(warm.folded_events, 1);
+        assert_eq!(warm.seq, 2);
+        let warm_state = shadow
+            .read_run_state("checkpoint-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "warm run-state projection missing".to_string())?;
+
+        std::fs::remove_file(shadow.checkpoint_path("checkpoint-run"))
+            .map_err(|error| error.to_string())?;
+        let cold_again = shadow
+            .rewrite_plan_with_stats("checkpoint-run")
+            .map_err(|error| error.to_string())?;
+        assert!(!cold_again.used_checkpoint);
+        assert_eq!(cold_again.folded_events, 2);
+        let rebuilt_state = shadow
+            .read_run_state("checkpoint-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "rebuilt run-state projection missing".to_string())?;
+        assert_eq!(
+            serde_json::to_value(warm_state).map_err(|error| error.to_string())?,
+            serde_json::to_value(rebuilt_state).map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_retains_usage_and_compaction_deduplication() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        append_run_created(&shadow, "dedupe-run")?;
+        for (kind, payload) in [
+            (
+                RuntimeEventKind::RunTurnStarted,
+                serde_json::json!({
+                    "turn_id": "turn-1",
+                    "ordinal": 0,
+                    "origin": "continuation",
+                    "transcript_visibility": "internal",
+                }),
+            ),
+            (
+                RuntimeEventKind::RunTurnUsageAccounted,
+                serde_json::json!({
+                    "event_id": "usage-1",
+                    "turn_id": "turn-1",
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "elapsed_seconds": 0,
+                }),
+            ),
+            (
+                RuntimeEventKind::RunTurnCompacted,
+                serde_json::json!({"event_id": "compact-1", "turn_id": "turn-1"}),
+            ),
+        ] {
+            shadow
+                .append_event_line("dedupe-run", None, None, kind, payload)
+                .map_err(|error| error.to_string())?;
+        }
+        shadow
+            .rewrite_plan("dedupe-run")
+            .map_err(|error| error.to_string())?;
+
+        for (kind, payload) in [
+            (
+                RuntimeEventKind::RunTurnUsageAccounted,
+                serde_json::json!({
+                    "event_id": "usage-1",
+                    "turn_id": "turn-1",
+                    "input_tokens": 2,
+                    "output_tokens": 3,
+                    "elapsed_seconds": 0,
+                }),
+            ),
+            (
+                RuntimeEventKind::RunTurnCompacted,
+                serde_json::json!({"event_id": "compact-1", "turn_id": "turn-1"}),
+            ),
+        ] {
+            shadow
+                .append_event_line("dedupe-run", None, None, kind, payload)
+                .map_err(|error| error.to_string())?;
+        }
+        let warm = shadow
+            .rewrite_plan_with_stats("dedupe-run")
+            .map_err(|error| error.to_string())?;
+        assert!(warm.used_checkpoint);
+        assert_eq!(warm.folded_events, 2);
+        let continuation = shadow
+            .read_run_state("dedupe-run")
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| "continuation projection missing".to_string())?;
+        assert_eq!(continuation.tokens_used, 5);
+        assert_eq!(continuation.compaction_count, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_checkpoint_is_discarded_and_rebuilt_from_events() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        append_run_created(&shadow, "corrupt-checkpoint")?;
+        shadow
+            .rewrite_plan("corrupt-checkpoint")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(
+            shadow.checkpoint_path("corrupt-checkpoint"),
+            b"{\"schema_version\":1,\"state_hash\":",
+        )
+        .map_err(|error| error.to_string())?;
+        shadow
+            .append_event_line(
+                "corrupt-checkpoint",
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({"from": "pending", "to": "running"}),
+            )
+            .map_err(|error| error.to_string())?;
+
+        let rebuilt = shadow
+            .rewrite_plan_with_stats("corrupt-checkpoint")
+            .map_err(|error| error.to_string())?;
+        assert!(!rebuilt.used_checkpoint);
+        assert_eq!(rebuilt.folded_events, 2);
+        let run = shadow
+            .read_run_state("corrupt-checkpoint")
+            .map_err(|error| error.to_string())?
+            .map(|state| state.run)
+            .ok_or_else(|| "rebuilt run missing".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Running);
+        let bytes = std::fs::read(shadow.checkpoint_path("corrupt-checkpoint"))
+            .map_err(|error| error.to_string())?;
+        let checkpoint = serde_json::from_slice::<RuntimeCheckpoint>(&bytes)
+            .map_err(|error| error.to_string())?;
+        checkpoint
+            .validate("corrupt-checkpoint")
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_schema_hash_and_offset_mismatches_fall_back() -> Result<(), String> {
+        for case in ["schema", "hash", "offset"] {
+            let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let shadow = FileTaskShadow::new(tmp.path());
+            let run_id = format!("invalid-{case}");
+            append_run_created(&shadow, &run_id)?;
+            shadow
+                .rewrite_plan(&run_id)
+                .map_err(|error| error.to_string())?;
+            let path = shadow.checkpoint_path(&run_id);
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|error| error.to_string())?;
+            match case {
+                "schema" => {
+                    let field = value
+                        .get_mut("schema_version")
+                        .ok_or_else(|| "schema field missing".to_string())?;
+                    *field = serde_json::json!(999);
+                }
+                "hash" => {
+                    let field = value
+                        .get_mut("state_hash")
+                        .ok_or_else(|| "state_hash field missing".to_string())?;
+                    *field = serde_json::json!("invalid");
+                }
+                "offset" => {
+                    let field = value
+                        .get_mut("event_byte_offset")
+                        .ok_or_else(|| "offset field missing".to_string())?;
+                    let offset = field
+                        .as_u64()
+                        .ok_or_else(|| "offset was not a u64".to_string())?;
+                    *field = serde_json::json!(offset.saturating_add(1));
+                }
+                _ => return Err(format!("unsupported checkpoint case: {case}")),
+            }
+            std::fs::write(
+                &path,
+                serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+            shadow
+                .append_event_line(
+                    &run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunStatusChanged,
+                    serde_json::json!({"from": "pending", "to": "running"}),
+                )
+                .map_err(|error| error.to_string())?;
+            let rebuilt = shadow
+                .rewrite_plan_with_stats(&run_id)
+                .map_err(|error| error.to_string())?;
+            assert!(!rebuilt.used_checkpoint, "case {case}");
+            assert_eq!(rebuilt.folded_events, 2, "case {case}");
+            let repaired = std::fs::read(&path).map_err(|error| error.to_string())?;
+            serde_json::from_slice::<RuntimeCheckpoint>(&repaired)
+                .map_err(|error| error.to_string())?
+                .validate(&run_id)
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn durable_event_reports_typed_projection_degradation() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        append_run_created(&shadow, "degraded-run")?;
+        shadow
+            .rewrite_plan("degraded-run")
+            .map_err(|error| error.to_string())?;
+        std::fs::remove_file(shadow.checkpoint_path("degraded-run"))
+            .map_err(|error| error.to_string())?;
+        std::fs::create_dir(shadow.checkpoint_path("degraded-run"))
+            .map_err(|error| error.to_string())?;
+        let committed = shadow
+            .append_event_line(
+                "degraded-run",
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({"from": "pending", "to": "running"}),
+            )
+            .map_err(|error| error.to_string())?;
+        let error = match shadow.rewrite_plan("degraded-run") {
+            Ok(()) => {
+                return Err("checkpoint directory unexpectedly accepted replacement".to_string());
+            }
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ShadowError::CommittedProjectionDegraded { seq, .. } if seq == committed.seq
+        ));
+        assert_eq!(
+            shadow
+                .read_events("degraded-run")
+                .map_err(|error| error.to_string())?
+                .last()
+                .map(|event| event.seq),
+            Some(committed.seq)
+        );
+
+        std::fs::remove_dir(shadow.checkpoint_path("degraded-run"))
+            .map_err(|error| error.to_string())?;
+        shadow
+            .rewrite_plan("degraded-run")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            shadow
+                .read_run_state("degraded-run")
+                .map_err(|error| error.to_string())?
+                .map(|state| state.run.status),
+            Some(TaskRunStatus::Running)
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "M5 performance fixture; run explicitly with --ignored --nocapture"]
+    fn benchmark_checkpoint_1k_turns_10k_events_100_compactions() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        let run_id = "benchmark-run";
+        std::fs::create_dir_all(shadow.run_dir(run_id)).map_err(|error| error.to_string())?;
+        let mut events = Vec::with_capacity(10_000);
+        {
+            let mut push = |event_type: RuntimeEventKind, payload: serde_json::Value| {
+                let next = i64::try_from(events.len())
+                    .unwrap_or(i64::MAX)
+                    .saturating_add(1);
+                events.push(RuntimeTaskEvent {
+                    seq: next,
+                    run_id: run_id.to_string(),
+                    task_id: None,
+                    step_id: None,
+                    event_type,
+                    payload,
+                    timestamp: chrono::Utc::now(),
+                });
+            };
+            push(
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": "benchmark checkpoint",
+                    "goal_revision": 1,
+                    "goal_sha256": crate::tasks::task_runtime::task_goal_sha256("benchmark checkpoint"),
+                    "domain_profile": "general",
+                    "workspace_id": "ws",
+                    "conversation_id": "benchmark",
+                    "root_message_id": "message",
+                    "route": "complex_runtime",
+                    "attended_mode": "unattended",
+                }),
+            );
+            push(
+                RuntimeEventKind::RunContinuationConfigured,
+                serde_json::json!({"enabled": true}),
+            );
+            for ordinal in 0_u64..1_000 {
+                let turn_id = format!("turn-{ordinal}");
+                push(
+                    RuntimeEventKind::RunTurnStarted,
+                    serde_json::json!({
+                        "turn_id": turn_id.clone(),
+                        "ordinal": ordinal,
+                        "origin": "continuation",
+                        "transcript_visibility": "internal",
+                    }),
+                );
+                push(
+                    RuntimeEventKind::RunTurnUsageAccounted,
+                    serde_json::json!({
+                        "event_id": format!("usage-{ordinal}"),
+                        "turn_id": turn_id.clone(),
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "elapsed_seconds": 0,
+                    }),
+                );
+                if ordinal < 100 {
+                    push(
+                        RuntimeEventKind::RunTurnCompacted,
+                        serde_json::json!({
+                            "event_id": format!("compact-{ordinal}"),
+                            "turn_id": turn_id.clone(),
+                        }),
+                    );
+                }
+                push(
+                    RuntimeEventKind::RunTurnFinished,
+                    serde_json::json!({
+                        "turn_id": turn_id,
+                        "status": "ended",
+                        "elapsed_seconds": 0,
+                        "made_progress": true,
+                    }),
+                );
+            }
+        }
+        while events.len() < 10_000 {
+            let next = i64::try_from(events.len())
+                .unwrap_or(i64::MAX)
+                .saturating_add(1);
+            events.push(RuntimeTaskEvent {
+                seq: next,
+                run_id: run_id.to_string(),
+                task_id: None,
+                step_id: None,
+                event_type: RuntimeEventKind::Note,
+                payload: serde_json::json!({
+                    "kind": "benchmark_runtime_diagnostic",
+                    "detail": "representative persisted tool and runtime diagnostic payload used to avoid benchmarking an unrealistically empty event tail; the content is fixed so consecutive samples exercise identical JSON decoding and event-fold work",
+                }),
+                timestamp: chrono::Utc::now(),
+            });
+        }
+        let mut jsonl = Vec::new();
+        for event in &events {
+            serde_json::to_writer(&mut jsonl, event).map_err(|error| error.to_string())?;
+            jsonl.push(b'\n');
+        }
+        std::fs::write(shadow.events_path(run_id), &jsonl).map_err(|error| error.to_string())?;
+
+        shadow
+            .rewrite_plan_with_stats(run_id)
+            .map_err(|error| error.to_string())?;
+        let full_started = std::time::Instant::now();
+        let full_events = shadow
+            .read_events(run_id)
+            .map_err(|error| error.to_string())?;
+        let full_rebuilt =
+            rebuild_plan_from_events(&full_events).map_err(|error| error.to_string())?;
+        let full_elapsed = full_started.elapsed();
+        assert_eq!(full_events.len(), 10_000);
+        assert_eq!(full_rebuilt.run.run_id, run_id);
+        let state = shadow
+            .read_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "benchmark run-state missing".to_string())?;
+        let continuation = state
+            .continuation
+            .ok_or_else(|| "benchmark continuation missing".to_string())?;
+        assert_eq!(continuation.compaction_count, 100);
+        assert_eq!(continuation.next_turn_ordinal, 1_000);
+
+        let warm_rebuild_started = std::time::Instant::now();
+        let checkpoint_result = shadow
+            .load_checkpoint_suffix(run_id)
+            .ok_or_else(|| "benchmark checkpoint missing".to_string())?
+            .map_err(|error| error.to_string())?;
+        let (checkpoint, suffix) = checkpoint_result;
+        assert!(suffix.is_empty());
+        let mut checkpoint_state = checkpoint.state;
+        checkpoint_state.apply_events(&suffix);
+        let warm_rebuilt = checkpoint_state
+            .rebuilt_plan()
+            .map_err(|error| error.to_string())?;
+        let warm_rebuild_elapsed = warm_rebuild_started.elapsed();
+        assert_eq!(warm_rebuilt.run.run_id, run_id);
+
+        let append_fold_started = std::time::Instant::now();
+        shadow
+            .append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunContinuationDeferred,
+                serde_json::json!({"reason": "benchmark"}),
+            )
+            .map_err(|error| error.to_string())?;
+        let warm = shadow
+            .rewrite_plan_with_stats(run_id)
+            .map_err(|error| error.to_string())?;
+        let append_fold_elapsed = append_fold_started.elapsed();
+        assert!(warm.used_checkpoint);
+        assert_eq!(warm.folded_events, 1);
+
+        let snapshot_started = std::time::Instant::now();
+        let run = FileTaskStore::new(shadow.clone())
+            .get_run(run_id)
+            .map_err(|error| error.to_string())?;
+        let snapshot_elapsed = snapshot_started.elapsed();
+        assert!(run.is_some());
+        let checkpoint_bytes = std::fs::metadata(shadow.checkpoint_path(run_id))
+            .map_err(|error| error.to_string())?
+            .len();
+        let event_bytes = std::fs::metadata(shadow.events_path(run_id))
+            .map_err(|error| error.to_string())?
+            .len();
+        println!(
+            "{}",
+            serde_json::json!({
+                "events": 10_001,
+                "run_turns": 1_000,
+                "compactions": 100,
+                "full_rebuild_ms": full_elapsed.as_secs_f64() * 1_000.0,
+                "warm_rebuild_ms": warm_rebuild_elapsed.as_secs_f64() * 1_000.0,
+                "warm_append_fold_ms": append_fold_elapsed.as_secs_f64() * 1_000.0,
+                "snapshot_read_ms": snapshot_elapsed.as_secs_f64() * 1_000.0,
+                "checkpoint_bytes": checkpoint_bytes,
+                "event_bytes": event_bytes,
+                "warm_folded_events": warm.folded_events,
+            })
+        );
+        assert!(checkpoint_bytes < event_bytes);
+        assert!(full_elapsed < std::time::Duration::from_millis(150));
+        assert!(warm_rebuild_elapsed < std::time::Duration::from_millis(10));
+        assert!(append_fold_elapsed < std::time::Duration::from_millis(50));
+        assert!(snapshot_elapsed < std::time::Duration::from_millis(2));
+        assert!(
+            full_elapsed.as_nanos() > warm_rebuild_elapsed.as_nanos().saturating_mul(5),
+            "warm checkpoint rebuild must be at least five times faster"
+        );
+        assert!(checkpoint_bytes <= 128 * 1024);
+        assert!(checkpoint_bytes.saturating_mul(10) < event_bytes);
+        Ok(())
     }
 
     /// Parity: after attaching a shadow and driving a full lifecycle, the file
