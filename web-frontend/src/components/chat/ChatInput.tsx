@@ -1015,52 +1015,51 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
                   </button>
                 ))}
               </div>
-              {displayModel && displayModel.thinking_levels.length > 0 && (
-                <div className="relative">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setPermissionMenuOpen(false);
-                      setModelMenuOpen(false);
-                      setThinkingMenuOpen((open) => !open);
-                    }}
-                    className="flex max-w-[140px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                    title="切换思考深度"
-                  >
-                    <Brain size={13} />
-                    <span className="truncate">
-                      {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
-                    </span>
-                    <ChevronDown size={12} />
-                  </button>
-                  {thinkingMenuOpen && (
-                    <MenuOverlay title="思考深度" width="w-56">
-                      <div className="p-1">
-                        {thinkingLevels.map((lvl) => (
-                          <button
-                            key={lvl.id}
-                            type="button"
-                            onClick={() => switchThinkingLevel(lvl.id)}
-                            disabled={switchingThinking}
-                            className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
-                          >
-                            <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
-                              {lvl.id === thinkingLevel && <Check size={13} />}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPermissionMenuOpen(false);
+                    setModelMenuOpen(false);
+                    setThinkingMenuOpen((open) => !open);
+                  }}
+                  disabled={!displayModel || switchingThinking}
+                  className="flex max-w-[140px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-[var(--text-tertiary)]"
+                  title={displayModel ? '切换思考深度' : '配置模型后可用'}
+                >
+                  <Brain size={13} />
+                  <span className="truncate">
+                    {thinkingLevels.find((level) => level.id === thinkingLevel)?.label ?? '自动'}
+                  </span>
+                  {displayModel && <ChevronDown size={12} />}
+                </button>
+                {thinkingMenuOpen && displayModel && (
+                  <MenuOverlay title="思考深度" width="w-56">
+                    <div className="p-1">
+                      {thinkingLevels.map((lvl) => (
+                        <button
+                          key={lvl.id}
+                          type="button"
+                          onClick={() => switchThinkingLevel(lvl.id)}
+                          disabled={switchingThinking}
+                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
+                        >
+                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                            {lvl.id === thinkingLevel && <Check size={13} />}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-xs text-[var(--text-primary)]">
+                              {switchingThinking && lvl.id === thinkingLevel
+                                ? '切换中...'
+                                : lvl.label}
                             </span>
-                            <span className="min-w-0 flex-1">
-                              <span className="block text-xs text-[var(--text-primary)]">
-                                {switchingThinking && lvl.id === thinkingLevel
-                                  ? '切换中...'
-                                  : lvl.label}
-                              </span>
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    </MenuOverlay>
-                  )}
-                </div>
-              )}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </MenuOverlay>
+                )}
+              </div>
             </div>
             <div className="ml-auto flex shrink-0 items-center gap-2">
               <ContextRingIndicator

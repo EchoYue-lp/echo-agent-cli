@@ -43,6 +43,7 @@ const model = {
   temperature: null,
   max_tokens: null,
   context_window: null,
+  thinking_levels: ['none', 'low', 'medium', 'high', 'xhigh', 'max'],
 };
 
 describe('ProviderPanel', () => {
@@ -112,6 +113,11 @@ describe('ProviderPanel', () => {
         })
       )
     );
+  });
+
+  it('shows the thinking levels inferred by the backend for a configured model', async () => {
+    const { findByText } = render(<ProviderPanel />);
+    expect(await findByText('思考: 自动 / 关闭 / 低 / 中 / 高 / 很高 / 最高')).toBeTruthy();
   });
 
   it('surfaces provider deletion validation from the linearized backend path', async () => {

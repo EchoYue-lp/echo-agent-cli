@@ -8,6 +8,7 @@ import type {
   ModelInputModality,
   ModelProviderView,
 } from '../../generated';
+import { thinkingLevelOptions } from '../chat/thinkingLevels';
 
 const MODELS_CHANGED_EVENT = 'eko:models-changed';
 const PROTOCOLS: ReadonlyArray<[LlmApiProtocol, string]> = [
@@ -508,6 +509,12 @@ export function ProviderPanel() {
                         </span>
                         <span className="block truncate text-[10px] text-[var(--text-tertiary)]">
                           {model.model} · {model.api_protocol} · {model.input_modalities.join(', ')}
+                        </span>
+                        <span className="block truncate text-[10px] text-[var(--text-tertiary)]">
+                          思考:{' '}
+                          {thinkingLevelOptions(model.thinking_levels)
+                            .map((level) => level.label)
+                            .join(' / ')}
                         </span>
                       </button>
                       {model.is_default ? (

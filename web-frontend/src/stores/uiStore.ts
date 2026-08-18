@@ -101,7 +101,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   terminalOpen: false,
 
   toggleLeftSidebar: () => set((s) => ({ leftSidebarOpen: !s.leftSidebarOpen })),
-  openSettings: () => set({ settingsOpen: true }),
+  openSettings: () => set({ settingsOpen: true, activeSettingsTab: 'overview' }),
   closeSettings: () => set({ settingsOpen: false }),
   setActiveSettingsTab: (tab) => set({ activeSettingsTab: tab, settingsOpen: true }),
   toggleTheme: async () => {

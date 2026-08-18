@@ -303,7 +303,9 @@ pub fn build_tauri_app(
             use tauri::Manager;
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
 
-            #[cfg(debug_assertions)]
+            // Keep normal `cargo gui-dev` usable. The inspector opens only for
+            // an explicitly requested `devtools` build.
+            #[cfg(all(debug_assertions, feature = "devtools"))]
             if let Some(window) = app.get_webview_window("main") {
                 window.open_devtools();
             }
