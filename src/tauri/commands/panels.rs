@@ -72,20 +72,21 @@ pub async fn set_permissions_mode(
     *mode_lock = normalized.to_string();
     drop(mode_lock);
 
-    state
+    if let Some(pool) = &state.app_state.connection.pool {
+        pool.apply_permission_mode(normalized.to_string()).await;
+    }
+
+    let primary_updated = state
         .app_state
         .connection
         .primary_agent()
-        .write_async(|agent| {
-            let mode = normalized.to_string();
-            Box::pin(async move {
-                agent.set_permission_mode(&mode);
-            })
-        })
-        .await;
-
-    if let Some(pool) = &state.app_state.connection.pool {
-        pool.apply_permission_mode(normalized.to_string()).await;
+        .try_write(|agent| agent.set_permission_mode(normalized))
+        .is_some();
+    if !primary_updated {
+        tracing::debug!(
+            mode = normalized,
+            "Primary agent is active; shared permission service already has the new mode"
+        );
     }
 
     Ok(serde_json::json!({"success": true, "mode": normalized}))

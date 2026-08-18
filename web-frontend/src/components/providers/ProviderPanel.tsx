@@ -18,18 +18,13 @@ const PROTOCOLS: ReadonlyArray<[LlmApiProtocol, string]> = [
 ];
 
 interface ProviderDraft {
-  id: string;
   name: string;
   baseUrl: string;
   apiKey: string;
-  apiKeyEnv: string;
-  requiresApiKey: boolean;
-  protocol: LlmApiProtocol;
 }
 
 interface ModelDraft {
   id?: string;
-  displayName: string;
   model: string;
   protocol: LlmApiProtocol;
   imageInput: boolean;
@@ -43,27 +38,18 @@ interface ModelDraft {
 type Notice = { success: boolean; message: string } | null;
 
 const emptyProvider = (): ProviderDraft => ({
-  id: '',
   name: '',
   baseUrl: '',
   apiKey: '',
-  apiKeyEnv: '',
-  requiresApiKey: false,
-  protocol: 'chat_completions',
 });
 
 const providerDraft = (provider: ModelProviderView): ProviderDraft => ({
-  id: provider.id,
   name: provider.name,
   baseUrl: provider.base_url,
   apiKey: '',
-  apiKeyEnv: provider.api_key_env ?? '',
-  requiresApiKey: provider.requires_api_key,
-  protocol: provider.default_api_protocol,
 });
 
 const emptyModel = (protocol: LlmApiProtocol = 'chat_completions'): ModelDraft => ({
-  displayName: '',
   model: '',
   protocol,
   imageInput: false,
@@ -76,7 +62,6 @@ const emptyModel = (protocol: LlmApiProtocol = 'chat_completions'): ModelDraft =
 
 const modelDraft = (model: ConfiguredModel): ModelDraft => ({
   id: model.id,
-  displayName: model.display_name,
   model: model.model,
   protocol: model.api_protocol,
   imageInput: model.input_modalities.includes('image'),
@@ -140,7 +125,10 @@ export function ProviderPanel() {
         null;
       setSelectedId(nextId);
       const next = providerResult.providers.find((provider) => provider.id === nextId);
-      if (next) setProviderForm(providerDraft(next));
+      if (next) {
+        setProviderForm(providerDraft(next));
+        setModelForm(emptyModel(next.default_api_protocol));
+      }
     },
     [selectedId]
   );
@@ -178,13 +166,13 @@ export function ProviderPanel() {
     setNotice(null);
     try {
       const result = await providerApi.upsertProvider({
-        id: providerForm.id.trim(),
+        id: selectedProvider?.id ?? `provider-${crypto.randomUUID()}`,
         name: providerForm.name.trim(),
         base_url: providerForm.baseUrl.trim(),
         api_key: providerForm.apiKey.trim() || undefined,
-        api_key_env: providerForm.apiKeyEnv.trim() || undefined,
-        requires_api_key: providerForm.requiresApiKey,
-        default_api_protocol: providerForm.protocol,
+        api_key_env: selectedProvider?.api_key_env ?? undefined,
+        requires_api_key: false,
+        default_api_protocol: selectedProvider?.default_api_protocol ?? 'chat_completions',
       });
       await reload(result.provider_id);
       setNotice({ success: true, message: `Provider ${result.provider_id} 已保存` });
@@ -218,7 +206,6 @@ export function ProviderPanel() {
     try {
       await providerApi.upsertConfigured({
         id: modelForm.id,
-        display_name: modelForm.displayName.trim() || undefined,
         provider: selectedProvider.id,
         model: modelForm.model.trim(),
         api_protocol: modelForm.protocol,
@@ -240,11 +227,12 @@ export function ProviderPanel() {
   };
 
   const testConnection = async () => {
+    if (!selectedProvider) return;
     setBusy('test');
     setNotice(null);
     try {
       const result = await providerApi.test({
-        provider: providerForm.id.trim(),
+        provider: selectedProvider.id,
         model: modelForm.model.trim(),
         api_protocol: modelForm.protocol,
         input_modalities: modalities(),
@@ -298,9 +286,9 @@ export function ProviderPanel() {
     <div className="p-3">
       <div className="mb-3 flex items-center justify-between">
         <div>
-          <h3 className="text-sm font-semibold text-[var(--text-primary)]">模型 Provider</h3>
+          <h3 className="text-sm font-semibold text-[var(--text-primary)]">模型服务</h3>
           <p className="text-xs text-[var(--text-tertiary)]">
-            {providers.length} providers · {models.length} models
+            {providers.length} 个 Provider · {models.length} 个模型
           </p>
         </div>
         <button
@@ -381,31 +369,17 @@ export function ProviderPanel() {
               )}
             </div>
 
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <label className="text-xs text-[var(--text-secondary)]">
-                Provider ID
-                <input
-                  value={providerForm.id}
-                  disabled={selectedProvider != null}
-                  onChange={(event) =>
-                    setProviderForm((value) => ({ ...value, id: event.target.value }))
-                  }
-                  placeholder="company-gateway"
-                  className={`${fieldClass} disabled:opacity-60`}
-                />
-              </label>
-              <label className="text-xs text-[var(--text-secondary)]">
-                名称
-                <input
-                  value={providerForm.name}
-                  onChange={(event) =>
-                    setProviderForm((value) => ({ ...value, name: event.target.value }))
-                  }
-                  placeholder="Company Gateway"
-                  className={fieldClass}
-                />
-              </label>
-            </div>
+            <label className="block text-xs text-[var(--text-secondary)]">
+              Provider 名称
+              <input
+                value={providerForm.name}
+                onChange={(event) =>
+                  setProviderForm((value) => ({ ...value, name: event.target.value }))
+                }
+                placeholder="例如 OpenAI、DeepSeek 或本地模型"
+                className={fieldClass}
+              />
+            </label>
 
             <label className="block text-xs text-[var(--text-secondary)]">
               API 根地址
@@ -419,63 +393,33 @@ export function ProviderPanel() {
               />
             </label>
 
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-              <label className="text-xs text-[var(--text-secondary)]">
-                API Key
-                <input
-                  type="password"
-                  value={providerForm.apiKey}
-                  onChange={(event) =>
-                    setProviderForm((value) => ({ ...value, apiKey: event.target.value }))
-                  }
-                  placeholder={selectedProvider?.has_auth_token ? '已配置' : '可选'}
-                  className={fieldClass}
-                />
-              </label>
-              <label className="text-xs text-[var(--text-secondary)]">
-                环境变量
-                <input
-                  value={providerForm.apiKeyEnv}
-                  onChange={(event) =>
-                    setProviderForm((value) => ({ ...value, apiKeyEnv: event.target.value }))
-                  }
-                  placeholder="COMPANY_LLM_API_KEY"
-                  className={fieldClass}
-                />
-              </label>
-            </div>
-
-            <div>
-              <div className="mb-1 text-xs text-[var(--text-secondary)]">新模型默认协议</div>
-              <ProtocolControl
-                value={providerForm.protocol}
-                onChange={(protocol) => setProviderForm((value) => ({ ...value, protocol }))}
+            <label className="block text-xs text-[var(--text-secondary)]">
+              API Key（可选）
+              <input
+                type="password"
+                value={providerForm.apiKey}
+                onChange={(event) =>
+                  setProviderForm((value) => ({ ...value, apiKey: event.target.value }))
+                }
+                placeholder={
+                  selectedProvider?.has_auth_token
+                    ? '已配置；留空将继续使用原 Key'
+                    : '本地或免认证服务可留空'
+                }
+                className={fieldClass}
               />
-            </div>
+            </label>
 
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <label className="flex items-center gap-2 text-xs text-[var(--text-secondary)]">
-                <input
-                  type="checkbox"
-                  checked={providerForm.requiresApiKey}
-                  onChange={(event) =>
-                    setProviderForm((value) => ({
-                      ...value,
-                      requiresApiKey: event.target.checked,
-                    }))
-                  }
-                />
-                必须提供 API Key
-              </label>
+            <div className="flex justify-end">
               <button
                 type="button"
                 onClick={() => void saveProvider()}
                 disabled={
-                  busy === 'provider' || !providerForm.id.trim() || !providerForm.baseUrl.trim()
+                  busy === 'provider' || !providerForm.name.trim() || !providerForm.baseUrl.trim()
                 }
                 className="flex min-h-8 items-center gap-1.5 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white disabled:opacity-40"
               >
-                <Save size={14} /> {busy === 'provider' ? '保存中...' : '保存 Provider'}
+                <Save size={14} /> {busy === 'provider' ? '保存中...' : '保存'}
               </button>
             </div>
           </section>
@@ -508,7 +452,7 @@ export function ProviderPanel() {
                           {model.display_name || model.model}
                         </span>
                         <span className="block truncate text-[10px] text-[var(--text-tertiary)]">
-                          {model.model} · {model.api_protocol} · {model.input_modalities.join(', ')}
+                          {model.api_protocol} · {model.input_modalities.join(', ')}
                         </span>
                         <span className="block truncate text-[10px] text-[var(--text-tertiary)]">
                           思考:{' '}
@@ -546,30 +490,17 @@ export function ProviderPanel() {
                 </div>
               )}
 
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <label className="text-xs text-[var(--text-secondary)]">
-                  模型 ID
-                  <input
-                    value={modelForm.model}
-                    onChange={(event) =>
-                      setModelForm((value) => ({ ...value, model: event.target.value }))
-                    }
-                    placeholder="model-name"
-                    className={fieldClass}
-                  />
-                </label>
-                <label className="text-xs text-[var(--text-secondary)]">
-                  显示名称
-                  <input
-                    value={modelForm.displayName}
-                    onChange={(event) =>
-                      setModelForm((value) => ({ ...value, displayName: event.target.value }))
-                    }
-                    placeholder="Model Name"
-                    className={fieldClass}
-                  />
-                </label>
-              </div>
+              <label className="block text-xs text-[var(--text-secondary)]">
+                API 模型名称
+                <input
+                  value={modelForm.model}
+                  onChange={(event) =>
+                    setModelForm((value) => ({ ...value, model: event.target.value }))
+                  }
+                  placeholder="例如 gpt-5.6-sol"
+                  className={fieldClass}
+                />
+              </label>
 
               <div>
                 <div className="mb-1 text-xs text-[var(--text-secondary)]">API 协议</div>
@@ -593,7 +524,7 @@ export function ProviderPanel() {
                         setModelForm((value) => ({ ...value, imageInput: event.target.checked }))
                       }
                     />{' '}
-                    图像
+                    图片
                   </label>
                   <label className="flex items-center gap-2">
                     <input

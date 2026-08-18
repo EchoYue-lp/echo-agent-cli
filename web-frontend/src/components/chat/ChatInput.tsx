@@ -451,13 +451,15 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const switchPermissionMode = useCallback(
     async (mode: string) => {
       if (mode === permissionMode || switchingPermissionMode) return;
+      const previousMode = permissionMode;
+      setPermissionMode(mode);
+      setPermissionMenuOpen(false);
       setSwitchingPermissionMode(mode);
       try {
         await permissionsApi.setMode(mode);
-        setPermissionMode(mode);
         notifyPermissionsChanged();
-        setPermissionMenuOpen(false);
       } catch (e) {
+        setPermissionMode(previousMode);
         console.error('[ChatInput] Failed to switch permission mode:', e);
       } finally {
         setSwitchingPermissionMode(null);

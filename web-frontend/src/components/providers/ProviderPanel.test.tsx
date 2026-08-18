@@ -68,36 +68,41 @@ describe('ProviderPanel', () => {
     const { getByLabelText, getByRole } = render(<ProviderPanel />);
     await waitFor(() => getByRole('button', { name: '添加 Provider' }));
     fireEvent.click(getByRole('button', { name: '添加 Provider' }));
-    fireEvent.change(getByLabelText('Provider ID'), { target: { value: 'local-lab' } });
-    fireEvent.change(getByLabelText('名称'), { target: { value: 'Local Lab' } });
+    fireEvent.change(getByLabelText('Provider 名称'), { target: { value: 'Local Lab' } });
     fireEvent.change(getByLabelText('API 根地址'), {
       target: { value: 'http://127.0.0.1:11434/v1' },
     });
-    fireEvent.click(getByRole('button', { name: 'Anthropic' }));
-    fireEvent.click(getByRole('button', { name: '保存 Provider' }));
+    fireEvent.click(getByRole('button', { name: '保存' }));
 
     await waitFor(() =>
       expect(mocks.upsertProvider).toHaveBeenCalledWith(
         expect.objectContaining({
-          id: 'local-lab',
+          id: expect.stringMatching(/^provider-/),
+          name: 'Local Lab',
           base_url: 'http://127.0.0.1:11434/v1',
-          default_api_protocol: 'anthropic',
+          default_api_protocol: 'chat_completions',
         })
       )
     );
   });
 
+  it('shows only user-facing provider and model identifiers', async () => {
+    const { findByLabelText, queryByLabelText, queryByText } = render(<ProviderPanel />);
+
+    expect(await findByLabelText('API 模型名称')).toBeTruthy();
+    expect(queryByLabelText('Provider ID')).toBeNull();
+    expect(queryByLabelText('显示名称')).toBeNull();
+    expect(queryByLabelText('环境变量')).toBeNull();
+    expect(queryByLabelText('必须提供 API Key')).toBeNull();
+    expect(queryByText('新模型默认协议')).toBeNull();
+  });
+
   it('persists per-model protocol and multimodal capabilities', async () => {
-    const { getAllByRole, getByLabelText, getByRole } = render(<ProviderPanel />);
-    await waitFor(() => getByLabelText('模型 ID'));
-    fireEvent.change(getByLabelText('模型 ID'), { target: { value: 'vision-model' } });
-    const protocolButtons = getAllByRole('button', { name: 'Chat Completions' });
-    const modelProtocolButton = protocolButtons.find(
-      (button) => button.getAttribute('aria-pressed') === 'true'
-    );
-    if (!modelProtocolButton) throw new Error('model protocol control not found');
-    fireEvent.click(modelProtocolButton);
-    fireEvent.click(getByLabelText('图像'));
+    const { getByLabelText, getByRole } = render(<ProviderPanel />);
+    await waitFor(() => getByLabelText('API 模型名称'));
+    fireEvent.change(getByLabelText('API 模型名称'), { target: { value: 'vision-model' } });
+    fireEvent.click(getByRole('button', { name: 'Chat Completions' }));
+    fireEvent.click(getByLabelText('图片'));
     fireEvent.click(getByLabelText('音频'));
     fireEvent.click(getByLabelText('视频'));
     fireEvent.click(getByRole('button', { name: '保存并启用' }));

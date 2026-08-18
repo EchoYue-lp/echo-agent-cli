@@ -652,6 +652,12 @@ impl AgentPool {
         // Fast path: reuse existing agent
         if let Some(existing) = agents.get_mut(conversation_id) {
             existing.last_used = Instant::now();
+            let permission_mode = self.permission_mode.read().await.clone();
+            let _updated = existing.handle.try_write(|agent| {
+                if agent.get_permission_mode() != permission_mode {
+                    agent.set_permission_mode(&permission_mode);
+                }
+            });
             return self
                 .admission
                 .issue(conversation_id, existing.handle.clone());
@@ -835,10 +841,28 @@ impl AgentPool {
         })
     }
 
-    /// Apply the current permission mode to all existing pooled agents and
-    /// remember it for future agents.
+    /// Publish the current permission mode without waiting for an active turn.
+    ///
+    /// The shared permission service is the authority used by tool execution,
+    /// so it is updated first. Idle agents mirror the mode immediately; a busy
+    /// agent refreshes its informational config on its next pool acquisition.
     pub async fn apply_permission_mode(&self, mode: String) {
         *self.permission_mode.write().await = mode.clone();
+
+        if let Some(service) = &self.shared.permission_service {
+            use echo_agent::tools::permission::PermissionMode;
+
+            let framework_mode = match mode.as_str() {
+                "full-auto" => PermissionMode::BypassPermissions,
+                "auto-edit" | "accept-edits" => PermissionMode::AcceptEdits,
+                "strict" | "strict-confirm" | "strict-confirmation" => {
+                    PermissionMode::StrictConfirm
+                }
+                _ => PermissionMode::Default,
+            };
+            service.set_mode(framework_mode).await;
+            service.clear_cache();
+        }
 
         let agents: Vec<AgentHandle> = self
             .agents
@@ -848,19 +872,30 @@ impl AgentPool {
             .map(|pa| pa.handle.clone())
             .collect();
 
+        let mut updated_agents = 0usize;
         for handle in agents {
             let mode = mode.clone();
-            handle
-                .write_async(|agent| {
-                    Box::pin(async move {
+            if handle
+                .try_write(|agent| {
+                    if agent.get_permission_mode() != mode {
                         agent.set_permission_mode(&mode);
-                    })
+                    }
                 })
-                .await;
+                .is_some()
+            {
+                updated_agents = updated_agents.saturating_add(1);
+            }
         }
 
         let pooled_agents = self.agents.read().await.len();
-        tracing::info!(mode = %mode, pooled_agents, "AgentPool: permission mode applied");
+        let deferred_agents = pooled_agents.saturating_sub(updated_agents);
+        tracing::info!(
+            mode = %mode,
+            pooled_agents,
+            updated_agents,
+            deferred_agents,
+            "AgentPool: permission mode published"
+        );
     }
 
     /// Refresh available file-based skill descriptors for future and existing
@@ -2324,6 +2359,36 @@ mod tests {
             .read(|agent| agent.get_permission_mode().to_string())
             .await;
         assert_eq!(second_mode, "full-auto");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_permission_mode_does_not_wait_for_busy_pool_agent() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let first = pool
+            .acquire("conv-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        let first_handle = first.agent();
+        let busy_guard = first_handle.inner().read().await;
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            pool.apply_permission_mode("full-auto".to_string()),
+        )
+        .await
+        .map_err(|_| "permission update waited for a busy agent".to_string())?;
+        drop(busy_guard);
+
+        let refreshed = pool
+            .acquire("conv-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        let refreshed_mode = refreshed
+            .agent()
+            .read(|agent| agent.get_permission_mode().to_string())
+            .await;
+        assert_eq!(refreshed_mode, "full-auto");
         Ok(())
     }
 
