@@ -417,6 +417,14 @@ pub(crate) struct PreparedAgentPoolModelPublication<'a> {
     runtime: ModelRuntimeConfig,
 }
 
+pub(crate) struct PreparedAgentPoolModelDeactivation<'a> {
+    pool: &'a AgentPool,
+    _transition: AgentPoolWorkspaceTransition<'a>,
+    _agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
+    publications: Vec<infra::PreparedAgentModelDeactivation>,
+    app_config: AppConfig,
+}
+
 impl PreparedAgentPoolModelPublication<'_> {
     pub(crate) async fn commit(self) {
         let Self {
@@ -436,6 +444,26 @@ impl PreparedAgentPoolModelPublication<'_> {
             model = %runtime.model,
             pooled_agents = _agents.len(),
             "AgentPool: prepared runtime generation committed"
+        );
+    }
+}
+
+impl PreparedAgentPoolModelDeactivation<'_> {
+    pub(crate) async fn commit(self) {
+        let Self {
+            pool,
+            _transition,
+            _agents,
+            publications,
+            app_config,
+        } = self;
+        for publication in publications {
+            publication.commit().await;
+        }
+        *pool.app_config.write().await = app_config;
+        tracing::info!(
+            pooled_agents = _agents.len(),
+            "AgentPool: active model removed from pooled agents"
         );
     }
 }
@@ -838,6 +866,37 @@ impl AgentPool {
             publications,
             app_config,
             runtime,
+        })
+    }
+
+    /// Admit every pooled agent before removing the final active model.
+    pub(crate) async fn prepare_model_deactivation(
+        &self,
+        app_config: AppConfig,
+    ) -> Result<PreparedAgentPoolModelDeactivation<'_>, String> {
+        let transition = self
+            .preflight_model_mutation()
+            .await
+            .map_err(|error| error.to_string())?;
+        let agents = self.agents.write().await;
+        let mut publications = Vec::with_capacity(agents.len());
+        let mut pooled_agents: Vec<(&String, &PooledAgent)> = agents.iter().collect();
+        pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
+        for (_, pooled) in pooled_agents {
+            publications.push(
+                infra::prepare_agent_model_deactivation(
+                    &pooled.handle,
+                    pooled.model_consumers.clone(),
+                )
+                .await,
+            );
+        }
+        Ok(PreparedAgentPoolModelDeactivation {
+            pool: self,
+            _transition: transition,
+            _agents: agents,
+            publications,
+            app_config,
         })
     }
 

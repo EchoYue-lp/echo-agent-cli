@@ -187,6 +187,16 @@ impl AgentModelConsumers {
         }
     }
 
+    async fn clear_inherited_generation(&self) {
+        let mut generation = self.inherited_generation.write().await;
+        generation.model.clear();
+        generation.llm_config = None;
+        generation.llm_client = None;
+        generation.temperature = None;
+        generation.max_tokens = None;
+        generation.thinking = None;
+    }
+
     #[cfg(test)]
     pub(crate) fn inherited_handle_for_test(&self, name: &str) -> Option<AgentHandle> {
         self.inherited_factories
@@ -2368,6 +2378,14 @@ pub(crate) struct PreparedAgentModelPublication {
     token_limit: usize,
 }
 
+/// Exact admission receipt for removing the active model from a live parent
+/// agent and all inherited subagent factories.
+pub(crate) struct PreparedAgentModelDeactivation {
+    generation: echo_agent::agent::PreparedAgentModelDeactivation,
+    inherited: Vec<echo_agent::agent::PreparedAgentModelDeactivation>,
+    consumers: AgentModelConsumers,
+}
+
 struct PreparedInheritedSubagentPublication {
     generation: echo_agent::agent::PreparedAgentModelGeneration,
 }
@@ -2389,6 +2407,16 @@ impl PreparedAgentModelPublication {
         self.consumers
             .publish_inherited_generation(&self.runtime, &self.prepared, self.token_limit)
             .await;
+    }
+}
+
+impl PreparedAgentModelDeactivation {
+    pub(crate) async fn commit(self) {
+        self.generation.commit();
+        for inherited in self.inherited {
+            inherited.commit();
+        }
+        self.consumers.clear_inherited_generation().await;
     }
 }
 
@@ -2509,6 +2537,26 @@ pub(crate) async fn prepare_agent_model_publication(
         prepared: prepared.clone(),
         token_limit,
     })
+}
+
+/// Lock every model consumer so deleting the final configured model can be
+/// committed without leaving a stale client available to later turns.
+pub(crate) async fn prepare_agent_model_deactivation(
+    handle: &AgentHandle,
+    consumers: AgentModelConsumers,
+) -> PreparedAgentModelDeactivation {
+    let generation = handle
+        .prepare_model_deactivation(Some(EKO_MODEL_CRITIC_OWNER.to_string()))
+        .await;
+    let mut inherited = Vec::with_capacity(consumers.inherited_factories.len());
+    for factory in consumers.inherited_factories.iter() {
+        inherited.push(factory.handle.prepare_model_deactivation(None).await);
+    }
+    PreparedAgentModelDeactivation {
+        generation,
+        inherited,
+        consumers,
+    }
 }
 
 #[cfg(test)]

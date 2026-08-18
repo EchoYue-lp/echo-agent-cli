@@ -308,20 +308,42 @@ pub fn upsert_model_provider(
     Ok(provider_id)
 }
 
-pub fn delete_model_provider(config: &mut AppConfig, provider_id: &str) -> Result<(), String> {
-    if config
-        .configured_models
-        .iter()
-        .any(|model| model.provider == provider_id)
-    {
-        return Err(format!(
-            "Provider '{provider_id}' still has configured models; delete them first"
-        ));
-    }
-    if config.model_providers.remove(provider_id).is_none() {
+pub fn delete_model_provider(config: &mut AppConfig, provider_id: &str) -> Result<usize, String> {
+    if !config.model_providers.contains_key(provider_id) {
         return Err(format!("Provider '{provider_id}' is not configured"));
     }
-    Ok(())
+
+    let deleting_default = config
+        .model
+        .default_model_id
+        .as_deref()
+        .and_then(|default_id| {
+            config
+                .configured_models
+                .iter()
+                .find(|model| model.id == default_id)
+        })
+        .is_some_and(|model| model.provider == provider_id);
+    let successor = deleting_default.then(|| {
+        config
+            .configured_models
+            .iter()
+            .find(|model| model.provider != provider_id && model.enabled)
+            .cloned()
+    });
+    let before = config.configured_models.len();
+    config
+        .configured_models
+        .retain(|model| model.provider != provider_id);
+    let removed_models = before.saturating_sub(config.configured_models.len());
+    config.model_providers.remove(provider_id);
+
+    if let Some(successor) = successor.flatten() {
+        set_default_model(config, &successor.id)?;
+    } else if deleting_default {
+        clear_selected_model(config);
+    }
+    Ok(removed_models)
 }
 
 pub fn upsert_configured_model(
@@ -410,6 +432,7 @@ pub fn session_config_for_runtime(
 pub enum DeleteConfiguredModelOutcome {
     RemovedNonDefault,
     ActivatedSuccessor(Box<ModelRuntimeConfig>),
+    Deactivated,
 }
 
 pub fn delete_configured_model(
@@ -426,11 +449,6 @@ pub fn delete_configured_model(
                 .cloned()
         })
         .flatten();
-    if deleting_default && successor.is_none() {
-        return Err(format!(
-            "Cannot delete default model '{model_id}' without another enabled model"
-        ));
-    }
     let before = config.configured_models.len();
     config
         .configured_models
@@ -444,7 +462,23 @@ pub fn delete_configured_model(
             runtime,
         )));
     }
+    if deleting_default {
+        clear_selected_model(config);
+        return Ok(DeleteConfiguredModelOutcome::Deactivated);
+    }
     Ok(DeleteConfiguredModelOutcome::RemovedNonDefault)
+}
+
+pub(crate) fn clear_selected_model(config: &mut AppConfig) {
+    config.model.default_model_id = None;
+    config.model.provider.clear();
+    config.model.name.clear();
+    config.model.auth_token = None;
+    config.model.base_url = None;
+    config.model.api_protocol = None;
+    config.model.max_tokens = None;
+    config.model.temperature = None;
+    config.model.context_window = None;
 }
 
 pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> ModelRuntimeConfig {
@@ -892,7 +926,7 @@ mod tests {
     }
 
     #[test]
-    fn deleting_last_default_is_rejected_without_mutation() -> Result<(), String> {
+    fn deleting_last_default_clears_the_selected_model() -> Result<(), String> {
         let mut config = AppConfig {
             configured_models: vec![ConfiguredModel {
                 id: "local:a".to_string(),
@@ -905,11 +939,90 @@ mod tests {
         };
         set_default_model(&mut config, "local:a")?;
 
-        let result = delete_configured_model(&mut config, "local:a");
+        let outcome = delete_configured_model(&mut config, "local:a")?;
 
-        assert!(result.is_err());
-        assert_eq!(config.model.default_model_id.as_deref(), Some("local:a"));
-        assert_eq!(config.configured_models.len(), 1);
+        assert!(matches!(outcome, DeleteConfiguredModelOutcome::Deactivated));
+        assert!(config.model.default_model_id.is_none());
+        assert!(config.model.provider.is_empty());
+        assert!(config.model.name.is_empty());
+        assert!(config.configured_models.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_provider_cascades_models_and_selects_an_external_successor() -> Result<(), String> {
+        let mut config = AppConfig::default();
+        config.model_providers.insert(
+            "first".to_string(),
+            ModelProviderConfig {
+                base_url: Some("https://first.example/v1".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        config.model_providers.insert(
+            "second".to_string(),
+            ModelProviderConfig {
+                base_url: Some("https://second.example/v1".to_string()),
+                ..ModelProviderConfig::default()
+            },
+        );
+        config.configured_models = vec![
+            ConfiguredModel {
+                id: "first:a".to_string(),
+                provider: "first".to_string(),
+                model: "a".to_string(),
+                ..ConfiguredModel::default()
+            },
+            ConfiguredModel {
+                id: "first:b".to_string(),
+                provider: "first".to_string(),
+                model: "b".to_string(),
+                ..ConfiguredModel::default()
+            },
+            ConfiguredModel {
+                id: "second:c".to_string(),
+                provider: "second".to_string(),
+                model: "c".to_string(),
+                ..ConfiguredModel::default()
+            },
+        ];
+        set_default_model(&mut config, "first:a")?;
+
+        let removed = delete_model_provider(&mut config, "first")?;
+
+        assert_eq!(removed, 2);
+        assert!(!config.model_providers.contains_key("first"));
+        assert_eq!(config.model.default_model_id.as_deref(), Some("second:c"));
+        assert!(
+            config
+                .configured_models
+                .iter()
+                .all(|model| model.provider == "second")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_last_provider_clears_the_selected_model() -> Result<(), String> {
+        let mut config = AppConfig::default();
+        config
+            .model_providers
+            .insert("local".to_string(), ModelProviderConfig::default());
+        config.configured_models = vec![ConfiguredModel {
+            id: "local:a".to_string(),
+            provider: "local".to_string(),
+            model: "a".to_string(),
+            ..ConfiguredModel::default()
+        }];
+        set_default_model(&mut config, "local:a")?;
+
+        let removed = delete_model_provider(&mut config, "local")?;
+
+        assert_eq!(removed, 1);
+        assert!(config.model_providers.is_empty());
+        assert!(config.configured_models.is_empty());
+        assert!(config.model.default_model_id.is_none());
+        assert!(config.model.name.is_empty());
         Ok(())
     }
 

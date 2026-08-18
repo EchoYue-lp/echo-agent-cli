@@ -6,6 +6,7 @@ import {
   type ReactNode,
   type RefObject,
 } from 'react';
+import { createPortal } from 'react-dom';
 
 const FOCUSABLE_SELECTOR = [
   'a[href]',
@@ -173,7 +174,7 @@ export function Modal({
     }
   }, [active, entry, initialFocusRef]);
 
-  return (
+  return createPortal(
     <div
       ref={overlayRef}
       aria-hidden={!active}
@@ -210,6 +211,7 @@ export function Modal({
       >
         {children}
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

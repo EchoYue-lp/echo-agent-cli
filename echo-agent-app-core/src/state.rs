@@ -500,6 +500,7 @@ struct PreparedModelMutation {
     runtime: Option<crate::model_config::ModelRuntimeConfig>,
     prepared: Option<crate::infra::PreparedRuntimeLlm>,
     activated: bool,
+    deactivated: bool,
     deleted: bool,
 }
 
@@ -1039,7 +1040,9 @@ impl AppState {
         let current = self.config.app_config.read().await.clone();
         let active_model_id = self.config.active_model_id.read().await.clone();
         let mutation = prepare_model_mutation(&current, &active_model_id, request)?;
-        let next_active_runtime = if mutation.activated {
+        let next_active_runtime = if mutation.deactivated {
+            None
+        } else if mutation.activated {
             Some(mutation.runtime.clone().ok_or_else(|| {
                 ModelMutationError::Publication(
                     "active model mutation lost its runtime candidate".to_string(),
@@ -1055,7 +1058,7 @@ impl AppState {
             }
             None => mutation.config.clone(),
         };
-        let _foreground = if mutation.activated {
+        let _foreground = if mutation.activated || mutation.deactivated {
             Some(
                 self.session
                     .foreground_turns
@@ -1096,6 +1099,18 @@ impl AppState {
             ),
             _ => None,
         };
+        let pool_deactivation = if mutation.deactivated {
+            match self.connection.pool.as_ref() {
+                Some(pool) => Some(
+                    pool.prepare_model_deactivation(pool_session_config.clone())
+                        .await
+                        .map_err(ModelMutationError::Publication)?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
         let primary_publication = match (runtime.as_ref(), prepared.as_ref()) {
             (Some(runtime), Some(prepared)) => {
                 let consumers = self.connection.model_consumers.clone().ok_or_else(|| {
@@ -1117,6 +1132,19 @@ impl AppState {
             }
             _ => None,
         };
+        let primary_deactivation = if mutation.deactivated {
+            let consumers = self.connection.model_consumers.clone().ok_or_else(|| {
+                ModelMutationError::Publication(
+                    "primary model consumers are unavailable".to_string(),
+                )
+            })?;
+            Some(
+                crate::infra::prepare_agent_model_deactivation(&self.connection.agent, consumers)
+                    .await,
+            )
+        } else {
+            None
+        };
 
         self.save_app_config(&mutation.config)
             .map_err(ModelMutationError::Persistence)?;
@@ -1124,10 +1152,14 @@ impl AppState {
 
         if let Some(publication) = primary_publication {
             publication.commit().await;
+        } else if let Some(deactivation) = primary_deactivation {
+            deactivation.commit().await;
         }
 
         if let Some(publication) = pool_publication {
             publication.commit().await;
+        } else if let Some(deactivation) = pool_deactivation {
+            deactivation.commit().await;
         } else if let Some(pool) = self.connection.pool.as_ref() {
             pool.update_app_config(pool_session_config).await;
         }
@@ -1140,6 +1172,9 @@ impl AppState {
                 model = %runtime.model,
                 "active model mutation fully settled"
             );
+        } else if mutation.deactivated {
+            self.config.active_model_id.write().await.clear();
+            tracing::info!("active model removed; agent requires model configuration");
         }
         Ok(ModelMutationReceipt {
             config: mutation.config,
@@ -2168,6 +2203,7 @@ fn prepare_model_mutation(
                 runtime: Some(runtime),
                 prepared: Some(prepared),
                 activated: activates_upserted_model,
+                deactivated: false,
                 deleted: false,
             })
         }
@@ -2207,6 +2243,7 @@ fn prepare_model_mutation(
                 runtime,
                 prepared,
                 activated,
+                deactivated: false,
                 deleted: false,
             })
         }
@@ -2225,6 +2262,7 @@ fn prepare_model_mutation(
                 runtime: Some(runtime),
                 prepared: Some(prepared),
                 activated: true,
+                deactivated: false,
                 deleted: false,
             })
         }
@@ -2249,6 +2287,7 @@ fn prepare_model_mutation(
                             runtime: Some(runtime),
                             prepared: Some(prepared),
                             activated: true,
+                            deactivated: false,
                             deleted: true,
                         })
                     } else {
@@ -2258,6 +2297,7 @@ fn prepare_model_mutation(
                             runtime: None,
                             prepared: None,
                             activated: false,
+                            deactivated: false,
                             deleted: true,
                         })
                     }
@@ -2271,6 +2311,18 @@ fn prepare_model_mutation(
                         runtime: Some(*runtime),
                         prepared: Some(prepared),
                         activated: true,
+                        deactivated: false,
+                        deleted: true,
+                    })
+                }
+                crate::model_config::DeleteConfiguredModelOutcome::Deactivated => {
+                    Ok(PreparedModelMutation {
+                        config,
+                        model_id,
+                        runtime: None,
+                        prepared: None,
+                        activated: false,
+                        deactivated: true,
                         deleted: true,
                     })
                 }
@@ -2278,14 +2330,32 @@ fn prepare_model_mutation(
         }
         ModelMutationRequest::DeleteProvider(provider_id) => {
             let mut config = current.clone();
+            let active_before = resolve_active_model_runtime(current, active_model_id)?;
+            let removes_active_model = active_before
+                .as_ref()
+                .is_some_and(|runtime| runtime.provider == provider_id);
             crate::model_config::delete_model_provider(&mut config, &provider_id)
+                .map_err(ModelMutationError::Validation)?;
+            let runtime = if removes_active_model {
+                resolve_active_model_runtime(&config, active_model_id)?
+            } else {
+                None
+            };
+            if removes_active_model && runtime.is_none() {
+                crate::model_config::clear_selected_model(&mut config);
+            }
+            let prepared = runtime
+                .as_ref()
+                .map(crate::infra::prepare_runtime_llm)
+                .transpose()
                 .map_err(ModelMutationError::Validation)?;
             Ok(PreparedModelMutation {
                 config,
                 model_id: provider_id,
-                runtime: None,
-                prepared: None,
-                activated: false,
+                activated: runtime.is_some(),
+                deactivated: removes_active_model && runtime.is_none(),
+                runtime,
+                prepared,
                 deleted: true,
             })
         }
@@ -2316,6 +2386,7 @@ fn prepare_model_mutation(
                 runtime,
                 prepared,
                 activated: reapply_active_model,
+                deactivated: false,
                 deleted: false,
             })
         }
@@ -2626,6 +2697,54 @@ mod model_mutation_tests {
         Ok(())
     }
 
+    async fn assert_no_live_generation(fixture: &ModelMutationFixture) -> Result<(), String> {
+        let snapshot = fixture.state.config.app_config.read().await;
+        assert!(snapshot.model.default_model_id.is_none());
+        assert!(snapshot.configured_models.is_empty());
+        drop(snapshot);
+        assert!(fixture.state.config.active_model_id.read().await.is_empty());
+
+        for handle in [
+            fixture.state.connection.agent.clone(),
+            fixture.existing.clone(),
+            inherited_handle(fixture)?,
+        ] {
+            let projection = handle
+                .read(|agent| {
+                    (
+                        agent.model_name().to_string(),
+                        agent.llm_config().is_none(),
+                        agent.llm_client().is_none(),
+                    )
+                })
+                .await;
+            assert!(projection.0.is_empty());
+            assert!(projection.1);
+            assert!(projection.2);
+        }
+
+        let new_lease = fixture
+            .pool
+            .acquire("new-after-model-deactivation")
+            .await
+            .map_err(|error| error.to_string())?;
+        let new_projection = new_lease
+            .agent()
+            .read(|agent| {
+                (
+                    agent.model_name().to_string(),
+                    agent.llm_config().is_none(),
+                    agent.llm_client().is_none(),
+                )
+            })
+            .await;
+        assert!(new_projection.0.is_empty());
+        assert!(new_projection.1);
+        assert!(new_projection.2);
+        drop(new_lease);
+        Ok(())
+    }
+
     async fn assert_session_generation(
         fixture: &ModelMutationFixture,
         durable_default_id: &str,
@@ -2922,21 +3041,43 @@ mod model_mutation_tests {
     }
 
     #[tokio::test]
-    async fn deleting_last_default_is_rejected_without_legacy_resurrection() -> Result<(), String> {
+    async fn deleting_last_default_deactivates_every_model_consumer() -> Result<(), String> {
         let mut config = valid_config()?;
         config.configured_models.retain(|model| model.id == MODEL_A);
         let fixture = fixture(config, false).await?;
 
-        let result = fixture.state.delete_configured_model_owned(MODEL_A).await;
+        let receipt = fixture
+            .state
+            .delete_configured_model_owned(MODEL_A)
+            .await
+            .map_err(|error| error.to_string())?;
 
-        assert!(matches!(result, Err(ModelMutationError::Validation(_))));
+        assert!(receipt.deleted);
+        assert!(!receipt.activated);
+        assert!(receipt.runtime.is_none());
         let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
-        assert_eq!(persisted.configured_models.len(), 1);
-        assert_eq!(
-            persisted.configured_models.first().map(|m| m.id.as_str()),
-            Some(MODEL_A)
-        );
-        assert_full_generation(&fixture, MODEL_A, "runtime-a", ENDPOINT_A, WINDOW_A).await
+        assert!(persisted.configured_models.is_empty());
+        assert!(persisted.model.default_model_id.is_none());
+        assert_no_live_generation(&fixture).await
+    }
+
+    #[tokio::test]
+    async fn deleting_provider_cascades_its_models_and_deactivates_every_consumer()
+    -> Result<(), String> {
+        let fixture = fixture(shared_provider_config()?, false).await?;
+
+        let receipt = fixture
+            .state
+            .delete_model_provider_owned("local-shared")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(receipt.deleted);
+        assert!(!receipt.activated);
+        assert!(receipt.config.model_providers.is_empty());
+        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        assert!(persisted.model_providers.is_empty());
+        assert_no_live_generation(&fixture).await
     }
 
     #[tokio::test]
