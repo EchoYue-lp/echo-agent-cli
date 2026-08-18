@@ -178,14 +178,14 @@ export function Modal({
       ref={overlayRef}
       aria-hidden={!active}
       inert={!active}
-      className={`fixed inset-0 z-50 flex items-center justify-center ${overlayClassName ?? ''}`}
+      className={`fixed inset-0 z-50 isolate flex items-center justify-center ${overlayClassName ?? ''}`}
     >
       {closeOnBackdrop ? (
         <button
           type="button"
           tabIndex={-1}
           aria-label="关闭对话框"
-          className="absolute inset-0 cursor-default"
+          className="absolute inset-0 z-0 cursor-default"
           style={{ background: 'var(--bg-overlay)' }}
           onClick={() => {
             if (getTopmostModal() === entry) onCloseRef.current();
@@ -194,7 +194,7 @@ export function Modal({
       ) : (
         <div
           aria-hidden="true"
-          className="absolute inset-0"
+          className="absolute inset-0 z-0"
           style={{ background: 'var(--bg-overlay)' }}
         />
       )}
@@ -205,7 +205,7 @@ export function Modal({
         aria-label={ariaLabel}
         aria-labelledby={ariaLabelledBy}
         tabIndex={-1}
-        className={className}
+        className={`relative z-10 ${className ?? ''}`}
         style={style}
       >
         {children}

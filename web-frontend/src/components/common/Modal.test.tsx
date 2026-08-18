@@ -66,6 +66,25 @@ describe('Modal', () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it('keeps dialog controls above the backdrop interception layer', () => {
+    const onClose = vi.fn();
+    const onAction = vi.fn();
+    const { getByRole } = render(
+      <Modal onClose={onClose} ariaLabel="Layered dialog">
+        <button onClick={onAction}>Action</button>
+      </Modal>
+    );
+
+    const dialog = getByRole('dialog', { name: 'Layered dialog' });
+    const backdrop = getByRole('button', { name: '关闭对话框' });
+    expect(dialog.classList.contains('z-10')).toBe(true);
+    expect(backdrop.classList.contains('z-0')).toBe(true);
+
+    fireEvent.click(getByRole('button', { name: 'Action' }));
+    expect(onAction).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('keeps focus inside across rerenders and uses the latest close handler', () => {
     const firstClose = vi.fn();
     const latestClose = vi.fn();
