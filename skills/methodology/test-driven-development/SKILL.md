@@ -15,7 +15,7 @@ triggers:
 allowed-tools: []
 hooks:
   PreToolUse:
-    - matcher: "write_file|edit_file|create_file"
+    - matcher: "apply_patch"
       hooks:
         - type: prompt
           prompt: |

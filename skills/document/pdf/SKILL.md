@@ -14,7 +14,7 @@ triggers:
   - pdf
   - 导出PDF
   - .pdf
-allowed-tools: [shell, read_file, read_artifact, write_file]
+allowed-tools: [shell, read_file, read_artifact, apply_patch]
 hooks:
   UserPromptSubmit:
     - matcher: "\\.pdf"

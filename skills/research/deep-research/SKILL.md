@@ -13,7 +13,7 @@ triggers:
   - 深度研究
   - 综合报告
   - 多源验证
-allowed-tools: [shell, read_file, read_artifact, write_file, web_search, web_fetch]
+allowed-tools: [shell, read_file, read_artifact, apply_patch, web_search, web_fetch]
 ---
 # Deep Research
 

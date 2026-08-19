@@ -13,7 +13,7 @@ triggers:
   - 粒子
   - generative art
   - p5js
-allowed-tools: [shell, read_file, read_artifact, write_file]
+allowed-tools: [shell, read_file, read_artifact, apply_patch]
 ---
 # Algorithmic Art
 

@@ -17,7 +17,7 @@ triggers:
   - 公文
   - word 文档
   - .docx
-allowed-tools: [shell, read_file, read_artifact, write_file]
+allowed-tools: [shell, read_file, read_artifact, apply_patch]
 hooks:
   UserPromptSubmit:
     - matcher: "\\.docx"

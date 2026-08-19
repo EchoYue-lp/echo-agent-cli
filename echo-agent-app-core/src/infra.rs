@@ -3005,7 +3005,7 @@ mod resolve_subagent_model_tests {
 
         assert!(subagent.sandbox_manager().is_some());
         assert!(!subagent.is_plan_mode());
-        for tool in ["write_file", "edit_file", "shell"] {
+        for tool in ["apply_patch", "shell"] {
             assert!(
                 subagent.list_tools().iter().any(|name| name == tool),
                 "writer subagent must expose {tool}"

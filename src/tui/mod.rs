@@ -504,7 +504,7 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
-    /// Tool result with diff display (file edit/create/write)
+    /// Tool result with diff display (transactional file patch)
     ToolResult {
         tool_name: String,
     },
@@ -522,9 +522,8 @@ pub(crate) fn tool_command(name: &str, args: &str) -> String {
     match name {
         "shell" => text(&["command"]).unwrap_or("shell").to_string(),
         "read_file" => text(&["path", "file_path"]).unwrap_or("file").to_string(),
-        "edit_file" => format!("Edit {}", text(&["path", "file_path"]).unwrap_or("file")),
-        "write_file" => format!("Write {}", text(&["path", "file_path"]).unwrap_or("file")),
-        "create_file" => format!("Create {}", text(&["path", "file_path"]).unwrap_or("file")),
+        "apply_patch" => "Apply patch".to_string(),
+        "view_image" => format!("View {}", text(&["path"]).unwrap_or("image")),
         "grep" | "code_search" | "search_text" => format!(
             "Search \"{}\"",
             text(&["query", "pattern", "symbol"]).unwrap_or("query")
@@ -620,7 +619,7 @@ pub(crate) fn tool_detail(tool: &ToolExecutionMessage) -> String {
                 .collect::<Vec<_>>()
                 .join(" · ")
         }
-        "edit_file" | "write_file" | "create_file" => {
+        "apply_patch" => {
             if value.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true) {
                 "dry run".to_string()
             } else {
@@ -693,9 +692,8 @@ pub(crate) fn tool_shows_success_tail(tool: &ToolExecutionMessage) -> bool {
     !matches!(
         tool.name.as_str(),
         "read_file"
-            | "edit_file"
-            | "write_file"
-            | "create_file"
+            | "apply_patch"
+            | "view_image"
             | "grep"
             | "glob"
             | "code_search"

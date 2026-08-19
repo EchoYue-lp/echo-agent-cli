@@ -15,7 +15,7 @@ triggers:
   - 电子表格
   - 公式
   - 数据表
-allowed-tools: [shell, read_file, read_artifact, write_file]
+allowed-tools: [shell, read_file, read_artifact, apply_patch]
 hooks:
   UserPromptSubmit:
     - matcher: "\\.xlsx"

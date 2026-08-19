@@ -609,16 +609,7 @@ impl ReplChatSink {
             }
             AgentEvent::ToolStream { .. } => true,
             AgentEvent::ToolResult { name, result, .. } => {
-                if matches!(
-                    name.as_str(),
-                    "write_file"
-                        | "edit_file"
-                        | "append_file"
-                        | "create_file"
-                        | "delete_file"
-                        | "update_file"
-                        | "move_file"
-                ) {
+                if name == "apply_patch" {
                     FILE_CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
                 }
                 state.first_chunk = true;

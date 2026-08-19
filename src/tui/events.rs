@@ -465,8 +465,11 @@ mod tool_execution_tests {
             "src/main.rs"
         );
         assert_eq!(
-            tool_command("edit_file", r#"{"path":"src/lib.rs"}"#),
-            "Edit src/lib.rs"
+            tool_command(
+                "apply_patch",
+                r#"{"patch":"*** Begin Patch\n*** Update File: src/lib.rs\n*** End Patch"}"#
+            ),
+            "Apply patch"
         );
     }
 
@@ -811,10 +814,7 @@ pub async fn run_event_loop(
                             ToolExecutionStatus::Failed
                         };
                         tool.finished_at = Some(Instant::now());
-                        if matches!(
-                            tool.name.as_str(),
-                            "edit_file" | "create_file" | "write_file"
-                        ) {
+                        if tool.name == "apply_patch" {
                             diff_tool_name = Some(tool.name.clone());
                         }
                         if success && tool.stdout.is_empty() {

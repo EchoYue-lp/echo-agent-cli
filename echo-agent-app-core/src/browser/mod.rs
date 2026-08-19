@@ -18,7 +18,7 @@ use echo_agent::prelude::{
     Tool, ToolFailure, ToolFailureCategory, ToolParameters, ToolResult, ToolRiskLevel,
     ToolSideEffect,
 };
-use echo_core::tools::{ToolContext, ToolResultKind};
+use echo_core::tools::{ToolContext, ToolResultContent, ToolResultKind};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
@@ -1626,6 +1626,10 @@ fn tool_result_with_frame(result: McpToolCallResult) -> (ToolResult, Option<Brow
             mime_type: frame.mime_type.clone(),
         };
         tool_result.mime_type = Some(frame.mime_type.clone());
+        tool_result = tool_result.with_model_content(ToolResultContent::ImageUrl {
+            url: frame.data_url.clone(),
+            detail: Some("high".to_string()),
+        });
     }
     if !result.extra.is_empty()
         && let Ok(extra) = serde_json::to_string_pretty(&result.extra)
@@ -1969,6 +1973,12 @@ mod tests {
                 mime_type: "image/png".to_string()
             }
         );
+        assert!(matches!(
+            result.model_content.first(),
+            Some(ToolResultContent::ImageUrl { url, detail })
+                if url == "data:image/png;base64,AQID"
+                    && detail.as_deref() == Some("high")
+        ));
     }
 
     #[test]

@@ -17,8 +17,7 @@ triggers:
 allowed-tools:
   - "read_file"
   - "read_artifact"
-  - "write_file"
-  - "edit_file"
+  - "apply_patch"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"

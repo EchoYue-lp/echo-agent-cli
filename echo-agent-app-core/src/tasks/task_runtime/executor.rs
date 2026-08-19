@@ -238,17 +238,11 @@ struct AgentDriveStreamResult {
 /// worktree is created only when the writer is dispatched, then integrated by
 /// the existing review/integration stage. Hiding these tools prevents a second
 /// run-level worktree mechanism from being required around the planning Agent.
-const UNATTENDED_DIRECT_MUTATION_TOOLS: [&str; 18] = [
+const UNATTENDED_DIRECT_MUTATION_TOOLS: [&str; 12] = [
     "agent_tool",
     "shell",
     "run_code",
-    "create_file",
-    "write_file",
-    "append_file",
-    "update_file",
-    "move_file",
-    "delete_file",
-    "edit_file",
+    "apply_patch",
     "git_branch",
     "git_commit",
     "enter_worktree",
@@ -4394,7 +4388,7 @@ mod tests {
         .unwrap_or_default();
 
         assert!(disabled.contains("shell"));
-        assert!(disabled.contains("write_file"));
+        assert!(disabled.contains("apply_patch"));
         assert!(disabled.contains("git_commit"));
         assert!(!disabled.contains("read_file"));
         assert!(!disabled.contains("task_create"));
@@ -4748,7 +4742,7 @@ Read the runtime path and found one missing branch.
     #[test]
     fn preflight_disabled_rejects_write_tools() {
         // B1: under Disabled, tools outside the readonly allowlist are rejected.
-        let task = preflight_task("t1", PlanTaskKind::Investigation, &["write_file"], &[]);
+        let task = preflight_task("t1", PlanTaskKind::Investigation, &["apply_patch"], &[]);
         let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
         assert!(
             result.is_err(),
@@ -4756,8 +4750,8 @@ Read the runtime path and found one missing branch.
         );
         let reason = result.unwrap_err().reason;
         assert!(
-            reason.contains("write_file"),
-            "reason should mention 'write_file', got {reason:?}"
+            reason.contains("apply_patch"),
+            "reason should mention 'apply_patch', got {reason:?}"
         );
     }
 
@@ -4800,7 +4794,7 @@ Read the runtime path and found one missing branch.
         let write_task = preflight_task(
             "w1",
             PlanTaskKind::Implementation,
-            &["write_file", "shell"],
+            &["apply_patch", "shell"],
             &["cargo check"],
         );
         let result = preflight_unattended_plan(&[write_task], UnattendedWriteMode::Worktree);
@@ -4817,7 +4811,7 @@ Read the runtime path and found one missing branch.
         let write_task = preflight_task(
             "w1",
             PlanTaskKind::Implementation,
-            &["write_file", "shell"],
+            &["apply_patch", "shell"],
             &["cargo check"],
         );
         let result = preflight_unattended_plan(&[write_task], UnattendedWriteMode::InPlace);

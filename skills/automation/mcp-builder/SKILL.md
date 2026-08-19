@@ -12,7 +12,7 @@ triggers:
   - mcp server
   - 模型上下文协议
   - 工具服务器
-allowed-tools: [shell, read_file, read_artifact, write_file]
+allowed-tools: [shell, read_file, read_artifact, apply_patch]
 ---
 # MCP Builder
 

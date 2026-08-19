@@ -21,8 +21,7 @@ triggers:
 allowed-tools:
   - "read_file"
   - "read_artifact"
-  - "write_file"
-  - "edit_file"
+  - "apply_patch"
   - "web_search"
   - "web_fetch"
   - "pubmed_search"

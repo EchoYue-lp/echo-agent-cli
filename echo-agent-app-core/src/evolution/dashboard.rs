@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn diagnostics_require_cross_run_repetition() {
         let repeated = ToolFailurePattern {
-            tool_name: "write_file".to_string(),
+            tool_name: "apply_patch".to_string(),
             error_class: ToolFailureClass::Permanent,
             pattern: "permission denied".to_string(),
             input_shape: "object{path:string}".to_string(),

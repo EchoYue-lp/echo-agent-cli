@@ -4,7 +4,7 @@ use crate::tasks::task_runtime::InteractionMode;
 
 pub(crate) const MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS: usize = 4_000;
 #[cfg(test)]
-const MAX_REGISTERED_BUILTIN_TOOLS: usize = 80;
+const MAX_REGISTERED_BUILTIN_TOOLS: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ToolOptimizationRollout {
@@ -57,14 +57,7 @@ pub(crate) fn record_mode_schema_budget(
 }
 
 const CONTROL_TOOLS: &[&str] = &["final_answer", "tool_search"];
-const FILE_TOOLS: &[&str] = &[
-    "read_file",
-    "read_artifact",
-    "write_file",
-    "edit_file",
-    "grep",
-    "glob",
-];
+const FILE_TOOLS: &[&str] = &["read_file", "read_artifact", "apply_patch", "grep", "glob"];
 const DIRECTORY_TOOLS: &[&str] = &["list_dir"];
 const EXECUTION_TOOLS: &[&str] = &["shell"];
 const CODE_EXECUTION_TOOLS: &[&str] = &["run_code"];
@@ -210,7 +203,7 @@ mod tests {
         assert_eq!(
             sorted_visible(InteractionMode::Chat),
             vec![
-                "edit_file",
+                "apply_patch",
                 "final_answer",
                 "glob",
                 "grep",
@@ -229,14 +222,13 @@ mod tests {
                 "wait",
                 "watch_cell",
                 "web_search",
-                "write_file",
             ]
         );
         assert_eq!(
             sorted_visible(InteractionMode::Task),
             vec![
+                "apply_patch",
                 "diff",
-                "edit_file",
                 "final_answer",
                 "glob",
                 "grep",
@@ -255,14 +247,13 @@ mod tests {
                 "wait",
                 "watch_cell",
                 "web_search",
-                "write_file",
             ]
         );
         assert_eq!(
             sorted_visible(InteractionMode::Auto),
             vec![
+                "apply_patch",
                 "diff",
-                "edit_file",
                 "final_answer",
                 "glob",
                 "grep",
@@ -283,7 +274,6 @@ mod tests {
                 "watch_cell",
                 "web_fetch",
                 "web_search",
-                "write_file",
             ]
         );
     }
@@ -324,6 +314,24 @@ mod tests {
             .read(|agent| (Agent::tool_definitions(agent), agent.tool_names()))
             .await;
         eprintln!("registered built-in tool catalog: {}", registered.len());
+
+        assert!(registered.contains(&"apply_patch".to_string()));
+        assert!(registered.contains(&"view_image".to_string()));
+        for superseded in [
+            "edit_file",
+            "write_file",
+            "append_file",
+            "create_file",
+            "delete_file",
+            "update_file",
+            "move_file",
+            "analyze_image",
+        ] {
+            assert!(
+                !registered.contains(&superseded.to_string()),
+                "superseded default tool remains registered: {superseded}"
+            );
+        }
         assert!(
             registered.len() <= MAX_REGISTERED_BUILTIN_TOOLS,
             "registered built-in catalog exceeded {MAX_REGISTERED_BUILTIN_TOOLS}: {}",
@@ -371,9 +379,9 @@ mod tests {
             let stats = ToolManager::schema_stats_for(&selected)?;
             eprintln!("{} tool schema baseline: {stats:?}", mode.as_str());
             let (minimum_tools, maximum_tools) = match mode {
-                InteractionMode::Chat => (12, 21),
-                InteractionMode::Task => (16, 25),
-                InteractionMode::Auto => (18, 28),
+                InteractionMode::Chat => (13, 20),
+                InteractionMode::Task => (14, 24),
+                InteractionMode::Auto => (16, 27),
             };
             assert!(
                 stats.tool_count >= minimum_tools && stats.tool_count <= maximum_tools,

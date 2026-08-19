@@ -342,7 +342,10 @@ mod tests {
     async fn cancelled_request_is_pruned_without_a_cleanup_task() -> Result<(), String> {
         let provider = Arc::new(TuiHumanLoopProvider::new());
         let request_provider = provider.clone();
-        let request = HumanLoopRequest::approval("write_file", serde_json::json!({"path": "a"}));
+        let request = HumanLoopRequest::approval(
+            "apply_patch",
+            serde_json::json!({"patch": "*** Begin Patch\n*** Add File: a\n+x\n*** End Patch"}),
+        );
         let task = tokio::spawn(async move { request_provider.request(request).await });
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {

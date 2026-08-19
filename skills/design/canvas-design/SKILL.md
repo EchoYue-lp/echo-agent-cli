@@ -14,7 +14,7 @@ triggers:
   - 信息图
   - poster
   - canvas
-allowed-tools: [shell, read_file, read_artifact, write_file]
+allowed-tools: [shell, read_file, read_artifact, apply_patch]
 ---
 # Canvas Design
 

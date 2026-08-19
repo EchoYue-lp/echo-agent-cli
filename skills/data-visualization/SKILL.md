@@ -20,8 +20,7 @@ allowed-tools:
   - "run_code"
   - "read_file"
   - "read_artifact"
-  - "write_file"
-  - "edit_file"
+  - "apply_patch"
   - "generate_chart"
 metadata:
   author: echo-agent-cli

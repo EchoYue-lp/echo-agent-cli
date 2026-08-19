@@ -13,7 +13,7 @@ triggers:
   - React
   - Tailwind
   - shadcn
-allowed-tools: [shell, read_file, read_artifact, write_file]
+allowed-tools: [shell, read_file, read_artifact, apply_patch]
 ---
 # Web Artifacts Builder
 

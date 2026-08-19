@@ -15,8 +15,7 @@ triggers:
 allowed-tools:
   - "read_file"
   - "read_artifact"
-  - "write_file"
-  - "edit_file"
+  - "apply_patch"
   - "web_fetch"
   - "pdf_fetch"
   - "extract_pdf"
