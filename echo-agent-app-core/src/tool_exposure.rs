@@ -419,4 +419,24 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn mcp_resource_tools_stay_in_the_progressive_catalog() {
+        let mut registered = policy_tool_names();
+        registered.extend(
+            echo_agent::mcp::MCP_RESOURCE_TOOL_NAMES
+                .into_iter()
+                .map(str::to_string),
+        );
+        for mode in [
+            InteractionMode::Chat,
+            InteractionMode::Task,
+            InteractionMode::Auto,
+        ] {
+            let visible = initial_visible_tools(mode, &registered);
+            for tool in echo_agent::mcp::MCP_RESOURCE_TOOL_NAMES {
+                assert!(!visible.contains(tool));
+            }
+        }
+    }
 }
