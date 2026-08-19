@@ -92,8 +92,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
     const loadedCharacters = chunks.reduce((total, chunk) => total + chunk.text.length, 0);
     if (
       !expanded ||
-      !tool ||
-      !tool.detail_ref ||
+      !tool?.detail_ref ||
       tool.status !== 'running' ||
       loadError ||
       loadedCharacters >= LIVE_DETAIL_AUTOLOAD_CHARS
@@ -125,12 +124,12 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
       <LoaderCircle size={12} className="animate-spin text-[var(--accent)]" />
     ) : tool.status === 'succeeded' ? (
       <Check size={12} className="text-[var(--color-success)]" />
-    ) : tool.status === 'failed' ? (
+    ) : tool.status === 'failed' || tool.status === 'timed_out' ? (
       <X size={12} className="text-[var(--color-error)]" />
     ) : (
       <CircleStop size={12} className="text-[var(--text-tertiary)]" />
     );
-  const argsText = manifest ? formatArgs(manifest.args_full) : '';
+  const argsText = manifest ? formatArgs(manifest.invocation.args) : '';
   const outputText = chunks.map((chunk) => `[${chunk.channel}]\n${chunk.text}`).join('\n');
   const summary = toolSummaryText(tool.name, tool.args_preview);
   const loadedCharacters = chunks.reduce((total, chunk) => total + chunk.text.length, 0);
@@ -143,7 +142,13 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
         ? 'success'
         : tool.status === 'failed'
           ? 'failed'
-          : 'cancelled';
+          : tool.status === 'cancelled'
+            ? 'cancelled'
+            : tool.status === 'timed_out'
+              ? 'timed out'
+              : tool.status === 'interrupted'
+                ? 'interrupted'
+                : 'unknown';
 
   const copyText = async (text: string, label: string) => {
     await navigator.clipboard.writeText(text);
@@ -203,7 +208,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
                 <div className="mb-1 flex items-center justify-between text-[9px] uppercase text-[var(--text-tertiary)]">
                   <span>
                     输出 · {formatBytes(manifest.output_bytes)}
-                    {manifest.truncated ? ' · Agent 上下文已截断' : ''}
+                    {manifest.result?.truncated ? ' · Agent 上下文已截断' : ''}
                   </span>
                   {outputText && (
                     <button type="button" onClick={() => copyText(outputText, 'output')}>
@@ -211,18 +216,18 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
                     </button>
                   )}
                 </div>
-                {manifest.failure && (
+                {manifest.result?.failure && (
                   <div className="mb-2 border-l-2 border-[var(--color-error)] pl-2 text-[10px] text-[var(--text-secondary)]">
-                    {manifest.failure.category} · {manifest.failure.recovery}
+                    {manifest.result.failure.category} · {manifest.result.failure.recovery}
                   </div>
                 )}
-                {Object.keys(manifest.metadata).length > 0 && (
+                {manifest.result && Object.keys(manifest.result.metadata).length > 0 && (
                   <details className="mb-2 text-[10px] text-[var(--text-secondary)]">
                     <summary className="cursor-pointer text-[var(--text-tertiary)]">
                       metadata
                     </summary>
                     <pre className="mt-1 overflow-auto whitespace-pre-wrap break-words bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
-                      {formatArgs(manifest.metadata)}
+                      {formatArgs(manifest.result.metadata)}
                     </pre>
                   </details>
                 )}

@@ -285,6 +285,8 @@ impl AgentRuntime {
             tracing::info!("ReviewIntegration created for session");
         }
         if let Some(review_integration) = &review_integration {
+            review_integration.bind_rule_projection_primary(agent_handle.clone());
+            review_integration.initialize_rule_promotions().await?;
             let evolution_observer = crate::evolution::evolution_hook_observer(&agent_handle).await;
             review_integration.set_evolution_observer(evolution_observer);
             let layer_manager =
@@ -340,75 +342,9 @@ impl AgentRuntime {
         // ── 12. Startup hook ──
         infra::fire_startup_hook(&agent_handle).await;
 
-        // ── 13. ChainedClassifier (Keyword → LLM) + IntentRouter ──
-        let mut keyword_classifier = KeywordClassifier::new();
-        let mut skill_descriptions = Vec::new();
-        {
-            let descriptors = agent_handle.read(|a| a.skill_descriptors()).await;
-            for desc in &descriptors {
-                let triggers: Vec<&str> = desc.triggers.iter().map(|s| s.as_str()).collect();
-                keyword_classifier.add_skill_keywords(&desc.name, &triggers);
-                // Build SkillDescription for LLM classifier
-                skill_descriptions.push(SkillDescription {
-                    name: desc.name.clone(),
-                    description: desc.description.clone(),
-                    example_triggers: desc.triggers.iter().take(3).cloned().collect(),
-                });
-            }
-            tracing::info!(
-                skill_count = descriptors.len(),
-                "KeywordClassifier populated from skill descriptors"
-            );
-        }
-        let available_skill_names = skill_descriptions
-            .iter()
-            .map(|skill| skill.name.clone())
-            .collect::<Vec<_>>();
-
-        // ── 12. TriggerSupervisor (Keyword + LLM + Hook fusion) + IntentRouter ──
-        // Build LLM classifier as fallback if LLM client is available,
-        // otherwise TriggerSupervisor operates keyword-only.
-        let hook_cache = agent_handle.read(|a| a.hook_activation_cache()).await;
-        let supervisor = {
-            let llm_classifier = agent_handle
-                .read(|a| a.llm_client().cloned())
-                .await
-                .map(|llm| LlmIntentClassifier::new(llm, skill_descriptions));
-            let has_llm = llm_classifier.is_some();
-            let sv = TriggerSupervisor::new(keyword_classifier.clone(), llm_classifier, hook_cache);
-            tracing::info!(
-                has_llm = has_llm,
-                "TriggerSupervisor: Keyword → {} → Hook slot (fusion)",
-                if has_llm {
-                    "LlmIntent"
-                } else {
-                    "Hook-only fallback"
-                }
-            );
-            sv
-        };
-
-        {
-            use echo_agent::intent::{IntentRouter, IntentRouterConfig};
-            let router = IntentRouter::new(
-                Box::new(supervisor),
-                IntentRouterConfig {
-                    confidence_threshold: 0.7,
-                    enable_direct_answer: true,
-                    enable_skill_routing: true,
-                    classification_timeout_ms: 5_000,
-                },
-            )
-            .with_available_skills(available_skill_names);
-            agent_handle
-                .write_async(|a| {
-                    Box::pin(async move {
-                        a.set_intent_router(router);
-                    })
-                })
-                .await;
-            tracing::info!("IntentRouter wired with TriggerSupervisor");
-        }
+        // Intent routing is a projection of the live skill catalog. Dynamic
+        // plugin publications reuse this exact builder for primary and pool.
+        let keyword_classifier = agent_handle.write(configure_intent_router).await;
 
         Ok(Self {
             agent_handle,
@@ -439,6 +375,7 @@ impl AgentRuntime {
             Some(self.model_consumers.clone()),
             self.hitl_dispatcher.clone(),
             conversation_store,
+            self.state_store.clone(),
             self.app_config.clone(),
             self.mcp_config_runtime.clone(),
         );
@@ -463,10 +400,8 @@ impl AgentRuntime {
         &self,
         config: crate::agent_pool::PoolConfig,
         task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
-    ) -> Arc<crate::agent_pool::AgentPool> {
-        let pool =
-            crate::agent_pool::AgentPool::from_runtime(self, config, task_runtime_store).await;
-        Arc::new(pool)
+    ) -> anyhow::Result<Arc<crate::agent_pool::AgentPool>> {
+        crate::agent_pool::AgentPool::from_runtime(self, config, task_runtime_store).await
     }
 
     /// Trigger reflection on a completed task or session.
@@ -569,6 +504,59 @@ impl AgentRuntime {
             }
         }
     }
+}
+
+/// Rebuild EKO intent routing from one agent's committed skill catalog.
+pub(crate) fn configure_intent_router(
+    agent: &mut echo_agent::agent::react::ReactAgent,
+) -> KeywordClassifier {
+    let descriptors = agent.skill_descriptors();
+    let mut keyword_classifier = KeywordClassifier::new();
+    let mut skill_descriptions = Vec::with_capacity(descriptors.len());
+    for descriptor in &descriptors {
+        let triggers = descriptor
+            .triggers
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keyword_classifier.add_skill_keywords(&descriptor.name, &triggers);
+        skill_descriptions.push(SkillDescription {
+            name: descriptor.name.clone(),
+            description: descriptor.description.clone(),
+            example_triggers: descriptor.triggers.iter().take(3).cloned().collect(),
+        });
+    }
+    let available_skill_names = skill_descriptions
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect::<Vec<_>>();
+    let llm_classifier = agent
+        .llm_client()
+        .cloned()
+        .map(|llm| LlmIntentClassifier::new(llm, skill_descriptions));
+    let has_llm = llm_classifier.is_some();
+    let supervisor = TriggerSupervisor::new(
+        keyword_classifier.clone(),
+        llm_classifier,
+        agent.hook_activation_cache(),
+    );
+    let router = echo_agent::intent::IntentRouter::new(
+        Box::new(supervisor),
+        echo_agent::intent::IntentRouterConfig {
+            confidence_threshold: 0.7,
+            enable_direct_answer: true,
+            enable_skill_routing: true,
+            classification_timeout_ms: 5_000,
+        },
+    )
+    .with_available_skills(available_skill_names);
+    agent.set_intent_router(router);
+    tracing::info!(
+        has_llm,
+        skill_count = descriptors.len(),
+        "IntentRouter replaced from committed skill catalog"
+    );
+    keyword_classifier
 }
 
 async fn register_lsp_tools(agent_handle: &AgentHandle) -> crate::plugin_runtime::PluginLspRuntime {

@@ -53,7 +53,6 @@ impl EnhancedCompleter {
                 "/system",
                 "/sys",
                 "/save",
-                "/load",
                 "/sessions",
                 "/ss",
                 "/theme",
@@ -211,6 +210,17 @@ mod tests {
         let completer = EnhancedCompleter::new();
         let candidates = completer.get_candidates("/hel");
         assert!(candidates.contains(&"/help".to_string()));
+    }
+
+    #[test]
+    fn completion_keeps_canonical_sessions_and_drops_legacy_load() {
+        let completer = EnhancedCompleter::new();
+
+        assert_eq!(
+            completer.get_candidates("/sess"),
+            vec!["/sessions".to_string()]
+        );
+        assert!(completer.get_candidates("/lo").is_empty());
     }
 
     #[test]

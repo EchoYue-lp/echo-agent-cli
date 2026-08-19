@@ -1,164 +1,7 @@
-//! Advanced slash commands — save, load, sessions, export, profiles, themes, diagnostics.
+//! Advanced slash commands — export, profiles, themes, and diagnostics.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
-
-// chrono is re-exported by the workspace
-use chrono;
-
-// ── SaveCommand ───────────────────────────────────────────────────────
-
-async fn cmd_save(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let name = args.first().copied().unwrap_or("session");
-    let sessions_dir = echo_agent::paths::user_data_path("sessions");
-    let _ = std::fs::create_dir_all(&sessions_dir);
-
-    let handle = ctx.agent.clone();
-    let name_owned = name.to_string();
-    let output = handle.read_async(move |a| {
-        let name = name_owned.clone();
-        Box::pin(async move {
-            let ctx = a.context().lock().await;
-            let messages: Vec<serde_json::Value> = ctx.messages().iter().map(|m| {
-                serde_json::json!({"role": m.role.as_str(), "content": m.content.as_text().unwrap_or_default()})
-            }).collect();
-            serde_json::json!({
-                "name": name,
-                "saved_at": echo_agent::utils::time::now_local().to_rfc3339(),
-                "messages": messages,
-                "plan_mode": a.is_plan_mode(),
-            })
-        })
-    }).await;
-
-    let path = sessions_dir.join(format!("{}.json", name));
-    match std::fs::write(
-        &path,
-        serde_json::to_string_pretty(&output).unwrap_or_default(),
-    ) {
-        Ok(_) => println!("Session '{}' saved to: {}", name, path.display()),
-        Err(e) => println!("Failed to save session: {e}"),
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    SaveCommand,
-    "save",
-    CommandCategory::Sessions,
-    "Save current session",
-    cmd_save
-);
-
-// ── LoadCommand ───────────────────────────────────────────────────────
-
-async fn cmd_load(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let name = args.first().copied().unwrap_or("session");
-    let sessions_dir = echo_agent::paths::user_data_path("sessions");
-    let path = sessions_dir.join(format!("{}.json", name));
-
-    if !path.exists() {
-        println!(
-            "Session '{}' not found. Use /sessions to list saved sessions.",
-            name
-        );
-        return CommandOutcome::Continue;
-    }
-
-    match std::fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(data) => {
-                let msg_count = data
-                    .get("messages")
-                    .and_then(|m| m.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let saved_at = data
-                    .get("saved_at")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                println!(
-                    "Session '{}' loaded ({} messages, saved: {})",
-                    name, msg_count, saved_at
-                );
-                println!("Note: session restoration requires agent restart for full effect.");
-            }
-            Err(e) => println!("Failed to parse session file: {e}"),
-        },
-        Err(e) => println!("Failed to read session: {e}"),
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    LoadCommand,
-    "load",
-    CommandCategory::Sessions,
-    "Load a saved session",
-    cmd_load
-);
-
-// ── SessionsCommand ───────────────────────────────────────────────────
-
-async fn cmd_sessions(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    let sessions_dir = echo_agent::paths::user_data_path("sessions");
-
-    println!("\n--- Saved Sessions ---");
-    if !sessions_dir.exists() {
-        println!("  No sessions saved yet.");
-        println!("  Use /save <name> to save, /load <name> to restore.");
-        return CommandOutcome::Continue;
-    }
-
-    match std::fs::read_dir(&sessions_dir) {
-        Ok(entries) => {
-            let mut sessions: Vec<(String, String)> = Vec::new();
-            for entry in entries.flatten() {
-                if entry
-                    .path()
-                    .extension()
-                    .map(|e| e == "json")
-                    .unwrap_or(false)
-                {
-                    let name = entry
-                        .path()
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("?")
-                        .to_string();
-                    let meta = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| {
-                            let dt: chrono::DateTime<chrono::Utc> = t.into();
-                            dt.format("%Y-%m-%d %H:%M").to_string()
-                        })
-                        .unwrap_or_default();
-                    sessions.push((name, meta));
-                }
-            }
-            if sessions.is_empty() {
-                println!("  No sessions saved yet.");
-            } else {
-                sessions.sort();
-                for (name, date) in &sessions {
-                    println!("  {name:<20} {date}");
-                }
-                println!("\n  {} session(s) saved.", sessions.len());
-            }
-        }
-        Err(e) => println!("  Error reading sessions: {e}"),
-    }
-    println!("  Use /save <name> to save, /load <name> to restore.");
-    CommandOutcome::Continue
-}
-cmd!(
-    SessionsCommand,
-    "sessions",
-    ["ss"],
-    CommandCategory::Sessions,
-    "List saved sessions",
-    cmd_sessions
-);
 
 // ── ExportCommand ─────────────────────────────────────────────────────
 
@@ -342,17 +185,23 @@ async fn cmd_doctor(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
         })
         .await;
 
-    // Check sessions dir
-    {
-        let d = echo_agent::paths::user_data_path("sessions");
-        if d.exists() {
-            let count = std::fs::read_dir(&d)
-                .map(|r| r.flatten().count())
-                .unwrap_or(0);
-            println!("  [OK] Sessions: {count} saved");
-        } else {
-            println!("  [--] Sessions: directory not created yet");
-        }
+    // Check the same canonical conversation authority used by every surface.
+    let conversation_store = match ctx.app_state.as_ref() {
+        Some(app_state) => app_state.conversation_store().await,
+        None => None,
+    };
+    match conversation_store {
+        Some(store) => match store
+            .list_conversations(echo_agent::memory::ConversationFilter {
+                limit: Some(1),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => println!("  [OK] ConversationStore: accessible"),
+            Err(error) => println!("  [!!] ConversationStore: {error}"),
+        },
+        None => println!("  [--] ConversationStore: unavailable"),
     }
 
     println!("\nDiagnostics complete.");
@@ -467,9 +316,6 @@ cmd!(
 // ── Register ─────────────────────────────────────────────────────────
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
-    registry.register(Arc::new(SaveCommand));
-    registry.register(Arc::new(LoadCommand));
-    registry.register(Arc::new(SessionsCommand));
     registry.register(Arc::new(ExportCommand));
     registry.register(Arc::new(ProfileCommand));
     registry.register(Arc::new(ThemeCommand));
@@ -480,4 +326,27 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(DelegateCommand));
     registry.register(Arc::new(SearchCommand));
     registry.register(Arc::new(InspectCommand));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_json_session_commands_are_not_registered() {
+        let mut registry = crate::cli::command::CommandRegistry::new();
+        crate::cli::cmd_impls::session::register_all(&mut registry);
+        crate::cli::cmd_impls::context::register_all(&mut registry);
+        register_all(&mut registry);
+
+        assert_eq!(
+            registry.get("save").map(|command| command.name()),
+            Some("checkpoint")
+        );
+        assert!(registry.get("load").is_none());
+        assert_eq!(
+            registry.get("sessions").map(|command| command.name()),
+            Some("sessions")
+        );
+    }
 }

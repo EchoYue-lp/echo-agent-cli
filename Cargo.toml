@@ -24,15 +24,15 @@ tui = [
     "dep:ratatui", "dep:crossterm", "dep:arboard",
     "dep:unicode-width", "dep:textwrap", "dep:strum",
     "dep:strum_macros", "dep:pulldown-cmark", "dep:syntect",
-    "dep:image",
+    "dep:image", "dep:strip-ansi-escapes",
 ]
 gui = [
     "dep:tauri", "dep:tauri-plugin-shell", "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-notification", "dep:tauri-plugin-fs",
-    "dep:tauri-plugin-global-shortcut", "dep:portable-pty",
+    "dep:tauri-plugin-global-shortcut",
     "dep:dashmap", "dep:similar", "channels",
 ]
-channels = ["echo-agent/channels"]
+channels = ["echo-agent/channels", "dep:strip-ansi-escapes"]
 telemetry = ["echo-agent/telemetry"]
 devtools = ["tauri?/devtools"]
 
@@ -95,11 +95,11 @@ unicode-width = { version = "0.2", optional = true }
 textwrap = { version = "0.16", optional = true }
 strum = { version = "0.26", optional = true }
 strum_macros = { version = "0.26", optional = true }
-portable-pty = { version = "0.8", optional = true }
 dashmap = { version = "6", optional = true }
 base64 = "0.22"
 arboard = { version = "3", optional = true }
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
+strip-ansi-escapes = { version = "0.2", optional = true }
 
 [dev-dependencies]
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", default-features = false, features = ["testing"] }

@@ -1,23 +1,26 @@
 //! Application-owned durable tool-execution projection.
 //!
-//! Conversation messages and GUI stores keep only compact summaries. Complete
-//! arguments and output stay in local files and are read lazily by `detail_ref`.
+//! Each execution has one atomic manifest containing the canonical framework
+//! invocation and terminal result. Non-terminal stdout/stderr/progress is kept
+//! in a separate append-only trace so the GUI can follow a running tool without
+//! treating streamed chunks as a second terminal result. Large terminal output
+//! is still read only through the framework's verified artifact reader.
 
-use echo_agent::tools::ToolFailure;
+use echo_agent::agent::ToolInvocation;
+use echo_agent::tools::{ToolFailureCategory, ToolResult};
 use echo_agent::utils::time::now_millis;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard};
 use thiserror::Error;
 
 pub const TOOL_ARGS_PREVIEW_CHARS: usize = 160;
 pub const DEFAULT_DETAIL_PAGE_BYTES: usize = 64 * 1024;
-// JSON escaping can expand control characters up to 6x. Keeping raw chunks at
-// 8 KiB guarantees one encoded JSONL record remains below the 64 KiB page cap.
-const STORED_OUTPUT_CHUNK_BYTES: usize = 8 * 1024;
+const STREAM_SCAN_BYTES: usize = 8 * 1024;
+const STREAM_CURSOR_PREFIX: &str = "stream-v1";
 
 #[derive(Debug, Error)]
 pub enum ToolExecutionError {
@@ -25,8 +28,16 @@ pub enum ToolExecutionError {
     NotFound(String),
     #[error("invalid detail cursor: {0}")]
     InvalidCursor(String),
-    #[error("invalid UTF-8 in tool artifact: {0}")]
-    InvalidUtf8(String),
+    #[error("tool projection conflicts with the persisted execution: {0}")]
+    ProjectionConflict(String),
+    #[error("invalid orphan tool terminal status: {0:?}")]
+    InvalidTerminalStatus(ToolExecutionStatus),
+    #[error("tool artifact root is not registered: {0}")]
+    ArtifactRootUnavailable(String),
+    #[error("conversation still has active tool executions: {0}")]
+    ActiveConversation(String),
+    #[error(transparent)]
+    ArtifactRead(#[from] echo_agent::tools::files::artifact::ArtifactReadError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -36,7 +47,7 @@ pub enum ToolExecutionError {
 pub type ToolExecutionResult<T> = Result<T, ToolExecutionError>;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ToolExecutionOwner {
     Chat { message_id: String },
     Subagent { subagent_run_id: String },
@@ -58,9 +69,43 @@ pub enum ToolExecutionStatus {
     Succeeded,
     Failed,
     Cancelled,
+    TimedOut,
+    Interrupted,
+    Unknown,
+}
+
+impl ToolExecutionStatus {
+    fn from_result(result: &ToolResult) -> Self {
+        result.failure.as_ref().map_or_else(
+            || {
+                if result.success {
+                    Self::Succeeded
+                } else {
+                    Self::Failed
+                }
+            },
+            |failure| match failure.category {
+                ToolFailureCategory::Timeout => Self::TimedOut,
+                ToolFailureCategory::Cancelled => Self::Cancelled,
+                ToolFailureCategory::InvalidArguments
+                | ToolFailureCategory::Unavailable
+                | ToolFailureCategory::Transient
+                | ToolFailureCategory::Permanent
+                | ToolFailureCategory::PartialSideEffect => Self::Failed,
+            },
+        )
+    }
+
+    fn is_orphan_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled | Self::TimedOut | Self::Interrupted | Self::Unknown
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ToolExecutionSummary {
     pub id: String,
     pub call_id: String,
@@ -77,13 +122,12 @@ pub struct ToolExecutionSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolExecutionDetailManifest {
     pub id: String,
-    pub args_full: serde_json::Value,
+    pub invocation: ToolInvocation,
     pub status: ToolExecutionStatus,
-    pub failure: Option<ToolFailure>,
-    pub metadata: HashMap<String, String>,
-    pub truncated: bool,
+    pub result: Option<ToolResult>,
     pub output_bytes: u64,
 }
 
@@ -109,32 +153,29 @@ pub struct ToolExecutionDetailPage {
     pub complete: bool,
 }
 
+/// Result of applying one canonical event to the durable projection.
+///
+/// Replayed events return the existing summary with `changed = false`. This
+/// lets every surface share the same projector without emitting duplicate UI
+/// updates when two canonical event buses observe the same execution.
+#[derive(Debug, Clone)]
+pub struct ToolExecutionMutation {
+    pub summary: ToolExecutionSummary,
+    pub changed: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredManifest {
     summary: ToolExecutionSummary,
-    args_full: serde_json::Value,
-    failure: Option<ToolFailure>,
-    metadata: HashMap<String, String>,
-    truncated: bool,
+    invocation: ToolInvocation,
+    result: Option<ToolResult>,
     output_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct JournalRecord {
-    event: JournalEventKind,
-    summary: ToolExecutionSummary,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum JournalEventKind {
-    Started,
-    Finished,
-    Cancelled,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct StoredOutputChunk {
+#[serde(deny_unknown_fields)]
+struct StoredStreamChunk {
     channel: ToolExecutionDetailChannel,
     text: String,
 }
@@ -142,20 +183,11 @@ struct StoredOutputChunk {
 #[derive(Debug, Clone)]
 struct DetailLocation {
     manifest: PathBuf,
-    output: PathBuf,
-    journal: PathBuf,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveExecution {
-    manifest: StoredManifest,
-    location: DetailLocation,
-    has_output: bool,
+    stream: PathBuf,
 }
 
 #[derive(Default)]
 struct RepositoryState {
-    active: HashMap<String, Arc<Mutex<ActiveExecution>>>,
     details: HashMap<String, DetailLocation>,
     summaries: HashMap<String, ToolExecutionSummary>,
 }
@@ -163,15 +195,20 @@ struct RepositoryState {
 pub struct ToolExecutionRepository {
     root: PathBuf,
     state: Mutex<RepositoryState>,
+    projection_lock: Mutex<()>,
+    artifact_configs: Mutex<Vec<echo_agent::tools::artifact::ToolOutputArtifactConfig>>,
 }
 
 impl ToolExecutionRepository {
     pub fn open(root: impl Into<PathBuf>) -> ToolExecutionResult<Self> {
         let root = root.into();
+        reject_symlink(&root)?;
         fs::create_dir_all(&root)?;
         let repository = Self {
             root,
             state: Mutex::new(RepositoryState::default()),
+            projection_lock: Mutex::new(()),
+            artifact_configs: Mutex::new(Vec::new()),
         };
         repository.rebuild_index_and_recover()?;
         Ok(repository)
@@ -181,6 +218,8 @@ impl ToolExecutionRepository {
         Self {
             root: root.into(),
             state: Mutex::new(RepositoryState::default()),
+            projection_lock: Mutex::new(()),
+            artifact_configs: Mutex::new(Vec::new()),
         }
     }
 
@@ -188,23 +227,69 @@ impl ToolExecutionRepository {
         echo_agent::paths::user_data_path("tool-executions")
     }
 
-    pub fn start(
+    pub fn register_artifact_config(
+        &self,
+        config: echo_agent::tools::artifact::ToolOutputArtifactConfig,
+    ) {
+        let mut configs = lock_recover(&self.artifact_configs, "tool artifact roots");
+        if configs
+            .iter()
+            .all(|existing| existing.root_dir != config.root_dir)
+        {
+            configs.push(config);
+        }
+    }
+
+    pub fn project_start(
         &self,
         owner: ToolExecutionOwner,
         conversation_id: Option<&str>,
         run_id: Option<&str>,
         call_id: &str,
-        name: &str,
-        args: &serde_json::Value,
+        invocation: &ToolInvocation,
+    ) -> ToolExecutionResult<ToolExecutionMutation> {
+        let _projection = lock_recover(&self.projection_lock, "tool execution projection");
+        if let Some(existing) = self.summary_for(&owner, call_id) {
+            let manifest = self.read_manifest(&existing.detail_ref)?;
+            let identity_matches = manifest.invocation == *invocation
+                && existing.owner == owner
+                && existing.conversation_id.as_deref() == conversation_id
+                && existing.run_id.as_deref() == run_id;
+            if identity_matches {
+                return Ok(ToolExecutionMutation {
+                    summary: existing,
+                    changed: false,
+                });
+            }
+            return Err(ToolExecutionError::ProjectionConflict(format!(
+                "{}:{}",
+                owner.key(),
+                call_id
+            )));
+        }
+        self.start_new(owner, conversation_id, run_id, call_id, invocation)
+            .map(|summary| ToolExecutionMutation {
+                summary,
+                changed: true,
+            })
+    }
+
+    fn start_new(
+        &self,
+        owner: ToolExecutionOwner,
+        conversation_id: Option<&str>,
+        run_id: Option<&str>,
+        call_id: &str,
+        invocation: &ToolInvocation,
     ) -> ToolExecutionResult<ToolExecutionSummary> {
         let detail_ref = uuid::Uuid::new_v4().to_string();
-        let scope = self.scope_dir(conversation_id, run_id.or(Some(owner.key())));
-        let detail_dir = scope.join("details");
+        let detail_dir = self
+            .scope_dir(conversation_id, run_id.or(Some(owner.key())))
+            .join("details");
         fs::create_dir_all(&detail_dir)?;
         let location = DetailLocation {
             manifest: detail_dir.join(format!("{detail_ref}.json")),
-            output: detail_dir.join(format!("{detail_ref}.jsonl")),
-            journal: scope.join("events.jsonl"),
+            stream: detail_dir.join(format!("{detail_ref}.stream.jsonl")),
         };
         let now = now_millis();
         let summary = ToolExecutionSummary {
@@ -213,8 +298,8 @@ impl ToolExecutionRepository {
             owner,
             conversation_id: conversation_id.map(str::to_string),
             run_id: run_id.map(str::to_string),
-            name: name.to_string(),
-            args_preview: preview_args(args),
+            name: invocation.name.clone(),
+            args_preview: preview_args(&invocation.args),
             status: ToolExecutionStatus::Running,
             started_at: now,
             finished_at: None,
@@ -223,172 +308,135 @@ impl ToolExecutionRepository {
         };
         let manifest = StoredManifest {
             summary: summary.clone(),
-            args_full: args.clone(),
-            failure: None,
-            metadata: HashMap::new(),
-            truncated: false,
+            invocation: invocation.clone(),
+            result: None,
             output_bytes: 0,
         };
-        write_json_atomic(&location.manifest, &manifest)?;
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&location.output)?;
-        append_json_line(
-            &location.journal,
-            &JournalRecord {
-                event: JournalEventKind::Started,
-                summary: summary.clone(),
-            },
-        )?;
+        write_manifest(&location.manifest, &manifest)?;
 
         let key = execution_key(&summary.owner, call_id);
         let mut state = self.lock_state();
-        state.details.insert(detail_ref, location.clone());
-        state.summaries.insert(key.clone(), summary.clone());
-        state.active.insert(
-            key,
-            Arc::new(Mutex::new(ActiveExecution {
-                manifest,
-                location,
-                has_output: false,
-            })),
-        );
+        state.details.insert(detail_ref, location);
+        state.summaries.insert(key, summary.clone());
         Ok(summary)
     }
 
-    pub fn append_output(
+    /// Append non-terminal tool output without changing the canonical result.
+    pub fn project_stream(
         &self,
         owner: &ToolExecutionOwner,
         call_id: &str,
         channel: ToolExecutionDetailChannel,
         text: &str,
     ) -> ToolExecutionResult<()> {
-        let key = execution_key(owner, call_id);
-        let active = self
-            .lock_state()
-            .active
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
-        let mut execution = lock_recover(&active, "active tool execution");
-        for chunk in split_utf8_chunks(text, STORED_OUTPUT_CHUNK_BYTES) {
-            append_json_line(
-                &execution.location.output,
-                &StoredOutputChunk {
-                    channel: channel.clone(),
-                    text: chunk,
-                },
-            )?;
+        if text.is_empty() {
+            return Ok(());
         }
-        execution.manifest.output_bytes = execution
-            .manifest
-            .output_bytes
-            .saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
-        execution.has_output |= !text.is_empty();
-        Ok(())
+        let _projection = lock_recover(&self.projection_lock, "tool execution projection");
+        let summary = self
+            .summary_for(owner, call_id)
+            .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
+        if summary.status != ToolExecutionStatus::Running {
+            return Err(ToolExecutionError::ProjectionConflict(format!(
+                "{}:{} stream after terminal {:?}",
+                owner.key(),
+                call_id,
+                summary.status
+            )));
+        }
+        let location = self.detail_location(&summary.detail_ref)?;
+        append_stream_chunk(
+            &location.stream,
+            &StoredStreamChunk {
+                channel,
+                text: text.to_string(),
+            },
+        )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn finish(
+    pub fn project_finish(
         &self,
         owner: &ToolExecutionOwner,
         call_id: &str,
-        success: bool,
-        result: &str,
-        failure: Option<ToolFailure>,
-        metadata: HashMap<String, String>,
-        truncated: bool,
-    ) -> ToolExecutionResult<ToolExecutionSummary> {
-        let key = execution_key(owner, call_id);
-        let active = self
-            .lock_state()
-            .active
-            .get(&key)
-            .cloned()
+        result: &ToolResult,
+    ) -> ToolExecutionResult<ToolExecutionMutation> {
+        let _projection = lock_recover(&self.projection_lock, "tool execution projection");
+        let existing = self
+            .summary_for(owner, call_id)
             .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
-        let mut execution = lock_recover(&active, "active tool execution");
-
-        let artifact_available = metadata
-            .get("artifact_path")
-            .map(Path::new)
-            .is_some_and(Path::is_file);
-        if !execution.has_output && !artifact_available && !result.is_empty() {
-            for chunk in split_utf8_chunks(result, STORED_OUTPUT_CHUNK_BYTES) {
-                append_json_line(
-                    &execution.location.output,
-                    &StoredOutputChunk {
-                        channel: ToolExecutionDetailChannel::Result,
-                        text: chunk,
-                    },
-                )?;
+        let location = self.detail_location(&existing.detail_ref)?;
+        let mut manifest = read_manifest_path(&location.manifest)?;
+        if let Some(persisted) = manifest.result.as_ref() {
+            if canonical_json(persisted)? == canonical_json(result)? {
+                return Ok(ToolExecutionMutation {
+                    summary: existing,
+                    changed: false,
+                });
             }
-            execution.manifest.output_bytes = execution
-                .manifest
-                .output_bytes
-                .saturating_add(u64::try_from(result.len()).unwrap_or(u64::MAX));
+            return Err(ToolExecutionError::ProjectionConflict(format!(
+                "{}:{} terminal result",
+                owner.key(),
+                call_id
+            )));
         }
 
         let finished_at = now_millis();
-        execution.manifest.summary.status = if success {
-            ToolExecutionStatus::Succeeded
-        } else {
-            ToolExecutionStatus::Failed
-        };
-        execution.manifest.summary.finished_at = Some(finished_at);
-        execution.manifest.summary.duration_ms =
-            Some(finished_at.saturating_sub(execution.manifest.summary.started_at));
-        execution.manifest.failure = failure;
-        execution.manifest.metadata = metadata;
-        execution.manifest.truncated = truncated;
-        write_json_atomic(&execution.location.manifest, &execution.manifest)?;
-        append_json_line(
-            &execution.location.journal,
-            &JournalRecord {
-                event: JournalEventKind::Finished,
-                summary: execution.manifest.summary.clone(),
-            },
-        )?;
-        let summary = execution.manifest.summary.clone();
-        drop(execution);
-        let mut state = self.lock_state();
-        state.active.remove(&key);
-        state.summaries.insert(key, summary.clone());
-        Ok(summary)
+        manifest.summary.status = ToolExecutionStatus::from_result(result);
+        manifest.summary.finished_at = Some(finished_at);
+        manifest.summary.duration_ms =
+            Some(finished_at.saturating_sub(manifest.summary.started_at));
+        manifest.output_bytes =
+            stream_output_bytes(&location.stream)?.unwrap_or_else(|| result_output_bytes(result));
+        manifest.result = Some(result.clone());
+        write_manifest(&location.manifest, &manifest)?;
+
+        let summary = manifest.summary;
+        self.lock_state()
+            .summaries
+            .insert(execution_key(owner, call_id), summary.clone());
+        Ok(ToolExecutionMutation {
+            summary,
+            changed: true,
+        })
     }
 
-    pub fn cancel(
+    pub fn terminate_orphan(
         &self,
         owner: &ToolExecutionOwner,
         call_id: &str,
-    ) -> ToolExecutionResult<ToolExecutionSummary> {
-        let key = execution_key(owner, call_id);
-        let active = self
-            .lock_state()
-            .active
-            .get(&key)
-            .cloned()
+        status: ToolExecutionStatus,
+    ) -> ToolExecutionResult<ToolExecutionMutation> {
+        let _projection = lock_recover(&self.projection_lock, "tool execution projection");
+        if !status.is_orphan_terminal() {
+            return Err(ToolExecutionError::InvalidTerminalStatus(status));
+        }
+        let existing = self
+            .summary_for(owner, call_id)
             .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
-        let mut execution = lock_recover(&active, "active tool execution");
+        if existing.status != ToolExecutionStatus::Running {
+            return Ok(ToolExecutionMutation {
+                summary: existing,
+                changed: false,
+            });
+        }
+        let location = self.detail_location(&existing.detail_ref)?;
+        let mut manifest = read_manifest_path(&location.manifest)?;
         let finished_at = now_millis();
-        execution.manifest.summary.status = ToolExecutionStatus::Cancelled;
-        execution.manifest.summary.finished_at = Some(finished_at);
-        execution.manifest.summary.duration_ms =
-            Some(finished_at.saturating_sub(execution.manifest.summary.started_at));
-        write_json_atomic(&execution.location.manifest, &execution.manifest)?;
-        append_json_line(
-            &execution.location.journal,
-            &JournalRecord {
-                event: JournalEventKind::Cancelled,
-                summary: execution.manifest.summary.clone(),
-            },
-        )?;
-        let summary = execution.manifest.summary.clone();
-        drop(execution);
-        let mut state = self.lock_state();
-        state.active.remove(&key);
-        state.summaries.insert(key, summary.clone());
-        Ok(summary)
+        manifest.summary.status = status;
+        manifest.summary.finished_at = Some(finished_at);
+        manifest.summary.duration_ms =
+            Some(finished_at.saturating_sub(manifest.summary.started_at));
+        manifest.output_bytes = stream_output_bytes(&location.stream)?.unwrap_or(0);
+        write_manifest(&location.manifest, &manifest)?;
+
+        let summary = manifest.summary;
+        self.lock_state()
+            .summaries
+            .insert(execution_key(owner, call_id), summary.clone());
+        Ok(ToolExecutionMutation {
+            summary,
+            changed: true,
+        })
     }
 
     pub fn detail_manifest(
@@ -396,17 +444,13 @@ impl ToolExecutionRepository {
         detail_ref: &str,
     ) -> ToolExecutionResult<ToolExecutionDetailManifest> {
         let location = self.detail_location(detail_ref)?;
-        let manifest: StoredManifest = read_json(&location.manifest)?;
-        let mut metadata = manifest.metadata;
-        metadata.remove("artifact_path");
+        let manifest = read_manifest_path(&location.manifest)?;
         Ok(ToolExecutionDetailManifest {
             id: manifest.summary.id,
-            args_full: manifest.args_full,
+            invocation: manifest.invocation,
             status: manifest.summary.status,
-            failure: manifest.failure,
-            metadata,
-            truncated: manifest.truncated,
-            output_bytes: manifest.output_bytes,
+            result: manifest.result,
+            output_bytes: stream_output_bytes(&location.stream)?.unwrap_or(manifest.output_bytes),
         })
     }
 
@@ -417,35 +461,66 @@ impl ToolExecutionRepository {
         limit: usize,
     ) -> ToolExecutionResult<ToolExecutionDetailPage> {
         let location = self.detail_location(detail_ref)?;
-        let manifest: StoredManifest = read_json(&location.manifest)?;
-        let page_bytes = limit.clamp(4, DEFAULT_DETAIL_PAGE_BYTES);
-        if fs::metadata(&location.output)
-            .map(|value| value.len())
-            .unwrap_or(0)
-            > 0
-        {
-            return read_jsonl_output_page(
-                &location.output,
+        let manifest = read_manifest_path(&location.manifest)?;
+        if stream_has_output(&location.stream)? {
+            return read_stream_output_page(
+                detail_ref,
+                &location.stream,
                 cursor,
-                page_bytes,
+                limit.clamp(4, DEFAULT_DETAIL_PAGE_BYTES),
                 manifest.summary.status != ToolExecutionStatus::Running,
             );
         }
-        if let Some(path) = manifest.metadata.get("artifact_path") {
-            let artifact = Path::new(path);
-            if artifact.is_file() {
-                return read_artifact_page(
-                    artifact,
-                    cursor,
-                    page_bytes,
-                    manifest.summary.status != ToolExecutionStatus::Running,
-                );
+        let Some(result) = manifest.result.as_ref() else {
+            if let Some(cursor) = cursor {
+                return Err(ToolExecutionError::InvalidCursor(cursor.to_string()));
             }
+            return Ok(ToolExecutionDetailPage {
+                chunks: Vec::new(),
+                next_cursor: None,
+                complete: false,
+            });
+        };
+        if let Some(artifact) =
+            echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata)
+        {
+            let config = self.artifact_config_for(&artifact.path).ok_or_else(|| {
+                ToolExecutionError::ArtifactRootUnavailable(artifact.path.display().to_string())
+            })?;
+            let page = echo_agent::tools::files::artifact::read_artifact_page(
+                &config,
+                &artifact,
+                cursor,
+                echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(
+                    limit.clamp(4, DEFAULT_DETAIL_PAGE_BYTES),
+                ),
+            )?;
+            return Ok(ToolExecutionDetailPage {
+                chunks: (!page.content.is_empty())
+                    .then_some(ToolExecutionDetailChunk {
+                        channel: ToolExecutionDetailChannel::Log,
+                        text: page.content,
+                    })
+                    .into_iter()
+                    .collect(),
+                next_cursor: page.next_cursor,
+                complete: page.complete,
+            });
         }
+        if let Some(cursor) = cursor {
+            return Err(ToolExecutionError::InvalidCursor(cursor.to_string()));
+        }
+        let text = result_text(result);
         Ok(ToolExecutionDetailPage {
-            chunks: Vec::new(),
-            next_cursor: cursor.map(str::to_string),
-            complete: manifest.summary.status != ToolExecutionStatus::Running,
+            chunks: (!text.is_empty())
+                .then_some(ToolExecutionDetailChunk {
+                    channel: ToolExecutionDetailChannel::Result,
+                    text: text.to_string(),
+                })
+                .into_iter()
+                .collect(),
+            next_cursor: None,
+            complete: true,
         })
     }
 
@@ -461,94 +536,144 @@ impl ToolExecutionRepository {
         summaries
     }
 
+    pub fn summary_for(
+        &self,
+        owner: &ToolExecutionOwner,
+        call_id: &str,
+    ) -> Option<ToolExecutionSummary> {
+        self.lock_state()
+            .summaries
+            .get(&execution_key(owner, call_id))
+            .cloned()
+    }
+
+    pub fn terminate_running_for_owner(
+        &self,
+        owner: &ToolExecutionOwner,
+        status: ToolExecutionStatus,
+    ) -> ToolExecutionResult<Vec<ToolExecutionSummary>> {
+        if !status.is_orphan_terminal() {
+            return Err(ToolExecutionError::InvalidTerminalStatus(status));
+        }
+        let call_ids = {
+            let state = self.lock_state();
+            state
+                .summaries
+                .values()
+                .filter(|summary| summary.owner == *owner)
+                .filter(|summary| summary.status == ToolExecutionStatus::Running)
+                .map(|summary| summary.call_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut summaries = Vec::with_capacity(call_ids.len());
+        for call_id in call_ids {
+            let mutation = self.terminate_orphan(owner, &call_id, status)?;
+            if mutation.changed {
+                summaries.push(mutation.summary);
+            }
+        }
+        Ok(summaries)
+    }
+
     pub fn remove_conversation(&self, conversation_id: &str) -> ToolExecutionResult<()> {
         let scope = self
             .root
             .join(echo_agent::tools::artifact::artifact_scope_component(
                 conversation_id,
             ));
-        if !scope.exists() {
-            return Ok(());
+        {
+            let state = self.lock_state();
+            if state.summaries.values().any(|summary| {
+                summary.conversation_id.as_deref() == Some(conversation_id)
+                    && summary.status == ToolExecutionStatus::Running
+            }) {
+                return Err(ToolExecutionError::ActiveConversation(
+                    conversation_id.to_string(),
+                ));
+            }
         }
-        let trash_root = self.root.join(".trash");
-        fs::create_dir_all(&trash_root)?;
-        let tombstone = trash_root.join(format!(
-            "{}-{}",
-            echo_agent::tools::artifact::artifact_scope_component(conversation_id),
-            uuid::Uuid::new_v4()
-        ));
-        fs::rename(&scope, &tombstone)?;
+        let tombstone = if scope.exists() {
+            let trash_root = self.root.join(".trash");
+            fs::create_dir_all(&trash_root)?;
+            let tombstone = trash_root.join(format!(
+                "{}-{}",
+                echo_agent::tools::artifact::artifact_scope_component(conversation_id),
+                uuid::Uuid::new_v4()
+            ));
+            fs::rename(&scope, &tombstone)?;
+            Some(tombstone)
+        } else {
+            None
+        };
         {
             let mut state = self.lock_state();
+            let removed_details = state
+                .summaries
+                .values()
+                .filter(|summary| summary.conversation_id.as_deref() == Some(conversation_id))
+                .map(|summary| summary.detail_ref.clone())
+                .collect::<Vec<_>>();
             state
                 .summaries
                 .retain(|_, summary| summary.conversation_id.as_deref() != Some(conversation_id));
-            state.details.retain(|_, location| {
-                !location.manifest.starts_with(&scope)
-                    && !location.output.starts_with(&scope)
-                    && !location.journal.starts_with(&scope)
-            });
-            state.active.retain(|_, execution| {
-                lock_recover(execution, "active tool execution")
-                    .manifest
-                    .summary
-                    .conversation_id
-                    .as_deref()
-                    != Some(conversation_id)
+            for detail_ref in removed_details {
+                state.details.remove(&detail_ref);
+            }
+        }
+        if let Some(tombstone) = tombstone {
+            std::thread::spawn(move || {
+                if let Err(error) = fs::remove_dir_all(&tombstone) {
+                    tracing::warn!(path = %tombstone.display(), %error, "tool execution tombstone cleanup failed");
+                }
             });
         }
-        std::thread::spawn(move || {
-            if let Err(error) = fs::remove_dir_all(&tombstone) {
-                tracing::warn!(path = %tombstone.display(), %error, "tool execution tombstone cleanup failed");
-            }
-        });
         Ok(())
     }
 
     fn rebuild_index_and_recover(&self) -> ToolExecutionResult<()> {
-        let journals = find_named_files(&self.root, "events.jsonl")?;
-        for journal in journals {
-            let records = read_journal_repairing_last_line(&journal)?;
-            let mut latest = HashMap::<String, ToolExecutionSummary>::new();
-            for record in records {
-                let key = execution_key(&record.summary.owner, &record.summary.call_id);
-                latest.insert(key, record.summary);
+        for path in find_manifest_files(&self.root)? {
+            let location = DetailLocation {
+                stream: stream_path_for_manifest(&path),
+                manifest: path,
+            };
+            repair_torn_stream_tail(&location.stream)?;
+            let mut manifest = read_manifest_path(&location.manifest)?;
+            if manifest.summary.status == ToolExecutionStatus::Running {
+                let finished_at = now_millis();
+                manifest.summary.status = ToolExecutionStatus::Interrupted;
+                manifest.summary.finished_at = Some(finished_at);
+                manifest.summary.duration_ms =
+                    Some(finished_at.saturating_sub(manifest.summary.started_at));
+                manifest.output_bytes = stream_output_bytes(&location.stream)?.unwrap_or(0);
+                write_manifest(&location.manifest, &manifest)?;
             }
-            for (key, mut summary) in latest {
-                let detail_dir = journal
-                    .parent()
-                    .map(|parent| parent.join("details"))
-                    .unwrap_or_else(|| self.root.join("details"));
-                let location = DetailLocation {
-                    manifest: detail_dir.join(format!("{}.json", summary.detail_ref)),
-                    output: detail_dir.join(format!("{}.jsonl", summary.detail_ref)),
-                    journal: journal.clone(),
-                };
-                if summary.status == ToolExecutionStatus::Running {
-                    let finished_at = now_millis();
-                    summary.status = ToolExecutionStatus::Cancelled;
-                    summary.finished_at = Some(finished_at);
-                    summary.duration_ms = Some(finished_at.saturating_sub(summary.started_at));
-                    if location.manifest.is_file()
-                        && let Ok(mut manifest) = read_json::<StoredManifest>(&location.manifest)
-                    {
-                        manifest.summary = summary.clone();
-                        write_json_atomic(&location.manifest, &manifest)?;
-                    }
-                    append_json_line(
-                        &journal,
-                        &JournalRecord {
-                            event: JournalEventKind::Cancelled,
-                            summary: summary.clone(),
-                        },
-                    )?;
-                }
-                let mut state = self.lock_state();
-                state.details.insert(summary.detail_ref.clone(), location);
-                state.summaries.insert(key, summary);
+            let key = execution_key(&manifest.summary.owner, &manifest.summary.call_id);
+            let mut state = self.lock_state();
+            if state.summaries.contains_key(&key) {
+                return Err(ToolExecutionError::ProjectionConflict(format!(
+                    "duplicate persisted identity {key:?}"
+                )));
             }
+            state
+                .details
+                .insert(manifest.summary.detail_ref.clone(), location);
+            state.summaries.insert(key, manifest.summary);
         }
         Ok(())
+    }
+
+    fn artifact_config_for(
+        &self,
+        path: &Path,
+    ) -> Option<echo_agent::tools::artifact::ToolOutputArtifactConfig> {
+        let canonical_path = fs::canonicalize(path).ok()?;
+        let configs = lock_recover(&self.artifact_configs, "tool artifact roots");
+        configs.iter().find_map(|config| {
+            let canonical_root = fs::canonicalize(&config.root_dir).ok()?;
+            canonical_path
+                .starts_with(canonical_root)
+                .then(|| config.clone())
+        })
     }
 
     fn scope_dir(&self, conversation_id: Option<&str>, run_id: Option<&str>) -> PathBuf {
@@ -568,16 +693,17 @@ impl ToolExecutionRepository {
             .ok_or_else(|| ToolExecutionError::NotFound(detail_ref.to_string()))
     }
 
+    fn read_manifest(&self, detail_ref: &str) -> ToolExecutionResult<StoredManifest> {
+        read_manifest_path(&self.detail_location(detail_ref)?.manifest)
+    }
+
     fn lock_state(&self) -> MutexGuard<'_, RepositoryState> {
-        self.state.lock().unwrap_or_else(|poisoned| {
-            tracing::warn!("tool execution repository lock was poisoned; recovering state");
-            poisoned.into_inner()
-        })
+        lock_recover(&self.state, "tool execution repository")
     }
 }
 
 pub fn preview_args(args: &serde_json::Value) -> String {
-    let serialized = serde_json::to_string(args).unwrap_or_else(|_| String::new());
+    let serialized = serde_json::to_string(args).unwrap_or_default();
     if serialized.chars().count() <= TOOL_ARGS_PREVIEW_CHARS {
         serialized
     } else {
@@ -588,6 +714,212 @@ pub fn preview_args(args: &serde_json::Value) -> String {
                 .take(TOOL_ARGS_PREVIEW_CHARS)
                 .collect::<String>()
         )
+    }
+}
+
+fn result_text(result: &ToolResult) -> &str {
+    if result.output.is_empty() {
+        result.error.as_deref().unwrap_or_default()
+    } else {
+        &result.output
+    }
+}
+
+fn result_output_bytes(result: &ToolResult) -> u64 {
+    echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata)
+        .map(|artifact| artifact.artifact_bytes)
+        .unwrap_or_else(|| u64::try_from(result_text(result).len()).unwrap_or(u64::MAX))
+}
+
+fn stream_path_for_manifest(manifest: &Path) -> PathBuf {
+    manifest.with_extension("stream.jsonl")
+}
+
+fn stream_has_output(path: &Path) -> ToolExecutionResult<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "tool stream trace must not be a symlink: {}",
+                path.display()
+            ),
+        )
+        .into()),
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() > 0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn append_stream_chunk(path: &Path, chunk: &StoredStreamChunk) -> ToolExecutionResult<()> {
+    reject_symlink(path)?;
+    repair_torn_stream_tail(path)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, chunk)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn stream_output_bytes(path: &Path) -> ToolExecutionResult<Option<u64>> {
+    if !stream_has_output(path)? {
+        return Ok(None);
+    }
+    let mut total = 0_u64;
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            break;
+        }
+        let chunk: StoredStreamChunk = serde_json::from_str(&line)?;
+        total = total.saturating_add(u64::try_from(chunk.text.len()).unwrap_or(u64::MAX));
+    }
+    Ok(Some(total))
+}
+
+fn stream_cursor(detail_ref: &str, offset: u64) -> String {
+    format!("{STREAM_CURSOR_PREFIX}:{detail_ref}:{offset}")
+}
+
+fn parse_stream_cursor(detail_ref: &str, cursor: Option<&str>) -> ToolExecutionResult<u64> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    let prefix = format!("{STREAM_CURSOR_PREFIX}:{detail_ref}:");
+    cursor
+        .strip_prefix(&prefix)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| ToolExecutionError::InvalidCursor(cursor.to_string()))
+}
+
+fn read_stream_output_page(
+    detail_ref: &str,
+    path: &Path,
+    cursor: Option<&str>,
+    limit: usize,
+    terminal: bool,
+) -> ToolExecutionResult<ToolExecutionDetailPage> {
+    reject_symlink(path)?;
+    let start = parse_stream_cursor(detail_ref, cursor)?;
+    let end = fs::metadata(path)?.len();
+    if start > end {
+        return Err(ToolExecutionError::InvalidCursor(
+            cursor.unwrap_or_default().to_string(),
+        ));
+    }
+    let mut reader = BufReader::new(File::open(path)?);
+    reader.seek(SeekFrom::Start(start))?;
+    let mut consumed = 0_usize;
+    let mut line = String::new();
+    let mut chunks = Vec::new();
+    loop {
+        line.clear();
+        let line_start = reader.stream_position()?;
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        if !line.ends_with('\n') {
+            reader.seek(SeekFrom::Start(line_start))?;
+            break;
+        }
+        if consumed > 0 && consumed.saturating_add(bytes) > limit {
+            reader.seek(SeekFrom::Start(line_start))?;
+            break;
+        }
+        consumed = consumed.saturating_add(bytes);
+        let stored: StoredStreamChunk = serde_json::from_str(&line)?;
+        chunks.push(ToolExecutionDetailChunk {
+            channel: stored.channel,
+            text: stored.text,
+        });
+        if consumed >= limit {
+            break;
+        }
+    }
+    let next = reader.stream_position()?;
+    Ok(ToolExecutionDetailPage {
+        chunks,
+        next_cursor: (next < end || !terminal).then(|| stream_cursor(detail_ref, next)),
+        complete: terminal && next >= end,
+    })
+}
+
+fn repair_torn_stream_tail(path: &Path) -> ToolExecutionResult<()> {
+    reject_symlink(path)?;
+    let length = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if length == 0 {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last)?;
+    if last == *b"\n" {
+        return Ok(());
+    }
+
+    let mut end = length;
+    let scan_bytes = u64::try_from(STREAM_SCAN_BYTES).unwrap_or(u64::MAX);
+    while end > 0 {
+        let start = end.saturating_sub(scan_bytes);
+        let size = usize::try_from(end.saturating_sub(start)).unwrap_or(STREAM_SCAN_BYTES);
+        let mut chunk = vec![0_u8; size];
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut chunk)?;
+        if let Some(position) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            let valid = start
+                .saturating_add(u64::try_from(position).unwrap_or(u64::MAX))
+                .saturating_add(1);
+            file.set_len(valid)?;
+            file.sync_data()?;
+            return Ok(());
+        }
+        end = start;
+    }
+    file.set_len(0)?;
+    file.sync_data()?;
+    Ok(())
+}
+
+fn canonical_json<T: Serialize>(value: &T) -> ToolExecutionResult<serde_json::Value> {
+    let mut value = serde_json::to_value(value)?;
+    canonicalize_json(&mut value);
+    Ok(value)
+}
+
+fn canonicalize_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                canonicalize_json(value);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for value in entries.values_mut() {
+                canonicalize_json(value);
+            }
+            let mut ordered = std::mem::take(entries).into_iter().collect::<Vec<_>>();
+            ordered.sort_by(|left, right| left.0.cmp(&right.0));
+            entries.extend(ordered);
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
     }
 }
 
@@ -607,201 +939,34 @@ fn lock_recover<'a, T>(mutex: &'a Mutex<T>, label: &str) -> MutexGuard<'a, T> {
     })
 }
 
-fn split_utf8_chunks(value: &str, max_bytes: usize) -> Vec<String> {
-    if value.is_empty() {
-        return Vec::new();
+fn reject_symlink(path: &Path) -> ToolExecutionResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "tool execution root must not be a symlink: {}",
+                path.display()
+            ),
+        )
+        .into()),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
     }
-    let mut chunks = Vec::new();
-    let mut current = String::new();
-    for character in value.chars() {
-        if !current.is_empty()
-            && current.len().saturating_add(character.len_utf8()) > max_bytes.max(1)
-        {
-            chunks.push(std::mem::take(&mut current));
-        }
-        current.push(character);
-    }
-    if !current.is_empty() {
-        chunks.push(current);
-    }
-    chunks
 }
 
-fn append_json_line<T: Serialize>(path: &Path, value: &T) -> ToolExecutionResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    serde_json::to_writer(&mut file, value)?;
-    file.write_all(b"\n")?;
-    file.flush()?;
+fn write_manifest(path: &Path, manifest: &StoredManifest) -> ToolExecutionResult<()> {
+    let bytes = serde_json::to_vec(manifest)?;
+    echo_core::utils::fs::atomic_write(path, &bytes)?;
     Ok(())
 }
 
-fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> ToolExecutionResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec(value)?;
-    {
-        let mut file = File::create(&temp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-    }
-    fs::rename(temp, path)?;
-    Ok(())
+fn read_manifest_path(path: &Path) -> ToolExecutionResult<StoredManifest> {
+    let bytes = echo_core::utils::fs::read_existing(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> ToolExecutionResult<T> {
-    let file = File::open(path)?;
-    Ok(serde_json::from_reader(BufReader::new(file))?)
-}
-
-fn parse_cursor(cursor: Option<&str>) -> ToolExecutionResult<u64> {
-    match cursor {
-        Some(value) => value
-            .parse::<u64>()
-            .map_err(|_| ToolExecutionError::InvalidCursor(value.to_string())),
-        None => Ok(0),
-    }
-}
-
-fn read_jsonl_output_page(
-    path: &Path,
-    cursor: Option<&str>,
-    limit: usize,
-    terminal: bool,
-) -> ToolExecutionResult<ToolExecutionDetailPage> {
-    let start = parse_cursor(cursor)?;
-    let mut reader = BufReader::new(File::open(path)?);
-    reader.seek(SeekFrom::Start(start))?;
-    let mut consumed = 0usize;
-    let mut line = String::new();
-    let mut chunks = Vec::new();
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            break;
-        }
-        if consumed > 0 && consumed.saturating_add(bytes) > limit {
-            reader.seek(SeekFrom::Current(-i64::try_from(bytes).unwrap_or(i64::MAX)))?;
-            break;
-        }
-        consumed = consumed.saturating_add(bytes);
-        if !line.trim().is_empty() {
-            let stored: StoredOutputChunk = serde_json::from_str(&line)?;
-            chunks.push(ToolExecutionDetailChunk {
-                channel: stored.channel,
-                text: stored.text,
-            });
-        }
-        if consumed >= limit {
-            break;
-        }
-    }
-    let next = reader.stream_position()?;
-    let end = fs::metadata(path)?.len();
-    Ok(ToolExecutionDetailPage {
-        chunks,
-        next_cursor: (next < end || !terminal).then(|| next.to_string()),
-        complete: terminal && next >= end,
-    })
-}
-
-fn read_artifact_page(
-    path: &Path,
-    cursor: Option<&str>,
-    limit: usize,
-    terminal: bool,
-) -> ToolExecutionResult<ToolExecutionDetailPage> {
-    let start = parse_cursor(cursor)?;
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let page_limit = limit.max(4);
-    let mut bytes = Vec::with_capacity(page_limit);
-    let mut limited = file.take(u64::try_from(page_limit).unwrap_or(u64::MAX));
-    limited.read_to_end(&mut bytes)?;
-    let (text, read_bytes) = utf8_page_prefix(bytes)?;
-    let next = start.saturating_add(u64::try_from(read_bytes).unwrap_or(u64::MAX));
-    let end = fs::metadata(path)?.len();
-    Ok(ToolExecutionDetailPage {
-        chunks: if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![ToolExecutionDetailChunk {
-                channel: ToolExecutionDetailChannel::Log,
-                text,
-            }]
-        },
-        next_cursor: (next < end || !terminal).then(|| next.to_string()),
-        complete: terminal && next >= end,
-    })
-}
-
-fn utf8_page_prefix(mut bytes: Vec<u8>) -> ToolExecutionResult<(String, usize)> {
-    let mut removed = 0usize;
-    loop {
-        match String::from_utf8(bytes) {
-            Ok(text) => {
-                let consumed = text.len();
-                return Ok((text, consumed));
-            }
-            Err(error) if removed < 3 => {
-                bytes = error.into_bytes();
-                if bytes.pop().is_none() {
-                    return Ok((String::new(), 0));
-                }
-                removed = removed.saturating_add(1);
-            }
-            Err(error) => return Err(ToolExecutionError::InvalidUtf8(error.to_string())),
-        }
-    }
-}
-
-fn read_journal_repairing_last_line(path: &Path) -> ToolExecutionResult<Vec<JournalRecord>> {
-    let file = File::open(path)?;
-    let mut reader = BufReader::new(file);
-    let mut records = Vec::new();
-    let mut line = String::new();
-    let mut offset = 0u64;
-    let mut last_good_offset = 0u64;
-    let mut truncate_to = None;
-    loop {
-        line.clear();
-        let bytes = reader.read_line(&mut line)?;
-        if bytes == 0 {
-            break;
-        }
-        offset = offset.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
-        if line.trim().is_empty() {
-            last_good_offset = offset;
-            continue;
-        }
-        match serde_json::from_str::<JournalRecord>(&line) {
-            Ok(record) => {
-                records.push(record);
-                last_good_offset = offset;
-            }
-            Err(error) => {
-                if reader.fill_buf()?.is_empty() {
-                    tracing::warn!(path = %path.display(), %error, "discarding malformed final tool journal line");
-                    truncate_to = Some(last_good_offset);
-                    break;
-                }
-                return Err(error.into());
-            }
-        }
-    }
-    drop(reader);
-    if let Some(length) = truncate_to {
-        OpenOptions::new().write(true).open(path)?.set_len(length)?;
-    }
-    Ok(records)
-}
-
-fn find_named_files(root: &Path, name: &str) -> ToolExecutionResult<Vec<PathBuf>> {
+fn find_manifest_files(root: &Path) -> ToolExecutionResult<Vec<PathBuf>> {
     let mut files = Vec::new();
     if !root.exists() {
         return Ok(files);
@@ -811,25 +976,60 @@ fn find_named_files(root: &Path, name: &str) -> ToolExecutionResult<Vec<PathBuf>
         for entry in fs::read_dir(directory)? {
             let entry = entry?;
             let path = entry.path();
-            if path.is_dir() {
+            let metadata = fs::symlink_metadata(&path)?;
+            if metadata.file_type().is_symlink() {
+                if path.extension().and_then(|value| value.to_str()) == Some("json") {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "tool execution manifest must not be a symlink: {}",
+                            path.display()
+                        ),
+                    )
+                    .into());
+                }
+                continue;
+            }
+            if metadata.is_dir() {
                 if path.file_name().and_then(|value| value.to_str()) != Some(".trash") {
                     pending.push(path);
                 }
-            } else if path.file_name().and_then(|value| value.to_str()) == Some(name) {
+            } else if metadata.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some("json")
+                && path
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|value| value.to_str())
+                    == Some("details")
+            {
                 files.push(path);
             }
         }
     }
+    files.sort();
     Ok(files)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent::agent::ToolInvocationRewrite;
+    use echo_agent::tools::ToolFailure;
+    use echo_core::tools::ToolResultKind;
 
     fn chat_owner() -> ToolExecutionOwner {
         ToolExecutionOwner::Chat {
             message_id: "message-1".to_string(),
+        }
+    }
+
+    fn invocation(name: &str, args: serde_json::Value) -> ToolInvocation {
+        ToolInvocation {
+            requested_name: name.to_string(),
+            requested_args: args.clone(),
+            name: name.to_string(),
+            args,
+            rewrites: Vec::new(),
         }
     }
 
@@ -842,131 +1042,282 @@ mod tests {
     }
 
     #[test]
-    fn complete_output_is_read_in_pages() -> Result<(), Box<dyn std::error::Error>> {
+    fn canonical_invocation_and_rich_result_survive_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let owner = chat_owner();
+        let invocation = ToolInvocation {
+            requested_name: "run".to_string(),
+            requested_args: serde_json::json!({"command": "build"}),
+            name: "shell".to_string(),
+            args: serde_json::json!({"command": "./build"}),
+            rewrites: vec![ToolInvocationRewrite::Approval],
+        };
+        let mut result = ToolResult::success_with_kind(ToolResultKind::Json, "{\"status\":\"ok\"}");
+        result.data = Some(serde_json::json!({"status": "ok"}));
+        result.mime_type = Some("application/json".to_string());
+        result
+            .metadata
+            .insert("source".to_string(), "test".to_string());
+
+        let detail_ref = {
+            let repository = ToolExecutionRepository::open(temp.path())?;
+            let mutation = repository.project_start(
+                owner.clone(),
+                Some("conversation-1"),
+                Some("run-1"),
+                "call-1",
+                &invocation,
+            )?;
+            repository.project_finish(&owner, "call-1", &result)?;
+            mutation.summary.detail_ref
+        };
+
+        let reopened = ToolExecutionRepository::open(temp.path())?;
+        let detail = reopened.detail_manifest(&detail_ref)?;
+        assert_eq!(detail.invocation, invocation);
+        assert_eq!(
+            canonical_json(&detail.result)?,
+            canonical_json(&Some(result))?
+        );
+        assert_eq!(detail.status, ToolExecutionStatus::Succeeded);
+        Ok(())
+    }
+
+    #[test]
+    fn typed_failure_category_controls_terminal_status() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let repository = ToolExecutionRepository::open(temp.path())?;
         let owner = chat_owner();
-        let summary = repository.start(
+        repository.project_start(
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
-            "call-1",
-            "shell",
-            &serde_json::json!({"command": "printf hello"}),
+            "call-timeout",
+            &invocation("shell", serde_json::json!({"command": "sleep 30"})),
         )?;
-        repository.append_output(
-            &owner,
-            "call-1",
-            ToolExecutionDetailChannel::Stdout,
-            "hello world",
-        )?;
-        repository.finish(
-            &owner,
-            "call-1",
-            true,
-            "hello world",
-            None,
-            HashMap::new(),
-            false,
-        )?;
+        let mut result = ToolResult::success("deadline exceeded");
+        result.failure = Some(ToolFailure::new(ToolFailureCategory::Timeout));
 
-        let page = repository.read_output(&summary.detail_ref, None, 64)?;
-        assert_eq!(
-            page.chunks.first().map(|chunk| chunk.text.as_str()),
-            Some("hello world")
-        );
-        assert!(page.complete);
+        let mutation = repository.project_finish(&owner, "call-timeout", &result)?;
+        assert_eq!(mutation.summary.status, ToolExecutionStatus::TimedOut);
         Ok(())
     }
 
     #[test]
-    fn malformed_final_journal_line_is_removed() -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        let journal = temp.path().join("events.jsonl");
-        let summary = ToolExecutionSummary {
-            id: "detail-1".to_string(),
-            call_id: "call-1".to_string(),
-            owner: chat_owner(),
-            conversation_id: Some("conversation-1".to_string()),
-            run_id: Some("run-1".to_string()),
-            name: "shell".to_string(),
-            args_preview: "{}".to_string(),
-            status: ToolExecutionStatus::Succeeded,
-            started_at: 1,
-            finished_at: Some(2),
-            duration_ms: Some(1),
-            detail_ref: "detail-1".to_string(),
-        };
-        append_json_line(
-            &journal,
-            &JournalRecord {
-                event: JournalEventKind::Finished,
-                summary,
-            },
-        )?;
-        OpenOptions::new()
-            .append(true)
-            .open(&journal)?
-            .write_all(b"{partial")?;
-
-        let records = read_journal_repairing_last_line(&journal)?;
-        assert_eq!(records.len(), 1);
-        let repaired = fs::read_to_string(journal)?;
-        assert!(!repaired.contains("partial"));
-        Ok(())
-    }
-
-    #[test]
-    fn removing_conversation_drops_summary_and_detail_indexes()
+    fn replay_is_idempotent_but_identity_conflicts_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let repository = ToolExecutionRepository::open(temp.path())?;
         let owner = chat_owner();
-        let summary = repository.start(
+        let original_invocation = invocation("shell", serde_json::json!({"command": "true"}));
+        let first = repository.project_start(
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
             "call-1",
-            "shell",
-            &serde_json::json!({"command": "true"}),
+            &original_invocation,
         )?;
-        repository.finish(&owner, "call-1", true, "ok", None, HashMap::new(), false)?;
+        let replayed = repository.project_start(
+            owner.clone(),
+            Some("conversation-1"),
+            Some("run-1"),
+            "call-1",
+            &original_invocation,
+        )?;
+        assert!(first.changed);
+        assert!(!replayed.changed);
+        assert_eq!(replayed.summary.detail_ref, first.summary.detail_ref);
 
-        repository.remove_conversation("conversation-1")?;
-
-        assert!(
-            repository
-                .summaries_for_conversation("conversation-1")
-                .is_empty()
-        );
         assert!(matches!(
-            repository.detail_manifest(&summary.detail_ref),
-            Err(ToolExecutionError::NotFound(_))
+            repository.project_start(
+                owner,
+                Some("conversation-1"),
+                Some("run-1"),
+                "call-1",
+                &invocation("shell", serde_json::json!({"command": "false"})),
+            ),
+            Err(ToolExecutionError::ProjectionConflict(_))
         ));
         Ok(())
     }
 
     #[test]
-    fn artifact_pages_end_on_utf8_boundaries() -> Result<(), Box<dyn std::error::Error>> {
+    fn restart_marks_running_execution_interrupted_and_terminal_replay_corrects_it()
+    -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
-        let artifact = temp.path().join("artifact.log");
-        fs::write(&artifact, "你🙂好")?;
-
-        let first = read_artifact_page(&artifact, None, 1, true)?;
+        let owner = chat_owner();
+        let detail_ref = {
+            let repository = ToolExecutionRepository::open(temp.path())?;
+            repository
+                .project_start(
+                    owner.clone(),
+                    Some("conversation-1"),
+                    Some("run-1"),
+                    "call-1",
+                    &invocation("shell", serde_json::json!({"command": "true"})),
+                )?
+                .summary
+                .detail_ref
+        };
+        let reopened = ToolExecutionRepository::open(temp.path())?;
         assert_eq!(
-            first.chunks.first().map(|chunk| chunk.text.as_str()),
-            Some("你")
+            reopened.detail_manifest(&detail_ref)?.status,
+            ToolExecutionStatus::Interrupted
         );
-        let cursor = first
-            .next_cursor
-            .as_deref()
-            .ok_or_else(|| "missing next cursor".to_string())?;
-        let second = read_artifact_page(&artifact, Some(cursor), 8, true)?;
+        let result = ToolResult::success("done");
+        let corrected = reopened.project_finish(&owner, "call-1", &result)?;
+        assert_eq!(corrected.summary.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(corrected.summary.detail_ref, detail_ref);
+        Ok(())
+    }
+
+    #[test]
+    fn compact_result_is_returned_without_a_second_cursor_protocol()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = ToolExecutionRepository::open(temp.path())?;
+        let owner = chat_owner();
+        let mutation = repository.project_start(
+            owner.clone(),
+            Some("conversation-1"),
+            Some("run-1"),
+            "call-1",
+            &invocation("shell", serde_json::json!({"command": "printf hello"})),
+        )?;
+        repository.project_finish(&owner, "call-1", &ToolResult::success("hello"))?;
+
+        let page = repository.read_output(&mutation.summary.detail_ref, None, 4)?;
         assert_eq!(
-            second.chunks.first().map(|chunk| chunk.text.as_str()),
-            Some("🙂好")
+            page.chunks.first().map(|chunk| chunk.text.as_str()),
+            Some("hello")
+        );
+        assert!(page.complete);
+        assert!(page.next_cursor.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn running_stream_trace_is_paged_without_becoming_a_terminal_result()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = ToolExecutionRepository::open(temp.path())?;
+        let owner = chat_owner();
+        let mutation = repository.project_start(
+            owner.clone(),
+            Some("conversation-1"),
+            Some("run-1"),
+            "call-stream",
+            &invocation("shell", serde_json::json!({"command": "build"})),
+        )?;
+        repository.project_stream(
+            &owner,
+            "call-stream",
+            ToolExecutionDetailChannel::Stdout,
+            "building",
+        )?;
+
+        let detail = repository.detail_manifest(&mutation.summary.detail_ref)?;
+        assert_eq!(detail.status, ToolExecutionStatus::Running);
+        assert!(detail.result.is_none());
+        assert_eq!(detail.output_bytes, 8);
+
+        let first = repository.read_output(&mutation.summary.detail_ref, None, 4)?;
+        assert_eq!(
+            first.chunks,
+            vec![ToolExecutionDetailChunk {
+                channel: ToolExecutionDetailChannel::Stdout,
+                text: "building".to_string(),
+            }]
+        );
+        assert!(!first.complete);
+        let cursor = first.next_cursor.ok_or("running stream cursor missing")?;
+        let another = repository.project_start(
+            owner.clone(),
+            Some("conversation-1"),
+            Some("run-1"),
+            "call-other",
+            &invocation("shell", serde_json::json!({"command": "other"})),
+        )?;
+        repository.project_stream(
+            &owner,
+            "call-other",
+            ToolExecutionDetailChannel::Stdout,
+            "other",
+        )?;
+        assert!(matches!(
+            repository.read_output(&another.summary.detail_ref, Some(&cursor), 4),
+            Err(ToolExecutionError::InvalidCursor(_))
+        ));
+
+        repository.project_stream(
+            &owner,
+            "call-stream",
+            ToolExecutionDetailChannel::Stderr,
+            "warning",
+        )?;
+        repository.project_finish(&owner, "call-stream", &ToolResult::success("done"))?;
+        repository.terminate_orphan(&owner, "call-other", ToolExecutionStatus::Unknown)?;
+        let second = repository.read_output(&mutation.summary.detail_ref, Some(&cursor), 4)?;
+        assert_eq!(
+            second.chunks,
+            vec![ToolExecutionDetailChunk {
+                channel: ToolExecutionDetailChannel::Stderr,
+                text: "warning".to_string(),
+            }]
         );
         assert!(second.complete);
+        assert!(second.next_cursor.is_none());
+        assert_eq!(
+            repository
+                .detail_manifest(&mutation.summary.detail_ref)?
+                .output_bytes,
+            15
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_conversation_cannot_be_removed() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = ToolExecutionRepository::open(temp.path())?;
+        let owner = chat_owner();
+        repository.project_start(
+            owner.clone(),
+            Some("conversation-1"),
+            Some("run-1"),
+            "call-1",
+            &invocation("shell", serde_json::json!({"command": "true"})),
+        )?;
+        assert!(matches!(
+            repository.remove_conversation("conversation-1"),
+            Err(ToolExecutionError::ActiveConversation(_))
+        ));
+        repository.terminate_orphan(&owner, "call-1", ToolExecutionStatus::Unknown)?;
+        repository.remove_conversation("conversation-1")?;
+        assert!(
+            repository
+                .summaries_for_conversation("conversation-1")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn manifest_symlink_fails_closed_without_changing_external_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let external = temp.path().join("external.json");
+        fs::write(&external, b"external")?;
+        let details = temp.path().join("scope/run/details");
+        fs::create_dir_all(&details)?;
+        symlink(&external, details.join("detail.json"))?;
+
+        assert!(ToolExecutionRepository::open(temp.path()).is_err());
+        assert_eq!(fs::read(external)?, b"external");
         Ok(())
     }
 }

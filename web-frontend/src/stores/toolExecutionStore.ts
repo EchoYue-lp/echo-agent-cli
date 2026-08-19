@@ -89,6 +89,7 @@ function mergeTaskRuntimeBoundary(
   persisted: ToolExecution,
   runtimeBoundary: ToolExecution
 ): ToolExecution {
+  if (persisted.detail_ref) return persisted;
   if (runtimeBoundary.status === 'running' || persisted.status === runtimeBoundary.status) {
     return persisted;
   }

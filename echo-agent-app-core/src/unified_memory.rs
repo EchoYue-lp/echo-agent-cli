@@ -24,9 +24,24 @@ use std::path::PathBuf;
 
 use crate::instruction_provider::InstructionProvider;
 use echo_agent::llm::types::Message;
+use sha2::{Digest, Sha256};
 
 const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
 const HOT_MEMORY_CONTEXT_PROJECTION: &str = "eko:hot-memory-context";
+
+/// One strictly-read instruction generation shared by the primary agent and
+/// every existing or future pooled agent.
+#[derive(Debug, Clone)]
+pub(crate) struct InstructionProjectionSnapshot {
+    revision: String,
+    message: Option<Message>,
+}
+
+impl InstructionProjectionSnapshot {
+    pub(crate) fn revision(&self) -> &str {
+        &self.revision
+    }
+}
 
 // ── Instruction tiers ───────────────────────────────────────────────
 
@@ -134,20 +149,36 @@ impl UnifiedMemory {
     }
 }
 
-/// Replace the compression-stable instruction projection for one agent.
-pub async fn refresh_instruction_projection(
-    agent: &mut echo_agent::agent::ReactAgent,
+/// Build one fail-closed projection snapshot from current file authorities.
+pub(crate) fn load_instruction_projection_strict(
     root: Option<&std::path::Path>,
-) {
-    let suffix = UnifiedMemory::load_for(root).instruction_prompt_suffix();
-    let message = suffix
+) -> std::io::Result<InstructionProjectionSnapshot> {
+    let suffix = InstructionProvider::load_for_strict(root)?
+        .get_instruction_suffix()
         .filter(|value| !value.trim().is_empty())
-        .map(|value| Message::system(value.trim().to_string()));
+        .map(|value| value.trim().to_string());
+    let mut hasher = Sha256::new();
+    hasher.update(b"eko-instruction-projection-v1\0");
+    if let Some(value) = suffix.as_deref() {
+        hasher.update(value.as_bytes());
+    }
+    Ok(InstructionProjectionSnapshot {
+        revision: format!("{:x}", hasher.finalize()),
+        message: suffix.map(Message::system),
+    })
+}
+
+/// Publish an already-read snapshot. This function never touches disk, so all
+/// targets in one generation receive byte-identical content.
+pub(crate) async fn apply_instruction_projection_snapshot(
+    agent: &mut echo_agent::agent::ReactAgent,
+    snapshot: &InstructionProjectionSnapshot,
+) {
     agent
         .context()
         .lock()
         .await
-        .replace_projection(INSTRUCTION_CONTEXT_PROJECTION, message);
+        .replace_projection(INSTRUCTION_CONTEXT_PROJECTION, snapshot.message.clone());
 }
 
 /// Replace the independently-owned hot-memory projection for one agent.
@@ -229,8 +260,10 @@ mod tests {
             .system_prompt("test")
             .build()?;
 
-        refresh_instruction_projection(&mut agent, Some(&first)).await;
-        refresh_instruction_projection(&mut agent, Some(&second)).await;
+        let first_snapshot = load_instruction_projection_strict(Some(&first))?;
+        apply_instruction_projection_snapshot(&mut agent, &first_snapshot).await;
+        let second_snapshot = load_instruction_projection_strict(Some(&second))?;
+        apply_instruction_projection_snapshot(&mut agent, &second_snapshot).await;
 
         let context = agent.context().lock().await;
         let projected = context
@@ -257,7 +290,8 @@ mod tests {
             .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
             .system_prompt("test")
             .build()?;
-        refresh_instruction_projection(&mut agent, Some(root)).await;
+        let snapshot = load_instruction_projection_strict(Some(root))?;
+        apply_instruction_projection_snapshot(&mut agent, &snapshot).await;
         refresh_hot_memory_projection(&mut agent, Some(root)).await;
 
         let context = agent.context().lock().await;

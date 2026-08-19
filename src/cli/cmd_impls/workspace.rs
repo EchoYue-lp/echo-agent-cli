@@ -16,7 +16,15 @@ pub struct WorkspaceCommandResult {
 async fn cmd_workspace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let result = execute_workspace_command(ctx.app_state.as_ref(), args).await;
     if result.generation_changed {
-        ctx.staged_attachments.lock().await.clear();
+        let attachments = {
+            let mut staged = ctx.staged_attachments.lock().await;
+            std::mem::take(&mut *staged)
+        };
+        if let Err(error) =
+            echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+        {
+            tracing::warn!(%error, "failed to clean staged attachments after workspace change");
+        }
     }
     println!("{}", result.output);
     CommandOutcome::Continue

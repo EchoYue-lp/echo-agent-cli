@@ -124,8 +124,7 @@ pub async fn restore_checkpoint(
 pub async fn get_latest_session(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = match store_guard.as_ref() {
+    let store = match state.app_state.conversation_store().await {
         Some(s) => s,
         None => {
             return Ok(serde_json::json!({

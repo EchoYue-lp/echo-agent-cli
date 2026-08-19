@@ -1561,52 +1561,27 @@ cmd!(
 // ── RulePromoteCommand ────────────────────────────────────────────
 
 async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let writes_memory = !matches!(args.first().copied(), Some("scan") | None);
-    let memory_generation = if writes_memory {
-        let Some(integration) = ctx.review_integration.as_ref() else {
+    let integration = match ctx.review_integration.as_ref() {
+        Some(integration) => integration,
+        None => {
             println!("Review integration is not configured.");
             return CommandOutcome::Continue;
-        };
-        match integration.lease_generation() {
-            Ok(generation) => Some(generation),
-            Err(error) => {
-                println!("Rule promotion unavailable during workspace transition: {error}");
-                return CommandOutcome::Continue;
-            }
         }
-    } else {
-        None
-    };
-    let store = match memory_generation.as_ref() {
-        Some(generation) => Some(generation.memory_store()),
-        None => ctx.agent.read(|a| a.store().cloned()).await,
-    };
-    let store = match store {
-        Some(s) => s,
-        None => {
-            println!("No memory store configured.");
-            return CommandOutcome::Continue;
-        }
-    };
-
-    let promoter = match memory_generation.as_ref() {
-        Some(generation) => echo_agent_app_core::evolution::RulePromoter::new(store)
-            .with_rules_path(generation.echo_agent_dir().join("learned-rules.md")),
-        None => echo_agent_app_core::evolution::RulePromoter::new(store),
     };
 
     match args.first().copied() {
         Some("scan") | None => {
             println!("Scanning memories for rule promotion candidates...");
-            let proposals = promoter.scan_for_proposals().await;
+            let proposals = match integration.scan_rule_proposals().await {
+                Ok(proposals) => proposals,
+                Err(error) => {
+                    println!("Rule promotion scan failed: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
 
             if proposals.is_empty() {
                 println!("\nNo memories meet the promotion criteria.");
-                println!(
-                    "Criteria: confidence >= {:.2}, age >= {} days",
-                    promoter.criteria().min_confidence,
-                    promoter.criteria().min_age_days
-                );
             } else {
                 println!("\n=== Rule Promotion Candidates ===\n");
                 for (i, proposal) in proposals.iter().enumerate() {
@@ -1628,57 +1603,25 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         Some(memory_key) => {
             println!("Promoting memory '{}' to rule...", memory_key);
 
-            let proposals = promoter.scan_for_proposals().await;
+            let proposals = match integration.scan_rule_proposals().await {
+                Ok(proposals) => proposals,
+                Err(error) => {
+                    println!("Rule promotion scan failed: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
             let proposal = proposals.iter().find(|p| p.memory_key == memory_key);
 
             match proposal {
-                Some(prop) => {
-                    let echo_agent_dir = memory_generation
-                        .as_ref()
-                        .map(|generation| generation.echo_agent_dir().to_path_buf())
-                        .unwrap_or_else(|| current_echo_agent_dir(ctx));
-                    let change_log = match echo_agent::evolution::JsonlChangeLog::new(
-                        echo_agent_dir.join("evolution").join("change-log.jsonl"),
-                    ) {
-                        Ok(change_log) => change_log,
-                        Err(error) => {
-                            println!("Failed to open evolution change log: {error}");
-                            return CommandOutcome::Continue;
-                        }
-                    };
-
-                    match promoter.promote_rule(prop, &change_log).await {
-                        Ok(()) => {
-                            println!(
-                                "✓ Successfully promoted memory '{}' to AGENTS.md",
-                                memory_key
-                            );
-                            // Fire RulePromoted hook so registered hooks
-                            // (e.g. config-reload, dashboard refresh) are notified.
-                            echo_agent_app_core::evolution::fire_evolution_hook(
-                                &ctx.agent,
-                                echo_core::hooks::HookEvent::RulePromoted,
-                                memory_key,
-                            )
-                            .await;
-                            let root = echo_agent_dir.parent().map(std::path::Path::to_path_buf);
-                            ctx.agent
-                                .write_async(|agent| {
-                                    Box::pin(async move {
-                                        echo_agent_app_core::unified_memory::refresh_instruction_projection(
-                                            agent,
-                                            root.as_deref(),
-                                        )
-                                        .await;
-                                    })
-                                })
-                                .await;
-                        }
-                        Err(e) => {
-                            println!("✗ Failed to promote rule: {}", e);
-                        }
+                Some(proposal) => match integration.promote_rule(proposal).await {
+                    Ok(receipt) => {
+                        println!(
+                            "Successfully promoted memory '{}' as {}",
+                            memory_key, receipt.promotion_id
+                        );
                     }
-                }
+                    Err(error) => println!("Failed to promote rule: {error}"),
+                },
                 None => {
                     println!(
                         "Memory '{}' not found or does not meet promotion criteria.",

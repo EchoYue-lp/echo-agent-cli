@@ -7,8 +7,9 @@
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use echo_agent::agent::CancellationToken;
-use echo_agent::memory::ConversationStore;
+use echo_agent::memory::{Conversation, ConversationStore, NewConversation};
 use echo_agent::prelude::*;
+use echo_agent::state::RuntimeStateStore;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -18,7 +19,6 @@ pub use crate::hitl::HitlDispatcher;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::agent_handle::AgentHandle;
-use crate::persistence::Persistence;
 use crate::workspace::Workspace;
 use crate::workspace::registry::WorkspaceRegistry;
 
@@ -268,44 +268,6 @@ impl PermissionRuleConfig {
     }
 }
 
-// ── 工作流 ──
-
-/// 存储的工作流定义
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredWorkflow {
-    pub id: String,
-    pub name: String,
-    pub definition: String,
-    pub node_count: usize,
-    pub edge_count: usize,
-    pub created_at: String,
-    pub updated_at: String,
-}
-
-/// 工作流步骤（简单线性工作流）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowStep {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub step_type: String, // prompt / tool / condition
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_args: Option<serde_json::Value>,
-}
-
-/// CLI workflow definition — a simple linear sequence of steps stored/edited
-/// via the REST API. The framework also provides a full DAG-based
-/// [`WorkflowDefinition`] (`echo_agent::workflow::WorkflowDefinition`) with
-/// nodes, edges, entry/exit points and concurrent execution for advanced use
-/// cases. This type covers the common "prompt → tool → prompt" pattern.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkflowDef {
-    pub name: String,
-    pub steps: Vec<WorkflowStep>,
-}
-
 // ── 沙箱配置 ──
 
 /// Sandbox safety tier for the CLI's local-execution sandbox.
@@ -368,6 +330,7 @@ pub struct ConnectionState {
     /// When `Some`, `agent_for()` routes to pool agents by conversation_id.
     /// When `None`, all requests use the single `agent` (backward compatible).
     pub pool: Option<Arc<crate::agent_pool::AgentPool>>,
+    conversation_binding: Arc<RwLock<ConversationStorageBinding>>,
 }
 
 impl ConnectionState {
@@ -381,6 +344,14 @@ impl ConnectionState {
         conversation_id: &str,
     ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
     {
+        let binding = self.conversation_binding.read().await;
+        if let Err(error) = binding.deletions.ensure_admission_allowed(conversation_id) {
+            return Err(crate::agent_pool::PoolError::ConversationDeletionPending {
+                conversation_id: conversation_id.to_string(),
+                reason: error.to_string(),
+            });
+        }
+        drop(binding);
         if let Some(ref pool) = self.pool {
             pool.acquire(conversation_id).await
         } else {
@@ -520,17 +491,24 @@ pub struct PluginState {
 }
 
 /// 持久化存储状态
+pub struct ConversationStorageBinding {
+    pub store: Option<Arc<dyn ConversationStore>>,
+    pub runtime_state: Option<Arc<dyn RuntimeStateStore>>,
+    pub deletions: Arc<crate::conversation_deletion::ConversationDeletionService>,
+}
+
 pub struct StorageState {
-    pub conversation_store: RwLock<Option<Arc<dyn ConversationStore>>>,
-    pub persistence: RwLock<Persistence>,
-    pub search_engine: crate::sessions::SessionSearchEngine,
+    pub conversation: Arc<RwLock<ConversationStorageBinding>>,
     pub tool_executions: Arc<crate::tool_execution::ToolExecutionRepository>,
+    /// Bounded ordinary-chat replay stream. Formal task history remains owned
+    /// by TaskRuntimeStore; long-term transcript remains ConversationStore.
+    pub chat_events: Arc<crate::chat_event_log::ChatEventLog>,
 }
 
 /// 历史记录状态：审计日志 + 工作流
 pub struct HistoryState {
     pub audit_logs: RwLock<Vec<AuditLogEntry>>,
-    pub workflows: RwLock<HashMap<String, StoredWorkflow>>,
+    pub workflows: Arc<crate::workflow_service::WorkflowService>,
 }
 
 /// 调度器状态
@@ -649,6 +627,18 @@ fn memory_rebind_degradation(
     }
 }
 
+fn memory_rule_projection_degradation(
+    target_root: std::path::PathBuf,
+    error: impl std::fmt::Display,
+) -> WorkspaceSubsystemTransition {
+    WorkspaceSubsystemTransition {
+        subsystem: "memory_rule_projection".to_string(),
+        target_root,
+        stale_roots: Vec::new(),
+        error: error.to_string(),
+    }
+}
+
 enum WorkspaceTransitionRequest {
     Switch(Workspace),
     Exit,
@@ -711,6 +701,8 @@ pub struct AppState {
     pub plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
     /// Sole acknowledged hook/config watcher lifecycle handle.
     pub config_watcher: Option<Arc<crate::config_watcher::ConfigWatcherHandle>>,
+    /// Interactive terminal authority shared by GUI, TUI, CLI, and channels.
+    pub terminal: Arc<crate::terminal::TerminalService>,
 }
 
 impl AppState {
@@ -720,6 +712,7 @@ impl AppState {
         model_consumers: Option<crate::infra::AgentModelConsumers>,
         hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
         conversation_store: Option<Arc<dyn ConversationStore>>,
+        runtime_state_store: Option<Arc<dyn RuntimeStateStore>>,
         app_config: echo_agent::config::AppConfig,
         mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
     ) -> Self {
@@ -731,6 +724,10 @@ impl AppState {
                 ..Default::default()
             })
             .unwrap_or_default();
+        let initial_tool_output_artifacts = agent
+            .try_write(|guard| guard.tool_output_artifacts())
+            .flatten()
+            .unwrap_or_else(|| crate::infra::tool_output_artifact_config(None));
 
         let active_model_id = app_config
             .model
@@ -751,6 +748,13 @@ impl AppState {
             .map(|model| model.id.clone())
             .unwrap_or_default();
         let webhook_emitter = Arc::new(crate::webhook::WebhookEmitter::from_config(&app_config));
+        let conversation_binding = Arc::new(RwLock::new(ConversationStorageBinding {
+            store: conversation_store,
+            runtime_state: runtime_state_store,
+            deletions: Arc::new(
+                crate::conversation_deletion::ConversationDeletionService::at_default_root(),
+            ),
+        }));
 
         Self {
             connection: ConnectionState {
@@ -758,6 +762,7 @@ impl AppState {
                 model_consumers,
                 hitl_dispatcher,
                 pool: None,
+                conversation_binding: conversation_binding.clone(),
             },
             config: ConfigState {
                 app_config: RwLock::new(app_config),
@@ -779,19 +784,7 @@ impl AppState {
                 mcp_health: RwLock::new(HashMap::new()),
             },
             storage: StorageState {
-                conversation_store: RwLock::new(conversation_store),
-                persistence: RwLock::new(Persistence::new()),
-                search_engine: {
-                    // U1c: in-memory substring engine (no SQLite/FTS5). Reindex
-                    // from session files on start; failures just mean an empty
-                    // index (search returns nothing until content is re-added).
-                    let engine = crate::sessions::SessionSearchEngine::new();
-                    match engine.reindex_all() {
-                        Ok(n) => tracing::info!("Session search index rebuilt: {n} sessions"),
-                        Err(e) => tracing::warn!("Session search reindex failed: {e}"),
-                    }
-                    engine
-                },
+                conversation: conversation_binding,
                 tool_executions: {
                     let root = crate::tool_execution::ToolExecutionRepository::default_root();
                     let repository =
@@ -818,12 +811,14 @@ impl AppState {
                                     fallback,
                                 )
                             });
+                    repository.register_artifact_config(initial_tool_output_artifacts);
                     Arc::new(repository)
                 },
+                chat_events: Arc::new(crate::chat_event_log::ChatEventLog::at_default_root()),
             },
             history: HistoryState {
                 audit_logs: RwLock::new(Vec::new()),
-                workflows: RwLock::new(HashMap::new()),
+                workflows: Arc::new(crate::workflow_service::WorkflowService::at_default_path()),
             },
             scheduler: SchedulerState {
                 runner: None,
@@ -893,6 +888,7 @@ impl AppState {
             review_integration: None,
             plugin_runtime: None,
             config_watcher: None,
+            terminal: crate::terminal::TerminalService::new(),
         }
     }
 
@@ -1260,6 +1256,119 @@ impl AppState {
         self
     }
 
+    /// Return the conversation store from the currently published workspace binding.
+    pub async fn conversation_store(&self) -> Option<Arc<dyn ConversationStore>> {
+        self.storage.conversation.read().await.store.clone()
+    }
+
+    /// Create a conversation under the same identity lock used by aggregate deletion.
+    pub async fn create_conversation_owned(
+        &self,
+        conversation: NewConversation,
+    ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
+    {
+        let _workspace = self.workspace.transition.lock().await;
+        let binding = self.storage.conversation.read().await;
+        let store = binding
+            .store
+            .as_ref()
+            .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
+        binding
+            .deletions
+            .create_conversation(store.as_ref(), conversation)
+            .await
+    }
+
+    /// Ensure a conversation under the same identity lock used by aggregate deletion.
+    pub async fn ensure_conversation_owned(
+        &self,
+        conversation: NewConversation,
+    ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
+    {
+        let _workspace = self.workspace.transition.lock().await;
+        let binding = self.storage.conversation.read().await;
+        let store = binding
+            .store
+            .as_ref()
+            .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
+        binding
+            .deletions
+            .ensure_conversation(store.as_ref(), conversation)
+            .await
+    }
+
+    /// Begin a real user turn through the durable conversation admission boundary.
+    pub async fn begin_conversation_turn_owned(
+        &self,
+        surface: crate::foreground_turn::ForegroundTurnSurface,
+        conversation_id: &str,
+        turn_id: impl Into<String>,
+    ) -> std::result::Result<
+        crate::foreground_turn::ForegroundTurnLease,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let binding = self.storage.conversation.read().await;
+        binding
+            .deletions
+            .begin_foreground_turn(
+                &self.session.foreground_turns,
+                surface,
+                conversation_id,
+                turn_id,
+            )
+            .await
+    }
+
+    /// Delete every application-owned projection before retiring transcript authority.
+    pub async fn delete_conversation_owned(
+        &self,
+        conversation_id: &str,
+    ) -> std::result::Result<
+        crate::conversation_deletion::ConversationDeletionReceipt,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let _workspace = self.workspace.transition.lock().await;
+        let binding = self.storage.conversation.read().await;
+        let artifact_config = self
+            .connection
+            .agent
+            .read(|agent| agent.tool_output_artifacts())
+            .await;
+        binding
+            .deletions
+            .delete(
+                conversation_id,
+                binding.store.clone(),
+                self.connection.pool.clone(),
+                self.tasks.runtime.clone(),
+                self.storage.tool_executions.clone(),
+                self.storage.chat_events.clone(),
+                binding.runtime_state.clone(),
+                &self.session.foreground_turns,
+                artifact_config,
+            )
+            .await
+    }
+
+    /// Resume finalizer cleanup that crossed the transcript commit boundary.
+    pub async fn recover_committed_conversation_deletions(
+        &self,
+    ) -> std::result::Result<
+        Vec<crate::conversation_deletion::ConversationDeletionReceipt>,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let _workspace = self.workspace.transition.lock().await;
+        let binding = self.storage.conversation.read().await;
+        let store = binding
+            .store
+            .as_ref()
+            .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
+        binding
+            .deletions
+            .recover_committed_deletions(store.as_ref())
+            .await
+    }
+
     /// Set the agent pool for multi-conversation parallel execution.
     ///
     /// Call this **before** wrapping in `Arc`.
@@ -1597,17 +1706,36 @@ impl AppState {
         );
         let runtime_store = crate::infra::create_runtime_state_store_in(&sessions_dir)
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace runtime state store"))?;
+        let deletion_service = Arc::new(
+            crate::conversation_deletion::ConversationDeletionService::new(
+                state_dir.join("conversation-deletions"),
+            ),
+        );
+        if let Err(error) = deletion_service
+            .recover_committed_deletions(conversation_store.as_ref())
+            .await
+        {
+            tracing::warn!(%error, "workspace conversation deletion recovery remains pending");
+        }
         let memory_store = crate::infra::create_memory_store_for_workspace(&root)
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare workspace memory store"))?;
         // Reserve the memory/evolution generation before the process cwd or
         // any runtime projection crosses the workspace commit boundary. A
         // running review/Dreaming pass returns a deterministic Busy error.
-        let mut memory_rebind_permit = self
-            .review_integration
-            .as_ref()
-            .map(|integration| integration.prepare_rebind(state_dir.clone(), memory_store.clone()))
-            .transpose()
-            .map_err(anyhow::Error::from)?;
+        let mut memory_rebind_permit = match self.review_integration.as_ref() {
+            Some(integration) => {
+                if integration.has_pending_rule_projection() {
+                    integration.initialize_rule_promotions().await?;
+                }
+                Some(
+                    integration
+                        .prepare_rebind(state_dir.clone(), memory_store.clone())?
+                        .reconcile_rule_promotions()
+                        .await?,
+                )
+            }
+            None => None,
+        };
         let mut pool_transition = match self.connection.pool.as_ref() {
             Some(pool) => Some(pool.preflight_workspace_transition().await?),
             None => None,
@@ -1628,7 +1756,7 @@ impl AppState {
         // trigger settlement is carried into the workspace receipt.
         let memory_rebind_receipt = memory_rebind_permit
             .as_mut()
-            .map(crate::evolution::ReviewRebindPermit::commit);
+            .map(crate::evolution::ReconciledReviewRebindPermit::commit);
         if let Some(pool_transition) = pool_transition.as_mut() {
             pool_transition.commit().await;
         }
@@ -1636,14 +1764,17 @@ impl AppState {
         // 更新 agent 的 working_dir 配置（影响 project rules 注入等）
         let new_wd = Some(workspace.root.clone());
         let primary_root = workspace.root.clone();
+        let artifact_config = crate::infra::tool_output_artifact_config(Some(&primary_root));
+        self.storage
+            .tool_executions
+            .register_artifact_config(artifact_config.clone());
         self.connection
             .agent
             .write_async(|agent| {
+                let artifact_config = artifact_config.clone();
                 Box::pin(async move {
                     agent.set_working_dir(Some(primary_root.clone()));
-                    agent.set_tool_output_artifacts(Some(
-                        crate::infra::tool_output_artifact_config(Some(&primary_root)),
-                    ));
+                    agent.set_tool_output_artifacts(Some(artifact_config));
                     crate::infra::refresh_dynamic_context(agent, Some(&primary_root)).await;
                 })
             })
@@ -1654,18 +1785,6 @@ impl AppState {
             pool.apply_working_dir(new_wd).await;
         }
 
-        // 重新初始化 persistence 以使用工作区路径
-        let new_persistence = Persistence::with_base_dir(sessions_dir.clone());
-        {
-            let mut persistence = self.storage.persistence.write().await;
-            *persistence = new_persistence;
-        }
-
-        // 重新初始化 conversation_store 到工作区的存储目录（U1c：文件后端）
-        {
-            let mut guard = self.storage.conversation_store.write().await;
-            *guard = Some(conversation_store.clone());
-        }
         self.connection
             .agent
             .write(|agent| {
@@ -1674,7 +1793,17 @@ impl AppState {
             })
             .await;
         if let Some(pool) = &self.connection.pool {
-            pool.apply_conversation_store(conversation_store).await;
+            pool.apply_conversation_store(conversation_store.clone())
+                .await;
+            pool.apply_state_store(runtime_store.clone()).await;
+        }
+        {
+            let mut binding = self.storage.conversation.write().await;
+            *binding = ConversationStorageBinding {
+                store: Some(conversation_store),
+                runtime_state: Some(runtime_store),
+                deletions: deletion_service,
+            };
         }
 
         // 重新初始化 memory store 到工作区的存储目录（物理隔离：动态记忆
@@ -1764,6 +1893,15 @@ impl AppState {
                 pool.apply_memory_store(&mem_root).await;
             }
         }
+        let rule_projection_error =
+            if let Some(review_integration) = self.review_integration.as_ref() {
+                review_integration
+                    .settle_rebind_rule_promotions(pool_transition.as_ref())
+                    .await
+                    .err()
+            } else {
+                None
+            };
 
         tracing::info!(
             workspace = %workspace.id,
@@ -1779,6 +1917,9 @@ impl AppState {
             && receipt.is_degraded()
         {
             degraded_subsystems.push(memory_rebind_degradation(state_dir.clone(), receipt));
+        }
+        if let Some(error) = rule_projection_error {
+            degraded_subsystems.push(memory_rule_projection_degradation(state_dir.clone(), error));
         }
         if let Some(task_transition) = task_transition.as_ref()
             && let Err(error) =
@@ -1908,17 +2049,31 @@ impl AppState {
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global conversation store"))?;
         let runtime_store = crate::infra::create_runtime_state_store()
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global runtime state store"))?;
+        let deletion_service =
+            Arc::new(crate::conversation_deletion::ConversationDeletionService::at_default_root());
+        if let Err(error) = deletion_service
+            .recover_committed_deletions(conversation_store.as_ref())
+            .await
+        {
+            tracing::warn!(%error, "global conversation deletion recovery remains pending");
+        }
         let memory_store = crate::infra::create_global_memory_store()
             .ok_or_else(|| anyhow::anyhow!("Failed to prepare global memory store"))?;
         let (_, prepared_global_echo_dir) = crate::infra::global_memory_paths();
-        let mut memory_rebind_permit = self
-            .review_integration
-            .as_ref()
-            .map(|integration| {
-                integration.prepare_rebind(prepared_global_echo_dir.clone(), memory_store.clone())
-            })
-            .transpose()
-            .map_err(anyhow::Error::from)?;
+        let mut memory_rebind_permit = match self.review_integration.as_ref() {
+            Some(integration) => {
+                if integration.has_pending_rule_projection() {
+                    integration.initialize_rule_promotions().await?;
+                }
+                Some(
+                    integration
+                        .prepare_rebind(prepared_global_echo_dir.clone(), memory_store.clone())?
+                        .reconcile_rule_promotions()
+                        .await?,
+                )
+            }
+            None => None,
+        };
         let mut pool_transition = match self.connection.pool.as_ref() {
             Some(pool) => Some(pool.preflight_workspace_transition().await?),
             None => None,
@@ -1931,50 +2086,47 @@ impl AppState {
         })?;
         let memory_rebind_receipt = memory_rebind_permit
             .as_mut()
-            .map(crate::evolution::ReviewRebindPermit::commit);
+            .map(crate::evolution::ReconciledReviewRebindPermit::commit);
         if let Some(pool_transition) = pool_transition.as_mut() {
             pool_transition.commit().await;
         }
 
-        // 重置 persistence 到全局默认路径
-        let global_persistence = Persistence::new();
-        {
-            let mut persistence = self.storage.persistence.write().await;
-            *persistence = global_persistence;
-        }
-
+        let artifact_config = crate::infra::tool_output_artifact_config(None);
+        self.storage
+            .tool_executions
+            .register_artifact_config(artifact_config.clone());
         self.connection
             .agent
             .write_async(|agent| {
+                let artifact_config = artifact_config.clone();
                 Box::pin(async move {
                     agent.set_working_dir(None);
-                    agent.set_tool_output_artifacts(Some(
-                        crate::infra::tool_output_artifact_config(None),
-                    ));
+                    agent.set_tool_output_artifacts(Some(artifact_config));
                     crate::infra::refresh_dynamic_context(agent, None).await;
                 })
             })
             .await;
 
-        // 重置 conversation_store 到全局默认路径（U1c：文件后端）
-        {
-            let store = conversation_store;
-            let mut guard = self.storage.conversation_store.write().await;
-            *guard = Some(store.clone());
-            drop(guard);
-            self.connection
-                .agent
-                .write(|agent| agent.set_conversation_store(store.clone()))
-                .await;
-            if let Some(pool) = &self.connection.pool {
-                pool.apply_conversation_store(store).await;
-            }
-        }
-
-        // 重置 runtime_state_store 到全局默认路径
         self.connection
             .agent
-            .try_write(|a| a.set_state_store(runtime_store));
+            .write(|agent| {
+                agent.set_conversation_store(conversation_store.clone());
+                agent.set_state_store(runtime_store.clone());
+            })
+            .await;
+        if let Some(pool) = &self.connection.pool {
+            pool.apply_conversation_store(conversation_store.clone())
+                .await;
+            pool.apply_state_store(runtime_store.clone()).await;
+        }
+        {
+            let mut binding = self.storage.conversation.write().await;
+            *binding = ConversationStorageBinding {
+                store: Some(conversation_store),
+                runtime_state: Some(runtime_store),
+                deletions: deletion_service,
+            };
+        }
 
         // 重置 memory store 到全局默认路径（~/.eko/store.json）。
         // 与 switch_workspace 的 memory 重载对称：exit 后动态记忆回到全局 store，
@@ -2058,6 +2210,15 @@ impl AppState {
         if let Some(ref pool) = self.connection.pool {
             pool.apply_working_dir(None).await;
         }
+        let rule_projection_error =
+            if let Some(review_integration) = self.review_integration.as_ref() {
+                review_integration
+                    .settle_rebind_rule_promotions(pool_transition.as_ref())
+                    .await
+                    .err()
+            } else {
+                None
+            };
 
         let general = crate::workspace::WorkspaceKind::General;
         self.connection
@@ -2077,7 +2238,16 @@ impl AppState {
         if let Some(receipt) = memory_rebind_receipt.as_ref()
             && receipt.is_degraded()
         {
-            degraded_subsystems.push(memory_rebind_degradation(prepared_global_echo_dir, receipt));
+            degraded_subsystems.push(memory_rebind_degradation(
+                prepared_global_echo_dir.clone(),
+                receipt,
+            ));
+        }
+        if let Some(error) = rule_projection_error {
+            degraded_subsystems.push(memory_rule_projection_degradation(
+                prepared_global_echo_dir,
+                error,
+            ));
         }
         if let Some(task_transition) = task_transition.as_ref()
             && let Err(error) =
@@ -2155,15 +2325,6 @@ impl AppState {
 
         tracing::info!("Exited workspace, using global default paths");
         Ok(receipt)
-    }
-
-    /// 获取工作区感知的 sessions 目录。
-    pub async fn sessions_dir(&self) -> std::path::PathBuf {
-        if let Some(ref ws) = *self.workspace.current.read().await {
-            crate::workspace::layout::WorkspaceLayout::sessions(&ws.root)
-        } else {
-            Persistence::base_dir()
-        }
     }
 }
 
@@ -2629,6 +2790,7 @@ mod model_mutation_tests {
             primary,
             Some(primary_consumers),
             Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
             None,
             config,
             mcp_runtime,
@@ -3630,6 +3792,11 @@ mod workspace_transition_tests {
             )
             .await,
         );
+        integration.bind_rule_projection_primary(agent.clone());
+        integration
+            .bind_rule_projection_pool(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
         let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
             temp.path().join("mcp.json"),
             Default::default(),
@@ -3638,6 +3805,7 @@ mod workspace_transition_tests {
             agent,
             None,
             Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
             None,
             Default::default(),
             mcp_runtime,
@@ -3653,7 +3821,7 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
 
         // Acquire the parking execution while the generation is healthy. The
-        // fault below intentionally makes new layer-manager construction fail.
+        // trigger and projection fault below arrive after rebind preparation.
         let pool_execution = pool
             .acquire("memory-transition-parking-run")
             .await
@@ -3689,6 +3857,8 @@ mod workspace_transition_tests {
         })
         .await
         .map_err(|_| "memory transition did not enter rebind admission".to_string())??;
+
+        integration.inject_pool_projection_fault_for_test();
 
         let trigger = echo_agent::evolution::TriggerMatch {
             content: "workspace A uses a pinned memory root".to_string(),
@@ -3727,6 +3897,14 @@ mod workspace_transition_tests {
         assert_eq!(memory.target_root, target_state_dir);
         assert_eq!(memory.stale_roots, vec![stale_state_dir.clone()]);
         assert!(memory.error.contains("1 trigger(s) remain owned for retry"));
+        let projection = receipt
+            .degraded_subsystems
+            .iter()
+            .find(|subsystem| subsystem.subsystem == "memory_rule_projection")
+            .ok_or_else(|| "missing memory_rule_projection degradation".to_string())?;
+        assert_eq!(projection.target_root, target_state_dir);
+        assert!(projection.stale_roots.is_empty());
+        assert!(projection.error.contains("injected pool"));
         assert_eq!(integration.trigger_delivery_status().pending, 1);
         let published = integration
             .lease_generation()
@@ -3735,6 +3913,21 @@ mod workspace_transition_tests {
         drop(published);
 
         std::fs::remove_file(&blocked_evolution).map_err(|error| error.to_string())?;
+        drop(
+            integration
+                .lease_generation()
+                .map_err(|error| error.to_string())?,
+        );
+        let retry_store = Arc::new(echo_agent::memory::InMemoryStore::new())
+            as Arc<dyn echo_agent::memory::Store>;
+        assert!(matches!(
+            integration.prepare_rebind(canonical_root_a.join("retry/.eko"), retry_store),
+            Err(crate::evolution::ReviewGenerationError::ProjectionSettlement { .. })
+        ));
+        integration
+            .initialize_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
         let retried = integration
             .lease_generation()
             .map_err(|error| error.to_string())?;
@@ -3814,6 +4007,7 @@ mod workspace_transition_tests {
             agent,
             None,
             Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
             None,
             Default::default(),
             mcp_runtime,
@@ -3900,7 +4094,7 @@ mod workspace_transition_tests {
             .shutdown()
             .await
             .map_err(|error| error.to_string())?;
-        let persistence_write = state.storage.persistence.write().await;
+        let conversation_binding_write = state.storage.conversation.write().await;
         let detached_state = Arc::clone(&state);
         let detached_root = root_b.clone();
         let caller = tokio::spawn(async move {
@@ -3926,7 +4120,7 @@ mod workspace_transition_tests {
         caller.abort();
         let caller_result = caller.await;
         assert!(caller_result.is_err_and(|error| error.is_cancelled()));
-        drop(persistence_write);
+        drop(conversation_binding_write);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             state.shutdown_workspace_transition(),
@@ -4071,6 +4265,7 @@ mod service_bootstrap_tests {
             AgentHandle::new(agent),
             None,
             Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
             None,
             Default::default(),
             mcp_runtime,

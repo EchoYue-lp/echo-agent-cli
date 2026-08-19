@@ -9,7 +9,8 @@
 
 import { useChatStore } from '../stores/chatStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
-import type { ChatEvent } from '../types/api';
+import type { AgentEvent, ChatEvent, ChatEventEnvelope, ChatRunStatus } from '../types/api';
+import { recordTerminalStatusForTurn, terminalStatusForTurn } from './chatEventSequencer';
 
 interface EventContext {
   assistantIdRef: React.MutableRefObject<string | null>;
@@ -17,6 +18,166 @@ interface EventContext {
   currentMessageIdRef: React.MutableRefObject<string | null>;
   isCancelledRef: React.MutableRefObject<boolean>;
   currentThinkingIdRef: React.MutableRefObject<string | null>;
+}
+
+export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventContext): void {
+  const payload = envelope.payload;
+  const terminalAlreadyEstablished =
+    terminalStatusForTurn(envelope.stream_id, envelope.turn_id) !== null;
+  if (
+    terminalAlreadyEstablished &&
+    payload.source !== 'agent' &&
+    payload.source !== 'turn_status'
+  ) {
+    return;
+  }
+  switch (payload.source) {
+    case 'agent': {
+      const terminalStatus = agentTerminalStatus(payload.event.payload);
+      if (!terminalStatus && terminalAlreadyEstablished) return;
+      if (
+        terminalStatus &&
+        !recordTerminalStatusForTurn(envelope.stream_id, envelope.turn_id, terminalStatus)
+      ) {
+        return;
+      }
+      handleAgentEvent(payload.event.payload, ctx);
+      break;
+    }
+    case 'turn_status': {
+      const terminalStatus = turnTerminalStatus(payload.event.status);
+      if (!terminalStatus && terminalAlreadyEstablished) return;
+      if (
+        terminalStatus &&
+        !recordTerminalStatusForTurn(envelope.stream_id, envelope.turn_id, terminalStatus)
+      ) {
+        handleChatEvent({ type: 'done' }, ctx);
+        return;
+      }
+      handleChatEvent({ type: 'run_status', status: payload.event.status }, ctx);
+      if (terminalStatus) handleChatEvent({ type: 'done' }, ctx);
+      break;
+    }
+    case 'execution_path':
+      handleChatEvent({ type: 'execution_path', ...payload.event }, ctx);
+      break;
+    case 'interrupt':
+      handleChatEvent({ type: 'interrupt_prompt', ...payload.event }, ctx);
+      break;
+    case 'approval_request':
+      handleChatEvent({ type: 'approval_request', ...payload.event }, ctx);
+      break;
+    case 'input_request':
+      handleChatEvent({ type: 'input_request', ...payload.event }, ctx);
+      break;
+    case 'selection_request':
+      handleChatEvent({ type: 'selection_request', ...payload.event }, ctx);
+      break;
+    case 'context_compressed':
+      handleChatEvent({ type: 'context_compressed', ...payload.event }, ctx);
+      break;
+    case 'execution':
+      // The exact payload remains in the durable envelope. The dedicated
+      // execution projection updates the TaskRuntime store.
+      break;
+    default:
+      assertNever(payload, 'chat driver event');
+  }
+}
+
+function agentTerminalStatus(
+  event: AgentEvent
+): Extract<ChatRunStatus, 'completed' | 'failed' | 'cancelled'> | null {
+  switch (event.type) {
+    case 'final_answer':
+      return 'completed';
+    case 'cancelled':
+      return 'cancelled';
+    case 'error':
+      return event.data.failure.terminal_kind === 'cancelled' ? 'cancelled' : 'failed';
+    default:
+      return null;
+  }
+}
+
+function turnTerminalStatus(
+  status: ChatRunStatus
+): Extract<ChatRunStatus, 'completed' | 'failed' | 'cancelled'> | null {
+  return status === 'completed' || status === 'failed' || status === 'cancelled' ? status : null;
+}
+
+function handleAgentEvent(event: AgentEvent, ctx: EventContext): void {
+  switch (event.type) {
+    case 'token':
+      handleChatEvent({ type: 'token', data: event.data }, ctx);
+      break;
+    case 'think_start':
+      handleChatEvent({ type: 'run_status', status: 'thinking' }, ctx);
+      handleChatEvent({ type: 'thinking_start' }, ctx);
+      break;
+    case 'think_end':
+      handleChatEvent({ type: 'thinking_end', ...event.data }, ctx);
+      break;
+    case 'llm_usage':
+      handleChatEvent({ type: 'llm_usage', ...event.data }, ctx);
+      break;
+    case 'context_compressed':
+      handleChatEvent({ type: 'context_compressed', ...event.data }, ctx);
+      break;
+    case 'tool_call':
+      handleChatEvent({ type: 'run_status', status: 'using_tool' }, ctx);
+      break;
+    case 'tool_batch_start':
+      handleChatEvent({ type: 'tool_batch_start', tool_count: event.data.tool_count }, ctx);
+      break;
+    case 'tool_batch_end':
+      handleChatEvent({ type: 'tool_batch_end' }, ctx);
+      break;
+    case 'chart':
+      handleChatEvent({ type: 'chart', spec: event.data.spec }, ctx);
+      break;
+    case 'final_answer':
+      handleChatEvent({ type: 'final_answer', data: event.data }, ctx);
+      break;
+    case 'cancelled':
+      handleChatEvent({ type: 'cancelled' }, ctx);
+      break;
+    case 'error':
+      if (event.data.failure.terminal_kind === 'cancelled') {
+        handleChatEvent({ type: 'cancelled' }, ctx);
+      } else {
+        handleChatEvent(
+          { type: 'error', message: `${event.data.source}: ${event.data.message}` },
+          ctx
+        );
+      }
+      break;
+    case 'budget_decision':
+    case 'guard_triggered':
+    case 'memory_recalled':
+    case 'safety_notice':
+    case 'parameter_error':
+      handleChatEvent(
+        {
+          type: 'notice',
+          level: 'info',
+          code: event.type,
+          message: JSON.stringify(event.data),
+        },
+        ctx
+      );
+      break;
+    case 'tool_stream':
+    case 'tool_result':
+      // Tool facts are rendered from the already-persisted detail projection.
+      break;
+    default:
+      assertNever(event, 'agent event');
+  }
+}
+
+function assertNever(value: never, label: string): never {
+  throw new Error(`Unsupported ${label}: ${JSON.stringify(value)}`);
 }
 
 export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
@@ -104,8 +265,6 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
         store.finalizeAssistantMessage(id, event.data);
       }
       ctx.assistantIdRef.current = null;
-      ctx.currentMessageKeyRef.current = null;
-      ctx.currentMessageIdRef.current = null;
       break;
     }
     case 'approval_request': {
@@ -149,37 +308,36 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
         store.setRunStatus('failed');
       }
       ctx.assistantIdRef.current = null;
-      ctx.currentMessageKeyRef.current = null;
-      ctx.currentMessageIdRef.current = null;
       break;
     }
     case 'cancelled': {
       store.setRunStatus('cancelled');
+      if (ctx.assistantIdRef.current) {
+        store.settleAssistantMessage(ctx.assistantIdRef.current);
+      }
       ctx.assistantIdRef.current = null;
-      ctx.currentMessageKeyRef.current = null;
-      ctx.currentMessageIdRef.current = null;
-      ctx.isCancelledRef.current = false;
+      // Preserve the terminal guard until TurnStatus closes the stream. This
+      // rejects late deltas and a contradictory completed status.
+      ctx.isCancelledRef.current = true;
       break;
     }
     case 'run_status': {
-      // Narrow the string status to ChatRunStatus without `as any` (P1-40).
       if (!ctx.isCancelledRef.current) {
-        const status = (event.status ?? 'idle') as string;
-        const VALID_STATUSES = [
-          'idle',
-          'running',
-          'thinking',
-          'using_tool',
-          'waiting_approval',
-          'waiting_input',
-          'completed',
-          'failed',
-          'cancelled',
-        ] as const;
-        const validated = VALID_STATUSES.includes(status as (typeof VALID_STATUSES)[number])
-          ? (status as (typeof VALID_STATUSES)[number])
-          : 'idle';
-        store.setRunStatus(validated);
+        switch (event.status) {
+          case 'idle':
+          case 'running':
+          case 'thinking':
+          case 'using_tool':
+          case 'waiting_approval':
+          case 'waiting_input':
+          case 'completed':
+          case 'failed':
+          case 'cancelled':
+            store.setRunStatus(event.status);
+            break;
+          default:
+            assertNever(event.status, 'chat run status');
+        }
       }
       break;
     }
@@ -210,8 +368,14 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'done': {
       store.clearHitlRequests();
-      if (ctx.assistantIdRef.current && !ctx.isCancelledRef.current) {
-        store.finalizeAssistantMessage(ctx.assistantIdRef.current, '');
+      const terminalStatus = useChatStore.getState().runStatus;
+      const preservesFailure = terminalStatus === 'failed' || terminalStatus === 'cancelled';
+      if (ctx.assistantIdRef.current) {
+        if (preservesFailure) {
+          store.settleAssistantMessage(ctx.assistantIdRef.current);
+        } else if (!ctx.isCancelledRef.current) {
+          store.finalizeAssistantMessage(ctx.assistantIdRef.current, '');
+        }
       }
       ctx.assistantIdRef.current = null;
       ctx.currentMessageKeyRef.current = null;

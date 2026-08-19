@@ -83,7 +83,7 @@ describe('TaskRuntime tool execution recovery', () => {
     expect(mergeTaskRuntimeToolExecutions([persisted], fallback)).toEqual([persisted]);
   });
 
-  it('uses a durable TaskRuntime terminal fact over a stale recovered cancellation', () => {
+  it('never overwrites a canonical detail terminal with a flattened runtime boundary', () => {
     const fallback = taskRuntimeToolExecutions(run, runtimeEvents());
     const recovered: ToolExecution = {
       id: 'detail-recovered',
@@ -100,14 +100,7 @@ describe('TaskRuntime tool execution recovery', () => {
       detail_ref: 'detail-recovered',
     };
 
-    expect(mergeTaskRuntimeToolExecutions([recovered], fallback)).toEqual([
-      expect.objectContaining({
-        id: 'detail-recovered',
-        detail_ref: 'detail-recovered',
-        args_preview: '{"path":"src/main.rs"}',
-        status: 'succeeded',
-      }),
-    ]);
+    expect(mergeTaskRuntimeToolExecutions([recovered], fallback)).toEqual([recovered]);
   });
 
   it('preserves the start timestamp when a terminal event arrives incrementally', () => {
@@ -119,7 +112,7 @@ describe('TaskRuntime tool execution recovery', () => {
     expect(tool).toMatchObject({ status: 'succeeded', duration_ms: 1500 });
   });
 
-  it('updates a detailed stale cancellation when a runtime terminal event arrives', () => {
+  it('keeps a detailed canonical terminal when a flattened runtime event arrives', () => {
     const recovered: ToolExecution = {
       id: 'detail-recovered',
       call_id: 'call-1',
@@ -139,7 +132,7 @@ describe('TaskRuntime tool execution recovery', () => {
     ingestTaskRuntimeToolExecutions(run, runtimeEvents());
 
     expect(useToolExecutionStore.getState().tools['detail-recovered']).toMatchObject({
-      status: 'succeeded',
+      status: 'cancelled',
       detail_ref: 'detail-recovered',
     });
   });

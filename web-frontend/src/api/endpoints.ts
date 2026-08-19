@@ -398,13 +398,15 @@ export const sandboxApi = {
 };
 
 export const compressApi = {
-  trigger: (options?: { keep_messages?: number }) =>
+  trigger: (options?: { keep_messages?: number; conversation_id?: string }) =>
     isTauri()
-      ? apiInvoke<CompressResponse>('compress_context')
+      ? apiInvoke<CompressResponse>('compress_context', {
+          conversationId: options?.conversation_id,
+        })
       : post<CompressResponse>('/compress', options),
-  getStats: () =>
+  getStats: (conversationId?: string) =>
     isTauri()
-      ? apiInvoke<CompressionStats>('get_compression_stats')
+      ? apiInvoke<CompressionStats>('get_compression_stats', { conversationId })
       : get<CompressionStats>('/compress/stats'),
 };
 
@@ -466,8 +468,18 @@ export const conversationApi = {
         }>(`/conversations/${id}/branch`, { user_turn_index: userTurnIndex }),
   delete: (id: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('delete_conversation', { id })
-      : del<{ success: boolean }>(`/conversations/${id}`),
+      ? apiInvoke<{
+          success: boolean;
+          conversation_id: string;
+          resumed: boolean;
+          cleanup_pending: boolean;
+        }>('delete_conversation', { id })
+      : del<{
+          success: boolean;
+          conversation_id?: string;
+          resumed?: boolean;
+          cleanup_pending?: boolean;
+        }>(`/conversations/${id}`),
   export: (id: string) =>
     isTauri()
       ? apiInvoke<{ format: string; content: string; id: string }>('export_conversation', { id })

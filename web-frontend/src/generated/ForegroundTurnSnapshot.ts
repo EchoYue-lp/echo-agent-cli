@@ -7,6 +7,9 @@ import type { ForegroundTurnSurface } from './ForegroundTurnSurface';
 export type ForegroundTurnSnapshot = {
   surface: ForegroundTurnSurface;
   conversation_id: string;
-  turn_id: string;
+  /** Stable root identity used by the surface message and its events. */
+  root_turn_id: string;
+  /** Current framework turn identity used for exact steer/cancel requests. */
+  active_turn_id: string;
   cancellation_requested: boolean;
 };

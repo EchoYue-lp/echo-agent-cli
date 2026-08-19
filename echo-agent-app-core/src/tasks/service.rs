@@ -338,7 +338,7 @@ impl BackgroundTaskService {
         };
         let task_kind = format!("bg:kind:{source_kind}_composite");
         registration.mark_preparation_started();
-        if let Err(error) = self.task_runtime_store.create_run_for_active_workspace(
+        let run = match self.task_runtime_store.prepare_run_for_active_workspace(
             &run_id,
             &conversation_id,
             "",
@@ -347,11 +347,23 @@ impl BackgroundTaskService {
             &task_kind,
             AttendedMode::Unattended,
         ) {
-            registration.fail_preparation(error.to_string());
-            return Err(error.into());
-        }
-        if let Err(error) = super::task_runtime::commit_eko_task_plan(
+            Ok(run) => run,
+            Err(error) => {
+                registration.reject(error.to_string());
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = super::task_runtime::revisioned_adapter::publish_eko_task_plan(
             self.task_runtime_store.clone(),
+            run,
+            super::task_runtime::store::InitialRunTriggerMetadata {
+                source: source_id.to_string(),
+                kind: task_kind.clone(),
+                prompt: goal.to_string(),
+                priority: 5,
+                dependencies: Vec::new(),
+            },
+            Some((true, true, None, None)),
             TaskPlan {
                 plan_id: uuid::Uuid::new_v4().to_string(),
                 run_id: run_id.clone(),
@@ -367,25 +379,7 @@ impl BackgroundTaskService {
         )
         .await
         {
-            registration.fail_preparation(error.to_string());
-            return Err(error.into());
-        }
-        if let Err(error) = self
-            .task_runtime_store
-            .configure_run_continuation(&run_id, true, true, None, None)
-        {
-            registration.fail_preparation(error.to_string());
-            return Err(error.into());
-        }
-        if let Err(error) = self.task_runtime_store.record_trigger_metadata(
-            &run_id,
-            source_id,
-            &task_kind,
-            goal,
-            5,
-            &[],
-        ) {
-            registration.fail_preparation(error.to_string());
+            registration.reject(error.to_string());
             return Err(error.into());
         }
         self.start_run_driver(
@@ -1173,6 +1167,83 @@ mod tests {
             .ok_or_else(|| "background continuation policy missing".to_string())?;
         assert!(continuation.enabled);
         assert!(continuation.auto_resume_after_restart);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dag_submission_crash_before_publish_leaves_no_visible_run_or_driver()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        store.fail_next_initial_publish_before_rename();
+        let service = BackgroundTaskService::new(
+            test_agent()?,
+            CancellationToken::new(),
+            Some(store.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let result = service
+            .submit_dag(
+                vec![PlanTask {
+                    id: "inspect".to_string(),
+                    title: "Inspect runtime".to_string(),
+                    kind: PlanTaskKind::Investigation,
+                    agent_role: "explorer".to_string(),
+                    ..PlanTask::default()
+                }],
+                "inspect runtime",
+                "test",
+                "atomic-publish",
+            )
+            .await;
+        assert!(result.is_err());
+        store
+            .clone()
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            store
+                .active_run_driver_count()
+                .map_err(|error| error.to_string())?,
+            0
+        );
+        let has_visible_run = std::fs::read_dir(&root)
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| !name.starts_with(".preparing-"))
+            });
+        assert!(!has_visible_run);
+        drop(service);
+        drop(store);
+
+        let restarted = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        assert!(
+            std::fs::read_dir(&root)
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .all(|entry| entry
+                    .file_name()
+                    .to_str()
+                    .is_none_or(|name| !name.starts_with(".preparing-")))
+        );
+        restarted
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 

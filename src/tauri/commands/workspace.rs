@@ -156,8 +156,7 @@ pub async fn switch_workspace(
 
                 // Immediately verify conversation store by listing conversations
                 let conv_count = {
-                    let store_guard = state.app_state.storage.conversation_store.read().await;
-                    if let Some(store) = store_guard.as_ref() {
+                    if let Some(store) = state.app_state.conversation_store().await {
                         let filter = echo_agent::memory::ConversationFilter::default();
                         match store.list_conversations(filter).await {
                             Ok(list) => list.len(),

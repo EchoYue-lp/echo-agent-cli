@@ -74,6 +74,11 @@ pub enum StoreError {
     Shadow(#[from] super::file_shadow::ShadowError),
     #[error("run {run_id} has unresolved recovery barriers: {details}")]
     RecoveryBlocked { run_id: String, details: String },
+    #[error("conversation {conversation_id} still has active task runs: {run_ids:?}")]
+    ConversationHasActiveRuns {
+        conversation_id: String,
+        run_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +181,194 @@ pub enum BootAutoResumeOutcome {
     Resumed(Box<TaskRun>),
     WaitingUntil(DateTime<Utc>),
     Blocked(Vec<BootAutoResumeBlocker>),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct InitialRunTriggerMetadata {
+    pub source: String,
+    pub kind: String,
+    pub prompt: String,
+    pub priority: u8,
+    pub dependencies: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_pending_run(
+    run_id: &str,
+    workspace_id: &str,
+    conversation_id: &str,
+    root_message_id: &str,
+    domain_profile: DomainProfile,
+    goal: &str,
+    route: &str,
+    attended_mode: AttendedMode,
+) -> TaskRun {
+    let now = Utc::now();
+    TaskRun {
+        run_id: run_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+        root_message_id: root_message_id.to_string(),
+        domain_profile,
+        status: TaskRunStatus::Pending,
+        goal: goal.to_string(),
+        goal_revision: 1,
+        goal_sha256: task_goal_sha256(goal),
+        plan_id: None,
+        route: route.to_string(),
+        attended_mode,
+        attachments: Vec::new(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+struct PreparedRevisionCommit {
+    next: echo_agent::tasks::RevisionedTaskGraph,
+    plan: PlanRevision,
+    payload: serde_json::Value,
+}
+
+fn prepare_revisioned_graph_commit(
+    run_id: &str,
+    run: &TaskRun,
+    current: Option<&echo_agent::tasks::RevisionedTaskGraph>,
+    commit: echo_agent::tasks::TaskGraphCommit,
+) -> Result<PreparedRevisionCommit, StoreError> {
+    let echo_agent::tasks::TaskGraphCommit {
+        expected_revision,
+        next,
+        reason,
+        effects,
+    } = commit;
+    let current_revision = current.map(|graph| graph.snapshot.revision);
+    if current_revision != expected_revision {
+        return Err(StoreError::PlanConflict {
+            run_id: run_id.to_string(),
+            expected: expected_revision.unwrap_or_default(),
+            current: current_revision.unwrap_or_default(),
+        });
+    }
+    let next_revision = expected_revision
+        .unwrap_or_default()
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidPlan("plan revision overflow".to_string()))?;
+    if next.snapshot.revision != next_revision {
+        return Err(StoreError::InvalidPlan(format!(
+            "invalid next plan revision: expected {next_revision}, got {}",
+            next.snapshot.revision
+        )));
+    }
+    let previous_task_ids = current
+        .map(|graph| {
+            graph
+                .snapshot
+                .tasks
+                .iter()
+                .map(|task| task.spec.id.as_str())
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let plan_metadata: EkoPlanMetadata = serde_json::from_value(next.context.metadata.clone())?;
+    if next.context.goal != run.goal {
+        return Err(StoreError::GoalUpdateRejected {
+            run_id: run_id.to_string(),
+            reason: "TaskPlan cannot modify the authoritative TaskRun Goal".to_string(),
+        });
+    }
+    if let Some(current) = current {
+        let current_metadata: EkoPlanMetadata =
+            serde_json::from_value(current.context.metadata.clone())?;
+        if plan_metadata.goal_revision != current_metadata.goal_revision
+            || plan_metadata.goal_sha256 != current_metadata.goal_sha256
+        {
+            return Err(StoreError::GoalUpdateRejected {
+                run_id: run_id.to_string(),
+                reason: "TaskPlan Goal binding can only advance through update_run_goal"
+                    .to_string(),
+            });
+        }
+    } else if plan_metadata.goal_revision != run.goal_revision
+        || plan_metadata.goal_sha256 != run.goal_sha256
+    {
+        return Err(StoreError::GoalUpdateRejected {
+            run_id: run_id.to_string(),
+            reason: "initial TaskPlan Goal binding does not match TaskRun".to_string(),
+        });
+    }
+    let mut specifications = Vec::with_capacity(next.snapshot.tasks.len());
+    for task in &next.snapshot.tasks {
+        if task.spec.id != task.execution.task_id {
+            return Err(StoreError::InvalidPlan(format!(
+                "task spec id '{}' does not match execution id '{}'",
+                task.spec.id, task.execution.task_id
+            )));
+        }
+        let metadata: EkoTaskMetadata = serde_json::from_value(task.spec.metadata.clone())?;
+        specifications.push(EkoTaskSpec {
+            id: task.spec.id.clone(),
+            title: task.spec.title.clone(),
+            description: task.spec.description.clone(),
+            kind: PlanTaskKind::from_task_kind(task.spec.kind),
+            agent_role: task.spec.agent_role.clone(),
+            domain_profile: metadata.domain_profile,
+            depends_on: task.spec.depends_on.clone(),
+            parallel_group: metadata.parallel_group,
+            files: task.spec.files.clone(),
+            allowed_tools: task.spec.allowed_tools.clone(),
+            required_artifacts: task.spec.required_artifacts.clone(),
+            execution_checks: task.spec.execution_checks.clone(),
+            acceptance_criteria: task.spec.acceptance_criteria.clone(),
+            max_retries: task.spec.max_retries,
+            sort_order: metadata.sort_order,
+        });
+    }
+    if expected_revision.is_none()
+        && next.snapshot.tasks.iter().any(|task| {
+            task.execution.status != echo_agent::tasks::TaskStatus::Pending
+                || task.execution.retry_count != 0
+                || task.execution.failure_fingerprint.is_some()
+                || task.execution.claim.is_some()
+        })
+    {
+        return Err(StoreError::InvalidPlan(
+            "initial plan tasks must have pending execution state".to_string(),
+        ));
+    }
+    let plan = PlanRevision {
+        plan_id: plan_metadata.plan_id,
+        run_id: run_id.to_string(),
+        revision: next.snapshot.revision,
+        domain_profile: plan_metadata.domain_profile,
+        goal_revision: run.goal_revision,
+        goal_sha256: run.goal_sha256.clone(),
+        assumptions: next.context.assumptions.clone(),
+        risks: next.context.risks.clone(),
+        execution_mode: match next.context.execution_mode {
+            echo_agent::tasks::TaskGraphExecutionMode::Sequential => ExecutionMode::Sequential,
+            echo_agent::tasks::TaskGraphExecutionMode::Parallel => ExecutionMode::Parallel,
+        },
+        tasks: specifications,
+    };
+    let created_task_ids = plan
+        .tasks
+        .iter()
+        .filter(|task| !previous_task_ids.contains(task.id.as_str()))
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "base_revision": expected_revision.unwrap_or_default(),
+        "reason": reason,
+        "skipped_task_ids": effects.skipped_task_ids,
+        "reset_task_ids": effects.reset_task_ids,
+        "created_task_ids": created_task_ids,
+        "plan": &plan,
+    });
+    Ok(PreparedRevisionCommit {
+        next,
+        plan,
+        payload,
+    })
 }
 
 /// Bounded control-plane facts produced by one finite primary-Agent turn.
@@ -321,6 +514,10 @@ pub struct TaskRuntimeStore {
         std::sync::Mutex<Option<RunDriverRegistrationTestBarrier>>,
     #[cfg(test)]
     fail_next_run_driver_registration: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_recovery_commit: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_recovery_projection: std::sync::atomic::AtomicBool,
     /// File-backed event authority and deterministic projections.
     pub(super) shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     shadow_generation: std::sync::Mutex<ShadowGeneration>,
@@ -913,24 +1110,6 @@ impl Drop for RunCancellationRegistration {
 }
 
 impl TaskRuntimeStore {
-    pub(crate) fn abort_unpublished_run_creation(&self, run_id: &str) -> Result<bool, StoreError> {
-        let _operation = self.shadow_operation()?;
-        let removed = self.shadow.remove_unpublished_run(run_id)?;
-        if removed {
-            let task_prefix = format!("{run_id}::");
-            self.task_cancel_tokens
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .retain(|key, _| !key.starts_with(&task_prefix));
-            self.run_cancel_tokens
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remove(run_id);
-            self.plan_locks.remove(run_id);
-        }
-        Ok(removed)
-    }
-
     /// Whether the process runtime still accepts new finite TaskRun drivers.
     /// Long-horizon coordinators use this to stop cleanly during application
     /// shutdown and leave durable recovery to the next process.
@@ -975,6 +1154,10 @@ impl TaskRuntimeStore {
             run_driver_registration_test_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_next_run_driver_registration: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_recovery_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_recovery_projection: std::sync::atomic::AtomicBool::new(false),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
@@ -1021,6 +1204,10 @@ impl TaskRuntimeStore {
             run_driver_registration_test_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             fail_next_run_driver_registration: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_recovery_commit: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_recovery_projection: std::sync::atomic::AtomicBool::new(false),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
@@ -1427,6 +1614,18 @@ impl TaskRuntimeStore {
     #[cfg(test)]
     pub(crate) fn fail_next_run_driver_registration_for_test(&self) {
         self.fail_next_run_driver_registration
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_recovery_commit_for_test(&self) {
+        self.fail_next_recovery_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_recovery_projection_for_test(&self) {
+        self.fail_next_recovery_projection
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -2242,6 +2441,33 @@ impl TaskRuntimeStore {
         )
     }
 
+    /// Construct a pending run bound to the active workspace without making it
+    /// visible. The caller must publish it with a framework-validated revision
+    /// through `compare_and_publish_initial_revisioned_task_graph`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_run_for_active_workspace(
+        &self,
+        run_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+        route: &str,
+        attended_mode: AttendedMode,
+    ) -> Result<TaskRun, StoreError> {
+        let _operation = self.shadow_operation()?;
+        Ok(new_pending_run(
+            run_id,
+            &self.active_workspace_id(),
+            conversation_id,
+            root_message_id,
+            domain_profile,
+            goal,
+            route,
+            attended_mode,
+        ))
+    }
+
     /// Build a `FileTaskStore` over the shadow, for read delegation.
     fn file_store(&self) -> Result<ShadowFileStore<'_>, StoreError> {
         let operation = self.shadow_operation()?;
@@ -2272,25 +2498,16 @@ impl TaskRuntimeStore {
                 return Ok(existing);
             }
 
-            let now = Utc::now();
-            let goal_sha256 = task_goal_sha256(goal);
-            let run = TaskRun {
-                run_id: run_id.to_string(),
-                workspace_id: workspace_id.to_string(),
-                conversation_id: conversation_id.to_string(),
-                root_message_id: root_message_id.to_string(),
+            let run = new_pending_run(
+                run_id,
+                workspace_id,
+                conversation_id,
+                root_message_id,
                 domain_profile,
-                status: TaskRunStatus::Pending,
-                goal: goal.to_string(),
-                goal_revision: 1,
-                goal_sha256: goal_sha256.clone(),
-                plan_id: None,
-                route: route.to_string(),
+                goal,
+                route,
                 attended_mode,
-                attachments: Vec::new(),
-                created_at: now,
-                updated_at: now,
-            };
+            );
 
             // U1c phase-0/0bc step-2: file is the write authority. Append the
             // RunCreated event to events.jsonl and rebuild plan.json — no SQL
@@ -2303,7 +2520,7 @@ impl TaskRuntimeStore {
                 serde_json::json!({
                     "goal": goal,
                     "goal_revision": run.goal_revision,
-                    "goal_sha256": goal_sha256,
+                    "goal_sha256": run.goal_sha256,
                     "domain_profile": domain_profile.as_str(),
                     "workspace_id": run.workspace_id,
                     "conversation_id": run.conversation_id,
@@ -3312,11 +3529,6 @@ impl TaskRuntimeStore {
             let run = self
                 .get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            let previous_plan = self.get_plan(run_id)?;
-            let previous_requirements = previous_plan
-                .as_ref()
-                .map(super::completion_gate::requirements_for_plan)
-                .unwrap_or_default();
             if matches!(
                 run.status,
                 TaskRunStatus::Completed | TaskRunStatus::Cancelled
@@ -3326,133 +3538,18 @@ impl TaskRuntimeStore {
                     run_id, run.status
                 )));
             }
-            let current = self.load_revisioned_task_graph(run_id)?;
-            let previous_task_ids = current
+            let previous_plan = self.get_plan(run_id)?;
+            let previous_requirements = previous_plan
                 .as_ref()
-                .map(|graph| {
-                    graph
-                        .snapshot
-                        .tasks
-                        .iter()
-                        .map(|task| task.spec.id.as_str())
-                        .collect::<std::collections::HashSet<_>>()
-                })
+                .map(super::completion_gate::requirements_for_plan)
                 .unwrap_or_default();
-            let current_revision = current.as_ref().map(|graph| graph.snapshot.revision);
-            if current_revision != commit.expected_revision {
-                return Err(StoreError::PlanConflict {
-                    run_id: run_id.to_string(),
-                    expected: commit.expected_revision.unwrap_or_default(),
-                    current: current_revision.unwrap_or_default(),
-                });
-            }
-            let expected_revision = commit
-                .expected_revision
-                .unwrap_or_default()
-                .checked_add(1)
-                .ok_or_else(|| StoreError::InvalidPlan("plan revision overflow".to_string()))?;
-            if commit.next.snapshot.revision != expected_revision {
-                return Err(StoreError::InvalidPlan(format!(
-                    "invalid next plan revision: expected {expected_revision}, got {}",
-                    commit.next.snapshot.revision
-                )));
-            }
-            let plan_metadata: EkoPlanMetadata =
-                serde_json::from_value(commit.next.context.metadata.clone())?;
-            if commit.next.context.goal != run.goal {
-                return Err(StoreError::GoalUpdateRejected {
-                    run_id: run_id.to_string(),
-                    reason: "TaskPlan cannot modify the authoritative TaskRun Goal".to_string(),
-                });
-            }
-            if let Some(current) = current.as_ref() {
-                let current_metadata: EkoPlanMetadata =
-                    serde_json::from_value(current.context.metadata.clone())?;
-                if plan_metadata.goal_revision != current_metadata.goal_revision
-                    || plan_metadata.goal_sha256 != current_metadata.goal_sha256
-                {
-                    return Err(StoreError::GoalUpdateRejected {
-                        run_id: run_id.to_string(),
-                        reason: "TaskPlan Goal binding can only advance through update_run_goal"
-                            .to_string(),
-                    });
-                }
-            } else if plan_metadata.goal_revision != run.goal_revision
-                || plan_metadata.goal_sha256 != run.goal_sha256
-            {
-                return Err(StoreError::GoalUpdateRejected {
-                    run_id: run_id.to_string(),
-                    reason: "initial TaskPlan Goal binding does not match TaskRun".to_string(),
-                });
-            }
-            let mut specifications = Vec::with_capacity(commit.next.snapshot.tasks.len());
-            for task in &commit.next.snapshot.tasks {
-                if task.spec.id != task.execution.task_id {
-                    return Err(StoreError::InvalidPlan(format!(
-                        "task spec id '{}' does not match execution id '{}'",
-                        task.spec.id, task.execution.task_id
-                    )));
-                }
-                let metadata: EkoTaskMetadata = serde_json::from_value(task.spec.metadata.clone())?;
-                specifications.push(EkoTaskSpec {
-                    id: task.spec.id.clone(),
-                    title: task.spec.title.clone(),
-                    description: task.spec.description.clone(),
-                    kind: PlanTaskKind::from_task_kind(task.spec.kind),
-                    agent_role: task.spec.agent_role.clone(),
-                    domain_profile: metadata.domain_profile,
-                    depends_on: task.spec.depends_on.clone(),
-                    parallel_group: metadata.parallel_group,
-                    files: task.spec.files.clone(),
-                    allowed_tools: task.spec.allowed_tools.clone(),
-                    required_artifacts: task.spec.required_artifacts.clone(),
-                    execution_checks: task.spec.execution_checks.clone(),
-                    acceptance_criteria: task.spec.acceptance_criteria.clone(),
-                    max_retries: task.spec.max_retries,
-                    sort_order: metadata.sort_order,
-                });
-            }
-            if commit.expected_revision.is_none()
-                && commit.next.snapshot.tasks.iter().any(|task| {
-                    task.execution.status != echo_agent::tasks::TaskStatus::Pending
-                        || task.execution.retry_count != 0
-                        || task.execution.failure_fingerprint.is_some()
-                        || task.execution.claim.is_some()
-                })
-            {
-                return Err(StoreError::InvalidPlan(
-                    "initial plan tasks must have pending execution state".to_string(),
-                ));
-            }
-            let plan = PlanRevision {
-                plan_id: plan_metadata.plan_id,
-                run_id: run_id.to_string(),
-                revision: commit.next.snapshot.revision,
-                domain_profile: plan_metadata.domain_profile,
-                goal_revision: run.goal_revision,
-                goal_sha256: run.goal_sha256,
-                assumptions: commit.next.context.assumptions,
-                risks: commit.next.context.risks,
-                execution_mode: match commit.next.context.execution_mode {
-                    echo_agent::tasks::TaskGraphExecutionMode::Sequential => {
-                        ExecutionMode::Sequential
-                    }
-                    echo_agent::tasks::TaskGraphExecutionMode::Parallel => ExecutionMode::Parallel,
-                },
-                tasks: specifications,
-            };
-            let created_task_ids = plan
-                .tasks
-                .iter()
-                .filter(|task| !previous_task_ids.contains(task.id.as_str()))
-                .map(|task| task.id.clone())
-                .collect::<Vec<_>>();
+            let current = self.load_revisioned_task_graph(run_id)?;
+            let prepared = prepare_revisioned_graph_commit(run_id, &run, current.as_ref(), commit)?;
             let revalidated_requirements = previous_plan
                 .as_ref()
                 .filter(|previous| previous.goal_revision != run.goal_revision)
                 .map(|_previous| {
-                    let current = super::completion_gate::requirements_for_revision(&plan);
-                    current
+                    super::completion_gate::requirements_for_revision(&prepared.plan)
                         .into_iter()
                         .filter_map(|requirement| {
                             previous_requirements
@@ -3474,14 +3571,7 @@ impl TaskRuntimeStore {
                 None,
                 None,
                 RuntimeEventKind::PlanRevisionCommitted,
-                serde_json::json!({
-                    "base_revision": commit.expected_revision.unwrap_or_default(),
-                    "reason": commit.reason,
-                    "skipped_task_ids": commit.effects.skipped_task_ids,
-                    "reset_task_ids": commit.effects.reset_task_ids,
-                    "created_task_ids": created_task_ids,
-                    "plan": plan,
-                }),
+                prepared.payload,
             )?;
             for (old_goal_revision, old_plan_revision, requirement) in revalidated_requirements {
                 self.shadow.append_event_line(
@@ -3500,9 +3590,115 @@ impl TaskRuntimeStore {
                 )?;
             }
             self.shadow.rewrite_plan(run_id)?;
-            self.load_revisioned_task_graph(run_id)?
-                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))
+            Ok(prepared.next)
         })
+    }
+
+    /// Publish a pending run and revision 1 as one visible file generation.
+    /// A process failure before the final rename leaves only a hidden staging
+    /// directory, which startup removes without exposing a partial TaskRun.
+    pub(crate) fn compare_and_publish_initial_revisioned_task_graph(
+        &self,
+        run: &TaskRun,
+        trigger: &InitialRunTriggerMetadata,
+        continuation: Option<(bool, bool, Option<u64>, Option<u64>)>,
+        commit: echo_agent::tasks::TaskGraphCommit,
+    ) -> Result<echo_agent::tasks::RevisionedTaskGraph, StoreError> {
+        self.with_run_lock(&run.run_id, || {
+            if self.get_run(&run.run_id)?.is_some() {
+                return Err(StoreError::PlanConflict {
+                    run_id: run.run_id.clone(),
+                    expected: 0,
+                    current: self
+                        .load_revisioned_task_graph(&run.run_id)?
+                        .map(|graph| graph.snapshot.revision)
+                        .unwrap_or_default(),
+                });
+            }
+            if run.status != TaskRunStatus::Pending || run.plan_id.is_some() {
+                return Err(StoreError::InvalidPlan(
+                    "initial task publication requires an uncommitted pending run".to_string(),
+                ));
+            }
+            let prepared = prepare_revisioned_graph_commit(&run.run_id, run, None, commit)?;
+            let timestamp = Utc::now();
+            let mut events = vec![
+                RuntimeTaskEvent {
+                    seq: 1,
+                    run_id: run.run_id.clone(),
+                    task_id: None,
+                    step_id: None,
+                    event_type: RuntimeEventKind::RunCreated,
+                    payload: serde_json::json!({
+                        "goal": run.goal,
+                        "goal_revision": run.goal_revision,
+                        "goal_sha256": run.goal_sha256,
+                        "domain_profile": run.domain_profile.as_str(),
+                        "workspace_id": run.workspace_id,
+                        "conversation_id": run.conversation_id,
+                        "root_message_id": run.root_message_id,
+                        "route": run.route,
+                        "attended_mode": run.attended_mode.as_str(),
+                        "attachments": run.attachments,
+                        "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
+                    }),
+                    timestamp,
+                },
+                RuntimeTaskEvent {
+                    seq: 2,
+                    run_id: run.run_id.clone(),
+                    task_id: None,
+                    step_id: None,
+                    event_type: RuntimeEventKind::PlanRevisionCommitted,
+                    payload: prepared.payload,
+                    timestamp,
+                },
+            ];
+            if let Some((enabled, auto_resume, token_budget, time_budget_seconds)) = continuation {
+                events.push(RuntimeTaskEvent {
+                    seq: 3,
+                    run_id: run.run_id.clone(),
+                    task_id: None,
+                    step_id: None,
+                    event_type: RuntimeEventKind::RunContinuationConfigured,
+                    payload: serde_json::json!({
+                        "enabled": enabled,
+                        "auto_resume_after_restart": auto_resume,
+                        "token_budget": token_budget,
+                        "time_budget_seconds": time_budget_seconds,
+                    }),
+                    timestamp,
+                });
+            }
+            let trigger_seq = i64::try_from(events.len())
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| StoreError::InvalidPlan("initial event sequence overflow".into()))?;
+            events.push(RuntimeTaskEvent {
+                seq: trigger_seq,
+                run_id: run.run_id.clone(),
+                task_id: None,
+                step_id: None,
+                event_type: RuntimeEventKind::Note,
+                payload: serde_json::json!({
+                    "kind": "trigger_metadata",
+                    "source": trigger.source,
+                    "task_kind": trigger.kind,
+                    "prompt": trigger.prompt,
+                    "priority": trigger.priority.min(10),
+                    "dependencies": trigger.dependencies,
+                }),
+                timestamp,
+            });
+            self.shadow
+                .publish_initial_event_batch(&run.run_id, &events)?;
+            Ok(prepared.next)
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_initial_publish_before_rename(&self) {
+        self.shadow.fail_next_initial_publish_before_rename();
     }
 
     /// Unit-test convenience for exercising the canonical framework patch
@@ -4152,6 +4348,24 @@ impl TaskRuntimeStore {
     pub fn list_subagent_runs(&self, run_id: &str) -> Result<Vec<SubagentRun>, StoreError> {
         let mut runs = std::collections::BTreeMap::<String, SubagentRun>::new();
         for event in self.list_events(run_id, 0)? {
+            if let Some(recovery) = boot_recovery_payload(&event)
+                && let Some(subagents) = recovery
+                    .get("subagents")
+                    .and_then(serde_json::Value::as_array)
+            {
+                for recovered in subagents {
+                    let Some(execution_id) = json_string(recovered, "execution_id") else {
+                        continue;
+                    };
+                    let Some(run) = runs.get_mut(&execution_id) else {
+                        continue;
+                    };
+                    run.status = json_string(recovered, "status")
+                        .as_deref()
+                        .and_then(SubagentRunStatus::from_str)
+                        .unwrap_or(SubagentRunStatus::Failed);
+                }
+            }
             let Some(execution_id) = event.step_id.clone() else {
                 continue;
             };
@@ -4238,12 +4452,79 @@ impl TaskRuntimeStore {
         Ok(runs.into_values().collect())
     }
 
+    pub fn list_runs_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<TaskRun>, StoreError> {
+        self.file_store()?
+            .list_runs()
+            .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))
+            .map(|runs| {
+                runs.into_iter()
+                    .filter(|run| run.conversation_id == conversation_id)
+                    .collect()
+            })
+    }
+
+    /// Remove every TaskRun owned by one conversation after its drivers have
+    /// settled. The outer conversation deletion transaction owns retries; this
+    /// primitive owns only TaskRuntime files and process-local projections.
+    pub fn remove_conversation(&self, conversation_id: &str) -> Result<(), StoreError> {
+        let _operation = self.shadow_operation()?;
+        let runs = super::file_store::FileTaskStore::new((*self.shadow).clone())
+            .list_runs()
+            .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))?
+            .into_iter()
+            .filter(|run| run.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        let active_run_ids = runs
+            .iter()
+            .filter(|run| self.is_run_active(&run.run_id))
+            .map(|run| run.run_id.clone())
+            .collect::<Vec<_>>();
+        if !active_run_ids.is_empty() {
+            return Err(StoreError::ConversationHasActiveRuns {
+                conversation_id: conversation_id.to_string(),
+                run_ids: active_run_ids,
+            });
+        }
+
+        let run_ids = runs.into_iter().map(|run| run.run_id).collect::<Vec<_>>();
+        for run_id in &run_ids {
+            super::command_cells::stop_cells_for_run(run_id).map_err(StoreError::CommandCell)?;
+        }
+        self.shadow.remove_runs(&run_ids)?;
+        for run_id in &run_ids {
+            super::continuation::clear_launcher(self, run_id);
+            self.plan_locks.remove(run_id);
+        }
+        if let Ok(mut tokens) = self.task_cancel_tokens.lock() {
+            tokens.retain(|key, _| {
+                !run_ids
+                    .iter()
+                    .any(|run_id| key.starts_with(&format!("{run_id}::")))
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn active_subagent_boundaries(
         &self,
         run_id: &str,
     ) -> Result<Vec<ActiveSubagentBoundary>, StoreError> {
         let mut active = std::collections::HashMap::<String, ActiveSubagentBoundary>::new();
         for event in self.list_events(run_id, 0)? {
+            if let Some(recovery) = boot_recovery_payload(&event)
+                && let Some(subagents) = recovery
+                    .get("subagents")
+                    .and_then(serde_json::Value::as_array)
+            {
+                for recovered in subagents {
+                    if let Some(execution_id) = json_string(recovered, "execution_id") {
+                        active.remove(&execution_id);
+                    }
+                }
+            }
             let Some(execution_id) = event.step_id.clone() else {
                 continue;
             };
@@ -4273,6 +4554,19 @@ impl TaskRuntimeStore {
     fn active_tool_boundaries(&self, run_id: &str) -> Result<Vec<ActiveToolBoundary>, StoreError> {
         let mut active = std::collections::HashMap::<(String, String), ActiveToolBoundary>::new();
         for event in self.list_events(run_id, 0)? {
+            if let Some(recovery) = boot_recovery_payload(&event)
+                && let Some(tools) = recovery.get("tools").and_then(serde_json::Value::as_array)
+            {
+                for recovered in tools {
+                    let Some(task_id) = json_string(recovered, "task_id") else {
+                        continue;
+                    };
+                    let Some(call_id) = json_string(recovered, "call_id") else {
+                        continue;
+                    };
+                    active.remove(&(task_id, call_id));
+                }
+            }
             let Some(task_id) = event.task_id.clone() else {
                 continue;
             };
@@ -4306,6 +4600,7 @@ impl TaskRuntimeStore {
         Ok(active.into_values().collect())
     }
 
+    #[cfg(test)]
     fn record_recovery_blocker(
         &self,
         run_id: &str,
@@ -4331,259 +4626,215 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Boot-time recovery of runs interrupted by a process restart (P1-8).
+    /// Recover every run whose process-scoped driver disappeared at restart.
     ///
-    /// Boot-time recovery of runs interrupted by a process restart.
-    ///
-    /// A run left in `Running` when the process died has durable plan/task/tool
-    /// facts but no live driver. Move it to `Paused` so the normal resume path
-    /// can re-read the plan and skip completed work. Pending/Paused are left
-    /// untouched.
-    /// Returns the number of runs recovered.
-    ///
-    /// Safe to call on an empty/fresh store (no-op).
+    /// One `RunStatusChanged` event contains the complete recovery generation.
+    /// Failure before that append leaves `Running` as the retry marker. Failure
+    /// after it can only leave derived files stale; the next canonical read
+    /// repairs those files from the event tail without appending a duplicate.
     pub fn recover_incomplete(&self) -> Result<usize, StoreError> {
         let _operation = self.shadow_operation()?;
         const INTERRUPTED: &[TaskRunStatus] = &[TaskRunStatus::Running];
-        let zombies = match self.list_runs_in(INTERRUPTED) {
-            Ok(z) => z,
-            Err(e) => {
-                tracing::warn!(error = %e, "recover_incomplete: failed to list interrupted runs");
-                return Ok(0);
-            }
-        };
-        let count = zombies.len();
+        let zombies = self.list_runs_in(INTERRUPTED)?;
+        let mut recovered = 0_usize;
         for run in &zombies {
-            let reason = format!(
-                "recovered from {} (interrupted by process restart)",
-                run.status.as_str()
-            );
-            if let Err(e) = self.note(&run.run_id, None, &reason) {
-                tracing::warn!(
-                    run_id = %run.run_id,
-                    error = %e,
-                    "recover_incomplete: failed to note recovery"
-                );
-            }
-            if let Ok(Some(state)) = self.get_run_state(&run.run_id)
-                && let Some(active_turn) = state.continuation.and_then(|state| state.active_turn)
-                && let Err(error) = self.finish_run_turn(
-                    &run.run_id,
-                    RunTurnCompletion {
-                        turn_id: &active_turn.turn_id,
-                        status: RunTurnStatus::Failed,
-                        elapsed_seconds: 0,
-                        final_message_id: None,
-                        error_fingerprint: Some("process_interrupted"),
-                    },
-                )
-            {
-                tracing::warn!(
-                    run_id = %run.run_id,
-                    turn_id = %active_turn.turn_id,
-                    %error,
-                    "recover_incomplete: failed to close orphan RunTurn"
-                );
-            }
-            if let Err(error) = self.record_run_pause_reason(
-                &run.run_id,
-                RunPauseReason::BootRecovery,
-                Some("the application process ended while this run was active"),
-            ) {
-                tracing::warn!(
-                    run_id = %run.run_id,
-                    %error,
-                    "recover_incomplete: failed to persist boot-recovery pause reason"
-                );
-            }
-            match self.transition_run(&run.run_id, TaskRunStatus::Paused) {
-                Ok(_) => {
-                    // Cell handles are process-scoped. A started cell without
-                    // a terminal event cannot still exist after boot, so close
-                    // the durable projection as interrupted. The command is
-                    // never replayed here; normal task recovery decides
-                    // whether its side effects require user review.
-                    let orphan_cells = self
-                        .list_background_cells(&run.run_id)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(BackgroundCellState::is_active)
-                        .collect::<Vec<_>>();
-                    for cell in orphan_cells {
-                        if let Err(error) = self.record_background_cell_finished(
-                            &run.run_id,
-                            &cell.cell_id,
-                            &cell.name,
-                            "interrupted",
-                            None,
-                            cell.total_output_bytes,
-                            cell.output_truncated,
-                            Some("cell process ended with the previous application process"),
-                            cell.artifact_path.as_deref(),
-                            cell.artifact_sha256.as_deref(),
-                            cell.call_id.as_deref(),
-                        ) {
-                            tracing::warn!(
-                                run_id = %run.run_id,
-                                cell_id = %cell.cell_id,
-                                %error,
-                                "recover_incomplete: failed to close orphan command cell"
-                            );
-                        }
-                    }
-                    let plan = self.get_plan(&run.run_id).ok().flatten();
-                    let active_subagents = self
-                        .active_subagent_boundaries(&run.run_id)
-                        .unwrap_or_default();
-                    let active_tools = self.active_tool_boundaries(&run.run_id).unwrap_or_default();
-                    if let Ok(todos) = self.list_todos(&run.run_id) {
-                        for todo in todos
-                            .into_iter()
-                            .filter(|todo| todo.status == TodoStatus::Running)
-                        {
-                            let task = plan.as_ref().and_then(|plan| {
-                                plan.tasks.iter().find(|task| task.id == todo.task_id)
-                            });
-                            let execution_id = task.and_then(|task| {
-                                task.claim
-                                    .as_ref()
-                                    .map(|claim| claim.execution_id(&run.run_id, &task.id))
-                            });
-                            let completed_subagent =
-                                task.and_then(|task| task.claim.as_ref()).and_then(|claim| {
-                                    self.recoverable_subagent_result_for_attempt(
-                                        &run.run_id,
-                                        &todo.task_id,
-                                        claim.revision,
-                                        claim.attempt,
-                                    )
-                                    .ok()
-                                    .flatten()
-                                });
-
-                            let active_tool = active_tools
-                                .iter()
-                                .find(|boundary| {
-                                    boundary.task_id == todo.task_id && !boundary.replay_safe
-                                })
-                                .cloned();
-                            let active_subagent = active_subagents
-                                .iter()
-                                .find(|boundary| {
-                                    boundary.task_id == todo.task_id && !boundary.replay_safe
-                                })
-                                .cloned();
-
-                            let (next_status, summary) = if completed_subagent.is_some() {
-                                (
-                                    TodoStatus::Pending,
-                                    "Subagent completed before interruption; pending review",
-                                )
-                            } else if active_tool.is_some() || active_subagent.is_some() {
-                                (
-                                    TodoStatus::Blocked,
-                                    "mutating side effect is indeterminate after restart",
-                                )
-                            } else {
-                                (TodoStatus::Pending, "interrupted; pending resume")
-                            };
-
-                            if let Err(error) = self.set_task_status(
-                                &run.run_id,
-                                &todo.task_id,
-                                next_status,
-                                None,
-                                Some(summary),
-                            ) {
-                                tracing::warn!(
-                                    run_id = %run.run_id,
-                                    task_id = %todo.task_id,
-                                    %error,
-                                    "recover_incomplete: failed to reset running task"
-                                );
-                                continue;
-                            }
-
-                            if next_status == TodoStatus::Blocked {
-                                let (boundary_execution_id, call_id, tool_name) =
-                                    if let Some(tool) = active_tool {
-                                        (
-                                            tool.execution_id,
-                                            Some(tool.call_id),
-                                            Some(tool.tool_name),
-                                        )
-                                    } else if let Some(subagent) = active_subagent {
-                                        (Some(subagent.execution_id), None, None)
-                                    } else {
-                                        (execution_id, None, None)
-                                    };
-                                if let Err(error) = self.record_recovery_blocker(
-                                    &run.run_id,
-                                    &todo.task_id,
-                                    boundary_execution_id.as_deref(),
-                                    call_id.as_deref(),
-                                    tool_name.as_deref(),
-                                    summary,
-                                ) {
-                                    tracing::warn!(
-                                        run_id = %run.run_id,
-                                        task_id = %todo.task_id,
-                                        %error,
-                                        "recover_incomplete: failed to persist recovery blocker"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    // A process-scoped Subagent attempt cannot remain live
-                    // across boot. Close the exact orphan boundary without
-                    // calling it a user cancellation. Unsafe attempts already
-                    // produced a recovery blocker above; replay-safe attempts
-                    // may be dispatched again from their Pending task.
-                    for boundary in active_subagents {
-                        if let Err(error) = self.shadow.append_event_line(
-                            &run.run_id,
-                            Some(&boundary.task_id),
-                            Some(&boundary.execution_id),
-                            RuntimeEventKind::SubagentReleased,
-                            serde_json::json!({
-                                "execution_id": boundary.execution_id,
-                                "status": SubagentRunStatus::Failed.as_str(),
-                                "terminal_cause": "process_interrupted",
-                                "recovered_at_boot": true,
-                            }),
-                        ) {
-                            tracing::warn!(
-                                run_id = %run.run_id,
-                                task_id = %boundary.task_id,
-                                %error,
-                                "recover_incomplete: failed to close orphan Subagent attempt"
-                            );
-                        }
-                    }
-                    tracing::info!(
-                        run_id = %run.run_id,
-                        from = %run.status.as_str(),
-                        "recovered interrupted run -> Paused at boot"
-                    );
-                }
-                Err(StoreError::IllegalTransition { from, .. }) => {
-                    // State changed concurrently between list and transition —
-                    // not an error, just skip this run.
-                    tracing::debug!(
-                        run_id = %run.run_id,
-                        from,
-                        "recover_incomplete: run no longer in interrupted state, skipped"
-                    );
-                }
-                Err(e) => tracing::warn!(
-                    run_id = %run.run_id,
-                    error = %e,
-                    "recover_incomplete: failed to transition run to Paused"
-                ),
+            if self.recover_interrupted_run(run)? {
+                recovered = recovered.saturating_add(1);
             }
         }
-        Ok(count)
+        Ok(recovered)
+    }
+
+    fn recover_interrupted_run(&self, run: &TaskRun) -> Result<bool, StoreError> {
+        self.with_run_lock(&run.run_id, || {
+            let state = self
+                .get_run_state(&run.run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run.run_id.clone()))?;
+            if state.run.status != TaskRunStatus::Running {
+                let was_boot_recovered = state
+                    .continuation
+                    .as_ref()
+                    .and_then(|continuation| continuation.pause.as_ref())
+                    .is_some_and(|pause| pause.reason == RunPauseReason::BootRecovery);
+                self.shadow.rewrite_plan(&run.run_id)?;
+                return Ok(was_boot_recovered);
+            }
+
+            let active_turn = state
+                .continuation
+                .as_ref()
+                .and_then(|continuation| continuation.active_turn.as_ref())
+                .map(|turn| serde_json::json!({ "turn_id": turn.turn_id }));
+            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
+                max_string_chars: 1_200,
+                ..Default::default()
+            };
+            let orphan_cells = state
+                .background_cells
+                .iter()
+                .filter(|cell| cell.is_active())
+                .map(|cell| {
+                    serde_json::json!({
+                        "cell_id": cell.cell_id,
+                        "name": cell.name,
+                        "call_id": cell.call_id,
+                        "total_output_bytes": cell.total_output_bytes,
+                        "output_truncated": cell.output_truncated,
+                        "output_excerpt": retention.sanitize_text(
+                            "cell process ended with the previous application process"
+                        ),
+                        "artifact_path": cell.artifact_path,
+                        "artifact_sha256": cell.artifact_sha256,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let plan = self.get_plan(&run.run_id)?;
+            let active_subagents = self.active_subagent_boundaries(&run.run_id)?;
+            let active_tools = self.active_tool_boundaries(&run.run_id)?;
+            let running_task_ids = state
+                .tasks
+                .iter()
+                .filter(|task| TodoStatus::project_task_status(&task.status) == TodoStatus::Running)
+                .map(|task| task.task_id.clone())
+                .collect::<Vec<_>>();
+            let mut recovered_tasks = Vec::with_capacity(running_task_ids.len());
+            for task_id in running_task_ids {
+                let task = plan
+                    .as_ref()
+                    .and_then(|plan| plan.tasks.iter().find(|task| task.id == task_id));
+                let execution_id = task.and_then(|task| {
+                    task.claim
+                        .as_ref()
+                        .map(|claim| claim.execution_id(&run.run_id, &task.id))
+                });
+                let completed_subagent = match task.and_then(|task| task.claim.as_ref()) {
+                    Some(claim) => self.recoverable_subagent_result_for_attempt(
+                        &run.run_id,
+                        &task_id,
+                        claim.revision,
+                        claim.attempt,
+                    )?,
+                    None => None,
+                };
+                let active_tool = active_tools
+                    .iter()
+                    .find(|boundary| boundary.task_id == task_id && !boundary.replay_safe)
+                    .cloned();
+                let active_subagent = active_subagents
+                    .iter()
+                    .find(|boundary| boundary.task_id == task_id && !boundary.replay_safe)
+                    .cloned();
+                let (next_status, summary) = if completed_subagent.is_some() {
+                    (
+                        TodoStatus::Pending,
+                        "Subagent completed before interruption; pending review",
+                    )
+                } else if active_tool.is_some() || active_subagent.is_some() {
+                    (
+                        TodoStatus::Blocked,
+                        "mutating side effect is indeterminate after restart",
+                    )
+                } else {
+                    (TodoStatus::Pending, "interrupted; pending resume")
+                };
+                let blocker = if next_status == TodoStatus::Blocked {
+                    let (boundary_execution_id, call_id, tool_name) =
+                        if let Some(tool) = active_tool {
+                            (tool.execution_id, Some(tool.call_id), Some(tool.tool_name))
+                        } else if let Some(subagent) = active_subagent {
+                            (Some(subagent.execution_id), None, None)
+                        } else {
+                            (execution_id, None, None)
+                        };
+                    Some(serde_json::json!({
+                        "execution_id": boundary_execution_id,
+                        "call_id": call_id,
+                        "tool_name": tool_name,
+                        "reason": summary,
+                    }))
+                } else {
+                    None
+                };
+                recovered_tasks.push(serde_json::json!({
+                    "task_id": task_id,
+                    "status": next_status.as_str(),
+                    "status_detail": (next_status == TodoStatus::Blocked).then_some(summary),
+                    "summary": summary,
+                    "blocker": blocker,
+                }));
+            }
+            let recovered_subagents = active_subagents
+                .iter()
+                .map(|boundary| {
+                    serde_json::json!({
+                        "task_id": boundary.task_id,
+                        "execution_id": boundary.execution_id,
+                        "status": SubagentRunStatus::Failed.as_str(),
+                        "terminal_cause": "process_interrupted",
+                    })
+                })
+                .collect::<Vec<_>>();
+            let recovered_tools = active_tools
+                .iter()
+                .map(|boundary| {
+                    serde_json::json!({
+                        "task_id": boundary.task_id,
+                        "execution_id": boundary.execution_id,
+                        "call_id": boundary.call_id,
+                        "tool_name": boundary.tool_name,
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            #[cfg(test)]
+            if self
+                .fail_next_recovery_commit
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::InvalidPlan(
+                    "injected recovery commit failure".to_string(),
+                ));
+            }
+            self.shadow.append_event_line(
+                &run.run_id,
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({
+                    "from": TaskRunStatus::Running.as_str(),
+                    "to": TaskRunStatus::Paused.as_str(),
+                    "recovery": {
+                        "kind": "boot_recovery",
+                        "message": "recovered from running (interrupted by process restart)",
+                        "active_turn": active_turn,
+                        "pause": {
+                            "reason": RunPauseReason::BootRecovery.as_str(),
+                            "detail": "the application process ended while this run was active",
+                        },
+                        "cells": orphan_cells,
+                        "tasks": recovered_tasks,
+                        "subagents": recovered_subagents,
+                        "tools": recovered_tools,
+                    },
+                }),
+            )?;
+            #[cfg(test)]
+            if self
+                .fail_next_recovery_projection
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::InvalidPlan(
+                    "injected recovery projection failure".to_string(),
+                ));
+            }
+            self.shadow.rewrite_plan(&run.run_id)?;
+            tracing::info!(
+                run_id = %run.run_id,
+                from = %run.status.as_str(),
+                "recovered interrupted run -> Paused at boot"
+            );
+            Ok(true)
+        })
     }
 
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, StoreError> {
@@ -5838,6 +6089,39 @@ impl TaskRuntimeStore {
         let mut blockers = std::collections::BTreeMap::<String, RecoveryBlocker>::new();
         for event in self.list_events(run_id, 0)? {
             match event.event_type {
+                RuntimeEventKind::RunStatusChanged => {
+                    let Some(recovery) = boot_recovery_payload(&event) else {
+                        continue;
+                    };
+                    let Some(tasks) = recovery.get("tasks").and_then(serde_json::Value::as_array)
+                    else {
+                        continue;
+                    };
+                    for recovered in tasks {
+                        let Some(task_id) = json_string(recovered, "task_id") else {
+                            continue;
+                        };
+                        let Some(blocker) = recovered.get("blocker") else {
+                            continue;
+                        };
+                        if blocker.is_null() {
+                            continue;
+                        }
+                        blockers.insert(
+                            task_id.clone(),
+                            RecoveryBlocker {
+                                run_id: run_id.to_string(),
+                                task_id,
+                                execution_id: json_string(blocker, "execution_id"),
+                                call_id: json_string(blocker, "call_id"),
+                                tool_name: json_string(blocker, "tool_name"),
+                                reason: json_string(blocker, "reason").unwrap_or_else(|| {
+                                    "mutating side effect is indeterminate".to_string()
+                                }),
+                            },
+                        );
+                    }
+                }
                 RuntimeEventKind::RecoveryBlocked => {
                     let Some(task_id) = event.task_id.clone() else {
                         continue;
@@ -5940,6 +6224,12 @@ fn json_bool(value: &serde_json::Value, key: &str, default: bool) -> bool {
     value.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
+fn boot_recovery_payload(event: &RuntimeTaskEvent) -> Option<&serde_json::Value> {
+    event.payload.get("recovery").filter(|recovery| {
+        recovery.get("kind").and_then(serde_json::Value::as_str) == Some("boot_recovery")
+    })
+}
+
 fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
     value
         .get(key)
@@ -6009,6 +6299,14 @@ mod tests {
 
     fn fresh() -> TaskRuntimeStore {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    }
+
+    fn boot_recovery_event_count(store: &TaskRuntimeStore) -> Result<usize, StoreError> {
+        Ok(store
+            .list_events("r1", 0)?
+            .iter()
+            .filter(|event| boot_recovery_payload(event).is_some())
+            .count())
     }
 
     fn create_paused_run(store: &TaskRuntimeStore, run_id: &str) -> Result<TaskRun, StoreError> {
@@ -8093,17 +8391,6 @@ mod tests {
     }
 
     #[test]
-    fn abort_unpublished_run_creation_never_removes_a_published_plan() -> Result<(), StoreError> {
-        let store = fresh();
-        seed_plan(&store);
-
-        assert!(!store.abort_unpublished_run_creation("r1")?);
-        assert!(store.get_run("r1")?.is_some());
-        assert!(store.get_plan("r1")?.is_some());
-        Ok(())
-    }
-
-    #[test]
     fn provider_retry_claim_waits_then_success_clears_schedule() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
@@ -8706,6 +8993,105 @@ mod tests {
     }
 
     #[test]
+    fn boot_recovery_failure_keeps_running_marker_and_is_retryable() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        let event_count_before = store.list_events("r1", 0)?.len();
+        store.fail_next_recovery_commit_for_test();
+
+        assert!(matches!(
+            store.recover_incomplete(),
+            Err(StoreError::InvalidPlan(message)) if message == "injected recovery commit failure"
+        ));
+        assert_eq!(store.list_events("r1", 0)?.len(), event_count_before);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Running
+        );
+        assert_eq!(
+            store
+                .list_todos("r1")?
+                .into_iter()
+                .find(|todo| todo.task_id == "t1")
+                .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
+                .status,
+            TodoStatus::Running
+        );
+
+        assert_eq!(store.recover_incomplete()?, 1);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Paused
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_repairs_projection_after_atomic_event_commit() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.fail_next_recovery_projection_for_test();
+
+        assert!(matches!(
+            store.recover_incomplete(),
+            Err(StoreError::InvalidPlan(message))
+                if message == "injected recovery projection failure"
+        ));
+        let stale_projection = store
+            .shadow
+            .read_run_state("r1")
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        assert_eq!(stale_projection.run.status, TaskRunStatus::Running);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Paused
+        );
+        let authoritative = store
+            .get_run_state("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        assert_eq!(authoritative.run.status, TaskRunStatus::Paused);
+        assert_eq!(
+            authoritative
+                .tasks
+                .iter()
+                .find(|task| task.task_id == "t1")
+                .map(|task| TodoStatus::project_task_status(&task.status)),
+            Some(TodoStatus::Pending)
+        );
+        assert_eq!(boot_recovery_event_count(&store)?, 1);
+
+        assert_eq!(store.recover_incomplete()?, 0);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Paused
+        );
+        let todo = store
+            .list_todos("r1")?
+            .into_iter()
+            .find(|todo| todo.task_id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(todo.status, TodoStatus::Pending);
+        assert_eq!(todo.summary.as_deref(), Some("interrupted; pending resume"));
+        assert_eq!(boot_recovery_event_count(&store)?, 1);
+        Ok(())
+    }
+
+    #[test]
     fn boot_recovery_closes_orphan_turn_and_records_pause_reason() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
@@ -8775,19 +9161,21 @@ mod tests {
             .ok_or_else(|| StoreError::InvalidPlan("orphan cell was not rebuilt".to_string()))?;
         assert_eq!(cell.phase, "interrupted");
         assert!(!cell.is_active());
-        let finished_count = store
+        let recovered_cell_count = store
             .list_events("r1", 0)?
             .iter()
             .filter(|event| {
-                event.event_type == RuntimeEventKind::BackgroundCellFinished
-                    && event
-                        .payload
-                        .get("cell_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("orphan-cell")
+                boot_recovery_payload(event)
+                    .and_then(|recovery| recovery.get("cells"))
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|cells| {
+                        cells.iter().any(|cell| {
+                            json_string(cell, "cell_id").as_deref() == Some("orphan-cell")
+                        })
+                    })
             })
             .count();
-        assert_eq!(finished_count, 1);
+        assert_eq!(recovered_cell_count, 1);
         assert_eq!(store.recover_incomplete()?, 0);
         Ok(())
     }
@@ -8930,18 +9318,22 @@ mod tests {
             .find(|run| run.subagent_run_id == execution_id)
             .ok_or_else(|| StoreError::InvalidPlan("orphan Subagent missing".to_string()))?;
         assert_eq!(subagent.status, SubagentRunStatus::Failed);
-        let terminal = store
+        let recovery = store
             .list_events("r1", 0)?
             .into_iter()
-            .find(|event| {
-                event.event_type == RuntimeEventKind::SubagentReleased
-                    && event.step_id.as_deref() == Some(execution_id.as_str())
-            })
-            .ok_or_else(|| StoreError::InvalidPlan("orphan terminal event missing".to_string()))?;
+            .find_map(|event| boot_recovery_payload(&event).cloned())
+            .ok_or_else(|| StoreError::InvalidPlan("recovery event missing".to_string()))?;
         assert_eq!(
-            terminal
-                .payload
-                .get("terminal_cause")
+            recovery
+                .get("subagents")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|subagents| {
+                    subagents.iter().find(|subagent| {
+                        json_string(subagent, "execution_id").as_deref()
+                            == Some(execution_id.as_str())
+                    })
+                })
+                .and_then(|subagent| subagent.get("terminal_cause"))
                 .and_then(serde_json::Value::as_str),
             Some("process_interrupted")
         );
@@ -9882,6 +10274,73 @@ mod tests {
             store.get_run("run-a")?.map(|run| run.workspace_id),
             Some("test".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_removal_deletes_only_its_task_runs() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))?;
+        for (run_id, conversation_id) in [
+            ("conversation-run-a", "conversation-delete"),
+            ("conversation-run-b", "conversation-delete"),
+            ("retained-run", "conversation-keep"),
+        ] {
+            store.create_run(
+                run_id,
+                "workspace",
+                conversation_id,
+                "message",
+                DomainProfile::General,
+                run_id,
+                "chat",
+                AttendedMode::Attended,
+            )?;
+        }
+
+        store.remove_conversation("conversation-delete")?;
+
+        assert!(store.get_run("conversation-run-a")?.is_none());
+        assert!(store.get_run("conversation-run-b")?.is_none());
+        assert!(store.get_run("retained-run")?.is_some());
+        assert!(
+            store
+                .list_runs_for_conversation("conversation-delete")?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_removal_fails_closed_while_a_driver_is_active()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = std::sync::Arc::new(TaskRuntimeStore::new_in_memory_with_shadow_root(
+            temp.path().join("tasks"),
+        )?);
+        store.create_run(
+            "active-delete-run",
+            "workspace",
+            "conversation-delete",
+            "message",
+            DomainProfile::General,
+            "active run",
+            "chat",
+            AttendedMode::Attended,
+        )?;
+        let registration = store.register_run_cancellation(
+            "active-delete-run",
+            echo_agent::agent::CancellationToken::new(),
+        )?;
+
+        assert!(matches!(
+            store.remove_conversation("conversation-delete"),
+            Err(StoreError::ConversationHasActiveRuns { .. })
+        ));
+        assert!(store.get_run("active-delete-run")?.is_some());
+        drop(registration);
+        store.remove_conversation("conversation-delete")?;
+        assert!(store.get_run("active-delete-run")?.is_none());
         Ok(())
     }
 

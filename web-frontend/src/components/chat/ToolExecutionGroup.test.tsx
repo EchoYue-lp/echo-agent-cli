@@ -35,4 +35,33 @@ describe('ToolExecutionGroup', () => {
       missingCount: 2,
     });
   });
+
+  it('does not present interrupted and timed-out tools as successful', () => {
+    const interrupted = {
+      id: 'call-a',
+      call_id: 'call-a',
+      owner: { kind: 'chat', message_id: 'assistant-1' },
+      name: 'shell',
+      args_preview: '',
+      status: 'interrupted',
+      started_at: 1,
+      finished_at: 2,
+      duration_ms: 1,
+      detail_ref: 'call-a',
+    } satisfies ToolExecution;
+    const timedOut = {
+      ...interrupted,
+      id: 'call-b',
+      call_id: 'call-b',
+      status: 'timed_out',
+      detail_ref: 'call-b',
+    } satisfies ToolExecution;
+
+    expect(
+      toolExecutionGroupPresentation(['call-a', 'call-b'], {
+        'call-a': interrupted,
+        'call-b': timedOut,
+      })
+    ).toMatchObject({ failedCount: 1, uncertainCount: 1, missingCount: 0 });
+  });
 });

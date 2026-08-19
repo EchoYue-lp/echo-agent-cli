@@ -535,7 +535,7 @@ async fn resume_continuation_run(
         turn_id.clone(),
         Some(conversation_id.clone()),
         state.app_state.storage.tool_executions.clone(),
-        Some(store.clone()),
+        state.app_state.storage.chat_events.clone(),
     );
     let _ = sink.on_event(
         echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
@@ -559,11 +559,7 @@ async fn resume_continuation_run(
         layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(Arc::new(
-            crate::tauri::commands::chat::TauriHumanLoopHandler::new(
-                app.clone(),
-                Some(conversation_id.clone()),
-                root_message_id.clone(),
-            ),
+            crate::tauri::commands::chat::TauriHumanLoopHandler::new(sink.clone(), turn_id.clone()),
         )),
     });
     let binding = RunTurnBinding {

@@ -1,0 +1,194 @@
+import { beforeEach, describe, expect, it } from 'vitest';
+import fixtureText from '../fixtures/chat-event-envelope-v4.json?raw';
+import { useChatStore } from '../stores/chatStore';
+import type { ChatEventEnvelope } from '../types/api';
+import { handleChatEventEnvelope } from './chatEventHandler';
+import { resetChatEventCursorsForTest } from './chatEventSequencer';
+
+const fixture = JSON.parse(fixtureText) as ChatEventEnvelope[];
+
+const context = (): Parameters<typeof handleChatEventEnvelope>[1] => ({
+  assistantIdRef: { current: null },
+  currentMessageKeyRef: { current: null },
+  currentMessageIdRef: { current: null },
+  isCancelledRef: { current: false },
+  currentThinkingIdRef: { current: null },
+});
+
+describe('canonical chat event v4 contract', () => {
+  beforeEach(() => {
+    useChatStore.getState().clearMessages();
+    resetChatEventCursorsForTest();
+  });
+
+  it('preserves effective invocation and the complete typed tool result through the reducer', () => {
+    expect(fixture).toHaveLength(2);
+    const [toolCall, toolResult] = fixture;
+    if (!toolCall || !toolResult) throw new Error('contract fixture is incomplete');
+
+    expect(toolCall.sequence).toBe(1);
+    if (toolCall.payload.source !== 'agent') throw new Error('expected agent tool call');
+    const call = toolCall.payload.event.payload;
+    if (call.type !== 'tool_call') throw new Error('expected tool_call');
+    expect(call.data.invocation.requested_name).toBe('shell');
+    expect(call.data.invocation.name).toBe('sandbox_shell');
+    expect(call.data.invocation.rewrites).toEqual([
+      'intervention_redirect',
+      'pre_tool_use_hook',
+      'approval',
+    ]);
+
+    if (toolResult.payload.source !== 'agent') throw new Error('expected agent tool result');
+    const completion = toolResult.payload.event.payload;
+    if (completion.type !== 'tool_result') throw new Error('expected tool_result');
+    expect(completion.data.result).toMatchObject({
+      success: false,
+      error: 'command timed out',
+      truncated: true,
+      failure: {
+        category: 'timeout',
+        recovery: 'verify_then_retry',
+        side_effect: 'possible',
+      },
+      metadata: {
+        artifact_path: '/tmp/tool-output.txt',
+        duration_ms: '5000',
+      },
+    });
+
+    const refs = context();
+    handleChatEventEnvelope(toolCall, refs);
+    handleChatEventEnvelope(toolResult, refs);
+    expect(useChatStore.getState().runStatus).toBe('using_tool');
+  });
+
+  it('fails closed for an unknown material agent variant', () => {
+    const toolCall = fixture[0];
+    if (!toolCall || toolCall.payload.source !== 'agent') throw new Error('expected fixture');
+    const unknown = {
+      ...toolCall,
+      payload: {
+        source: 'agent',
+        event: {
+          ...toolCall.payload.event,
+          payload: { type: 'future_material_event', data: { value: 'must not disappear' } },
+        },
+      },
+    } as unknown as ChatEventEnvelope;
+
+    expect(() => handleChatEventEnvelope(unknown, context())).toThrow('Unsupported agent event');
+  });
+
+  it.each(['failed', 'cancelled'] as const)(
+    'preserves a terminal-only %s status instead of finalizing it as completed',
+    (status) => {
+      const base = fixture[0];
+      if (!base) throw new Error('contract fixture is incomplete');
+      const assistantId = useChatStore.getState().startAssistantMessage(`assistant-${status}`);
+      useChatStore.getState().appendToken(assistantId, 'partial answer');
+      const refs = context();
+      refs.assistantIdRef.current = assistantId;
+      const terminal = {
+        ...base,
+        sequence: 3,
+        payload: { source: 'turn_status', event: { status } },
+      } as ChatEventEnvelope;
+
+      handleChatEventEnvelope(terminal, refs);
+
+      const state = useChatStore.getState();
+      expect(state.runStatus).toBe(status);
+      expect(state.isStreaming).toBe(false);
+      expect(state.messages.at(-1)).toMatchObject({
+        content: 'partial answer',
+        isStreaming: false,
+      });
+    }
+  );
+
+  it('projects a typed cancellation failure as cancelled rather than failed', () => {
+    const base = fixture[0];
+    if (!base || base.payload.source !== 'agent') throw new Error('expected agent fixture');
+    const assistantId = useChatStore.getState().startAssistantMessage('assistant-cancelled-error');
+    const refs = context();
+    refs.assistantIdRef.current = assistantId;
+    const cancelledError = {
+      ...base,
+      payload: {
+        source: 'agent',
+        event: {
+          ...base.payload.event,
+          payload: {
+            type: 'error',
+            data: {
+              source: 'agent',
+              message: 'cancelled by user',
+              failure: {
+                category: 'agent',
+                terminal_kind: 'cancelled',
+                retryable: false,
+                code: 'agent_cancelled',
+                http_status: null,
+                message: 'cancelled by user',
+              },
+            },
+          },
+        },
+      },
+    } as ChatEventEnvelope;
+
+    handleChatEventEnvelope(cancelledError, refs);
+    expect(useChatStore.getState().runStatus).toBe('cancelled');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('does not let a contradictory completed terminal override a cancelled fact', () => {
+    const base = fixture[0];
+    if (!base || base.payload.source !== 'agent') throw new Error('expected agent fixture');
+    const assistantId = useChatStore.getState().startAssistantMessage('assistant-cancelled');
+    const refs = context();
+    refs.assistantIdRef.current = assistantId;
+    const cancelled = {
+      ...base,
+      payload: {
+        source: 'agent',
+        event: { ...base.payload.event, payload: { type: 'cancelled' } },
+      },
+    } as ChatEventEnvelope;
+    const contradictoryTerminal = {
+      ...base,
+      sequence: 2,
+      payload: { source: 'turn_status', event: { status: 'completed' } },
+    } as ChatEventEnvelope;
+    const lateToken = {
+      ...base,
+      sequence: 3,
+      payload: {
+        source: 'agent',
+        event: { ...base.payload.event, payload: { type: 'token', data: 'late token' } },
+      },
+    } as ChatEventEnvelope;
+
+    handleChatEventEnvelope(cancelled, refs);
+    handleChatEventEnvelope(contradictoryTerminal, refs);
+    handleChatEventEnvelope(lateToken, refs);
+
+    expect(useChatStore.getState().runStatus).toBe('cancelled');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().messages.at(-1)?.content).not.toContain('late token');
+    expect(refs.isCancelledRef.current).toBe(false);
+  });
+
+  it('fails closed for an unknown run status', () => {
+    const base = fixture[0];
+    if (!base) throw new Error('contract fixture is incomplete');
+    const unknownStatus = {
+      ...base,
+      payload: { source: 'turn_status', event: { status: 'future_terminal' } },
+    } as unknown as ChatEventEnvelope;
+
+    expect(() => handleChatEventEnvelope(unknownStatus, context())).toThrow(
+      'Unsupported chat run status'
+    );
+  });
+});

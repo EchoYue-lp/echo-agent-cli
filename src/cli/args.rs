@@ -26,6 +26,14 @@ pub struct Args {
     #[arg(long, short = 'i', default_value_t = false, hide = true)]
     pub cli: bool,
 
+    /// Run one non-interactive turn and emit canonical chat envelopes as JSONL.
+    #[arg(
+        long,
+        value_name = "PROMPT",
+        conflicts_with_all = ["tui", "web", "cli", "channels"]
+    )]
+    pub jsonl: Option<String>,
+
     /// Web 服务端口（仅内部 Web/GUI 使用）
     #[arg(long, short = 'p', default_value = "3000", hide = true)]
     pub port: u16,

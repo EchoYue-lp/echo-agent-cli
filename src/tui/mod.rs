@@ -427,6 +427,10 @@ pub struct TuiApp {
     pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     /// Shared application authority for workspace transitions and scoped stores.
     pub app_state: Option<std::sync::Arc<echo_agent_app_core::state::AppState>>,
+    /// PTY currently attached to the TUI terminal pane.
+    pub active_terminal_id: Option<String>,
+    /// Bounded raw PTY output rendered by the terminal pane.
+    pub terminal_output: Vec<u8>,
     /// Active workspace root used by attachments, long-input artifacts and file views.
     pub workspace_root: Option<std::path::PathBuf>,
     /// Runtime-ready configured models exposed by the product configuration.
@@ -451,6 +455,18 @@ pub struct TuiApp {
     pub last_escape_at: Option<Instant>,
     /// Event-loop request to rewind the most recent persisted turn.
     pub rewind_requested: bool,
+}
+
+impl TuiApp {
+    pub(crate) fn discard_unsubmitted_attachments(&mut self) -> Result<(), String> {
+        let mut attachments = std::mem::take(&mut self.pending_attachments);
+        attachments.extend(
+            self.queued_turns
+                .drain(..)
+                .flat_map(|turn| turn.attachments),
+        );
+        echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -887,6 +903,8 @@ impl TuiApp {
             conversation_id: None,
             conversation_store: None,
             app_state: None,
+            active_terminal_id: None,
+            terminal_output: Vec::new(),
             workspace_root: None,
             configured_models: Vec::new(),
             prompt_assembly: None,
@@ -1948,7 +1966,7 @@ async fn settle_tui_foreground_on_exit(
             .cancel_and_wait(
                 ForegroundTurnSurface::Tui,
                 conversation_id,
-                &snapshot.turn_id,
+                &snapshot.active_turn_id,
             )
             .await
         {
@@ -2095,15 +2113,28 @@ pub async fn run_tui(
 
     let foreground_shutdown =
         settle_tui_foreground_on_exit(&app_state.session.foreground_turns, &conversation_id).await;
+    let attachment_cleanup = app.discard_unsubmitted_attachments();
     // Guard drop will restore the terminal.
-    match (result, foreground_shutdown) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(()), Err(error)) => Err(anyhow::anyhow!(
+    match (result, foreground_shutdown, attachment_cleanup) {
+        (Ok(()), Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(()), Ok(())) => Err(error),
+        (Ok(()), Err(error), Ok(())) => Err(anyhow::anyhow!(
             "failed to settle TUI foreground turn during shutdown: {error}"
         )),
-        (Err(loop_error), Err(shutdown_error)) => Err(anyhow::anyhow!(
-            "TUI event loop failed: {loop_error}; foreground shutdown failed: {shutdown_error}"
+        (Ok(()), Ok(()), Err(error)) => Err(anyhow::anyhow!(
+            "failed to clean TUI attachment staging during shutdown: {error}"
+        )),
+        (loop_result, shutdown_result, cleanup_result) => Err(anyhow::anyhow!(
+            "TUI shutdown did not settle cleanly: event_loop={}; foreground={}; attachments={}",
+            loop_result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string()),
+            shutdown_result
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| "ok".to_string()),
+            cleanup_result.err().unwrap_or_else(|| "ok".to_string())
         )),
     }
 }

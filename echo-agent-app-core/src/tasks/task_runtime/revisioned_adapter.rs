@@ -1,6 +1,6 @@
 //! Thin EKO adapters for the framework-owned task revision service.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -11,26 +11,46 @@ use echo_agent::tasks::{
 };
 use echo_core::tools::ToolContext;
 
-use super::executor::ExecEvent;
 use super::profiles::default_subagent_for;
-use super::store::{StoreError, TaskRuntimeStore};
-use super::task_tools::{
-    TaskCapabilityCatalog, current_run_id, formal_run_id_for_turn, trace_sink_from_tool_context,
-};
+use super::store::{InitialRunTriggerMetadata, StoreError, TaskRuntimeStore};
+use super::task_tools::{TaskCapabilityCatalog, current_run_id, formal_run_id_for_turn};
 use super::types::{
-    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskMetadata, PlanTaskKind, TaskRunStatus,
+    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskMetadata, PlanTaskKind, TaskRun,
     TaskUpdateRequest,
 };
+
+#[derive(Clone)]
+struct PendingInitialRun {
+    run: TaskRun,
+    trigger: InitialRunTriggerMetadata,
+    continuation: Option<(bool, bool, Option<u64>, Option<u64>)>,
+}
+
+type PendingInitialRuns = Arc<Mutex<HashMap<String, PendingInitialRun>>>;
 
 /// File persistence adapter. It deliberately has no patch or validation
 /// logic; those remain authoritative in the framework service.
 pub struct EkoRevisionedTaskStore {
     store: Arc<TaskRuntimeStore>,
+    pending_initial_runs: PendingInitialRuns,
 }
 
 impl EkoRevisionedTaskStore {
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            pending_initial_runs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn with_pending_initial_runs(
+        store: Arc<TaskRuntimeStore>,
+        pending_initial_runs: PendingInitialRuns,
+    ) -> Self {
+        Self {
+            store,
+            pending_initial_runs,
+        }
     }
 }
 
@@ -50,9 +70,31 @@ impl RevisionedTaskStore for EkoRevisionedTaskStore {
         scope_id: &str,
         commit: TaskGraphCommit,
     ) -> Result<RevisionedTaskGraph, RevisionedTaskStoreError> {
-        self.store
-            .compare_and_commit_revisioned_task_graph(scope_id, commit)
-            .map_err(store_error)
+        let pending = self
+            .pending_initial_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(scope_id)
+            .cloned();
+        let committed = match pending {
+            Some(pending) => self
+                .store
+                .compare_and_publish_initial_revisioned_task_graph(
+                    &pending.run,
+                    &pending.trigger,
+                    pending.continuation,
+                    commit,
+                ),
+            None => self
+                .store
+                .compare_and_commit_revisioned_task_graph(scope_id, commit),
+        }
+        .map_err(store_error)?;
+        self.pending_initial_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(scope_id);
+        Ok(committed)
     }
 }
 
@@ -86,19 +128,32 @@ fn store_error(error: StoreError) -> RevisionedTaskStoreError {
 pub struct EkoTaskToolPolicy {
     store: Arc<TaskRuntimeStore>,
     capabilities: Arc<TaskCapabilityCatalog>,
-    staged_scopes: Mutex<HashSet<String>>,
+    pending_initial_runs: PendingInitialRuns,
 }
 
 impl EkoTaskToolPolicy {
-    pub fn new(store: Arc<TaskRuntimeStore>, capabilities: Arc<TaskCapabilityCatalog>) -> Self {
+    fn new(
+        store: Arc<TaskRuntimeStore>,
+        capabilities: Arc<TaskCapabilityCatalog>,
+        pending_initial_runs: PendingInitialRuns,
+    ) -> Self {
         Self {
             store,
             capabilities,
-            staged_scopes: Mutex::new(HashSet::new()),
+            pending_initial_runs,
         }
     }
 
     fn run(&self, scope_id: &str) -> Result<super::types::TaskRun, TaskPolicyError> {
+        if let Some(pending) = self
+            .pending_initial_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(scope_id)
+            .cloned()
+        {
+            return Ok(pending.run);
+        }
         self.store
             .get_run(scope_id)
             .map_err(|error| TaskPolicyError::Backend {
@@ -137,13 +192,7 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         context: &ToolContext,
     ) -> Result<(), TaskPolicyError> {
         match self.store.get_run(scope_id) {
-            Ok(Some(_)) => {
-                self.staged_scopes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(scope_id);
-                return Ok(());
-            }
+            Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(error) => {
                 return Err(TaskPolicyError::Backend {
@@ -181,16 +230,11 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
             .as_ref()
             .map(|resources| resources.attachments.clone())
             .unwrap_or_default();
-        let trace_sink = trace_sink_from_tool_context(context).or_else(|| {
-            chat_resources
-                .as_ref()
-                .map(|resources| crate::chat_driver::subagent_trace_sink_for(&resources.sink))
-        });
         let goal = task_goal(&first.title, &first.description);
-        self.store
-            .create_run(
+        let mut run = self
+            .store
+            .prepare_run_for_active_workspace(
                 scope_id,
-                "default",
                 &conversation_id,
                 &root_message_id,
                 DomainProfile::General,
@@ -199,67 +243,33 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
                 AttendedMode::Attended,
             )
             .map_err(|error| TaskPolicyError::Backend {
-                message: format!("Failed to create task run before creating task: {error}"),
+                message: format!("Failed to prepare task run before creating task: {error}"),
             })?;
-        if !attachments.is_empty()
-            && let Err(error) = self.store.set_run_attachments(scope_id, &attachments)
-        {
-            tracing::warn!(run_id = scope_id, %error, "failed to bind attachments to task run");
-        }
-        if let Err(error) = self.store.transition_run(scope_id, TaskRunStatus::Running) {
-            let cleanup = self.store.abort_unpublished_run_creation(scope_id);
-            return Err(TaskPolicyError::Backend {
-                message: match cleanup {
-                    Ok(_) => format!("Failed to start task run before creating task: {error}"),
-                    Err(cleanup_error) => format!(
-                        "Failed to start task run before creating task: {error}; cleanup failed: {cleanup_error}"
-                    ),
-                },
-            });
-        }
-        self.staged_scopes
+        run.attachments = attachments;
+        self.pending_initial_runs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(scope_id.to_string());
-        if let Some(sink) = trace_sink {
-            sink(ExecEvent::run(
-                scope_id.to_string(),
-                super::types::RuntimeEventKind::RunStarted,
-                serde_json::json!({
-                    "goal": goal,
-                    "route": "agent_task_plan",
-                    "source": "task_create",
-                }),
-            ));
-        }
+            .entry(scope_id.to_string())
+            .or_insert(PendingInitialRun {
+                run,
+                trigger: InitialRunTriggerMetadata {
+                    source: "task_create".to_string(),
+                    kind: "agent_task_plan".to_string(),
+                    prompt: goal,
+                    priority: 5,
+                    dependencies: Vec::new(),
+                },
+                continuation: None,
+            });
         Ok(())
     }
 
     async fn abort_scope_preparation(&self, scope_id: &str) -> Result<(), TaskPolicyError> {
-        let was_staged = self
-            .staged_scopes
+        self.pending_initial_runs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(scope_id);
-        if !was_staged {
-            return Ok(());
-        }
-        if self
-            .store
-            .load_revisioned_task_graph(scope_id)
-            .map_err(|error| TaskPolicyError::Backend {
-                message: format!("Failed to inspect staged task scope: {error}"),
-            })?
-            .is_some()
-        {
-            return Ok(());
-        }
-        self.store
-            .abort_unpublished_run_creation(scope_id)
-            .map(|_| ())
-            .map_err(|error| TaskPolicyError::Backend {
-                message: format!("Failed to roll back staged task scope: {error}"),
-            })
+        Ok(())
     }
 
     async fn prepare_task(
@@ -363,9 +373,17 @@ pub fn build_eko_task_revision_service(
     store: Arc<TaskRuntimeStore>,
     capabilities: Arc<TaskCapabilityCatalog>,
 ) -> Arc<TaskRevisionService> {
+    let pending_initial_runs = Arc::new(Mutex::new(HashMap::new()));
     Arc::new(TaskRevisionService::new(
-        Arc::new(EkoRevisionedTaskStore::new(store.clone())),
-        Arc::new(EkoTaskToolPolicy::new(store, capabilities)),
+        Arc::new(EkoRevisionedTaskStore::with_pending_initial_runs(
+            store.clone(),
+            pending_initial_runs.clone(),
+        )),
+        Arc::new(EkoTaskToolPolicy::new(
+            store,
+            capabilities,
+            pending_initial_runs,
+        )),
     ))
 }
 
@@ -406,6 +424,68 @@ pub async fn commit_eko_task_plan(
         .ok_or_else(|| TaskRevisionError::GraphNotFound {
             scope_id: plan.run_id.clone(),
         })?;
+    let (run_id, context, tasks) = plan_graph_input(plan, run)?;
+    let service = TaskRevisionService::new(
+        Arc::new(EkoRevisionedTaskStore::new(store.clone())),
+        Arc::new(DefaultTaskToolPolicy::new(run_id.clone())),
+    );
+    service
+        .create_prepared(&run_id, context, tasks, "initial complete plan".to_string())
+        .await?;
+    load_committed_plan(&store, run_id)
+}
+
+/// Publish a prepared TaskRun and its first framework-validated graph as one
+/// visible file generation. EKO owns this local-file transaction; graph
+/// validation, revision calculation, and CAS remain framework-owned.
+pub(crate) async fn publish_eko_task_plan(
+    store: Arc<TaskRuntimeStore>,
+    run: TaskRun,
+    trigger: InitialRunTriggerMetadata,
+    continuation: Option<(bool, bool, Option<u64>, Option<u64>)>,
+    plan: super::types::TaskPlan,
+) -> Result<super::types::TaskPlan, TaskRevisionError> {
+    if plan.run_id != run.run_id {
+        return Err(TaskRevisionError::InvalidInput {
+            message: format!(
+                "TaskPlan run '{}' does not match prepared run '{}'",
+                plan.run_id, run.run_id
+            ),
+        });
+    }
+    let (run_id, context, tasks) = plan_graph_input(plan, run.clone())?;
+    let pending_initial_runs = Arc::new(Mutex::new(HashMap::from([(
+        run_id.clone(),
+        PendingInitialRun {
+            run,
+            trigger,
+            continuation,
+        },
+    )])));
+    let service = TaskRevisionService::new(
+        Arc::new(EkoRevisionedTaskStore::with_pending_initial_runs(
+            store.clone(),
+            pending_initial_runs.clone(),
+        )),
+        Arc::new(DefaultTaskToolPolicy::new(run_id.clone())),
+    );
+    let create_result = service
+        .create_prepared(&run_id, context, tasks, "initial complete plan".to_string())
+        .await;
+    if create_result.is_err() {
+        pending_initial_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&run_id);
+    }
+    create_result?;
+    load_committed_plan(&store, run_id)
+}
+
+fn plan_graph_input(
+    plan: super::types::TaskPlan,
+    run: TaskRun,
+) -> Result<(String, TaskGraphContext, Vec<echo_agent::tasks::Task>), TaskRevisionError> {
     let context_metadata = serde_json::to_value(EkoPlanMetadata {
         plan_id: plan.plan_id,
         domain_profile: plan.domain_profile,
@@ -435,13 +515,13 @@ pub async fn commit_eko_task_plan(
         .iter()
         .map(super::types::PlanTask::to_task)
         .collect();
-    let service = TaskRevisionService::new(
-        Arc::new(EkoRevisionedTaskStore::new(store.clone())),
-        Arc::new(DefaultTaskToolPolicy::new(run_id.clone())),
-    );
-    service
-        .create_prepared(&run_id, context, tasks, "initial complete plan".to_string())
-        .await?;
+    Ok((run_id, context, tasks))
+}
+
+fn load_committed_plan(
+    store: &TaskRuntimeStore,
+    run_id: String,
+) -> Result<super::types::TaskPlan, TaskRevisionError> {
     store
         .get_plan(&run_id)
         .map_err(|error| TaskRevisionError::Backend {
@@ -455,6 +535,51 @@ mod tests {
     use super::*;
     use echo_agent::tasks::{TaskGraphExecutionMode, TaskKind};
 
+    fn test_capabilities() -> Arc<TaskCapabilityCatalog> {
+        let definitions = crate::subagent_loader::discover_subagents(None, None);
+        Arc::new(TaskCapabilityCatalog::new(
+            Arc::new(
+                crate::subagent_loader::SubagentCatalogSnapshot::from_definitions(&definitions),
+            ),
+            Vec::<String>::new(),
+        ))
+    }
+
+    fn test_context(run_id: &str) -> ToolContext {
+        ToolContext {
+            run_id: Some(run_id.to_string()),
+            conversation_id: Some(format!("{run_id}-conversation")),
+            turn_id: Some(format!("{run_id}-turn")),
+            message_id: Some(format!("{run_id}-message")),
+            ..ToolContext::default()
+        }
+    }
+
+    fn task_input(subagent: &str) -> TaskCreateInput {
+        TaskCreateInput {
+            tasks: vec![TaskDraft {
+                id: "task-1".to_string(),
+                title: "Inspect runtime".to_string(),
+                description: "Inspect the current runtime state".to_string(),
+                kind: TaskKind::Investigation,
+                subagent: Some(subagent.to_string()),
+                depends_on: Vec::new(),
+                files: Vec::new(),
+                allowed_tools: Vec::new(),
+                required_artifacts: Vec::new(),
+                execution_checks: vec!["facts captured".to_string()],
+                acceptance_criteria: vec!["summary is grounded".to_string()],
+                max_retries: 1,
+                extensions: serde_json::Value::Null,
+            }],
+            base_revision: None,
+            reason: None,
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: TaskGraphExecutionMode::Sequential,
+        }
+    }
+
     #[tokio::test]
     async fn failed_initial_graph_validation_rolls_back_staged_run() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -463,46 +588,10 @@ mod tests {
             TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
                 .map_err(|error| error.to_string())?,
         );
-        let service = build_eko_task_revision_service(
-            store.clone(),
-            Arc::new(TaskCapabilityCatalog::new(
-                Arc::new(crate::subagent_loader::SubagentCatalogSnapshot::default()),
-                Vec::<String>::new(),
-            )),
-        );
-        let context = ToolContext {
-            run_id: Some("rollback-run".to_string()),
-            conversation_id: Some("rollback-conversation".to_string()),
-            turn_id: Some("rollback-turn".to_string()),
-            message_id: Some("rollback-message".to_string()),
-            ..ToolContext::default()
-        };
+        let service = build_eko_task_revision_service(store.clone(), test_capabilities());
+        let context = test_context("rollback-run");
         let result = service
-            .create_from_tool(
-                TaskCreateInput {
-                    tasks: vec![TaskDraft {
-                        id: "task-1".to_string(),
-                        title: "Rejected task".to_string(),
-                        description: "Unknown Subagent must fail validation".to_string(),
-                        kind: TaskKind::Implementation,
-                        subagent: Some("missing-subagent".to_string()),
-                        depends_on: Vec::new(),
-                        files: Vec::new(),
-                        allowed_tools: Vec::new(),
-                        required_artifacts: Vec::new(),
-                        execution_checks: vec!["cargo test".to_string()],
-                        acceptance_criteria: vec!["validation passes".to_string()],
-                        max_retries: 1,
-                        extensions: serde_json::Value::Null,
-                    }],
-                    base_revision: None,
-                    reason: None,
-                    assumptions: Vec::new(),
-                    risks: Vec::new(),
-                    execution_mode: TaskGraphExecutionMode::Sequential,
-                },
-                &context,
-            )
+            .create_from_tool(task_input("missing-subagent"), &context)
             .await;
 
         assert!(result.is_err());
@@ -513,6 +602,109 @@ mod tests {
                 .is_none()
         );
         assert!(!root.join("rollback-run").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_create_publishes_one_complete_pending_generation() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+                .map_err(|error| error.to_string())?,
+        );
+        let service = build_eko_task_revision_service(store.clone(), test_capabilities());
+
+        service
+            .create_from_tool(task_input("explorer"), &test_context("atomic-run"))
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let run = store
+            .get_run("atomic-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "published run is missing".to_string())?;
+        assert_eq!(run.status, super::super::types::TaskRunStatus::Pending);
+        let plan = store
+            .get_plan("atomic-run")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "published plan is missing".to_string())?;
+        assert_eq!(plan.revision, 1);
+        assert_eq!(plan.tasks.len(), 1);
+        let events = store
+            .list_events("atomic-run", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(events.len(), 3);
+        assert_eq!(events.first().map(|event| event.seq), Some(1));
+        assert_eq!(events.last().map(|event| event.seq), Some(3));
+        assert_eq!(
+            events.last().and_then(|event| event.payload.get("kind")),
+            Some(&serde_json::json!("trigger_metadata"))
+        );
+        assert!(!events.iter().any(|event| {
+            event.event_type == super::super::types::RuntimeEventKind::RunStatusChanged
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn crash_before_initial_rename_is_invisible_and_retryable_after_restart()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        store.fail_next_initial_publish_before_rename();
+        let service = build_eko_task_revision_service(store.clone(), test_capabilities());
+        let result = service
+            .create_from_tool(task_input("explorer"), &test_context("crash-run"))
+            .await;
+        assert!(result.is_err());
+        assert!(
+            store
+                .get_run("crash-run")
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(!root.join("crash-run").exists());
+        let staged_before_restart = std::fs::read_dir(&root)
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".preparing-"))
+            });
+        assert!(staged_before_restart);
+        drop(service);
+        drop(store);
+
+        let restarted = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
+                .map_err(|error| error.to_string())?,
+        );
+        let staged_after_restart = std::fs::read_dir(&root)
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(".preparing-"))
+            });
+        assert!(!staged_after_restart);
+        build_eko_task_revision_service(restarted.clone(), test_capabilities())
+            .create_from_tool(task_input("explorer"), &test_context("crash-run"))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            restarted
+                .get_plan("crash-run")
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
         Ok(())
     }
 }

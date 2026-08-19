@@ -5,7 +5,7 @@
 //! turn, and that cancellation never releases that ownership before the
 //! existing [`crate::chat_driver::TurnOutcome`] has settled.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,7 +51,10 @@ struct ForegroundTurnKey {
 pub struct ForegroundTurnSnapshot {
     pub surface: ForegroundTurnSurface,
     pub conversation_id: String,
-    pub turn_id: String,
+    /// Stable root identity used by the surface message and its events.
+    pub root_turn_id: String,
+    /// Current framework turn identity used for exact steer/cancel requests.
+    pub active_turn_id: String,
     pub cancellation_requested: bool,
 }
 
@@ -94,10 +97,16 @@ pub enum ForegroundTurnError {
     },
     #[error("foreground turn admission is suspended for a workspace transition")]
     AdmissionSuspended,
+    #[error(
+        "foreground turn admission is suspended while conversation {conversation_id} is deleted"
+    )]
+    ConversationAdmissionSuspended { conversation_id: String },
     #[error("foreground turn control is shutting down")]
     ShuttingDown,
     #[error("a foreground turn is active; workspace transition admission cannot be suspended")]
     ActiveTurns,
+    #[error("conversation {conversation_id} has an active foreground turn")]
+    ActiveConversationTurns { conversation_id: String },
     #[error("foreground turn control state is unavailable")]
     StateUnavailable,
     #[error("foreground driver supervision requires an active Tokio runtime: {0}")]
@@ -128,7 +137,8 @@ impl ActiveForegroundTurn {
         ForegroundTurnSnapshot {
             surface: self.key.surface,
             conversation_id: self.key.conversation_id.clone(),
-            turn_id: self.active_agent_turn_id(),
+            root_turn_id: self.root_turn_id.clone(),
+            active_turn_id: self.active_agent_turn_id(),
             cancellation_requested: self.cancel.is_cancelled(),
         }
     }
@@ -178,6 +188,7 @@ struct ForegroundTurnState {
     shutdown: ForegroundShutdownState,
     shutdown_owner: Option<tokio::task::JoinHandle<()>>,
     admission_suspended: bool,
+    suspended_conversations: HashSet<String>,
     shutting_down: bool,
 }
 
@@ -262,6 +273,31 @@ impl Drop for ForegroundAdmissionSuspension {
     }
 }
 
+/// Prevents any surface from starting a turn for one conversation while its
+/// application-owned resources are being deleted.
+#[must_use]
+pub(crate) struct ForegroundConversationSuspension {
+    control: ForegroundTurnControl,
+    conversation_id: String,
+    active: bool,
+}
+
+impl Drop for ForegroundConversationSuspension {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .control
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.suspended_conversations.remove(&self.conversation_id);
+        self.active = false;
+    }
+}
+
 impl ForegroundTurnControl {
     /// Acquire one exact foreground turn. The returned lease owns its token.
     pub fn begin(
@@ -292,6 +328,11 @@ impl ForegroundTurnControl {
         }
         if state.admission_suspended {
             return Err(ForegroundTurnError::AdmissionSuspended);
+        }
+        if state.suspended_conversations.contains(&key.conversation_id) {
+            return Err(ForegroundTurnError::ConversationAdmissionSuspended {
+                conversation_id: key.conversation_id,
+            });
         }
         if let Some(existing) = state.active.get(&key) {
             return Err(ForegroundTurnError::Busy {
@@ -352,7 +393,7 @@ impl ForegroundTurnControl {
         snapshots.sort_by(|left, right| {
             left.conversation_id
                 .cmp(&right.conversation_id)
-                .then_with(|| left.turn_id.cmp(&right.turn_id))
+                .then_with(|| left.root_turn_id.cmp(&right.root_turn_id))
         });
         Ok(snapshots)
     }
@@ -376,6 +417,43 @@ impl ForegroundTurnControl {
             }
             Err(_) => true,
         }
+    }
+
+    /// Close admission for one conversation only when every surface is idle.
+    /// The active-turn check and suspension marker share the same mutex as
+    /// [`Self::begin`], so no turn can enter between them.
+    pub(crate) fn suspend_conversation_admission_if_idle(
+        &self,
+        conversation_id: &str,
+    ) -> Result<ForegroundConversationSuspension, ForegroundTurnError> {
+        if conversation_id.trim().is_empty() {
+            return Err(ForegroundTurnError::EmptyConversationId);
+        }
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+        if state.shutting_down {
+            return Err(ForegroundTurnError::ShuttingDown);
+        }
+        if state
+            .active
+            .keys()
+            .any(|key| key.conversation_id == conversation_id)
+        {
+            return Err(ForegroundTurnError::ActiveConversationTurns {
+                conversation_id: conversation_id.to_string(),
+            });
+        }
+        state
+            .suspended_conversations
+            .insert(conversation_id.to_string());
+        Ok(ForegroundConversationSuspension {
+            control: self.clone(),
+            conversation_id: conversation_id.to_string(),
+            active: true,
+        })
     }
 
     fn collect_finished_drivers(state: &mut ForegroundTurnState) {
@@ -524,6 +602,48 @@ impl ForegroundTurnControl {
                 conversation_id: conversation_id.to_string(),
                 expected_turn_id: expected_turn_id.to_string(),
                 actual_turn_id: active_turn_id,
+            });
+        }
+        let settlement_rx = entry.settlement_tx.subscribe();
+        entry.cancel.cancel();
+        Ok(ForegroundTurnSettlementWaiter { settlement_rx })
+    }
+
+    /// Request cancellation for one exact root surface operation.
+    ///
+    /// Product Stop actions target the stable root identity. Internal
+    /// continuation turns may advance while the user clicks Stop, but they
+    /// share the same cancellation token and must not make that request stale.
+    pub fn request_root_cancel(
+        &self,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        expected_root_turn_id: &str,
+    ) -> Result<ForegroundTurnSettlementWaiter, ForegroundTurnError> {
+        let key = ForegroundTurnKey {
+            surface,
+            conversation_id: conversation_id.to_string(),
+        };
+        let entry =
+            {
+                let state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+                state.active.get(&key).cloned().ok_or_else(|| {
+                    ForegroundTurnError::NoActiveTurn {
+                        surface,
+                        conversation_id: conversation_id.to_string(),
+                    }
+                })?
+            };
+        if entry.root_turn_id != expected_root_turn_id {
+            return Err(ForegroundTurnError::TurnMismatch {
+                surface,
+                conversation_id: conversation_id.to_string(),
+                expected_turn_id: expected_root_turn_id.to_string(),
+                actual_turn_id: entry.root_turn_id.clone(),
             });
         }
         let settlement_rx = entry.settlement_tx.subscribe();
@@ -1128,7 +1248,8 @@ mod tests {
             vec![ForegroundTurnSnapshot {
                 surface: ForegroundTurnSurface::Gui,
                 conversation_id: "conversation".to_string(),
-                turn_id: "gui-turn".to_string(),
+                root_turn_id: "gui-turn".to_string(),
+                active_turn_id: "gui-turn".to_string(),
                 cancellation_requested: false,
             }]
         );
@@ -1158,6 +1279,65 @@ mod tests {
 
         let reopened = control.begin(ForegroundTurnSurface::Tui, "reopened", "turn")?;
         reopened.settle(TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_suspension_blocks_every_surface_and_reopens_only_its_identity()
+    -> Result<(), ForegroundTurnError> {
+        let control = ForegroundTurnControl::default();
+        let suspension = control.suspend_conversation_admission_if_idle("conversation-a")?;
+
+        for surface in [
+            ForegroundTurnSurface::Gui,
+            ForegroundTurnSurface::Tui,
+            ForegroundTurnSurface::Cli,
+            ForegroundTurnSurface::Channel,
+        ] {
+            assert!(matches!(
+                control.begin(surface, "conversation-a", "blocked-turn"),
+                Err(ForegroundTurnError::ConversationAdmissionSuspended {
+                    ref conversation_id
+                }) if conversation_id == "conversation-a"
+            ));
+        }
+        let other = control.begin(ForegroundTurnSurface::Gui, "conversation-b", "allowed-turn")?;
+        other.settle(TurnOutcome::Completed);
+
+        drop(suspension);
+        let reopened = control.begin(
+            ForegroundTurnSurface::Channel,
+            "conversation-a",
+            "reopened-turn",
+        )?;
+        reopened.settle(TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn conversation_suspension_refuses_an_active_identity_without_blocking_others()
+    -> Result<(), ForegroundTurnError> {
+        let control = ForegroundTurnControl::default();
+        let active = control.begin(ForegroundTurnSurface::Tui, "conversation-a", "active-turn")?;
+
+        assert!(matches!(
+            control.suspend_conversation_admission_if_idle("conversation-a"),
+            Err(ForegroundTurnError::ActiveConversationTurns {
+                ref conversation_id
+            }) if conversation_id == "conversation-a"
+        ));
+        let other = control.suspend_conversation_admission_if_idle("conversation-b")?;
+        assert!(matches!(
+            control.begin(
+                ForegroundTurnSurface::Channel,
+                "conversation-b",
+                "blocked-turn"
+            ),
+            Err(ForegroundTurnError::ConversationAdmissionSuspended { .. })
+        ));
+
+        drop(other);
+        active.settle(TurnOutcome::Completed);
         Ok(())
     }
 
@@ -1217,7 +1397,8 @@ mod tests {
                 let snapshot = control
                     .snapshot(ForegroundTurnSurface::Gui, "conversation")
                     .ok_or(ForegroundTurnError::StateUnavailable)?;
-                assert_eq!(snapshot.turn_id, "continuation-turn");
+                assert_eq!(snapshot.root_turn_id, "root-turn");
+                assert_eq!(snapshot.active_turn_id, "continuation-turn");
                 assert!(matches!(
                     control
                         .request_cancel(ForegroundTurnSurface::Gui, "conversation", "root-turn",),
@@ -1227,6 +1408,35 @@ mod tests {
                     ForegroundTurnSurface::Gui,
                     "conversation",
                     "continuation-turn",
+                )?;
+                assert!(lease.cancellation_token().is_cancelled());
+                lease.settle(TurnOutcome::Cancelled);
+                assert_eq!(waiter.wait().await?.turn_id, "root-turn");
+                Ok::<(), ForegroundTurnError>(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn root_cancel_survives_a_continuation_identity_change() -> Result<(), ForegroundTurnError>
+    {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin(ForegroundTurnSurface::Gui, "conversation", "root-turn")?;
+        CURRENT_FOREGROUND_TURN
+            .scope(Arc::clone(&lease.entry), async {
+                advance_current_agent_turn("continuation-turn");
+                assert!(matches!(
+                    control.request_root_cancel(
+                        ForegroundTurnSurface::Gui,
+                        "conversation",
+                        "another-root",
+                    ),
+                    Err(ForegroundTurnError::TurnMismatch { .. })
+                ));
+                let waiter = control.request_root_cancel(
+                    ForegroundTurnSurface::Gui,
+                    "conversation",
+                    "root-turn",
                 )?;
                 assert!(lease.cancellation_token().is_cancelled());
                 lease.settle(TurnOutcome::Cancelled);

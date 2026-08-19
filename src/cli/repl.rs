@@ -68,6 +68,13 @@ impl ReplTurnQueue {
         self.turns.pop_front()
     }
 
+    fn discard_attachments(&mut self) -> Vec<echo_agent_app_core::attachments::AttachmentRef> {
+        self.turns
+            .drain(..)
+            .flat_map(|turn| turn.attachments)
+            .collect()
+    }
+
     fn settle_start_failure(
         &mut self,
         error: &ReplTurnStartError,
@@ -103,6 +110,17 @@ impl ReplTurnStartError {
             | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended) => {
                 Self::Retryable(error)
             }
+            error => Self::Permanent(error.to_string()),
+        }
+    }
+
+    fn from_conversation_admission(
+        error: echo_agent_app_core::conversation_deletion::ConversationDeletionError,
+    ) -> Self {
+        match error {
+            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                error,
+            ) => Self::from_admission(error),
             error => Self::Permanent(error.to_string()),
         }
     }
@@ -809,6 +827,41 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
             } => self.output.emit(format!(
                 "Run {run_id} paused ({goal}); new instruction: {new_message}"
             )),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::ApprovalRequest {
+                request_id,
+                tool_name,
+                prompt,
+                ..
+            } => self.output.emit(format!(
+                "Approval requested [{request_id}] for {tool_name}: {prompt}"
+            )),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::InputRequest {
+                request_id,
+                prompt,
+            } => self
+                .output
+                .emit(format!("Input requested [{request_id}]: {prompt}")),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::SelectionRequest {
+                request_id,
+                prompt,
+                options,
+                ..
+            } => self.output.emit(format!(
+                "Selection requested [{request_id}]: {prompt} ({})",
+                options.join(", ")
+            )),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::ContextCompressed {
+                before_count,
+                after_count,
+                before_tokens,
+                after_tokens,
+            } => {
+                let saved = before_tokens.saturating_sub(after_tokens);
+                self.output.emit(format!(
+                    "Context compressed: {before_count}->{after_count} messages, \
+                     {before_tokens}->{after_tokens} tokens ({saved} saved)"
+                ))
+            }
         }
     }
 }
@@ -1096,6 +1149,7 @@ async fn run_repl_inner(
     crate::cli::cmd_impls::analysis::register_all(&mut registry);
     crate::cli::cmd_impls::coding::register_all(&mut registry);
     crate::cli::cmd_impls::diff_cmd::register_all(&mut registry);
+    crate::cli::cmd_impls::developer::register_all(&mut registry);
     crate::cli::cmd_impls::git::register_all(&mut registry);
     crate::cli::cmd_impls::session::register_all(&mut registry);
     crate::cli::cmd_impls::info::register_all(&mut registry);
@@ -1110,6 +1164,7 @@ async fn run_repl_inner(
     crate::cli::cmd_impls::pipelines::register_all(&mut registry);
     crate::cli::cmd_impls::pipeline::register_all(&mut registry);
     crate::cli::cmd_impls::workspace::register_all(&mut registry);
+    crate::cli::cmd_impls::workflows::register_all(&mut registry);
     crate::cli::cmd_impls::plugins::register_all(&mut registry);
     crate::cli::cmd_impls::cron::register_all(&mut registry);
     crate::cli::cmd_impls::all::register_all(&mut registry);
@@ -1486,7 +1541,23 @@ async fn run_repl_inner(
             }
         }
     };
-    repl_result
+    let mut abandoned_attachments = {
+        let mut staged = staged_attachments.lock().await;
+        std::mem::take(&mut *staged)
+    };
+    abandoned_attachments.extend(queued_turns.discard_attachments());
+    let cleanup =
+        echo_agent_app_core::attachments::discard_staged_attachment_refs(&abandoned_attachments);
+    match (repl_result, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup)) => Err(anyhow::anyhow!(
+            "failed to clean abandoned CLI attachment staging: {cleanup}"
+        )),
+        (Err(error), Err(cleanup)) => Err(anyhow::anyhow!(
+            "CLI session failed: {error}; attachment staging cleanup failed: {cleanup}"
+        )),
+    }
 }
 
 /// Run auto-memory extraction when the session ends.
@@ -1889,13 +1960,14 @@ async fn prepare_repl_turn_start(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| config.conversation_id.clone());
     let control = app_state.session.foreground_turns.clone();
-    let lease = control
-        .begin(
+    let lease = app_state
+        .begin_conversation_turn_owned(
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
-            conversation_id.clone(),
+            &conversation_id,
             turn_id.clone(),
         )
-        .map_err(ReplTurnStartError::from_admission)?;
+        .await
+        .map_err(ReplTurnStartError::from_conversation_admission)?;
     let workspace_root = match config.app_state.as_ref() {
         Some(state) => state
             .current_workspace()
@@ -1955,7 +2027,20 @@ fn spawn_prepared_repl_turn(
     } = prepared;
     let cancel = lease.cancellation_token();
     let renderer = Arc::new(ReplChatSink::new(live_output.clone(), output.config()));
-    let sink: Arc<dyn echo_agent_app_core::chat_driver::ChatSink> = renderer.clone();
+    let render_sink: Arc<dyn echo_agent_app_core::chat_driver::ChatSink> = renderer.clone();
+    let sink = config
+        .app_state
+        .as_ref()
+        .map_or(render_sink.clone(), |state| {
+            echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
+                echo_agent_app_core::chat_event_log::ChatSurface::Cli,
+                render_sink,
+                state.storage.chat_events.clone(),
+                state.storage.tool_executions.clone(),
+                Some(conversation_id.clone()),
+                turn_id.clone(),
+            )
+        });
     let _ = live_output.bind_turn_cancel(cancel.clone());
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: config.pool.clone(),
@@ -2317,7 +2402,10 @@ mod tests {
     #[test]
     fn prepared_steer_fallback_keeps_spilled_paste_durable() -> Result<(), String> {
         let root = std::env::temp_dir().join(format!("eko-repl-steer-{}", uuid::Uuid::new_v4()));
-        let staging = root.join("staging").join("paste.txt");
+        let staging = root
+            .join(".eko")
+            .join("uploads")
+            .join(format!("{}_paste.txt", uuid::Uuid::new_v4()));
         let artifacts = root.join("artifacts");
         let parent = staging
             .parent()

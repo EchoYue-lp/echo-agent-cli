@@ -397,7 +397,10 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       set({ isLoading: false });
     }
     try {
-      await conversationApi.delete(id);
+      const receipt = await conversationApi.delete(id);
+      if (receipt.cleanup_pending) {
+        useToastStore.getState().addToast('warning', '会话已删除，剩余本地清理将在下次启动时继续');
+      }
     } catch (e) {
       console.error('Failed to delete conversation:', e);
       useToastStore.getState().addToast('error', '删除会话失败，请重试');

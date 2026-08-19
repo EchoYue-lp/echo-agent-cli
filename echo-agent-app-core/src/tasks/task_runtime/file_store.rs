@@ -376,6 +376,24 @@ fn fold_task_runtime(events: &[RuntimeTaskEvent], task_id: &str) -> TaskRuntimeM
     let mut completed = None;
     let mut summary = None;
     for e in events {
+        if let Some(recovery_summary) = e
+            .payload
+            .get("recovery")
+            .filter(|recovery| {
+                recovery.get("kind").and_then(serde_json::Value::as_str) == Some("boot_recovery")
+            })
+            .and_then(|recovery| recovery.get("tasks"))
+            .and_then(serde_json::Value::as_array)
+            .and_then(|tasks| {
+                tasks.iter().find(|task| {
+                    task.get("task_id").and_then(serde_json::Value::as_str) == Some(task_id)
+                })
+            })
+            .and_then(|task| task.get("summary"))
+            .and_then(serde_json::Value::as_str)
+        {
+            summary = Some(recovery_summary.to_string());
+        }
         if e.task_id.as_deref() != Some(task_id) {
             continue;
         }

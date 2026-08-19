@@ -2,9 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
-use echo_agent::lsp::{LspConfig, LspManager};
+use echo_agent::lsp::{LspConfig, LspManager, LspServerStatus};
 use echo_agent::mcp::McpConfigFile;
 use echo_agent::plugin::{
     AGENT_PLUGIN_SCHEMA_V1, InstallSource, PluginEntry, PluginIntegrator, PluginLifecycle,
@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::agent_handle::AgentHandle;
+use crate::agent_pool::{AgentPluginGeneration, AgentPool};
 use crate::mcp_config_runtime::{
     McpNameOwnershipGuard, McpNameOwnershipRegistry, PluginMcpOwnershipToken,
 };
@@ -198,6 +199,7 @@ struct PluginRuntimeState {
     cleanup_quarantine: Vec<PluginCleanupQuarantine>,
     active_theme: Option<String>,
     active_output_style: Option<String>,
+    generation: u64,
     shut_down: bool,
 }
 
@@ -241,6 +243,7 @@ pub struct PluginRuntimeService {
     registry_source: RegistrySource,
     preferences_file: PathBuf,
     state: Mutex<PluginRuntimeState>,
+    agent_pool: RwLock<Option<Weak<AgentPool>>>,
     mutation_supervisor: Mutex<PluginMutationSupervisor>,
 }
 
@@ -285,8 +288,10 @@ impl PluginRuntimeService {
                 cleanup_quarantine: Vec::new(),
                 active_theme: preferences.active_theme,
                 active_output_style: preferences.active_output_style,
+                generation: 0,
                 shut_down: false,
             }),
+            agent_pool: RwLock::new(None),
             mutation_supervisor: Mutex::new(PluginMutationSupervisor::default()),
         });
         if let Err(error) = service.reload().await {
@@ -370,6 +375,115 @@ impl PluginRuntimeService {
         result_receiver
             .await
             .map_err(|_| anyhow::anyhow!("plugin mutation settlement task stopped unexpectedly"))?
+    }
+
+    /// Bind the process pool to the currently committed plugin generation.
+    pub async fn bind_agent_pool(self: &Arc<Self>, pool: Weak<AgentPool>) -> anyhow::Result<()> {
+        self.run_owned_mutation(
+            move |service| async move { service.bind_agent_pool_inner(pool).await },
+        )
+        .await
+    }
+
+    async fn bind_agent_pool_inner(&self, pool: Weak<AgentPool>) -> anyhow::Result<()> {
+        let pool_owner = pool
+            .upgrade()
+            .ok_or_else(|| anyhow::anyhow!("AgentPool was released before plugin binding"))?;
+        if let Some(existing) = self
+            .agent_pool
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade)
+            && !Arc::ptr_eq(&existing, &pool_owner)
+        {
+            return Err(anyhow::anyhow!(
+                "plugin runtime is already bound to another live AgentPool"
+            ));
+        }
+        let state = self.state.lock().await;
+        if state.shut_down {
+            return Err(anyhow::anyhow!("plugin runtime is shut down"));
+        }
+        let generation = self
+            .capture_agent_generation(state.generation, &state.prepared)
+            .await;
+        let mut publication = pool_owner
+            .begin_plugin_publication()
+            .await
+            .map_err(anyhow::Error::msg)?;
+        publication
+            .prepare(generation)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        publication.commit().await.map_err(anyhow::Error::msg)?;
+        *self.agent_pool.write().await = Some(pool);
+        Ok(())
+    }
+
+    async fn capture_agent_generation(
+        &self,
+        revision: u64,
+        prepared: &PreparedApplicationComponents,
+    ) -> AgentPluginGeneration {
+        let descriptors = self
+            .agent_handle
+            .read(|agent| agent.skill_descriptors())
+            .await;
+        AgentPluginGeneration::new(revision, descriptors, prepared.agents.clone())
+    }
+
+    /// Republish application-owned skills through the same primary/pool/router
+    /// generation used by plugin mutations.
+    pub async fn refresh_agent_catalog(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.run_owned_mutation(|service| async move {
+            let mut state = service.state.lock().await;
+            if state.shut_down {
+                return Err(anyhow::anyhow!("plugin runtime is shut down"));
+            }
+            let revision = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("plugin generation revision exhausted"))?;
+            let primary_execution = service
+                .agent_handle
+                .read(|agent| Arc::clone(agent.execution_mutex()))
+                .await;
+            let _primary_execution_guard = primary_execution.lock_owned().await;
+            let primary_owner = Arc::clone(service.agent_handle.inner());
+            let mut primary = primary_owner.write_owned().await;
+            let pool = service
+                .agent_pool
+                .read()
+                .await
+                .as_ref()
+                .and_then(Weak::upgrade);
+            let mut pool_publication = if let Some(pool) = pool.as_ref() {
+                Some(
+                    pool.begin_plugin_publication()
+                        .await
+                        .map_err(anyhow::Error::msg)?,
+                )
+            } else {
+                None
+            };
+            crate::runtime::configure_intent_router(&mut primary);
+            let generation = AgentPluginGeneration::new(
+                revision,
+                primary.skill_descriptors(),
+                state.prepared.agents.clone(),
+            );
+            if let Some(publication) = pool_publication.as_mut() {
+                publication
+                    .prepare(generation)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                publication.commit().await.map_err(anyhow::Error::msg)?;
+            }
+            state.generation = revision;
+            Ok(())
+        })
+        .await
     }
 
     async fn drain_owned_mutations(&self) -> anyhow::Result<()> {
@@ -554,6 +668,32 @@ impl PluginRuntimeService {
         previous_root: PathBuf,
     ) -> Vec<String> {
         let mut errors = Vec::new();
+        let primary_execution = self
+            .agent_handle
+            .read(|agent| Arc::clone(agent.execution_mutex()))
+            .await;
+        let _primary_execution_guard = primary_execution.lock_owned().await;
+        let primary_owner = Arc::clone(self.agent_handle.inner());
+        let mut primary = primary_owner.write_owned().await;
+        let pool = self
+            .agent_pool
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade);
+        let mut pool_publication = if let Some(pool) = pool.as_ref() {
+            match pool.begin_plugin_publication().await {
+                Ok(publication) => Some(publication),
+                Err(error) => {
+                    errors.push(format!(
+                        "Failed to close AgentPool admission for fail-closed plugin retirement: {error}"
+                    ));
+                    return errors;
+                }
+            }
+        } else {
+            None
+        };
         let previous_prepared = std::mem::take(&mut state.prepared);
         let mut failed_monitors = Vec::new();
         if let Some(scheduler) = self.scheduler.read().await.clone() {
@@ -588,16 +728,11 @@ impl PluginRuntimeService {
             &previous_mcp_ownership,
             &ownership_guard,
         );
-        self.agent_handle
-            .write_async(|agent| {
-                Box::pin(async move {
-                    unload_agent_components(agent, &exact_framework, &previous_prepared).await;
-                    agent
-                        .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
-                        .await;
-                })
-            })
+        unload_agent_components(&mut primary, &exact_framework, &previous_prepared).await;
+        primary
+            .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
             .await;
+        crate::runtime::configure_intent_router(&mut primary);
         release_plugin_mcp_claims(&mut ownership_guard, &previous_mcp_ownership);
         drop(ownership_guard);
 
@@ -611,6 +746,31 @@ impl PluginRuntimeService {
         state.registry = self.registry_for(binding.project_root.clone());
         state.active_theme = None;
         state.active_output_style = None;
+        match state.generation.checked_add(1) {
+            Some(revision) => {
+                let generation = AgentPluginGeneration::new(
+                    revision,
+                    primary.skill_descriptors(),
+                    state.prepared.agents.clone(),
+                );
+                if let Some(publication) = pool_publication.as_mut() {
+                    match publication.prepare(generation).await {
+                        Ok(()) => match publication.commit().await {
+                            Ok(()) => state.generation = revision,
+                            Err(error) => errors.push(format!(
+                                "Failed to commit fail-closed AgentPool generation: {error}"
+                            )),
+                        },
+                        Err(error) => errors.push(format!(
+                            "Failed to prepare fail-closed AgentPool generation: {error}"
+                        )),
+                    }
+                } else {
+                    state.generation = revision;
+                }
+            }
+            None => errors.push("plugin generation revision exhausted".to_string()),
+        }
         if let Err(error) = persist_preferences(
             &self.preferences_file,
             &PluginPreferences {
@@ -622,6 +782,8 @@ impl PluginRuntimeService {
                 "Failed to persist fail-closed plugin preferences: {error}"
             ));
         }
+        drop(pool_publication);
+        drop(primary);
         errors
     }
 
@@ -685,6 +847,71 @@ impl PluginRuntimeService {
 
     pub async fn workspace_root(&self) -> PathBuf {
         self.lsp.binding().await.project_root
+    }
+
+    pub async fn lsp_configured_languages(&self) -> Vec<String> {
+        let _state = self.state.lock().await;
+        let manager = self.lsp.manager.read().await;
+        let mut languages = manager
+            .configured_languages()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        languages.sort();
+        languages
+    }
+
+    pub async fn lsp_status(&self) -> Vec<LspServerStatus> {
+        let _state = self.state.lock().await;
+        let manager = self.lsp.manager.read().await;
+        let mut statuses = manager.status_all().await;
+        statuses.sort_by(|left, right| left.language.cmp(&right.language));
+        statuses
+    }
+
+    pub async fn lsp_start(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
+        self.run_owned_mutation(move |service| async move {
+            let mut manager = service.lsp.manager.write().await;
+            if manager.get_client(&language).is_some() {
+                return Err(anyhow::anyhow!(
+                    "language server '{language}' is already running"
+                ));
+            }
+            manager
+                .start_server(&language)
+                .await
+                .map_err(anyhow::Error::msg)
+        })
+        .await
+    }
+
+    pub async fn lsp_stop(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
+        self.run_owned_mutation(move |service| async move {
+            service
+                .lsp
+                .manager
+                .write()
+                .await
+                .stop_server(&language)
+                .await
+                .map_err(anyhow::Error::msg)
+        })
+        .await
+    }
+
+    pub async fn lsp_restart(self: &Arc<Self>, language: String) -> anyhow::Result<()> {
+        self.run_owned_mutation(move |service| async move {
+            let mut manager = service.lsp.manager.write().await;
+            manager
+                .stop_server(&language)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            manager
+                .start_server(&language)
+                .await
+                .map_err(anyhow::Error::msg)
+        })
+        .await
     }
 
     pub async fn bind_scheduler(
@@ -1239,6 +1466,10 @@ impl PluginRuntimeService {
         if state.shut_down {
             return Err(anyhow::anyhow!("plugin runtime is shut down"));
         }
+        let candidate_revision = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("plugin generation revision exhausted"))?;
         candidate
             .resolve_enabled_dependencies()
             .map_err(|error| anyhow::anyhow!("Plugin dependency validation failed: {error}"))?;
@@ -1258,6 +1489,36 @@ impl PluginRuntimeService {
         let candidate_mcp_declarations = plugin_mcp_declarations(&mut candidate)?;
         self.validate_agent_collisions(state, &prepared).await?;
         let mut replacement_lsp = self.prepare_lsp(&prepared, binding).await?;
+
+        // Publication lock order: primary execution, primary agent write,
+        // then pool transition/agents. No primary or pooled turn can observe
+        // a half-published skill/Subagent/router catalog.
+        let primary_execution = self
+            .agent_handle
+            .read(|agent| Arc::clone(agent.execution_mutex()))
+            .await;
+        let _primary_execution_guard = primary_execution.lock_owned().await;
+        let primary_owner = Arc::clone(self.agent_handle.inner());
+        let mut primary = primary_owner.write_owned().await;
+        let pool = self
+            .agent_pool
+            .read()
+            .await
+            .as_ref()
+            .and_then(Weak::upgrade);
+        let mut pool_publication = if let Some(pool) = pool.as_ref() {
+            match pool.begin_plugin_publication().await {
+                Ok(publication) => Some(publication),
+                Err(error) => {
+                    replacement_lsp.shutdown_all().await;
+                    return Err(anyhow::anyhow!(
+                        "Failed to close AgentPool plugin publication admission: {error}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
 
         let deactivate_errors = state.lifecycle.deactivate_all();
         if !deactivate_errors.is_empty() {
@@ -1299,6 +1560,7 @@ impl PluginRuntimeService {
         let previous_prepared = std::mem::take(&mut state.prepared);
         let apply = self
             .replace_agent_components(
+                &mut primary,
                 previous_registry,
                 previous_framework,
                 previous_mcp_ownership,
@@ -1338,6 +1600,73 @@ impl PluginRuntimeService {
             }
         };
 
+        let candidate_generation = AgentPluginGeneration::new(
+            candidate_revision,
+            primary.skill_descriptors(),
+            applied.prepared.agents.clone(),
+        );
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(pool_error) = publication.prepare(candidate_generation).await
+        {
+            let candidate_monitors = applied.prepared.monitors.clone();
+            let previous_monitors = applied.previous_prepared.monitors.clone();
+            let rollback = self
+                .replace_agent_components(
+                    &mut primary,
+                    applied.registry,
+                    applied.wiring.components_by_plugin,
+                    applied.mcp_ownership,
+                    applied.prepared,
+                    applied.previous_registry,
+                    applied.previous_mcp_declarations,
+                    applied.previous_prepared,
+                )
+                .await;
+            let mut errors = vec![format!(
+                "AgentPool plugin generation publication failed: {pool_error}"
+            )];
+            match rollback {
+                Ok(restored) => {
+                    if let Some(scheduler) = scheduler.as_ref()
+                        && let Err(error) = replace_plugin_monitors(
+                            scheduler,
+                            &candidate_monitors,
+                            &previous_monitors,
+                        )
+                        .await
+                    {
+                        errors.push(format!("rollback plugin monitors failed: {error}"));
+                    }
+                    state.registry = restored.registry;
+                    state.framework_components = restored.wiring.components_by_plugin;
+                    state.mcp_ownership = restored.mcp_ownership;
+                    state.prepared = restored.prepared;
+                    errors.extend(
+                        state
+                            .lifecycle
+                            .activate_enabled(previous_plugins.iter().map(String::as_str)),
+                    );
+                }
+                Err(failed) => {
+                    errors.push(format!(
+                        "rollback agent components failed: {}",
+                        failed.error
+                    ));
+                    state.registry = failed.registry;
+                    state.framework_components = failed.framework_components;
+                    state.mcp_ownership = failed.mcp_ownership;
+                    state.prepared = failed.prepared;
+                    errors.extend(
+                        state
+                            .lifecycle
+                            .activate_enabled(candidate_plugins.iter().map(String::as_str)),
+                    );
+                }
+            }
+            replacement_lsp.shutdown_all().await;
+            return Err(anyhow::anyhow!(errors.join("; ")));
+        }
+
         let mut previous_lsp = {
             let mut current = self.lsp.manager.write().await;
             std::mem::replace(&mut *current, replacement_lsp)
@@ -1357,6 +1686,7 @@ impl PluginRuntimeService {
             let previous_monitors = applied.previous_prepared.monitors.clone();
             let rollback = self
                 .replace_agent_components(
+                    &mut primary,
                     applied.registry,
                     applied.wiring.components_by_plugin,
                     applied.mcp_ownership,
@@ -1410,7 +1740,16 @@ impl PluginRuntimeService {
                     );
                 }
             }
+            if let Some(publication) = pool_publication.as_mut()
+                && let Err(error) = publication.rollback().await
+            {
+                errors.push(error);
+            }
             return Err(anyhow::anyhow!(errors.join("; ")));
+        }
+
+        if let Some(publication) = pool_publication.as_mut() {
+            publication.commit().await.map_err(anyhow::Error::msg)?;
         }
 
         previous_lsp.shutdown_all().await;
@@ -1422,6 +1761,7 @@ impl PluginRuntimeService {
         state.framework_components = applied.wiring.components_by_plugin.clone();
         state.mcp_ownership = applied.mcp_ownership;
         state.prepared = applied.prepared;
+        state.generation = candidate_revision;
         if let Some(style) = active_style {
             if state
                 .prepared
@@ -1435,28 +1775,13 @@ impl PluginRuntimeService {
                     .iter()
                     .find(|candidate| candidate.name == style)
                     .map(|candidate| candidate.instructions.clone());
-                self.agent_handle
-                    .read_async(|agent| {
-                        Box::pin(async move {
-                            agent
-                                .replace_system_context_projection(
-                                    OUTPUT_STYLE_PROJECTION,
-                                    instructions,
-                                )
-                                .await;
-                        })
-                    })
+                primary
+                    .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, instructions)
                     .await;
             } else {
                 state.active_output_style = None;
-                self.agent_handle
-                    .read_async(|agent| {
-                        Box::pin(async move {
-                            agent
-                                .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
-                                .await;
-                        })
-                    })
+                primary
+                    .replace_system_context_projection(OUTPUT_STYLE_PROJECTION, None)
                     .await;
             }
         }
@@ -1484,6 +1809,8 @@ impl PluginRuntimeService {
         ) {
             summary.errors.push(error.to_string());
         }
+        drop(pool_publication);
+        drop(primary);
         self.fire_loaded_events(&candidate_plugins).await;
         tracing::info!(
             total,
@@ -1501,6 +1828,7 @@ impl PluginRuntimeService {
     #[allow(clippy::too_many_arguments)]
     async fn replace_agent_components(
         &self,
+        agent: &mut echo_agent::agent::react::ReactAgent,
         mut previous_registry: PluginRegistry,
         previous_framework: HashMap<String, WiredPluginComponents>,
         previous_mcp_ownership: PluginMcpOwnership,
@@ -1545,14 +1873,7 @@ impl PluginRuntimeService {
             &ownership_guard,
         );
         let previous_prepared_for_unload = previous_prepared.clone();
-        self.agent_handle
-            .write_async(|agent| {
-                Box::pin(async move {
-                    unload_agent_components(agent, &exact_previous, &previous_prepared_for_unload)
-                        .await;
-                })
-            })
-            .await;
+        unload_agent_components(agent, &exact_previous, &previous_prepared_for_unload).await;
         release_plugin_mcp_claims(&mut ownership_guard, &previous_mcp_ownership);
         let candidate_mcp_ownership =
             match claim_plugin_mcp_names(&mut ownership_guard, &candidate_mcp_declarations) {
@@ -1570,39 +1891,33 @@ impl PluginRuntimeService {
             };
 
         let candidate_prepared_for_wiring = candidate_prepared.clone();
-        let candidate_outcome = self
-            .agent_handle
-            .write_async(|agent| {
-                Box::pin(async move {
-                    let wiring = PluginIntegrator::new()
-                        .wire_all(agent, &mut candidate)
-                        .await;
-                    if !wiring.errors.is_empty() {
-                        return Err((
-                            format!("Plugin wiring failed: {}", wiring.errors.join("; ")),
-                            candidate,
-                            wiring,
-                        ));
-                    }
-                    if let Err(error) =
-                        register_plugin_agents(agent, &candidate_prepared_for_wiring.agents).await
-                    {
-                        unload_agent_components(
-                            agent,
-                            &wiring.components_by_plugin,
-                            &candidate_prepared_for_wiring,
-                        )
-                        .await;
-                        return Err((
-                            format!("Plugin Subagent registration failed: {error}"),
-                            candidate,
-                            wiring,
-                        ));
-                    }
-                    Ok((candidate, wiring))
-                })
-            })
+        let wiring = PluginIntegrator::new()
+            .wire_all(agent, &mut candidate)
             .await;
+        let candidate_outcome = if !wiring.errors.is_empty() {
+            Err((
+                format!("Plugin wiring failed: {}", wiring.errors.join("; ")),
+                candidate,
+                wiring,
+            ))
+        } else if let Err(error) =
+            register_plugin_agents(agent, &candidate_prepared_for_wiring.agents).await
+        {
+            unload_agent_components(
+                agent,
+                &wiring.components_by_plugin,
+                &candidate_prepared_for_wiring,
+            )
+            .await;
+            Err((
+                format!("Plugin Subagent registration failed: {error}"),
+                candidate,
+                wiring,
+            ))
+        } else {
+            crate::runtime::configure_intent_router(agent);
+            Ok((candidate, wiring))
+        };
 
         match candidate_outcome {
             Ok((registry, wiring)) => {
@@ -1642,25 +1957,18 @@ impl PluginRuntimeService {
                     }
                 };
                 let previous_prepared_for_restore = previous_prepared.clone();
-                let restored = self
-                    .agent_handle
-                    .write_async(|agent| {
-                        Box::pin(async move {
-                            let restored = PluginIntegrator::new()
-                                .wire_all(agent, &mut previous_registry)
-                                .await;
-                            let restore_agent_error = if restored.errors.is_empty() {
-                                register_plugin_agents(agent, &previous_prepared_for_restore.agents)
-                                    .await
-                                    .err()
-                            } else {
-                                None
-                            };
-                            (previous_registry, restored, restore_agent_error)
-                        })
-                    })
+                let restored = PluginIntegrator::new()
+                    .wire_all(agent, &mut previous_registry)
                     .await;
-                let (registry, restored, restore_agent_error) = restored;
+                let restore_agent_error = if restored.errors.is_empty() {
+                    register_plugin_agents(agent, &previous_prepared_for_restore.agents)
+                        .await
+                        .err()
+                } else {
+                    None
+                };
+                crate::runtime::configure_intent_router(agent);
+                let registry = previous_registry;
                 let mut errors = vec![error];
                 if !restored.errors.is_empty() {
                     errors.push(format!(
@@ -2369,6 +2677,7 @@ fn component_names(root: &Path, resolved: &echo_agent::plugin::ResolvedComponent
 mod tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::intent::IntentClassifier;
     use echo_agent::testing::MockLlmClient;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -2433,17 +2742,24 @@ mod tests {
     fn write_fixture_at(plugin: PathBuf, name: &str) -> Result<PathBuf, String> {
         PluginRuntimeService::scaffold(&plugin, name).map_err(|error| error.to_string())?;
         std::fs::write(
+            plugin.join("skills/example/SKILL.md"),
+            format!(
+                "---\nname: {name}-example\ndescription: Example skill\ntriggers:\n  - route {name} work\n---\nUse this skill for {name} tasks.\n"
+            ),
+        )
+        .map_err(|error| error.to_string())?;
+        std::fs::write(
             plugin.join("monitors.yaml"),
             "monitors:\n  - name: daily-review\n    cron: \"0 0 * * * *\"\n    prompt: Review pending work\n",
         )
         .map_err(|error| error.to_string())?;
         #[cfg(unix)]
-        write_fake_lsp(&plugin)?;
+        write_fake_lsp(&plugin, name)?;
         Ok(plugin)
     }
 
     #[cfg(unix)]
-    fn write_fake_lsp(plugin: &Path) -> Result<(), String> {
+    fn write_fake_lsp(plugin: &Path, plugin_name: &str) -> Result<(), String> {
         let server = plugin.join("fake-lsp.sh");
         std::fs::write(
             &server,
@@ -2471,19 +2787,25 @@ done
         permissions.set_mode(0o755);
         std::fs::set_permissions(&server, permissions).map_err(|error| error.to_string())?;
 
-        let lsp = serde_yaml::to_string(&serde_json::json!({
-            "languages": {
-                "fixture": {
-                    "language": "fixture",
-                    "command": server,
-                    "args": [],
-                    "extensions": [".fixture"],
-                    "env": {},
-                    "max_restarts": 0
-                }
-            }
-        }))
-        .map_err(|error| error.to_string())?;
+        let language = if plugin_name == "runtime-fixture" {
+            "fixture".to_string()
+        } else {
+            format!("{plugin_name}-fixture")
+        };
+        let mut languages = serde_json::Map::new();
+        languages.insert(
+            language.clone(),
+            serde_json::json!({
+                "language": language,
+                "command": server,
+                "args": [],
+                "extensions": [".fixture"],
+                "env": {},
+                "max_restarts": 0
+            }),
+        );
+        let lsp = serde_yaml::to_string(&serde_json::json!({ "languages": languages }))
+            .map_err(|error| error.to_string())?;
         std::fs::write(plugin.join("lsp.yaml"), lsp).map_err(|error| error.to_string())
     }
 
@@ -2504,6 +2826,51 @@ done
             root.join("plugin-data"),
         )
         .await)
+    }
+
+    async fn bind_test_pool(runtime: &Arc<PluginRuntimeService>) -> Result<Arc<AgentPool>, String> {
+        let pool = Arc::new(
+            AgentPool::new_for_test(runtime.agent_handle.clone(), None, None, 8, false).await,
+        );
+        runtime
+            .bind_agent_pool(Arc::downgrade(&pool))
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(pool)
+    }
+
+    async fn agent_has_plugin_generation(
+        handle: &AgentHandle,
+        plugin: &str,
+        expected: bool,
+    ) -> Result<(), String> {
+        let skill = format!("{plugin}-example");
+        let subagent = format!("{plugin}-specialist");
+        let has_skill = handle
+            .read(|agent| {
+                agent
+                    .skill_descriptors()
+                    .iter()
+                    .any(|descriptor| descriptor.name == skill)
+            })
+            .await;
+        let registry = handle.read(|agent| agent.subagent_registry().clone()).await;
+        let has_subagent = registry.contains(&subagent).await;
+        let classifier = handle.write(crate::runtime::configure_intent_router).await;
+        let routed_skill = match classifier
+            .classify(&format!("route {plugin} work"), &[])
+            .await
+        {
+            echo_agent::intent::Intent::SkillRequired { skill_name, .. } => Some(skill_name),
+            _ => None,
+        };
+        let has_route = routed_skill.as_deref() == Some(skill.as_str());
+        if has_skill != expected || has_subagent != expected || has_route != expected {
+            return Err(format!(
+                "agent plugin generation mismatch for {plugin}: skill={has_skill}, subagent={has_subagent}, route={routed_skill:?}, expected={expected}"
+            ));
+        }
+        Ok(())
     }
 
     async fn default_service(root: &Path) -> Result<Arc<PluginRuntimeService>, String> {
@@ -2698,6 +3065,181 @@ done
         assert!(!registry.contains("runtime-fixture-specialist").await);
         assert!(scheduler.list_tasks().await.is_empty());
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn plugin_generation_reaches_primary_existing_and_future_pool_agents()
+    -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = service(temporary.path()).await?;
+        let pool = bind_test_pool(&runtime).await?;
+        let existing_lease = pool
+            .acquire("existing-plugin-consumer")
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing = existing_lease.agent();
+        drop(existing_lease);
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", false).await?;
+        agent_has_plugin_generation(&existing, "runtime-fixture", false).await?;
+
+        let _plugin = write_fixture(temporary.path())?;
+        runtime.reload().await.map_err(|error| error.to_string())?;
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
+        agent_has_plugin_generation(&existing, "runtime-fixture", true).await?;
+
+        let future_lease = pool
+            .acquire("future-plugin-consumer")
+            .await
+            .map_err(|error| error.to_string())?;
+        let future = future_lease.agent();
+        drop(future_lease);
+        agent_has_plugin_generation(&future, "runtime-fixture", true).await?;
+        let committed_revision = pool.plugin_generation_revision_for_test().await;
+
+        runtime
+            .disable("runtime-fixture")
+            .await
+            .map_err(|error| error.to_string())?;
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", false).await?;
+        agent_has_plugin_generation(&existing, "runtime-fixture", false).await?;
+        agent_has_plugin_generation(&future, "runtime-fixture", false).await?;
+        let after_remove_lease = pool
+            .acquire("after-plugin-remove")
+            .await
+            .map_err(|error| error.to_string())?;
+        let after_remove = after_remove_lease.agent();
+        drop(after_remove_lease);
+        agent_has_plugin_generation(&after_remove, "runtime-fixture", false).await?;
+        assert!(pool.plugin_generation_revision_for_test().await > committed_revision);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_plugin_activation_restores_primary_and_pool_generation() -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let _first = write_fixture(temporary.path())?;
+        let runtime = service(temporary.path()).await?;
+        let pool = bind_test_pool(&runtime).await?;
+        let existing_lease = pool
+            .acquire("rollback-existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing = existing_lease.agent();
+        drop(existing_lease);
+        let previous_revision = pool.plugin_generation_revision_for_test().await;
+        let lifecycle = Arc::new(LifecycleCounts::default());
+        runtime
+            .register_lifecycle(
+                "runtime-fixture",
+                Arc::new(TestLifecycle(Arc::clone(&lifecycle))),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let _second = write_fixture_at(
+            temporary
+                .path()
+                .join(".echo-agent/plugins/rollback-candidate"),
+            "rollback-candidate",
+        )?;
+        lifecycle.fail_next_activation.store(true, Ordering::SeqCst);
+
+        let error = runtime
+            .reload()
+            .await
+            .err()
+            .ok_or_else(|| "injected activation failure unexpectedly committed".to_string())?;
+        if !error.to_string().contains("injected activation failure") {
+            return Err(format!(
+                "plugin activation failed for an unexpected reason: {error}"
+            ));
+        }
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
+        agent_has_plugin_generation(&existing, "runtime-fixture", true).await?;
+        agent_has_plugin_generation(&runtime.agent_handle, "rollback-candidate", false).await?;
+        agent_has_plugin_generation(&existing, "rollback-candidate", false).await?;
+        assert_eq!(
+            pool.plugin_generation_revision_for_test().await,
+            previous_revision
+        );
+
+        let future_lease = pool
+            .acquire("rollback-future")
+            .await
+            .map_err(|error| error.to_string())?;
+        let future = future_lease.agent();
+        drop(future_lease);
+        agent_has_plugin_generation(&future, "runtime-fixture", true).await?;
+        agent_has_plugin_generation(&future, "rollback-candidate", false).await?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_primary_execution_blocks_plugin_generation_publication() -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = service(temporary.path()).await?;
+        let pool = bind_test_pool(&runtime).await?;
+        let previous_revision = pool.plugin_generation_revision_for_test().await;
+        let primary_execution = runtime
+            .agent_handle
+            .read(|agent| Arc::clone(agent.execution_mutex()))
+            .await;
+        let active_execution = primary_execution.lock_owned().await;
+        let _plugin = write_fixture(temporary.path())?;
+
+        let reload_runtime = Arc::clone(&runtime);
+        let mut reload = tokio::spawn(async move { reload_runtime.reload().await });
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut reload)
+                .await
+                .is_err(),
+            "plugin publication escaped an already-active primary execution"
+        );
+        assert_eq!(
+            pool.plugin_generation_revision_for_test().await,
+            previous_revision
+        );
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", false).await?;
+
+        drop(active_execution);
+        reload
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        agent_has_plugin_generation(&runtime.agent_handle, "runtime-fixture", true).await?;
+        assert!(pool.plugin_generation_revision_for_test().await > previous_revision);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lsp_readers_wait_for_plugin_generation_settlement() -> Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = service(temporary.path()).await?;
+        let _plugin = write_fixture(temporary.path())?;
+        let ownership = runtime.mcp_ownership.lock().await;
+
+        let reload_runtime = Arc::clone(&runtime);
+        let reload = tokio::spawn(async move { reload_runtime.reload().await });
+        wait_until_mutation_holds_state(&runtime).await?;
+
+        let reader_runtime = Arc::clone(&runtime);
+        let mut reader =
+            tokio::spawn(async move { reader_runtime.lsp_configured_languages().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut reader)
+                .await
+                .is_err(),
+            "LSP reader observed a plugin generation before settlement"
+        );
+
+        drop(ownership);
+        reload
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let languages = reader.await.map_err(|error| error.to_string())?;
+        assert!(!languages.is_empty());
+        runtime.shutdown().await.map_err(|error| error.to_string())
     }
 
     #[tokio::test]

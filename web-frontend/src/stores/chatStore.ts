@@ -81,6 +81,7 @@ interface ChatState {
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
+  settleAssistantMessage: (id: string) => void;
   failAssistantMessage: (id: string, error: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
   /** Insert a non-streaming assistant note (e.g. background subagent finished). */
@@ -363,6 +364,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
       runStatus: 'completed',
       pendingHitlRequests: [],
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
+    }));
+    scheduleAutoSave();
+  },
+
+  settleAssistantMessage: (id) => {
+    set((state) => ({
+      isStreaming: false,
+      isThinking: false,
+      pendingHitlRequests: [],
+      messages: state.messages.map((message) =>
+        message.id === id ? { ...message, isStreaming: false } : message
+      ),
     }));
     scheduleAutoSave();
   },

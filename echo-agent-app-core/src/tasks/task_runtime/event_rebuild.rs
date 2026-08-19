@@ -212,6 +212,21 @@ impl EventFoldState {
                         }
                         r.updated_at = ev.timestamp;
                     }
+                    if ev
+                        .payload
+                        .get("recovery")
+                        .and_then(|value| value.get("kind"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("boot_recovery")
+                    {
+                        apply_boot_recovery(
+                            ev,
+                            tasks,
+                            background_cells,
+                            continuation,
+                            finished_turns,
+                        );
+                    }
                 }
                 K::RunAttachmentsUpdated => {
                     // Attachments bound to the run (so plan-level subagents see the
@@ -733,6 +748,107 @@ fn json_string(payload: &serde_json::Value, key: &str) -> Option<String> {
         .get(key)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
+}
+
+fn apply_boot_recovery(
+    event: &RuntimeTaskEvent,
+    tasks: &mut [PlanTask],
+    background_cells: &mut std::collections::BTreeMap<String, BackgroundCellState>,
+    continuation: &mut Option<RunContinuationState>,
+    finished_turns: &mut std::collections::BTreeSet<String>,
+) {
+    let Some(recovery) = event.payload.get("recovery") else {
+        return;
+    };
+    let state = continuation.get_or_insert_with(RunContinuationState::default);
+    if let Some(turn_id) = recovery
+        .get("active_turn")
+        .and_then(|value| value.get("turn_id"))
+        .and_then(serde_json::Value::as_str)
+        && finished_turns.insert(turn_id.to_string())
+        && state.active_turn.as_ref().map(|turn| turn.turn_id.as_str()) == Some(turn_id)
+        && let Some(mut turn) = state.active_turn.take()
+    {
+        turn.status = RunTurnStatus::Failed;
+        turn.ended_at = Some(event.timestamp);
+        turn.elapsed_seconds = 0;
+        turn.final_message_id = None;
+        turn.error_fingerprint = Some("process_interrupted".to_string());
+        state.last_turn = Some(turn);
+    }
+    state.pause = Some(RunPause {
+        reason: RunPauseReason::BootRecovery,
+        detail: recovery
+            .get("pause")
+            .and_then(|value| value.get("detail"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        changed_at: event.timestamp,
+    });
+
+    if let Some(cells) = recovery.get("cells").and_then(serde_json::Value::as_array) {
+        for recovered in cells {
+            let Some(cell_id) = recovered.get("cell_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let cell = background_cells
+                .entry(cell_id.to_string())
+                .or_insert_with(|| BackgroundCellState {
+                    cell_id: cell_id.to_string(),
+                    name: json_string(recovered, "name").unwrap_or_default(),
+                    command_hash: String::new(),
+                    turn_id: None,
+                    execution_id: None,
+                    call_id: json_string(recovered, "call_id"),
+                    phase: "unknown".to_string(),
+                    exit_code: None,
+                    total_output_bytes: 0,
+                    output_truncated: false,
+                    output_excerpt: None,
+                    artifact_path: None,
+                    artifact_sha256: None,
+                    started_at: event.timestamp,
+                    finished_at: None,
+                });
+            cell.phase = "interrupted".to_string();
+            cell.exit_code = None;
+            cell.total_output_bytes = recovered
+                .get("total_output_bytes")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(cell.total_output_bytes);
+            cell.output_truncated = recovered
+                .get("output_truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(cell.output_truncated);
+            cell.output_excerpt = json_string(recovered, "output_excerpt");
+            cell.artifact_path = json_string(recovered, "artifact_path");
+            cell.artifact_sha256 = json_string(recovered, "artifact_sha256");
+            cell.finished_at = Some(event.timestamp);
+        }
+    }
+
+    if let Some(recovered_tasks) = recovery.get("tasks").and_then(serde_json::Value::as_array) {
+        for recovered in recovered_tasks {
+            let Some(task_id) = recovered.get("task_id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Some(status) = recovered
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .and_then(TodoStatus::from_str)
+            else {
+                continue;
+            };
+            if let Some(task) = tasks.iter_mut().find(|task| task.id == task_id) {
+                task.status = status;
+                task.status_detail = recovered
+                    .get("status_detail")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                task.claim = None;
+            }
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

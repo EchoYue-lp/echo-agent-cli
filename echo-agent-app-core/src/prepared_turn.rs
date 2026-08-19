@@ -86,6 +86,13 @@ pub enum PreparedTurnError {
         path: PathBuf,
         source: std::string::FromUtf8Error,
     },
+    #[error("{primary}; cleanup after failed preparation also failed: {cleanup}")]
+    Cleanup {
+        primary: Box<PreparedTurnError>,
+        cleanup: String,
+    },
+    #[error("failed to retire staged attachment files after scoped artifact commit: {0}")]
+    StagingCleanup(String),
 }
 
 type Result<T> = std::result::Result<T, PreparedTurnError>;
@@ -277,13 +284,26 @@ impl PreparedUserTurn {
     pub fn build(input: UserTurnInput) -> Result<Self> {
         let mut resources = Vec::with_capacity(input.attachments.len().saturating_add(1));
         let mut resource_references = Vec::new();
+        let mut created_artifacts = Vec::new();
         for attachment in input.attachments {
-            let resource = prepare_attachment_resource(
+            let resource = match prepare_attachment_resource(
                 attachment,
                 input.spill_dir,
                 input.conversation_id,
                 input.turn_id,
-            )?;
+            ) {
+                Ok(resource) => resource,
+                Err(error) => {
+                    return Err(rollback_created_artifacts(
+                        error,
+                        &created_artifacts,
+                        input.spill_dir,
+                    ));
+                }
+            };
+            if resource.path != attachment.path {
+                created_artifacts.push(resource.path.clone());
+            }
             if resource.delivery == Delivery::ToolReference {
                 resource_references.push(build_data_reference(&resource));
             }
@@ -291,14 +311,24 @@ impl PreparedUserTurn {
         }
 
         let instruction = if should_spill(input.text) {
-            let artifact = spill_to_artifact(
+            let artifact = match spill_to_artifact(
                 input.text,
                 input.spill_dir,
                 input.conversation_id,
                 input.turn_id,
                 "user-message.txt",
                 AttachmentSource::Message,
-            )?;
+            ) {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    return Err(rollback_created_artifacts(
+                        error,
+                        &created_artifacts,
+                        input.spill_dir,
+                    ));
+                }
+            };
+            created_artifacts.push(artifact.path.clone());
             resources.push(artifact.clone());
             let mut instruction = build_original_message_reference(input.text, &artifact);
             if !resource_references.is_empty() {
@@ -316,7 +346,18 @@ impl PreparedUserTurn {
             }
             instruction
         };
-        cleanup_staged_paste_files(input.attachments, &resources);
+        if let Err(error) = cleanup_staged_attachment_files(input.attachments, &resources) {
+            let rollback_artifacts = created_artifacts
+                .iter()
+                .filter(|path| !error.retained_scoped_paths().contains(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            return Err(rollback_created_artifacts(
+                PreparedTurnError::StagingCleanup(error.to_string()),
+                &rollback_artifacts,
+                input.spill_dir,
+            ));
+        }
         Ok(Self {
             instruction,
             resources,
@@ -351,6 +392,32 @@ impl PreparedUserTurn {
                 source: resource.source,
             })
             .collect()
+    }
+
+    /// Remove exact artifact files when a surface cannot hand off this turn.
+    pub fn cleanup_resources(&self, spill_dir: &Path) -> std::io::Result<()> {
+        let mut failures = Vec::new();
+        for resource in self.resources.iter().rev() {
+            if !resource.path.starts_with(spill_dir) {
+                failures.push(format!(
+                    "{} is outside prepared-turn artifact root {}",
+                    resource.path.display(),
+                    spill_dir.display()
+                ));
+                continue;
+            }
+            if let Err(error) = std::fs::remove_file(&resource.path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                failures.push(format!("{}: {error}", resource.path.display()));
+            }
+            prune_empty_artifact_parents(resource.path.parent(), spill_dir, &mut failures);
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(std::io::Error::other(failures.join("; ")))
+        }
     }
 
     /// Collapse the turn into a single framework [`Message`]. This is the
@@ -400,18 +467,74 @@ impl PreparedUserTurn {
     }
 }
 
-fn cleanup_staged_paste_files(attachments: &[AttachmentRef], resources: &[InputResourceRef]) {
-    for (attachment, resource) in attachments.iter().zip(resources.iter()) {
-        if attachment.source != AttachmentSource::Paste
-            || resource.delivery != Delivery::ToolReference
-            || attachment.path == resource.path
+fn rollback_created_artifacts(
+    primary: PreparedTurnError,
+    created_artifacts: &[PathBuf],
+    spill_dir: &Path,
+) -> PreparedTurnError {
+    let mut failures = Vec::new();
+    for path in created_artifacts.iter().rev() {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
         {
-            continue;
+            failures.push(format!("{}: {error}", path.display()));
         }
-        if let Err(error) = std::fs::remove_file(&attachment.path) {
-            tracing::warn!(path = %attachment.path.display(), %error, "failed to remove staged paste after artifact spill");
+        prune_empty_artifact_parents(path.parent(), spill_dir, &mut failures);
+    }
+    if failures.is_empty() {
+        primary
+    } else {
+        PreparedTurnError::Cleanup {
+            primary: Box::new(primary),
+            cleanup: failures.join("; "),
         }
     }
+}
+
+fn prune_empty_artifact_parents(
+    mut current: Option<&Path>,
+    spill_dir: &Path,
+    failures: &mut Vec<String>,
+) {
+    while let Some(directory) = current {
+        if directory == spill_dir || !directory.starts_with(spill_dir) {
+            break;
+        }
+        match std::fs::remove_dir(directory) {
+            Ok(()) => current = directory.parent(),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                failures.push(format!("{}: {error}", directory.display()));
+                break;
+            }
+        }
+    }
+}
+
+fn cleanup_staged_attachment_files(
+    attachments: &[AttachmentRef],
+    resources: &[InputResourceRef],
+) -> std::result::Result<(), crate::attachments::StagedAttachmentRetirementError> {
+    let retirements = attachments
+        .iter()
+        .zip(resources.iter())
+        .filter(|(attachment, resource)| attachment.path != resource.path)
+        .map(|(attachment, resource)| {
+            (
+                attachment,
+                resource.path.as_path(),
+                resource.sha256.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    crate::attachments::retire_staged_attachment_refs(&retirements)
 }
 
 /// Decide whether raw user text should be spilled to a user-input artifact.
@@ -482,18 +605,16 @@ fn prepare_attachment_resource(
         source,
     })?;
     if is_image_mime(&attachment.mime_type) {
-        return Ok(InputResourceRef {
-            path: attachment.path.clone(),
-            name: attachment.name.clone(),
-            mime_type: attachment.mime_type.clone(),
-            kind: ResourceKind::Image,
-            delivery: Delivery::Inline,
-            bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-            chars: None,
-            lines: None,
-            sha256: None,
-            source: attachment.source,
-        });
+        return persist_inline_resource(
+            &bytes,
+            attachment,
+            ResourceKind::Image,
+            None,
+            None,
+            spill_dir,
+            conversation_id,
+            turn_id,
+        );
     }
 
     if is_text_resource(&attachment.name, &attachment.mime_type) {
@@ -511,30 +632,68 @@ fn prepare_attachment_resource(
                 attachment.source,
             );
         }
-        return Ok(InputResourceRef {
-            path: attachment.path.clone(),
-            name: attachment.name.clone(),
-            mime_type: attachment.mime_type.clone(),
-            kind: ResourceKind::TextArtifact,
-            delivery: Delivery::Inline,
-            bytes: u64::try_from(text.len()).unwrap_or(u64::MAX),
-            chars: Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX)),
-            lines: Some(u64::try_from(text.lines().count()).unwrap_or(u64::MAX)),
-            sha256: None,
-            source: attachment.source,
-        });
+        return persist_inline_resource(
+            text.as_bytes(),
+            attachment,
+            ResourceKind::TextArtifact,
+            Some(u64::try_from(text.chars().count()).unwrap_or(u64::MAX)),
+            Some(u64::try_from(text.lines().count()).unwrap_or(u64::MAX)),
+            spill_dir,
+            conversation_id,
+            turn_id,
+        );
     }
 
+    persist_inline_resource(
+        &bytes,
+        attachment,
+        ResourceKind::Document,
+        None,
+        None,
+        spill_dir,
+        conversation_id,
+        turn_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_inline_resource(
+    bytes: &[u8],
+    attachment: &AttachmentRef,
+    kind: ResourceKind,
+    chars: Option<u64>,
+    lines: Option<u64>,
+    spill_dir: &Path,
+    conversation_id: Option<&str>,
+    turn_id: Option<&str>,
+) -> Result<InputResourceRef> {
+    let conversation = path_component(conversation_id.unwrap_or("unscoped"));
+    let generated_turn = uuid::Uuid::new_v4().to_string();
+    let turn = path_component(turn_id.unwrap_or(&generated_turn));
+    let directory = spill_dir.join(conversation).join(turn);
+    std::fs::create_dir_all(&directory).map_err(|source| PreparedTurnError::CreateDir {
+        path: directory.clone(),
+        source,
+    })?;
+    let nonce = uuid::Uuid::new_v4();
+    let safe_name = path_component(&attachment.name);
+    let final_path = directory.join(format!("{nonce}-{safe_name}"));
+    echo_core::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
+        PreparedTurnError::Write {
+            path: final_path.clone(),
+            source,
+        }
+    })?;
     Ok(InputResourceRef {
-        path: attachment.path.clone(),
+        path: final_path,
         name: attachment.name.clone(),
         mime_type: attachment.mime_type.clone(),
-        kind: ResourceKind::Document,
+        kind,
         delivery: Delivery::Inline,
         bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-        chars: None,
-        lines: None,
-        sha256: None,
+        chars,
+        lines,
+        sha256: Some(hex::encode(Sha256::digest(bytes))),
         source: attachment.source,
     })
 }
@@ -558,7 +717,6 @@ fn spill_to_artifact(
     let nonce = uuid::Uuid::new_v4();
     let directory = spill_dir.join(&conv).join(&turn);
     let final_path = directory.join(format!("{nonce}-paste.txt"));
-    let partial_path = final_path.with_extension("txt.partial");
 
     if let Err(error) = cleanup_user_input_older_than(spill_dir, USER_INPUT_MAX_AGE) {
         tracing::warn!(path = %spill_dir.display(), %error, "failed to clean expired user-input artifacts");
@@ -569,17 +727,12 @@ fn spill_to_artifact(
     })?;
 
     let bytes = text.as_bytes();
-    std::fs::write(&partial_path, bytes).map_err(|source| PreparedTurnError::Write {
-        path: partial_path.clone(),
-        source,
-    })?;
-    if let Err(source) = std::fs::rename(&partial_path, &final_path) {
-        let _ = std::fs::remove_file(&partial_path);
-        return Err(PreparedTurnError::Write {
-            path: final_path,
+    echo_core::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
+        PreparedTurnError::Write {
+            path: final_path.clone(),
             source,
-        });
-    }
+        }
+    })?;
 
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -697,6 +850,12 @@ mod tests {
         }
     }
 
+    fn flat_staging_path(root: &Path, name: &str) -> anyhow::Result<PathBuf> {
+        let uploads = root.join(".eko/uploads");
+        std::fs::create_dir_all(&uploads)?;
+        Ok(uploads.join(format!("{}_{}", uuid::Uuid::new_v4(), name)))
+    }
+
     #[test]
     fn short_text_is_not_spilled() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
@@ -782,10 +941,10 @@ mod tests {
     fn attachment_is_inlined_as_resource() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
         // Write a fake image file and build an AttachmentRef pointing at it.
-        let img_path = tmp.path().join("photo.png");
+        let img_path = flat_staging_path(tmp.path(), "photo.png")?;
         std::fs::write(&img_path, b"fake-png-bytes")?;
         let att = AttachmentRef {
-            path: img_path,
+            path: img_path.clone(),
             name: "photo.png".to_string(),
             mime_type: "image/png".to_string(),
             source: AttachmentSource::Upload,
@@ -804,6 +963,9 @@ mod tests {
         };
         assert_eq!(resource.kind, ResourceKind::Image);
         assert_eq!(resource.delivery, Delivery::Inline);
+        assert!(!img_path.exists(), "flat staging copy was not retired");
+        assert!(resource.path.starts_with(tmp.path().join("conv-1/turn-1")));
+        assert!(resource.path.exists());
         let msg = turn.to_message()?;
         let MessageContent::Parts(parts) = &msg.content else {
             anyhow::bail!("expected multimodal message parts");
@@ -816,7 +978,7 @@ mod tests {
     #[test]
     fn pasted_text_is_always_a_tool_reference_and_may_contain_instructions() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let paste_path = tmp.path().join("pasted.txt");
+        let paste_path = flat_staging_path(tmp.path(), "pasted.txt")?;
         let paste = "请排查下面日志\n".to_string() + &"INFO line\n".repeat(150);
         assert!(
             !should_spill(&paste),
@@ -853,7 +1015,7 @@ mod tests {
     #[test]
     fn uploaded_long_text_remains_data_separate_from_instruction() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let log_path = tmp.path().join("server.log");
+        let log_path = flat_staging_path(tmp.path(), "server.log")?;
         let log = "ERROR failed\n".repeat(2_000);
         std::fs::write(&log_path, &log)?;
         let attachment = AttachmentRef {

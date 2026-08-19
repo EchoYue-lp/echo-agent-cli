@@ -5,7 +5,7 @@ use crate::tauri::state::TauriState;
 use echo_agent::agent::Agent;
 use echo_agent::llm::types::{Message, Role};
 use echo_agent::memory::{NewConversation, StoredMessage};
-use echo_agent_app_core::persistence::{AttachmentsPayload, SavedMessage};
+use echo_agent_app_core::conversation_projection::{AttachmentsPayload, SavedMessage};
 use std::collections::BTreeMap;
 
 fn pack_ui_projection(message: &mut SavedMessage) -> Option<String> {
@@ -528,9 +528,10 @@ mod tests {
 pub async fn list_conversations(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
+    let store = state
+        .app_state
+        .conversation_store()
+        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     let filter = echo_agent::memory::ConversationFilter::default();
@@ -553,9 +554,10 @@ pub async fn save_conversation(
     title: String,
     messages: Vec<SavedMessage>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
+    let store = state
+        .app_state
+        .conversation_store()
+        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     tracing::info!(
@@ -587,8 +589,9 @@ pub async fn save_conversation(
             agent_type: None,
             title: Some(title),
         };
-        let conv = store
-            .create_conversation(new_conv)
+        let conv = state
+            .app_state
+            .create_conversation_owned(new_conv)
             .await
             .map_err(|e| IpcError::Internal(e.to_string()))?;
         conv.conversation_id
@@ -616,9 +619,10 @@ pub async fn get_conversation(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
+    let store = state
+        .app_state
+        .conversation_store()
+        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     let conv = store
@@ -709,9 +713,10 @@ pub async fn update_conversation(
     title: Option<String>,
     messages: Option<Vec<SavedMessage>>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
+    let store = state
+        .app_state
+        .conversation_store()
+        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     let conv = store
@@ -757,11 +762,8 @@ pub async fn branch_conversation(
     }
     let store = state
         .app_state
-        .storage
-        .conversation_store
-        .read()
+        .conversation_store()
         .await
-        .clone()
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
     let source = store
         .get_conversation(&id)
@@ -799,8 +801,9 @@ pub async fn branch_conversation(
         .as_deref()
         .map(|title| format!("{title} (branch)"))
         .unwrap_or_else(|| "Conversation branch".to_string());
-    store
-        .create_conversation(NewConversation {
+    state
+        .app_state
+        .create_conversation_owned(NewConversation {
             conversation_id: branch_id.clone(),
             user_id: source.user_id,
             agent_type: source.agent_type,
@@ -809,11 +812,15 @@ pub async fn branch_conversation(
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
     if let Err(error) = store.save_messages(&branch_id, &prefix).await {
-        let _ = store.delete_conversation(&branch_id).await;
+        if let Err(cleanup_error) = state.app_state.delete_conversation_owned(&branch_id).await {
+            tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back incomplete conversation branch");
+        }
         return Err(IpcError::Internal(error.to_string()));
     }
     if let Err(error) = load_agent_transcript(&state, &branch_id, &prefix).await {
-        let _ = store.delete_conversation(&branch_id).await;
+        if let Err(cleanup_error) = state.app_state.delete_conversation_owned(&branch_id).await {
+            tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back unusable conversation branch");
+        }
         return Err(error);
     }
 
@@ -831,56 +838,17 @@ pub async fn delete_conversation(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
-
-    store
-        .delete_conversation(&id)
+    let receipt = state
+        .app_state
+        .delete_conversation_owned(&id)
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
-
-    if let Err(error) = state
-        .app_state
-        .storage
-        .tool_executions
-        .remove_conversation(&id)
-    {
-        tracing::warn!(conversation_id = %id, %error, "Failed to remove conversation tool execution details");
-    }
-
-    let artifact_config = state
-        .app_state
-        .connection
-        .agent
-        .read(|agent| agent.tool_output_artifacts())
-        .await;
-    if let Some(config) = artifact_config {
-        let conversation_id = id.clone();
-        let user_input_spill_dir = config.root_dir.join("user-input");
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = echo_agent::tools::artifact::cleanup_tool_output_scope(
-                &config,
-                &conversation_id,
-                None,
-            ) {
-                tracing::warn!(conversation_id = %conversation_id, %error, "Failed to clean conversation tool artifacts");
-            }
-            if let Err(error) = echo_agent_app_core::prepared_turn::cleanup_user_input_scope(
-                &user_input_spill_dir,
-                &conversation_id,
-            ) {
-                tracing::warn!(
-                    conversation_id = %conversation_id,
-                    %error,
-                    "Failed to clean conversation user-input artifacts"
-                );
-            }
-        });
-    }
-
-    Ok(serde_json::json!({"success": true}))
+    Ok(serde_json::json!({
+        "success": true,
+        "conversation_id": receipt.conversation_id,
+        "resumed": receipt.resumed,
+        "cleanup_pending": receipt.cleanup_pending,
+    }))
 }
 
 #[tauri::command]
@@ -888,9 +856,10 @@ pub async fn export_conversation(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
+    let store = state
+        .app_state
+        .conversation_store()
+        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     let conv = store
@@ -925,9 +894,10 @@ pub async fn restore_conversation(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
+    let store = state
+        .app_state
+        .conversation_store()
+        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     let conv = store
@@ -960,9 +930,10 @@ pub async fn search_conversations(
         return Ok(serde_json::json!([]));
     }
 
-    let store_guard = state.app_state.storage.conversation_store.read().await;
-    let store = store_guard
-        .as_ref()
+    let store = state
+        .app_state
+        .conversation_store()
+        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     let results = store

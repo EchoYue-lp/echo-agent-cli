@@ -53,7 +53,7 @@ echo-agent-cli/
 │       ├── tasks/          # 后台任务、长程任务、流水线
 │       ├── hitl/           # 人机协作循环
 │       ├── workspace/      # 工作区管理
-│       ├── sessions/       # 会话管理（SQLite + FTS）
+│       ├── conversation_projection.rs  # 会话 UI 投影 DTO
 │       ├── project/        # 项目上下文、编码循环
 │       ├── output/         # 输出渲染（Markdown、主题、语法高亮）
 │       ├── scheduler/      # 定时任务调度
@@ -383,9 +383,8 @@ namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持�
 
 | 命令 | 别名 | 描述 |
 |------|------|------|
-| `/save` | `ss` | 保存会话状态 |
-| `/load` | | 加载会话状态 |
-| `/sessions` | | 会话管理 |
+| `/checkpoint` | `/save` | 强制保存当前 runtime checkpoint |
+| `/sessions [query]` | `ss` | 从 canonical ConversationStore 列出或搜索会话 |
 | `/export` | | 导出会话 |
 | `/profile` | `prof` | 配置档案管理 |
 | `/theme` | | 切换主题 |
@@ -428,6 +427,7 @@ namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持�
 | `--config <path>` | | 指定配置文件路径 |
 | `--mcp-config <path>` | | 指定 MCP 配置文件路径 |
 | `--project <path>` | | 指定项目目录 |
+| `--jsonl <prompt>` | | 非交互执行一次请求；stdout 每行输出一个 canonical chat envelope |
 | `--continue` | `-c` | 继续最近一次会话 |
 | `--resume <id>` | `-r` | 恢复指定会话 |
 | `--verbose` | `-v` | 详细输出模式 |
@@ -488,7 +488,7 @@ echo-agent-cli (二进制入口)
             ▼
 echo-agent-app-core (共享应用库)
     ├── state / config / memory
-    ├── tasks / sessions / workspace
+    ├── tasks / conversations / workspace
     ├── project / scheduler / skills_hub
     └── output / hitl / webhook / observability
             │
@@ -559,8 +559,7 @@ echo-agent (AI Agent 框架)
 workspaces/
 ├── {workspace-id}/
 │   └── .eko/
-│       ├── sessions/         # 会话历史（SQLite + FTS）
-│       ├── conversations/    # 对话记录
+│       ├── conversations/    # 文件化对话记录与搜索
 │       ├── memory/            # 记忆存储
 │       ├── tasks/             # 任务状态
 │       ├── traces/            # 执行轨迹

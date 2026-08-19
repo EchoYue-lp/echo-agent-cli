@@ -2215,15 +2215,13 @@ async fn execute_task(
         task.kind,
         PlanTaskKind::Implementation | PlanTaskKind::Debugging
     );
-    let app_owns_subagent_events = !is_read_only_task && !is_writer_task;
+    let dispatch_hooks_from_runtime = !is_read_only_task && !is_writer_task;
     // Resolve the run's root_message_id so the framework can carry it on
     // SubagentEvent::DispatchStarted → execution://event, letting the frontend
     // pin the subagent stream to the right chat message block.
-    let root_message_id = store
-        .get_run(&run_id)
-        .ok()
-        .flatten()
-        .map(|r| r.root_message_id);
+    let run_context = store.get_run(&run_id).ok().flatten();
+    let root_message_id = run_context.as_ref().map(|run| run.root_message_id.clone());
+    let conversation_id = run_context.as_ref().map(|run| run.conversation_id.clone());
     let controlled_attempt = if is_read_only_task || is_writer_task {
         let framework_executor = primary_agent
             .read(|agent| agent.subagent_executor().clone())
@@ -2251,7 +2249,7 @@ async fn execute_task(
                 claim.revision,
                 attempt,
                 task.kind.is_read_only(),
-                app_owns_subagent_events,
+                dispatch_hooks_from_runtime,
                 framework_executor.clone(),
             )
             .map_err(|error| {
@@ -2280,7 +2278,7 @@ async fn execute_task(
                 claim.revision,
                 attempt,
                 task.kind.is_read_only(),
-                app_owns_subagent_events,
+                dispatch_hooks_from_runtime,
             )
             .map_err(|error| {
                 TaskDispatchFailure::failed(
@@ -2290,6 +2288,17 @@ async fn execute_task(
             })?;
         None
     };
+    emit_subagent_started(
+        trace_sink.as_ref(),
+        &run_id,
+        &execution_id,
+        &task,
+        &contract,
+        claim.revision,
+        attempt,
+        conversation_id.as_deref(),
+        root_message_id.as_deref(),
+    );
     let framework_attempt_identity = controlled_attempt
         .as_ref()
         .map(|(identity, _guard)| identity.clone());
@@ -2409,13 +2418,6 @@ async fn execute_task(
             payload: Some(&prompt_payload),
             constraints: &[],
         });
-        emit_primary_subagent_started(
-            trace_sink.as_ref(),
-            &run_id,
-            &execution_id,
-            &task,
-            &contract,
-        );
         emit_primary_subagent_isolation_observed(
             trace_sink.as_ref(),
             &run_id,
@@ -2477,7 +2479,7 @@ async fn execute_task(
                 result: Some(&task_result),
                 full_output: Some(&full_output),
                 usage: Some(&usage.durable),
-                dispatch_hook: app_owns_subagent_events,
+                dispatch_hook: dispatch_hooks_from_runtime,
             }) {
                 return Err(TaskDispatchFailure::failed(
                     task_id,
@@ -2505,6 +2507,10 @@ async fn execute_task(
             }
             let terminal_payload = serde_json::json!({
                 "execution_id": &execution_id,
+                "plan_revision": claim.revision,
+                "attempt": attempt,
+                "conversation_id": conversation_id,
+                "message_id": root_message_id,
                 "output": &full_output,
                 "terminal_status": task_result.status.as_str(),
                 "contract_version": task_result.contract_version,
@@ -2513,30 +2519,29 @@ async fn execute_task(
                 "verification": &task_result.verification,
                 "remaining_work": &task_result.remaining_work,
                 "touched_files": &task_result.touched_files,
+                "usage": &usage.durable,
             });
+            emit_exec(
+                trace_sink.as_ref(),
+                ExecEvent::subagent(
+                    run_id.clone(),
+                    task_id.clone(),
+                    execution_id.clone(),
+                    subagent_terminal_event(task_result.status),
+                    terminal_payload.clone(),
+                )
+                .with_agent(task.agent_role.clone()),
+            );
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::task(
                     run_id.clone(),
                     task_id.clone(),
                     RuntimeEventKind::TaskCompleted,
-                    terminal_payload.clone(),
+                    terminal_payload,
                 )
                 .with_agent(task.agent_role.clone()),
             );
-            if app_owns_subagent_events {
-                emit_exec(
-                    trace_sink.as_ref(),
-                    ExecEvent::subagent(
-                        run_id.clone(),
-                        task_id.clone(),
-                        execution_id.clone(),
-                        RuntimeEventKind::Completed,
-                        terminal_payload,
-                    )
-                    .with_agent(task.agent_role.clone()),
-                );
-            }
             Ok(TaskDispatchSuccess {
                 task_id,
                 result: task_result,
@@ -2573,7 +2578,7 @@ async fn execute_task(
                 result: Some(&task_result),
                 full_output: Some(&message),
                 usage: usage.as_ref().map(|value| &value.durable),
-                dispatch_hook: app_owns_subagent_events,
+                dispatch_hook: dispatch_hooks_from_runtime,
             }) {
                 tracing::warn!(
                     run_id = %run_id,
@@ -2600,6 +2605,10 @@ async fn execute_task(
             }
             let terminal_payload = serde_json::json!({
                 "execution_id": &execution_id,
+                "plan_revision": claim.revision,
+                "attempt": attempt,
+                "conversation_id": conversation_id,
+                "message_id": root_message_id,
                 "error": &message,
                 "terminal_status": status.as_str(),
                 "contract_version": task_result.contract_version,
@@ -2608,6 +2617,7 @@ async fn execute_task(
                 "verification": &task_result.verification,
                 "remaining_work": &task_result.remaining_work,
                 "touched_files": &task_result.touched_files,
+                "usage": usage.as_ref().map(|value| &value.durable),
             });
             let task_terminal_event = match status {
                 SubagentRunStatus::Cancelled => RuntimeEventKind::TaskCancelled,
@@ -2618,27 +2628,25 @@ async fn execute_task(
             };
             emit_exec(
                 trace_sink.as_ref(),
-                ExecEvent::task(
+                ExecEvent::subagent(
                     run_id.clone(),
                     task_id.clone(),
-                    task_terminal_event,
+                    execution_id.clone(),
+                    subagent_terminal_event(status),
                     terminal_payload.clone(),
                 )
                 .with_agent(task.agent_role.clone()),
             );
-            if app_owns_subagent_events {
-                emit_exec(
-                    trace_sink.as_ref(),
-                    ExecEvent::subagent(
-                        run_id,
-                        task_id.clone(),
-                        execution_id,
-                        subagent_terminal_event(status),
-                        terminal_payload,
-                    )
-                    .with_agent(task.agent_role.clone()),
-                );
-            }
+            emit_exec(
+                trace_sink.as_ref(),
+                ExecEvent::task(
+                    run_id,
+                    task_id.clone(),
+                    task_terminal_event,
+                    terminal_payload,
+                )
+                .with_agent(task.agent_role.clone()),
+            );
             Err(TaskDispatchFailure::from_execution(
                 task_id,
                 ExecutionFailure {
@@ -2850,13 +2858,29 @@ fn emit_task_started(
     );
 }
 
-fn emit_primary_subagent_started(
+#[allow(clippy::too_many_arguments)]
+fn emit_subagent_started(
     sink: Option<&ExecSink>,
     run_id: &str,
     execution_id: &str,
     task: &PlanTask,
     contract: &SubagentRuntimeContract,
+    plan_revision: u64,
+    attempt: u32,
+    conversation_id: Option<&str>,
+    message_id: Option<&str>,
 ) {
+    let mut payload = runtime_contract_started_payload(contract, task, execution_id);
+    if let serde_json::Value::Object(fields) = &mut payload {
+        fields.insert("plan_revision".to_string(), plan_revision.into());
+        fields.insert("attempt".to_string(), attempt.into());
+        if let Some(conversation_id) = conversation_id {
+            fields.insert("conversation_id".to_string(), conversation_id.into());
+        }
+        if let Some(message_id) = message_id {
+            fields.insert("message_id".to_string(), message_id.into());
+        }
+    }
     emit_exec(
         sink,
         ExecEvent::subagent(
@@ -2864,7 +2888,7 @@ fn emit_primary_subagent_started(
             task.id.clone(),
             execution_id,
             RuntimeEventKind::Started,
-            runtime_contract_started_payload(contract, task, execution_id),
+            payload,
         )
         .with_agent(task.agent_role.clone()),
     );
@@ -3427,21 +3451,21 @@ async fn run_main_agent_task(
                             call_id,
                             invocation,
                         } => {
-                            let name = invocation.name;
-                            let args = invocation.args;
-                            if let Some(check) = verification_check_from_agent_tool(&name, &args) {
+                            let name = &invocation.name;
+                            let args = &invocation.args;
+                            if let Some(check) = verification_check_from_agent_tool(name, args) {
                                 pending_verification.insert(call_id.clone(), check);
                             }
-                            if let Some(access) = file_access_from_agent_tool(&name, &args) {
+                            if let Some(access) = file_access_from_agent_tool(name, args) {
                                 pending_file_access.insert(call_id.clone(), access);
                             }
-                            let replay_safe = tool_call_is_replay_safe(agent, &name);
+                            let replay_safe = tool_call_is_replay_safe(agent, name);
                             if let Err(error) = store.record_tool_started(
                                 &run_id,
                                 &task_id,
                                 &execution_id,
                                 &call_id,
-                                &name,
+                                name,
                                 replay_safe,
                             ) {
                                 event_cancel.cancel();
@@ -3458,8 +3482,7 @@ async fn run_main_agent_task(
                                     RuntimeEventKind::ToolStarted,
                                     serde_json::json!({
                                         "call_id": call_id,
-                                        "name": name,
-                                        "args": args,
+                                        "invocation": invocation,
                                     }),
                                 )
                                 .with_agent(agent_role.clone()),
@@ -3503,6 +3526,22 @@ async fn run_main_agent_task(
                             } else {
                                 pending_file_access.remove(&call_id);
                             }
+                            if let Some(artifact) =
+                                echo_core::tools::artifact::ToolOutputArtifactRef::from_metadata(
+                                    &result.metadata,
+                                )
+                            {
+                                observed_artifacts.push(
+                                    echo_agent::agent::subagent::SubagentArtifact {
+                                        path: artifact.path.to_string_lossy().to_string(),
+                                        kind: "tool_log".to_string(),
+                                        bytes: Some(artifact.artifact_bytes),
+                                        sha256: Some(artifact.sha256),
+                                        producer_execution_id: Some(execution_id.clone()),
+                                        available: artifact.path.is_file(),
+                                    },
+                                );
+                            }
                             if let Err(error) = store.record_tool_finished(
                                 &run_id,
                                 &task_id,
@@ -3528,9 +3567,7 @@ async fn run_main_agent_task(
                                     serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
-                                        "result": result_text,
-                                        "success": result.success,
-                                        "failure": result.failure,
+                                        "result": result,
                                     }),
                                 )
                                 .with_agent(agent_role.clone()),
@@ -3563,30 +3600,7 @@ async fn run_main_agent_task(
                                         "chunk": chunk,
                                     }))
                                 }
-                                echo_agent::tools::ToolStreamEvent::Complete(result) => {
-                                    if let Some(artifact) = echo_core::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata) {
-                                        observed_artifacts.push(
-                                            echo_agent::agent::subagent::SubagentArtifact {
-                                                path: artifact.path.to_string_lossy().to_string(),
-                                                kind: "tool_log".to_string(),
-                                                bytes: Some(artifact.artifact_bytes),
-                                                sha256: Some(artifact.sha256),
-                                                producer_execution_id: Some(execution_id.clone()),
-                                                available: artifact.path.is_file(),
-                                            },
-                                        );
-                                    }
-                                    (
-                                        RuntimeEventKind::ToolCompleted,
-                                        serde_json::json!({
-                                        "call_id": call_id,
-                                        "name": name,
-                                        "success": result.success,
-                                        "metadata": result.metadata,
-                                        "truncated": result.truncated,
-                                        }),
-                                    )
-                                }
+                                echo_agent::tools::ToolStreamEvent::Complete(_) => continue,
                             };
                             emit_exec(
                                 trace_sink.as_ref(),
@@ -4613,7 +4627,17 @@ mod tests {
         };
 
         emit_task_started(Some(&sink), "run-1", "task-1:1", &task, &contract);
-        emit_primary_subagent_started(Some(&sink), "run-1", "task-1:1", &task, &contract);
+        emit_subagent_started(
+            Some(&sink),
+            "run-1",
+            "task-1:1",
+            &task,
+            &contract,
+            1,
+            1,
+            Some("conversation-1"),
+            Some("message-1"),
+        );
         emit_primary_subagent_isolation_observed(
             Some(&sink),
             "run-1",
@@ -6388,7 +6412,12 @@ Read the runtime path and found one missing branch.
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
                     && event.subagent_run_id.as_deref() == Some(execution_id.as_str())
-                    && event.payload.get("name").and_then(|v| v.as_str()) == Some("run_code")
+                    && event
+                        .payload
+                        .get("invocation")
+                        .and_then(|value| value.get("name"))
+                        .and_then(|value| value.as_str())
+                        == Some("run_code")
             }),
             "expected tool_started for run_code, got {events:?}"
         );
@@ -6398,11 +6427,17 @@ Read the runtime path and found one missing branch.
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
                     && event.subagent_run_id.as_deref() == Some(execution_id.as_str())
-                    && event.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
                     && event
                         .payload
                         .get("result")
-                        .and_then(|v| v.as_str())
+                        .and_then(|value| value.get("success"))
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+                    && event
+                        .payload
+                        .get("result")
+                        .and_then(|value| value.get("output"))
+                        .and_then(|value| value.as_str())
                         .is_some_and(|text| text.contains("42"))
             }),
             "expected successful tool_completed with tool output, got {events:?}"

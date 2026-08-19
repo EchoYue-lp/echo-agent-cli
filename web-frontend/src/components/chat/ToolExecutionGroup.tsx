@@ -24,8 +24,13 @@ export function toolExecutionGroupPresentation(
     return tool ? [tool] : [];
   });
   const runningCount = tools.filter((tool) => tool.status === 'running').length;
-  const failedCount = tools.filter((tool) => tool.status === 'failed').length;
+  const failedCount = tools.filter(
+    (tool) => tool.status === 'failed' || tool.status === 'timed_out'
+  ).length;
   const cancelledCount = tools.filter((tool) => tool.status === 'cancelled').length;
+  const uncertainCount = tools.filter(
+    (tool) => tool.status === 'interrupted' || tool.status === 'unknown'
+  ).length;
   const count = toolIds.length;
   const missingCount = Math.max(0, count - tools.length);
   const label =
@@ -34,7 +39,15 @@ export function toolExecutionGroupPresentation(
       : missingCount > 0
         ? `${count} 个工具 · ${missingCount} 个状态未恢复`
         : `已执行 ${count} 个工具`;
-  return { runningCount, failedCount, cancelledCount, missingCount, count, label };
+  return {
+    runningCount,
+    failedCount,
+    cancelledCount,
+    uncertainCount,
+    missingCount,
+    count,
+    label,
+  };
 }
 
 export const ToolExecutionGroup = memo(function ToolExecutionGroup({
@@ -42,18 +55,19 @@ export const ToolExecutionGroup = memo(function ToolExecutionGroup({
 }: ToolExecutionGroupProps) {
   const [expanded, setExpanded] = useState(false);
   const toolsById = useToolExecutionStore((state) => state.tools);
-  const { runningCount, failedCount, cancelledCount, missingCount, label } =
+  const { runningCount, failedCount, cancelledCount, uncertainCount, missingCount, label } =
     toolExecutionGroupPresentation(toolIds, toolsById);
   const statusSuffix = [
     failedCount > 0 ? `${failedCount} 个失败` : '',
     cancelledCount > 0 ? `${cancelledCount} 个已取消` : '',
+    uncertainCount > 0 ? `${uncertainCount} 个状态未知` : '',
   ]
     .filter(Boolean)
     .join(' · ');
   const statusIcon =
     runningCount > 0 ? (
       <LoaderCircle size={12} className="animate-spin text-[var(--accent)]" />
-    ) : missingCount > 0 ? (
+    ) : missingCount > 0 || uncertainCount > 0 ? (
       <AlertTriangle size={12} className="text-[var(--color-warning)]" />
     ) : failedCount > 0 ? (
       <AlertTriangle size={12} className="text-[var(--color-error)]" />

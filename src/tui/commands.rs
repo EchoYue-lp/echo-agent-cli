@@ -112,6 +112,8 @@ pub enum SlashCommand {
     Edit,
     Browser,
     Analysis,
+    Terminal,
+    Lsp,
 
     // -- Git --
     Git,
@@ -119,6 +121,7 @@ pub enum SlashCommand {
 
     // -- Pipeline --
     Pipeline,
+    Workflow,
 
     // -- Security --
     Permission,
@@ -200,11 +203,14 @@ impl SlashCommand {
             Self::Edit => "Edit a workspace file in $VISUAL/$EDITOR",
             Self::Browser => "Show or switch the browser backend",
             Self::Analysis => "Create, inspect, and run file-backed analyses",
+            Self::Terminal => "Manage and attach to interactive terminal sessions",
+            Self::Lsp => "Inspect and manage workspace language servers",
 
             Self::Git => "Run a git command",
             Self::Worktrees => "Review and clean retained EKO worktrees",
 
             Self::Pipeline => "Manage pipelines",
+            Self::Workflow => "Manage and execute durable Graph workflows",
 
             Self::Permission => "Show/set permission mode",
 
@@ -279,9 +285,11 @@ impl SlashCommand {
             | Self::Preview
             | Self::Edit
             | Self::Browser
-            | Self::Analysis => Category::Coding,
+            | Self::Analysis
+            | Self::Terminal
+            | Self::Lsp => Category::Coding,
             Self::Git | Self::Worktrees => Category::Git,
-            Self::Pipeline => Category::Pipeline,
+            Self::Pipeline | Self::Workflow => Category::Pipeline,
             Self::Permission => Category::Security,
             Self::Cron
             | Self::AutoMemory
@@ -315,9 +323,16 @@ impl SlashCommand {
             Self::Preview | Self::Edit => "<file-path>",
             Self::Browser => "[status|managed|chrome]",
             Self::Analysis => "[list|create <python|r> <title>|show <id>|run <id>]",
+            Self::Terminal => {
+                "[list|create <id> [cwd] [rows] [cols]|attach <id>|write <id> <data>|resize <id> <rows> <cols>|close <id>]"
+            }
+            Self::Lsp => "[list|status|start <language>|stop <language>|restart <language>]",
             Self::Git => "<git-args>",
             Self::Worktrees => "[list|cleanup|merge <run-id>|discard <run-id>]",
             Self::Pipeline => "[list|run <name>]",
+            Self::Workflow => {
+                "[list|show <id>|create <name> <definition|@path>|delete <id>|run <id> [json-input]]"
+            }
             Self::Permission => "[ask|auto|deny]",
             Self::Cron => "[list|create|delete|pause|resume|run|reload]",
             Self::Test => "[test-name]",
@@ -480,6 +495,32 @@ mod tests {
         assert_eq!(provider.category(), Category::Context);
         assert!(provider.usage().contains("add <id> <base-url>"));
         assert!(model.usage().contains("[image] [audio] [video]"));
+        Ok(())
+    }
+
+    #[test]
+    fn developer_commands_are_first_class_coding_actions() -> Result<(), String> {
+        let terminal = "terminal"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        let lsp = "lsp"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(terminal.category(), Category::Coding);
+        assert!(terminal.usage().contains("attach <id>"));
+        assert_eq!(lsp.category(), Category::Coding);
+        assert!(lsp.usage().contains("restart <language>"));
+        Ok(())
+    }
+
+    #[test]
+    fn workflow_is_a_first_class_pipeline_action() -> Result<(), String> {
+        let workflow = "workflow"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(workflow.category(), Category::Pipeline);
+        assert!(workflow.usage().contains("create <name>"));
+        assert!(workflow.usage().contains("run <id>"));
         Ok(())
     }
 }

@@ -10,10 +10,11 @@ import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
-import { handleChatEvent } from './chatEventHandler';
+import { handleChatEventEnvelope } from './chatEventHandler';
+import { ChatEventSequencer } from './chatEventSequencer';
 import { reorderById } from './queuedChat';
 import type { ForegroundTurnSnapshot } from '../generated';
-import type { Attachment, ChatEvent, ToolExecution } from '../types/api';
+import type { Attachment, ChatEventEnvelope, ChatEventReplay, ToolExecution } from '../types/api';
 
 export type QueuedChatInput = {
   id: string;
@@ -28,12 +29,16 @@ type CancelChatResponse = {
 };
 
 export function useTauriChat() {
+  const activeConversationId = useConversationStore((state) => state.activeId);
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
+  const activeTurnIdRef = useRef<string | null>(null);
   const currentMessageKeyRef = useRef<string | null>(null);
   const currentConversationIdRef = useRef<string | null>(null);
   const identityGenerationRef = useRef(0);
+  const previousActiveConversationIdRef = useRef(activeConversationId);
   const thinkingIdRef = useRef<string | null>(null);
+  const eventSequencerRef = useRef(new ChatEventSequencer());
   const queuedInputsRef = useRef<QueuedChatInput[]>([]);
   const dispatchMessageRef = useRef<
     ((text: string, attachments: Attachment[] | undefined) => Promise<boolean>) | null
@@ -41,50 +46,49 @@ export function useTauriChat() {
   const [queuedInputs, setQueuedInputs] = useState<QueuedChatInput[]>([]);
 
   const getActiveTurnSnapshot = useCallback(async () => {
-    const conversationId = useConversationStore.getState().activeId;
     return apiInvoke<ForegroundTurnSnapshot | null>('get_active_chat_turn', {
-      conversationId: conversationId ?? undefined,
-      conversation_id: conversationId ?? undefined,
+      conversationId: activeConversationId ?? undefined,
+      conversation_id: activeConversationId ?? undefined,
     });
-  }, []);
+  }, [activeConversationId]);
 
   const restoreActiveTurnRefs = useCallback((snapshot: ForegroundTurnSnapshot | null) => {
-    if (snapshot && !currentMessageKeyRef.current) {
+    if (snapshot) {
       currentConversationIdRef.current = snapshot.conversation_id;
-      currentMessageKeyRef.current = snapshot.turn_id;
+      activeTurnIdRef.current = snapshot.active_turn_id;
+      if (
+        useChatStore.getState().messages.some((message) => message.id === snapshot.root_turn_id)
+      ) {
+        currentMessageKeyRef.current = snapshot.root_turn_id;
+        assistantIdRef.current = snapshot.root_turn_id;
+      }
     }
   }, []);
-
-  // The Rust owner survives WebView and hook remounts. Restore its exact scope
-  // key so Stop never falls back to an unkeyed/global cancellation. When a
-  // conversation has not been persisted yet, the backend returns the sole
-  // active `message:<turn_id>` scope; it rejects an ambiguous global lookup.
-  useEffect(() => {
-    if (!isTauri()) return;
-    let aborted = false;
-    const identityGeneration = identityGenerationRef.current;
-    const restoreActiveTurn = async () => {
-      try {
-        const snapshot = await getActiveTurnSnapshot();
-        if (!aborted && identityGeneration === identityGenerationRef.current) {
-          restoreActiveTurnRefs(snapshot);
-        }
-      } catch (error) {
-        if (!aborted) {
-          console.warn('[TauriChat] Failed to restore active foreground turn:', error);
-        }
-      }
-    };
-    void restoreActiveTurn();
-    return () => {
-      aborted = true;
-    };
-  }, [getActiveTurnSnapshot, restoreActiveTurnRefs]);
 
   const replaceQueue = (next: QueuedChatInput[]) => {
     queuedInputsRef.current = next;
     setQueuedInputs(next);
   };
+
+  useEffect(() => {
+    const previous = previousActiveConversationIdRef.current;
+    if (previous === activeConversationId) return;
+    previousActiveConversationIdRef.current = activeConversationId;
+    identityGenerationRef.current += 1;
+
+    const adoptsCurrentTurn =
+      previous === null && activeConversationId !== null && activeTurnIdRef.current !== null;
+    currentConversationIdRef.current = activeConversationId;
+    if (adoptsCurrentTurn) return;
+
+    activeTurnIdRef.current = null;
+    currentMessageKeyRef.current = null;
+    assistantIdRef.current = null;
+    thinkingIdRef.current = null;
+    isCancelledRef.current = false;
+    queuedInputsRef.current = [];
+    setQueuedInputs([]);
+  }, [activeConversationId]);
 
   const dispatchNextQueued = useCallback(() => {
     const [next, ...remaining] = queuedInputsRef.current;
@@ -96,31 +100,69 @@ export function useTauriChat() {
     }
   }, []);
 
-  const isCurrentRunEvent = (event: ChatEvent) => {
-    if (event.message_key) {
-      return currentMessageKeyRef.current === event.message_key;
-    }
+  const isCurrentStreamEvent = useCallback((event: ChatEventEnvelope) => {
     if (event.conversation_id) {
-      return currentConversationIdRef.current === event.conversation_id;
+      const activeConversation =
+        useConversationStore.getState().activeId ?? currentConversationIdRef.current;
+      return activeConversation === event.conversation_id;
     }
-    return true;
-  };
+    return (
+      activeTurnIdRef.current === event.turn_id ||
+      currentMessageKeyRef.current === event.message_id ||
+      useChatStore
+        .getState()
+        .messages.some((message) => message.id === event.message_id && message.isStreaming)
+    );
+  }, []);
+
+  const isCurrentRunEvent = useCallback(
+    (event: ChatEventEnvelope) => {
+      if (!isCurrentStreamEvent(event)) return false;
+      if (!event.conversation_id) return true;
+      const rootMessageId = currentMessageKeyRef.current;
+      return !rootMessageId || rootMessageId === event.message_id;
+    },
+    [isCurrentStreamEvent]
+  );
+
+  const rebindEventRefs = useCallback((event: ChatEventEnvelope) => {
+    activeTurnIdRef.current = event.turn_id;
+    const message = useChatStore
+      .getState()
+      .messages.find((candidate) => candidate.id === event.message_id && candidate.isStreaming);
+    if (!message) return;
+    currentConversationIdRef.current = event.conversation_id;
+    currentMessageKeyRef.current = event.message_id;
+    assistantIdRef.current = event.message_id;
+  }, []);
 
   const handleEvent = useCallback(
-    (event: ChatEvent) => {
+    (event: ChatEventEnvelope) => {
       if (!isCurrentRunEvent(event)) return;
-      handleChatEvent(event, {
+      rebindEventRefs(event);
+      handleChatEventEnvelope(event, {
         assistantIdRef,
         currentMessageKeyRef,
         currentMessageIdRef: currentMessageKeyRef,
         isCancelledRef,
         currentThinkingIdRef: thinkingIdRef,
       });
-      if (event.type === 'done') {
+      if (
+        event.payload.source === 'agent' &&
+        (event.payload.event.payload.type === 'cancelled' ||
+          event.payload.event.payload.type === 'error')
+      ) {
+        activeTurnIdRef.current = null;
+      }
+      if (
+        event.payload.source === 'turn_status' &&
+        ['completed', 'failed', 'cancelled'].includes(event.payload.event.status)
+      ) {
+        activeTurnIdRef.current = null;
         dispatchNextQueued();
       }
     },
-    [dispatchNextQueued]
+    [dispatchNextQueued, isCurrentRunEvent, rebindEventRefs]
   );
 
   // Set up event listener on mount.
@@ -140,11 +182,12 @@ export function useTauriChat() {
     const pendingCleanup: Array<() => void> = [];
 
     const setupListener = async () => {
+      const setupIdentityGeneration = identityGenerationRef.current;
       const { listen } = await import('@tauri-apps/api/event');
       if (aborted) return; // 卸载发生在 import 期间, 不再注册
-      const unlisten = await listen<ChatEvent>('chat://event', (event) => {
-        if (!aborted) {
-          handleEvent(event.payload);
+      const unlisten = await listen<ChatEventEnvelope>('chat://event', (event) => {
+        if (!aborted && isCurrentStreamEvent(event.payload)) {
+          eventSequencerRef.current.ingest(event.payload, handleEvent);
         }
       });
       // 卸载发生在两个 listen 之间: 立即注销刚注册的第一个, 不再注册第二个。
@@ -206,6 +249,38 @@ export function useTauriChat() {
         return;
       }
       pendingCleanup.push(unlistenExec);
+      try {
+        const snapshot = await getActiveTurnSnapshot();
+        if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
+          restoreActiveTurnRefs(snapshot);
+          const activeConversation = useConversationStore.getState().activeId;
+          const snapshotIsMessageScope = snapshot?.conversation_id.startsWith('message:') ?? false;
+          const conversationId = snapshotIsMessageScope
+            ? undefined
+            : (activeConversation ?? snapshot?.conversation_id);
+          const messageKey = snapshot?.root_turn_id;
+          if (conversationId || messageKey) {
+            const streamId = conversationId
+              ? `conversation:${conversationId}`
+              : `message:${messageKey}`;
+            const replay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+              conversationId,
+              conversation_id: conversationId,
+              messageKey,
+              message_key: messageKey,
+              afterCursor: eventSequencerRef.current.cursor(streamId),
+              after_cursor: eventSequencerRef.current.cursor(streamId),
+            });
+            if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
+              eventSequencerRef.current.ingestReplay(replay, handleEvent);
+            }
+          }
+        }
+      } catch (error) {
+        if (!aborted) {
+          console.warn('[TauriChat] Failed to replay journaled chat events:', error);
+        }
+      }
     };
 
     setupListener();
@@ -216,7 +291,7 @@ export function useTauriChat() {
       pendingCleanup.forEach((fn) => fn());
       pendingCleanup.length = 0;
     };
-  }, [handleEvent]);
+  }, [getActiveTurnSnapshot, handleEvent, isCurrentStreamEvent, restoreActiveTurnRefs]);
 
   const dispatchMessage = useCallback(
     async (text: string, attachments?: Attachment[]) => {
@@ -240,6 +315,7 @@ export function useTauriChat() {
             ? crypto.randomUUID()
             : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         currentMessageKeyRef.current = message_key;
+        activeTurnIdRef.current = message_key;
         pendingAssistantId = store.startAssistantMessage(message_key);
         assistantIdRef.current = pendingAssistantId;
 
@@ -295,6 +371,7 @@ export function useTauriChat() {
         store.setRunStatus('failed');
         assistantIdRef.current = null;
         currentMessageKeyRef.current = null;
+        activeTurnIdRef.current = null;
         dispatchNextQueued();
         return false;
       }
@@ -306,7 +383,7 @@ export function useTauriChat() {
 
   const sendMessage = useCallback(
     async (text: string, attachments?: Attachment[]) => {
-      if (currentMessageKeyRef.current) {
+      if (activeTurnIdRef.current) {
         const id =
           typeof crypto !== 'undefined' && 'randomUUID' in crypto
             ? crypto.randomUUID()
@@ -366,28 +443,28 @@ export function useTauriChat() {
 
   const cancel = useCallback(async () => {
     identityGenerationRef.current += 1;
-    let messageKey = currentMessageKeyRef.current;
+    let rootTurnId = currentMessageKeyRef.current;
     let conversationId = currentConversationIdRef.current;
     try {
       // Mount recovery is asynchronous. Stop must independently recover the
       // exact registry identity when the effect has not populated refs yet.
-      if (!messageKey || !conversationId) {
+      if (!rootTurnId || !conversationId) {
         const snapshot = await getActiveTurnSnapshot();
         if (snapshot) {
           restoreActiveTurnRefs(snapshot);
-          messageKey = snapshot.turn_id;
+          rootTurnId = snapshot.root_turn_id;
           conversationId = snapshot.conversation_id;
         }
       }
-      if (!messageKey || !conversationId) {
+      if (!rootTurnId || !conversationId) {
         useToastStore.getState().addToast('error', '无法定位正在运行的任务，请稍后重试');
         return;
       }
       const settlement = await apiInvoke<CancelChatResponse>('cancel_chat', {
         conversationId,
         conversation_id: conversationId,
-        messageKey,
-        message_key: messageKey,
+        rootTurnId,
+        root_turn_id: rootTurnId,
       });
       if (!settlement.success) {
         throw new Error(`取消请求未完成（${settlement.status}）`);

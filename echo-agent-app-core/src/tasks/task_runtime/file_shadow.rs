@@ -50,19 +50,27 @@ pub struct FileTaskShadow {
     event_hook: std::sync::Arc<
         std::sync::OnceLock<std::sync::Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>>,
     >,
+    #[cfg(test)]
+    fail_initial_publish_before_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FileTaskShadow {
     /// Create a shadow rooted at `root`. The directory is created lazily on first write.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
+        let shadow = Self {
             root: std::sync::Arc::new(std::sync::RwLock::new(root.into())),
             seq_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_write_locks: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             event_hook: std::sync::Arc::new(std::sync::OnceLock::new()),
-        }
+            #[cfg(test)]
+            fail_initial_publish_before_rename: std::sync::Arc::new(
+                std::sync::atomic::AtomicBool::new(false),
+            ),
+        };
+        shadow.recover_interrupted_transactions();
+        shadow
     }
 
     /// Attach a synchronous event hook fired after each successful append.
@@ -106,6 +114,7 @@ impl FileTaskShadow {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
+        self.recover_interrupted_transactions();
     }
 
     fn run_dir(&self, run_id: &str) -> PathBuf {
@@ -128,38 +137,161 @@ impl FileTaskShadow {
         self.run_dir(run_id).join("checkpoint.json")
     }
 
-    /// Remove a scope created only for a failed task-graph preparation.
-    /// Published plans are never deleted, even if the caller misclassifies the
-    /// scope as staged.
-    pub(crate) fn remove_unpublished_run(&self, run_id: &str) -> Result<bool, ShadowError> {
-        let mut components = Path::new(run_id).components();
-        let valid_component = matches!(components.next(), Some(std::path::Component::Normal(_)))
-            && components.next().is_none();
-        if run_id.trim().is_empty() || !valid_component {
-            return Err(ShadowError::Io(format!(
-                "refusing to remove invalid task run id: {run_id}"
-            )));
+    /// Settle hidden task-publication and deletion directories left by a process
+    /// that ended inside a file transaction. Product run enumeration never
+    /// treats these directories as TaskRuns.
+    fn recover_interrupted_transactions(&self) {
+        let root = self.root();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::warn!(%error, path = %root.display(), "failed to inspect task publication transactions");
+                return;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    tracing::warn!(%error, path = %root.display(), "failed to inspect task publication transaction entry");
+                    continue;
+                }
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    tracing::warn!(%error, path = %entry.path().display(), "failed to inspect task publication transaction type");
+                    continue;
+                }
+            };
+            if file_type.is_dir()
+                && (name.starts_with(".preparing-") || name.starts_with(".deleting-"))
+                && let Err(error) = std::fs::remove_dir_all(entry.path())
+            {
+                tracing::warn!(%error, path = %entry.path().display(), "failed to remove stale task file transaction");
+            }
         }
+    }
+
+    /// Publish a TaskRun's complete first generation with one directory rename.
+    /// The supplied event batch is already framework-validated; both derived
+    /// projections are rebuilt before the run becomes enumerable.
+    pub(crate) fn publish_initial_event_batch(
+        &self,
+        run_id: &str,
+        events: &[RuntimeTaskEvent],
+    ) -> Result<(), ShadowError> {
+        if events.is_empty() {
+            return Err(ShadowError::Encode(
+                "initial task publication requires at least one event".to_string(),
+            ));
+        }
+        for (index, event) in events.iter().enumerate() {
+            let expected_seq = i64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| {
+                    ShadowError::Encode("initial event sequence overflow".to_string())
+                })?;
+            if event.run_id != run_id || event.seq != expected_seq {
+                return Err(ShadowError::Encode(format!(
+                    "invalid initial event at position {expected_seq}: run '{}', seq {}",
+                    event.run_id, event.seq
+                )));
+            }
+        }
+        if events.first().map(|event| event.event_type) != Some(RuntimeEventKind::RunCreated)
+            || !events
+                .iter()
+                .any(|event| event.event_type == RuntimeEventKind::PlanRevisionCommitted)
+        {
+            return Err(ShadowError::Encode(
+                "initial task publication requires RunCreated and PlanRevisionCommitted"
+                    .to_string(),
+            ));
+        }
+
+        let rebuilt = super::event_rebuild::rebuild_plan_from_events(events)
+            .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+        let mut events_jsonl = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut events_jsonl, event)
+                .map_err(|error| ShadowError::Encode(error.to_string()))?;
+            events_jsonl.push(b'\n');
+        }
+        let plan_json = serde_json::to_vec_pretty(&rebuilt.plan_revision())
+            .map_err(|error| ShadowError::Encode(error.to_string()))?;
+        let state_json = serde_json::to_vec_pretty(&rebuilt.run_state())
+            .map_err(|error| ShadowError::Encode(error.to_string()))?;
+
         let lock = self.run_write_lock(run_id);
         let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-        let events = self.read_events(run_id)?;
-        if events
-            .iter()
-            .any(|event| event.event_type == RuntimeEventKind::PlanRevisionCommitted)
-        {
-            return Ok(false);
+        let root = self.root();
+        std::fs::create_dir_all(&root).map_err(|error| ShadowError::Io(error.to_string()))?;
+        let final_directory = self.run_dir(run_id);
+        if final_directory.exists() {
+            return Err(ShadowError::Io(format!(
+                "task run already exists: {run_id}"
+            )));
         }
-        let run_dir = self.run_dir(run_id);
-        match std::fs::remove_dir_all(&run_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(ShadowError::Io(error.to_string())),
+        let staging_directory = root.join(format!(".preparing-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&staging_directory)
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+        #[cfg(test)]
+        let simulate_crash = self
+            .fail_initial_publish_before_rename
+            .swap(false, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let simulate_crash = false;
+        let stage_result = (|| -> Result<(), ShadowError> {
+            write_synced(&staging_directory.join("events.jsonl"), &events_jsonl)
+                .map_err(|error| ShadowError::Io(error.to_string()))?;
+            write_synced(&staging_directory.join("plan.json"), &plan_json)
+                .map_err(|error| ShadowError::Io(error.to_string()))?;
+            write_synced(&staging_directory.join("run-state.json"), &state_json)
+                .map_err(|error| ShadowError::Io(error.to_string()))?;
+            sync_directory(&staging_directory)
+                .map_err(|error| ShadowError::Io(error.to_string()))?;
+            if simulate_crash {
+                return Err(ShadowError::Io(
+                    "injected crash before initial run publication".to_string(),
+                ));
+            }
+            std::fs::rename(&staging_directory, &final_directory)
+                .map_err(|error| ShadowError::Io(error.to_string()))?;
+            if let Err(error) = sync_directory(&root) {
+                tracing::warn!(%error, path = %root.display(), "task publication is visible but parent directory sync failed");
+            }
+            Ok(())
+        })();
+        if stage_result.is_err() {
+            if !simulate_crash && let Err(error) = std::fs::remove_dir_all(&staging_directory) {
+                tracing::warn!(%error, path = %staging_directory.display(), "failed to remove aborted task publication transaction");
+            }
+            return stage_result;
         }
+
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
         self.seq_cache
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(run_id);
-        Ok(true)
+            .insert(run_id.to_string(), last_seq);
+        if let Some(hook) = self.event_hook.get() {
+            for event in events {
+                hook(event);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_initial_publish_before_rename(&self) {
+        self.fail_initial_publish_before_rename
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     // ── 0bc step-2: file-authority write path (replaces SQL INSERT + flush) ──
@@ -461,6 +593,13 @@ impl FileTaskShadow {
         for entry in read_dir {
             let entry = entry.map_err(|e| ShadowError::Io(e.to_string()))?;
             let path = entry.path();
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".preparing-"))
+            {
+                continue;
+            }
             if !path.is_dir() {
                 continue;
             }
@@ -476,6 +615,83 @@ impl FileTaskShadow {
             }
         }
         Ok(ids)
+    }
+
+    /// Hide a settled set of TaskRuns before removing their files. The durable
+    /// conversation deletion transaction owns cross-store retries; this method
+    /// keeps ordinary rename failures from exposing only part of this store's
+    /// participant set.
+    pub(crate) fn remove_runs(&self, run_ids: &[String]) -> Result<(), ShadowError> {
+        let mut run_ids = run_ids.to_vec();
+        run_ids.sort();
+        run_ids.dedup();
+        if run_ids.is_empty() {
+            return Ok(());
+        }
+        for run_id in &run_ids {
+            let mut components = Path::new(run_id).components();
+            let valid = matches!(components.next(), Some(std::path::Component::Normal(_)))
+                && components.next().is_none();
+            if run_id.trim().is_empty() || !valid {
+                return Err(ShadowError::Io(format!(
+                    "refusing to remove invalid task run id: {run_id}"
+                )));
+            }
+        }
+
+        let locks = run_ids
+            .iter()
+            .map(|run_id| self.run_write_lock(run_id))
+            .collect::<Vec<_>>();
+        let guards = locks
+            .iter()
+            .map(|lock| lock.lock().unwrap_or_else(|error| error.into_inner()))
+            .collect::<Vec<_>>();
+        let root = self.root();
+        std::fs::create_dir_all(&root).map_err(|error| ShadowError::Io(error.to_string()))?;
+        let tombstone = root.join(format!(".deleting-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&tombstone).map_err(|error| ShadowError::Io(error.to_string()))?;
+
+        let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+        for run_id in &run_ids {
+            let source = self.run_dir(run_id);
+            if !source.exists() {
+                continue;
+            }
+            let target = tombstone.join(run_id);
+            if let Err(error) = std::fs::rename(&source, &target) {
+                let mut rollback_errors = Vec::new();
+                for (original, staged) in moved.iter().rev() {
+                    if let Err(rollback_error) = std::fs::rename(staged, original) {
+                        rollback_errors.push(rollback_error.to_string());
+                    }
+                }
+                if let Err(cleanup_error) = std::fs::remove_dir(&tombstone) {
+                    rollback_errors.push(cleanup_error.to_string());
+                }
+                return Err(ShadowError::Io(format!(
+                    "failed to stage run {run_id} for deletion: {error}; rollback errors: {}",
+                    rollback_errors.join("; ")
+                )));
+            }
+            moved.push((source, target));
+        }
+        drop(guards);
+
+        for run_id in &run_ids {
+            self.seq_cache
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(run_id);
+            self.run_write_locks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(run_id);
+        }
+        if let Err(error) = std::fs::remove_dir_all(&tombstone) {
+            tracing::warn!(path = %tombstone.display(), %error, "TaskRun deletion tombstone remains for startup cleanup");
+        }
+        Ok(())
     }
 
     /// Read the shadow plan.json for parity comparison. Returns None if not yet written.
@@ -795,6 +1011,23 @@ pub enum ShadowError {
     Rebuild(String),
     #[error("event seq {seq} committed but projection refresh degraded: {detail}")]
     CommittedProjectionDegraded { seq: i64, detail: String },
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// Write `bytes` to `path` atomically: write to a unique tmp file, fsync,

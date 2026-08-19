@@ -1829,6 +1829,7 @@ mod bootstrap_shutdown_tests {
 pub enum LogTarget {
     Stderr,
     TuiFile,
+    MachineReadableFile,
 }
 
 /// Load shell environment variables by spawning the user's login shell.
@@ -1912,6 +1913,11 @@ pub fn init_logging_for_tui(level: &str) {
     init_logging_with_target(level, LogTarget::TuiFile);
 }
 
+/// Keep stdout and stderr free of tracing output for a machine protocol.
+pub fn init_logging_for_machine_output(level: &str) {
+    init_logging_with_target(level, LogTarget::MachineReadableFile);
+}
+
 pub fn init_logging(level: &str) {
     init_logging_with_target(level, LogTarget::Stderr);
 }
@@ -1960,7 +1966,7 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
             let config = echo_agent::telemetry::TelemetryConfig {
                 otlp_endpoint,
                 service_name,
-                enable_console: target == LogTarget::Stderr,
+                enable_console: matches!(target, LogTarget::Stderr),
             };
             // Use env filter matching the requested level
             // Note: We don't set RUST_LOG env var to avoid thread-safety issues
@@ -1995,6 +2001,21 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
                                     .with_timer(LocalTimer),
                             )
                             .try_init();
+                    }
+                }
+                LogTarget::MachineReadableFile => {
+                    let registry = tracing_subscriber::registry().with(env_filter());
+                    if let Some(file) = app_log_file() {
+                        let _ = registry
+                            .with(
+                                tracing_subscriber::fmt::layer()
+                                    .with_writer(std::sync::Mutex::new(file))
+                                    .with_ansi(false)
+                                    .with_timer(LocalTimer),
+                            )
+                            .try_init();
+                    } else {
+                        let _ = registry.try_init();
                     }
                 }
                 LogTarget::Stderr => {

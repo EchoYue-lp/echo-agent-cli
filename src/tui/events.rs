@@ -31,10 +31,12 @@ use echo_agent_app_core::context_window::ContextWindowSnapshot;
 use echo_agent_app_core::foreground_turn::{
     ForegroundTurnLease, ForegroundTurnSnapshot, ForegroundTurnSurface,
 };
+use echo_agent_app_core::terminal::TerminalEvent;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const PASTE_ATTACHMENT_CHAR_THRESHOLD: usize = 1_000;
+const MAX_TUI_TERMINAL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
 /// Handle keyboard input when an approval request is pending.
 /// Returns `true` if the key was consumed.
@@ -590,6 +592,10 @@ pub async fn run_event_loop(
     agent: AgentHandle,
 ) -> anyhow::Result<()> {
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+    let mut terminal_event_rx = app
+        .app_state
+        .as_ref()
+        .map(|state| state.terminal.subscribe());
     let mut subagent_event_rx = agent
         .read(|a| a.subagent_registry().event_bus().subscribe())
         .await;
@@ -598,6 +604,12 @@ pub async fn run_event_loop(
         .unwrap_or_else(Instant::now);
 
     loop {
+        let terminal_events_closed = terminal_event_rx
+            .as_mut()
+            .is_some_and(|events| drain_terminal_events(app, events));
+        if terminal_events_closed {
+            terminal_event_rx = None;
+        }
         while let Ok(event) = subagent_event_rx.try_recv() {
             update_subagent_runs(app, &event);
         }
@@ -901,9 +913,16 @@ pub async fn run_event_loop(
         match event::poll(POLL_INTERVAL) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => handle_key(app, key, &agent, agent_tx.clone()).await,
+                Ok(Event::Paste(text)) if app.active_terminal_id.is_some() => {
+                    send_terminal_input(app, text.as_bytes()).await;
+                }
                 Ok(Event::Paste(text)) => handle_pasted_text(app, &text),
+                Ok(Event::Mouse(_)) if app.active_terminal_id.is_some() => {}
                 Ok(Event::Mouse(mouse)) => handle_mouse(app, &mouse),
-                Ok(Event::Resize(_, _)) => {} // ratatui handles resize automatically
+                Ok(Event::Resize(cols, rows)) if app.active_terminal_id.is_some() => {
+                    resize_active_terminal(app, rows, cols).await;
+                }
+                Ok(Event::Resize(_, _)) => {}
                 Ok(_) => {}
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => {
@@ -1101,6 +1120,10 @@ async fn handle_key(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
+    if app.active_terminal_id.is_some() {
+        handle_terminal_key(app, &key).await;
+        return;
+    }
     // ── Approval mode takes priority over everything ──
     if let Some(pending_handle) = app.pending_approval.clone() {
         // Check if there's a pending approval
@@ -1127,6 +1150,113 @@ async fn handle_key(
         return;
     }
     handle_normal_key(app, &key, agent, agent_tx).await;
+}
+
+fn append_terminal_output(app: &mut TuiApp, bytes: &[u8]) {
+    app.terminal_output.extend_from_slice(bytes);
+    let excess = app
+        .terminal_output
+        .len()
+        .saturating_sub(MAX_TUI_TERMINAL_OUTPUT_BYTES);
+    if excess > 0 {
+        app.terminal_output.drain(..excess);
+    }
+}
+
+fn drain_terminal_events(
+    app: &mut TuiApp,
+    events: &mut tokio::sync::broadcast::Receiver<TerminalEvent>,
+) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(TerminalEvent::Output { id, bytes })
+                if app.active_terminal_id.as_deref() == Some(id.as_str()) =>
+            {
+                append_terminal_output(app, &bytes);
+            }
+            Ok(TerminalEvent::Exited { id, reason })
+                if app.active_terminal_id.as_deref() == Some(id.as_str()) =>
+            {
+                app.active_terminal_id = None;
+                app.status_msg = format!("Terminal '{id}' exited: {reason:?}");
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return false,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(skipped)) => {
+                app.status_msg = format!(
+                    "Terminal output lagged by {skipped} event(s); the visible tail remains live"
+                );
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => return true,
+        }
+    }
+}
+
+async fn handle_terminal_key(app: &mut TuiApp, key: &KeyEvent) {
+    if key.code == KeyCode::Esc {
+        let id = app.active_terminal_id.take().unwrap_or_default();
+        app.status_msg = format!("Detached from terminal '{id}'");
+        return;
+    }
+    let bytes = match key.code {
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Char(value) if key.modifiers.contains(KeyModifiers::CONTROL) => value
+            .is_ascii_alphabetic()
+            .then(|| vec![(value.to_ascii_lowercase() as u8).saturating_sub(b'a') + 1]),
+        KeyCode::Char(value) => {
+            let mut encoded = [0_u8; 4];
+            let bytes = value.encode_utf8(&mut encoded).as_bytes();
+            let mut result = Vec::with_capacity(bytes.len().saturating_add(1));
+            if key.modifiers.contains(KeyModifiers::ALT) {
+                result.push(0x1b);
+            }
+            result.extend_from_slice(bytes);
+            Some(result)
+        }
+        _ => None,
+    };
+    if let Some(bytes) = bytes {
+        send_terminal_input(app, &bytes).await;
+    }
+}
+
+async fn send_terminal_input(app: &mut TuiApp, bytes: &[u8]) {
+    let Some(id) = app.active_terminal_id.clone() else {
+        return;
+    };
+    let Some(state) = app.app_state.as_ref() else {
+        app.status_msg = "Terminal service is unavailable".to_string();
+        return;
+    };
+    if let Err(error) = state.terminal.write(&id, bytes).await {
+        app.status_msg = format!("Terminal '{id}' input failed: {error}");
+        if !state.terminal.contains(&id) {
+            app.active_terminal_id = None;
+        }
+    }
+}
+
+async fn resize_active_terminal(app: &mut TuiApp, rows: u16, cols: u16) {
+    let Some(id) = app.active_terminal_id.clone() else {
+        return;
+    };
+    let Some(state) = app.app_state.as_ref() else {
+        return;
+    };
+    if let Err(error) = state.terminal.resize(&id, rows.max(1), cols.max(1)).await {
+        app.status_msg = format!("Terminal '{id}' resize failed: {error}");
+    }
 }
 
 // ── Command palette ────────────────────────────────────────────────────────
@@ -1418,8 +1548,68 @@ async fn dispatch_turn(
 ) -> TurnDispatchResult {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let run_turn_binding = run_turn_binding_for_queued_turn(&turn, &turn_id);
-    let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+    let app_state = match app.app_state.as_ref() {
+        Some(state) => state.clone(),
+        None => {
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: "TUI application state is unavailable".to_string(),
+                retryable: false,
+            };
+        }
+    };
+    let foreground_turns = app_state.session.foreground_turns.clone();
+    let lease = match begin_tui_foreground_turn(app, &turn_id).await {
+        Ok(lease) => lease,
+        Err(error) => {
+            tracing::warn!(%error, turn_id, "failed to acquire TUI foreground turn");
+            let retryable = matches!(
+                &error,
+                echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                    echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
+                        | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
+                )
+            );
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: format!("Unable to start foreground turn: {error}"),
+                retryable,
+            };
+        }
+    };
+    if let Some(conversation_id) = app.conversation_id.as_deref() {
+        let title: String = turn.text.chars().take(80).collect();
+        if let Err(error) = app_state
+            .ensure_conversation_owned(echo_agent::memory::NewConversation {
+                conversation_id: conversation_id.to_string(),
+                user_id: "default".to_string(),
+                agent_type: None,
+                title: Some(title),
+            })
+            .await
+        {
+            tracing::warn!(error = %error, conversation_id, "failed to ensure TUI conversation metadata");
+            let detail = format!("Unable to persist TUI conversation metadata: {error}");
+            lease.settle(TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("conversation_store", detail.clone()),
+            ));
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: detail,
+                retryable: false,
+            };
+        }
+    }
+    let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
+    let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
+        echo_agent_app_core::chat_event_log::ChatSurface::Tui,
+        renderer,
+        app_state.storage.chat_events.clone(),
+        app_state.storage.tool_executions.clone(),
+        app.conversation_id.clone(),
+        turn_id.clone(),
+    );
     let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
         app.workspace_root.as_deref(),
     );
@@ -1435,62 +1625,24 @@ async fn dispatch_turn(
         Ok(prepared) => prepared,
         Err(error) => {
             tracing::warn!(%error, "failed to prepare TUI user turn");
+            let detail = format!("Failed to prepare user turn: {error}");
+            lease.settle(TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("prepared_turn", detail.clone()),
+            ));
             return TurnDispatchResult::Rejected {
                 turn,
-                error: format!("Failed to prepare user turn: {error}"),
+                error: detail,
                 retryable: false,
             };
         }
     };
+    let retry_turn = queued_turn_from_prepared(&turn, &prepared);
     let task_attachments = prepared.inline_attachment_refs();
     let display_text = if turn.text.is_empty() {
         format!("[{} attachment(s)]", turn.attachments.len())
     } else {
         turn.text.clone()
     };
-    let foreground_turns = match app.app_state.as_ref() {
-        Some(state) => state.session.foreground_turns.clone(),
-        None => {
-            return TurnDispatchResult::Rejected {
-                turn,
-                error: "TUI application state is unavailable".to_string(),
-                retryable: false,
-            };
-        }
-    };
-    let lease = match begin_tui_foreground_turn(app, &turn_id) {
-        Ok(lease) => lease,
-        Err(error) => {
-            tracing::warn!(%error, turn_id, "failed to acquire TUI foreground turn");
-            let retryable = matches!(
-                &error,
-                echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
-                    | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
-            );
-            return TurnDispatchResult::Rejected {
-                turn,
-                error: format!("Unable to start foreground turn: {error}"),
-                retryable,
-            };
-        }
-    };
-    if let (Some(store), Some(conversation_id)) = (
-        app.conversation_store.as_ref(),
-        app.conversation_id.as_deref(),
-    ) {
-        let title: String = turn.text.chars().take(80).collect();
-        if let Err(error) = store
-            .ensure_conversation(echo_agent::memory::NewConversation {
-                conversation_id: conversation_id.to_string(),
-                user_id: "default".to_string(),
-                agent_type: None,
-                title: Some(title),
-            })
-            .await
-        {
-            tracing::warn!(error = %error, conversation_id, "failed to ensure TUI conversation metadata");
-        }
-    }
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: app.pool.clone(),
         store: app.task_runtime_store.clone(),
@@ -1536,7 +1688,7 @@ async fn dispatch_turn(
         });
     }) {
         return TurnDispatchResult::Rejected {
-            turn,
+            turn: retry_turn,
             error: format!("Unable to supervise foreground turn: {error}"),
             retryable: false,
         };
@@ -1546,22 +1698,38 @@ async fn dispatch_turn(
     TurnDispatchResult::Started
 }
 
-fn begin_tui_foreground_turn(
+fn queued_turn_from_prepared(
+    turn: &QueuedTurn,
+    prepared: &echo_agent_app_core::prepared_turn::PreparedUserTurn,
+) -> QueuedTurn {
+    QueuedTurn {
+        text: prepared.instruction.clone(),
+        attachments: prepared.inline_attachment_refs(),
+        interaction_mode: turn.interaction_mode,
+        run_resume: turn.run_resume.clone(),
+    }
+}
+
+async fn begin_tui_foreground_turn(
     app: &TuiApp,
     turn_id: &str,
-) -> Result<ForegroundTurnLease, echo_agent_app_core::foreground_turn::ForegroundTurnError> {
-    let app_state = app
-        .app_state
-        .as_ref()
-        .ok_or(echo_agent_app_core::foreground_turn::ForegroundTurnError::StateUnavailable)?;
-    let conversation_id = app
-        .conversation_id
-        .as_deref()
-        .ok_or(echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId)?;
+) -> Result<
+    ForegroundTurnLease,
+    echo_agent_app_core::conversation_deletion::ConversationDeletionError,
+> {
+    let app_state = app.app_state.as_ref().ok_or(
+        echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+            echo_agent_app_core::foreground_turn::ForegroundTurnError::StateUnavailable,
+        ),
+    )?;
+    let conversation_id = app.conversation_id.as_deref().ok_or(
+        echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+            echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId,
+        ),
+    )?;
     app_state
-        .session
-        .foreground_turns
-        .begin(ForegroundTurnSurface::Tui, conversation_id, turn_id)
+        .begin_conversation_turn_owned(ForegroundTurnSurface::Tui, conversation_id, turn_id)
+        .await
 }
 
 fn restore_undispatched_turn(app: &mut TuiApp, turn: QueuedTurn, error: String) {
@@ -1600,10 +1768,10 @@ fn active_tui_turn(app: &TuiApp) -> Result<ForegroundTurnSnapshot, String> {
         .foreground_turns
         .snapshot(ForegroundTurnSurface::Tui, conversation_id)
         .ok_or_else(|| "No active TUI foreground turn".to_string())?;
-    if snapshot.turn_id != expected_turn_id {
+    if snapshot.active_turn_id != expected_turn_id {
         return Err(format!(
             "TUI foreground turn mismatch: expected {expected_turn_id}, actual {}",
-            snapshot.turn_id
+            snapshot.active_turn_id
         ));
     }
     Ok(snapshot)
@@ -2155,7 +2323,7 @@ async fn cancel_active_tui_turn(app: &mut TuiApp) -> Result<(), String> {
         .cancel_and_wait(
             ForegroundTurnSurface::Tui,
             &snapshot.conversation_id,
-            &snapshot.turn_id,
+            &snapshot.active_turn_id,
         )
         .await
         .map(|_| ())
@@ -2255,6 +2423,37 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 run_id,
                 goal,
                 new_message,
+            },
+            ChatDriverEvent::ApprovalRequest {
+                request_id,
+                tool_name,
+                prompt,
+                ..
+            } => AgentEvent::Notice(format!(
+                "Approval requested [{request_id}] for {tool_name}: {prompt}"
+            )),
+            ChatDriverEvent::InputRequest { request_id, prompt } => {
+                AgentEvent::Notice(format!("Input requested [{request_id}]: {prompt}"))
+            }
+            ChatDriverEvent::SelectionRequest {
+                request_id,
+                prompt,
+                options,
+                ..
+            } => AgentEvent::Notice(format!(
+                "Selection requested [{request_id}]: {prompt} ({})",
+                options.join(", ")
+            )),
+            ChatDriverEvent::ContextCompressed {
+                before_count,
+                after_count,
+                before_tokens,
+                after_tokens,
+            } => AgentEvent::ContextCompressed {
+                before_count,
+                after_count,
+                before_tokens,
+                after_tokens,
             },
             ChatDriverEvent::Agent(event) => match event.payload {
                 echo_agent::agent::AgentEvent::Token(t) => AgentEvent::Token(t),
@@ -2796,15 +2995,16 @@ async fn refresh_workspace_generation(
     agent: &AgentHandle,
     state: &echo_agent_app_core::state::AppState,
 ) {
-    app.pending_attachments.clear();
-    app.queued_turns.clear();
+    if let Err(error) = app.discard_unsubmitted_attachments() {
+        tracing::warn!(%error, "failed to clean staged attachments after workspace change");
+    }
     app.task_runtime_view = None;
     app.subagent_runs.clear();
     app.workspace_root = state
         .current_workspace()
         .await
         .map(|workspace| workspace.root);
-    app.conversation_store = state.storage.conversation_store.read().await.clone();
+    app.conversation_store = state.conversation_store().await;
     app.conversation_id = agent
         .read(|value| value.conversation_id().map(str::to_string))
         .await;
@@ -3410,13 +3610,11 @@ async fn handle_slash_command(
         Some(SlashCommand::New) => {
             reset_conversation_state(app, agent, true).await;
             if !args.trim().is_empty()
-                && let (Some(store), Some(id)) = (
-                    app.conversation_store.as_ref(),
-                    app.conversation_id.as_deref(),
-                )
+                && let (Some(app_state), Some(id)) =
+                    (app.app_state.as_ref(), app.conversation_id.as_deref())
             {
-                let _ = store
-                    .ensure_conversation(echo_agent::memory::NewConversation {
+                let _ = app_state
+                    .ensure_conversation_owned(echo_agent::memory::NewConversation {
                         conversation_id: id.to_string(),
                         user_id: "default".to_string(),
                         agent_type: None,
@@ -3524,29 +3722,15 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::DeleteSession) => {
             let id = args.trim();
-            let result = match app.conversation_store.as_ref() {
+            let result = match app.app_state.as_ref() {
                 _ if id.is_empty() => Err("Usage: /delete-session <conversation-id>".to_string()),
-                Some(store) => store
-                    .delete_conversation(id)
+                Some(app_state) => app_state
+                    .delete_conversation_owned(id)
                     .await
+                    .map(|_| ())
                     .map_err(|error| error.to_string()),
                 None => Err("Conversation persistence is unavailable".to_string()),
             };
-            if result.is_ok()
-                && let Some(config) = agent.read(|a| a.tool_output_artifacts()).await
-            {
-                if let Err(error) =
-                    echo_agent::tools::artifact::cleanup_tool_output_scope(&config, id, None)
-                {
-                    tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation tool artifacts");
-                }
-                let spill_dir = config.root_dir.join("user-input");
-                if let Err(error) =
-                    echo_agent_app_core::prepared_turn::cleanup_user_input_scope(&spill_dir, id)
-                {
-                    tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation user-input artifacts");
-                }
-            }
             if result.is_ok() && app.conversation_id.as_deref() == Some(id) {
                 reset_conversation_state(app, agent, true).await;
             }
@@ -3619,20 +3803,37 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::Compact) => {
-            let result = agent
-                .write_async(|a| Box::pin(async move { a.force_compress_context().await }))
-                .await;
+            let result = match (app.app_state.as_ref(), app.conversation_id.as_ref()) {
+                (Some(app_state), Some(conversation_id)) => {
+                    app_state
+                        .compress_conversation_owned(
+                            echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                                conversation_id: conversation_id.clone(),
+                                surface: ForegroundTurnSurface::Tui,
+                                focus: None,
+                                keep_messages: 12,
+                            },
+                        )
+                        .await
+                }
+                _ => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: "压缩需要一个已持久化的活动会话。".to_string(),
+                    });
+                    return;
+                }
+            };
             match result {
-                Ok((stats, _checkpoint)) => {
-                    // 手动 /compact 不走 run_compact，不会发 ContextCompressed；
-                    // 成功路径显式 clear_usage，与 auto-compact 效果一致。
+                Ok(receipt) => {
                     app.context_snapshot.clear_usage();
-                    let saved = stats.before_tokens.saturating_sub(stats.after_tokens);
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
                         content: format!(
                             "上下文已压缩: {} → {} 条消息, 节省 ≈{} tokens",
-                            stats.before_count, stats.after_count, saved
+                            receipt.messages_before,
+                            receipt.messages_after,
+                            receipt.tokens_saved()
                         ),
                     });
                 }
@@ -4672,6 +4873,45 @@ async fn handle_slash_command(
                 content,
             });
         }
+        Some(command @ (SlashCommand::Terminal | SlashCommand::Lsp)) => {
+            let Some(state) = app.app_state.clone() else {
+                push_system_message(
+                    app,
+                    "Developer tools are unavailable during application bootstrap.".to_string(),
+                );
+                app.rebuild_message_groups();
+                return;
+            };
+            let parsed = match shell_words::split(args) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    push_system_message(app, format!("Invalid command arguments: {error}"));
+                    app.rebuild_message_groups();
+                    return;
+                }
+            };
+            let parsed_refs = parsed.iter().map(String::as_str).collect::<Vec<_>>();
+            let name = if command == SlashCommand::Terminal {
+                "terminal"
+            } else {
+                "lsp"
+            };
+            let registry = echo_agent_app_core::developer_commands::DeveloperCommandRegistry::new(
+                state.terminal.clone(),
+                state.plugin_runtime.clone(),
+            );
+            match registry.execute(name, &parsed_refs).await {
+                Ok(output) => {
+                    push_system_message(app, output.message);
+                    if let Some(terminal_id) = output.attached_terminal {
+                        app.terminal_output.clear();
+                        app.active_terminal_id = Some(terminal_id);
+                    }
+                }
+                Err(error) => push_system_message(app, format!("/{name} failed: {error}")),
+            }
+            app.rebuild_message_groups();
+        }
         Some(SlashCommand::Trace) => {
             let run_store = agent.read(|value| value.run_store().cloned()).await;
             let content = match run_store {
@@ -4820,7 +5060,7 @@ async fn handle_slash_command(
                     attachments: &attachments,
                     spill_dir: &spill_dir,
                     conversation_id: app.conversation_id.as_deref(),
-                    turn_id: Some(&snapshot.turn_id),
+                    turn_id: Some(&snapshot.active_turn_id),
                 },
             ) {
                 Ok(prepared) => prepared,
@@ -4844,7 +5084,10 @@ async fn handle_slash_command(
                     return;
                 }
             };
-            match agent.steer_input(Some(&snapshot.turn_id), message).await {
+            match agent
+                .steer_input(Some(&snapshot.active_turn_id), message)
+                .await
+            {
                 Ok(turn_id) => {
                     app.messages.push(ChatMessage {
                         role: MessageRole::User,
@@ -5447,6 +5690,22 @@ async fn handle_slash_command(
             });
             app.rebuild_message_groups();
         }
+        Some(SlashCommand::Workflow) => {
+            let content = match app.app_state.as_ref() {
+                Some(state) => state
+                    .history
+                    .workflows
+                    .execute_command(args)
+                    .await
+                    .unwrap_or_else(|error| format!("Workflow command failed: {error}")),
+                None => "Workflow service is unavailable.".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+            app.rebuild_message_groups();
+        }
         Some(SlashCommand::Cron) => {
             let content = handle_tui_cron(app, args).await;
             app.messages.push(ChatMessage {
@@ -5747,8 +6006,9 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
     app.tokens = (0, 0, 0);
     app.streaming_text.clear();
     app.pending_stream.clear();
-    app.pending_attachments.clear();
-    app.queued_turns.clear();
+    if let Err(error) = app.discard_unsubmitted_attachments() {
+        tracing::warn!(%error, "failed to clean staged attachments during TUI reset");
+    }
     app.active_turn_id = None;
     app.task_runtime_view = None;
     app.subagent_runs.clear();
@@ -5845,8 +6105,12 @@ async fn fork_conversation(
         .as_deref()
         .map(|source| format!("Fork of {}", source.chars().take(8).collect::<String>()))
         .unwrap_or_else(|| "Forked conversation".to_string());
-    store
-        .create_conversation(echo_agent::memory::NewConversation {
+    let app_state = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TUI application state is unavailable"))?;
+    app_state
+        .create_conversation_owned(echo_agent::memory::NewConversation {
             conversation_id: id.clone(),
             user_id: "default".to_string(),
             agent_type: None,
@@ -6620,8 +6884,8 @@ mod tests {
         TurnDispatchResult, apply_turn_settlement, complete_file_reference, delete_previous_word,
         format_task_runtime_view, format_unattended_worktrees, handle_approval_key, handle_esc,
         move_cursor_vertical, parse_interaction_mode, project_queued_dispatch,
-        queue_steer_follow_up, render_cancelled_event, render_error_event,
-        resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
+        queue_steer_follow_up, queued_turn_from_prepared, render_cancelled_event,
+        render_error_event, resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
         run_turn_binding_for_queued_turn, slash_command_allowed_while_busy, update_subagent_runs,
     };
     use crate::tui::{
@@ -6864,6 +7128,49 @@ mod tests {
             echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible
         );
         Ok(())
+    }
+
+    #[test]
+    fn supervision_rejection_requeues_prepared_attachment_identity() {
+        let staged = std::path::PathBuf::from("/workspace/.eko/uploads/staged.txt");
+        let scoped = std::path::PathBuf::from(
+            "/workspace/.eko/artifacts/user-input/conversation/turn/scoped.txt",
+        );
+        let turn = QueuedTurn {
+            text: "original".to_string(),
+            attachments: vec![echo_agent_app_core::attachments::AttachmentRef {
+                path: staged,
+                name: "input.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                source: echo_agent_app_core::types::AttachmentSource::Upload,
+            }],
+            interaction_mode: InteractionMode::Auto,
+            run_resume: None,
+        };
+        let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn {
+            instruction: "prepared".to_string(),
+            resources: vec![echo_agent_app_core::prepared_turn::InputResourceRef {
+                path: scoped.clone(),
+                name: "input.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                kind: echo_agent_app_core::prepared_turn::ResourceKind::Document,
+                delivery: echo_agent_app_core::prepared_turn::Delivery::Inline,
+                bytes: 5,
+                chars: None,
+                lines: None,
+                sha256: None,
+                source: echo_agent_app_core::types::AttachmentSource::Upload,
+            }],
+            authorship: echo_agent_app_core::prepared_turn::InstructionAuthorship::User,
+        };
+
+        let retry = queued_turn_from_prepared(&turn, &prepared);
+
+        assert_eq!(retry.text, "prepared");
+        assert_eq!(
+            retry.attachments.first().map(|attachment| &attachment.path),
+            Some(&scoped)
+        );
     }
 
     #[test]

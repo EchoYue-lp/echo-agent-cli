@@ -186,8 +186,7 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Cron definitions are independent of TaskRun lifecycle state.
     let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
-        let file_path =
-            echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
+        let file_path = echo_agent::paths::user_data_path("scheduler_store");
         match echo_agent::memory::FileStore::new(&file_path) {
             Ok(store) => Arc::new(store),
             Err(_) => Arc::new(echo_agent::memory::InMemoryStore::new()),
@@ -203,6 +202,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         Some(runtime.model_consumers.clone()),
         runtime.hitl_dispatcher.clone(),
         conversation_store,
+        runtime.state_store.clone(),
         app_config.clone(),
         runtime.mcp_config_runtime.clone(),
     );
@@ -216,6 +216,17 @@ async fn run_desktop() -> anyhow::Result<()> {
         .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
         .with_config_watcher(Some(config_watcher.clone()));
     state_inner.webhook.emitter = webhook_emitter;
+    match state_inner.recover_committed_conversation_deletions().await {
+        Ok(receipts) if !receipts.is_empty() => tracing::info!(
+            count = receipts.len(),
+            "Recovered committed conversation deletion finalizers"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "Some committed conversation deletion finalizers remain pending"
+        ),
+    }
 
     // Build task tools before the pool extracts the shared ToolManager, and
     // pass the store into pool construction before its background agent exists.
@@ -233,7 +244,7 @@ async fn run_desktop() -> anyhow::Result<()> {
             echo_agent_app_core::agent_pool::PoolConfig::default(),
             state_inner.tasks.runtime.clone(),
         )
-        .await;
+        .await?;
     if let Some(task_store) = state_inner.tasks.runtime.clone() {
         echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
             &agent_handle,
@@ -289,12 +300,10 @@ async fn run_desktop() -> anyhow::Result<()> {
     });
 
     // ── Launch Tauri window ──
-    let terminal_manager = Arc::new(crate::tauri::terminal::TerminalManager::new());
     let bridge_supervisor = Arc::new(crate::tauri::state::TauriBridgeSupervisor::new());
     let tauri_result = crate::tauri::build_tauri_app(
         state.clone(),
         runtime.browser_runtime.clone(),
-        terminal_manager.clone(),
         bridge_supervisor.clone(),
     )
     .run(tauri::generate_context!());
@@ -345,7 +354,9 @@ async fn run_desktop() -> anyhow::Result<()> {
     runtime.mcp_config_runtime.shutdown().await;
     runtime.browser_runtime.shutdown().await;
     bridge_supervisor.shutdown().await;
-    terminal_manager.close_all().await;
+    if let Err(error) = state.terminal.close_all().await {
+        tracing::warn!(%error, "failed to close terminal sessions");
+    }
     if let Some(store) = state.tasks.runtime.as_ref()
         && let Err(error) = store.shutdown_hook_events().await
     {

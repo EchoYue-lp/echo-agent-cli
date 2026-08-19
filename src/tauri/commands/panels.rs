@@ -8,6 +8,7 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent_app_core::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
 use echo_agent_app_core::tasks::task_runtime::compact_context::RUNTIME_RECOVERY_MARKER;
+use echo_agent_app_core::workflow_service::WorkflowServiceError;
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -33,6 +34,16 @@ fn evolution_write_lease(
         .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?
         .lease_generation()
         .map_err(|error| IpcError::Validation(error.to_string()))
+}
+
+fn map_workflow_error(error: WorkflowServiceError) -> IpcError {
+    match error {
+        WorkflowServiceError::NotFound(id) => {
+            IpcError::NotFound(format!("Workflow '{id}' not found"))
+        }
+        WorkflowServiceError::InvalidDefinition(message) => IpcError::Validation(message),
+        other => IpcError::Internal(other.to_string()),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -500,16 +511,16 @@ async fn refresh_skill_hub_loaded_state(state: &TauriState) {
     hub.set_loaded_skills(names);
 }
 
-async fn refresh_pool_skill_descriptors(state: &TauriState) {
-    let descriptors = state
+async fn refresh_runtime_skill_catalog(state: &TauriState) -> Result<(), IpcError> {
+    let plugin_runtime = state
         .app_state
-        .connection
-        .primary_agent()
-        .read(|a| a.skill_descriptors())
-        .await;
-    if let Some(pool) = &state.app_state.connection.pool {
-        pool.refresh_skill_descriptors(descriptors).await;
-    }
+        .plugin_runtime
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Plugin runtime is not configured".to_string()))?;
+    plugin_runtime
+        .refresh_agent_catalog()
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[tauri::command]
@@ -589,7 +600,7 @@ pub async fn sync_skills(
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
     refresh_skill_hub_loaded_state(&state).await;
-    refresh_pool_skill_descriptors(&state).await;
+    refresh_runtime_skill_catalog(&state).await?;
     serde_json::to_value(results).map_err(|error| IpcError::Internal(error.to_string()))
 }
 
@@ -625,7 +636,7 @@ pub async fn load_skill(
         .map_err(|e| IpcError::Internal(e.to_string()))?;
     let count = loaded.len();
     refresh_skill_hub_loaded_state(&state).await;
-    refresh_pool_skill_descriptors(&state).await;
+    refresh_runtime_skill_catalog(&state).await?;
 
     let skills: Vec<serde_json::Value> = agent
         .read(|a| {
@@ -677,7 +688,7 @@ pub async fn enable_skill(
     // B3:同步写 enabled-skills.json,消除三套状态不同步。
     persist_skill_enabled(&name, &category, true);
     refresh_skill_hub_loaded_state(&state).await;
-    refresh_pool_skill_descriptors(&state).await;
+    refresh_runtime_skill_catalog(&state).await?;
 
     Ok(json!({
         "success": true,
@@ -733,21 +744,14 @@ pub async fn upload_skill(
 pub async fn list_workflows(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let workflows = state.app_state.history.workflows.read().await;
-    let list: Vec<serde_json::Value> = workflows
-        .values()
-        .map(|w| {
-            serde_json::json!({
-                "id": w.id,
-                "name": w.name,
-                "node_count": w.node_count,
-                "edge_count": w.edge_count,
-                "created_at": w.created_at,
-                "updated_at": w.updated_at,
-            })
-        })
-        .collect();
-    Ok(serde_json::to_value(list).unwrap_or_default())
+    let workflows = state
+        .app_state
+        .history
+        .workflows
+        .list()
+        .map_err(map_workflow_error)?;
+    serde_json::to_value(workflows)
+        .map_err(|error| IpcError::Internal(format!("Failed to serialize workflows: {error}")))
 }
 
 #[tauri::command]
@@ -755,11 +759,14 @@ pub async fn get_workflow(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let workflows = state.app_state.history.workflows.read().await;
-    workflows
+    let workflow = state
+        .app_state
+        .history
+        .workflows
         .get(&id)
-        .map(|w| serde_json::to_value(w).unwrap_or_default())
-        .ok_or_else(|| IpcError::NotFound(format!("Workflow '{}' not found", id)))
+        .map_err(map_workflow_error)?;
+    serde_json::to_value(workflow)
+        .map_err(|error| IpcError::Internal(format!("Failed to serialize workflow: {error}")))
 }
 
 #[tauri::command]
@@ -768,21 +775,13 @@ pub async fn create_workflow(
     name: String,
     definition: String,
 ) -> Result<serde_json::Value, IpcError> {
-    use echo_agent_app_core::state::StoredWorkflow;
-    let id = uuid::Uuid::new_v4().to_string();
-    let now = echo_agent::utils::time::now_local().to_rfc3339();
-    let workflow = StoredWorkflow {
-        id: id.clone(),
-        name,
-        definition,
-        node_count: 0,
-        edge_count: 0,
-        created_at: now.clone(),
-        updated_at: now,
-    };
-    let mut workflows = state.app_state.history.workflows.write().await;
-    workflows.insert(id.clone(), workflow);
-    Ok(serde_json::json!({"success": true, "id": id}))
+    let workflow = state
+        .app_state
+        .history
+        .workflows
+        .create(name, definition)
+        .map_err(map_workflow_error)?;
+    Ok(serde_json::json!({"success": true, "id": workflow.id}))
 }
 
 #[tauri::command]
@@ -790,12 +789,13 @@ pub async fn delete_workflow(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let mut workflows = state.app_state.history.workflows.write().await;
-    if workflows.remove(&id).is_some() {
-        Ok(serde_json::json!({"success": true}))
-    } else {
-        Err(IpcError::NotFound(format!("Workflow '{}' not found", id)))
-    }
+    state
+        .app_state
+        .history
+        .workflows
+        .delete(&id)
+        .map_err(map_workflow_error)?;
+    Ok(serde_json::json!({"success": true}))
 }
 
 #[tauri::command]
@@ -804,40 +804,16 @@ pub async fn execute_workflow(
     id: String,
     input: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, IpcError> {
-    let workflow = {
-        let workflows = state.app_state.history.workflows.read().await;
-        workflows
-            .get(&id)
-            .cloned()
-            .ok_or_else(|| IpcError::NotFound(format!("Workflow '{}' not found", id)))?
-    };
-
-    let definition = workflow.definition.trim();
-    let graph = echo_agent::workflow::loader::load_graph_from_yaml_str(definition)
-        .or_else(|_| echo_agent::workflow::loader::load_graph_from_json_str(definition))
-        .map_err(|e| {
-            IpcError::Validation(format!(
-                "Workflow '{}' is not a framework Graph workflow definition: {e}",
-                workflow.name
-            ))
-        })?;
-
-    let shared_state = echo_agent::workflow::SharedState::new();
-    shared_state
-        .set("input", input.unwrap_or_else(|| json!({})))
-        .map_err(|e| IpcError::Internal(format!("Failed to initialize workflow state: {e}")))?;
-    let result = graph
-        .run(shared_state)
+    let result = state
+        .app_state
+        .history
+        .workflows
+        .execute(&id, input)
         .await
-        .map_err(|e| IpcError::Internal(format!("Workflow execution failed: {e}")))?;
-
-    Ok(json!({
-        "success": true,
-        "workflow_id": workflow.id,
-        "path": result.path,
-        "steps": result.steps,
-        "state": result.state.to_json_value().map_err(|e| IpcError::Internal(format!("Failed to serialize workflow state: {e}")))?,
-    }))
+        .map_err(map_workflow_error)?;
+    serde_json::to_value(result).map_err(|error| {
+        IpcError::Internal(format!("Failed to serialize workflow execution: {error}"))
+    })
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -995,64 +971,68 @@ pub async fn execute_sandbox(
 pub async fn compress_context(
     app: tauri::AppHandle,
     state: tauri::State<'_, TauriState>,
+    conversation_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let (messages_before, messages_after, tokens_before, tokens_after) = state
+    let conversation_id = match conversation_id.filter(|value| !value.trim().is_empty()) {
+        Some(conversation_id) => conversation_id,
+        None => state
+            .app_state
+            .connection
+            .primary_agent()
+            .read(|agent| agent.conversation_id().map(str::to_string))
+            .await
+            .ok_or_else(|| {
+                IpcError::Validation("No active conversation to compress".to_string())
+            })?,
+    };
+    let receipt = state
         .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            Box::pin(async move {
-                match agent.force_compress_context().await {
-                    Ok((stats, _checkpoint)) => (
-                        stats.before_count,
-                        stats.after_count,
-                        stats.before_tokens,
-                        stats.after_tokens,
-                    ),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Manual context compression failed");
-                        (0, 0, 0, 0)
-                    }
-                }
-            })
-        })
-        .await;
-
-    if messages_before == 0 && messages_after == 0 {
-        Ok(serde_json::json!({
-            "success": true,
-            "message": "No messages to compress",
-            "messages_before": 0,
-            "messages_after": 0,
-            "tokens_saved": 0,
-        }))
-    } else {
-        // 手动压缩不走 run_compact，不会发 AgentEvent::ContextCompressed；
-        // 显式 emit，与 auto-compact 对齐（前端 Snapshot 置空、Accumulator 保留）。
-        let payload = serde_json::json!({
-            "type": "context_compressed",
-            "before_count": messages_before,
-            "after_count": messages_after,
-            "before_tokens": tokens_before,
-            "after_tokens": tokens_after,
-        });
-        if let Err(e) = app.emit("chat://event", payload) {
-            tracing::warn!(error = %e, "failed to emit context_compressed after manual compress");
-        }
-        Ok(serde_json::json!({
-            "success": true,
-            "message": format!("Compressed: {messages_before} → {messages_after} messages"),
-            "messages_before": messages_before,
-            "messages_after": messages_after,
-            "tokens_saved": tokens_before.saturating_sub(tokens_after),
-        }))
-    }
+        .compress_conversation_owned(
+            echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                conversation_id,
+                surface: echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+                focus: None,
+                keep_messages: 12,
+            },
+        )
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    app.emit("chat://event", &receipt.envelope)
+        .map_err(|error| {
+            IpcError::Internal(format!("compression event delivery failed: {error}"))
+        })?;
+    Ok(serde_json::json!({
+        "success": true,
+        "message": format!(
+            "Compressed: {} → {} messages",
+            receipt.messages_before, receipt.messages_after
+        ),
+        "messages_before": receipt.messages_before,
+        "messages_after": receipt.messages_after,
+        "tokens_saved": receipt.tokens_saved(),
+    }))
 }
 
 #[tauri::command]
 pub async fn get_compression_stats(
     state: tauri::State<'_, TauriState>,
+    conversation_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    let execution = match conversation_id.filter(|value| !value.trim().is_empty()) {
+        Some(conversation_id) => Some(
+            state
+                .app_state
+                .connection
+                .agent_for(&conversation_id)
+                .await
+                .map_err(|error| IpcError::Validation(error.to_string()))?,
+        ),
+        None => None,
+    };
+    let agent = execution
+        .as_ref()
+        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .unwrap_or_else(|| state.app_state.connection.primary_agent());
     let (
         message_count,
         current_tokens,
@@ -1061,10 +1041,7 @@ pub async fn get_compression_stats(
         protected_message_count,
         protected_tokens,
         runtime_recovery_active,
-    ) = state
-        .app_state
-        .connection
-        .agent
+    ) = agent
         .read_async(|agent| {
             Box::pin(async move {
                 let token_limit = agent.config().get_token_limit();
@@ -1558,14 +1535,15 @@ pub async fn get_evolution_dashboard(
 pub async fn scan_rule_proposals(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let agent = state.app_state.connection.primary_agent();
-    let store = agent
-        .read(|a| a.store().cloned())
+    let integration = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
+    let proposals = integration
+        .scan_rule_proposals()
         .await
-        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
-
-    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
-    let proposals = promoter.scan_for_proposals().await;
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
 
     Ok(json!({ "proposals": proposals, "count": proposals.len() }))
 }
@@ -1585,19 +1563,11 @@ pub async fn promote_rule(
         .review_integration
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
-    let memory_generation = integration
-        .lease_generation()
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let agent = state.app_state.connection.primary_agent();
-    let echo_agent_dir = memory_generation.echo_agent_dir().to_path_buf();
-    let promoter =
-        echo_agent_app_core::evolution::RulePromoter::new(memory_generation.memory_store())
-            .with_rules_path(echo_agent_dir.join("learned-rules.md"));
-
     // 找到对应候选(scan 已过置信度/age/type 门槛)
-    let proposal = promoter
-        .scan_for_proposals()
+    let proposal = integration
+        .scan_rule_proposals()
         .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
         .into_iter()
         .find(|p| p.memory_key == memory_key)
         .ok_or_else(|| {
@@ -1606,43 +1576,16 @@ pub async fn promote_rule(
             ))
         })?;
 
-    let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        echo_agent_dir.join("evolution").join("change-log.jsonl"),
-    )
-    .map_err(|error| IpcError::Internal(error.to_string()))?;
-
-    promoter
-        .promote_rule(&proposal, &change_log)
+    let receipt = integration
+        .promote_rule(&proposal)
         .await
-        .map_err(|e| IpcError::Internal(format!("Failed to promote rule: {e}")))?;
-
-    // Fire RulePromoted hook so registered hooks are notified.
-    echo_agent_app_core::evolution::fire_evolution_hook(
-        &agent,
-        echo_core::hooks::HookEvent::RulePromoted,
-        &memory_key,
-    )
-    .await;
-    let root = echo_agent_dir.parent().map(std::path::Path::to_path_buf);
-    agent
-        .write_async(|value| {
-            Box::pin(async move {
-                echo_agent_app_core::unified_memory::refresh_instruction_projection(
-                    value,
-                    root.as_deref(),
-                )
-                .await;
-            })
-        })
-        .await;
-    if let Some(pool) = &state.app_state.connection.pool {
-        pool.refresh_instruction_context().await;
-    }
+        .map_err(|error| IpcError::Internal(format!("Failed to promote rule: {error}")))?;
 
     Ok(json!({
         "success": true,
         "memory_key": memory_key,
         "rule_text": proposal.rule_text,
+        "promotion_id": receipt.promotion_id,
     }))
 }
 

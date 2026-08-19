@@ -42,8 +42,32 @@ use tokio::sync::{Notify, RwLock};
 
 use crate::infra;
 use crate::model_config::ModelRuntimeConfig;
+use crate::plugin_components::{PreparedPluginAgent, register_plugin_agents};
 use crate::workspace::WorkspaceKind;
 use echo_agent::config::AppConfig;
+
+/// Immutable EKO projection of the plugin catalog installed into primary,
+/// existing pooled, and future pooled agents as one generation.
+#[derive(Clone, Default)]
+pub(crate) struct AgentPluginGeneration {
+    revision: u64,
+    skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
+    plugin_agents: Vec<PreparedPluginAgent>,
+}
+
+impl AgentPluginGeneration {
+    pub(crate) fn new(
+        revision: u64,
+        skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
+        plugin_agents: Vec<PreparedPluginAgent>,
+    ) -> Self {
+        Self {
+            revision,
+            skill_descriptors,
+            plugin_agents,
+        }
+    }
+}
 
 /// Configuration for the agent pool.
 #[derive(Debug, Clone)]
@@ -81,6 +105,11 @@ pub enum PoolError {
     ExecutionLeaseCapacity,
     /// The caller attempted to retire a pool entry with another key/pool's receipt.
     ExecutionLeaseMismatch,
+    /// Durable conversation deletion owns this identity until its finalizer retires.
+    ConversationDeletionPending {
+        conversation_id: String,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for PoolError {
@@ -107,6 +136,13 @@ impl std::fmt::Display for PoolError {
             PoolError::ExecutionLeaseMismatch => {
                 write!(f, "Agent pool execution lease does not own this pool entry")
             }
+            PoolError::ConversationDeletionPending {
+                conversation_id,
+                reason,
+            } => write!(
+                f,
+                "Conversation {conversation_id} cannot acquire an agent: {reason}"
+            ),
         }
     }
 }
@@ -376,9 +412,8 @@ pub struct AgentPool {
     /// Working directory applied to existing and future pooled agents.
     working_dir: RwLock<Option<std::path::PathBuf>>,
     permission_mode: RwLock<String>,
-    /// Skill descriptors extracted from the primary agent.
-    /// Pool agents register these instead of re-reading from disk.
-    skill_descriptors: RwLock<Vec<echo_agent::skills::external::SkillDescriptor>>,
+    /// Exact plugin generation projected into existing and future agents.
+    agent_generation: RwLock<AgentPluginGeneration>,
     /// Cancellation token for the cleanup monitor task.
     cleanup_cancel: CancellationToken,
     /// Sole owned cleanup monitor settlement handle. The monitor holds only a
@@ -391,11 +426,16 @@ pub struct AgentPool {
     memory_store_override: RwLock<Option<Arc<dyn echo_agent::memory::Store>>>,
     /// Workspace-scoped conversation store used by existing and future agents.
     conversation_store_override: RwLock<Option<Arc<dyn echo_agent::memory::ConversationStore>>>,
+    /// Workspace-scoped runtime-state store used by existing and future agents.
+    state_store_override: RwLock<Option<Arc<dyn echo_agent::state::RuntimeStateStore>>>,
     /// Product-owned complete tool-output artifact policy for existing and
     /// future pooled agents. Updated together with workspace routing.
     tool_output_artifacts: RwLock<echo_agent::tools::artifact::ToolOutputArtifactConfig>,
     /// Active workspace profile applied to existing and future pooled agents.
     workspace_kind: RwLock<WorkspaceKind>,
+    /// Last strictly-read instruction generation. Existing and future pool
+    /// agents are always projected from this same snapshot.
+    instruction_projection: RwLock<Option<crate::unified_memory::InstructionProjectionSnapshot>>,
 }
 
 pub(crate) struct AgentPoolWorkspaceTransition<'a> {
@@ -423,6 +463,25 @@ pub(crate) struct PreparedAgentPoolModelDeactivation<'a> {
     _agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
     publications: Vec<infra::PreparedAgentModelDeactivation>,
     app_config: AppConfig,
+}
+
+/// Pool-wide plugin publication. The existing workspace-transition admission
+/// guard prevents new leases and waits for current executions to settle while
+/// every cached agent is moved to the same candidate generation.
+pub(crate) struct PreparedAgentPoolPluginPublication<'a> {
+    pool: &'a AgentPool,
+    _transition: AgentPoolWorkspaceTransition<'a>,
+    agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
+    previous: AgentPluginGeneration,
+    candidate: Option<AgentPluginGeneration>,
+}
+
+/// Pool-wide instruction publication under the existing execution admission.
+pub(crate) struct PreparedAgentPoolInstructionPublication<'a> {
+    pool: &'a AgentPool,
+    _transition: AgentPoolWorkspaceTransition<'a>,
+    agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
+    candidate: Option<crate::unified_memory::InstructionProjectionSnapshot>,
 }
 
 impl PreparedAgentPoolModelPublication<'_> {
@@ -468,6 +527,119 @@ impl PreparedAgentPoolModelDeactivation<'_> {
     }
 }
 
+impl PreparedAgentPoolPluginPublication<'_> {
+    pub(crate) async fn prepare(&mut self, candidate: AgentPluginGeneration) -> Result<(), String> {
+        if self.candidate.is_some() {
+            return Err("AgentPool plugin publication is already prepared".to_string());
+        }
+
+        let mut applied = Vec::new();
+        let mut pooled_agents = self.agents.iter().collect::<Vec<_>>();
+        pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
+        for (conversation_id, pooled) in pooled_agents {
+            if let Err(error) =
+                replace_agent_plugin_generation(&pooled.handle, &self.previous, &candidate).await
+            {
+                let mut errors = vec![format!("{conversation_id}: {error}")];
+                for (applied_id, applied_handle) in applied.into_iter().rev() {
+                    if let Err(rollback_error) =
+                        replace_agent_plugin_generation(&applied_handle, &candidate, &self.previous)
+                            .await
+                    {
+                        errors.push(format!("rollback {applied_id}: {rollback_error}"));
+                    }
+                }
+                return Err(format!(
+                    "AgentPool plugin generation preparation failed: {}",
+                    errors.join("; ")
+                ));
+            }
+            applied.push((conversation_id.clone(), pooled.handle.clone()));
+        }
+
+        self.candidate = Some(candidate);
+        Ok(())
+    }
+
+    pub(crate) async fn commit(&mut self) -> Result<(), String> {
+        let candidate = self.candidate.as_ref().ok_or_else(|| {
+            "AgentPool plugin publication cannot commit before preparation".to_string()
+        })?;
+        let revision = candidate.revision;
+        *self.pool.agent_generation.write().await = candidate.clone();
+        tracing::info!(
+            revision,
+            pooled_agents = self.agents.len(),
+            "AgentPool: plugin generation committed"
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn rollback(&mut self) -> Result<(), String> {
+        let Some(candidate) = self.candidate.take() else {
+            return Ok(());
+        };
+        let mut errors = Vec::new();
+        let mut pooled_agents = self.agents.iter().collect::<Vec<_>>();
+        pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
+        for (conversation_id, pooled) in pooled_agents {
+            if let Err(error) =
+                replace_agent_plugin_generation(&pooled.handle, &candidate, &self.previous).await
+            {
+                errors.push(format!("{conversation_id}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "AgentPool plugin generation rollback failed: {}",
+                errors.join("; ")
+            ))
+        }
+    }
+}
+
+impl PreparedAgentPoolInstructionPublication<'_> {
+    pub(crate) async fn prepare(
+        &mut self,
+        candidate: crate::unified_memory::InstructionProjectionSnapshot,
+    ) -> Result<(), String> {
+        if self.candidate.is_some() {
+            return Err("AgentPool instruction publication is already prepared".to_string());
+        }
+        for pooled in self.agents.values() {
+            let snapshot = candidate.clone();
+            pooled
+                .handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        crate::unified_memory::apply_instruction_projection_snapshot(
+                            agent, &snapshot,
+                        )
+                        .await;
+                    })
+                })
+                .await;
+        }
+        self.candidate = Some(candidate);
+        Ok(())
+    }
+
+    pub(crate) async fn commit(mut self) -> Result<(), String> {
+        let candidate = self.candidate.take().ok_or_else(|| {
+            "AgentPool instruction publication cannot commit before preparation".to_string()
+        })?;
+        tracing::info!(
+            revision = candidate.revision(),
+            pooled_agents = self.agents.len(),
+            "AgentPool: instruction projection generation committed"
+        );
+        *self.pool.instruction_projection.write().await = Some(candidate);
+        Ok(())
+    }
+}
+
 impl AgentPoolWorkspaceTransition<'_> {
     pub(crate) async fn commit(&mut self) {
         if self.committed {
@@ -481,6 +653,33 @@ impl AgentPoolWorkspaceTransition<'_> {
             agents_cleared = count,
             "AgentPool: cleared for workspace transition"
         );
+    }
+
+    pub(crate) async fn publish_instruction_snapshot(
+        &self,
+        expected_pool: &Arc<AgentPool>,
+        snapshot: crate::unified_memory::InstructionProjectionSnapshot,
+    ) -> Result<(), String> {
+        if !std::ptr::eq(self.pool, expected_pool.as_ref()) {
+            return Err("instruction snapshot targets a different AgentPool".to_string());
+        }
+        if !self.committed {
+            return Err(
+                "instruction snapshot cannot publish before the pool transition commits"
+                    .to_string(),
+            );
+        }
+        if !self.pool.agents.read().await.is_empty() {
+            return Err(
+                "instruction snapshot cannot publish while retired pool agents remain".to_string(),
+            );
+        }
+        tracing::info!(
+            revision = snapshot.revision(),
+            "AgentPool: workspace instruction projection generation committed"
+        );
+        *self.pool.instruction_projection.write().await = Some(snapshot);
+        Ok(())
     }
 }
 
@@ -513,7 +712,7 @@ impl AgentPool {
         runtime: &crate::runtime::AgentRuntime,
         config: PoolConfig,
         task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
-    ) -> Self {
+    ) -> anyhow::Result<Arc<Self>> {
         let shared = SharedResources::extract_from(
             &runtime.agent_handle,
             runtime.review_integration.clone(),
@@ -532,7 +731,7 @@ impl AgentPool {
             .unwrap_or_else(|| crate::infra::tool_output_artifact_config(None));
         let working_dir = runtime.agent_handle.read(|agent| agent.working_dir()).await;
 
-        let pool = Self {
+        let pool = Arc::new(Self {
             shared,
             agents: RwLock::new(HashMap::new()),
             workspace_transitioning: AtomicBool::new(false),
@@ -542,14 +741,30 @@ impl AgentPool {
             app_config: RwLock::new(runtime.session_app_config.clone()),
             working_dir: RwLock::new(working_dir),
             permission_mode: RwLock::new("default".to_string()),
-            skill_descriptors: RwLock::new(skill_descriptors),
+            agent_generation: RwLock::new(AgentPluginGeneration::new(
+                0,
+                skill_descriptors,
+                Vec::new(),
+            )),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
             memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
+            state_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(tool_output_artifacts),
             workspace_kind: RwLock::new(WorkspaceKind::General),
-        };
+            instruction_projection: RwLock::new(None),
+        });
+
+        // Bind before creating the background agent so it and every later
+        // conversation start from PluginRuntimeService's committed catalog.
+        runtime
+            .plugin_runtime
+            .bind_agent_pool(Arc::downgrade(&pool))
+            .await?;
+        if let Some(review_integration) = runtime.review_integration.as_ref() {
+            review_integration.bind_rule_projection_pool(&pool).await?;
+        }
 
         // Pre-create background agent if enabled
         if pool.config.enable_background_agent {
@@ -565,7 +780,7 @@ impl AgentPool {
             }
         }
 
-        pool
+        Ok(pool)
     }
 
     #[cfg(test)]
@@ -626,13 +841,15 @@ impl AgentPool {
             app_config: RwLock::new(app_config),
             working_dir: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
-            skill_descriptors: RwLock::new(Vec::new()),
+            agent_generation: RwLock::new(AgentPluginGeneration::default()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
             memory_store_override: RwLock::new(None),
             conversation_store_override: RwLock::new(None),
+            state_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
+            instruction_projection: RwLock::new(None),
         }
     }
 
@@ -957,43 +1174,6 @@ impl AgentPool {
         );
     }
 
-    /// Refresh available file-based skill descriptors for future and existing
-    /// pooled agents after the primary agent discovers or loads skills.
-    pub async fn refresh_skill_descriptors(
-        &self,
-        descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
-    ) {
-        *self.skill_descriptors.write().await = descriptors.clone();
-
-        let agents: Vec<AgentHandle> = self
-            .agents
-            .read()
-            .await
-            .values()
-            .map(|pa| pa.handle.clone())
-            .collect();
-        let descriptor_count = descriptors.len();
-        for handle in agents {
-            let descriptors = descriptors.clone();
-            handle
-                .write_async(|agent| {
-                    Box::pin(async move {
-                        for desc in descriptors {
-                            agent.skill_registry_mut().register_descriptor(desc);
-                        }
-                    })
-                })
-                .await;
-        }
-
-        let pooled_agents = self.agents.read().await.len();
-        tracing::info!(
-            descriptor_count,
-            pooled_agents,
-            "AgentPool: skill descriptors refreshed"
-        );
-    }
-
     /// Propagate `working_dir` to all pooled agents.
     ///
     /// Called after a workspace switch so that background tasks and
@@ -1068,6 +1248,22 @@ impl AgentPool {
             handle
                 .write(|agent| agent.set_conversation_store(store))
                 .await;
+        }
+    }
+
+    /// Rebind existing and future pooled agents to the active checkpoint store.
+    pub async fn apply_state_store(&self, store: Arc<dyn echo_agent::state::RuntimeStateStore>) {
+        *self.state_store_override.write().await = Some(store.clone());
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect();
+        for handle in agents {
+            let store = store.clone();
+            handle.write(|agent| agent.set_state_store(store)).await;
         }
     }
 
@@ -1175,32 +1371,6 @@ impl AgentPool {
             pooled_agents,
             "AgentPool: memory store applied"
         );
-    }
-
-    /// Refresh the AGENTS/instructions projection on every existing agent.
-    pub async fn refresh_instruction_context(&self) {
-        let root = self.working_dir.read().await.clone();
-        let agents: Vec<AgentHandle> = self
-            .agents
-            .read()
-            .await
-            .values()
-            .map(|pooled| pooled.handle.clone())
-            .collect();
-        for handle in agents {
-            let root = root.clone();
-            handle
-                .write_async(|agent| {
-                    Box::pin(async move {
-                        crate::unified_memory::refresh_instruction_projection(
-                            agent,
-                            root.as_deref(),
-                        )
-                        .await;
-                    })
-                })
-                .await;
-        }
     }
 
     /// Refresh the independently-owned MEMORY.md projection for every pooled agent.
@@ -1415,9 +1585,59 @@ impl AgentPool {
         self.preflight_workspace_transition().await
     }
 
+    pub(crate) async fn begin_plugin_publication(
+        &self,
+    ) -> Result<PreparedAgentPoolPluginPublication<'_>, String> {
+        let transition = self
+            .preflight_workspace_transition()
+            .await
+            .map_err(|error| error.to_string())?;
+        let agents = self.agents.write().await;
+        let previous = self.agent_generation.read().await.clone();
+        Ok(PreparedAgentPoolPluginPublication {
+            pool: self,
+            _transition: transition,
+            agents,
+            previous,
+            candidate: None,
+        })
+    }
+
+    /// Close pool execution/creation admission and retain the agents write
+    /// guard until one instruction snapshot is committed.
+    pub(crate) async fn begin_instruction_publication(
+        &self,
+    ) -> Result<PreparedAgentPoolInstructionPublication<'_>, String> {
+        let transition = self
+            .preflight_model_mutation()
+            .await
+            .map_err(|error| error.to_string())?;
+        let agents = self.agents.write().await;
+        Ok(PreparedAgentPoolInstructionPublication {
+            pool: self,
+            _transition: transition,
+            agents,
+            candidate: None,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn transition_admission_closed_for_test(&self) -> bool {
         self.workspace_transitioning.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn plugin_generation_revision_for_test(&self) -> u64 {
+        self.agent_generation.read().await.revision
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn instruction_projection_revision_for_test(&self) -> Option<String> {
+        self.instruction_projection
+            .read()
+            .await
+            .as_ref()
+            .map(|snapshot| snapshot.revision().to_string())
     }
 
     /// Internal: create a new agent with shared resources injected.
@@ -1436,6 +1656,12 @@ impl AgentPool {
         //    see None and the runtime checkpoint loop silently no-op'd.)
         let app_config = self.app_config.read().await.clone();
         let working_dir = self.working_dir.read().await.clone();
+        let state_store = self
+            .state_store_override
+            .read()
+            .await
+            .clone()
+            .or_else(|| self.shared.state_store.clone());
         let params = infra::AgentCreateParams {
             model: None, // will use app_config default
             system_prompt: None,
@@ -1443,7 +1669,7 @@ impl AgentPool {
             session_id: Some(conversation_id.to_string()),
             conversation_id: Some(conversation_id.to_string()),
             react_checkpoint_interval: None,
-            state_store: self.shared.state_store.clone(),
+            state_store,
             memory_context_suffix: None,
             working_dir,
             // Thread the TaskRuntimeStore so pooled agents get task-management
@@ -1522,11 +1748,19 @@ impl AgentPool {
         let permission_mode = self.permission_mode.read().await.clone();
         agent.set_permission_mode(&permission_mode);
 
-        // 3. Register skill descriptors extracted from primary agent
-        //    (avoids re-reading SKILL.md files from disk for each pool agent)
-        let skill_descriptors = self.skill_descriptors.read().await.clone();
-        for desc in &skill_descriptors {
+        // 3. Install the exact plugin generation committed by PluginRuntime.
+        let agent_generation = self.agent_generation.read().await.clone();
+        for desc in &agent_generation.skill_descriptors {
             agent.skill_registry_mut().register_descriptor(desc.clone());
+        }
+        register_plugin_agents(&mut agent, &agent_generation.plugin_agents)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        crate::runtime::configure_intent_router(&mut agent);
+
+        if let Some(snapshot) = self.instruction_projection.read().await.clone() {
+            crate::unified_memory::apply_instruction_projection_snapshot(&mut agent, &snapshot)
+                .await;
         }
 
         let workspace_kind = self.workspace_kind.read().await.clone();
@@ -1570,6 +1804,61 @@ impl AgentPool {
             model_consumers,
             conversation_id.to_string(),
         ))
+    }
+}
+
+async fn replace_agent_plugin_generation(
+    handle: &AgentHandle,
+    previous: &AgentPluginGeneration,
+    candidate: &AgentPluginGeneration,
+) -> Result<(), String> {
+    let previous = previous.clone();
+    let candidate = candidate.clone();
+    handle
+        .write_async(|agent| {
+            Box::pin(async move {
+                remove_agent_plugin_generation(agent, &previous).await;
+                for descriptor in &candidate.skill_descriptors {
+                    agent
+                        .skill_registry_mut()
+                        .register_descriptor(descriptor.clone());
+                }
+                if let Err(error) = register_plugin_agents(agent, &candidate.plugin_agents).await {
+                    remove_agent_plugin_generation(agent, &candidate).await;
+                    for descriptor in &previous.skill_descriptors {
+                        agent
+                            .skill_registry_mut()
+                            .register_descriptor(descriptor.clone());
+                    }
+                    let restore_error = register_plugin_agents(agent, &previous.plugin_agents)
+                        .await
+                        .err();
+                    crate::runtime::configure_intent_router(agent);
+                    return Err(match restore_error {
+                        Some(restore_error) => {
+                            format!("{error}; previous generation restore failed: {restore_error}")
+                        }
+                        None => error,
+                    });
+                }
+                crate::runtime::configure_intent_router(agent);
+                Ok(())
+            })
+        })
+        .await
+}
+
+async fn remove_agent_plugin_generation(
+    agent: &mut echo_agent::agent::react::ReactAgent,
+    generation: &AgentPluginGeneration,
+) {
+    for plugin_agent in &generation.plugin_agents {
+        let _ = agent.unregister_subagent(plugin_agent.name()).await;
+    }
+    for descriptor in &generation.skill_descriptors {
+        agent
+            .skill_registry_mut()
+            .remove_descriptor(&descriptor.name);
     }
 }
 
@@ -2021,6 +2310,41 @@ mod tests {
             store.clone(),
         ));
         Ok(AgentPool::new_for_test(handle, Some(review_integration), Some(store), 3, false).await)
+    }
+
+    #[tokio::test]
+    async fn runtime_state_store_rebind_reaches_existing_and_future_agents() -> TestResult {
+        let pool = create_test_pool(4, false).await?;
+        let existing_lease = pool
+            .acquire("existing-state-binding")
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing = existing_lease.agent();
+        drop(existing_lease);
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store: Arc<dyn echo_agent::state::RuntimeStateStore> = Arc::new(
+            echo_agent::state::FileRuntimeStateStore::new(temp.path())
+                .map_err(|error| error.to_string())?,
+        );
+
+        pool.apply_state_store(store.clone()).await;
+        let existing_store = existing
+            .read(|agent| agent.state_store().clone())
+            .await
+            .ok_or_else(|| "existing agent has no runtime state store".to_string())?;
+        assert!(Arc::ptr_eq(&existing_store, &store));
+
+        let future_lease = pool
+            .acquire("future-state-binding")
+            .await
+            .map_err(|error| error.to_string())?;
+        let future_store = future_lease
+            .agent()
+            .read(|agent| agent.state_store().clone())
+            .await
+            .ok_or_else(|| "future agent has no runtime state store".to_string())?;
+        assert!(Arc::ptr_eq(&future_store, &store));
+        Ok(())
     }
 
     #[tokio::test]

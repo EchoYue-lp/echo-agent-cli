@@ -11,15 +11,16 @@ pub mod commands;
 pub mod completion;
 pub mod editor;
 pub mod git_ops;
+pub mod jsonl;
 pub mod keybindings;
 pub mod modes;
 pub mod repl;
 
 pub use args::Args;
 #[cfg(feature = "channels")]
-pub use modes::run_channels_mode;
+pub use modes::{ChannelsModeArgs, run_channels_mode};
 pub use modes::{
     CompanionModeShutdown, HeadlessDreamingOwner, HeadlessServiceResources, HeadlessServices,
-    run_cli_mode, shutdown_headless_services, start_headless_services,
+    run_cli_mode, run_jsonl_mode, shutdown_headless_services, start_headless_services,
 };
 pub use repl::{ReplConfig, ReplHumanLoopSession, run_repl};

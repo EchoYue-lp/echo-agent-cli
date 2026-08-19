@@ -294,50 +294,64 @@ cmd!(
 
 // ── CompressCommand ───────────────────────────────────────────────────
 
-async fn cmd_compress(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn run_manual_compression(
+    ctx: &CommandContext,
+    args: &[&str],
+    keep_messages: usize,
+    label: &str,
+) -> CommandOutcome {
+    let (Some(app_state), Some(conversation_id)) =
+        (ctx.app_state.as_ref(), ctx.conversation_id.as_ref())
+    else {
+        println!("Manual compression requires an active persisted conversation.");
+        return CommandOutcome::Continue;
+    };
     let focus = if args.is_empty() {
         None
     } else {
         Some(args.join(" "))
     };
-    ctx.agent
-        .read_async(|a| {
-            Box::pin(async move {
-                let result = if let Some(ref focus_instructions) = focus {
-                    a.force_compress_with_focus_and_hooks(focus_instructions, 6, "manual")
-                        .await
-                } else {
-                    // Respect the agent's installed compression strategy (e.g.
-                    // Adaptive) instead of forcing a fresh SlidingWindow.
-                    a.force_compress_context().await
-                };
-                match result {
-                    Ok((s, checkpoint)) => {
-                        println!(
-                            "Compressed: {} -> {} msgs ({} tokens -> {})",
-                            s.before_count, s.after_count, s.before_tokens, s.after_tokens
-                        );
-                        if let Some(ref cp) = checkpoint {
-                            println!(
-                                "  Checkpoint: {} | Strategy: {} | Evicted: {} | Protected: {} | Tool fixes: {} | Duration: {}ms",
-                                cp.checkpoint_id,
-                                cp.strategy,
-                                cp.evicted_count,
-                                cp.protected_count,
-                                cp.tool_pair_fixes.len(),
-                                cp.compression_duration_ms
-                            );
-                            if let Some(ref f) = cp.focus_instructions {
-                                println!("  Focus: {}", f);
-                            }
-                        }
-                    }
-                    Err(e) => println!("Compression failed: {e}"),
+    match app_state
+        .compress_conversation_owned(
+            echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                conversation_id: conversation_id.clone(),
+                surface: echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                focus,
+                keep_messages,
+            },
+        )
+        .await
+    {
+        Ok(receipt) => {
+            println!(
+                "{label}: {} -> {} msgs ({} tokens -> {})",
+                receipt.messages_before,
+                receipt.messages_after,
+                receipt.tokens_before,
+                receipt.tokens_after
+            );
+            if let Some(checkpoint) = receipt.checkpoint {
+                println!(
+                    "  Checkpoint: {} | Strategy: {} | Evicted: {} | Protected: {} | Tool fixes: {} | Duration: {}ms",
+                    checkpoint.checkpoint_id,
+                    checkpoint.strategy,
+                    checkpoint.evicted_count,
+                    checkpoint.protected_count,
+                    checkpoint.tool_pair_fixes.len(),
+                    checkpoint.compression_duration_ms
+                );
+                if let Some(focus) = checkpoint.focus_instructions {
+                    println!("  Focus: {focus}");
                 }
-            })
-        })
-        .await;
+            }
+        }
+        Err(error) => println!("{label} failed: {error}"),
+    }
     CommandOutcome::Continue
+}
+
+async fn cmd_compress(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    run_manual_compression(ctx, args, 6, "Compressed").await
 }
 // NOTE: No /cp alias — /cp belongs to /compact only
 cmd!(
@@ -351,49 +365,7 @@ cmd!(
 // ── CompactCommand ────────────────────────────────────────────────────
 
 async fn cmd_compact(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let focus = if args.is_empty() {
-        None
-    } else {
-        Some(args.join(" "))
-    };
-    ctx.agent
-        .read_async(|a| {
-            Box::pin(async move {
-                let result = if let Some(ref focus_instructions) = focus {
-                    a.force_compress_with_focus_and_hooks(focus_instructions, 12, "manual")
-                        .await
-                } else {
-                    // Respect the agent's installed compression strategy (e.g.
-                    // Adaptive) instead of forcing a fresh SlidingWindow.
-                    a.force_compress_context().await
-                };
-                match result {
-                    Ok((s, checkpoint)) => {
-                        println!(
-                            "Compact: {}->{} msgs ({} tokens -> {})",
-                            s.before_count, s.after_count, s.before_tokens, s.after_tokens
-                        );
-                        if let Some(ref cp) = checkpoint {
-                            println!(
-                                "  Checkpoint: {} | Strategy: {} | Evicted: {} | Protected: {} | Tool fixes: {} | Duration: {}ms",
-                                cp.checkpoint_id,
-                                cp.strategy,
-                                cp.evicted_count,
-                                cp.protected_count,
-                                cp.tool_pair_fixes.len(),
-                                cp.compression_duration_ms
-                            );
-                            if let Some(ref f) = cp.focus_instructions {
-                                println!("  Focus: {}", f);
-                            }
-                        }
-                    }
-                    Err(e) => println!("Compaction failed: {e}"),
-                }
-            })
-        })
-        .await;
-    CommandOutcome::Continue
+    run_manual_compression(ctx, args, 12, "Compact").await
 }
 cmd!(
     CompactCommand,

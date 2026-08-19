@@ -5,13 +5,10 @@ use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use super::terminal::TerminalManager;
-
 /// Shared state accessible from all Tauri IPC commands.
 pub struct TauriState {
     pub app_state: Arc<AppState>,
     pub browser_runtime: Arc<BrowserRuntime>,
-    pub terminal_manager: Arc<TerminalManager>,
     pub bridge_supervisor: Arc<TauriBridgeSupervisor>,
 }
 
@@ -19,13 +16,11 @@ impl TauriState {
     pub fn new(
         app_state: Arc<AppState>,
         browser_runtime: Arc<BrowserRuntime>,
-        terminal_manager: Arc<TerminalManager>,
         bridge_supervisor: Arc<TauriBridgeSupervisor>,
     ) -> Self {
         Self {
             app_state,
             browser_runtime,
-            terminal_manager,
             bridge_supervisor,
         }
     }

@@ -101,6 +101,64 @@ cmd!(
     cmd_status
 );
 
+// ── SessionsCommand ─────────────────────────────────────────────────
+
+async fn cmd_sessions(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let Some(app_state) = ctx.app_state.as_ref() else {
+        println!("Conversation persistence is unavailable in this runtime.");
+        return CommandOutcome::Continue;
+    };
+    let store = app_state.conversation_store().await;
+    let Some(store) = store else {
+        println!("Conversation persistence is unavailable in this runtime.");
+        return CommandOutcome::Continue;
+    };
+    let query = args.join(" ");
+    let result = if query.trim().is_empty() {
+        store
+            .list_conversations(echo_agent::memory::ConversationFilter {
+                limit: Some(30),
+                ..Default::default()
+            })
+            .await
+    } else {
+        store.search_conversations(query.trim(), 30).await
+    };
+    match result {
+        Ok(items) if items.is_empty() => println!("No persisted conversations."),
+        Ok(items) => {
+            println!("\n--- Conversations ---");
+            for item in items {
+                let marker =
+                    if ctx.conversation_id.as_deref() == Some(item.conversation_id.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                let title = item
+                    .title
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("Untitled");
+                println!(
+                    "{marker} {}  {:>4} messages  {title}",
+                    item.conversation_id, item.message_count
+                );
+            }
+        }
+        Err(error) => println!("Failed to list conversations: {error}"),
+    }
+    CommandOutcome::Continue
+}
+cmd!(
+    SessionsCommand,
+    "sessions",
+    ["ss"],
+    CommandCategory::Sessions,
+    "List or search persisted conversations",
+    cmd_sessions
+);
+
 // ── NewCommand ───────────────────────────────────────────────────────
 
 async fn cmd_new(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
@@ -161,6 +219,7 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(HistoryCommand));
     registry.register(Arc::new(StatsCommand));
     registry.register(Arc::new(StatusCommand));
+    registry.register(Arc::new(SessionsCommand));
     registry.register(Arc::new(NewCommand));
     registry.register(Arc::new(UndoCommand));
 }

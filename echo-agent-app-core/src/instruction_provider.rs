@@ -81,6 +81,53 @@ impl InstructionProvider {
         }
     }
 
+    /// Load the complete instruction projection without silently dropping an
+    /// existing but unreadable source.
+    ///
+    /// Promotion and workspace-rebind transactions use this path before
+    /// publishing a runtime generation. Missing optional files are valid;
+    /// symlinks, non-regular entries, invalid UTF-8, and read failures are not.
+    pub(crate) fn load_for_strict(working_dir: Option<&Path>) -> std::io::Result<Self> {
+        let project_root = working_dir.map(|path| {
+            crate::utils::find_project_root(path).unwrap_or_else(|| path.to_path_buf())
+        });
+        let project_level = strict_optional_text(
+            project_root
+                .as_deref()
+                .map(|root| root.join(".eko").join("project.md"))
+                .as_deref(),
+        )?;
+        let user_path = echo_agent::paths::user_data_path("user.md");
+        let user_level = strict_optional_text(Some(&user_path))?;
+        let repository_level =
+            strict_repository_instructions(working_dir, project_root.as_deref())?;
+        let local_level = strict_optional_text(
+            working_dir
+                .map(|root| root.join(".eko").join("local.md"))
+                .as_deref(),
+        )?;
+        let agents_level = strict_learned_rules(project_root.as_deref())?
+            .map(|raw| crate::utils::strip_yaml_frontmatter(&raw));
+        let project_memory = project_root
+            .as_deref()
+            .map(|root| root.join(".eko").join("MEMORY.md"));
+        let global_memory = echo_agent::paths::user_data_path("MEMORY.md");
+        let hot_memory = match project_memory.as_deref() {
+            Some(path) if path.try_exists()? => strict_optional_text(Some(path))?,
+            _ => strict_optional_text(Some(&global_memory))?,
+        }
+        .map(|raw| crate::utils::strip_yaml_frontmatter(&raw));
+
+        Ok(Self {
+            project_level,
+            user_level,
+            repository_level,
+            local_level,
+            agents_level,
+            hot_memory,
+        })
+    }
+
     /// One-time migration: rename `<root>/.eko/AGENTS.md` → `<root>/.eko/learned-rules.md`.
     ///
     /// Skipped when: no project root, legacy file absent, or new file already
@@ -308,6 +355,84 @@ impl InstructionProvider {
     }
 }
 
+fn strict_optional_text(path: Option<&Path>) -> std::io::Result<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "instruction source {} must be a regular non-symlink file",
+                path.display()
+            ),
+        ));
+    }
+    std::fs::read_to_string(path).map(Some)
+}
+
+fn strict_learned_rules(project_root: Option<&Path>) -> std::io::Result<Option<String>> {
+    let Some(root) = project_root else {
+        return Ok(None);
+    };
+    let eko_dir = root.join(".eko");
+    let current = eko_dir.join(LEARNED_RULES_FILE);
+    if current.try_exists()? {
+        return strict_optional_text(Some(&current));
+    }
+    strict_optional_text(Some(&eko_dir.join(LEGACY_AGENTS_FILE)))
+}
+
+fn strict_repository_instructions(
+    working_dir: Option<&Path>,
+    project_root: Option<&Path>,
+) -> std::io::Result<Option<String>> {
+    let Some(working_dir) = working_dir else {
+        return Ok(None);
+    };
+    let scan_root = project_root.unwrap_or(working_dir);
+    if !working_dir.starts_with(scan_root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "instruction working directory {} escapes project root {}",
+                working_dir.display(),
+                scan_root.display()
+            ),
+        ));
+    }
+    let mut directories = working_dir
+        .ancestors()
+        .take_while(|directory| directory.starts_with(scan_root))
+        .map(Path::to_path_buf)
+        .collect::<Vec<_>>();
+    directories.reverse();
+    let mut blocks = Vec::new();
+    for directory in directories {
+        for name in ["AGENTS.override.md", "AGENTS.md"] {
+            let path = directory.join(name);
+            let Some(content) = strict_optional_text(Some(&path))? else {
+                continue;
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            blocks.push(format!(
+                "<!-- PROJECT INSTRUCTIONS: {} -->\n{}\n<!-- END PROJECT INSTRUCTIONS -->",
+                path.display(),
+                content.trim()
+            ));
+            break;
+        }
+    }
+    Ok((!blocks.is_empty()).then(|| blocks.join("\n\n")))
+}
+
 impl Default for InstructionProvider {
     fn default() -> Self {
         Self::load()
@@ -333,108 +458,142 @@ mod tests {
     }
 
     #[test]
-    fn migrate_legacy_agents_file_renames_when_new_absent() {
-        let temp = tempfile::tempdir().unwrap();
+    fn migrate_legacy_agents_file_renames_when_new_absent() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path();
         let eko = root.join(".eko");
-        std::fs::create_dir_all(&eko).unwrap();
-        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "# legacy rules\n").unwrap();
+        std::fs::create_dir_all(&eko)?;
+        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "# legacy rules\n")?;
 
         InstructionProvider::migrate_legacy_agents_file(Some(root));
 
         assert!(!eko.join(LEGACY_AGENTS_FILE).exists());
         assert!(eko.join(LEARNED_RULES_FILE).exists());
         assert_eq!(
-            std::fs::read_to_string(eko.join(LEARNED_RULES_FILE)).unwrap(),
+            std::fs::read_to_string(eko.join(LEARNED_RULES_FILE))?,
             "# legacy rules\n"
         );
+        Ok(())
     }
 
     #[test]
-    fn migrate_legacy_agents_file_skips_when_new_exists() {
+    fn migrate_legacy_agents_file_skips_when_new_exists() -> std::io::Result<()> {
         // If the user already created learned-rules.md, the legacy file is left
         // in place rather than clobbering their content.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let root = temp.path();
         let eko = root.join(".eko");
-        std::fs::create_dir_all(&eko).unwrap();
-        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "legacy").unwrap();
-        std::fs::write(eko.join(LEARNED_RULES_FILE), "new").unwrap();
+        std::fs::create_dir_all(&eko)?;
+        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "legacy")?;
+        std::fs::write(eko.join(LEARNED_RULES_FILE), "new")?;
 
         InstructionProvider::migrate_legacy_agents_file(Some(root));
 
         assert_eq!(
-            std::fs::read_to_string(eko.join(LEARNED_RULES_FILE)).unwrap(),
+            std::fs::read_to_string(eko.join(LEARNED_RULES_FILE))?,
             "new"
         );
         assert!(eko.join(LEGACY_AGENTS_FILE).exists());
+        Ok(())
     }
 
     #[test]
-    fn migrate_legacy_agents_file_noop_without_legacy() {
-        let temp = tempfile::tempdir().unwrap();
+    fn migrate_legacy_agents_file_noop_without_legacy() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path();
-        std::fs::create_dir_all(root.join(".eko")).unwrap();
+        std::fs::create_dir_all(root.join(".eko"))?;
         // No legacy file, no new file — must not create anything.
         InstructionProvider::migrate_legacy_agents_file(Some(root));
         assert!(!root.join(".eko").join(LEARNED_RULES_FILE).exists());
+        Ok(())
     }
 
     #[test]
-    fn load_agents_instructions_reads_new_name() {
-        let temp = tempfile::tempdir().unwrap();
+    fn load_agents_instructions_reads_new_name() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path();
         let eko = root.join(".eko");
-        std::fs::create_dir_all(&eko).unwrap();
-        std::fs::write(eko.join(LEARNED_RULES_FILE), "RULE_BODY").unwrap();
+        std::fs::create_dir_all(&eko)?;
+        std::fs::write(eko.join(LEARNED_RULES_FILE), "RULE_BODY")?;
 
         let provider = InstructionProvider::load_for(Some(root));
         assert_eq!(provider.agents_level.as_deref(), Some("RULE_BODY"));
+        Ok(())
     }
 
     #[test]
-    fn load_agents_instructions_falls_back_to_legacy() {
+    fn load_agents_instructions_falls_back_to_legacy() -> std::io::Result<()> {
         // When migration failed or was skipped, the legacy file is still readable.
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir()?;
         let root = temp.path();
         let eko = root.join(".eko");
-        std::fs::create_dir_all(&eko).unwrap();
+        std::fs::create_dir_all(&eko)?;
         // Write BOTH (simulating user manually keeping legacy); new name wins.
-        std::fs::write(eko.join(LEARNED_RULES_FILE), "NEW").unwrap();
-        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "LEGACY").unwrap();
+        std::fs::write(eko.join(LEARNED_RULES_FILE), "NEW")?;
+        std::fs::write(eko.join(LEGACY_AGENTS_FILE), "LEGACY")?;
         let provider = InstructionProvider::load_for(Some(root));
         assert_eq!(provider.agents_level.as_deref(), Some("NEW"));
+        Ok(())
     }
 
     #[test]
-    fn loads_agents_chain_without_echo_agent_namespace() {
-        let temp = tempfile::tempdir().unwrap();
+    fn loads_agents_chain_without_echo_agent_namespace() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("repo");
         let child = root.join("src");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(root.join(".echo-agent")).unwrap();
-        std::fs::create_dir_all(&child).unwrap();
-        std::fs::write(root.join("AGENTS.md"), "ROOT_RULE").unwrap();
-        std::fs::write(child.join("AGENTS.override.md"), "CHILD_RULE").unwrap();
-        std::fs::write(root.join(".echo-agent/AGENT.md"), "NOT_EKO_PROTOCOL").unwrap();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join(".echo-agent"))?;
+        std::fs::create_dir_all(&child)?;
+        std::fs::write(root.join("AGENTS.md"), "ROOT_RULE")?;
+        std::fs::write(child.join("AGENTS.override.md"), "CHILD_RULE")?;
+        std::fs::write(root.join(".echo-agent/AGENT.md"), "NOT_EKO_PROTOCOL")?;
 
         let provider = InstructionProvider::load_for(Some(&child));
         let repository = provider.repository_level.unwrap_or_default();
         assert!(repository.contains("ROOT_RULE"));
         assert!(repository.contains("CHILD_RULE"));
         assert!(!repository.contains("NOT_EKO_PROTOCOL"));
+        Ok(())
     }
 
     #[test]
-    fn local_instructions_are_relative_to_working_directory() {
-        let temp = tempfile::tempdir().unwrap();
+    fn local_instructions_are_relative_to_working_directory() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
         let root = temp.path().join("repo");
         let child = root.join("src");
-        std::fs::create_dir_all(root.join(".git")).unwrap();
-        std::fs::create_dir_all(child.join(".eko")).unwrap();
-        std::fs::write(child.join(".eko/local.md"), "LOCAL_CHILD_RULE").unwrap();
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(child.join(".eko"))?;
+        std::fs::write(child.join(".eko/local.md"), "LOCAL_CHILD_RULE")?;
 
         let provider = InstructionProvider::load_for(Some(&child));
         assert_eq!(provider.local_level.as_deref(), Some("LOCAL_CHILD_RULE"));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_loader_rejects_invalid_utf8_in_learned_rules() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join(".eko"))?;
+        std::fs::write(root.join(".eko/learned-rules.md"), [0xff, 0xfe])?;
+
+        assert!(InstructionProvider::load_for_strict(Some(&root)).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_loader_rejects_symlinked_instruction_source() -> std::io::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join(".git"))?;
+        std::fs::create_dir_all(root.join(".eko"))?;
+        let outside = temp.path().join("outside.md");
+        std::fs::write(&outside, "outside")?;
+        std::os::unix::fs::symlink(&outside, root.join(".eko/learned-rules.md"))?;
+
+        assert!(InstructionProvider::load_for_strict(Some(&root)).is_err());
+        Ok(())
     }
 }

@@ -93,20 +93,23 @@ cargo run --bin echo-agent-tauri
 # 单次对话（run 子命令）
 echo-agent-cli run "解释这段代码"
 
-# Headless 模式（适合 CI/CD，非交互式执行）
-echo-agent-cli --headless "写一个快速排序并测试"
+# 非交互 JSONL（stdout 每行一个 canonical chat envelope）
+echo-agent-cli --jsonl "写一个快速排序并测试"
 
 # 指定模型
-echo-agent-cli --model qwen3.7-max run "写一个快速排序"
+echo-agent-cli --model qwen3.7-max --jsonl "写一个快速排序"
 
 # 使用指定配置
-echo-agent-cli --config ./my-config.yaml run "分析这段代码"
+echo-agent-cli --config ./my-config.yaml --jsonl "分析这段代码"
 
 # 继续最近一次会话
 echo-agent-cli --continue
 
 # 恢复指定会话
 echo-agent-cli --resume <session-id>
+
+# 在原会话上执行一次非交互请求
+echo-agent-cli --resume <session-id> --jsonl "继续处理剩余任务"
 ```
 
 ## 核心功能
@@ -122,14 +125,16 @@ echo-agent-cli --resume <session-id>
 - `/status` - 显示当前状态
 - `/compact` - 压缩上下文窗口
 
-通过 CLI 子命令管理会话持久化数据：
+在 CLI REPL 中也可直接查询同一个文件化 ConversationStore：
 
 ```bash
-echo-agent-cli sessions list          # 列出所有会话
-echo-agent-cli sessions show <id>     # 查看会话详情
-echo-agent-cli sessions export <id>   # 导出会话
-echo-agent-cli sessions delete <id>   # 删除会话
+/sessions                             # 列出最近会话
+/sessions <query>                     # 搜索会话
+/checkpoint                           # 强制保存 runtime checkpoint（/save 是别名）
 ```
+
+从新进程恢复时使用 `echo-agent-cli --continue` 或
+`echo-agent-cli --resume <conversation-id>`；不存在 `sessions` 子命令。
 
 ### 2. 模式切换
 

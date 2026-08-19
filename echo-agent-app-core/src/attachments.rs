@@ -12,10 +12,12 @@
 //! 3. [`build_message`] reads each file back and builds a `Message::user_multimodal`
 //!    with `ContentPart::ImageUrl` (images) or `ContentPart::File` (documents).
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use echo_agent::llm::types::{ContentPart, ImageUrl, Message};
+use sha2::{Digest, Sha256};
 
 use crate::types::{AttachmentData, AttachmentSource};
 
@@ -39,6 +41,11 @@ pub enum AttachmentError {
         name: String,
         path: PathBuf,
         source: std::io::Error,
+    },
+    #[error("{primary}; cleanup after failed attachment staging also failed: {cleanup}")]
+    Cleanup {
+        primary: Box<AttachmentError>,
+        cleanup: String,
     },
     #[error("failed to read attachment back from {path}: {source}")]
     Read {
@@ -163,7 +170,7 @@ pub fn save_attachment(att: &AttachmentData, uploads_dir: &Path) -> Result<PathB
 
     let file_name = format!("{}_{}", uuid::Uuid::new_v4(), base);
     let path = uploads_dir.join(file_name);
-    std::fs::write(&path, &bytes).map_err(|source| AttachmentError::Write {
+    echo_core::utils::fs::atomic_write(&path, &bytes).map_err(|source| AttachmentError::Write {
         name: att.name.clone(),
         path: path.clone(),
         source,
@@ -173,22 +180,313 @@ pub fn save_attachment(att: &AttachmentData, uploads_dir: &Path) -> Result<PathB
 
 /// Persist a batch of attachments, returning `(path, attachment)` pairs.
 ///
-/// Failures are logged and skipped so a single bad attachment does not abort
-/// the whole message; the caller proceeds with whatever saved successfully.
+/// The batch is fail-closed: if one item cannot be staged, every file written
+/// by this call is removed before the error is returned.
 pub fn save_attachments<'a>(
     attachments: &'a [AttachmentData],
     uploads_dir: &Path,
-) -> Vec<(PathBuf, &'a AttachmentData)> {
+) -> Result<Vec<(PathBuf, &'a AttachmentData)>> {
     let mut saved = Vec::new();
     for att in attachments {
         match save_attachment(att, uploads_dir) {
             Ok(path) => saved.push((path, att)),
-            Err(e) => {
-                tracing::warn!(error = %e, name = %att.name, "skipping attachment");
+            Err(error) => {
+                let paths = saved
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>();
+                return match remove_paths(&paths) {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(AttachmentError::Cleanup {
+                        primary: Box::new(error),
+                        cleanup,
+                    }),
+                };
             }
         }
     }
-    saved
+    Ok(saved)
+}
+
+fn remove_paths(paths: &[PathBuf]) -> std::result::Result<(), String> {
+    let mut failures = Vec::new();
+    for path in paths.iter().rev() {
+        if let Err(error) = std::fs::remove_file(path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            failures.push(format!("{}: {error}", path.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Owns one successful flat staging batch until a prepared turn takes over.
+#[must_use]
+pub struct StagedAttachmentBatch {
+    paths: Vec<PathBuf>,
+    armed: bool,
+}
+
+impl StagedAttachmentBatch {
+    pub fn from_saved(saved: &[(PathBuf, &AttachmentData)]) -> Self {
+        Self {
+            paths: saved.iter().map(|(path, _)| path.clone()).collect(),
+            armed: true,
+        }
+    }
+
+    pub fn commit(mut self) {
+        self.armed = false;
+    }
+
+    pub fn rollback(mut self) -> std::result::Result<(), String> {
+        let result = remove_paths(&self.paths);
+        self.armed = false;
+        result
+    }
+}
+
+impl Drop for StagedAttachmentBatch {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(error) = remove_paths(&self.paths)
+        {
+            tracing::error!(%error, "failed to roll back an uncommitted attachment batch");
+        }
+    }
+}
+
+/// Remove only this module's UUID-prefixed flat staging files.
+pub fn discard_staged_attachment_refs(
+    attachments: &[AttachmentRef],
+) -> std::result::Result<(), String> {
+    let paths = attachments
+        .iter()
+        .filter_map(|attachment| match validated_staged_path(&attachment.path) {
+            Ok(path) => path.map(Ok),
+            Err(error) => Some(Err(error)),
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    remove_paths(&paths)
+}
+
+#[derive(Debug)]
+pub(crate) struct StagedAttachmentRetirementError {
+    primary: String,
+    restoration_failures: Vec<String>,
+    retained_scoped_paths: Vec<PathBuf>,
+}
+
+impl StagedAttachmentRetirementError {
+    pub(crate) fn retained_scoped_paths(&self) -> &[PathBuf] {
+        &self.retained_scoped_paths
+    }
+}
+
+impl std::fmt::Display for StagedAttachmentRetirementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.primary)?;
+        if !self.restoration_failures.is_empty() {
+            write!(
+                formatter,
+                "; restoration after failed retirement also failed: {}",
+                self.restoration_failures.join("; ")
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for StagedAttachmentRetirementError {}
+
+#[derive(Debug)]
+struct PreparedStagedRetirement {
+    staged_path: PathBuf,
+    scoped_path: PathBuf,
+}
+
+/// Retire staging files only after all scoped copies and identities validate.
+pub(crate) fn retire_staged_attachment_refs(
+    retirements: &[(&AttachmentRef, &Path, Option<&str>)],
+) -> std::result::Result<(), StagedAttachmentRetirementError> {
+    retire_staged_attachment_refs_inner(retirements, None)
+}
+
+fn retire_staged_attachment_refs_inner(
+    retirements: &[(&AttachmentRef, &Path, Option<&str>)],
+    fail_before_index: Option<usize>,
+) -> std::result::Result<(), StagedAttachmentRetirementError> {
+    let mut prepared = Vec::new();
+    for (attachment, scoped_path, expected_sha256) in retirements {
+        let Some(staged_path) =
+            validated_staged_path(&attachment.path).map_err(retirement_error)?
+        else {
+            continue;
+        };
+        validate_regular_file(scoped_path, "scoped copy").map_err(retirement_error)?;
+        let expected_sha256 = expected_sha256.ok_or_else(|| {
+            retirement_error(format!(
+                "{} has no content identity for staged retirement",
+                scoped_path.display()
+            ))
+        })?;
+        validate_identity(&staged_path, expected_sha256).map_err(retirement_error)?;
+        validate_identity(scoped_path, expected_sha256).map_err(retirement_error)?;
+        prepared.push(PreparedStagedRetirement {
+            staged_path,
+            scoped_path: scoped_path.to_path_buf(),
+        });
+    }
+
+    let mut retired = Vec::new();
+    for (index, item) in prepared.iter().enumerate() {
+        if fail_before_index == Some(index) {
+            return Err(restore_retired_staging(
+                format!(
+                    "injected staging retirement failure before {}",
+                    item.staged_path.display()
+                ),
+                &retired,
+            ));
+        }
+        if let Err(error) = std::fs::remove_file(&item.staged_path) {
+            return Err(restore_retired_staging(
+                format!("{}: {error}", item.staged_path.display()),
+                &retired,
+            ));
+        }
+        retired.push(item);
+    }
+    Ok(())
+}
+
+fn retirement_error(primary: String) -> StagedAttachmentRetirementError {
+    StagedAttachmentRetirementError {
+        primary,
+        restoration_failures: Vec::new(),
+        retained_scoped_paths: Vec::new(),
+    }
+}
+
+fn restore_retired_staging(
+    primary: String,
+    retired: &[&PreparedStagedRetirement],
+) -> StagedAttachmentRetirementError {
+    let mut restoration_failures = Vec::new();
+    let mut retained_scoped_paths = Vec::new();
+    for item in retired.iter().rev() {
+        let result = match std::fs::symlink_metadata(&item.staged_path) {
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "staging path reappeared before restoration",
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::read(&item.scoped_path)
+                    .and_then(|bytes| echo_core::utils::fs::atomic_write(&item.staged_path, &bytes))
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            restoration_failures.push(format!(
+                "{} from {}: {error}",
+                item.staged_path.display(),
+                item.scoped_path.display()
+            ));
+            retained_scoped_paths.push(item.scoped_path.clone());
+        }
+    }
+    StagedAttachmentRetirementError {
+        primary,
+        restoration_failures,
+        retained_scoped_paths,
+    }
+}
+
+fn validated_staged_path(path: &Path) -> std::result::Result<Option<PathBuf>, String> {
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let owner = parent.parent();
+    let owned_namespace = parent.file_name().and_then(|name| name.to_str()) == Some("uploads")
+        && owner
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some(".eko");
+    let owned_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.split_once('_').map(|(prefix, _)| prefix))
+        .is_some_and(|prefix| uuid::Uuid::parse_str(prefix).is_ok());
+    if !owned_namespace || !owned_name {
+        return Ok(None);
+    }
+    validate_regular_directory(parent, "uploads directory")?;
+    let Some(owner) = owner else {
+        return Ok(None);
+    };
+    validate_regular_directory(owner, ".eko directory")?;
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(Some(path.to_path_buf())),
+        Ok(_) => Err(format!("{} is not a regular staged file", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn validate_regular_directory(path: &Path, label: &str) -> std::result::Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(format!("{} is not a regular {label}", path.display())),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn validate_regular_file(path: &Path, label: &str) -> std::result::Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(format!("{} is not a regular {label}", path.display())),
+        Err(error) => Err(format!("{}: {error}", path.display())),
+    }
+}
+
+fn validate_identity(path: &Path, expected_sha256: &str) -> std::result::Result<(), String> {
+    let actual_sha256 = hash_file(path)?;
+    if actual_sha256 == expected_sha256 {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} content identity mismatch: expected sha256 {expected_sha256}, found {actual_sha256}",
+            path.display()
+        ))
+    }
+}
+
+fn hash_file(path: &Path) -> std::result::Result<String, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).ok_or_else(|| {
+            format!(
+                "{} returned invalid read length {read} for {} byte buffer",
+                path.display(),
+                buffer.len()
+            )
+        })?;
+        hasher.update(chunk);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Whether a MIME type is an image (routed to `ContentPart::ImageUrl`).
@@ -270,6 +568,10 @@ pub fn build_message_from_refs(
 mod tests {
     use super::*;
 
+    fn sha256(value: &[u8]) -> String {
+        hex::encode(Sha256::digest(value))
+    }
+
     fn att(name: &str, mime: &str, data: &str) -> AttachmentData {
         AttachmentData {
             name: name.to_string(),
@@ -281,61 +583,167 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_traversal() {
+    fn sanitize_rejects_traversal() -> std::result::Result<(), String> {
         assert!(sanitize_name("../etc/passwd").is_ok()); // keeps "passwd"
         assert!(sanitize_name("").is_err());
         assert!(sanitize_name("   ").is_err());
         assert!(sanitize_name("..").is_err());
         assert!(sanitize_name("a\0b").is_err());
         // "passwd" is the last segment of "../etc/passwd"
-        assert_eq!(sanitize_name("../etc/passwd").unwrap(), "passwd");
+        assert_eq!(
+            sanitize_name("../etc/passwd").map_err(|error| error.to_string())?,
+            "passwd"
+        );
+        Ok(())
     }
 
     #[test]
-    fn save_and_build_image_roundtrip() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn save_and_build_image_roundtrip() -> std::result::Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let png_b64 = base64::engine::general_purpose::STANDARD.encode(b"fake-png");
         let attachments = [att("photo.png", "image/png", &png_b64)];
-        let saved = save_attachments(&attachments, tmp.path());
+        let saved =
+            save_attachments(&attachments, tmp.path()).map_err(|error| error.to_string())?;
         assert_eq!(saved.len(), 1);
         let refs: Vec<_> = saved
             .iter()
             .map(|(p, a)| AttachmentRef::from_saved(p.clone(), a))
             .collect();
-        let msg = build_message_from_refs("look", &refs).unwrap();
+        let msg = build_message_from_refs("look", &refs).map_err(|error| error.to_string())?;
         // Multimodal message: 1 text + 1 image part.
-        match &msg.content {
-            echo_core::llm::types::MessageContent::Parts(parts) => {
-                assert_eq!(parts.len(), 2);
-                assert!(matches!(parts[1], ContentPart::ImageUrl { .. }));
-            }
-            other => panic!("expected Parts, got {other:?}"),
-        }
+        let echo_core::llm::types::MessageContent::Parts(parts) = &msg.content else {
+            return Err(format!("expected Parts, got {:?}", msg.content));
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(parts.get(1), Some(ContentPart::ImageUrl { .. })));
+        Ok(())
     }
 
     #[test]
-    fn save_and_build_text_file() {
-        let tmp = tempfile::tempdir().unwrap();
+    fn save_and_build_text_file() -> std::result::Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let b64 = base64::engine::general_purpose::STANDARD.encode(b"hello world");
         let attachments = [att("notes.txt", "text/plain", &b64)];
-        let saved = save_attachments(&attachments, tmp.path());
+        let saved =
+            save_attachments(&attachments, tmp.path()).map_err(|error| error.to_string())?;
         let refs: Vec<_> = saved
             .iter()
             .map(|(p, a)| AttachmentRef::from_saved(p.clone(), a))
             .collect();
-        let msg = build_message_from_refs("see notes", &refs).unwrap();
-        match &msg.content {
-            echo_core::llm::types::MessageContent::Parts(parts) => {
-                assert_eq!(parts.len(), 2);
-                assert!(matches!(parts[1], ContentPart::File { .. }));
-            }
-            other => panic!("expected Parts, got {other:?}"),
-        }
+        let msg = build_message_from_refs("see notes", &refs).map_err(|error| error.to_string())?;
+        let echo_core::llm::types::MessageContent::Parts(parts) = &msg.content else {
+            return Err(format!("expected Parts, got {:?}", msg.content));
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(parts.get(1), Some(ContentPart::File { .. })));
+        Ok(())
     }
 
     #[test]
-    fn build_message_no_attachments_is_text() {
-        let msg = build_message_from_refs("plain", &[]).unwrap();
+    fn build_message_no_attachments_is_text() -> std::result::Result<(), String> {
+        let msg = build_message_from_refs("plain", &[]).map_err(|error| error.to_string())?;
         assert_eq!(msg.content.as_text(), Some("plain".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_batch_failure_removes_every_staged_file() -> std::result::Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let valid = base64::engine::general_purpose::STANDARD.encode(b"first");
+        let attachments = [
+            att("first.txt", "text/plain", &valid),
+            att("broken.txt", "text/plain", "not-base64%%%"),
+        ];
+        assert!(save_attachments(&attachments, tmp.path()).is_err());
+        assert_eq!(
+            std::fs::read_dir(tmp.path())
+                .map_err(|error| error.to_string())?
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_retirement_restores_prior_items_and_can_retry() -> std::result::Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let uploads = temporary.path().join(".eko/uploads");
+        let scoped = temporary
+            .path()
+            .join(".eko/artifacts/user-input/conversation/turn");
+        std::fs::create_dir_all(&uploads).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&scoped).map_err(|error| error.to_string())?;
+        let first_staged = uploads.join(format!("{}_first.txt", uuid::Uuid::new_v4()));
+        let second_staged = uploads.join(format!("{}_second.txt", uuid::Uuid::new_v4()));
+        let first_scoped = scoped.join("first.txt");
+        let second_scoped = scoped.join("second.txt");
+        std::fs::write(&first_staged, "first").map_err(|error| error.to_string())?;
+        std::fs::write(&second_staged, "second").map_err(|error| error.to_string())?;
+        std::fs::write(&first_scoped, "first").map_err(|error| error.to_string())?;
+        std::fs::write(&second_scoped, "second").map_err(|error| error.to_string())?;
+        let first = AttachmentRef {
+            path: first_staged.clone(),
+            name: "first.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            source: AttachmentSource::Upload,
+        };
+        let second = AttachmentRef {
+            path: second_staged.clone(),
+            name: "second.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            source: AttachmentSource::Upload,
+        };
+        let first_hash = sha256(b"first");
+        let second_hash = sha256(b"second");
+        let retirements = [
+            (&first, first_scoped.as_path(), Some(first_hash.as_str())),
+            (&second, second_scoped.as_path(), Some(second_hash.as_str())),
+        ];
+
+        let failure = retire_staged_attachment_refs_inner(&retirements, Some(1))
+            .err()
+            .ok_or_else(|| "injected retirement unexpectedly succeeded".to_string())?;
+        assert!(failure.retained_scoped_paths().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&first_staged).map_err(|error| error.to_string())?,
+            "first"
+        );
+        assert!(second_staged.exists());
+
+        retire_staged_attachment_refs(&retirements).map_err(|error| error.to_string())?;
+        assert!(!first_staged.exists());
+        assert!(!second_staged.exists());
+        assert!(first_scoped.exists());
+        assert!(second_scoped.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn discard_only_removes_owned_flat_staging_files() -> std::result::Result<(), String> {
+        let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let uploads = temporary.path().join(".eko/uploads");
+        std::fs::create_dir_all(&uploads).map_err(|error| error.to_string())?;
+        let staged = uploads.join(format!("{}_selected.txt", uuid::Uuid::new_v4()));
+        let arbitrary = uploads.join("notes.txt");
+        std::fs::write(&staged, "staged").map_err(|error| error.to_string())?;
+        std::fs::write(&arbitrary, "user").map_err(|error| error.to_string())?;
+        let refs = [
+            AttachmentRef {
+                path: staged.clone(),
+                name: "selected.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                source: AttachmentSource::Upload,
+            },
+            AttachmentRef {
+                path: arbitrary.clone(),
+                name: "notes.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                source: AttachmentSource::Upload,
+            },
+        ];
+        discard_staged_attachment_refs(&refs)?;
+        assert!(!staged.exists());
+        assert!(arbitrary.exists());
+        Ok(())
     }
 }

@@ -131,6 +131,7 @@ fn channel_render_event_stream(
 /// pre-judged here.
 #[cfg(feature = "channels")]
 pub struct AppChannelMessageHandler {
+    app_state: Arc<echo_agent_app_core::state::AppState>,
     pool: Arc<AgentPool>,
     store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
@@ -144,6 +145,7 @@ pub struct AppChannelMessageHandler {
 #[cfg(feature = "channels")]
 impl AppChannelMessageHandler {
     pub fn new(
+        app_state: Arc<echo_agent_app_core::state::AppState>,
         pool: Arc<AgentPool>,
         store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
         review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
@@ -151,6 +153,7 @@ impl AppChannelMessageHandler {
         foreground_turns: ForegroundTurnControl,
     ) -> Self {
         Self {
+            app_state,
             pool,
             store,
             review_integration,
@@ -474,6 +477,40 @@ impl AppChannelMessageHandler {
         let command = parts.next()?;
         let argument = parts.next().map(str::trim).unwrap_or_default();
         match command {
+            "/workflow" => Some(
+                self.app_state
+                    .history
+                    .workflows
+                    .execute_command(argument)
+                    .await
+                    .unwrap_or_else(|error| format!("Workflow command failed: {error}")),
+            ),
+            "/compact" | "/compress" => {
+                let keep_messages = if command == "/compress" { 6 } else { 12 };
+                let focus = (!argument.is_empty()).then(|| argument.to_string());
+                Some(
+                    match self
+                        .app_state
+                        .compress_conversation_owned(
+                            echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                                conversation_id: conv.to_string(),
+                                surface: ForegroundTurnSurface::Channel,
+                                focus,
+                                keep_messages,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(receipt) => format!(
+                            "Context compressed: {} -> {} messages, {} tokens saved.",
+                            receipt.messages_before,
+                            receipt.messages_after,
+                            receipt.tokens_saved()
+                        ),
+                        Err(error) => format!("Context compression failed: {error}"),
+                    },
+                )
+            }
             "/stop" => {
                 let Some(snapshot) = self
                     .foreground_turns
@@ -484,7 +521,11 @@ impl AppChannelMessageHandler {
                 Some(
                     match self
                         .foreground_turns
-                        .cancel_and_wait(ForegroundTurnSurface::Channel, conv, &snapshot.turn_id)
+                        .cancel_and_wait(
+                            ForegroundTurnSurface::Channel,
+                            conv,
+                            &snapshot.active_turn_id,
+                        )
                         .await
                     {
                         Ok(settlement) => format!(
@@ -512,7 +553,11 @@ impl AppChannelMessageHandler {
                     .snapshot(ForegroundTurnSurface::Channel, conv)
                     && let Err(error) = self
                         .foreground_turns
-                        .cancel_and_wait(ForegroundTurnSurface::Channel, conv, &snapshot.turn_id)
+                        .cancel_and_wait(
+                            ForegroundTurnSurface::Channel,
+                            conv,
+                            &snapshot.active_turn_id,
+                        )
                         .await
                     && !matches!(error, ForegroundTurnError::NoActiveTurn { .. })
                 {
@@ -521,13 +566,19 @@ impl AppChannelMessageHandler {
                     ));
                 }
                 let reset_turn_id = uuid::Uuid::new_v4().to_string();
-                let reset_lease = match self.foreground_turns.begin(
-                    ForegroundTurnSurface::Channel,
-                    conv.to_string(),
-                    reset_turn_id,
-                ) {
+                let reset_lease = match self
+                    .app_state
+                    .begin_conversation_turn_owned(
+                        ForegroundTurnSurface::Channel,
+                        conv,
+                        reset_turn_id,
+                    )
+                    .await
+                {
                     Ok(lease) => lease,
-                    Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+                    Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                        ForegroundTurnError::Busy { active_turn_id, .. },
+                    )) => {
                         return Some(format!(
                             "Turn {active_turn_id} started before reset admission; stop it and retry."
                         ));
@@ -612,7 +663,7 @@ impl AppChannelMessageHandler {
                 let agent = execution.agent();
                 let response = match agent
                     .steer_input(
-                        Some(&snapshot.turn_id),
+                        Some(&snapshot.active_turn_id),
                         echo_agent::prelude::Message::user(argument.to_string()),
                     )
                     .await
@@ -765,6 +816,97 @@ fn is_agent_management_command(message: &str) -> bool {
 }
 
 #[cfg(feature = "channels")]
+fn parse_developer_command(message: &str) -> Result<Option<(String, Vec<String>)>, String> {
+    let command_token = message.split_whitespace().next().unwrap_or_default();
+    let requested = command_token.trim_start_matches('/');
+    let command = if requested == "term" {
+        "terminal"
+    } else {
+        requested
+    };
+    if !echo_agent_app_core::developer_commands::DeveloperCommandRegistry::commands()
+        .iter()
+        .any(|descriptor| descriptor.name == command)
+    {
+        return Ok(None);
+    }
+    let mut parts = shell_words::split(message)
+        .map_err(|error| format!("Invalid /{command} arguments: {error}"))?
+        .into_iter();
+    let _command_token = parts
+        .next()
+        .ok_or_else(|| "Developer command is missing its slash prefix".to_string())?;
+    Ok(Some((command.to_string(), parts.collect())))
+}
+
+#[cfg(feature = "channels")]
+fn channel_terminal_stream(
+    message: &echo_agent::channels::InboundMessage,
+    initial: String,
+    mut events: tokio::sync::broadcast::Receiver<echo_agent_app_core::terminal::TerminalEvent>,
+    terminal_id: String,
+) -> futures::stream::BoxStream<
+    'static,
+    echo_core::error::Result<echo_agent::channels::OutboundMessage>,
+> {
+    use futures::StreamExt;
+
+    let channel_id = message.channel_id.clone();
+    let reply_target = message.reply_target().to_string();
+    let chat_type = message.chat_type;
+    async_stream::stream! {
+        yield Ok(echo_agent::channels::OutboundMessage::new(
+            &channel_id,
+            &reply_target,
+            chat_type,
+            initial,
+        ));
+        loop {
+            match events.recv().await {
+                Ok(echo_agent_app_core::terminal::TerminalEvent::Output { id, bytes })
+                    if id == terminal_id =>
+                {
+                    let stripped = strip_ansi_escapes::strip(bytes);
+                    let text = String::from_utf8_lossy(&stripped).into_owned();
+                    if !text.is_empty() {
+                        yield Ok(echo_agent::channels::OutboundMessage::new(
+                            &channel_id,
+                            &reply_target,
+                            chat_type,
+                            text,
+                        ));
+                    }
+                }
+                Ok(echo_agent_app_core::terminal::TerminalEvent::Exited { id, reason })
+                    if id == terminal_id =>
+                {
+                    yield Ok(echo_agent::channels::OutboundMessage::new(
+                        &channel_id,
+                        &reply_target,
+                        chat_type,
+                        format!("Terminal '{terminal_id}' exited: {reason:?}"),
+                    ));
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    yield Ok(echo_agent::channels::OutboundMessage::new(
+                        &channel_id,
+                        &reply_target,
+                        chat_type,
+                        format!(
+                            "Terminal '{terminal_id}' output lagged by {skipped} event(s); subsequent output remains live."
+                        ),
+                    ));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+    .boxed()
+}
+
+#[cfg(feature = "channels")]
 #[async_trait::async_trait]
 impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     async fn handle(
@@ -799,6 +941,35 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             echo_core::error::Result<echo_agent::channels::OutboundMessage>,
         >,
     > {
+        let developer_command = match parse_developer_command(&msg.text) {
+            Ok(command) => command,
+            Err(error) => return Ok(immediate_channel_response(&msg, error)),
+        };
+        if let Some((command, args)) = developer_command {
+            // Subscribe before dispatch so a fast shell cannot exit before
+            // this channel starts observing its output.
+            let terminal_events = self.app_state.terminal.subscribe();
+            let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let registry = echo_agent_app_core::developer_commands::DeveloperCommandRegistry::new(
+                self.app_state.terminal.clone(),
+                self.app_state.plugin_runtime.clone(),
+            );
+            return match registry.execute(&command, &arg_refs).await {
+                Ok(output) => match output.attached_terminal {
+                    Some(terminal_id) => Ok(channel_terminal_stream(
+                        &msg,
+                        output.message,
+                        terminal_events,
+                        terminal_id,
+                    )),
+                    None => Ok(immediate_channel_response(&msg, output.message)),
+                },
+                Err(error) => Ok(immediate_channel_response(
+                    &msg,
+                    format!("/{command} failed: {error}"),
+                )),
+            };
+        }
         let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id());
         let cache_id = Self::cache_user_id(&msg.channel_id, msg.conversation_id());
         let mut resume_task_run = None;
@@ -829,13 +1000,19 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         }
         if msg.text.split_whitespace().next() == Some("/mode") {
             let command_id = uuid::Uuid::new_v4().to_string();
-            let lease = match self.foreground_turns.begin(
-                ForegroundTurnSurface::Channel,
-                conv.clone(),
-                command_id,
-            ) {
+            let lease = match self
+                .app_state
+                .begin_conversation_turn_owned(
+                    ForegroundTurnSurface::Channel,
+                    &conv,
+                    command_id,
+                )
+                .await
+            {
                 Ok(lease) => lease,
-                Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+                Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                    ForegroundTurnError::Busy { active_turn_id, .. },
+                )) => {
                     return Ok(immediate_channel_response(
                         &msg,
                         format!("Turn {active_turn_id} is still running; mode was not changed."),
@@ -860,13 +1037,19 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         // any admission step fails.
         if is_agent_management_command(&msg.text) {
             let command_id = uuid::Uuid::new_v4().to_string();
-            let lease = match self.foreground_turns.begin(
-                ForegroundTurnSurface::Channel,
-                conv.clone(),
-                command_id,
-            ) {
+            let lease = match self
+                .app_state
+                .begin_conversation_turn_owned(
+                    ForegroundTurnSurface::Channel,
+                    &conv,
+                    command_id,
+                )
+                .await
+            {
                 Ok(lease) => lease,
-                Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+                Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                    ForegroundTurnError::Busy { active_turn_id, .. },
+                )) => {
                     return Ok(immediate_channel_response(
                         &msg,
                         format!("Turn {active_turn_id} is still running; command was not applied."),
@@ -922,13 +1105,17 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         }
 
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let foreground_lease = match self.foreground_turns.begin(
-            ForegroundTurnSurface::Channel,
-            conv.clone(),
-            turn_id.clone(),
-        ) {
+        let foreground_lease = match self
+            .app_state
+            .begin_conversation_turn_owned(ForegroundTurnSurface::Channel, &conv, turn_id.clone())
+            .await
+        {
             Ok(lease) => lease,
-            Err(ForegroundTurnError::Busy { active_turn_id, .. }) => {
+            Err(
+                echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                    ForegroundTurnError::Busy { active_turn_id, .. },
+                ),
+            ) => {
                 return Ok(immediate_channel_response(
                     &msg,
                     format!(
@@ -954,7 +1141,18 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         );
         // Persist IM attachments into the same durable reference contract as
         // GUI/TUI so TaskRuntime subagents can reconstruct the same message.
-        let attachment_refs = stage_channel_attachments(&msg.attachments);
+        let attachment_refs = match stage_channel_attachments(&msg.attachments) {
+            Ok(attachments) => attachments,
+            Err(error) => {
+                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("attachment_staging", error.clone()),
+                ));
+                return Ok(immediate_channel_response(
+                    &msg,
+                    format!("附件保存失败，未发送本条消息：{error}"),
+                ));
+            }
+        };
         // Channels have no workspace root; long pastes spill to the global
         // user-input artifact dir (~/.eko/artifacts/user-input/).
         let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
@@ -980,9 +1178,16 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                     echo_agent::error::AgentFailure::message("prepared_turn", error.to_string()),
                 ));
+                let cleanup = echo_agent_app_core::attachments::discard_staged_attachment_refs(
+                    &attachment_refs,
+                )
+                .err();
+                let suffix = cleanup
+                    .map(|cleanup| format!("；临时附件清理也失败：{cleanup}"))
+                    .unwrap_or_default();
                 return Ok(immediate_channel_response(
                     &msg,
-                    format!("无法安全保存这条长消息，请检查本地磁盘后重试：{error}"),
+                    format!("无法安全保存这条消息，请检查本地磁盘后重试：{error}{suffix}"),
                 ));
             }
         };
@@ -993,6 +1198,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let pool = self.pool.clone();
         let store = self.store.clone();
+        let app_state = self.app_state.clone();
         let webhook_emitter = self.webhook_emitter.clone();
         let review_integration = self.review_integration.clone();
         let hitl = Arc::clone(&self.hitl);
@@ -1016,8 +1222,16 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         drive_foreground_pooled_chat, drive_foreground_pooled_chat_turn,
                     };
 
-                    let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+                    let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
                         std::sync::Arc::new(ChannelChatSink::new(tx));
+                    let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
+                        echo_agent_app_core::chat_event_log::ChatSurface::Channel,
+                        renderer,
+                        app_state.storage.chat_events.clone(),
+                        app_state.storage.tool_executions.clone(),
+                        Some(conv_owned.clone()),
+                        turn_id.clone(),
+                    );
                     let res =
                         std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
                             pool: Some(pool.clone()),
@@ -1285,21 +1499,23 @@ fn channel_attachment_data(
 #[cfg(feature = "channels")]
 fn stage_channel_attachments(
     attachments: &[echo_agent::channels::MessageAttachment],
-) -> Vec<echo_agent_app_core::attachments::AttachmentRef> {
-    attachments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, attachment)| {
-            let data = channel_attachment_data(index, attachment);
-            match echo_agent_app_core::attachments::stage_attachment_data(&data, None) {
-                Ok(reference) => Some(reference),
-                Err(error) => {
-                    tracing::warn!(%error, name = %data.name, "skipping channel attachment");
-                    None
-                }
+) -> Result<Vec<echo_agent_app_core::attachments::AttachmentRef>, String> {
+    let mut staged = Vec::with_capacity(attachments.len());
+    for (index, attachment) in attachments.iter().enumerate() {
+        let data = channel_attachment_data(index, attachment);
+        match echo_agent_app_core::attachments::stage_attachment_data(&data, None) {
+            Ok(reference) => staged.push(reference),
+            Err(error) => {
+                let cleanup =
+                    echo_agent_app_core::attachments::discard_staged_attachment_refs(&staged).err();
+                let suffix = cleanup
+                    .map(|cleanup| format!("; staged attachment cleanup failed: {cleanup}"))
+                    .unwrap_or_default();
+                return Err(format!("{error}{suffix}"));
             }
-        })
-        .collect()
+        }
+    }
+    Ok(staged)
 }
 
 #[cfg(feature = "channels")]
@@ -1456,6 +1672,61 @@ async fn aggregate_by_sentence<'a>(
                         format!("[paused:{run_id}] {goal}; new instruction: {new_message}"),
                     );
                 }
+                ChannelRenderEvent::Driver(ChatDriverEvent::ApprovalRequest {
+                    request_id,
+                    tool_name,
+                    prompt,
+                    ..
+                }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[approval:{request_id}] {tool_name}: {prompt}"),
+                    );
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::InputRequest { request_id, prompt }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[input:{request_id}] {prompt}"),
+                    );
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::SelectionRequest {
+                    request_id,
+                    prompt,
+                    options,
+                    ..
+                }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[selection:{request_id}] {prompt} ({})", options.join(", ")),
+                    );
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::ContextCompressed {
+                    before_count,
+                    after_count,
+                    before_tokens,
+                    after_tokens,
+                }) => {
+                    flush_all!();
+                    let saved = before_tokens.saturating_sub(after_tokens);
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!(
+                            "[context] compressed {before_count}->{after_count} messages, \
+                             {before_tokens}->{after_tokens} tokens ({saved} saved)"
+                        ),
+                    );
+                }
                 ChannelRenderEvent::Terminal(
                     echo_agent_app_core::chat_driver::TurnOutcome::Completed,
                 ) => {
@@ -1560,6 +1831,75 @@ mod tests {
         assert!(super::is_agent_management_command(" /skills list "));
         assert!(!super::is_agent_management_command("/stop"));
         assert!(!super::is_agent_management_command("/traceable"));
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn shared_developer_catalog_is_parsed_before_chat() -> Result<(), String> {
+        for descriptor in
+            echo_agent_app_core::developer_commands::DeveloperCommandRegistry::commands()
+        {
+            let parsed = super::parse_developer_command(&format!("/{} status", descriptor.name))?
+                .ok_or_else(|| format!("/{} was not recognized", descriptor.name))?;
+            assert_eq!(parsed.0, descriptor.name);
+            assert_eq!(parsed.1, vec!["status"]);
+        }
+        let alias = super::parse_developer_command("/term list")?
+            .ok_or_else(|| "/term was not recognized".to_string())?;
+        assert_eq!(alias.0, "terminal");
+        Ok(())
+    }
+
+    #[cfg(all(feature = "channels", unix))]
+    #[tokio::test]
+    async fn terminal_stream_keeps_fast_output_from_pre_dispatch_subscription() -> Result<(), String>
+    {
+        use echo_agent::channels::{ChatType, InboundMessage};
+        use futures::StreamExt;
+
+        let terminal = echo_agent_app_core::terminal::TerminalService::new();
+        let receiver = terminal.subscribe();
+        terminal
+            .create("channel-fast".to_string(), None, 24, 80)
+            .await?;
+        terminal
+            .write("channel-fast", b"printf channel-fast-output; exit\r")
+            .await?;
+        let message = InboundMessage::new(
+            "qq",
+            "user",
+            "conversation",
+            ChatType::Direct,
+            "/terminal create channel-fast",
+            "message-1",
+        );
+        let mut stream = super::channel_terminal_stream(
+            &message,
+            "created".to_string(),
+            receiver,
+            "channel-fast".to_string(),
+        );
+        let texts = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut texts = Vec::new();
+            while let Some(message) = stream.next().await {
+                let message = message.map_err(|error| error.to_string())?;
+                let exited = message.text.contains("exited:");
+                texts.push(message.text);
+                if exited {
+                    break;
+                }
+            }
+            Ok::<_, String>(texts)
+        })
+        .await
+        .map_err(|_| "channel terminal stream did not observe exit".to_string())??;
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("channel-fast-output"))
+        );
+        assert!(texts.iter().any(|text| text.contains("exited:")));
+        Ok(())
     }
 
     #[cfg(feature = "channels")]

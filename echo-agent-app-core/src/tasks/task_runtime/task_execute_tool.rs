@@ -376,13 +376,20 @@ impl Tool for ExecuteTaskTool {
             // RAII guard: 持锁 + Drop 时清理 RUN_EXECUTION_LOCKS entry (P1-1 修复)。
             let _run_guard = acquire_run_execution_lock(&run_id).await;
             tracing::info!(run_id = %run_id, "task_execute: acquired run execution lock");
-            if self
-                .store
-                .get_run(&run_id)
-                .ok()
-                .flatten()
-                .is_some_and(|run| run.status == TaskRunStatus::Completed)
-                && !has_unresolved_tasks(&self.store, &run_id)
+            let run = match self.store.get_run(&run_id) {
+                Ok(Some(run)) => run,
+                Ok(None) => {
+                    return Ok(ToolResult::error(format!(
+                        "Task run disappeared before execution: {run_id}"
+                    )));
+                }
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Failed to reload the task run before execution: {error}"
+                    )));
+                }
+            };
+            if run.status == TaskRunStatus::Completed && !has_unresolved_tasks(&self.store, &run_id)
             {
                 let summaries = build_run_summaries(&self.store, &run_id);
                 tracing::info!(
@@ -393,6 +400,18 @@ impl Tool for ExecuteTaskTool {
                 return Ok(ToolResult::success(task_execute_outcome_text(
                     &RunOutcome::Completed,
                     &summaries,
+                )));
+            }
+
+            // task_create publishes the TaskRun and revision 1 atomically as
+            // Pending. The exact task_execute owner starts that durable run
+            // only after it holds the per-run execution lock, so a prepared
+            // graph cannot appear Running before an executor exists.
+            if run.status == TaskRunStatus::Pending
+                && let Err(error) = self.store.transition_run(&run_id, TaskRunStatus::Running)
+            {
+                return Ok(ToolResult::error(format!(
+                    "Failed to start the committed task graph: {error}"
                 )));
             }
 

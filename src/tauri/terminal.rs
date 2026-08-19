@@ -1,280 +1,89 @@
-//! PTY-based terminal for Tauri desktop mode.
-//!
-//! Architecture:
-//! - `PtySession`: wraps a single PTY (shell process + I/O handles)
-//! - `TerminalManager`: concurrent map of active sessions
-//! - Tauri Events stream PTY output to the frontend:
-//!   - `terminal-output` → `{ id, data }` (base64-encoded)
-//!   - `terminal-exit` → `{ id }` (process exited)
-//! - Frontend uses xterm.js + FitAddon for rendering.
+//! Thin Tauri adapter over the application-owned terminal service.
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use base64::Engine;
-use dashmap::DashMap;
-use portable_pty::{CommandBuilder, PtyPair, PtySize};
+use echo_agent_app_core::terminal::{TerminalEvent, TerminalExitReason, TerminalService};
 use serde::Serialize;
-use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::Emitter;
-use tokio::sync::Mutex;
-use tracing::{debug, info, warn};
-
-// ── Event payloads ──────────────────────────────────────────────────────────
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Serialize)]
 struct OutputEvent {
     id: String,
-    data: String, // base64-encoded raw bytes
+    data: String,
 }
 
 #[derive(Clone, Serialize)]
 struct ExitEvent {
     id: String,
+    reason: &'static str,
 }
 
-// ── PtySession ──────────────────────────────────────────────────────────────
-
-/// A single terminal session backed by a pseudo-terminal.
-pub struct PtySession {
-    pub id: String,
-    pub pid: u32,
-    master: Mutex<Box<dyn portable_pty::MasterPty + Send>>,
-    writer: Mutex<Box<dyn Write + Send>>,
-    child_killer: Mutex<Box<dyn portable_pty::ChildKiller + Send>>,
-}
-
-impl PtySession {
-    /// Spawn a new shell in a PTY.
-    pub fn spawn(
-        id: String,
-        cwd: Option<String>,
-        rows: u16,
-        cols: u16,
-        app_handle: tauri::AppHandle,
-    ) -> Result<Arc<Self>, String> {
-        let pty_system = portable_pty::native_pty_system();
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-
-        let pair: PtyPair = pty_system
-            .openpty(size)
-            .map_err(|e| format!("Failed to open PTY: {e}"))?;
-
-        // Clone reader BEFORE spawning the child (portable-pty requirement)
-        let reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| format!("Failed to clone PTY reader: {e}"))?;
-
-        // Build shell command — use $SHELL on Unix, fallback to /bin/sh
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut cmd = CommandBuilder::new(&shell);
-        if let Some(ref dir) = cwd {
-            cmd.cwd(dir);
-        }
-
-        // Spawn child process on the slave side
-        let child = pair
-            .slave
-            .spawn_command(cmd)
-            .map_err(|e| format!("Failed to spawn shell: {e}"))?;
-
-        // Drop slave — only master side is needed now
-        drop(pair.slave);
-
-        let pid = child.process_id().unwrap_or(0);
-
-        // Take writer for stdin
-        let writer = pair
-            .master
-            .take_writer()
-            .map_err(|e| format!("Failed to take PTY writer: {e}"))?;
-
-        // Start background reader thread → emit Tauri events
-        let session_id = id.clone();
-        std::thread::Builder::new()
-            .name(format!("pty-reader-{id}"))
-            .spawn(move || {
-                Self::reader_loop(session_id, reader, app_handle);
-            })
-            .map_err(|e| format!("Failed to spawn reader thread: {e}"))?;
-
-        info!("Terminal session '{id}' created (pid={pid})");
-
-        Ok(Arc::new(Self {
-            id,
-            pid,
-            master: Mutex::new(pair.master),
-            writer: Mutex::new(writer),
-            child_killer: Mutex::new(child.clone_killer()),
-        }))
-    }
-
-    /// Background loop: read PTY output and emit to frontend via Tauri events.
-    fn reader_loop(
-        id: String,
-        mut reader: Box<dyn std::io::Read + Send>,
-        app_handle: tauri::AppHandle,
-    ) {
-        let mut buf = [0u8; 8192];
+pub fn spawn_event_bridge(
+    app_handle: tauri::AppHandle,
+    terminal: Arc<TerminalService>,
+    cancel: CancellationToken,
+) -> JoinHandle<()> {
+    let mut events = terminal.subscribe();
+    tokio::spawn(async move {
         loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    // EOF — shell process exited
-                    debug!("Terminal '{id}' EOF, process exited");
-                    let _ = app_handle.emit("terminal-exit", ExitEvent { id: id.clone() });
-                    break;
+            let event = tokio::select! {
+                _ = cancel.cancelled() => break,
+                event = events.recv() => event,
+            };
+            match event {
+                Ok(TerminalEvent::Output { id, bytes }) => {
+                    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+                    if let Err(error) = app_handle.emit("terminal-output", OutputEvent { id, data })
+                    {
+                        tracing::warn!(%error, "failed to emit terminal output");
+                    }
                 }
-                Ok(n) => {
-                    // Encode as base64 to safely transport binary data over JSON
-                    let data = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                    let _ = app_handle.emit(
-                        "terminal-output",
-                        OutputEvent {
-                            id: id.clone(),
-                            data,
-                        },
-                    );
+                Ok(TerminalEvent::Exited { id, reason }) => {
+                    let reason = match reason {
+                        TerminalExitReason::ProcessExited => "process_exited",
+                        TerminalExitReason::Closed => "closed",
+                        TerminalExitReason::ReadFailed(_) => "read_failed",
+                    };
+                    if let Err(error) = app_handle.emit("terminal-exit", ExitEvent { id, reason }) {
+                        tracing::warn!(%error, "failed to emit terminal exit");
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => {
-                    warn!("Terminal '{id}' read error: {e}");
-                    let _ = app_handle.emit("terminal-exit", ExitEvent { id: id.clone() });
-                    break;
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "terminal event receiver lagged");
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    }
-
-    /// Write data to the PTY stdin.
-    pub async fn write(&self, data: &[u8]) -> Result<(), String> {
-        let mut writer = self.writer.lock().await;
-        writer
-            .write_all(data)
-            .map_err(|e| format!("Write failed: {e}"))?;
-        writer.flush().map_err(|e| format!("Flush failed: {e}"))?;
-        Ok(())
-    }
-
-    /// Resize the PTY.
-    pub async fn resize(&self, rows: u16, cols: u16) -> Result<(), String> {
-        let master = self.master.lock().await;
-        master
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| format!("Resize failed: {e}"))
-    }
-
-    /// Kill the shell process.
-    pub async fn kill(&self) -> Result<(), String> {
-        let mut killer = self.child_killer.lock().await;
-        killer.kill().map_err(|e| format!("Kill failed: {e}"))
-    }
+    })
 }
-
-// ── TerminalManager ─────────────────────────────────────────────────────────
-
-/// Manages multiple concurrent terminal sessions.
-pub struct TerminalManager {
-    sessions: DashMap<String, Arc<PtySession>>,
-}
-
-impl TerminalManager {
-    pub fn new() -> Self {
-        Self {
-            sessions: DashMap::new(),
-        }
-    }
-
-    pub fn create(
-        &self,
-        id: String,
-        cwd: Option<String>,
-        rows: u16,
-        cols: u16,
-        app_handle: tauri::AppHandle,
-    ) -> Result<u32, String> {
-        if self.sessions.contains_key(&id) {
-            return Err(format!("Terminal '{id}' already exists"));
-        }
-        let session = PtySession::spawn(id.clone(), cwd, rows, cols, app_handle)?;
-        let pid = session.pid;
-        self.sessions.insert(id, session);
-        Ok(pid)
-    }
-
-    pub fn get(&self, id: &str) -> Result<Arc<PtySession>, String> {
-        self.sessions
-            .get(id)
-            .map(|r| r.value().clone())
-            .ok_or_else(|| format!("Terminal '{id}' not found"))
-    }
-
-    pub fn remove(&self, id: &str) -> Option<Arc<PtySession>> {
-        self.sessions.remove(id).map(|(_, v)| v)
-    }
-
-    pub fn list(&self) -> Vec<serde_json::Value> {
-        self.sessions
-            .iter()
-            .map(|entry| {
-                serde_json::json!({
-                    "id": entry.key().clone(),
-                    "pid": entry.value().pid,
-                })
-            })
-            .collect()
-    }
-
-    pub async fn close_all(&self) {
-        let ids: Vec<String> = self.sessions.iter().map(|r| r.key().clone()).collect();
-        for id in ids {
-            if let Some(session) = self.sessions.remove(&id).map(|(_, s)| s)
-                && let Err(error) = session.kill().await
-            {
-                tracing::warn!(%error, terminal_id = %id, "Failed to close terminal session");
-            }
-        }
-    }
-}
-
-impl Default for TerminalManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-// ── Tauri IPC Commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn create_terminal(
     state: tauri::State<'_, TauriState>,
-    app: tauri::AppHandle,
     id: String,
     cwd: Option<String>,
     rows: Option<u16>,
     cols: Option<u16>,
 ) -> Result<serde_json::Value, IpcError> {
-    // The terminal is an interactive developer tool (compile / test / git etc.),
-    // not an agent-auto path. EKO is a local personal assistant — there's no
-    // multi-user / online threat model that warrants a permission gate here.
-    // Input arrives from the terminal component's direct user event path.
-    let rows = rows.unwrap_or(24);
-    let cols = cols.unwrap_or(80);
-    let pid = state
-        .terminal_manager
-        .create(id.clone(), cwd, rows, cols, app)
+    // This is a direct user-operated local developer tool, not an agent-auto
+    // execution path, so agent permission modes do not gate it.
+    let info = state
+        .app_state
+        .terminal
+        .create(
+            id,
+            cwd.map(PathBuf::from),
+            rows.unwrap_or(24),
+            cols.unwrap_or(80),
+        )
+        .await
         .map_err(IpcError::Internal)?;
-    Ok(serde_json::json!({ "id": id, "pid": pid }))
+    serde_json::to_value(info).map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[tauri::command]
@@ -283,35 +92,15 @@ pub async fn write_terminal(
     id: String,
     data: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let session = state
-        .terminal_manager
-        .get(&id)
-        .map_err(IpcError::NotFound)?;
-
-    // Bound a single IPC payload so an accidental paste cannot exhaust memory.
-    const MAX_WRITE_BYTES: usize = 64 * 1024;
-
-    // Data is base64-encoded from the frontend.
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&data)
-        .map_err(|e| IpcError::Validation(format!("Invalid base64: {e}")))?;
-    if bytes.len() > MAX_WRITE_BYTES {
-        return Err(IpcError::Validation(format!(
-            "Terminal write payload too large ({} bytes > {} max). Batch large inputs or use a file.",
-            bytes.len(),
-            MAX_WRITE_BYTES
-        )));
-    }
-
-    // Terminal input often contains credentials. Persist only metadata, never
-    // command bytes or a content preview.
-    tracing::info!(
-        terminal_session = %id,
-        bytes = bytes.len(),
-        "terminal write"
-    );
-
-    session.write(&bytes).await.map_err(IpcError::Internal)?;
+        .decode(data)
+        .map_err(|error| IpcError::Validation(format!("invalid base64: {error}")))?;
+    state
+        .app_state
+        .terminal
+        .write(&id, &bytes)
+        .await
+        .map_err(IpcError::Internal)?;
     Ok(serde_json::json!({ "success": true }))
 }
 
@@ -322,15 +111,13 @@ pub async fn resize_terminal(
     rows: u16,
     cols: u16,
 ) -> Result<serde_json::Value, IpcError> {
-    let session = state
-        .terminal_manager
-        .get(&id)
-        .map_err(IpcError::NotFound)?;
-    session
-        .resize(rows, cols)
+    state
+        .app_state
+        .terminal
+        .resize(&id, rows, cols)
         .await
         .map_err(IpcError::Internal)?;
-    Ok(serde_json::json!({"success": true}))
+    Ok(serde_json::json!({ "success": true }))
 }
 
 #[tauri::command]
@@ -338,18 +125,22 @@ pub async fn close_terminal(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let session = state
-        .terminal_manager
-        .remove(&id)
-        .ok_or_else(|| IpcError::NotFound(format!("Terminal '{id}' not found")))?;
-    session.kill().await.map_err(IpcError::Internal)?;
-    info!("Terminal '{id}' closed");
-    Ok(serde_json::json!({"success": true}))
+    let closed = state
+        .app_state
+        .terminal
+        .close(&id)
+        .await
+        .map_err(IpcError::Internal)?;
+    if !closed {
+        return Err(IpcError::NotFound(format!("terminal '{id}' not found")));
+    }
+    Ok(serde_json::json!({ "success": true }))
 }
 
 #[tauri::command]
 pub async fn list_terminal_sessions(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!(state.terminal_manager.list()))
+    serde_json::to_value(state.app_state.terminal.list())
+        .map_err(|error| IpcError::Internal(error.to_string()))
 }

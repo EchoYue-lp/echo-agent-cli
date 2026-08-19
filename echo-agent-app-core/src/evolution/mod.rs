@@ -19,8 +19,12 @@ pub use evidence::{
 };
 pub use hook_fire::{evolution_hook_observer, fire_evolution_hook};
 pub use review_integration::{
-    BackgroundReviewPass, BackgroundReviewSettlement, MemoryRebindReceipt, ReviewGenerationError,
-    ReviewGenerationLease, ReviewIntegration, ReviewRebindPermit, TriggerDeliveryStatus,
-    discover_echo_agent_dir, format_review_report, workspace_curator,
+    BackgroundReviewPass, BackgroundReviewSettlement, MemoryRebindReceipt,
+    ReconciledReviewRebindPermit, ReviewGenerationError, ReviewGenerationLease, ReviewIntegration,
+    ReviewRebindPermit, TriggerDeliveryStatus, discover_echo_agent_dir, format_review_report,
+    workspace_curator,
 };
-pub use rule_promoter::{PromotionCriteria, RulePromoter, RuleProposal};
+pub use rule_promoter::{
+    PromotionCriteria, RulePromoter, RulePromotionError, RulePromotionPhase, RulePromotionReceipt,
+    RuleProposal,
+};

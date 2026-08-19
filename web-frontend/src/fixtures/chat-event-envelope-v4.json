@@ -1,0 +1,102 @@
+[
+  {
+    "schema_version": 1,
+    "event_id": "chat-event-1",
+    "content_hash": "chat-hash-1",
+    "sequence": 1,
+    "stream_id": "conversation:fixture-conversation",
+    "conversation_id": "fixture-conversation",
+    "turn_id": "fixture-turn",
+    "message_id": "fixture-message",
+    "timestamp": "2026-08-16T00:00:00Z",
+    "payload": {
+      "source": "agent",
+      "event": {
+        "schema_version": 4,
+        "event_id": "agent-event-1",
+        "content_hash": "agent-hash-1",
+        "sequence": 1,
+        "stream_id": "chat:fixture-turn",
+        "conversation_id": "fixture-conversation",
+        "run_id": null,
+        "turn_id": "fixture-turn",
+        "message_id": "fixture-message",
+        "execution_id": null,
+        "parent_event_id": null,
+        "timestamp": "2026-08-16T00:00:00Z",
+        "payload": {
+          "type": "tool_call",
+          "data": {
+            "call_id": "call-1",
+            "invocation": {
+              "requested_name": "shell",
+              "requested_args": { "command": "unsafe command" },
+              "name": "sandbox_shell",
+              "args": { "command": "safe command" },
+              "rewrites": ["intervention_redirect", "pre_tool_use_hook", "approval"]
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "schema_version": 1,
+    "event_id": "chat-event-2",
+    "content_hash": "chat-hash-2",
+    "sequence": 2,
+    "stream_id": "conversation:fixture-conversation",
+    "conversation_id": "fixture-conversation",
+    "turn_id": "fixture-turn",
+    "message_id": "fixture-message",
+    "timestamp": "2026-08-16T00:00:01Z",
+    "payload": {
+      "source": "agent",
+      "event": {
+        "schema_version": 4,
+        "event_id": "agent-event-2",
+        "content_hash": "agent-hash-2",
+        "sequence": 2,
+        "stream_id": "chat:fixture-turn",
+        "conversation_id": "fixture-conversation",
+        "run_id": null,
+        "turn_id": "fixture-turn",
+        "message_id": "fixture-message",
+        "execution_id": null,
+        "parent_event_id": "agent-event-1",
+        "timestamp": "2026-08-16T00:00:01Z",
+        "payload": {
+          "type": "tool_result",
+          "data": {
+            "call_id": "call-1",
+            "name": "sandbox_shell",
+            "result": {
+              "kind": {
+                "kind_type": "structured_error",
+                "error_code": "command_timeout"
+              },
+              "success": false,
+              "output": "partial output",
+              "error": "command timed out",
+              "failure": {
+                "category": "timeout",
+                "recovery": "verify_then_retry",
+                "side_effect": "possible",
+                "retry_after_ms": 500,
+                "idempotency_key": "call-1-attempt-1",
+                "postcondition": "verify command side effects before retry"
+              },
+              "data": { "exit_code": null, "elapsed_ms": 5000 },
+              "truncated": true,
+              "mime_type": "text/plain",
+              "metadata": {
+                "artifact_path": "/tmp/tool-output.txt",
+                "duration_ms": "5000"
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+]

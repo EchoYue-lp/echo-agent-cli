@@ -21,12 +21,28 @@ use echo_agent::memory::Store;
 use echo_agent::memory::TypedMemoryStore;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use super::evidence::{
     EvidenceCandidate, EvidenceCandidateDraft, EvidenceKind, EvidenceRef, EvidenceSource,
     EvidenceStore, capture_memory_conflict, capture_review_outcome,
 };
+#[cfg(test)]
+use super::rule_promoter::RulePromotionPhase;
+use super::rule_promoter::{RulePromoter, RulePromotionError, RulePromotionReceipt, RuleProposal};
+
+#[derive(Default)]
+struct RuleProjectionTargets {
+    primary: Option<crate::agent_handle::AgentHandle>,
+    pool: Option<Weak<crate::agent_pool::AgentPool>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuleProjectionFault {
+    Primary,
+    Pool,
+}
 
 #[derive(Clone)]
 struct ReviewBinding {
@@ -37,6 +53,8 @@ struct ReviewBinding {
 
 struct ReviewBindingState {
     current: ReviewBinding,
+    pending_rule_projection: Option<crate::unified_memory::InstructionProjectionSnapshot>,
+    pending_rule_receipts: Vec<RulePromotionReceipt>,
     active_passes: usize,
     rebind_in_progress: bool,
     pending_triggers: VecDeque<QueuedTrigger>,
@@ -107,6 +125,9 @@ pub enum ReviewGenerationError {
         pending: usize,
         last_error: String,
     },
+    ProjectionSettlement {
+        pending_receipts: usize,
+    },
 }
 
 impl std::fmt::Display for ReviewGenerationError {
@@ -128,6 +149,10 @@ impl std::fmt::Display for ReviewGenerationError {
             } => write!(
                 formatter,
                 "memory trigger settlement failed with {pending} candidate(s) still pending: {last_error}"
+            ),
+            Self::ProjectionSettlement { pending_receipts } => write!(
+                formatter,
+                "memory rule projection settlement must retry before rebind ({pending_receipts} receipt(s) pending)"
             ),
         }
     }
@@ -355,14 +380,53 @@ pub struct ReviewRebindPermit {
     next: Option<ReviewBinding>,
 }
 
+/// A prepared workspace memory generation whose pending rule promotions were
+/// reconciled before the process crosses its workspace commit boundary.
+#[must_use]
+pub struct ReconciledReviewRebindPermit {
+    permit: ReviewRebindPermit,
+    projection: Option<crate::unified_memory::InstructionProjectionSnapshot>,
+    receipts: Vec<RulePromotionReceipt>,
+}
+
 impl ReviewRebindPermit {
-    /// Settle triggers captured against the old workspace, then publish the
-    /// prepared directory, Store, and generation in one lock acquisition.
-    /// Publication is infallible; an incomplete old-root flush is reported in
-    /// the receipt so the canonical workspace transition can settle Degraded.
-    /// The permit keeps blocking passes until projection settlement completes.
+    pub async fn reconcile_rule_promotions(
+        self,
+    ) -> Result<ReconciledReviewRebindPermit, RulePromotionError> {
+        let next = self.next.as_ref().ok_or_else(|| {
+            RulePromotionError::Projection(
+                "workspace rebind permit has no prepared binding".to_string(),
+            )
+        })?;
+        let promoter = RulePromoter::new(next.store.clone())
+            .with_rules_path(next.echo_agent_dir.join("learned-rules.md"));
+        let change_log = echo_agent::evolution::JsonlChangeLog::new(
+            next.echo_agent_dir
+                .join("evolution")
+                .join("change-log.jsonl"),
+        )
+        .map_err(|error| RulePromotionError::Audit(error.to_string()))?;
+        let receipts = promoter.reconcile_pending(&change_log).await?;
+        let root = next
+            .echo_agent_dir
+            .parent()
+            .map(std::path::Path::to_path_buf);
+        let projection = crate::unified_memory::load_instruction_projection_strict(root.as_deref())
+            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+        Ok(ReconciledReviewRebindPermit {
+            permit: self,
+            projection: Some(projection),
+            receipts,
+        })
+    }
+}
+
+impl ReconciledReviewRebindPermit {
+    /// Publish the prepared binding while retaining the exact projection read
+    /// before the workspace commit boundary for later runtime settlement.
     pub fn commit(&mut self) -> MemoryRebindReceipt {
         let mut state = self
+            .permit
             .control
             .state
             .lock()
@@ -380,8 +444,10 @@ impl ReviewRebindPermit {
         } else {
             state.last_trigger_delivery_error.clone()
         };
-        if let Some(next) = self.next.take() {
+        if let Some(next) = self.permit.next.take() {
             state.current = next;
+            state.pending_rule_projection = self.projection.take();
+            state.pending_rule_receipts = std::mem::take(&mut self.receipts);
         }
         MemoryRebindReceipt {
             generation: state.current.generation,
@@ -433,6 +499,16 @@ pub struct ReviewIntegration {
     binding: Arc<ReviewBindingControl>,
     /// Framework observer wired to the shared agent HookRegistry.
     evolution_observer: RwLock<Option<Arc<dyn EvolutionObserver>>>,
+    /// Serializes promotion recovery, publication, and projection settlement.
+    promotion_gate: tokio::sync::Mutex<()>,
+    /// Primary plus current pool are the one projection target set used by all
+    /// surfaces. A successful promotion refreshes both before returning.
+    rule_projection_targets: RwLock<RuleProjectionTargets>,
+    /// Last generation confirmed on primary and pool. Instruction files remain
+    /// the content authority; this is only a runtime publication receipt.
+    rule_projection_snapshot: RwLock<Option<crate::unified_memory::InstructionProjectionSnapshot>>,
+    #[cfg(test)]
+    rule_projection_fault: Mutex<Option<RuleProjectionFault>>,
 }
 
 impl ReviewIntegration {
@@ -447,6 +523,8 @@ impl ReviewIntegration {
                         store,
                         generation: 0,
                     },
+                    pending_rule_projection: None,
+                    pending_rule_receipts: Vec::new(),
                     active_passes: 0,
                     rebind_in_progress: false,
                     pending_triggers: VecDeque::new(),
@@ -460,7 +538,344 @@ impl ReviewIntegration {
                 }),
             }),
             evolution_observer: RwLock::new(None),
+            promotion_gate: tokio::sync::Mutex::new(()),
+            rule_projection_targets: RwLock::new(RuleProjectionTargets::default()),
+            rule_projection_snapshot: RwLock::new(None),
+            #[cfg(test)]
+            rule_projection_fault: Mutex::new(None),
         }
+    }
+
+    pub fn bind_rule_projection_primary(&self, primary: crate::agent_handle::AgentHandle) {
+        self.rule_projection_targets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .primary = Some(primary);
+    }
+
+    pub async fn bind_rule_projection_pool(
+        &self,
+        pool: &Arc<crate::agent_pool::AgentPool>,
+    ) -> Result<(), RulePromotionError> {
+        self.rule_projection_targets
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pool = Some(Arc::downgrade(pool));
+        let _gate = self.promotion_gate.lock().await;
+        let lease = self
+            .lease_generation()
+            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+        let snapshot = self.current_or_load_rule_projection(&lease)?;
+        self.publish_rule_projection(snapshot).await
+    }
+
+    /// Reconcile prepared rule promotions for the bootstrap binding before any
+    /// review or promotion admission is published.
+    pub async fn initialize_rule_promotions(&self) -> Result<(), RulePromotionError> {
+        let _gate = self.promotion_gate.lock().await;
+        let lease = self
+            .lease_generation()
+            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+        let pending = self.reconcile_rule_promotions_for_lease(&lease).await?;
+        if !pending.is_empty() || self.has_rule_projection_primary() {
+            let snapshot = self.current_or_load_rule_projection(&lease)?;
+            self.publish_rule_projection(snapshot).await?;
+            self.commit_rule_projection_receipts(&lease, &pending)
+                .await?;
+            self.clear_pending_rule_projection();
+        }
+        Ok(())
+    }
+
+    /// Settle the prepared workspace generation without reopening pool
+    /// admission between workspace publication and instruction publication.
+    pub(crate) async fn settle_rebind_rule_promotions(
+        &self,
+        pool_transition: Option<&crate::agent_pool::AgentPoolWorkspaceTransition<'_>>,
+    ) -> Result<(), RulePromotionError> {
+        let _gate = self.promotion_gate.lock().await;
+        let (binding, snapshot, receipts) = {
+            let state = self
+                .binding
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !state.rebind_in_progress {
+                return Err(RulePromotionError::Projection(
+                    "workspace rule projection settlement has no active rebind".to_string(),
+                ));
+            }
+            let snapshot = state.pending_rule_projection.clone().ok_or_else(|| {
+                RulePromotionError::Projection(
+                    "workspace rule projection settlement has no prepared snapshot".to_string(),
+                )
+            })?;
+            (
+                state.current.clone(),
+                snapshot,
+                state.pending_rule_receipts.clone(),
+            )
+        };
+        let promoter = RulePromoter::new(binding.store)
+            .with_rules_path(binding.echo_agent_dir.join("learned-rules.md"));
+        self.publish_rule_projection_with_transition(snapshot, pool_transition)
+            .await?;
+        for receipt in &receipts {
+            promoter.commit_projection(receipt).await?;
+        }
+        self.clear_pending_rule_projection();
+        Ok(())
+    }
+
+    pub async fn scan_rule_proposals(&self) -> Result<Vec<RuleProposal>, RulePromotionError> {
+        let _gate = self.promotion_gate.lock().await;
+        let lease = self
+            .lease_generation()
+            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+        let pending = self.reconcile_rule_promotions_for_lease(&lease).await?;
+        let snapshot = self.current_or_load_rule_projection(&lease)?;
+        self.publish_rule_projection(snapshot).await?;
+        self.commit_rule_projection_receipts(&lease, &pending)
+            .await?;
+        self.clear_pending_rule_projection();
+        Ok(RulePromoter::new(lease.memory_store())
+            .with_rules_path(lease.echo_agent_dir().join("learned-rules.md"))
+            .scan_for_proposals()
+            .await)
+    }
+
+    pub async fn promote_rule(
+        &self,
+        proposal: &RuleProposal,
+    ) -> Result<RulePromotionReceipt, RulePromotionError> {
+        let _gate = self.promotion_gate.lock().await;
+        let lease = self
+            .lease_generation()
+            .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+        let promoter = RulePromoter::new(lease.memory_store())
+            .with_rules_path(lease.echo_agent_dir().join("learned-rules.md"));
+        let change_log = self.rule_promotion_change_log(&lease)?;
+        let recovered = promoter.reconcile_pending(&change_log).await?;
+        if !recovered.is_empty() {
+            let recovered_snapshot = self.current_or_load_rule_projection(&lease)?;
+            self.publish_rule_projection(recovered_snapshot).await?;
+            self.commit_rule_projection_receipts(&lease, &recovered)
+                .await?;
+        }
+        let effects = promoter.promote_rule(proposal, &change_log).await?;
+        let snapshot = crate::unified_memory::load_instruction_projection_strict(
+            lease.echo_agent_dir().parent(),
+        )
+        .map_err(|error| RulePromotionError::Projection(error.to_string()))?;
+        self.publish_rule_projection(snapshot).await?;
+        let receipt = promoter.commit_projection(&effects).await?;
+        self.clear_pending_rule_projection();
+        let primary = self
+            .rule_projection_targets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .primary
+            .clone()
+            .ok_or_else(|| {
+                RulePromotionError::Projection(
+                    "primary rule projection target is not bound during promotion".to_string(),
+                )
+            })?;
+        super::fire_evolution_hook(
+            &primary,
+            echo_core::hooks::HookEvent::RulePromoted,
+            &receipt.memory_key,
+        )
+        .await;
+        Ok(receipt)
+    }
+
+    async fn reconcile_rule_promotions_for_lease(
+        &self,
+        lease: &ReviewGenerationLease,
+    ) -> Result<Vec<RulePromotionReceipt>, RulePromotionError> {
+        let promoter = RulePromoter::new(lease.memory_store())
+            .with_rules_path(lease.echo_agent_dir().join("learned-rules.md"));
+        let change_log = self.rule_promotion_change_log(lease)?;
+        promoter.reconcile_pending(&change_log).await
+    }
+
+    async fn commit_rule_projection_receipts(
+        &self,
+        lease: &ReviewGenerationLease,
+        receipts: &[RulePromotionReceipt],
+    ) -> Result<(), RulePromotionError> {
+        if receipts.is_empty() {
+            return Ok(());
+        }
+        let promoter = RulePromoter::new(lease.memory_store())
+            .with_rules_path(lease.echo_agent_dir().join("learned-rules.md"));
+        for receipt in receipts {
+            promoter.commit_projection(receipt).await?;
+        }
+        Ok(())
+    }
+
+    fn rule_promotion_change_log(
+        &self,
+        lease: &ReviewGenerationLease,
+    ) -> Result<echo_agent::evolution::JsonlChangeLog, RulePromotionError> {
+        echo_agent::evolution::JsonlChangeLog::new(
+            lease
+                .echo_agent_dir()
+                .join("evolution")
+                .join("change-log.jsonl"),
+        )
+        .map_err(|error| RulePromotionError::Audit(error.to_string()))
+    }
+
+    fn current_or_load_rule_projection(
+        &self,
+        lease: &ReviewGenerationLease,
+    ) -> Result<crate::unified_memory::InstructionProjectionSnapshot, RulePromotionError> {
+        let pending = self
+            .binding
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending_rule_projection
+            .clone();
+        match pending {
+            Some(snapshot) => Ok(snapshot),
+            None => crate::unified_memory::load_instruction_projection_strict(
+                lease.echo_agent_dir().parent(),
+            )
+            .map_err(|error| RulePromotionError::Projection(error.to_string())),
+        }
+    }
+
+    fn clear_pending_rule_projection(&self) {
+        let mut state = self
+            .binding
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_rule_projection = None;
+        state.pending_rule_receipts.clear();
+    }
+
+    pub(crate) fn has_pending_rule_projection(&self) -> bool {
+        self.binding
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending_rule_projection
+            .is_some()
+    }
+
+    fn has_rule_projection_primary(&self) -> bool {
+        self.rule_projection_targets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .primary
+            .is_some()
+    }
+
+    async fn publish_rule_projection(
+        &self,
+        snapshot: crate::unified_memory::InstructionProjectionSnapshot,
+    ) -> Result<(), RulePromotionError> {
+        self.publish_rule_projection_with_transition(snapshot, None)
+            .await
+    }
+
+    async fn publish_rule_projection_with_transition(
+        &self,
+        snapshot: crate::unified_memory::InstructionProjectionSnapshot,
+        workspace_transition: Option<&crate::agent_pool::AgentPoolWorkspaceTransition<'_>>,
+    ) -> Result<(), RulePromotionError> {
+        let targets = {
+            let targets = self
+                .rule_projection_targets
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (targets.primary.clone(), targets.pool.clone())
+        };
+        let primary = targets.0.ok_or_else(|| {
+            RulePromotionError::Projection(
+                "primary rule projection target is not bound during bootstrap".to_string(),
+            )
+        })?;
+        let primary_execution = primary
+            .read(|agent| Arc::clone(agent.execution_mutex()))
+            .await;
+        let _primary_execution_guard = primary_execution.lock_owned().await;
+        let primary_owner = Arc::clone(primary.inner());
+        let mut primary_agent = primary_owner.write_owned().await;
+        let pool = targets.1.and_then(|pool| pool.upgrade());
+        let mut pool_publication = match (pool.as_ref(), workspace_transition) {
+            (Some(pool), None) => Some(
+                pool.begin_instruction_publication()
+                    .await
+                    .map_err(RulePromotionError::Projection)?,
+            ),
+            _ => None,
+        };
+        #[cfg(test)]
+        if self.take_rule_projection_fault(RuleProjectionFault::Primary) {
+            return Err(RulePromotionError::Projection(
+                "injected primary instruction projection failure".to_string(),
+            ));
+        }
+        #[cfg(test)]
+        if self.take_rule_projection_fault(RuleProjectionFault::Pool) {
+            return Err(RulePromotionError::Projection(
+                "injected pool instruction projection failure".to_string(),
+            ));
+        }
+        if let Some(publication) = pool_publication.as_mut()
+            && let Err(error) = publication.prepare(snapshot.clone()).await
+        {
+            return Err(RulePromotionError::Projection(error));
+        }
+        if let (Some(pool), Some(transition)) = (pool.as_ref(), workspace_transition) {
+            transition
+                .publish_instruction_snapshot(pool, snapshot.clone())
+                .await
+                .map_err(RulePromotionError::Projection)?;
+        }
+        crate::unified_memory::apply_instruction_projection_snapshot(&mut primary_agent, &snapshot)
+            .await;
+        if workspace_transition.is_none()
+            && let Some(publication) = pool_publication
+        {
+            publication
+                .commit()
+                .await
+                .map_err(RulePromotionError::Projection)?;
+        }
+        *self
+            .rule_projection_snapshot
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn take_rule_projection_fault(&self, expected: RuleProjectionFault) -> bool {
+        let mut fault = self
+            .rule_projection_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *fault == Some(expected) {
+            *fault = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_pool_projection_fault_for_test(&self) {
+        *self
+            .rule_projection_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuleProjectionFault::Pool);
     }
 
     /// Attach the runtime observer used by memory, candidate and health paths.
@@ -499,6 +914,11 @@ impl ReviewIntegration {
                     .last_trigger_delivery_error
                     .clone()
                     .unwrap_or_else(|| "unknown trigger delivery failure".to_string()),
+            });
+        }
+        if state.pending_rule_projection.is_some() {
+            return Err(ReviewGenerationError::ProjectionSettlement {
+                pending_receipts: state.pending_rule_receipts.len(),
             });
         }
         let generation = state
@@ -613,7 +1033,24 @@ impl ReviewIntegration {
     /// Creates framework plumbing through `MemoryRuntimeIntegrationBuilder` on
     /// each call. Reviews are manual by default, so this overhead is negligible.
     async fn run_review_inner(&self) -> Result<ReviewReport, String> {
+        let _promotion_gate = self.promotion_gate.lock().await;
         let lease = self.lease_generation().map_err(|error| error.to_string())?;
+        let pending = self
+            .reconcile_rule_promotions_for_lease(&lease)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !pending.is_empty() || self.has_rule_projection_primary() {
+            let snapshot = self
+                .current_or_load_rule_projection(&lease)
+                .map_err(|error| error.to_string())?;
+            self.publish_rule_projection(snapshot)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.commit_rule_projection_receipts(&lease, &pending)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.clear_pending_rule_projection();
+        }
         let echo_agent_dir = lease.receipt.binding.echo_agent_dir.clone();
         let store = lease.receipt.binding.store.clone();
         let typed_store = TypedMemoryStore::new(store.clone());
@@ -1054,6 +1491,38 @@ mod tests {
     use futures::future::BoxFuture;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    fn projection_test_agent() -> Result<crate::agent_handle::AgentHandle, String> {
+        use echo_agent::agent::ReactAgentBuilder;
+        use echo_agent::testing::MockLlmClient;
+
+        let model = Arc::new(MockLlmClient::new().with_model_name("projection-test"));
+        ReactAgentBuilder::new()
+            .model("projection-test")
+            .llm_client(model)
+            .build()
+            .map(crate::agent_handle::AgentHandle::new)
+            .map_err(|error| error.to_string())
+    }
+
+    async fn projected_instruction_text(handle: &crate::agent_handle::AgentHandle) -> String {
+        let context = handle.read(|agent| agent.context().clone()).await;
+        context
+            .lock()
+            .await
+            .messages()
+            .iter()
+            .filter_map(|message| message.content.as_text_ref())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn inject_projection_fault(integration: &ReviewIntegration, fault: RuleProjectionFault) {
+        *integration
+            .rule_projection_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fault);
+    }
+
     struct CountingEvolutionObserver {
         writes: Arc<AtomicUsize>,
     }
@@ -1216,6 +1685,263 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projection_failure_preserves_the_previous_primary_and_pool_generation()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace");
+        let echo_dir = root.join(".eko");
+        std::fs::create_dir_all(root.join(".git")).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&echo_dir).map_err(|error| error.to_string())?;
+        let rules_path = echo_dir.join("learned-rules.md");
+        std::fs::write(&rules_path, "old projection").map_err(|error| error.to_string())?;
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let integration = Arc::new(ReviewIntegration::new(
+            ReviewConfig::default(),
+            echo_dir,
+            store,
+        ));
+        let primary = projection_test_agent()?;
+        integration.bind_rule_projection_primary(primary.clone());
+        integration
+            .initialize_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(primary.clone(), None, None, 4, false).await,
+        );
+        let existing = pool
+            .acquire("existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(existing);
+        integration
+            .bind_rule_projection_pool(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        std::fs::write(&rules_path, "new projection").map_err(|error| error.to_string())?;
+        inject_projection_fault(&integration, RuleProjectionFault::Pool);
+        assert!(integration.initialize_rule_promotions().await.is_err());
+        assert!(
+            projected_instruction_text(&primary)
+                .await
+                .contains("old projection")
+        );
+        let existing = pool
+            .acquire("existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            projected_instruction_text(&existing.agent())
+                .await
+                .contains("old projection")
+        );
+        drop(existing);
+
+        integration
+            .initialize_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            projected_instruction_text(&primary)
+                .await
+                .contains("new projection")
+        );
+        let future = pool
+            .acquire("future")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            projected_instruction_text(&future.agent())
+                .await
+                .contains("new projection")
+        );
+        let primary_revision = integration
+            .rule_projection_snapshot
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|snapshot| snapshot.revision().to_string())
+            .ok_or_else(|| "primary projection revision missing".to_string())?;
+        assert_eq!(
+            pool.instruction_projection_revision_for_test().await,
+            Some(primary_revision)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_rebind_hands_instruction_generation_off_without_reopening_pool_admission()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root_a = temp.path().join("workspace-a");
+        let root_b = temp.path().join("workspace-b");
+        for root in [&root_a, &root_b] {
+            std::fs::create_dir_all(root.join(".git")).map_err(|error| error.to_string())?;
+            std::fs::create_dir_all(root.join(".eko")).map_err(|error| error.to_string())?;
+        }
+        std::fs::write(root_a.join(".eko/learned-rules.md"), "GENERATION_A")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(root_b.join(".eko/learned-rules.md"), "GENERATION_B")
+            .map_err(|error| error.to_string())?;
+        let store_a = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let store_b = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let integration = Arc::new(ReviewIntegration::new(
+            ReviewConfig::default(),
+            root_a.join(".eko"),
+            store_a,
+        ));
+        let primary = projection_test_agent()?;
+        integration.bind_rule_projection_primary(primary.clone());
+        integration
+            .initialize_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(primary.clone(), None, None, 4, false).await,
+        );
+        integration
+            .bind_rule_projection_pool(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let existing = pool
+            .acquire("existing")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(existing);
+
+        let mut memory_permit = integration
+            .prepare_rebind(root_b.join(".eko"), store_b)
+            .map_err(|error| error.to_string())?
+            .reconcile_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut pool_transition = pool
+            .preflight_workspace_transition()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(memory_permit.commit().generation, 1);
+        pool_transition.commit().await;
+        integration
+            .settle_rebind_rule_promotions(Some(&pool_transition))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(pool.transition_admission_closed_for_test());
+        assert!(
+            projected_instruction_text(&primary)
+                .await
+                .contains("GENERATION_B")
+        );
+        drop(pool_transition);
+        drop(memory_permit);
+
+        let future = pool
+            .acquire("future")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            projected_instruction_text(&future.agent())
+                .await
+                .contains("GENERATION_B")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn promotion_receipt_commits_only_after_projection_retry() -> Result<(), String> {
+        use echo_agent::memory::{MemoryMeta, MemorySource, MemoryType};
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace");
+        let echo_dir = root.join(".eko");
+        std::fs::create_dir_all(root.join(".git")).map_err(|error| error.to_string())?;
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        TypedMemoryStore::new(store.clone())
+            .put_typed(
+                echo_agent::evolution::layer::WARM_NAMESPACE,
+                "promotion-projection",
+                "Run the canonical projection transaction",
+                MemoryMeta::new(
+                    MemoryType::ProjectFact,
+                    MemorySource::ExplicitSave,
+                    "projection-test",
+                )
+                .with_confidence(0.99),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let integration =
+            ReviewIntegration::new(ReviewConfig::default(), echo_dir.clone(), store.clone());
+        let primary = projection_test_agent()?;
+        integration.bind_rule_projection_primary(primary);
+        integration
+            .initialize_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
+        let pool = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(
+                projection_test_agent()?,
+                None,
+                None,
+                2,
+                false,
+            )
+            .await,
+        );
+        integration
+            .bind_rule_projection_pool(&pool)
+            .await
+            .map_err(|error| error.to_string())?;
+        let proposal = RuleProposal {
+            memory_key: "promotion-projection".to_string(),
+            namespace: echo_agent::evolution::layer::WARM_NAMESPACE
+                .iter()
+                .map(|part| (*part).to_string())
+                .collect(),
+            rule_text: "- **Project fact**: Run the canonical projection transaction".to_string(),
+            confidence: 0.99,
+            memory_type: MemoryType::ProjectFact,
+            proposed_at: chrono::Utc::now(),
+            reason: "projection transaction test".to_string(),
+        };
+
+        inject_projection_fault(&integration, RuleProjectionFault::Pool);
+        assert!(integration.promote_rule(&proposal).await.is_err());
+        let receipts_dir = echo_dir.join("evolution/rule-promotions");
+        let receipt_path = std::fs::read_dir(&receipts_dir)
+            .map_err(|error| error.to_string())?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .ok_or_else(|| "effects receipt was not persisted".to_string())?;
+        let effects: RulePromotionReceipt = serde_json::from_slice(
+            &std::fs::read(&receipt_path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(effects.phase, RulePromotionPhase::EffectsApplied);
+
+        let committed = integration
+            .promote_rule(&proposal)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(committed.phase, RulePromotionPhase::Committed);
+
+        let restarted = ReviewIntegration::new(ReviewConfig::default(), echo_dir, store);
+        let restarted_primary = projection_test_agent()?;
+        restarted.bind_rule_projection_primary(restarted_primary.clone());
+        restarted
+            .initialize_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            projected_instruction_text(&restarted_primary)
+                .await
+                .contains("Run the canonical projection transaction")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn evolution_observer_survives_rebind_and_manager_rebuild() -> Result<(), String> {
         use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
 
@@ -1248,6 +1974,9 @@ mod tests {
         let second_store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
         let mut permit = ri
             .prepare_rebind(temp.path().join("second/.eko"), second_store)
+            .map_err(|error| error.to_string())?
+            .reconcile_rule_promotions()
+            .await
             .map_err(|error| error.to_string())?;
         assert_eq!(permit.commit().generation, 1);
         drop(permit);
@@ -1280,8 +2009,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn binding_snapshot_is_atomic_and_rebind_is_busy_until_settlement() -> Result<(), String> {
+    #[tokio::test]
+    async fn binding_snapshot_is_atomic_and_rebind_is_busy_until_settlement() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let dir_a = temp.path().join("workspace-a/.eko");
         let dir_b = temp.path().join("workspace-b/.eko");
@@ -1307,6 +2037,9 @@ mod tests {
         drop(pass_a);
         let mut permit = integration
             .prepare_rebind(dir_b.clone(), store_b.clone())
+            .map_err(|error| error.to_string())?
+            .reconcile_rule_promotions()
+            .await
             .map_err(|error| error.to_string())?;
         assert!(matches!(
             integration.lease_generation(),
@@ -1369,6 +2102,9 @@ mod tests {
         let store_b = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
         let mut permit = integration
             .prepare_rebind(temp.path().join("workspace-b/.eko"), store_b)
+            .map_err(|error| error.to_string())?
+            .reconcile_rule_promotions()
+            .await
             .map_err(|error| error.to_string())?;
         assert_eq!(permit.commit().generation, 1);
         Ok(())
@@ -1444,7 +2180,7 @@ mod tests {
         drop_release_sender
             .send(())
             .map_err(|error| format!("failed to release background review child: {error}"))?;
-        let mut permit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let next_store =
                     Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
@@ -1457,6 +2193,10 @@ mod tests {
         })
         .await
         .map_err(|_| "background review lease did not settle after child exit".to_string())??;
+        let mut permit = permit
+            .reconcile_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(permit.commit().generation, 1);
         Ok(())
     }
@@ -1699,8 +2439,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn degraded_commit_publishes_next_binding_and_retries_old_root_only() -> Result<(), String> {
+    #[tokio::test]
+    async fn degraded_commit_publishes_next_binding_and_retries_old_root_only() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let dir_a = temp.path().join("workspace-a/.eko");
         let dir_b = temp.path().join("workspace-b/.eko");
@@ -1708,7 +2449,7 @@ mod tests {
         let store_a = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
         let store_b = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
         let integration = ReviewIntegration::new(ReviewConfig::default(), dir_a.clone(), store_a);
-        let mut permit = integration
+        let permit = integration
             .prepare_rebind(dir_b.clone(), store_b.clone())
             .map_err(|error| error.to_string())?;
 
@@ -1734,6 +2475,10 @@ mod tests {
             None,
         );
 
+        let mut permit = permit
+            .reconcile_rule_promotions()
+            .await
+            .map_err(|error| error.to_string())?;
         let receipt = permit.commit();
         assert_eq!(receipt.generation, 1);
         assert_eq!(receipt.pending_old, 1);

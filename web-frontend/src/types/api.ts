@@ -52,7 +52,14 @@ export type ChatRunStatus =
   | 'failed'
   | 'cancelled';
 
-export type ToolExecutionStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
+export type ToolExecutionStatus =
+  | 'running'
+  | 'succeeded'
+  | 'failed'
+  | 'cancelled'
+  | 'timed_out'
+  | 'interrupted'
+  | 'unknown';
 
 export type ToolExecutionOwner =
   | { kind: 'chat'; message_id: string }
@@ -83,6 +90,43 @@ export interface ToolFailure {
   postcondition?: string;
 }
 
+export type ToolInvocationRewrite =
+  | 'intervention_redirect'
+  | 'intervention_arguments'
+  | 'pre_tool_use_hook'
+  | 'approval';
+
+export interface ToolInvocation {
+  requested_name: string;
+  requested_args: unknown;
+  name: string;
+  args: unknown;
+  rewrites?: ToolInvocationRewrite[];
+}
+
+export type ToolResultKind =
+  | { kind_type: 'text' }
+  | { kind_type: 'json' }
+  | { kind_type: 'image'; mime_type: string }
+  | { kind_type: 'table'; columns: string[]; rows: string[][] }
+  | { kind_type: 'diff'; unified_diff: string }
+  | { kind_type: 'file_reference'; path: string }
+  | { kind_type: 'command_output'; exit_code?: number | null }
+  | { kind_type: 'skill_activation'; name: string }
+  | { kind_type: 'structured_error'; error_code: string };
+
+export interface ToolResult {
+  kind: ToolResultKind;
+  success: boolean;
+  output: string;
+  error?: string | null;
+  failure?: ToolFailure | null;
+  data?: unknown | null;
+  truncated: boolean;
+  mime_type?: string | null;
+  metadata: Record<string, string>;
+}
+
 export interface ToolExecution {
   id: string;
   call_id: string;
@@ -100,11 +144,9 @@ export interface ToolExecution {
 
 export interface ToolExecutionDetailManifest {
   id: string;
-  args_full: unknown;
+  invocation: ToolInvocation;
   status: ToolExecutionStatus;
-  failure?: ToolFailure | null;
-  metadata: Record<string, string>;
-  truncated: boolean;
+  result?: ToolResult | null;
   output_bytes: number;
 }
 
@@ -181,6 +223,148 @@ export type ChatEvent = {
   | { type: 'interrupt_prompt'; run_id: string; goal: string; new_message: string }
   | { type: 'done' }
 );
+
+export type AgentFailureCategory =
+  | 'llm'
+  | 'tool'
+  | 'parse'
+  | 'agent'
+  | 'config'
+  | 'mcp'
+  | 'memory'
+  | 'sandbox'
+  | 'runtime_state'
+  | 'channel'
+  | 'io'
+  | 'other';
+
+export type AgentTerminalKind = 'failed' | 'cancelled' | 'timed_out' | 'permission_denied';
+
+export interface AgentFailure {
+  category: AgentFailureCategory;
+  terminal_kind: AgentTerminalKind;
+  retryable: boolean;
+  code: string;
+  http_status: number | null;
+  message: string;
+}
+
+export type ToolStreamEvent =
+  | { event_type: 'progress'; message: string; percent: number | null }
+  | { event_type: 'output'; channel: 'stdout' | 'stderr' | 'log'; chunk: string }
+  | ({ event_type: 'complete' } & ToolResult);
+
+export type AgentEvent =
+  | { type: 'token'; data: string }
+  | { type: 'think_start' }
+  | { type: 'think_end'; data: { prompt_tokens: number; completion_tokens: number } }
+  | {
+      type: 'llm_usage';
+      data: {
+        model: string;
+        prompt_tokens: number;
+        completion_tokens: number;
+        total_tokens: number;
+        cached_prompt_tokens: number;
+        cache_creation_prompt_tokens: number;
+        usage_reported: boolean;
+      };
+    }
+  | { type: 'budget_decision'; data: Record<string, unknown> }
+  | { type: 'tool_call'; data: { call_id: string; invocation: ToolInvocation } }
+  | {
+      type: 'tool_stream';
+      data: { call_id: string; name: string; event: ToolStreamEvent };
+    }
+  | { type: 'tool_result'; data: { call_id: string; name: string; result: ToolResult } }
+  | { type: 'tool_batch_start'; data: { tool_count: number } }
+  | { type: 'tool_batch_end' }
+  | { type: 'guard_triggered'; data: { guard: string; blocked: boolean } }
+  | { type: 'memory_recalled'; data: { count: number } }
+  | {
+      type: 'context_compressed';
+      data: {
+        before_count: number;
+        after_count: number;
+        before_tokens: number;
+        after_tokens: number;
+      };
+    }
+  | { type: 'chart'; data: { spec: unknown } }
+  | { type: 'error'; data: { source: string; message: string; failure: AgentFailure } }
+  | { type: 'safety_notice'; data: Record<string, unknown> }
+  | { type: 'parameter_error'; data: Record<string, unknown> }
+  | { type: 'final_answer'; data: string }
+  | { type: 'cancelled' };
+
+export interface AgentEventEnvelope {
+  schema_version: number;
+  event_id: string;
+  content_hash: string;
+  sequence: number;
+  stream_id: string;
+  conversation_id: string | null;
+  run_id: string | null;
+  turn_id: string;
+  message_id: string | null;
+  execution_id: string | null;
+  parent_event_id: string | null;
+  timestamp: string;
+  payload: AgentEvent;
+}
+
+export type ChatDriverEvent =
+  | { source: 'agent'; event: AgentEventEnvelope }
+  | { source: 'execution'; event: Record<string, unknown> }
+  | { source: 'turn_status'; event: { status: ChatRunStatus } }
+  | { source: 'execution_path'; event: { requested_mode: string; observed_path: string } }
+  | { source: 'interrupt'; event: { run_id: string; goal: string; new_message: string } }
+  | {
+      source: 'approval_request';
+      event: { request_id: string; tool_name: string; args: unknown; prompt: string };
+    }
+  | { source: 'input_request'; event: { request_id: string; prompt: string } }
+  | {
+      source: 'selection_request';
+      event: {
+        request_id: string;
+        prompt: string;
+        options: string[];
+        task_id: string | null;
+        context: unknown;
+        phase: string | null;
+      };
+    }
+  | {
+      source: 'context_compressed';
+      event: {
+        before_count: number;
+        after_count: number;
+        before_tokens: number;
+        after_tokens: number;
+      };
+    };
+
+export interface ChatEventEnvelope {
+  schema_version: number;
+  event_id: string;
+  content_hash: string;
+  sequence: number;
+  stream_id: string;
+  conversation_id: string | null;
+  turn_id: string;
+  message_id: string;
+  timestamp: string;
+  payload: ChatDriverEvent;
+}
+
+export interface ChatEventReplay {
+  events: ChatEventEnvelope[];
+  retained_earliest_cursor: number | null;
+  returned_earliest_cursor: number | null;
+  latest_cursor: number;
+  truncated: boolean;
+}
 
 /** Product projection emitted by the Tauri skills panel commands. */
 export type TauriSkillInfo = Pick<GeneratedSkillInfo, 'name' | 'description'> & {

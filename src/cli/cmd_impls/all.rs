@@ -323,8 +323,14 @@ async fn cmd_attach(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         return CommandOutcome::Continue;
     }
     if value.trim().eq_ignore_ascii_case("clear") {
-        ctx.staged_attachments.lock().await.clear();
-        println!("Cleared staged attachments.");
+        let attachments = {
+            let mut staged = ctx.staged_attachments.lock().await;
+            std::mem::take(&mut *staged)
+        };
+        match echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments) {
+            Ok(()) => println!("Cleared staged attachments."),
+            Err(error) => println!("Cleared attachment refs, but staging cleanup failed: {error}"),
+        }
         return CommandOutcome::Continue;
     }
     let expanded = shellexpand::tilde(value.trim()).into_owned();

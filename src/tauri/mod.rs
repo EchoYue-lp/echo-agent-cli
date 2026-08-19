@@ -26,10 +26,51 @@ fn task_id_from_subagent_execution_id(execution_id: &str, run_id: &str) -> Optio
         .then(|| task_id.to_string())
 }
 
+fn emit_tool_projection_updates(
+    app: &tauri::AppHandle,
+    updates: &[echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionUpdate],
+) {
+    use echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionKind;
+
+    for update in updates {
+        commands::chat::emit_tool_execution_summary(
+            app,
+            match update.kind {
+                ToolExecutionProjectionKind::Started => "started",
+                ToolExecutionProjectionKind::Finished => "finished",
+            },
+            &update.agent,
+            &update.summary,
+        );
+    }
+}
+
+fn terminate_subagent_tools(
+    app: &tauri::AppHandle,
+    projector: &echo_agent_app_core::tool_execution_projection::ToolExecutionProjector,
+    subagent_run_id: Option<&str>,
+    status: echo_agent_app_core::tool_execution::ToolExecutionStatus,
+    agent: &str,
+) {
+    let Some(subagent_run_id) = subagent_run_id else {
+        tracing::error!(%agent, "subagent terminal event is missing a stable execution id");
+        return;
+    };
+    match projector.terminate_subagent(subagent_run_id, status, agent) {
+        Ok(updates) => emit_tool_projection_updates(app, &updates),
+        Err(error) => {
+            tracing::warn!(%error, %subagent_run_id, "failed to close orphaned subagent tools");
+        }
+    }
+}
+
+fn framework_subagent_event_needs_app_projection(run_id: Option<&str>) -> bool {
+    run_id.is_none()
+}
+
 pub fn build_tauri_app(
     app_state: Arc<AppState>,
     browser_runtime: Arc<BrowserRuntime>,
-    terminal_manager: Arc<terminal::TerminalManager>,
     bridge_supervisor: Arc<TauriBridgeSupervisor>,
 ) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
@@ -41,7 +82,6 @@ pub fn build_tauri_app(
         .manage(TauriState::new(
             app_state,
             browser_runtime,
-            terminal_manager,
             bridge_supervisor,
         ))
         .invoke_handler(tauri::generate_handler![
@@ -211,6 +251,7 @@ pub fn build_tauri_app(
             commands::chat::send_chat_message,
             commands::chat::steer_chat_message,
             commands::chat::get_active_chat_turn,
+            commands::chat::replay_chat_events,
             commands::chat::cancel_chat,
             commands::chat::send_approval_response,
             commands::chat::send_input_response,
@@ -310,6 +351,14 @@ pub fn build_tauri_app(
                 window.open_devtools();
             }
 
+            let terminal_state = app.state::<TauriState>();
+            let terminal_bridge = terminal::spawn_event_bridge(
+                app.handle().clone(),
+                terminal_state.app_state.terminal.clone(),
+                terminal_state.bridge_supervisor.cancellation_token(),
+            );
+            terminal_state.bridge_supervisor.track(terminal_bridge);
+
             let browser_app_handle = app.handle().clone();
             let mut browser_events = app.state::<TauriState>().browser_runtime.subscribe();
             let browser_bridge_cancel = app
@@ -374,6 +423,12 @@ pub fn build_tauri_app(
                 let agent = state.app_state.connection.agent.clone();
                 let task_runtime_store = state.app_state.tasks.runtime.clone();
                 let tool_executions = state.app_state.storage.tool_executions.clone();
+                let tool_projector = Arc::new(
+                    echo_agent_app_core::tool_execution_projection::ToolExecutionProjector::new(
+                        tool_executions,
+                        task_runtime_store.clone(),
+                    ),
+                );
                 let supervisor = state.bridge_supervisor.clone();
                 let cancel = supervisor.cancellation_token();
                 let bridge = tokio::spawn(async move {
@@ -388,10 +443,6 @@ pub fn build_tauri_app(
                         std::collections::HashMap::<String, u64>::new();
                     let mut subagent_context_by_execution =
                         std::collections::HashMap::<String, Option<String>>::new();
-                    let mut active_tool_ids_by_execution = std::collections::HashMap::<
-                        String,
-                        std::collections::HashSet<String>,
-                    >::new();
                     loop {
                         let event = tokio::select! {
                             _ = cancel.cancelled() => break,
@@ -425,45 +476,47 @@ pub fn build_tauri_app(
                                         run_id,
                                         ..
                                     } => {
-                                        let subagent_run_id = execution_id
-                                            .clone()
-                                            .unwrap_or_else(|| format!("{agent}:unknown"));
-                                        let conversation_id = subagent_context_by_execution
-                                            .get(&subagent_run_id)
-                                            .cloned()
-                                            .flatten()
-                                            .or_else(|| {
-                                                run_id.as_deref().and_then(|run_id| {
-                                                    task_runtime_store
-                                                        .as_ref()
-                                                        .and_then(|store| store.get_run(run_id).ok())
-                                                        .flatten()
-                                                        .map(|run| run.conversation_id)
-                                                })
-                                            });
-                                        let owner = echo_agent_app_core::tool_execution::ToolExecutionOwner::Subagent {
-                                            subagent_run_id: subagent_run_id.clone(),
+                                        if !framework_subagent_event_needs_app_projection(run_id.as_deref()) {
+                                            continue;
+                                        }
+                                        let Some(subagent_run_id) = execution_id.as_deref() else {
+                                            tracing::error!(%call_id, name = %invocation.name, "subagent tool start is missing a stable execution id");
+                                            continue;
                                         };
-                                        match tool_executions.start(
-                                            owner,
+                                        let mut conversation_id = subagent_context_by_execution
+                                            .get(subagent_run_id)
+                                            .cloned()
+                                            .flatten();
+                                        if conversation_id.is_none()
+                                            && let (Some(run_id), Some(store)) =
+                                                (run_id.as_deref(), task_runtime_store.as_ref())
+                                        {
+                                            match store.get_run(run_id) {
+                                                Ok(Some(run)) => {
+                                                    conversation_id = Some(run.conversation_id)
+                                                }
+                                                Ok(None) => {
+                                                    tracing::error!(%run_id, %call_id, "subagent tool start references a missing TaskRuntime run");
+                                                    continue;
+                                                }
+                                                Err(error) => {
+                                                    tracing::error!(%error, %run_id, %call_id, "failed to resolve subagent tool conversation");
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        match tool_projector.project_subagent_started(
+                                            subagent_run_id,
                                             conversation_id.as_deref(),
                                             run_id.as_deref(),
                                             call_id,
-                                            &invocation.name,
-                                            &invocation.args,
+                                            invocation,
+                                            agent,
                                         ) {
-                                            Ok(summary) => {
-                                                active_tool_ids_by_execution
-                                                    .entry(subagent_run_id)
-                                                    .or_default()
-                                                    .insert(call_id.clone());
-                                                commands::chat::emit_tool_execution_summary(
-                                                    &app_handle,
-                                                    "started",
-                                                    agent,
-                                                    &summary,
-                                                );
-                                            }
+                                            Ok(updates) => emit_tool_projection_updates(
+                                                &app_handle,
+                                                &updates,
+                                            ),
                                             Err(error) => {
                                                 tracing::warn!(%error, %call_id, name = %invocation.name, "failed to persist subagent tool start");
                                             }
@@ -473,42 +526,30 @@ pub fn build_tauri_app(
                                     SubagentEvent::DispatchToolCompleted {
                                         agent,
                                         call_id,
+                                        name,
                                         result,
                                         execution_id,
+                                        run_id,
                                         ..
                                     } => {
-                                        let subagent_run_id = execution_id
-                                            .clone()
-                                            .unwrap_or_else(|| format!("{agent}:unknown"));
-                                        let owner = echo_agent_app_core::tool_execution::ToolExecutionOwner::Subagent {
-                                            subagent_run_id: subagent_run_id.clone(),
+                                        if !framework_subagent_event_needs_app_projection(run_id.as_deref()) {
+                                            continue;
+                                        }
+                                        let Some(subagent_run_id) = execution_id.as_deref() else {
+                                            tracing::error!(%call_id, %name, "subagent tool result is missing a stable execution id");
+                                            continue;
                                         };
-                                        match tool_executions.finish(
-                                            &owner,
+                                        match tool_projector.project_subagent_completed(
+                                            subagent_run_id,
                                             call_id,
-                                            result.success,
-                                            result.error.as_deref().unwrap_or(&result.output),
-                                            result.failure.clone(),
-                                            result.metadata.clone(),
-                                            result.truncated,
+                                            name,
+                                            result,
+                                            agent,
                                         ) {
-                                            Ok(summary) => {
-                                                if let Some(call_ids) = active_tool_ids_by_execution
-                                                    .get_mut(&subagent_run_id)
-                                                {
-                                                    call_ids.remove(call_id);
-                                                    if call_ids.is_empty() {
-                                                        active_tool_ids_by_execution
-                                                            .remove(&subagent_run_id);
-                                                    }
-                                                }
-                                                commands::chat::emit_tool_execution_summary(
-                                                    &app_handle,
-                                                    "finished",
-                                                    agent,
-                                                    &summary,
-                                                );
-                                            }
+                                            Ok(updates) => emit_tool_projection_updates(
+                                                &app_handle,
+                                                &updates,
+                                            ),
                                             Err(error) => {
                                                 tracing::warn!(%error, %call_id, "failed to persist subagent tool completion");
                                             }
@@ -518,47 +559,79 @@ pub fn build_tauri_app(
                                     SubagentEvent::DispatchCompleted {
                                         execution_id,
                                         agent,
+                                        run_id,
                                         ..
+                                    } if framework_subagent_event_needs_app_projection(
+                                        run_id.as_deref(),
+                                    ) => {
+                                        terminate_subagent_tools(
+                                            &app_handle,
+                                            &tool_projector,
+                                            execution_id.as_deref(),
+                                            echo_agent_app_core::tool_execution::ToolExecutionStatus::Unknown,
+                                            agent,
+                                        );
                                     }
-                                    | SubagentEvent::DispatchFailed {
+                                    SubagentEvent::DispatchFailed {
                                         execution_id,
                                         agent,
+                                        status,
+                                        run_id,
                                         ..
-                                    }
-                                    | SubagentEvent::DispatchCancelled {
-                                        execution_id,
-                                        agent,
-                                        ..
-                                    } => {
-                                        if let Some(subagent_run_id) = execution_id {
-                                            let owner = echo_agent_app_core::tool_execution::ToolExecutionOwner::Subagent {
-                                                subagent_run_id: subagent_run_id.clone(),
-                                            };
-                                            if let Some(call_ids) = active_tool_ids_by_execution
-                                                .remove(subagent_run_id)
-                                            {
-                                                for call_id in call_ids {
-                                                    match tool_executions.cancel(&owner, &call_id) {
-                                                        Ok(summary) => {
-                                                            commands::chat::emit_tool_execution_summary(
-                                                                &app_handle,
-                                                                "cancelled",
-                                                                agent,
-                                                                &summary,
-                                                            );
-                                                        }
-                                                        Err(error) => {
-                                                            tracing::warn!(%error, %call_id, "failed to cancel persisted subagent tool");
-                                                        }
-                                                    }
-                                                }
+                                    } if framework_subagent_event_needs_app_projection(
+                                        run_id.as_deref(),
+                                    ) => {
+                                        let tool_status = match *status {
+                                            echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                                                echo_agent_app_core::tool_execution::ToolExecutionStatus::Cancelled
                                             }
-                                        }
+                                            echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                                                echo_agent_app_core::tool_execution::ToolExecutionStatus::TimedOut
+                                            }
+                                            echo_agent::agent::subagent::SubagentStatus::Completed
+                                            | echo_agent::agent::subagent::SubagentStatus::Failed => {
+                                                echo_agent_app_core::tool_execution::ToolExecutionStatus::Unknown
+                                            }
+                                        };
+                                        terminate_subagent_tools(
+                                            &app_handle,
+                                            &tool_projector,
+                                            execution_id.as_deref(),
+                                            tool_status,
+                                            agent,
+                                        );
+                                    }
+                                    SubagentEvent::DispatchCancelled {
+                                        execution_id,
+                                        agent,
+                                        run_id,
+                                        ..
+                                    } if framework_subagent_event_needs_app_projection(
+                                        run_id.as_deref(),
+                                    ) => {
+                                        terminate_subagent_tools(
+                                            &app_handle,
+                                            &tool_projector,
+                                            execution_id.as_deref(),
+                                            echo_agent_app_core::tool_execution::ToolExecutionStatus::Cancelled,
+                                            agent,
+                                        );
                                     }
                                     _ => {}
                                 }
                                 let (event_type, execution_id, run_id, agent_name, extra) =
                                     match event.as_ref() {
+                                        SubagentEvent::DispatchStarted { run_id, .. }
+                                        | SubagentEvent::DispatchIsolationObserved { run_id, .. }
+                                        | SubagentEvent::DispatchCompleted { run_id, .. }
+                                        | SubagentEvent::DispatchFailed { run_id, .. }
+                                        | SubagentEvent::DispatchCancelled { run_id, .. }
+                                            if !framework_subagent_event_needs_app_projection(
+                                                run_id.as_deref(),
+                                            ) =>
+                                        {
+                                            continue;
+                                        }
                                         SubagentEvent::DispatchStarted {
                                             parent: _,
                                             agent,
@@ -783,7 +856,6 @@ pub fn build_tauri_app(
                                 ) {
                                     subagent_context_by_execution.remove(&subagent_run_id_owned);
                                     usage_sequence_by_execution.remove(&subagent_run_id_owned);
-                                    active_tool_ids_by_execution.remove(&subagent_run_id_owned);
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -802,7 +874,17 @@ pub fn build_tauri_app(
 
 #[cfg(test)]
 mod tests {
-    use super::task_id_from_subagent_execution_id;
+    use super::{
+        framework_subagent_event_needs_app_projection, task_id_from_subagent_execution_id,
+    };
+
+    #[test]
+    fn task_runtime_subagent_tools_have_only_the_exec_event_projector() {
+        assert!(!framework_subagent_event_needs_app_projection(Some(
+            "run-1"
+        )));
+        assert!(framework_subagent_event_needs_app_projection(None));
+    }
 
     #[test]
     fn execution_attempt_keeps_full_identity_and_extracts_only_the_task_join_key() {

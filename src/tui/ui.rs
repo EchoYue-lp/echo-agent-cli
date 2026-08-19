@@ -32,6 +32,10 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 /// ```
 pub fn draw(f: &mut Frame, app: &TuiApp) {
     let size = f.area();
+    if app.active_terminal_id.is_some() {
+        draw_terminal(f, app, size);
+        return;
+    }
 
     // Conditionally show task strip below input when there are active parallel tasks.
     let task_strip_rows = app.parallel_tasks.len().min(5) as u16;
@@ -101,6 +105,37 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
 
     // ── Approval card (inline overlay, bottom of chat area) ────────────
     render_approval_card(f, app, body_area);
+}
+
+fn draw_terminal(f: &mut Frame, app: &TuiApp, size: Rect) {
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(4)])
+        .split(size);
+    let Some(status_area) = areas.first().copied() else {
+        return;
+    };
+    let Some(terminal_area) = areas.get(1).copied() else {
+        return;
+    };
+    StatusBar.render(f, status_area, app);
+
+    let terminal_id = app.active_terminal_id.as_deref().unwrap_or("terminal");
+    let stripped = strip_ansi_escapes::strip(&app.terminal_output);
+    let content = String::from_utf8_lossy(&stripped).into_owned();
+    let visible_rows = terminal_area.height.saturating_sub(2);
+    let line_count = u16::try_from(content.lines().count()).unwrap_or(u16::MAX);
+    let scroll = line_count.saturating_sub(visible_rows);
+    let terminal = Paragraph::new(content)
+        .block(
+            Block::default()
+                .title(format!(" Terminal: {terminal_id} (Esc to detach) "))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(app.theme.peach)),
+        )
+        .scroll((scroll, 0));
+    f.render_widget(terminal, terminal_area);
 }
 
 /// Render the approval request card as an inline overlay at the bottom of the chat area.

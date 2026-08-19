@@ -12,14 +12,14 @@
 //! echo-agent-cli --model claude-sonnet-4-6
 //! ```
 
-#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
+#[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 use echo_agent::config;
-#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
+#[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 use echo_agent_cli::cli;
-#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
+#[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 use echo_agent_cli::infra;
 
-#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
+#[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 use clap::Parser;
 
 // ── 主入口 ─────────────────────────────────────────────────────
@@ -31,7 +31,7 @@ use clap::Parser;
 /// because `drive_chat` takes `Option<&TaskRuntimeStore>` (normal-only callers
 /// pass `None`). Headless modes support complex tasks (TUI/GUI parity,
 /// AGENTS.md), so they always provide a store.
-#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
+#[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 fn build_task_runtime_store_for_headless()
 -> Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>> {
     let store = match echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new() {
@@ -74,9 +74,15 @@ async fn main() -> anyhow::Result<()> {
 
     // Tauri CLI builds the package-name binary (`echo-agent-cli`) and then
     // bundles/renames it. In a GUI-only build, route this binary to the
-    // desktop runtime so the packaged app does not start the TUI path.
+    // desktop runtime unless the caller explicitly selected the canonical
+    // non-interactive JSONL surface.
     #[cfg(all(feature = "gui", not(feature = "tui")))]
-    return echo_agent_cli::tauri::desktop::run_desktop_entry().await;
+    {
+        if process_args_request_jsonl(std::env::args_os()) {
+            return run_tui_or_cli_entry().await;
+        }
+        return echo_agent_cli::tauri::desktop::run_desktop_entry().await;
+    }
 
     #[cfg(feature = "tui")]
     {
@@ -94,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
+#[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     // 解析命令行参数
     let args = cli::Args::parse();
@@ -121,19 +127,26 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         echo_agent_app_core::webhook::WebhookEmitter::from_config(&app_config),
     );
 
-    let is_tui_entry = args.tui || (!args.web && !args.cli && !args.channels);
+    let is_tui_entry =
+        args.tui || (!args.web && !args.cli && !args.channels && args.jsonl.is_none());
 
     // 初始化日志。默认用户入口是 TUI，日志必须写入文件，避免污染全屏界面。
     #[cfg(feature = "tui")]
     if is_tui_entry {
         infra::init_logging_for_tui(&app_config.logging.level);
+    } else if args.jsonl.is_some() {
+        infra::init_logging_for_machine_output(&app_config.logging.level);
     } else {
         infra::init_logging(&app_config.logging.level);
     }
 
     #[cfg(not(feature = "tui"))]
     {
-        infra::init_logging(&app_config.logging.level);
+        if args.jsonl.is_some() {
+            infra::init_logging_for_machine_output(&app_config.logging.level);
+        } else {
+            infra::init_logging(&app_config.logging.level);
+        }
     }
 
     if args.web {
@@ -211,8 +224,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             echo_agent_app_core::agent_pool::PoolConfig::default(),
             task_runtime_store.clone(),
         )
-        .await;
-        let pool = std::sync::Arc::new(pool);
+        .await?;
         if let Some(store) = task_runtime_store.clone() {
             echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
                 &agent_handle,
@@ -246,7 +258,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             message_count,
             "Conversation resumed from file store"
         );
-        if !is_tui_entry {
+        if !is_tui_entry && args.jsonl.is_none() {
             println!("Resuming conversation {short_id} from {date}, {message_count} messages");
         }
     }
@@ -294,6 +306,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 task_runtime_store: task_runtime_store.clone(),
                 webhook_emitter: webhook_emitter.clone(),
                 conversation_store: conversation_store.clone(),
+                runtime_state_store: runtime.state_store.clone(),
                 review_integration: runtime.review_integration.clone(),
                 mcp_config_runtime: runtime.mcp_config_runtime.clone(),
                 plugin_runtime: runtime.plugin_runtime.clone(),
@@ -395,6 +408,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     }
 
     // ── Hidden legacy/internal modes ───────────────────────────────────
+    let run_jsonl = args.jsonl.is_some();
     let run_cli = args.cli;
     let run_channels = args.channels;
 
@@ -423,6 +437,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             task_runtime_store: task_runtime_store.clone(),
             webhook_emitter: webhook_emitter.clone(),
             conversation_store: conversation_store.clone(),
+            runtime_state_store: runtime.state_store.clone(),
             review_integration: runtime.review_integration.clone(),
             mcp_config_runtime: runtime.mcp_config_runtime.clone(),
             plugin_runtime: runtime.plugin_runtime.clone(),
@@ -478,7 +493,19 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     });
 
     let mut mode_error: Option<anyhow::Error> = None;
-    if run_channels {
+    if run_jsonl {
+        let prompt = args.jsonl.as_deref().unwrap_or_default();
+        if let Err(error) = cli::run_jsonl_mode(
+            agent_handle.clone(),
+            prompt,
+            conversation_id.clone(),
+            &headless_services,
+        )
+        .await
+        {
+            mode_error = Some(error);
+        }
+    } else if run_channels {
         #[cfg(feature = "channels")]
         {
             tracing::info!(
@@ -486,15 +513,16 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 "AgentPool initialized for channels (IM per-sender agents)"
             );
             let channels_cancel = echo_agent::agent::CancellationToken::new();
-            let channels_handle = tokio::spawn(cli::run_channels_mode(
-                pool.clone(),
-                app_config.clone(),
-                task_runtime_store.clone(),
-                runtime.review_integration.clone(),
-                webhook_emitter.clone(),
-                foreground_turns.clone(),
-                channels_cancel.clone(),
-            ));
+            let channels_handle = tokio::spawn(cli::run_channels_mode(cli::ChannelsModeArgs {
+                app_state: headless_services.app_state.clone(),
+                pool: pool.clone(),
+                app_config: app_config.clone(),
+                task_runtime_store: task_runtime_store.clone(),
+                review_integration: runtime.review_integration.clone(),
+                webhook_emitter: webhook_emitter.clone(),
+                foreground_turns: foreground_turns.clone(),
+                shutdown: channels_cancel.clone(),
+            }));
 
             if run_cli {
                 let companion_shutdown =
@@ -585,7 +613,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         mode_result,
         headless_services,
         dreaming_owner,
-        run_cli.then_some(agent_handle.clone()),
+        (run_cli || run_jsonl).then_some(agent_handle.clone()),
         runtime.plugin_runtime.clone(),
         config_watcher.clone(),
         runtime.mcp_config_runtime.clone(),
@@ -595,6 +623,15 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     .await;
     drop(runtime);
     shutdown_result
+}
+
+#[cfg(all(feature = "gui", not(feature = "tui")))]
+fn process_args_request_jsonl(args: impl IntoIterator<Item = std::ffi::OsString>) -> bool {
+    args.into_iter().skip(1).any(|argument| {
+        argument
+            .to_str()
+            .is_some_and(|argument| argument == "--jsonl" || argument.starts_with("--jsonl="))
+    })
 }
 
 // ── 单元测试 ─────────────────────────────────────────────────────
@@ -616,6 +653,7 @@ mod tests {
             cli: false,
             tui: false,
             no_alt_screen: false,
+            jsonl: None,
             port: 3000,
             host: "127.0.0.1".to_string(),
             model: Some("test-model".to_string()),
@@ -668,6 +706,7 @@ mod tests {
         assert!(!args.web);
         assert!(!args.cli);
         assert!(!args.channels);
+        assert!(args.jsonl.is_none());
         assert_eq!(args.port, 3000);
         assert_eq!(args.model, None);
     }
@@ -685,6 +724,14 @@ mod tests {
         let args = cli::Args::parse_from(["echo-agent-cli", "--web", "--cli"]);
         assert!(args.web);
         assert!(args.cli);
+    }
+
+    #[test]
+    fn test_args_accept_jsonl_one_shot_prompt() {
+        let args = cli::Args::parse_from(["echo-agent-cli", "--jsonl", "inspect the project"]);
+        assert_eq!(args.jsonl.as_deref(), Some("inspect the project"));
+        assert!(!args.cli);
+        assert!(!args.channels);
     }
 
     #[test]
@@ -723,5 +770,28 @@ mod tests {
     fn test_args_resume_short_flag() {
         let args = cli::Args::parse_from(["echo-agent-cli", "-r", "xyz-789"]);
         assert_eq!(args.resume.as_deref(), Some("xyz-789"));
+    }
+}
+
+#[cfg(all(test, feature = "gui", not(feature = "tui")))]
+mod gui_entry_tests {
+    use super::process_args_request_jsonl;
+    use std::ffi::OsString;
+
+    #[test]
+    fn gui_binary_preserves_explicit_jsonl_machine_entry() {
+        assert!(process_args_request_jsonl([
+            OsString::from("echo-agent-cli"),
+            OsString::from("--jsonl"),
+            OsString::from("inspect the project"),
+        ]));
+        assert!(process_args_request_jsonl([
+            OsString::from("echo-agent-cli"),
+            OsString::from("--jsonl=inspect the project"),
+        ]));
+        assert!(!process_args_request_jsonl([
+            OsString::from("echo-agent-cli"),
+            OsString::from("-psn_0_12345"),
+        ]));
     }
 }

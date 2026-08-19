@@ -151,6 +151,7 @@ pub struct HeadlessServiceResources {
         Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     pub webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
+    pub runtime_state_store: Option<std::sync::Arc<dyn echo_agent::state::RuntimeStateStore>>,
     pub review_integration:
         Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     pub mcp_config_runtime:
@@ -169,6 +170,184 @@ pub struct HeadlessServices {
     pub app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
 }
 
+async fn await_jsonl_driver_or_cancel<Driver, Signal, Output>(
+    driver: Driver,
+    cancel: echo_agent::agent::CancellationToken,
+    signal: Signal,
+) -> Output
+where
+    Driver: std::future::Future<Output = Output>,
+    Signal: std::future::Future<Output = ()>,
+{
+    tokio::pin!(driver);
+    tokio::pin!(signal);
+    tokio::select! {
+        result = &mut driver => result,
+        () = &mut signal => {
+            cancel.cancel();
+            driver.await
+        }
+    }
+}
+
+/// Run one prompt through the shared finite chat driver and print only the
+/// canonical, already-journaled application envelope stream.
+pub async fn run_jsonl_mode(
+    agent: AgentHandle,
+    prompt: &str,
+    conversation_id: String,
+    services: &HeadlessServices,
+) -> Result<()> {
+    if prompt.trim().is_empty() {
+        return Err(anyhow::anyhow!("--jsonl requires a non-empty prompt"));
+    }
+
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let lease = services
+        .app_state
+        .begin_conversation_turn_owned(
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+            &conversation_id,
+            turn_id.clone(),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+        std::sync::Arc::new(crate::cli::jsonl::JsonlChatSink::stdout());
+    let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
+        echo_agent_app_core::chat_event_log::ChatSurface::Cli,
+        renderer,
+        services.app_state.storage.chat_events.clone(),
+        services.app_state.storage.tool_executions.clone(),
+        Some(conversation_id.clone()),
+        turn_id.clone(),
+    );
+    if !sink.on_event(
+        echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+            status: "running".to_string(),
+        },
+    ) {
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message(
+                "jsonl_output",
+                "JSONL output closed before the turn started",
+            ),
+        ));
+        return Err(anyhow::anyhow!(
+            "JSONL output closed before the turn started"
+        ));
+    }
+
+    let title: String = prompt.trim().chars().take(80).collect();
+    if let Err(error) = services
+        .app_state
+        .ensure_conversation_owned(echo_agent::memory::NewConversation {
+            conversation_id: conversation_id.clone(),
+            user_id: "default".to_string(),
+            agent_type: None,
+            title: Some(title),
+        })
+        .await
+    {
+        let detail = format!("failed to persist JSONL conversation metadata: {error}");
+        let _ = sink.on_event(
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+                status: "failed".to_string(),
+            },
+        );
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message("conversation_store", detail.clone()),
+        ));
+        return Err(anyhow::Error::msg(detail));
+    }
+
+    let workspace_root = services
+        .app_state
+        .current_workspace()
+        .await
+        .map(|workspace| workspace.root);
+    let spill_dir =
+        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(workspace_root.as_deref());
+    let attachments = Vec::<echo_agent_app_core::attachments::AttachmentRef>::new();
+    let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+        echo_agent_app_core::prepared_turn::UserTurnInput {
+            text: prompt,
+            attachments: &attachments,
+            spill_dir: &spill_dir,
+            conversation_id: Some(&conversation_id),
+            turn_id: Some(&turn_id),
+        },
+    ) {
+        Ok(turn) => turn,
+        Err(error) => {
+            let detail = format!("failed to prepare JSONL user turn: {error}");
+            let _ = sink.on_event(
+                echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+                    status: "failed".to_string(),
+                },
+            );
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("prepared_turn", detail.clone()),
+            ));
+            return Err(anyhow::Error::msg(detail));
+        }
+    };
+    let resources = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+        pool: services.app_state.connection.pool.clone(),
+        store: services.app_state.tasks.runtime.clone(),
+        sink: sink.clone(),
+        webhook_emitter: Some(services.app_state.webhook.emitter.clone()),
+        conv_id: Some(conversation_id),
+        root_message_id: turn_id,
+        attachments: turn.inline_attachment_refs(),
+        cancel: lease.cancellation_token(),
+        interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
+        review_integration: services.app_state.review_integration.clone(),
+        layer_manager: None,
+        memory_generation: None,
+        human_loop_provider: Some(services.app_state.connection.hitl_dispatcher.clone()
+            as std::sync::Arc<dyn echo_agent::human_loop::HumanLoopProvider>),
+    });
+    let turn_cancel = lease.cancellation_token();
+    let result = await_jsonl_driver_or_cancel(
+        echo_agent_app_core::foreground_turn::drive_foreground_chat(
+            lease, &agent, &turn, resources,
+        ),
+        turn_cancel,
+        async {
+            if let Err(error) = tokio::signal::ctrl_c().await {
+                tracing::warn!(%error, "JSONL Ctrl+C listener is unavailable");
+                std::future::pending::<()>().await;
+            }
+        },
+    )
+    .await;
+    let status = result.as_ref().map_or(
+        "failed",
+        echo_agent_app_core::chat_driver::TurnOutcome::status,
+    );
+    if !sink.on_event(
+        echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
+            status: status.to_string(),
+        },
+    ) {
+        return Err(anyhow::anyhow!(
+            "JSONL output closed before the terminal status was delivered"
+        ));
+    }
+
+    match result {
+        Ok(echo_agent_app_core::chat_driver::TurnOutcome::Completed) => Ok(()),
+        Ok(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled) => {
+            Err(anyhow::anyhow!("one-shot turn was cancelled"))
+        }
+        Ok(echo_agent_app_core::chat_driver::TurnOutcome::Failed(failure)) => {
+            Err(anyhow::anyhow!("{}: {}", failure.code, failure.message))
+        }
+        Err(error) => Err(anyhow::Error::msg(error)),
+    }
+}
+
 pub async fn start_headless_services(
     agent: AgentHandle,
     hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
@@ -176,8 +355,7 @@ pub async fn start_headless_services(
     resources: HeadlessServiceResources,
 ) -> Result<HeadlessServices> {
     let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
-        let file_path =
-            echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
+        let file_path = echo_agent::paths::user_data_path("scheduler_store");
         match echo_agent::memory::FileStore::new(&file_path) {
             Ok(store) => std::sync::Arc::new(store),
             Err(error) => {
@@ -192,6 +370,7 @@ pub async fn start_headless_services(
         Some(resources.model_consumers),
         hitl_dispatcher,
         resources.conversation_store,
+        resources.runtime_state_store,
         app_config.clone(),
         resources.mcp_config_runtime,
     )
@@ -203,6 +382,17 @@ pub async fn start_headless_services(
     state.webhook.emitter = resources.webhook_emitter;
     state.connection.pool = Some(resources.pool);
     state.tasks.runtime = resources.task_runtime_store;
+    match state.recover_committed_conversation_deletions().await {
+        Ok(receipts) if !receipts.is_empty() => tracing::info!(
+            count = receipts.len(),
+            "Recovered committed conversation deletion finalizers"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "Some committed conversation deletion finalizers remain pending"
+        ),
+    }
     state
         .start_scheduler_and_task_service(Some(scheduler_store))
         .await?;
@@ -418,17 +608,21 @@ pub async fn shutdown_headless_services(
 /// MemoryLayerManager/permission_service/per-sender cache_user_id+conversation_id),
 /// per-sender 隔离由 pool key `channel:{channel_id}:{sender_id}` 承载。
 #[cfg(feature = "channels")]
-pub async fn run_channels_mode(
-    pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
-    app_config: AppConfig,
-    task_runtime_store: Option<
-        std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-    >,
-    review_integration: Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
-    webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
-    foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
-    shutdown: echo_agent::agent::CancellationToken,
-) -> Result<()> {
+pub struct ChannelsModeArgs {
+    pub app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
+    pub pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
+    pub app_config: AppConfig,
+    pub task_runtime_store:
+        Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    pub review_integration:
+        Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    pub webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
+    pub foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    pub shutdown: echo_agent::agent::CancellationToken,
+}
+
+#[cfg(feature = "channels")]
+pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
     use std::sync::Arc;
 
     use echo_agent::channels::{
@@ -437,6 +631,17 @@ pub async fn run_channels_mode(
     };
 
     use crate::cli::channels::AppChannelMessageHandler;
+
+    let ChannelsModeArgs {
+        app_state,
+        pool,
+        app_config,
+        task_runtime_store,
+        review_integration,
+        webhook_emitter,
+        foreground_turns,
+        shutdown,
+    } = args;
 
     let mut manager = ChannelManager::new();
     let mut failures = Vec::new();
@@ -510,6 +715,7 @@ pub async fn run_channels_mode(
     // 每 (channel,sender) 产出 AppChannelMessageHandler(持 pool clone)。
     let handler_factory = move |_channel_id: &str| -> Arc<dyn MessageHandler> {
         let session_config = session_config.clone();
+        let app_state = app_state.clone();
         let pool = pool.clone();
         let store = task_runtime_store.clone();
         let review_integration = review_integration.clone();
@@ -519,6 +725,7 @@ pub async fn run_channels_mode(
             session_config,
             move || -> Box<dyn MessageHandler> {
                 Box::new(AppChannelMessageHandler::new(
+                    app_state.clone(),
                     pool.clone(),
                     store.clone(),
                     review_integration.clone(),

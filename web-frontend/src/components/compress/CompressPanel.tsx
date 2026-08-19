@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Minimize2, BarChart3, Zap, Brain, ShieldCheck, Workflow } from 'lucide-react';
 import { compressApi } from '../../api/endpoints';
 import type { CompressionStats, CompressResponse } from '../../types/api';
@@ -36,25 +36,26 @@ export function CompressPanel() {
   const subagentRuns = useSubagentRunStore((s) => s.runs);
   const activeConversationId = useConversationStore((s) => s.activeId);
   const runtimeConversationId = useTaskRuntimeStore((s) => s.activeRun?.conversation_id ?? null);
+  const targetConversationId = activeConversationId ?? runtimeConversationId ?? undefined;
 
-  const loadStats = async () => {
+  const loadStats = useCallback(async () => {
     try {
-      const data = await compressApi.getStats();
+      const data = await compressApi.getStats(targetConversationId);
       setStats(data);
     } catch (e) {
       console.error(e);
     }
-  };
+  }, [targetConversationId]);
 
   useEffect(() => {
-    loadStats();
-  }, []);
+    void loadStats();
+  }, [loadStats]);
 
   const compress = async () => {
     setCompressing(true);
     setMsg(null);
     try {
-      const res = await compressApi.trigger();
+      const res = await compressApi.trigger({ conversation_id: targetConversationId });
       if (res.success) {
         setLastCompress(res);
         // 与后端 emit context_compressed 对齐：Snapshot 置空（Accumulator 保留）。

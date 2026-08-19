@@ -45,6 +45,30 @@ pub enum ChatDriverEvent {
         goal: String,
         new_message: String,
     },
+    ApprovalRequest {
+        request_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        prompt: String,
+    },
+    InputRequest {
+        request_id: String,
+        prompt: String,
+    },
+    SelectionRequest {
+        request_id: String,
+        prompt: String,
+        options: Vec<String>,
+        task_id: Option<String>,
+        context: Option<serde_json::Value>,
+        phase: Option<String>,
+    },
+    ContextCompressed {
+        before_count: usize,
+        after_count: usize,
+        before_tokens: usize,
+        after_tokens: usize,
+    },
 }
 
 /// Runtime-owned terminal result for one interactive turn.
@@ -120,6 +144,26 @@ impl ChatTurnOutcome {
 pub trait ChatSink: Send + Sync + 'static {
     /// Return `false` to stop the current stream because the consumer closed.
     fn on_event(&self, event: ChatDriverEvent) -> bool;
+
+    /// Receive an event only after the ordinary-chat journal has accepted it.
+    /// Text surfaces may render the payload, while GUI keeps the envelope's
+    /// identity and cursor on its canonical wire.
+    fn on_journaled_event(&self, envelope: crate::chat_event_log::ChatEventEnvelope) -> bool {
+        self.on_event(envelope.payload)
+    }
+
+    /// Receive a secondary tool detail only after the shared app-core
+    /// projector has committed it. Surface adapters must not persist it again.
+    fn on_tool_execution_projection(
+        &self,
+        _update: &crate::tool_execution_projection::ToolExecutionProjectionUpdate,
+    ) -> bool {
+        true
+    }
+
+    fn delivery_guarantee(&self) -> crate::chat_event_log::ChatDeliveryGuarantee {
+        crate::chat_event_log::ChatDeliveryGuarantee::BestEffort
+    }
 
     /// Return a sink safe to retain beyond the current foreground lease. Most
     /// sinks are already durable and use the default. Foreground cancellation
@@ -1957,7 +2001,11 @@ mod tests {
                     .push((requested_mode, observed_path)),
                 ChatDriverEvent::Execution(_)
                 | ChatDriverEvent::TurnStatus { .. }
-                | ChatDriverEvent::Interrupt { .. } => {}
+                | ChatDriverEvent::Interrupt { .. }
+                | ChatDriverEvent::ApprovalRequest { .. }
+                | ChatDriverEvent::InputRequest { .. }
+                | ChatDriverEvent::SelectionRequest { .. }
+                | ChatDriverEvent::ContextCompressed { .. } => {}
             }
             true
         }
