@@ -1,7 +1,7 @@
 # EKO 长程任务运行时 M0-M5 实施计划
 
 > 日期：2026-08-17
-> 状态：R0/M0/M1/M2/M3/M4 Complete；M5 next；Codex Runtime Goal active
+> 状态：R0/M0/M1/M2/M3/M4/M5 Complete；Codex Runtime Goal complete
 > 设计基线：[`2026-08-14-eko-long-horizon-task-runtime-design.md`](./2026-08-14-eko-long-horizon-task-runtime-design.md)  
 > 跨会话状态：[`MASTER-PLAN.md`](./MASTER-PLAN.md)
 
@@ -568,7 +568,7 @@ GUI/Tauri 或 web frontend 时执行对应 GUI 与 Prettier/test/build 条件矩
 | M2 | Complete | framework `6d7d0cf`；app `f4771f3` | Framework Subagent 定向 122 项及 control/executor 7 项、完整门禁与 11 个逐 feature check；application exact control 5 项、层级回归、完整 Rust/GUI/frontend 门禁：全绿 | exact-attempt message/guidance/interrupt 已复用 `TurnSteerMailbox`；应用 `events.jsonl` 持久 command identity/result，四 surface 共用同一 service。M3 前不得绕过安全 admission 开启 cold-start auto-resume |
 | M3 | Complete | app `aa92178` | provider retry、boot admission、orphan recovery 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | provider retry schedule/deadline/fingerprint 已进入唯一事件 fold；cold-start 仅对满足 typed admission 的 `Paused/BootRecovery` unattended run 自动恢复；M4 已收归 completion blocker 路径 |
 | M4 | Complete | app `54d8bc4` | requirement/evidence、Goal revalidation、artifact rehash、direct Plan、四 surface 聚焦回归；完整 Rust/GUI/frontend 门禁：全绿 | 完成权威仍在 TaskRuntime store；无第二状态/store/tool。M5 须增加可丢弃 checkpoint 缓存、基准和故障/soak 矩阵 |
-| M5 | In progress (M5a and M5b automation complete; real soak active) | app `3e409d0`、`82d8eda` | checkpoint/fold 等价、损坏恢复、强杀窗口、1k/10k/100 release benchmark；resumable soak harness；canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix；完整 Rust 门禁：全绿 | 真实 12/24/48h soak 尚未完成；用户已明确改为隔离目录并行运行，任一失败仍须单独修复重跑 |
+| M5 | Complete | app `3e409d0`、`82d8eda` | checkpoint/fold 等价、损坏恢复、强杀窗口、1k/10k/100 release benchmark；resumable soak harness；canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix；12h real soak；完整 Rust 门禁：全绿 | 12h ledger 通过：1,439 ended turns、143 compactions、11 recoveries、0 failed turns、完整 final hashes。用户于 2026-08-19 将 12h 结果确认为最终 real-soak 门禁并豁免 24/48h 完成；两个服务已停止，账本原样保留且不记为 pass |
 
 每次自动续跑或重启后仍须核对 Runtime Goal、本文、`MASTER-PLAN`、两个仓库状态和
 最近提交，再从第一个未完成阶段继续。
@@ -930,7 +930,7 @@ checkpoint 为 36,416 bytes，约占 3.68 MB event log 的 0.99%。完整原始�
   benchmark ignored；runtime e2e 5 passed；CLI/TUI/Tauri lib 142 passed；CLI main 10 passed
 - `cargo check -p echo-agent-app-core --no-default-features --locked --offline`
 - release benchmark 最终二进制连续五次通过；Goal hash 100 compaction 回归通过
-- `git diff --check`、Cargo worktree/绝对路径、Worker/CLI SQLite 静态审计全绿
+- `git diff --check`、Cargo worktree/绝对路径、遗留执行角色术语/CLI SQLite 静态审计全绿
 
 失败与修正：第一版 benchmark 把 full projection fsync 与无写盘的 warm fold 比较，产生无效的
 37.4x；改为两侧都测 `read + parse + fold` 后诚实暴露 10x 门不稳定，最终固定 5x 抗抖动门并
@@ -939,10 +939,9 @@ checkpoint 为 36,416 bytes，约占 3.68 MB event log 的 0.99%。完整原始�
 归一化后无 diff。验证后因可用空间低于 50 GiB，`cargo clean` 回收 42.3 GiB，可用空间恢复到
 59 GiB。
 
-M5 仍未完成。剩余 M5b：执行并记录 provider/network、process kill/power loss、disk write、
-HITL suspended、Subagent/cell race 和 Goal drift 的 canonical fault matrix；实现可提交、可恢复、
-有结构化 ledger 的真实 soak harness，并按顺序完成 12/24/48 小时运行。M1 已完成，因此该阶段
-可以验证冷启动自动续跑，但不得绕过 blocker、预算、workspace generation、launcher/HITL owner 门。
+该记录形成 M5b 的实现输入。后续完成的 canonical fault matrix、可恢复结构化 ledger harness 和
+真实 soak 结果见 15.13 与 M5 evaluation 文档。M1 已完成，因此该阶段可以验证冷启动自动续跑，
+但不得绕过 blocker、预算、workspace generation、launcher/HITL owner 门。
 
 ### 15.12 Application M5b 实现前门禁（2026-08-17）
 
@@ -984,7 +983,7 @@ hash 与稳定失败 fingerprint；启动时拒绝脏工作树，成功、Ctrl-C
 - example 聚焦测试完成 3 个真实 RunTurn、1 次 production boot recovery、最终 pause/evidence：通过。
 - `cargo fmt --all -- --check`、两组 workspace all-feature Clippy、workspace all-feature test、
   app-core no-default check：全绿；app-core 926 tests、runtime e2e 5、CLI/TUI lib 142、main 10 通过。
-- 静态审计确认无 panic API、Worker 术语、CLI SQLite、worktree/绝对 Cargo path；生成 TypeScript
+- 静态审计确认无 panic API、遗留执行角色术语、CLI SQLite、worktree/绝对 Cargo path；生成 TypeScript
   经项目 Prettier 归一化后无 diff。
 
 固定提交后的 canonical fault matrix 全绿：application provider 4、BootRecovery 8、snapshot/
@@ -995,8 +994,9 @@ unsafe-boundary 2、checkpoint 5、disk/torn-tail/projection 3、HITL 3、Subage
 自动矩阵后磁盘仅余 20 GiB，两个 target 合计 37 GiB，低于仓库 50 GiB 可用空间门槛；按规则清理
 调试缓存后仅构建固定提交的 release soak example。用户随后明确批准 12/24/48 小时使用三个隔离
 目录并行运行，避免 Codex 前台等待数十小时；这一执行方式替代原顺序门禁，但不降低单次验收。
-剩余事项是收集三个真实 ledger 并把最终证据写回评测文档；任一时长失败仍必须修复并用新目录
-从该时长重新开始，不能由其它更长运行覆盖。
+启动时的验收计划要求收集三个真实 ledger；用户随后于 2026-08-19 将 12 小时成功结果确认为
+最终 real-soak 门禁，并明确豁免 24/48 小时完成。因此 24/48 小时不再是剩余事项；它们的服务已
+停止，停止时账本保持 `running` 快照且不伪装为成功。
 
 首次 detached 启动使用 `nohup`，三个子进程在 Codex 终端命令返回时被执行器回收，尚未创建
 ledger、TaskRun 或事件，因此不计为 soak 失败或有效时长。launcher 随即改为 macOS 用户域
@@ -1008,6 +1008,19 @@ ledger、TaskRun 或事件，因此不计为 soak 失败或有效时长。launch
 事件、1 个 ended RunTurn、3 tokens 且无 failure fingerprint，第二次观测均达到约 60.6 秒、
 12 个事件和 2 个 ended RunTurn。Markdown 只保存启动快照；实时状态和最终证据以三个 ledger 为准。
 
+### 15.14 Application M5 real soak 完成记录（2026-08-19）
+
+12 小时 ledger 在 `2026-08-18T10:01:53Z` 以 `passed` 完成，累计 43,200,302 active ms、5,971 个
+连续事件、1,439 个 ended RunTurn、0 failed turn、4,317 tokens、143 次 compaction、11 次 runtime
+reopen/recovery，且没有 failure fingerprint。最终 Goal、event log、checkpoint state 和 run-state
+hash 均已持久化，run durable pause 且不存在 active turn。
+
+用户于 2026-08-19 明确将该 12 小时结果作为最终 soak 验收，允许不再验证 24/48 小时。对应
+launchd 服务随即停止；24/48 小时账本分别保留在 73,856,651/73,855,026 active ms，均包含
+10,214 个连续事件、2,461 个 ended RunTurn、0 failed turn、246 次 compaction、20 次 recovery 且
+无 failure fingerprint。两者仍是 `running` 状态、没有 final evidence，因此只作为停止时诊断快照，
+不记为通过。详细 hash 与账本位置见 M5 evaluation 和 soak run index。
+
 ## 16. 最终验收
 
 - 100 次上下文压缩后 `TaskRun.goal_sha256` 不漂移。
@@ -1018,4 +1031,4 @@ ledger、TaskRun 或事件，因此不计为 soak 失败或有效时长。launch
 - 每个 Requirement 有可验证 Evidence 或用户确认 Skip。
 - checkpoint 损坏可从 `events.jsonl` 完整重建，warm fold 不再 O(n²)。
 - GUI、TUI、CLI、channel 在 Goal、Resume、Subagent 控制、HITL、恢复和完成门上对等。
-- 12/24/48 小时 soak 全部通过，所有适用提交门禁全绿。
+- 用户最终接受的 12 小时 soak 通过；被豁免的 24/48 小时快照不记为通过；所有适用提交门禁全绿。

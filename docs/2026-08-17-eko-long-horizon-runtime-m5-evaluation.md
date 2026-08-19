@@ -3,7 +3,7 @@
 > Date: 2026-08-17
 > Runtime Goal: M0-M5 implementation
 > Authority: `events.jsonl`; `checkpoint.json` is a discardable projection
-> Status: M5a checkpoint/performance `3e409d0` and M5b harness/fault matrix `82d8eda` complete; real 12/24/48-hour soak active
+> Status: Complete; M5a checkpoint/performance `3e409d0`, M5b harness/fault matrix `82d8eda`, and the user-accepted 12-hour real soak all passed
 
 ## Checkpoint Contract
 
@@ -129,11 +129,24 @@ worktree and pins the current commit and configuration into each ledger.
 
 ## Real Soak Ledger
 
-Soaks run concurrently in isolated directories. A failure restarts the same
-duration in a new directory after the fix; a passing longer run cannot waive it.
+Soaks ran concurrently in isolated directories. On 2026-08-19 the user changed
+the final acceptance gate to the completed 12-hour run and explicitly waived
+24/48-hour completion. The longer ledgers remain unmodified shutdown snapshots
+and are not counted as passes.
 
 | Duration | Commit | Configuration/provider | Events/compactions/recoveries | Failure fingerprints | Final evidence | Status |
 |---:|---|---|---|---|---|---|
-| 12 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | launch: 12 events / 0 compactions / 0 recoveries | none at launch | pending final hashes | Running |
-| 24 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | launch: 12 events / 0 compactions / 0 recoveries | none at launch | pending final hashes | Running |
-| 48 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | launch: 12 events / 0 compactions / 0 recoveries | none at launch | pending final hashes | Running |
+| 12 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | 5,971 events / 143 compactions / 11 recoveries; 1,439 ended / 0 failed turns | none | Goal `f08dc4e3`; event log `6963144f`; checkpoint `6f8a0b1c`; run state `3659be4b` | Passed |
+| 24 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | 10,214 events / 246 compactions / 20 recoveries; 2,461 ended / 0 failed turns | none | none; ledger retained at 73,856,651 active ms | Waived; stopped with `running` snapshot |
+| 48 hours | `61a3e389` | deterministic local; 30s heartbeat; recovery/120 turns | 10,214 events / 246 compactions / 20 recoveries; 2,461 ended / 0 failed turns | none | none; ledger retained at 73,855,026 active ms | Waived; stopped with `running` snapshot |
+
+The 12-hour ledger completed at `2026-08-18T10:01:53.043536Z` after
+43,200,302 active milliseconds. Its full final hashes are:
+
+- Goal: `f08dc4e373ef8e23202420fb3c94aba63a6353a5435cf87b55055e3fd73bde00`
+- Event log: `6963144f5714bb164fe4a9e2c9dd9250981d37f6c60a6c1e324ed78835e89ee1`
+- Checkpoint state: `6f8a0b1c3b9ca195d1b0371e852630ae326384766d233619ae8fc74f9bae1ea1`
+- Run state: `3659be4bff783b48ee713932fd28860c50d8bf410be481695c68b23ccf6d4c83`
+
+All three launchd services were removed after the final acceptance decision.
+The ledger, event, checkpoint, run-state, and process-log files were retained.

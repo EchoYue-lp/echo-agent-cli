@@ -10,11 +10,11 @@ write to isolated directories. Running them concurrently shortens wall-clock
 evaluation time without sharing TaskRun identity, event logs, projections,
 ledgers, PIDs, or process output.
 
-| Duration | Run record | Runtime directory | Initial status |
+| Duration | Run record | Runtime directory | Final disposition |
 |---:|---|---|---|
-| 12 hours | `docs/2026-08-17-eko-m5-soak-12h.md` | `.eko/soak/m5-12h` | Running; first heartbeat verified |
-| 24 hours | `docs/2026-08-17-eko-m5-soak-24h.md` | `.eko/soak/m5-24h` | Running; first heartbeat verified |
-| 48 hours | `docs/2026-08-17-eko-m5-soak-48h.md` | `.eko/soak/m5-48h` | Running; first heartbeat verified |
+| 12 hours | `docs/2026-08-17-eko-m5-soak-12h.md` | `.eko/soak/m5-12h` | Passed; accepted as the final real-soak gate |
+| 24 hours | `docs/2026-08-17-eko-m5-soak-24h.md` | `.eko/soak/m5-24h` | Waived on 2026-08-19; service stopped; ledger retained as `running` snapshot |
+| 48 hours | `docs/2026-08-17-eko-m5-soak-48h.md` | `.eko/soak/m5-48h` | Waived on 2026-08-19; service stopped; ledger retained as `running` snapshot |
 
 All three ledgers started at `2026-08-17T08:50:35Z`. The first common
 observation showed about 30.6 seconds active time, 8 contiguous events, one
@@ -77,7 +77,10 @@ A stopped process with `running` or `interrupted` can resume using the same
 binary, duration, output directory, and commit. `failed` requires a fix and a
 new output directory for that duration; a longer run never hides the failure.
 
-The Markdown status above is only the verified launch snapshot; consult each
-ledger for live state. After all processes stop, copy the three final summaries into
-`docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`, run the final
-repository gates, and only then mark M5 and the Runtime Goal complete.
+The 12-hour run met that condition after 43,200,302 active milliseconds: 5,971
+events, 1,439 ended turns, 143 compactions, 11 recoveries, zero failed turns,
+no failure fingerprint, and complete final hashes. On 2026-08-19 the user
+accepted it as the final real-soak gate and waived completion of the longer
+runs. The 24/48-hour services were stopped; their ledgers were deliberately not
+edited, so both remain truthful `running` snapshots without final evidence and
+are not represented as passes. All runtime data remains under `.eko/soak`.

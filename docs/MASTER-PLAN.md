@@ -80,8 +80,8 @@ evidence, and the next bounded step.
 | MCP Resource model surface | Complete | `docs/2026-08-19-mcp-resource-tool-surface.md`; the existing MCP manager now projects three canonical, read-only list/template/read tools from connected resource-capable clients. EKO keeps them searchable but out of every mode's first-turn schema. |
 | Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
 | Background command cells + awaiter role (Phase C1-C4) | Complete | Design: `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11 (C track). Framework commits `58e6733`, `7f66ff5`: one `CommandCellRegistry`, sandbox-preserving launch, durable output artifacts, retry-safe multi-waiter cursors, explicit owner cancellation, and UTF-8-safe bounded output. Application commit `5cf49c2`: process-wide registry, low-thinking `awaiter`, `watch_cell`, TaskRuntime start/finish events, recovery-capsule projection, active-cell completion blocker, explicit-cancel propagation, and boot recovery that closes orphaned cells without replaying external commands. Pause keeps cells alive; only explicit run cancellation stops them. |
-| Long-horizon TaskRun continuation control plane (Phase C5) | Core complete; superseded follow-up active as M0-M5 | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, durable provider retry, typed boot admission, stable surface HITL replay, versioned Requirement/Evidence, cross-surface controls, and discardable checkpoint projections. Remaining real soak work is governed by `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; M1-M4, M5a and the M5b automated matrix are complete. |
-| Long-horizon runtime M0-M5 implementation | R0/M0/M1/M2/M3/M4, M5a and M5b automation complete; real soak active | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal active. App `de09946` makes `TaskRun.goal` the revision/hash-bound authority. Framework `cd4fccf` and app `9d59a0b` close M1. Framework `6d7d0cf` plus app `f4771f3` close M2 with exact-attempt controls through the existing `TurnSteerMailbox`. App `aa92178` closes M3 with event-folded provider retry, typed boot admission, exact orphan recovery and safe staged run creation. App `54d8bc4` closes M4 through one store-owned Requirement/Evidence completion report shared by execution and GUI/TUI/CLI/channel. App `3e409d0` closes M5a with a schema/hash-validated discardable checkpoint, suffix-only event fold, crash-window snapshot repair and fixed release performance gates while preserving `events.jsonl` as sole authority. App `82d8eda` adds the resumable, commit-pinned long-horizon harness; its canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix is all green. The user approved concurrent isolated 12/24/48-hour processes; M5 remains active until all three ledgers pass. |
+| Long-horizon TaskRun continuation control plane (Phase C5) | Complete | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, durable provider retry, typed boot admission, stable surface HITL replay, versioned Requirement/Evidence, cross-surface controls, and discardable checkpoint projections. The automated fault matrix and the accepted 12-hour real soak are complete; detailed evidence is governed by `docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`. |
+| Long-horizon runtime M0-M5 implementation | Complete | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal complete. App `de09946` makes `TaskRun.goal` the revision/hash-bound authority. Framework `cd4fccf` and app `9d59a0b` close M1. Framework `6d7d0cf` plus app `f4771f3` close M2 with exact-attempt controls through the existing `TurnSteerMailbox`. App `aa92178` closes M3 with event-folded provider retry, typed boot admission, exact orphan recovery and safe staged run creation. App `54d8bc4` closes M4 through one store-owned Requirement/Evidence completion report shared by execution and GUI/TUI/CLI/channel. App `3e409d0` closes M5a with a schema/hash-validated discardable checkpoint, suffix-only event fold, crash-window snapshot repair and fixed release performance gates while preserving `events.jsonl` as sole authority. App `82d8eda` adds the resumable, commit-pinned long-horizon harness; its canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix is all green. The 12-hour ledger passed with 1,439 ended turns, 143 compactions, 11 production recoveries, zero failed turns and complete final hashes. On 2026-08-19 the user accepted 12 hours as the final real-soak gate and waived 24/48-hour completion; those services were stopped and their durable ledger snapshots retained without being represented as passes. |
 
 ## Current Decisions
 
@@ -629,7 +629,7 @@ legacy layer manager or add a framework lifecycle API.
 
 ## Next Step
 
-The Codex Runtime Goal is active with this exact objective:
+The Codex Runtime Goal is complete with this exact objective:
 
 ```text
 完整实现 EKO 长程任务运行时 M0-M5，包括 Goal 生命周期、正确性、
@@ -650,8 +650,12 @@ store-owned completion report to GUI/TUI/CLI/channel without a second state or
 schema-versioned and hash-verified checkpoint retains the sole fold state and
 deduplication keys; reads detect a durable suffix before trusting snapshots. The
 automated M5b fault matrix is all green. Commit `61a3e389` launched concurrent,
-isolated real 12/24/48-hour runs through user launchd on 2026-08-17; their first
-two heartbeats advanced with no failure fingerprint. Evidence is recorded in
+isolated real 12/24/48-hour runs through user launchd on 2026-08-17. The 12-hour
+run passed after 43,200,302 active milliseconds with 5,971 events, 1,439 ended
+turns, 143 compactions, 11 recoveries, zero failed turns and no failure
+fingerprint. On 2026-08-19 the user accepted that result as the final real-soak
+gate and waived completion of the 24/48-hour runs; their services were stopped
+and their unchanged ledger snapshots retained. Evidence is recorded in
 `docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`
 and the run index `docs/2026-08-17-eko-m5-soak-runs.md`.
 
