@@ -209,8 +209,9 @@ impl BackgroundTaskKind {
                      reviewable script. Execute the persisted file with run_code using \
                      script_path, not inline code. Record package/runtime versions, script/input/\
                      output SHA-256 hashes, exit status, assumptions, missing-data handling, \
-                     warnings, and diagnostics. Treat exploratory_statistics as exploratory only; \
-                     formal inference must use a mature pinned library. If execution or a \
+                     warnings, and diagnostics. Persisted Python scripts use EKO's locked \
+                     pandas/SciPy/statsmodels environment; formal inference must use those mature \
+                     implementations rather than hand-written approximations. If execution or a \
                      dependency fails, preserve a structured failed run instead of fabricating \
                      results. End with an executive summary that points to the saved artifacts."
                 )

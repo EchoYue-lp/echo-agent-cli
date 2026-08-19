@@ -22,7 +22,6 @@ allowed-tools:
   - "read_artifact"
   - "write_file"
   - "edit_file"
-  - "read_data"
   - "generate_chart"
 metadata:
   author: echo-agent-cli
@@ -71,8 +70,9 @@ metadata:
 5. **选择正确的起点** — 柱状图的 y 轴通常从 0 开始
 
 ### 工具策略
-- 使用当前真实可用的图表/代码/数据工具，不假装某个示例工具一定存在
-- 保存生成图表所需的数据变换、参数和代码，使结果可复现
+- 对自定义图表，先保存 Python 脚本，再使用 `run_code(script_path)` 在 EKO 锁定的 matplotlib/seaborn 环境执行；不要把正式制图塞进内联代码
+- 简单 Vega-Lite 图表可使用 `generate_chart`，但生成图表所需的数据变换、参数和代码仍须保存并可复现
+- 图表文件写入分析目录的 `outputs/`，记录输入哈希、实际包版本和生成参数
 
 ### 输出规范
 - 选择合适的图表类型（参考上方决策树）

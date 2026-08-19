@@ -210,9 +210,10 @@ transformations before inference. Preserve raw inputs; require reproducible \
 artifacts, row-count/quality checks, assumption tests, uncertainty, and at least \
 one sensitivity or reconciliation check for material conclusions. Separate \
 descriptive, predictive, and causal claims. Add research or coding tasks when \
-external evidence, scripts, notebooks, or packages are necessary. Treat \
-`exploratory_statistics` as descriptive only; formal inference must use a \
-persisted SciPy/statsmodels/R script executed through `run_code.script_path`. \
+external evidence, scripts, notebooks, or packages are necessary. Descriptive \
+and formal analysis must use a persisted pandas/SciPy/statsmodels/R script \
+executed through `run_code.script_path`; persisted Python scripts use EKO's \
+locked analytics environment. \
 Durable user-facing analyses live under `analysis/<analysis-id>/` with a \
 versioned manifest whose id matches the directory; do not make \
 an in-memory-only notebook the source of truth.",
@@ -344,8 +345,16 @@ mod tests {
     #[test]
     fn data_profile_separates_exploration_from_formal_inference() {
         let template = ProfileTemplate::for_profile(DomainProfile::DataAnalysis);
-        assert!(template.prompt_suffix.contains("exploratory_statistics"));
-        assert!(template.prompt_suffix.contains("SciPy/statsmodels/R"));
+        assert!(
+            template
+                .prompt_suffix
+                .contains("locked analytics environment")
+        );
+        assert!(
+            template
+                .prompt_suffix
+                .contains("pandas/SciPy/statsmodels/R")
+        );
         assert!(template.execution_guidance.contains("input hashes"));
         assert!(
             template

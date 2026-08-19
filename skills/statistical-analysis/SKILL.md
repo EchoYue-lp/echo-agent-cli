@@ -24,8 +24,7 @@ allowed-tools:
   - "read_artifact"
   - "write_file"
   - "edit_file"
-  - "read_data"
-  - "exploratory_statistics"
+  - "generate_chart"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"
@@ -67,8 +66,9 @@ metadata:
 6. **稳健性** — 对关键结论做合理的敏感性分析、模型诊断或替代规格检查
 
 ### 工具策略
-- `data_stats` — 描述统计、分组聚合
-- 可执行代码工具 — 执行可保存、可复现的 Python/R 分析；记录包版本、随机种子和参数
+- 先写入可审阅的 Python/R 脚本，再通过 `run_code(script_path)` 执行；正式分析禁止只运行内联代码
+- Python 持久脚本自动使用 EKO 锁定的 pandas/SciPy/statsmodels 分析环境；仍须在产物中记录实际包版本、随机种子和参数
+- 描述统计、分组聚合、假设检验、模型诊断和敏感性分析应由同一脚本或明确版本化的脚本链完成
 - `generate_chart` — 结果可视化
 
 ### 统计报告规范

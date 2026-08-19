@@ -23,22 +23,12 @@ allowed-tools:
   - "read_artifact"
   - "write_file"
   - "edit_file"
-  - "read_data"
-  - "filter_data"
-  - "aggregate_data"
-  - "data_stats"
-  - "transform_data"
-  - "profile_data"
-  - "topn_data"
-  - "contribution_data"
-  - "bin_data"
-  - "ratio_data"
-  - "join_data"
-  - "correlate_data"
-  - "pivot_data"
-  - "missing_value_analysis"
-  - "outlier_detection"
-  - "consistency_check"
+  - "excel_info"
+  - "read_excel"
+  - "excel_profile"
+  - "excel_to_csv"
+  - "write_excel"
+  - "generate_chart"
 metadata:
   author: echo-agent-cli
   version: "1.0.0"
@@ -52,7 +42,7 @@ metadata:
 ### 工作流程
 
 **第一步：数据加载与概览**
-- 使用 `read_data` 加载数据文件（CSV、Excel、JSON、Parquet 等）
+- 先保存一个可审阅的 Python 脚本，再用 pandas/pyarrow/openpyxl 加载 CSV、Excel、JSON 或 Parquet；通过 `run_code` 的 `script_path` 执行，禁止把正式分析塞进内联代码
 - 检查基本信息：行数、列数、数据类型、内存占用
 - 抽样检查多处记录，确认编码、分隔符、sheet/table、表头和解析是否正确
 
@@ -61,7 +51,7 @@ metadata:
 - 重复行检查：是否有完全重复的记录
 - 数据类型验证：日期列是否为日期类型，数值列是否含非数字
 - 异常值检测：数值列的 min/max/mean/std，是否有极端值
-- 使用 `profile_data` 生成完整的数据画像
+- 在脚本中生成结构化数据画像，并把行列数、类型、缺失、重复、范围和解析警告写入结果文件
 
 **第三步：数据清洗**
 - 处理缺失值：先判断缺失机制与业务含义，再决定保留、标记、删除、填充或插值；记录影响行数
@@ -73,43 +63,31 @@ metadata:
 - 单变量分布：直方图、箱线图、频率表
 - 双变量关系：散点图、相关系数
 - 分组统计：按关键维度分组聚合
-- 使用 `data_stats` 进行统计汇总
+- 在同一持久脚本中生成描述统计和分组汇总
 
 ### 工具策略
 
-以下工具仅在当前上下文真实可用时使用；若名称或能力不同，选择等价的结构化数据工具，不要假装调用成功。
+EKO 会为持久 Python 脚本懒加载锁定的分析环境。正式数据处理必须保存脚本并使用 `run_code(script_path)`，以便执行环境、输入和产出可审计；不要退回一长串不可复现的逐操作工具调用。
 
 #### 读取数据
-- CSV / JSON / Parquet 文件：使用 `read_data` 读取
+- CSV / JSON：可先用 `read_file` 抽样确认编码和表头，完整加载与类型解析放在持久 Python 脚本中
+- Parquet：在持久 Python 脚本中使用 pandas/pyarrow 读取并输出 schema 与抽样结果
 - Excel 文件（.xlsx/.xls/.xlsb/.ods）：
   1. 先用 `excel_info` 查看 sheet 列表和行列数
   2. 用 `read_excel` 预览数据内容
   3. 用 `excel_profile` 了解列类型、缺失率和基本统计
-  4. 用 `excel_load` 将 Excel 转为 Parquet/CSV，解锁全部数据工具
+  4. 需要完整处理时，用 `excel_to_csv` 或持久 Python 脚本读取；不要修改原文件
 - 注意：`read_file` 只能读取文本文件（CSV/JSON），不能读取 Excel 二进制文件
 
-#### 数据分析（需先通过 read_data 或 excel_load 加载）
-- `profile_data` — 自动识别维度/指标列，分析缺失率和数据质量
-- `data_stats` — 每列描述统计（均值、标准差、分位数等）
-- `filter_data` — 条件过滤（支持 "列名" > 100, col == "val", A > 0 AND B < 5）
-- `aggregate_data` — 分组聚合（sum, mean, count, median, p25/p75/p95 等）
-- `topn_data` — Top-N 排名分析
-- `contribution_data` — 帕累托分析（贡献度、累计占比）
-- `bin_data` — 等宽/等频分箱（直方图）
-- `ratio_data` — 列间算术表达式（利润率 = (revenue-cost)/revenue*100）
-- `correlate_data` — 相关系数矩阵（Pearson 或 Spearman）
-- `pivot_data` — 透视表（按一列展开为多列）
-- `join_data` — 双表 Join（inner/left/outer/cross）
-- `transform_data` — 排序、选择列、重命名列
-- `export_data` — 导出为 CSV/JSON/Parquet
-
-#### 数据质量
-- `missing_value_analysis` — 缺失值分析和模式识别
-- `outlier_detection` — 异常值检测（IQR / Z-score）
-- `consistency_check` — 类型一致性和范围检查
+#### 数据处理与质量
+- 使用 pandas/pyarrow 完成画像、过滤、分组、Join、透视、分箱、贡献度、相关性和导出
+- 每个转换步骤记录输入/输出行数、列变化、丢弃或填充值数量以及采用该规则的理由
+- 缺失、异常和一致性检查要输出机器可读明细，不只打印一句总结
+- 输出 CSV/JSON/Parquet 后重新读取并核对 schema、行数、关键汇总和文件哈希
 
 #### 可视化与输出
 - `generate_chart` — 生成 Vega-Lite 图表
+- matplotlib/seaborn 图表也必须由同一持久脚本生成到 `outputs/`，并使用无界面后端
 - `write_excel` — 创建 .xlsx 文件
 - `excel_to_csv` — 将 Excel sheet 导出为 CSV
 
@@ -122,5 +100,6 @@ metadata:
 - 标注数据中可能需要注意的问题
 - 不使用 emoji，保持专业风格
 - 明确原始数据是否保持未修改、产出文件路径、转换脚本/参数和关键校验结果
+- 记录 Python 与 pandas/pyarrow/openpyxl 等实际包版本；不要声称使用了未执行的脚本
 
 如需 EDA 检查清单，使用 `read_skill_resource("data-wrangling", "references/eda_checklist.md")`。

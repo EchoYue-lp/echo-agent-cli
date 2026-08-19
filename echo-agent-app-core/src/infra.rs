@@ -442,6 +442,9 @@ pub async fn create_agent_with_diagnostics(
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
+    let script_execution_profile_resolver: Arc<
+        dyn echo_agent::tools::ScriptExecutionProfileResolver,
+    > = Arc::new(crate::analysis_runtime::AnalyticsRuntime::default());
     let command_cells =
         crate::tasks::task_runtime::command_cells::shared_command_cells(sandbox_manager.clone())?;
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
@@ -624,6 +627,9 @@ pub async fn create_agent_with_diagnostics(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    agent
+        .tool_manager()
+        .apply_script_execution_profile_resolver(script_execution_profile_resolver.clone());
     // `prepare_runtime_llm` already constructed this exact client before any
     // runtime state was accepted. Install it explicitly so agent bootstrap can
     // never fall back to an environment/YAML client after a swallowed rebuild.
@@ -697,6 +703,7 @@ pub async fn create_agent_with_diagnostics(
         params.browser_runtime.clone(),
         sandbox_manager,
         command_cells.clone(),
+        script_execution_profile_resolver,
         run_code_available,
     )
     .await;
@@ -796,6 +803,7 @@ async fn register_default_subagents(
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
+    script_execution_profile_resolver: Arc<dyn echo_agent::tools::ScriptExecutionProfileResolver>,
     run_code_available: bool,
 ) -> AgentModelConsumers {
     let tool_output_artifacts = agent.tool_output_artifacts();
@@ -894,6 +902,7 @@ async fn register_default_subagents(
                 browser_runtime.clone(),
                 sandbox_manager.clone(),
                 command_cells.clone(),
+                script_execution_profile_resolver.clone(),
                 run_code_available,
             )
         };
@@ -978,6 +987,8 @@ async fn register_default_subagents(
                 let factory_browser_runtime = browser_runtime.clone();
                 let factory_sandbox_manager = sandbox_manager.clone();
                 let factory_command_cells = command_cells.clone();
+                let factory_script_execution_profile_resolver =
+                    script_execution_profile_resolver.clone();
                 let factory_tool_output_artifacts = tool_output_artifacts.clone();
                 let factory_system_prompt = compiled_system.system_prompt.clone();
                 let factory_prompt_compiler = prompt_compiler.clone();
@@ -990,6 +1001,8 @@ async fn register_default_subagents(
                         let browser_runtime = factory_browser_runtime.clone();
                         let sandbox_manager = factory_sandbox_manager.clone();
                         let command_cells = factory_command_cells.clone();
+                        let script_execution_profile_resolver =
+                            factory_script_execution_profile_resolver.clone();
                         let tool_output_artifacts = factory_tool_output_artifacts.clone();
                         let system_prompt = factory_system_prompt.clone();
                         let prompt_compiler = factory_prompt_compiler.clone();
@@ -1047,6 +1060,7 @@ async fn register_default_subagents(
                                     browser_runtime,
                                     sandbox_manager,
                                     command_cells,
+                                    script_execution_profile_resolver,
                                     run_code_available,
                                 )?
                             };
@@ -1155,6 +1169,7 @@ fn build_writer_subagent_agent(
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
+    script_execution_profile_resolver: Arc<dyn echo_agent::tools::ScriptExecutionProfileResolver>,
     run_code_available: bool,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_subagent_agent, but OMIT `.readonly_tools()` → the
@@ -1213,6 +1228,9 @@ fn build_writer_subagent_agent(
     }
 
     let mut subagent = builder.build()?;
+    subagent
+        .tool_manager()
+        .apply_script_execution_profile_resolver(script_execution_profile_resolver);
     if let Some(client) = llm_client {
         subagent.set_llm_client(client);
     }
@@ -2981,6 +2999,7 @@ mod resolve_subagent_model_tests {
             None,
             sandbox,
             test_command_cells()?,
+            Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
         )?;
 
@@ -3024,6 +3043,7 @@ mod resolve_subagent_model_tests {
             None,
             Arc::new(SandboxManager::local_sandbox()),
             test_command_cells()?,
+            Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
             true,
         )?;
 

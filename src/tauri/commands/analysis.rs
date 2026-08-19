@@ -29,9 +29,10 @@ fn ipc_error(error: AnalysisError) -> IpcError {
         AnalysisError::Conflict => {
             IpcError::Validation("analysis changed on disk; reload before saving".to_string())
         }
-        AnalysisError::Io(_) | AnalysisError::Json(_) | AnalysisError::Execution(_) => {
-            IpcError::Internal(error.to_string())
-        }
+        AnalysisError::Io(_)
+        | AnalysisError::Json(_)
+        | AnalysisError::Execution(_)
+        | AnalysisError::RuntimeUnavailable(_) => IpcError::Internal(error.to_string()),
     }
 }
 

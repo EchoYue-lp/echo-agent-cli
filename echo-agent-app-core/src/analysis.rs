@@ -46,6 +46,8 @@ pub enum AnalysisError {
     Json(#[from] serde_json::Error),
     #[error("analysis execution failed: {0}")]
     Execution(String),
+    #[error("analysis runtime is unavailable: {0}")]
+    RuntimeUnavailable(String),
 }
 
 pub type AnalysisResult<T> = Result<T, AnalysisError>;
@@ -184,6 +186,8 @@ pub struct AnalysisRunRecord {
     pub environment: BTreeMap<String, String>,
     pub exit_code: Option<i32>,
     pub sandbox_type: Option<String>,
+    #[serde(default)]
+    pub runtime_profile: Option<String>,
     pub output: String,
     pub error: Option<String>,
     pub output_truncated: bool,
@@ -380,7 +384,24 @@ pub async fn run_analysis_with_agent(
     cancel: Option<Arc<CancellationToken>>,
 ) -> AnalysisResult<AnalysisDocument> {
     let tool_manager = agent.read(|agent| agent.tool_manager().clone()).await;
-    run_analysis(tool_manager.as_ref(), workspace_root, analysis_id, cancel).await
+    let document = load_analysis(workspace_root, analysis_id)?;
+    let runtime = match document.manifest.language {
+        AnalysisLanguage::Python => Some(
+            crate::analysis_runtime::AnalyticsRuntime::default()
+                .prepare_python()
+                .await
+                .map_err(|error| AnalysisError::RuntimeUnavailable(error.to_string()))?,
+        ),
+        AnalysisLanguage::R => None,
+    };
+    run_analysis_with_runtime(
+        tool_manager.as_ref(),
+        workspace_root,
+        analysis_id,
+        cancel,
+        runtime.as_ref(),
+    )
+    .await
 }
 
 pub async fn run_analysis(
@@ -388,6 +409,16 @@ pub async fn run_analysis(
     workspace_root: &Path,
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
+) -> AnalysisResult<AnalysisDocument> {
+    run_analysis_with_runtime(tool_manager, workspace_root, analysis_id, cancel, None).await
+}
+
+async fn run_analysis_with_runtime(
+    tool_manager: &ToolManager,
+    workspace_root: &Path,
+    analysis_id: &str,
+    cancel: Option<Arc<CancellationToken>>,
+    runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
 ) -> AnalysisResult<AnalysisDocument> {
     let document = load_analysis(workspace_root, analysis_id)?;
     let analysis_dir = analysis_dir(workspace_root, analysis_id)?;
@@ -414,6 +445,7 @@ pub async fn run_analysis(
         working_dir: Some(analysis_dir.clone()),
         execution_id: Some(run_id.clone()),
         call_id: Some(format!("analysis:{run_id}")),
+        script_execution_profile: runtime.map(|runtime| runtime.profile.clone()),
         cancel,
         ..ToolContext::default()
     };
@@ -453,7 +485,10 @@ pub async fn run_analysis(
     };
 
     let outputs = archive_outputs(workspace_root, &analysis_dir, &run_id)?;
-    let environment = read_environment(&analysis_dir.join("environment.json"))?;
+    let mut environment = read_environment(&analysis_dir.join("environment.json"))?;
+    if let Some(runtime) = runtime {
+        environment.extend(runtime.environment.clone());
+    }
     let record = AnalysisRunRecord {
         contract_version: CONTRACT_VERSION,
         run_id: run_id.clone(),
@@ -471,6 +506,7 @@ pub async fn run_analysis(
         environment,
         exit_code,
         sandbox_type,
+        runtime_profile: runtime.map(|runtime| runtime.profile.id.clone()),
         output,
         error,
         output_truncated,
@@ -1005,6 +1041,10 @@ mod tests {
     struct ScriptTool;
     struct ArtifactFailureTool;
 
+    struct ProfileScriptTool {
+        seen_profile: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
     impl Tool for ScriptTool {
         fn name(&self) -> &str {
             "run_code"
@@ -1079,6 +1119,53 @@ mod tests {
                 Ok(ToolResult::success(
                     "ran but artifact persistence will fail",
                 ))
+            })
+        }
+    }
+
+    impl Tool for ProfileScriptTool {
+        fn name(&self) -> &str {
+            "run_code"
+        }
+
+        fn description(&self) -> &str {
+            "test managed analysis script runner"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn execute_with_context<'a>(
+            &'a self,
+            _parameters: ToolParameters,
+            context: &'a ToolContext,
+        ) -> BoxFuture<'a, AgentResult<ToolResult>> {
+            Box::pin(async move {
+                let directory = context.working_dir.as_ref().ok_or_else(|| {
+                    echo_agent::error::ReactError::Other("missing working directory".to_string())
+                })?;
+                let profile_id = context
+                    .script_execution_profile
+                    .as_ref()
+                    .map(|profile| profile.id.clone())
+                    .ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "missing script execution profile".to_string(),
+                        )
+                    })?;
+                *self
+                    .seen_profile
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(profile_id);
+                fs::write(directory.join("result.json"), "{\"status\":\"ok\"}\n")?;
+                fs::write(
+                    directory.join("environment.json"),
+                    "{\"analysis.script\":\"managed\"}\n",
+                )?;
+                Ok(ToolResult::success("managed analysis completed")
+                    .with_meta("exit_code", "0")
+                    .with_meta("sandbox_type", "test"))
             })
         }
     }
@@ -1216,6 +1303,70 @@ mod tests {
                 .stale_reasons
                 .iter()
                 .any(|reason| reason.contains("input changed"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_runtime_profile_reaches_run_code_and_run_record() -> AnalysisResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let created = create_analysis(workspace.path(), "Managed", AnalysisLanguage::Python)?;
+        let seen_profile = Arc::new(std::sync::Mutex::new(None));
+        let manager = ToolManager::new();
+        manager.register(Box::new(ProfileScriptTool {
+            seen_profile: seen_profile.clone(),
+        }));
+        let prepared = crate::analysis_runtime::PreparedAnalyticsRuntime {
+            profile: Arc::new(echo_core::tools::ScriptExecutionProfile::new(
+                "eko-analytics:test-lock",
+                "python",
+                "/tmp/eko-analytics/.venv/bin/python",
+            )),
+            environment: BTreeMap::from([
+                (
+                    "analytics.profile".to_string(),
+                    "eko-analytics:test-lock".to_string(),
+                ),
+                ("python".to_string(), "3.12.4".to_string()),
+                ("python.package.pandas".to_string(), "3.0.5".to_string()),
+            ]),
+        };
+
+        let completed = run_analysis_with_runtime(
+            &manager,
+            workspace.path(),
+            &created.manifest.analysis_id,
+            None,
+            Some(&prepared),
+        )
+        .await?;
+        let run = completed
+            .last_run
+            .ok_or_else(|| AnalysisError::Invalid("missing managed run".to_string()))?;
+        assert_eq!(
+            seen_profile
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_deref(),
+            Some("eko-analytics:test-lock")
+        );
+        assert_eq!(
+            run.runtime_profile.as_deref(),
+            Some("eko-analytics:test-lock")
+        );
+        assert_eq!(
+            run.environment.get("python").map(String::as_str),
+            Some("3.12.4")
+        );
+        assert_eq!(
+            run.environment
+                .get("python.package.pandas")
+                .map(String::as_str),
+            Some("3.0.5")
+        );
+        assert_eq!(
+            run.environment.get("analysis.script").map(String::as_str),
+            Some("managed")
         );
         Ok(())
     }

@@ -3,6 +3,8 @@ use std::collections::HashSet;
 use crate::tasks::task_runtime::InteractionMode;
 
 pub(crate) const MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS: usize = 4_000;
+#[cfg(test)]
+const MAX_REGISTERED_BUILTIN_TOOLS: usize = 80;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ToolOptimizationRollout {
@@ -321,6 +323,39 @@ mod tests {
         let (definitions, registered) = agent
             .read(|agent| (Agent::tool_definitions(agent), agent.tool_names()))
             .await;
+        eprintln!("registered built-in tool catalog: {}", registered.len());
+        assert!(
+            registered.len() <= MAX_REGISTERED_BUILTIN_TOOLS,
+            "registered built-in catalog exceeded {MAX_REGISTERED_BUILTIN_TOOLS}: {}",
+            registered.len()
+        );
+        for removed in [
+            "read_data",
+            "filter_data",
+            "aggregate_data",
+            "data_stats",
+            "transform_data",
+            "export_data",
+            "profile_data",
+            "topn_data",
+            "contribution_data",
+            "bin_data",
+            "ratio_data",
+            "multi_read_data",
+            "join_data",
+            "correlate_data",
+            "pivot_data",
+            "missing_value_analysis",
+            "outlier_detection",
+            "consistency_check",
+            "exploratory_statistics",
+            "excel_load",
+        ] {
+            assert!(
+                !registered.iter().any(|tool| tool == removed),
+                "script-first EKO build must not register legacy data tool '{removed}'"
+            );
+        }
 
         for mode in [
             InteractionMode::Chat,
