@@ -1529,6 +1529,22 @@ export interface WorkspaceListResponse {
   count: number;
 }
 
+export type WorkspaceCreateAndSwitchResponse =
+  | {
+      success: true;
+      created: boolean;
+      switched: true;
+      workspace: Workspace;
+      transition: WorkspaceTransitionReceipt;
+    }
+  | {
+      success: false;
+      created: boolean;
+      switched: false;
+      workspace: Workspace;
+      error: string;
+    };
+
 export const workspaceApi = {
   list: () =>
     isTauri()
@@ -1536,12 +1552,35 @@ export const workspaceApi = {
       : get<WorkspaceListResponse>('/workspaces'),
   create: (name: string, kind?: string, root?: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; workspace: Workspace }>('create_workspace', {
+      ? apiInvoke<{ success: boolean; created?: boolean; workspace: Workspace }>(
+          'create_workspace',
+          {
+            name,
+            kind,
+            root,
+          }
+        )
+      : post<{ success: boolean; created?: boolean; workspace: Workspace }>('/workspaces', {
+          name,
+          kind,
+          root,
+        }),
+  createAndSwitch: (name: string, kind?: string, root?: string) =>
+    isTauri()
+      ? apiInvoke<WorkspaceCreateAndSwitchResponse>('create_and_switch_workspace', {
           name,
           kind,
           root,
         })
-      : post<{ success: boolean; workspace: Workspace }>('/workspaces', { name, kind, root }),
+      : workspaceApi.create(name, kind, root).then(async ({ workspace, created }) => {
+          const switched = await workspaceApi.switch(workspace.id);
+          return {
+            ...switched,
+            success: true as const,
+            created: created ?? true,
+            switched: true as const,
+          };
+        }),
   current: () =>
     isTauri()
       ? apiInvoke<{ workspace: Workspace | null; active: boolean }>('get_current_workspace')

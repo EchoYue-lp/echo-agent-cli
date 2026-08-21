@@ -126,6 +126,7 @@ pub fn build_tauri_app(
             // Workspace
             commands::workspace::list_workspaces,
             commands::workspace::create_workspace,
+            commands::workspace::create_and_switch_workspace,
             commands::workspace::get_default_root,
             commands::workspace::get_current_workspace,
             commands::workspace::get_workspace,

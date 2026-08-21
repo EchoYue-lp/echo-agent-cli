@@ -103,12 +103,27 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   createAndSwitch: async (name: string, kind?: string, root?: string) => {
-    const res = await workspaceApi.create(name, kind, root);
-    const ws = res.workspace;
-    // Refresh list
+    const res = await workspaceApi.createAndSwitch(name, kind, root);
     await get().init();
-    // Switch to it
-    await get().switchTo(ws.id);
+    if (!res.success) {
+      const prefix = res.created ? '工作区已创建，但进入失败' : '无法创建并进入工作区';
+      throw new Error(`${prefix}：${res.error}`);
+    }
+    const ws = res.workspace;
+    set({ current: ws });
+    showTransitionWarning(res.transition);
+    const fileStore = useFileStore.getState();
+    fileStore.markWorkspaceChanged();
+    void fileStore.loadTree(4);
+    void fileStore.loadChanges();
+    useChatStore.getState().clearMessages();
+    try {
+      await sessionApi.reset();
+    } catch (error) {
+      console.warn('[workspaceStore] session reset failed (non-fatal):', error);
+    }
+    useConversationStore.setState({ activeId: null });
+    await useConversationStore.getState().init();
     return ws;
   },
 

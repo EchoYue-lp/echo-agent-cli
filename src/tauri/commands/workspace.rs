@@ -2,8 +2,84 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent_app_core::workspace::WorkspaceKind;
 use echo_agent_app_core::workspace::migration::LegacyMigrator;
+use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
+use echo_agent_app_core::workspace::{Workspace, WorkspaceId, WorkspaceKind};
+use std::sync::Arc;
+
+fn same_workspace_root(left: &std::path::Path, right: &std::path::Path) -> bool {
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn create_or_open_workspace(
+    registry: &WorkspaceRegistry,
+    name: &str,
+    kind: WorkspaceKind,
+    root: Option<&str>,
+) -> Result<(Workspace, bool), IpcError> {
+    let id = WorkspaceId::from_name(name);
+    let requested_root = root
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| registry.default_root(name));
+    if let Ok(existing) = registry.open(&id) {
+        if root.is_none() || same_workspace_root(&existing.root, &requested_root) {
+            return Ok((existing, false));
+        }
+        return Err(IpcError::Validation(format!(
+            "Workspace '{}' already exists at a different path: {}",
+            id,
+            existing.root.display()
+        )));
+    }
+
+    let workspace = if root.is_some() {
+        registry.create_at(name, kind, requested_root)
+    } else {
+        registry.create(name, kind)
+    }
+    .map_err(|error| IpcError::Internal(format!("Failed to create workspace: {error}")))?;
+    Ok((workspace, true))
+}
+
+async fn switch_opened_workspace(
+    app_state: &Arc<echo_agent_app_core::AppState>,
+    workspace: Workspace,
+) -> Result<serde_json::Value, IpcError> {
+    let transition = app_state
+        .switch_workspace(workspace.clone())
+        .await
+        .map_err(|error| IpcError::Internal(format!("Failed to switch workspace: {error}")))?;
+    let conversation_count = match app_state.conversation_store().await {
+        Some(store) => {
+            let filter = echo_agent::memory::ConversationFilter::default();
+            match store.list_conversations(filter).await {
+                Ok(conversations) => conversations.len(),
+                Err(error) => {
+                    tracing::error!(%error, "failed to list conversations after workspace switch");
+                    0
+                }
+            }
+        }
+        None => {
+            tracing::error!("conversation store is unavailable after workspace switch");
+            0
+        }
+    };
+    tracing::info!(
+        workspace = %workspace.id,
+        conversation_count,
+        "Switched workspace via IPC"
+    );
+    Ok(serde_json::json!({
+        "success": true,
+        "workspace": workspace,
+        "transition": transition,
+        "debug_conversation_count": conversation_count,
+    }))
+}
 
 #[tauri::command]
 pub async fn list_workspaces(
@@ -34,30 +110,60 @@ pub async fn create_workspace(
         .map(WorkspaceKind::from_str_loose)
         .unwrap_or_default();
 
-    let result = if let Some(ref root_str) = root {
+    if let Some(ref root_str) = root {
         crate::tauri::path_validator::validate_workspace_root(root_str)
             .map_err(IpcError::Validation)?;
-        let root_path = std::path::PathBuf::from(root_str);
-        state
-            .app_state
-            .workspace
-            .registry
-            .create_at(&name, ws_kind, root_path)
-    } else {
-        state.app_state.workspace.registry.create(&name, ws_kind)
-    };
+    }
+    let (workspace, created) = create_or_open_workspace(
+        &state.app_state.workspace.registry,
+        &name,
+        ws_kind,
+        root.as_deref(),
+    )?;
+    tracing::info!(workspace = %workspace.id, root = %workspace.root.display(), created, "Created or opened workspace via IPC");
+    Ok(serde_json::json!({
+        "success": true,
+        "workspace": workspace,
+        "created": created,
+    }))
+}
 
-    match result {
-        Ok(ws) => {
-            tracing::info!(workspace = %ws.id, root = %ws.root.display(), "Created workspace via IPC");
-            Ok(serde_json::json!({
-                "success": true,
-                "workspace": ws,
-            }))
+#[tauri::command]
+pub async fn create_and_switch_workspace(
+    state: tauri::State<'_, TauriState>,
+    name: String,
+    kind: Option<String>,
+    root: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    if let Some(ref root_str) = root {
+        crate::tauri::path_validator::validate_workspace_root(root_str)
+            .map_err(IpcError::Validation)?;
+    }
+    let workspace_kind = kind
+        .as_deref()
+        .map(WorkspaceKind::from_str_loose)
+        .unwrap_or_default();
+    let (workspace, created) = create_or_open_workspace(
+        &state.app_state.workspace.registry,
+        &name,
+        workspace_kind,
+        root.as_deref(),
+    )?;
+    match switch_opened_workspace(&state.app_state, workspace.clone()).await {
+        Ok(mut response) => {
+            if let Some(object) = response.as_object_mut() {
+                object.insert("created".to_string(), serde_json::Value::Bool(created));
+                object.insert("switched".to_string(), serde_json::Value::Bool(true));
+            }
+            Ok(response)
         }
-        Err(e) => Err(IpcError::Internal(format!(
-            "Failed to create workspace: {e}"
-        ))),
+        Err(error) => Ok(serde_json::json!({
+            "success": false,
+            "created": created,
+            "switched": false,
+            "workspace": workspace,
+            "error": error.to_string(),
+        })),
     }
 }
 
@@ -150,48 +256,92 @@ pub async fn switch_workspace(
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id.clone());
     match state.app_state.workspace.registry.open(&ws_id) {
-        Ok(ws) => match state.app_state.switch_workspace(ws.clone()).await {
-            Ok(transition) => {
-                tracing::info!(workspace = %id, "Switched workspace via IPC");
-
-                // Immediately verify conversation store by listing conversations
-                let conv_count = {
-                    if let Some(store) = state.app_state.conversation_store().await {
-                        let filter = echo_agent::memory::ConversationFilter::default();
-                        match store.list_conversations(filter).await {
-                            Ok(list) => list.len(),
-                            Err(e) => {
-                                tracing::error!(
-                                    "[switch_workspace] list_conversations failed: {e}"
-                                );
-                                0
-                            }
-                        }
-                    } else {
-                        tracing::error!(
-                            "[switch_workspace] conversation_store is None after switch!"
-                        );
-                        0
-                    }
-                };
-                tracing::info!(
-                    "[switch_workspace] workspace '{}' has {} conversations",
-                    id,
-                    conv_count
-                );
-
-                Ok(serde_json::json!({
-                    "success": true,
-                    "workspace": ws,
-                    "transition": transition,
-                    "debug_conversation_count": conv_count,
-                }))
-            }
-            Err(e) => Err(IpcError::Internal(format!(
-                "Failed to switch workspace: {e}"
-            ))),
-        },
+        Ok(workspace) => switch_opened_workspace(&state.app_state, workspace).await,
         Err(e) => Err(IpcError::NotFound(format!("Workspace not found: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn new() -> std::io::Result<Self> {
+            let path = std::env::temp_dir()
+                .join(format!("eko-workspace-command-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&path)?;
+            Ok(Self(path))
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                eprintln!("failed to clean workspace command test directory: {error}");
+            }
+        }
+    }
+
+    #[test]
+    fn create_or_open_reuses_same_workspace_root() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDirectory::new()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("registry"))?;
+        let project = temp.path().join("project");
+        registry.create_at("Lp-agent", WorkspaceKind::General, project.clone())?;
+
+        let project_text = project.to_string_lossy().to_string();
+        let (workspace, created) = create_or_open_workspace(
+            &registry,
+            "Lp-agent",
+            WorkspaceKind::Code { repo_url: None },
+            Some(&project_text),
+        )?;
+
+        assert!(!created);
+        assert_eq!(workspace.root, project);
+        Ok(())
+    }
+
+    #[test]
+    fn create_or_open_without_root_reuses_custom_workspace()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDirectory::new()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("registry"))?;
+        let project = temp.path().join("custom-project");
+        registry.create_at("Lp-agent", WorkspaceKind::General, project.clone())?;
+
+        let (workspace, created) =
+            create_or_open_workspace(&registry, "Lp-agent", WorkspaceKind::General, None)?;
+
+        assert!(!created);
+        assert_eq!(workspace.root, project);
+        Ok(())
+    }
+
+    #[test]
+    fn create_or_open_rejects_same_id_at_another_root() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = TestDirectory::new()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("registry"))?;
+        registry.create_at(
+            "Lp-agent",
+            WorkspaceKind::General,
+            temp.path().join("project-a"),
+        )?;
+
+        let other = temp.path().join("project-b").to_string_lossy().to_string();
+        let error =
+            create_or_open_workspace(&registry, "Lp-agent", WorkspaceKind::General, Some(&other))
+                .err()
+                .ok_or("expected workspace path conflict")?;
+
+        assert!(matches!(error, IpcError::Validation(_)));
+        Ok(())
     }
 }
 

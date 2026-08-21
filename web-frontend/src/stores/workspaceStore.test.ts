@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   switchWorkspace: vi.fn(),
+  createAndSwitchWorkspace: vi.fn(),
+  listWorkspaces: vi.fn(),
+  currentWorkspace: vi.fn(),
   resetSession: vi.fn(),
   clearMessages: vi.fn(),
   initConversations: vi.fn(),
@@ -14,6 +17,9 @@ const mocks = vi.hoisted(() => ({
 vi.mock('../api/endpoints', () => ({
   workspaceApi: {
     switch: mocks.switchWorkspace,
+    createAndSwitch: mocks.createAndSwitchWorkspace,
+    list: mocks.listWorkspaces,
+    current: mocks.currentWorkspace,
   },
   sessionApi: {
     reset: mocks.resetSession,
@@ -68,6 +74,27 @@ describe('workspaceStore file identity integration', () => {
         degraded_subsystems: [],
       },
     });
+    mocks.createAndSwitchWorkspace.mockResolvedValue({
+      success: true,
+      created: true,
+      switched: true,
+      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      transition: {
+        status: 'committed',
+        previous_workspace_id: null,
+        target_workspace_id: 'workspace-b',
+        target_root: '/workspace-b',
+        degraded_subsystems: [],
+      },
+    });
+    mocks.listWorkspaces.mockResolvedValue({
+      workspaces: [{ id: 'workspace-b', name: 'Workspace B' }],
+      count: 1,
+    });
+    mocks.currentWorkspace.mockResolvedValue({
+      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      active: true,
+    });
     mocks.resetSession.mockResolvedValue(undefined);
     mocks.initConversations.mockResolvedValue(undefined);
     mocks.loadTree.mockResolvedValue(undefined);
@@ -110,5 +137,33 @@ describe('workspaceStore file identity integration', () => {
       expect.stringContaining('config_watcher'),
       8000
     );
+  });
+
+  it('creates and switches through one backend transition', async () => {
+    await useWorkspaceStore.getState().createAndSwitch('Workspace B', 'code', '/workspace-b');
+
+    expect(mocks.createAndSwitchWorkspace).toHaveBeenCalledWith(
+      'Workspace B',
+      'code',
+      '/workspace-b'
+    );
+    expect(mocks.switchWorkspace).not.toHaveBeenCalled();
+    expect(mocks.markWorkspaceChanged).toHaveBeenCalledOnce();
+    expect(useWorkspaceStore.getState().current?.id).toBe('workspace-b');
+  });
+
+  it('does not issue a second switch when backend switching fails', async () => {
+    mocks.createAndSwitchWorkspace.mockResolvedValueOnce({
+      success: false,
+      created: true,
+      switched: false,
+      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      error: 'runtime transition failed',
+    });
+
+    await expect(
+      useWorkspaceStore.getState().createAndSwitch('Workspace B', 'code', '/workspace-b')
+    ).rejects.toThrow('工作区已创建，但进入失败：runtime transition failed');
+    expect(mocks.switchWorkspace).not.toHaveBeenCalled();
   });
 });
