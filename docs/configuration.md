@@ -1,423 +1,267 @@
 # EKO 配置指南
 
-## 配置文件位置
+## 配置位置与优先级
 
-EKO 按以下优先级查找配置文件：
+EKO 启动时把 framework 用户数据根设置为 `~/.eko`。`EKO_DATA_DIR` 可以覆盖整个
+数据根，适合测试或隔离实例。
 
-1. 命令行参数: `--config <path>`
-2. 当前目录: `./echo-agent.yaml`
-3. 项目目录: `./.echo-agent/echo-agent.yaml`
-4. 用户目录: `~/.echo-agent/config.yaml`
+主配置查找顺序：
 
-## 快速配置
+1. `--config <path>`
+2. `ECHO_AGENT_CONFIG`
+3. `./echo-agent.yaml`
+4. `~/.eko/config.yaml`
 
-GUI 用户不需要手写 YAML。打开 **设置 → 模型 Provider**：
+GUI、TUI、CLI/JSONL 和 channel 读取同一份配置。GUI 变更通过统一 AppState mutation
+原子保存；包含密钥的配置在 Unix 上写成 `0600`。
 
-1. 添加 Provider，填写名称、API 根地址和认证方式。
-2. 在该 Provider 下添加一个或多个模型。
-3. 每个模型明确选择 Chat Completions、Responses 或 Anthropic 协议。
-4. 纯文本能力默认启用；按需勾选图像、音频、视频能力，然后保存或保存并启用。
-5. 在聊天输入框底部的“默认模型”下拉框中切换已配置模型。
+## 推荐配置
 
-用户填写的 API Key 优先级高于系统环境变量。CLI/TUI 会读取同一份已配置默认模型。
-CLI 的 `--model` 接受已启用的配置模型 ID 或唯一模型名称，不会把一个裸模型名套用到
-默认供应商的密钥、endpoint 和协议；未知或重名选择会直接报错。
-
-## 完整配置文件（echo-agent.yaml）
-
-将以下内容复制到 `~/.echo-agent/config.yaml` 或项目根目录的 `echo-agent.yaml`：
+GUI 用户优先在“设置 -> 模型 Provider”中管理 Provider 和模型。手写 YAML 时可从
+`config/echo-agent.example.yaml` 开始，核心结构如下：
 
 ```yaml
-# ── 模型配置 ─────────────────────────────────────────────────────
-# GUI、TUI 和 CLI 共享同一模型配置。
-# Provider 保存连接和认证；模型显式保存协议和输入能力。
-# base_url 可以是根地址，也可以是完整协议 endpoint。
-# 本地服务可设置 requires_api_key: false 并省略 auth_token/api_key_env。
 model:
-  default_model_id: "deepseek:deepseek-v4-flash"
-  provider: "deepseek"        # 运行时镜像字段，由“模型供应商”保存默认模型时同步
-  name: "deepseek-v4-flash"   # 运行时镜像字段，不建议手动编辑
+  default_model_id: "gateway:main"
   max_tokens: 8192
   temperature: 0.7
 
 model_providers:
-  deepseek:
-    name: "DeepSeek"
-    api_key_env: "DEEPSEEK_API_KEY"
-    base_url: "https://api.deepseek.com"
-    default_api_protocol: "chat_completions"
-    requires_api_key: true
-
-configured_models:
-  - id: "deepseek:deepseek-v4-flash"
-    display_name: "Deepseek V4 Flash"
-    provider: "deepseek"
-    model: "deepseek-v4-flash"
-    api_protocol: "chat_completions"
-    input_modalities: ["text"]
-    enabled: true
-    max_tokens: 8192
-    temperature: 0.7
-
-# ── Agent 配置 ─────────────────────────────────────────────────────
-agent:
-  name: "echo-assistant"                              # Agent 名称
-  system_prompt: "你是 EKO，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"  # 系统提示词
-  max_iterations: 0            # ReAct 最大迭代次数（0 = 无限制，直到任务完成或用户取消）
-  enable_tools: true          # 启用工具调用
-  enable_memory: true         # 启用记忆
-  enable_human_in_loop: true  # 启用人工介入
-  memory_path: "~/.echo-agent/memory"  # 记忆存储路径
-  tool_timeout_ms: 120000     # 工具执行超时（毫秒）
-  token_limit: 0              # 0 = 使用所选模型 context_window；缺失时使用 EKO 默认值
-  compress_strategy: "sliding" # 压缩策略: sliding / summary / hybrid
-  compress_window: 20         # 滑动窗口保留消息数
-
-# ── MCP 配置 ─────────────────────────────────────────────────────
-mcp:
-  # MCP 配置文件路径（支持 mcp.json）
-  # 如果不指定，会按顺序搜索：
-  #   ./mcp.json → ./.echo-agent/mcp.json → ~/.echo-agent/mcp.json
-  # config_path: "mcp.json"
-
-# ── 研究与医学 API 配置 ─────────────────────────────────────────
-# 学术研究和医学模式使用的工具 — 全部免费，无需 API Key 即可使用
-#
-# 学术研究工具（Research 模式）:
-#   - arxiv_search            → 免费，搜索 ArXiv 预印本论文
-#   - semantic_scholar_search  → 免费，搜索 Semantic Scholar 学术数据库
-#   - pdf_fetch               → 免费，下载和解析 PDF 论文全文
-#   - web_search              → 免费（DuckDuckGo），可选 API Key 提升质量
-#   - web_fetch               → 免费，抓取网页内容
-#   - bibtex_generate         → 本地工具，生成 BibTeX 引用
-#
-# 医学研究工具（Medical 模式）:
-#   - pubmed_search           → 免费，搜索 PubMed 医学文献（NCBI）
-#   - clinical_trials_search  → 免费，搜索 ClinicalTrials.gov 临床试验
-#   - pdf_fetch               → 免费（部分论文需机构网络访问）
-#   - web_search              → 免费（DuckDuckGo）
-#   - web_fetch               → 免费
-#   - bibtex_generate         → 本地工具
-#
-# 可选 API Key（提升搜索质量，非必需）:
-#
-# web_search 可选升级（优先级：Tavily > Brave > DuckDuckGo）:
-#   export TAVILY_API_KEY="your-key"         # 推荐，AI 优化搜索，免费 1000 次/月
-#                                          # 申请：https://tavily.com/
-#   export BRAVE_SEARCH_API_KEY="your-key"   # 备选，免费 2000 次/月
-#                                          # 申请：https://brave.com/search/api/
-
-# ── IM 通道配置 ─────────────────────────────────────────────────────
-channels:
-  # QQ Bot 通道
-  qq:
-    enabled: false             # 是否启用
-    app_id: ""                 # QQ Bot App ID
-    client_secret: ""          # QQ Bot Client Secret
-
-  # 飞书通道
-  feishu:
-    enabled: false             # 是否启用
-    app_id: ""                 # 飞书 App ID
-    app_secret: ""             # 飞书 App Secret
-    mode: "long_poll"          # 连接模式: long_poll | webhook
-
-  # 会话配置
-  session:
-    timeout_minutes: 60                    # 会话超时（分钟）
-    reset_keywords:                         # 触发重置的关键词
-      - "重置对话"
-      - "新对话"
-      - "清除记忆"
-    reset_commands:                         # 触发重置的命令
-      - "/reset"
-      - "/clear"
-      - "/new"
-
-# ── Webhook 配置 ──────────────────────────────────────────────────
-webhooks:
-  endpoints: []                        # Webhook 回调端点列表
-
-# ── 用户钩子配置 ──────────────────────────────────────────────────
-hooks: {}                              # 生命周期钩子（详见 hooks.yaml）
-
-# ── 服务配置 ─────────────────────────────────────────────────────
-server:
-  host: "127.0.0.1"             # 监听地址（默认绑定 localhost，安全起见不绑定 0.0.0.0）
-  port: 3000                   # 监听端口
-  max_body_bytes: 1048576      # 请求体最大大小（字节）
-
-# ── 日志配置 ─────────────────────────────────────────────────────
-logging:
-  level: "info"                # 日志级别: trace | debug | info | warn | error
-
-# ── TUI 配置 ─────────────────────────────────────────────────────
-tui:
-  max_display_chars: 20000     # 聊天区域最大保留字符数（超出后自动裁剪旧消息）
-```
-
-## MCP 服务器配置（mcp.json）
-
-将以下内容复制到 `~/.echo-agent/mcp.json` 或项目根目录的 `mcp.json`：
-
-```json
-{
-  "mcpServers": {
-    "playwright": {
-      "command": "npx",
-      "args": ["-y", "@playwright/mcp@latest"],
-      "disabled": false,
-      "description": "Playwright MCP Server - 浏览器自动化"
-    },
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@anthropic-ai/mcp-server-filesystem", "/workspace"],
-      "disabled": true,
-      "description": "文件系统 MCP Server - 文件读写操作"
-    },
-    "github": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-github"],
-      "disabled": true,
-      "env": {
-        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
-      },
-      "description": "GitHub MCP Server - GitHub API 操作"
-    },
-    "postgres": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-postgres"],
-      "disabled": true,
-      "env": {
-        "DATABASE_URL": "postgresql://user:pass@localhost:5432/db"
-      },
-      "description": "PostgreSQL MCP Server - 数据库查询"
-    }
-  }
-}
-```
-
-MCP 配置文件搜索路径（按优先级）：
-1. `./mcp.json`（项目根目录）
-2. `./.echo-agent/mcp.json`
-3. `~/.echo-agent/mcp.json`
-
-### 托管浏览器
-
-EKO 默认在应用启动后后台预热 `@playwright/mcp@latest`，无需把 Playwright
-写入 `mcp.json`。需要 Node.js 18 或更高版本以及可用的 `npm`/`npx`。浏览器
-Profile 和输出默认位于 `~/.echo-agent/browser/`。
-
-可用环境变量：
-
-```bash
-EKO_BROWSER_ENABLED=true
-EKO_BROWSER_HEADLESS=false
-EKO_BROWSER_PROFILE_DIR=~/.echo-agent/browser/profiles/managed
-EKO_BROWSER_OUTPUT_DIR=~/.echo-agent/browser/output
-EKO_BROWSER_STARTUP_TIMEOUT_SECS=60
-EKO_BROWSER_EXTENSION_ENABLED=true
-# Optional: reuse the token configured in the official Playwright Extension.
-EKO_BROWSER_EXTENSION_TOKEN=replace-with-extension-token
-```
-
-保留手动 MCP 配置兼容路径。希望完全使用自定义 Playwright MCP 配置时，可设
-`EKO_BROWSER_ENABLED=false`，避免同时启动托管 sidecar。
-
-### Chrome 登录态模式
-
-需要现有 Chrome 登录态时，安装官方
-[Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)。
-EKO 会启动第二个 `@playwright/mcp@latest --extension` sidecar；首次切换到 Chrome
-时，由 Playwright 的标签页选择界面决定本次连接控制哪个页面。普通公开网页与
-localhost 仍默认使用托管 Chromium。
-
-扩展设置页可生成连接 token。将同一值写入
-`EKO_BROWSER_EXTENSION_TOKEN` 后，sidecar 通过
-`PLAYWRIGHT_MCP_EXTENSION_TOKEN` 连接，可省去重复批准。可用
-`EKO_BROWSER_EXTENSION_ENABLED=false` 单独关闭 Chrome 后端，不影响托管浏览器。
-
-## 模型配置详解
-
-### 模型供应商配置
-
-GUI、TUI 和 CLI 使用同一份 `model_providers` 和 `configured_models`。Provider ID 是用户定义的，不存在连接厂商白名单。`configured_models[].api_protocol` 必须明确为 `responses`、`chat_completions` 或 `anthropic`；`input_modalities` 可包含 `text`、`image`、`audio`、`video`，其中 `text` 是默认能力。Provider 的 `default_api_protocol` 只作为新建模型时的界面默认值。
-
-模型配置不保存 `thinking_protocol`、思考等级或厂商原始字段。EKO 根据 Provider endpoint、API 协议和模型名从中央 `ThinkingProfile` 注册表解析能力。GUI 的思考菜单以及 TUI/CLI 的 `/think` 只显示当前模型的有效等级；`auto` 表示不发送思考字段。未知模型照常使用，但只有 `auto`。当前注册范围、版本门槛和官方依据见[动态 Provider 架构](architecture/providers.md)。
-
-下面的单个网关同时承载 Responses 文本模型和 Chat Completions 多模态模型：
-
-```yaml
-model:
-  default_model_id: "team-gateway:vision-model"
-
-model_providers:
-  team-gateway:
+  gateway:
     name: "Team Gateway"
-    api_key_env: "TEAM_LLM_KEY"
     base_url: "https://gateway.example/v1"
-    default_api_protocol: "responses"
+    api_key_env: "TEAM_LLM_KEY"
     requires_api_key: true
+    default_api_protocol: "responses"
 
 configured_models:
-  - id: "team-gateway:text-model"
-    display_name: "Text Model"
-    provider: "team-gateway"
-    model: "text-model"
+  - id: "gateway:main"
+    display_name: "Main Model"
+    provider: "gateway"
+    model: "main-model"
     api_protocol: "responses"
-    input_modalities: ["text"]
+    input_modalities: ["text", "image"]
     enabled: true
+    context_window: 396000
 
-  - id: "team-gateway:vision-model"
-    display_name: "Vision Model"
-    provider: "team-gateway"
-    model: "vision-model"
-    api_protocol: "chat_completions"
-    input_modalities: ["text", "image", "audio", "video"]
-    enabled: true
+agent:
+  name: "echo-assistant"
+  max_iterations: 0
+  enable_tools: true
+  enable_memory: true
+  enable_human_in_loop: true
+  tool_timeout_ms: 120000
+  max_tool_output_tokens: 8000
+  token_limit: 0
+  compress_strategy: "summary"
+  compress_window: 20
+  subagent_timeout_secs: 600
+
+mcp:
+  config_path: null
+
+channels:
+  qq:
+    enabled: false
+    app_id: ""
+    client_secret: ""
+  feishu:
+    enabled: false
+    app_id: ""
+    app_secret: ""
+    mode: "long_poll"
+  session:
+    timeout_minutes: 60
+    reset_keywords: ["重置对话", "新对话"]
+    reset_commands: ["/reset", "/clear", "/new"]
+
+webhooks:
+  endpoints: []
+
+hooks: {}
+
+logging:
+  level: "info"
+
+tui:
+  max_display_chars: 20000
 ```
 
-### Ollama 本地部署
+## Provider 与模型
+
+Provider 保存共享连接与认证；模型保存调用协议、输入能力和模型参数。运行时不根据
+品牌名猜协议。
+
+支持的 `api_protocol`：
+
+- `chat_completions`
+- `responses`
+- `anthropic`
+
+支持的 `input_modalities`：`text`、`image`、`audio`、`video`。`text` 始终保留。
+
+密钥解析顺序是 Provider `auth_token`，然后 Provider `api_key_env` 指向的环境变量。
+CLI/TUI 的 Provider 命令不接受明文密钥，避免写入 shell history；GUI 可以把密钥保存
+到本地配置。
+
+`default_api_protocol` 只用于添加模型时的默认选择，运行时以模型自己的
+`api_protocol` 为准。完整决策见 [Provider 架构](./architecture/providers.md)。
+
+本地 OpenAI-compatible 服务示例：
 
 ```yaml
-model:
-  default_model_id: "ollama:llama3.1"
-
 model_providers:
-  ollama:
-    name: "Ollama"
-    base_url: "http://localhost:11434/v1"
-    default_api_protocol: "chat_completions"
+  local:
+    name: "Local"
+    base_url: "http://127.0.0.1:11434/v1"
     requires_api_key: false
+    default_api_protocol: "chat_completions"
 
 configured_models:
-  - id: "ollama:llama3.1"
-    display_name: "Llama3.1"
-    provider: "ollama"
+  - id: "local:llama"
+    display_name: "Local Llama"
+    provider: "local"
     model: "llama3.1"
     api_protocol: "chat_completions"
     input_modalities: ["text"]
     enabled: true
 ```
 
-Ollama 使用用户配置的 OpenAI-compatible 根地址，无需 API Key。
+## Agent 与压缩
 
-确保 Ollama 已启动：
+| 字段                     | 含义                                                         |
+| ------------------------ | ------------------------------------------------------------ |
+| `max_iterations`         | 单 turn 最大 ReAct 迭代；`0` 表示不设产品上限，直到完成/取消 |
+| `tool_timeout_ms`        | 单次工具调用超时                                             |
+| `max_tool_output_tokens` | 单个工具结果进入模型上下文的预算，完整输出仍可落盘恢复       |
+| `token_limit`            | 显式上下文压缩阈值；`0` 使用模型窗口/应用策略                |
+| `compress_strategy`      | `summary`、`sliding` 或 `adaptive`                           |
+| `compress_window`        | 压缩时保留的近期消息数                                       |
+| `subagent_timeout_secs`  | Subagent 派发默认超时；`0` 表示无超时                        |
+
+EKO 的 workspace memory 由文件化 layered memory 管理。不要在应用配置里启用 SQLite
+store；framework 的其它复用方是否使用 SQLite 与 EKO 无关。
+
+## MCP
+
+MCP 配置源优先级：
+
+1. `--mcp-config <path>`
+2. YAML `mcp.config_path`
+3. `MCP_CONFIG_PATH`
+4. `~/.eko/mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "example": {
+      "command": "npx",
+      "args": ["-y", "example-mcp-server"],
+      "disabled": false,
+      "env": {
+        "EXAMPLE_TOKEN": "${EXAMPLE_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+EKO 对用户配置的 MCP 不做权限级拦截。stdio 命令只做明显输入校验；HTTP endpoint
+允许本地/内网明文地址，远程地址要求 HTTPS。Plugin 与用户 MCP 同名时，用户配置优先。
+
+## Browser 与 Chrome
+
+Browser runtime 默认启动托管 `@playwright/mcp` sidecar。常用环境变量：
 
 ```bash
-ollama serve
-ollama pull llama3.1
+EKO_BROWSER_ENABLED=true
+EKO_BROWSER_HEADLESS=false
+EKO_BROWSER_NODE=node
+EKO_BROWSER_NPM=npm
+EKO_BROWSER_NPX=npx
+EKO_BROWSER_MCP_PACKAGE=@playwright/mcp@latest
+EKO_BROWSER_PROFILE_DIR=~/.eko/browser/profiles/managed
+EKO_BROWSER_OUTPUT_DIR=~/.eko/browser/output
+EKO_BROWSER_SESSION_DIR=~/.eko/browser/sessions
+EKO_BROWSER_STARTUP_TIMEOUT_SECS=60
+EKO_BROWSER_EXTENSION_ENABLED=true
+EKO_BROWSER_EXTENSION_TOKEN=replace-with-extension-token
 ```
 
-## 学术研究与医学模式
+`EKO_BROWSER_ALLOWED_DOMAINS` 和 `EKO_BROWSER_BLOCKED_DOMAINS` 接受逗号分隔列表。需要
+现有 Chrome 登录态时安装 Playwright Extension，并把扩展 token 配到
+`EKO_BROWSER_EXTENSION_TOKEN`。托管 Chromium 与 Chrome extension backend 可同时存在。
 
-### 快速入门
+## Hooks 与 Webhooks
 
-学术研究和医学模式的工具**全部免费**，无需任何 API Key 即可使用。启动后即可直接检索文献：
+Hook 合并顺序从低到高：
+
+1. `echo-agent.yaml` 内嵌 `hooks`
+2. `~/.eko/hooks.yaml`
+3. `<project>/.eko/hooks.yaml`
+
+config watcher 监听 create/modify/remove 和原子保存；修改 model/MCP/runtime topology
+仍应通过对应统一 mutation 或重启，不依赖通用文件 watcher 猜测重建。
+
+Webhook endpoint 示例：
+
+```yaml
+webhooks:
+  endpoints:
+    - url: "https://example.test/eko"
+      events: ["chat_completed", "tool_failed"]
+      secret: "replace-me"
+```
+
+secret 用于 HMAC-SHA256 签名，不会写入普通事件日志。
+
+## Plugin 与 Skill
+
+- 用户 Plugin：`~/.eko/plugins/`
+- Project Plugin：`<project>/.echo-agent/plugins/`
+- Local Plugin：`<project>/.echo-agent/plugins.local/`
+- 用户 Skill：`~/.eko/skills/`
+- Skill 启用状态：`~/.eko/enabled-skills.json`
+
+Plugin 使用根 `plugin.json` 和固定组件位置。Skill 安装、启用和上游同步见
+[Skill 同步](./skill-sync.md)。
+
+## 项目指令
+
+EKO 使用标准 `AGENTS.md` / `AGENTS.override.md` 的 root-to-cwd chain，并组合 EKO 自己的
+用户/项目/本地记忆投影。应用不会把 `.echo-agent/AGENT.md` 或 `CLAUDE.md` 当成 EKO
+项目指令来源。
+
+常用 EKO 文件：
+
+- `~/.eko/user.md`：用户级长期偏好
+- `<project>/.eko/learned-rules.md`：已采纳的项目规则
+- `<cwd>/.eko/local.md`：本机/目录级说明
+
+## Channel
+
+QQ 和飞书配置位于 `channels`。环境变量覆盖：
 
 ```bash
-# 启动 TUI（默认 coding 模式）
-echo-agent-cli
-
-# 切换到研究模式
-/mode research
-
-# 或切换到医学模式
-/mode medical
+QQ_APP_ID=...
+QQ_CLIENT_SECRET=...
+FEISHU_APP_ID=...
+FEISHU_APP_SECRET=...
 ```
 
-### 工具一览
+飞书支持 `long_poll` 与 `webhook`。Channel 是完整 Agent surface，使用与 GUI/TUI/CLI
+相同的 chat driver、TaskRuntime、HITL 和 memory 权威。
 
-| 工具 | 模式 | 数据来源 | API Key | 说明 |
-|------|------|---------|---------|------|
-| `arxiv_search` | Research | ArXiv.org | 不需要 | 搜索预印本论文，返回标题、作者、摘要、PDF 链接 |
-| `semantic_scholar_search` | Research | SemanticScholar.org | 不需要 | 搜索学术论文，返回引用数、研究领域、DOI |
-| `pubmed_search` | Medical | PubMed (NCBI) | 不需要 | 搜索医学文献，返回 PMID、MeSH 词、摘要 |
-| `clinical_trials_search` | Medical | ClinicalTrials.gov | 不需要 | 搜索临床试验，返回 NCT ID、状态、阶段、结局 |
-| `pdf_fetch` | 两者 | 各学术网站 | 不需要 | 下载并解析 PDF 全文（部分论文需机构网络） |
-| `web_search` | 两者 | DuckDuckGo | 不需要 | 网络搜索（可升级为 Tavily/Brave 提升质量） |
-| `web_fetch` | 两者 | 各网站 | 不需要 | 抓取网页内容并提取正文 |
-| `bibtex_generate` | 两者 | 本地生成 | 不需要 | 根据论文信息生成 BibTeX 引用格式 |
+## 常用环境变量
 
-### 可选：提升搜索质量
+| 变量                         | 用途                               |
+| ---------------------------- | ---------------------------------- |
+| `EKO_DATA_DIR`               | 覆盖 `~/.eko` 数据根               |
+| `ECHO_AGENT_CONFIG`          | 主配置文件                         |
+| `MODEL_NAME`                 | CLI `--model` 默认值               |
+| `MCP_CONFIG_PATH`            | MCP 配置文件                       |
+| `EKO_UV_PATH`                | analytics runtime 使用的 `uv` 路径 |
+| `RUST_LOG`                   | Rust 日志过滤                      |
+| `HTTP_PROXY` / `HTTPS_PROXY` | HTTP 代理                          |
 
-`web_search` 默认使用 DuckDuckGo（免费、无需配置），可通过环境变量升级为更高质量的搜索引擎：
-
-```bash
-# 方式 1（推荐）：Tavily — AI 优化搜索，免费 1000 次/月
-# 申请：https://tavily.com/
-export TAVILY_API_KEY="tvly-your-key-here"
-
-# 方式 2：Brave Search — 免费 2000 次/月
-# 申请：https://brave.com/search/api/
-export BRAVE_SEARCH_API_KEY="BSAyour-key-here"
-```
-
-优先级：Tavily > Brave > DuckDuckGo（自动选择可用的最佳引擎）。
-
-### 使用示例
-
-**学术研究模式：**
-
-```
-> /mode research
-
-> 搜索 2024 年大语言模型在医学领域的最新研究
-Agent: 调用 arxiv_search + semantic_scholar_search 交叉检索...
-
-> 下载第一篇论文的全文
-Agent: 调用 pdf_fetch 下载并解析...
-
-> 生成这些论文的 BibTeX 引用
-Agent: 调用 bibtex_generate...
-```
-
-**医学研究模式：**
-
-```
-> /mode medical
-
-> 搜索 CRISPR 基因治疗在肿瘤免疫中的最新临床试验
-Agent: 调用 pubmed_search + clinical_trials_search 交叉检索...
-
-> 搜索 2023-2025 年发表的 PD-1 抑制剂 meta-analysis
-Agent: 调用 pubmed_search(query='PD-1 inhibitor meta-analysis', min_date='2023/01/01')...
-
-> 下载 PMID 为 38245678 的论文全文
-Agent: 调用 pdf_fetch...
-```
-
-## 工作模式
-
-通过 TUI 内的 `/mode` 命令切换：
-
-| 模式 | 说明 |
-|------|------|
-| `general` | 通用助手（TUI 默认），适合日常问答和混合任务 |
-| `coding` | 编程模式，专注代码阅读、生成、重构、调试 |
-| `research` | 研究模式，适合信息检索、文档阅读、报告生成 |
-| `medical` | 医学研究模式，PubMed 文献检索、临床试验、循证医学分析 |
-| `data` | 数据分析模式，处理数据读取、统计、可视化 |
-| `writing` | 写作模式，专注文章撰写、内容编辑、翻译 |
-
-## 环境变量汇总
-
-```bash
-# ── Provider 专属 API Key（兜底） ──
-# GUI/YAML 中保存的 API Key 优先级更高；环境变量适合 CI 或无 GUI 环境。
-export DEEPSEEK_API_KEY="..."          # DeepSeek
-export OPENAI_API_KEY="..."            # OpenAI
-export ANTHROPIC_API_KEY="..."         # Anthropic
-export DASHSCOPE_API_KEY="..."         # 阿里通义
-export QWEN_API_KEY="..."              # 阿里通义别名
-export GEMINI_API_KEY="..."            # Gemini
-
-# ── 其他 ──
-export MCP_CONFIG_PATH="~/my-mcp-config.json"  # MCP 配置文件路径
-export MODEL_NAME="deepseek-v4-flash"          # 模型名称（覆盖配置文件）
-export TAVILY_API_KEY="..."                    # Web Search（可选，AI 优化搜索）
-export BRAVE_SEARCH_API_KEY="..."              # Web Search（可选，备选引擎）
-export HTTP_PROXY="http://proxy:8080"          # HTTP 代理
-export HTTPS_PROXY="http://proxy:8080"         # HTTPS 代理
-export RUST_LOG="info"                         # 日志级别
-```
+Provider API Key 使用各 Provider 的 `api_key_env`，无需维护固定厂商变量白名单。

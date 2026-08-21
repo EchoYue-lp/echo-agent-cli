@@ -2038,8 +2038,7 @@ pub struct Artifact {
 
 // ── SubagentRun(执行实例,原执行体概念的归一化载体)──────────────────────
 //
-// Subagent 统一重构(spec: docs/subagent-unification-plan.md):一次 subagent
-// 派发的运行实例。Task → SubagentRun 关联通过 task_id 查询投影得到,PlanTask
+// 一次 subagent 派发的运行实例。Task → SubagentRun 关联通过 task_id 查询投影得到,PlanTask
 // 不持有 executions 字段(避免污染 plan artifact)。
 //
 // `subagent_run_id` 与框架 SubagentEvent.execution_id 对齐(正式 PlanTask 格式

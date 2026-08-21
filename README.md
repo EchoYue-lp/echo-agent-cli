@@ -3,7 +3,7 @@
 > 一个基于 [echo-agent](https://github.com/EchoYue-lp/echo-agent) 的通用 AI Agent 产品，支持 Coding、数据分析和学术研究三大核心能力。
 
 [![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)](https://www.rust-lang.org)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/license/mit)
 
 ## 📋 项目简介
 
@@ -21,7 +21,7 @@ EKO 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供
 - 🧩 **可扩展架构**：MCP 服务器、插件系统（PluginRegistry）、技能管理
 - 📡 **IM 通道集成**：支持 QQ Bot、飞书（飞书 webhook/long_poll 模式）
 - 🔗 **Hooks 系统**：可配置的事件钩子，支持自定义工作流
-- 🎨 **现代化 GUI**：React + Tailwind CSS + WebSocket 实时通信
+- 🎨 **现代化 GUI**：React + Tailwind CSS + typed Tauri IPC 实时投影
 - 🧠 **统一记忆系统**：User / Project / Local 三层记忆，支持自动提取
 - 🔧 **LSP 集成**：诊断、跳转定义、查找引用、悬停提示
 - 🔁 **自我进化**：轨迹回放、自我审查、自动改进
@@ -101,11 +101,12 @@ GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_mo
 EKO 按以下优先级查找配置文件：
 
 1. 命令行参数: `--config <path>`
-2. 当前目录: `./echo-agent.yaml`
-3. 项目目录: `./.echo-agent/echo-agent.yaml`
-4. 用户目录: `~/.echo-agent/config.yaml`
+2. 环境变量: `ECHO_AGENT_CONFIG`
+3. 当前目录: `./echo-agent.yaml`
+4. 用户目录: `~/.eko/config.yaml`
 
-MCP 配置搜索路径：`./mcp.json` → `./.echo-agent/mcp.json` → `~/.echo-agent/mcp.json`
+MCP 配置优先级：`--mcp-config` → YAML `mcp.config_path` →
+`MCP_CONFIG_PATH` → `~/.eko/mcp.json`
 
 ---
 
@@ -174,14 +175,14 @@ cargo tauri build
 
 打包产物路径：
 
-| 平台 | 产物 |
-|------|------|
-| macOS | `target/release/bundle/macos/EKO.app` |
-|       | `target/release/bundle/dmg/EKO_*.dmg` |
-| Linux | `target/release/bundle/deb/echo-agent-tauri_*.deb` |
-|       | `target/release/bundle/appimage/echo-agent-tauri_*.AppImage` |
-| Windows | `target/release/bundle/msi/EKO_*.msi` |
-|         | `target/release/bundle/nsis/EKO_*.exe` |
+| 平台    | 产物                                                         |
+| ------- | ------------------------------------------------------------ |
+| macOS   | `target/release/bundle/macos/EKO.app`                        |
+|         | `target/release/bundle/dmg/EKO_*.dmg`                        |
+| Linux   | `target/release/bundle/deb/echo-agent-tauri_*.deb`           |
+|         | `target/release/bundle/appimage/echo-agent-tauri_*.AppImage` |
+| Windows | `target/release/bundle/msi/EKO_*.msi`                        |
+|         | `target/release/bundle/nsis/EKO_*.exe`                       |
 
 > **注意**：不要只把 `target/release/echo-agent-tauri` 复制进 `.app` 目录来当作安装包；那只是裸后端二进制，可能缺少前端资源、图标和平台元数据。
 
@@ -212,38 +213,40 @@ Tauri CLI 打包时会构建包名二进制 `echo-agent-cli`，项目已在 `--n
 
 #### GUI 功能状态
 
-当前 GUI 已接真实 Tauri 后端的核心面板包括：聊天/会话、记忆、Auto Memory、工具、MCP、技能、模型供应商、权限/审计、压缩、定时任务、自进化、Trace、Terminal、Scratchpad、Decisions、Worktree。
-
-仍隐藏或不作为完整 GUI 功能暴露的面板包括：`workflow`（仅保存/删除，执行未接 IPC）、`sandbox`（仅配置可读写，执行未开放）、`extract`（仅 schema 校验，抽取逻辑建议通过 chat skill 使用）、`papers`（论文库 IPC 尚未实现）。
-
-更完整的 GUI 状态矩阵见 [docs/gui-status.md](docs/gui-status.md)。
+GUI 已接真实 Tauri 后端的聊天/会话、TaskRuntime/Subagent、记忆/自进化、工具、
+MCP、技能、Plugin、模型供应商、权限/审计、压缩、定时任务、Trace、Terminal、
+Browser、Sandbox、数据分析和论文/系统综述工作台。Workflow 和通用结构化抽取的后端
+已存在，但 React panel 尚未接入生产导航，不能算 GUI 完成。当前代码依据与尚在收口的
+缺口见 [功能总览](docs/features.md)。
 
 > **注意**：每个平台只能打包该平台原生的安装包。如需交叉编译请使用 CI/CD（如 GitHub Actions）。
 
 ### Feature Flags 说明
 
-| Feature | 描述 | 默认启用 |
-|---------|------|----------|
-| `tui` | 终端全屏界面（ratatui） | ✅ |
-| `gui` | 桌面应用（Tauri，自动包含 `channels`） | ❌ |
-| `channels` | 多通道支持（IM） | ❌ |
-| `telemetry` | 遥测数据收集 | ❌ |
-| `devtools` | Tauri 开发者工具 | ❌ |
+| Feature     | 描述                                   | 默认启用 |
+| ----------- | -------------------------------------- | -------- |
+| `tui`       | 终端全屏界面（ratatui）                | ✅       |
+| `gui`       | 桌面应用（Tauri，自动包含 `channels`） | ❌       |
+| `channels`  | 多通道支持（IM）                       | ❌       |
+| `telemetry` | 遥测数据收集                           | ❌       |
+| `devtools`  | Tauri 开发者工具                       | ❌       |
 
 ### echo-agent 依赖 Features
 
 echo-agent-cli 启用以下 echo-agent 框架 features：
 
-| Feature | 描述 |
-|---------|------|
-| `sqlite` | SQLite 会话存储 |
-| `mcp` | MCP 协议支持 |
-| `lsp` | LSP 语言服务器集成 |
-| `human-loop` | 人机协作循环 |
-| `subagent` | 子 Agent 编排 |
-| `tasks` | 任务系统 |
-| `eval` | 评测框架 |
-| `improve` | 自我改进 |
+| Feature                   | 描述                  |
+| ------------------------- | --------------------- |
+| `mcp`                     | MCP 协议支持          |
+| `lsp`                     | LSP 语言服务器集成    |
+| `human-loop`              | 人机协作循环          |
+| `subagent`                | 子 Agent 编排         |
+| `tasks`                   | 任务系统              |
+| `git` / `shell` / `files` | 编码与本地执行工具    |
+| `web` / `media` / `chart` | Web、多模态与图表工具 |
+| `research` / `rag`        | 学术研究与检索能力    |
+
+EKO 不启用 framework `sqlite` feature；会话、runtime、memory 和 TaskRun 使用文件存储。
 
 ---
 
@@ -251,19 +254,19 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 
 ### TUI 快捷键
 
-| 快捷键 | 功能 |
-|--------|------|
-| `Ctrl+C` / `Ctrl+Q` | 退出应用 |
-| `Ctrl+B` | 切换侧边栏 |
-| `Ctrl+L` | 清空聊天 |
-| `Shift+Enter` | 输入换行 |
-| `Enter` | 发送消息 |
-| `Esc` | 取消生成 / 关闭弹窗 |
-| `Tab` | 切换侧边栏标签 |
-| `S-Tab` | 补全列表上一项 |
-| `↑/↓` | 浏览输入历史 |
-| `PageUp/PageDown` | 快速滚动聊天 |
-| `y` / `n` | 批准 / 拒绝工具执行（HITL 审批） |
+| 快捷键              | 功能                             |
+| ------------------- | -------------------------------- |
+| `Ctrl+C` / `Ctrl+Q` | 退出应用                         |
+| `Ctrl+B`            | 切换侧边栏                       |
+| `Ctrl+L`            | 清空聊天                         |
+| `Shift+Enter`       | 输入换行                         |
+| `Enter`             | 发送消息                         |
+| `Esc`               | 取消生成 / 关闭弹窗              |
+| `Tab`               | 切换侧边栏标签                   |
+| `S-Tab`             | 补全列表上一项                   |
+| `↑/↓`               | 浏览输入历史                     |
+| `PageUp/PageDown`   | 快速滚动聊天                     |
+| `y` / `n`           | 批准 / 拒绝工具执行（HITL 审批） |
 
 ### Slash 命令
 
@@ -271,62 +274,62 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 
 #### Session 会话管理
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/clear` | `cls` | 清空当前对话并重置 Agent 上下文 |
-| `/history` | `hist` | 查看会话历史 |
-| `/stats` | `st` | 显示会话统计 |
-| `/status` | | 显示 Agent 状态 |
-| `/new` | `n` | 创建新会话 |
-| `/compact` | `cp` | 压缩上下文窗口 |
-| `/undo` | `u` | 撤销上一步操作 |
+| 命令       | 别名   | 描述                            |
+| ---------- | ------ | ------------------------------- |
+| `/clear`   | `cls`  | 清空当前对话并重置 Agent 上下文 |
+| `/history` | `hist` | 查看会话历史                    |
+| `/stats`   | `st`   | 显示会话统计                    |
+| `/status`  |        | 显示 Agent 状态                 |
+| `/new`     | `n`    | 创建新会话                      |
+| `/compact` | `cp`   | 压缩上下文窗口                  |
+| `/undo`    | `u`    | 撤销上一步操作                  |
 
 #### Context 上下文管理
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/mode <mode>` | | 切换模式（general/coding/research/medical/data/writing） |
-| `/model <name>` | | 切换模型 |
-| `/think [level]` | | 查看或设置当前模型支持的思考等级 |
-| `/reasoning [level]` | | `/think` 的别名 |
-| `/system [prompt]` | `sys` | 查看或设置系统提示词 |
-| `/memory` | | 查看记忆内容 |
-| `/remember <fact>` | | 保存一条记忆 |
-| `/forget <fact>` | | 删除一条记忆 |
-| `/compress` | | 手动压缩上下文 |
-| `/context` | | 查看上下文信息 |
-| `/refresh` | | 刷新项目上下文 |
-| `/project` | `proj` | 项目管理 |
+| 命令                 | 别名   | 描述                                                     |
+| -------------------- | ------ | -------------------------------------------------------- |
+| `/mode <mode>`       |        | 切换模式（general/coding/research/medical/data/writing） |
+| `/model <name>`      |        | 切换模型                                                 |
+| `/think [level]`     |        | 查看或设置当前模型支持的思考等级                         |
+| `/reasoning [level]` |        | `/think` 的别名                                          |
+| `/system [prompt]`   | `sys`  | 查看或设置系统提示词                                     |
+| `/memory`            |        | 查看记忆内容                                             |
+| `/remember <fact>`   |        | 保存一条记忆                                             |
+| `/forget <fact>`     |        | 删除一条记忆                                             |
+| `/compress`          |        | 手动压缩上下文                                           |
+| `/context`           |        | 查看上下文信息                                           |
+| `/refresh`           |        | 刷新项目上下文                                           |
+| `/project`           | `proj` | 项目管理                                                 |
 
 #### Coding 编码工具
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/plan` | | 进入计划模式（只读分析） |
-| `/tasks` | | 查看活跃任务 |
-| `/task-progress` | `tp` | 查看任务进度 |
-| `/task-tree` | `tt` | 查看任务树 |
-| `/test [name]` | | 运行测试 |
-| `/code-review [path]` | `cr` | 请求代码审查 |
-| `/fix` | | 自动修复问题 |
-| `/diff [file]` | | 查看 git 或文件差异 |
-| `/agents` | | 列出可用 Agent |
-| `/agent` | | Agent 管理 |
-| `/hooks` | `hk` | 管理 Hooks |
+| 命令                  | 别名 | 描述                     |
+| --------------------- | ---- | ------------------------ |
+| `/plan`               |      | 进入计划模式（只读分析） |
+| `/tasks`              |      | 查看活跃任务             |
+| `/task-progress`      | `tp` | 查看任务进度             |
+| `/task-tree`          | `tt` | 查看任务树               |
+| `/test [name]`        |      | 运行测试                 |
+| `/code-review [path]` | `cr` | 请求代码审查             |
+| `/fix`                |      | 自动修复问题             |
+| `/diff [file]`        |      | 查看 git 或文件差异      |
+| `/agents`             |      | 列出可用 Agent           |
+| `/agent`              |      | Agent 管理               |
+| `/hooks`              | `hk` | 管理 Hooks               |
 
 #### Git 操作
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/git <args>` | | 运行 git 命令 |
+| 命令          | 别名 | 描述          |
+| ------------- | ---- | ------------- |
+| `/git <args>` |      | 运行 git 命令 |
 
 #### Research 学术研究
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
+| 命令             | 别名 | 描述         |
+| ---------------- | ---- | ------------ |
 | `/search-papers` | `sp` | 搜索学术论文 |
-| `/fetch-paper` | `fp` | 获取指定论文 |
-| `/papers` | | 列出已有论文 |
+| `/fetch-paper`   | `fp` | 获取指定论文 |
+| `/papers`        |      | 列出已有论文 |
 
 #### Medical 医学研究
 
@@ -337,23 +340,23 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 - `pdf_fetch` — 下载并解析论文全文
 - `web_search` + `web_fetch` — 网络搜索补充信息
 
-所有医学工具**免费使用**，无需 API Key。详见 [配置指南](docs/configuration.md#学术研究与医学模式)。
+所有医学工具**免费使用**，无需 API Key。详见 [配置指南](docs/configuration.md)。
 
 #### Pipeline 流水线
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/pipeline [list\|run]` | | 管理单流水线 |
-| `/analyze` | `da` | 运行数据分析流水线 |
-| `/write` | `wp` | 运行写作流水线 |
+| 命令                    | 别名 | 描述               |
+| ----------------------- | ---- | ------------------ |
+| `/pipeline [list\|run]` |      | 管理单流水线       |
+| `/analyze`              | `da` | 运行数据分析流水线 |
+| `/write`                | `wp` | 运行写作流水线     |
 
 #### Skills & Plugins 技能与插件
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/skills` | `sk` | 技能管理 |
-| `/mcp` | `m` | MCP 服务器管理 |
-| `/plugins` | `plugin` | 插件管理 |
+| 命令       | 别名     | 描述           |
+| ---------- | -------- | -------------- |
+| `/skills`  | `sk`     | 技能管理       |
+| `/mcp`     | `m`      | MCP 服务器管理 |
+| `/plugins` | `plugin` | 插件管理       |
 
 EKO 插件采用扁平包结构：根目录使用 `plugin.json`，Skills、MCP、Subagents、
 Hooks、LSP、monitors、themes 和 output styles 都从固定根位置发现，不使用
@@ -362,75 +365,75 @@ namespace 或组件路径声明。旧 `.echo-plugin/manifest.yaml` 不再支持�
 
 #### Evolution 自我进化
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/review` | | 从最近运行生成带证据的记忆候选（默认不保存） |
-| `/curator` | | 管理技能生命周期 |
-| `/critiques` | `cq` | 查看评审意见 |
-| `/memory-review` | `mr` | 审查已积累记忆（默认不自动语义合并） |
-| `/skill-candidates` | `sc` | 查看技能候选与草稿 |
-| `/runs` | | 列出最近运行 |
-| `/run` | | 查看或导出运行详情 |
+| 命令                | 别名 | 描述                                         |
+| ------------------- | ---- | -------------------------------------------- |
+| `/review`           |      | 从最近运行生成带证据的记忆候选（默认不保存） |
+| `/curator`          |      | 管理技能生命周期                             |
+| `/critiques`        | `cq` | 查看评审意见                                 |
+| `/memory-review`    | `mr` | 审查已积累记忆（默认不自动语义合并）         |
+| `/skill-candidates` | `sc` | 查看技能候选与草稿                           |
+| `/runs`             |      | 列出最近运行                                 |
+| `/run`              |      | 查看或导出运行详情                           |
 
 #### Scheduling 定时调度
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/cron [list\|add\|remove]` | | 管理定时任务 |
-| `/auto-memory` | `am` | 自动记忆管理（on/off/extract/show/config） |
+| 命令                        | 别名 | 描述                                       |
+| --------------------------- | ---- | ------------------------------------------ |
+| `/cron [list\|add\|remove]` |      | 管理定时任务                               |
+| `/auto-memory`              | `am` | 自动记忆管理（on/off/extract/show/config） |
 
 #### Advanced 高级功能
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/checkpoint` | `/save` | 强制保存当前 runtime checkpoint |
-| `/sessions [query]` | `ss` | 从 canonical ConversationStore 列出或搜索会话 |
-| `/export` | | 导出会话 |
-| `/profile` | `prof` | 配置档案管理 |
-| `/theme` | | 切换主题 |
-| `/output` | | 切换输出格式 |
-| `/verbose` | | 切换详细模式 |
-| `/doctor` | `doc` | 诊断配置问题 |
-| `/delegate` | `dl` | 委托子 Agent |
-| `/search` | | 搜索功能 |
-| `/inspect` | `ins` | 检查状态 |
-| `/trace` | `tr` | 追踪观测（sessions/summary/stats） |
-| `/workspace` | `ws` | 工作区管理 |
+| 命令                | 别名    | 描述                                          |
+| ------------------- | ------- | --------------------------------------------- |
+| `/checkpoint`       | `/save` | 强制保存当前 runtime checkpoint               |
+| `/sessions [query]` | `ss`    | 从 canonical ConversationStore 列出或搜索会话 |
+| `/export`           |         | 导出会话                                      |
+| `/profile`          | `prof`  | 配置档案管理                                  |
+| `/theme`            |         | 切换主题                                      |
+| `/output`           |         | 切换输出格式                                  |
+| `/verbose`          |         | 切换详细模式                                  |
+| `/doctor`           | `doc`   | 诊断配置问题                                  |
+| `/delegate`         | `dl`    | 委托子 Agent                                  |
+| `/search`           |         | 搜索功能                                      |
+| `/inspect`          | `ins`   | 检查状态                                      |
+| `/trace`            | `tr`    | 追踪观测（sessions/summary/stats）            |
+| `/workspace`        | `ws`    | 工作区管理                                    |
 
 #### Security 安全
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
+| 命令                 | 别名   | 描述              |
+| -------------------- | ------ | ----------------- |
 | `/permission [mode]` | `perm` | 查看/设置权限模式 |
 
 #### Info 信息
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/tools` | | 显示可用工具 |
-| `/cost` | | 显示 Token 用量 |
-| `/usage` | | 使用统计 |
-| `/debug` | | 调试信息 |
-| `/help` | `h`, `?` | 显示帮助信息 |
+| 命令     | 别名     | 描述            |
+| -------- | -------- | --------------- |
+| `/tools` |          | 显示可用工具    |
+| `/cost`  |          | 显示 Token 用量 |
+| `/usage` |          | 使用统计        |
+| `/debug` |          | 调试信息        |
+| `/help`  | `h`, `?` | 显示帮助信息    |
 
 #### Exit 退出
 
-| 命令 | 别名 | 描述 |
-|------|------|------|
-| `/quit` / `/exit` | `q` | 退出应用 |
+| 命令              | 别名 | 描述     |
+| ----------------- | ---- | -------- |
+| `/quit` / `/exit` | `q`  | 退出应用 |
 
 ### CLI 常用参数
 
-| 参数 | 短形式 | 描述 |
-|------|--------|------|
-| `--model <id-or-name>` | `-m` | 选择已启用的配置模型 ID 或唯一模型名称；未知/重名会报错 |
-| `--config <path>` | | 指定配置文件路径 |
-| `--mcp-config <path>` | | 指定 MCP 配置文件路径 |
-| `--project <path>` | | 指定项目目录 |
-| `--jsonl <prompt>` | | 非交互执行一次请求；stdout 每行输出一个 canonical chat envelope |
-| `--continue` | `-c` | 继续最近一次会话 |
-| `--resume <id>` | `-r` | 恢复指定会话 |
-| `--verbose` | `-v` | 详细输出模式 |
+| 参数                   | 短形式 | 描述                                                            |
+| ---------------------- | ------ | --------------------------------------------------------------- |
+| `--model <id-or-name>` | `-m`   | 选择已启用的配置模型 ID 或唯一模型名称；未知/重名会报错         |
+| `--config <path>`      |        | 指定配置文件路径                                                |
+| `--mcp-config <path>`  |        | 指定 MCP 配置文件路径                                           |
+| `--project <path>`     |        | 指定项目目录                                                    |
+| `--jsonl <prompt>`     |        | 非交互执行一次请求；stdout 每行输出一个 canonical chat envelope |
+| `--continue`           | `-c`   | 继续最近一次会话                                                |
+| `--resume <id>`        | `-r`   | 恢复指定会话                                                    |
+| `--verbose`            | `-v`   | 详细输出模式                                                    |
 
 > **提示**：Agent 模式、系统提示词等可在 TUI 内通过 `/mode`、`/system` 等 slash 命令调整，无需通过 CLI 参数设置。
 
@@ -496,8 +499,8 @@ echo-agent-app-core (共享应用库)
 echo-agent (AI Agent 框架)
     ├── react agent loop / tool execution
     ├── MCP / LSP / memory
-    ├── subagent / eval / improve
-    └── sqlite / tasks / human-loop
+    ├── Subagent / task DAG / workflow
+    └── file stores / human-loop / model protocols
 ```
 
 ### Agent Streaming
@@ -533,7 +536,7 @@ echo-agent (AI Agent 框架)
 
 三层记忆架构：
 
-- **User** — 全局用户偏好和指令（`~/.echo-agent/`）
+- **User** — 全局用户偏好和指令（`~/.eko/`）
 - **Project** — 项目级上下文和规则（`.eko/`）
 - **Local** — 本地开发环境特定配置
 
@@ -541,7 +544,7 @@ echo-agent (AI Agent 框架)
 
 ### LSP 集成
 
-当检测到 `.lsp.yaml` 配置时（项目目录或 `~/.echo-agent/`），自动注册 LSP 工具：
+当检测到 `.lsp.yaml` 配置时（项目目录或 `~/.eko/`），自动注册 LSP 工具：
 
 - 诊断信息获取
 - 跳转到定义
@@ -553,7 +556,7 @@ echo-agent (AI Agent 框架)
 
 ## 📁 工作区
 
-工作区存储在 `~/.echo-agent/workspaces/` 下，包含：
+工作区存储在 `~/.eko/workspaces/` 下，包含：
 
 ```
 workspaces/
@@ -578,7 +581,9 @@ workspaces/
 
 详细文档请参阅 `docs/` 目录：
 
-- [架构设计](docs/architecture.md) — 系统架构与设计决策
+- [文档索引](docs/README.md) — 项目文档边界与导航
+- [功能总览](docs/features.md) — 已实现能力与代码依据
+- [架构说明](docs/architecture.md) — 当前运行时所有权与数据流
 - [配置指南](docs/configuration.md) — 配置文件详解
 - [入门指南](docs/getting-started.md) — 从零开始使用
 
@@ -602,7 +607,7 @@ workspaces/
 
 ## 📄 许可证
 
-MIT License — 详见 [LICENSE](LICENSE) 文件。
+MIT License。
 
 ---
 

@@ -1,6 +1,5 @@
 /**
- * SubagentRun store — Phase 4c of the Subagent unification
- * (spec: docs/subagent-unification-plan.md §6).
+ * Canonical SubagentRun execution-flow store.
  *
  * Consumes the unified `execution://event` channel (kind="subagent"). The
  * legacy `subagent://trace` / `subagent://event` channels and their stores

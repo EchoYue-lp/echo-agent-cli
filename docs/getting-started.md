@@ -1,244 +1,140 @@
 # EKO 快速入门
 
-## 安装
+## 前置条件
 
-### 1. 安装 Rust 工具链
+- Rust 1.95 或更高版本
+- Node.js 20.19+、22.13+ 或 24+（仅 GUI 开发/打包需要）
+- macOS/Linux/Windows 对应的 Tauri 2 系统依赖（仅 GUI 需要）
+- 至少一个可用 LLM Provider 与模型
 
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-```
-
-### 2. 克隆仓库
+## 获取依赖
 
 ```bash
-git clone <repository-url>
 cd echo-agent-cli
-```
-
-### 3. 安装依赖
-
-```bash
-# Rust 依赖
 cargo fetch
 
-# 前端依赖（如果需要使用 GUI 模式）
-cd web-frontend && npm install && cd ..
+cd web-frontend
+npm install
 ```
 
-## 首次配置
+只使用 TUI 或 JSONL 时可以跳过前端依赖。
 
-### 运行初始化向导
+## 配置模型
 
-```bash
-cargo run --bin echo-agent-cli -- onboard
-```
+GUI 用户在“设置 -> 模型 Provider”中：
 
-向导将帮助你：
-- 创建数据目录 `~/.echo-agent/`
-- 配置 LLM API Key
-- 选择默认模型
-- 选择工作模式（general/coding/research/data/writing）
+1. 新建 Provider，填写 API 根地址和认证方式。
+2. 在 Provider 下添加模型。
+3. 为每个模型明确选择 `chat_completions`、`responses` 或 `anthropic`。
+4. 选择输入能力并设为默认模型。
 
-### 手动配置 API Key
-
-你也可以直接在 `~/.echo-agent/config.yaml` 中配置：
+TUI/CLI 用户可以准备 `./echo-agent.yaml` 或 `~/.eko/config.yaml`。最小示例：
 
 ```yaml
 model:
-  name: "qwen3.6-plus"
-  
-agent:
-  name: "echo-assistant"
-  system_prompt: "你是 EKO，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
-```
+  default_model_id: "my-provider:my-model"
 
-设置环境变量：
+model_providers:
+  my-provider:
+    name: "My Provider"
+    base_url: "https://api.example.com/v1"
+    api_key_env: "MY_PROVIDER_API_KEY"
+    requires_api_key: true
+    default_api_protocol: "responses"
+
+configured_models:
+  - id: "my-provider:my-model"
+    display_name: "My Model"
+    provider: "my-provider"
+    model: "my-model"
+    api_protocol: "responses"
+    input_modalities: ["text"]
+    enabled: true
+```
 
 ```bash
-export DASHSCOPE_API_KEY="your-api-key"
-# 或
-export OPENAI_API_KEY="your-api-key"
-# 或
-export ANTHROPIC_API_KEY="your-api-key"
+export MY_PROVIDER_API_KEY="..."
 ```
 
-## 基本使用
+完整字段见 [配置指南](./configuration.md)。
 
-### 启动 TUI 交互界面
+## 启动 TUI
 
 ```bash
 cargo run --bin echo-agent-cli
 ```
 
-或者直接运行已安装的版本：
+常用参数：
 
 ```bash
-echo-agent-cli
+cargo run --bin echo-agent-cli -- --project /path/to/project
+cargo run --bin echo-agent-cli -- --model my-provider:my-model
+cargo run --bin echo-agent-cli -- --continue
+cargo run --bin echo-agent-cli -- --resume <conversation-id>
 ```
 
-### 启动 GUI 桌面应用
+TUI 是完整 Agent surface，支持 TaskRun、Subagent、HITL、MCP、Browser、Plugin、Skill、
+Memory 和附件，不是 GUI 的精简版。输入 `/help` 查看当前代码注册的命令，避免依赖
+静态命令清单。
+
+## 启动 GUI
 
 ```bash
-# 需要先构建前端
-cd web-frontend && npm run build && cd ..
-
-# 启动 Tauri 应用
-cargo run --bin echo-agent-tauri
+cargo gui-dev
 ```
 
-### 命令行模式
+等价命令：
 
 ```bash
-# 单次对话（run 子命令）
-echo-agent-cli run "解释这段代码"
-
-# 非交互 JSONL（stdout 每行一个 canonical chat envelope）
-echo-agent-cli --jsonl "写一个快速排序并测试"
-
-# 指定模型
-echo-agent-cli --model qwen3.7-max --jsonl "写一个快速排序"
-
-# 使用指定配置
-echo-agent-cli --config ./my-config.yaml --jsonl "分析这段代码"
-
-# 继续最近一次会话
-echo-agent-cli --continue
-
-# 恢复指定会话
-echo-agent-cli --resume <session-id>
-
-# 在原会话上执行一次非交互请求
-echo-agent-cli --resume <session-id> --jsonl "继续处理剩余任务"
+cargo tauri dev -- --no-default-features --features gui --bin echo-agent-tauri
 ```
 
-## 核心功能
-
-### 1. 会话管理
-
-在 TUI 中可使用以下 slash 命令管理会话：
-
-- `/new` - 创建新会话
-- `/reset` - 重置当前会话历史
-- `/history` - 查看会话历史
-- `/stats` - 显示会话统计
-- `/status` - 显示当前状态
-- `/compact` - 压缩上下文窗口
-
-在 CLI REPL 中也可直接查询同一个文件化 ConversationStore：
+生产打包：
 
 ```bash
-/sessions                             # 列出最近会话
-/sessions <query>                     # 搜索会话
-/checkpoint                           # 强制保存 runtime checkpoint（/save 是别名）
+cargo gui-bundle
 ```
 
-从新进程恢复时使用 `echo-agent-cli --continue` 或
-`echo-agent-cli --resume <conversation-id>`；不存在 `sessions` 子命令。
+不要把裸 `target/release/echo-agent-tauri` 当作桌面安装包；Tauri bundle 才包含前端
+资源、图标和平台元数据。
 
-### 2. 模式切换
+## 非交互 JSONL
 
-```
-/mode general     # 通用模式（默认）
-/mode coding      # 编程模式
-/mode research    # 研究模式
-/mode data        # 数据分析模式
-/mode writing     # 写作模式
+```bash
+cargo run --bin echo-agent-cli -- --jsonl "检查当前项目并给出结论"
 ```
 
-### 3. 工具使用
+stdout 每行是 canonical chat envelope，日志写到 stderr/文件，适合脚本消费。
 
-EKO 内置了 67+ 工具，包括：
+## MCP 与 Browser
 
-- **文件操作**: read, write, edit, list
-- **Shell 执行**: bash, powershell
-- **网络请求**: http, websocket
-- **数据库**: sqlite, postgresql, mysql
-- **浏览器自动化**: playwright
-- **版本控制**: git
+默认 MCP 文件是 `~/.eko/mcp.json`：
 
-示例：
-
-```
-请读取当前目录下的 README.md 文件
-```
-
-### 4. 人机协作
-
-某些高风险操作（如文件写入、命令执行）会请求你的确认：
-
-- **y** - 批准执行（Approve）
-- **n** - 拒绝执行（Deny）
-
-### 5. 记忆系统
-
-EKO 支持长期记忆：
-
-- 自动记录重要信息
-- 跨会话保持上下文
-- 存储在 `~/.echo-agent/memory/`
-
-## 配置示例
-
-### 完整配置文件
-
-```yaml
-# ~/.echo-agent/config.yaml（或 ./echo-agent.yaml）
-
-model:
-  name: "qwen3.6-plus"
-  # max_tokens: 4096          # 可选
-  # temperature: 0.7          # 可选
-
-agent:
-  name: "echo-assistant"
-  system_prompt: "你是 EKO，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
-  max_iterations: 0            # 0 = 无限制
-  enable_tools: true
-  enable_memory: true
-  enable_human_in_loop: true
-  memory_path: "~/.echo-agent/memory"
-  # token_limit: 0             # 0 = 使用所选模型 context_window；缺失时使用 EKO 默认值
-  # compress_strategy: sliding # 压缩策略: sliding / summary / hybrid
-  # compress_window: 20        # 滑动窗口大小
-
-mcp:
-  # config_path: "mcp.json"   # MCP 配置文件路径
-  # 默认搜索: ./mcp.json → ~/.echo-agent/mcp.json
-
-logging:
-  level: "info"               # 日志级别: trace / debug / info / warn / error
+```json
+{
+  "mcpServers": {
+    "example": {
+      "command": "npx",
+      "args": ["-y", "example-mcp-server"],
+      "disabled": false
+    }
+  }
+}
 ```
 
-## 常见问题
+优先级为 `--mcp-config`、YAML `mcp.config_path`、`MCP_CONFIG_PATH`、
+`~/.eko/mcp.json`。
 
-### Q: 如何选择模型？
+托管 Browser 默认通过 `@playwright/mcp` 启动，需要可用的 Node/npm/npx。需要现有
+Chrome 登录态时启用 Playwright Extension backend；详见[配置指南](./configuration.md)。
 
-推荐使用：
-- **编程任务**: qwen3.7-max, gpt-5.5, claude-opus-4-8
-- **通用对话**: qwen3.6-plus, gpt-5.5
-- **本地部署**: ollama/llama3.1
+## 数据位置
 
-### Q: API Key 在哪里获取？
-
-- **阿里通义**: https://dashscope.console.aliyun.com/
-- **OpenAI**: https://platform.openai.com/api-keys
-- **Anthropic**: https://console.anthropic.com/
-
-### Q: 如何添加自定义工具？
-
-通过 MCP (Model Context Protocol) 服务器添加工具。在 `mcp.json` 文件中配置 MCP 服务器（默认搜索路径: `./mcp.json` → `~/.echo-agent/mcp.json`），详细格式参见 [配置指南](./configuration.md#mcp-服务器)。
-
-### Q: 数据存储在哪里？
-
-所有数据存储在 `~/.echo-agent/` 目录：
-- `config.yaml` - 配置文件
-- `memory/` - 记忆存储
-- `logs/` - 日志文件
-- `workspaces/` - 工作区数据
+EKO 默认使用 `~/.eko/`，可通过 `EKO_DATA_DIR` 覆盖。每个 workspace 的会话、任务、
+记忆、artifact 和 trace 位于 workspace 根的 `.eko/` 下。EKO 不使用 SQLite。
 
 ## 下一步
 
-- 阅读 [配置指南](./configuration.md) 了解详细配置选项
-- 查看 [架构说明](./architecture.md) 理解系统设计
-- 浏览 [echo-agent 文档](../echo-agent/README.md) 了解底层框架
+- [功能总览](./features.md)
+- [架构说明](./architecture.md)
+- [Skill 同步](./skill-sync.md)

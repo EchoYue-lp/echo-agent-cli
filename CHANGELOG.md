@@ -28,8 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **eval match_fn 修真**: 用 `KeywordClassifier` 替代 `String::contains`
   字符串匹配，F1 度量反映生产路由效果。`load_skill_triggers` 支持
   category 子目录扫描。
-- **文档**: `docs/skills-taxonomy.md`（技能分类总览）、
-  `docs/skill-sync.md`（上游同步指南）。
+- **文档**: Skill 分类与上游同步说明现统一维护在 `docs/skill-sync.md`。
 
 ### Changed
 

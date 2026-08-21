@@ -26,17 +26,17 @@ Provider 的 `default_api_protocol` 只用于新建模型表单的初始值，�
 只在会话中选择当前模型返回的有效等级；`auto` 不发送字段。切换模型时回到 `auto`。
 未知模型仍可正常调用，只是不显示手动思考控件。
 
-| 模型范围 | 用户可选项（另有 `auto`） | 说明 |
-|---|---|---|
-| GPT-5.6 | `none/low/medium/high/xhigh/max` | `max` 与 `xhigh` 是独立等级 |
-| DeepSeek V4（直连） | `none/low/high/max` | Chat 与 Responses 分别翻译 |
-| GLM 5.2+ | `none/high/max` | 旧于 5.2 不注册 |
-| Claude 4.6 | `low/medium/high/xhigh/max` | 仅 Anthropic 协议发送 Anthropic 字段 |
-| Claude 4.7+ | 仅 `auto` | 模型自行决定 |
-| Kimi K3 / K2.7 / K2.6 | `low/high/max` / 仅 `auto` / `none/high` | 分别是等级、模型自行决定、开关 |
-| Qwen3 | `none/high` | UI 只暴露真实的开关语义，不伪造等级 |
-| Gemini 3 / 2.5 | `minimal/low/medium/high` / `none/low/medium/high` | OpenAI-compatible 入口 |
-| Ollama GPT-OSS / 已知思考模型 | `low/medium/high` / `none/high` | 使用 Ollama `think` 扩展；未知模型仅 `auto` |
+| 模型范围                      | 用户可选项（另有 `auto`）                          | 说明                                        |
+| ----------------------------- | -------------------------------------------------- | ------------------------------------------- |
+| GPT-5.6                       | `none/low/medium/high/xhigh/max`                   | `max` 与 `xhigh` 是独立等级                 |
+| DeepSeek V4（直连）           | `none/low/high/max`                                | Chat 与 Responses 分别翻译                  |
+| GLM 5.2+                      | `none/high/max`                                    | 旧于 5.2 不注册                             |
+| Claude 4.6                    | `low/medium/high/xhigh/max`                        | 仅 Anthropic 协议发送 Anthropic 字段        |
+| Claude 4.7+                   | 仅 `auto`                                          | 模型自行决定                                |
+| Kimi K3 / K2.7 / K2.6         | `low/high/max` / 仅 `auto` / `none/high`           | 分别是等级、模型自行决定、开关              |
+| Qwen3                         | `none/high`                                        | UI 只暴露真实的开关语义，不伪造等级         |
+| Gemini 3 / 2.5                | `minimal/low/medium/high` / `none/low/medium/high` | OpenAI-compatible 入口                      |
+| Ollama GPT-OSS / 已知思考模型 | `low/medium/high` / `none/high`                    | 使用 Ollama `think` 扩展；未知模型仅 `auto` |
 
 ## 分层判定
 

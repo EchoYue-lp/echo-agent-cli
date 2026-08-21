@@ -1,11 +1,15 @@
 # EKO 多项目与多会话运行时可靠性修复规格
 
 > 日期：2026-08-21  
-> 状态：M0 Pending  
+> 状态：M0-M8 implementation in progress；最终 acceptance pending
 > 优先级：P0 可靠性修复  
-> 关联基线：[`2026-08-20-cross-workspace-agent-groups.md`](./2026-08-20-cross-workspace-agent-groups.md)  
-> 交互基线：[`2026-07-11-running-input-interrupt-design.md`](./2026-07-11-running-input-interrupt-design.md)  
-> 跨会话状态：[`MASTER-PLAN.md`](./MASTER-PLAN.md)
+> 整合范围：workspace/conversation runtime、foreground input/interrupt、本地恢复、
+> AgentRouter live/cold delivery 与 groups
+> 跨会话状态：[`docs/MASTER-PLAN.md`](../../docs/MASTER-PLAN.md)
+
+本文是上述未完成工作的唯一活跃规格。原有 cross-workspace Agent group 设计、运行中
+补充输入设计和 runtime recovery 审计中的未完成项均已合并到 F01-F18、M0-M8 和本页
+验收矩阵；已实现部分由代码与项目文档记录，不再保留独立历史规格。
 
 ## 1. 决策摘要
 
@@ -42,13 +46,13 @@ workspace-scoped runtime 迁移只切换了聊天执行主路径，GUI 查询、
 
 ### 2.1 用户要求覆盖的五类场景
 
-| 场景 | 当前判断 | 本规格目标 |
-|---|---|---|
-| 多项目同时执行 | core host 隔离存在，但 GUI 控制/事件仍可串项目 | A/B 项目并发且查询、控制、事件、资源完全隔离 |
-| 单项目多会话同时执行 | AgentPool 支持，但切换、队列、restore、右栏不可靠 | A/B 会话独立运行、切换、排队、终结和恢复 |
-| 打断、错误、恢复 | interrupt 会制造幽灵 turn；部分恢复只恢复 UI | 每个 accepted input/turn/run 有且仅有一个可解释终态 |
-| 历史未完成会话继续 | TaskRuntime 查错 store，Agent restore 错 pool | 精确 host 恢复；可续跑则续跑，不可安全续跑则显式 RecoveryRequired |
-| 跨会话/项目投递 | cold path 基础正确；live path 提前 Delivered、无回复结算 | durable accept、精确消费、terminal receipt、correlated reply 闭环 |
+| 场景                 | 当前判断                                                 | 本规格目标                                                        |
+| -------------------- | -------------------------------------------------------- | ----------------------------------------------------------------- |
+| 多项目同时执行       | core host 隔离存在，但 GUI 控制/事件仍可串项目           | A/B 项目并发且查询、控制、事件、资源完全隔离                      |
+| 单项目多会话同时执行 | AgentPool 支持，但切换、队列、restore、右栏不可靠        | A/B 会话独立运行、切换、排队、终结和恢复                          |
+| 打断、错误、恢复     | interrupt 会制造幽灵 turn；部分恢复只恢复 UI             | 每个 accepted input/turn/run 有且仅有一个可解释终态               |
+| 历史未完成会话继续   | TaskRuntime 查错 store，Agent restore 错 pool            | 精确 host 恢复；可续跑则续跑，不可安全续跑则显式 RecoveryRequired |
+| 跨会话/项目投递      | cold path 基础正确；live path 提前 Delivered、无回复结算 | durable accept、精确消费、terminal receipt、correlated reply 闭环 |
 
 ### 2.2 目标
 
@@ -93,14 +97,14 @@ workspace-scoped runtime 迁移只切换了聊天执行主路径，GUI 查询、
 
 跨系统共性及 EKO 取舍：
 
-| 共性 | EKO 取舍 |
-|---|---|
-| session/thread 有稳定身份，focus 只是视图 | 使用 `AgentAddress` 和 immutable `WorkspaceExecutionScope` |
-| start、steer、interrupt 是不同命令 | 保留现有 `TurnSteerMailbox`，新增 EKO typed admission/decision orchestration |
-| accepted queue 不能因切换 UI 丢失 | 用现有 chat journal 持久 queue 事件，前端只做投影 |
-| background work 不依赖当前页面 | 所有命令按显式 address resolve `WorkspaceRuntimeHost` |
-| recovery 依赖持久事实而非 loading 状态 | TaskRuntime events、chat journal、AgentRouter inbox 分别保持唯一权威 |
-| delivery receipt 与目标消费分离 | `Queued/Claimed/Injected/Delivered/Failed` 明确 safe point |
+| 共性                                      | EKO 取舍                                                                     |
+| ----------------------------------------- | ---------------------------------------------------------------------------- |
+| session/thread 有稳定身份，focus 只是视图 | 使用 `AgentAddress` 和 immutable `WorkspaceExecutionScope`                   |
+| start、steer、interrupt 是不同命令        | 保留现有 `TurnSteerMailbox`，新增 EKO typed admission/decision orchestration |
+| accepted queue 不能因切换 UI 丢失         | 用现有 chat journal 持久 queue 事件，前端只做投影                            |
+| background work 不依赖当前页面            | 所有命令按显式 address resolve `WorkspaceRuntimeHost`                        |
+| recovery 依赖持久事实而非 loading 状态    | TaskRuntime events、chat journal、AgentRouter inbox 分别保持唯一权威         |
+| delivery receipt 与目标消费分离           | `Queued/Claimed/Injected/Delivered/Failed` 明确 safe point                   |
 
 本设计不照搬任何产品 UI，也不增加审批状态机。只采用稳定身份、精确前置条件、持久
 receipt、焦点与执行分离、恢复可证明这五个成熟共识。
@@ -109,20 +113,20 @@ receipt、焦点与执行分离、恢复可证明这五个成熟共识。
 
 ### 4.1 已存在且必须复用
 
-| 能力 | 当前权威 | 结论 |
-|---|---|---|
-| workspace ID 和不可变执行根 | `workspace/mod.rs` 的 `WorkspaceId` / `WorkspaceExecutionScope` | 不新增 scope |
-| workspace conversation 地址 | `agent_router.rs::AgentAddress` | workspace 路径统一复用 |
-| active turn 完整身份 | `ForegroundTurnSnapshot` | IPC 直接携带，不由 focus 反推 |
-| workspace runtime owner | `WorkspaceRuntimeHost` / `WorkspaceRuntimeRegistry` | 增加按地址解析与 idle eviction |
-| workspace AgentPool/TaskRuntime | `WorkspaceExecutionRuntime` | GUI adapter 必须切入现有实例 |
-| TaskRun workspace/conversation | `TaskRun.workspace_id/conversation_id` | 事件直接投影，不建第二索引 |
-| checkpoint-first Agent 恢复 | framework ReAct run context | 删除 GUI 无条件 `load_messages` |
-| foreground admission/cancel | `ForegroundTurnControl` | 收紧为每个 AgentAddress 一个用户 turn |
-| same-turn steer | framework `TurnSteerMailbox` | 保持唯一 mailbox |
-| durable Agent inbox | `AgentRouter` inbox journal | 扩展结算/退避，不新增 router |
-| task DAG/retry/cancel | framework DAG + EKO TaskRuntime | 不新增 task state machine |
-| retry delay 计算 | `echo_core::retry::RetryPolicy` | delivery 复用计算并持久实际 deadline |
+| 能力                            | 当前权威                                                        | 结论                                  |
+| ------------------------------- | --------------------------------------------------------------- | ------------------------------------- |
+| workspace ID 和不可变执行根     | `workspace/mod.rs` 的 `WorkspaceId` / `WorkspaceExecutionScope` | 不新增 scope                          |
+| workspace conversation 地址     | `agent_router.rs::AgentAddress`                                 | workspace 路径统一复用                |
+| active turn 完整身份            | `ForegroundTurnSnapshot`                                        | IPC 直接携带，不由 focus 反推         |
+| workspace runtime owner         | `WorkspaceRuntimeHost` / `WorkspaceRuntimeRegistry`             | 增加按地址解析与 idle eviction        |
+| workspace AgentPool/TaskRuntime | `WorkspaceExecutionRuntime`                                     | GUI adapter 必须切入现有实例          |
+| TaskRun workspace/conversation  | `TaskRun.workspace_id/conversation_id`                          | 事件直接投影，不建第二索引            |
+| checkpoint-first Agent 恢复     | framework ReAct run context                                     | 删除 GUI 无条件 `load_messages`       |
+| foreground admission/cancel     | `ForegroundTurnControl`                                         | 收紧为每个 AgentAddress 一个用户 turn |
+| same-turn steer                 | framework `TurnSteerMailbox`                                    | 保持唯一 mailbox                      |
+| durable Agent inbox             | `AgentRouter` inbox journal                                     | 扩展结算/退避，不新增 router          |
+| task DAG/retry/cancel           | framework DAG + EKO TaskRuntime                                 | 不新增 task state machine             |
+| retry delay 计算                | `echo_core::retry::RetryPolicy`                                 | delivery 复用计算并持久实际 deadline  |
 
 ### 4.2 已确认的重复或错误旁路
 
@@ -165,26 +169,26 @@ receipt、焦点与执行分离、恢复可证明这五个成熟共识。
 
 以下故障在 2026-08-21 审查中确认，M0 必须先写失败合同测试：
 
-| ID | 严重度 | 故障 | 当前证据 |
-|---|---|---|---|
-| F01 | P0 | GUI TaskRuntime 查询/暂停/取消/resume 操作 global store | `src/tauri/commands/task_runtime.rs::store` |
-| F02 | P0 | send 使用 workspace runtime，但 interrupt 检测使用 global store | `src/tauri/commands/chat.rs` |
-| F03 | P0 | restore/branch transcript 加载到 global AgentPool | `src/tauri/commands/conversations.rs::load_agent_transcript` |
-| F04 | P0 | 切回 active conversation 可覆盖 live Agent context | `ReactAgent::load_messages` 无 execution guard |
-| F05 | P0 | GUI FIFO 无 address；切换时丢失或跨会话派发 | `useTauriChat.ts::queuedInputsRef` |
-| F06 | P0 | interrupt 先建 placeholder，backend 只 emit prompt 后返回 | `useTauriChat.ts` + `chat.rs` |
-| F07 | P0 | send/steer/cancel/replay/save 从 mutable focus 推导目标 | 多个 Tauri commands |
-| F08 | P0 | live Agent delivery 在 steer accepted 时提前 Delivered | `state.rs::deliver_agent_message_live` |
-| F09 | P0 | conversation 删除用 workspace transcript + global pool/runtime | `AppState::delete_conversation_owned` |
-| F10 | P0 | workspace 删除未 shutdown/evict host | `workspace.rs::delete_workspace` |
-| F11 | P1 | chat/execution/tool event 缺 workspace identity | app-core event types |
-| F12 | P1 | 返回 active conversation 无法重建 streaming placeholder | transcript/event projection split |
-| F13 | P1 | restore 失败被前端吞掉并标记 ready | `conversationStore.ts` |
-| F14 | P1 | startNew/switch workspace 保留旧 TaskRuntime polling/projection | frontend stores |
-| F15 | P1 | ordinary stream/HITL crash 后 UI 可复活但 response waiter 不存在 | Tauri memory-only pending map |
-| F16 | P1 | delivery retry 紧循环耗尽；一个坏 workspace 中止全局 recovery | delivery supervisor |
-| F17 | P1 | per-workspace/per-run semaphore 使全局并发上限成倍放大 | pool/executor limits |
-| F18 | P1 | frontend overlapping workspace switch 无 generation 防旧响应覆盖 | `workspaceStore.switchTo` |
+| ID  | 严重度 | 故障                                                             | 当前证据                                                     |
+| --- | ------ | ---------------------------------------------------------------- | ------------------------------------------------------------ |
+| F01 | P0     | GUI TaskRuntime 查询/暂停/取消/resume 操作 global store          | `src/tauri/commands/task_runtime.rs::store`                  |
+| F02 | P0     | send 使用 workspace runtime，但 interrupt 检测使用 global store  | `src/tauri/commands/chat.rs`                                 |
+| F03 | P0     | restore/branch transcript 加载到 global AgentPool                | `src/tauri/commands/conversations.rs::load_agent_transcript` |
+| F04 | P0     | 切回 active conversation 可覆盖 live Agent context               | `ReactAgent::load_messages` 无 execution guard               |
+| F05 | P0     | GUI FIFO 无 address；切换时丢失或跨会话派发                      | `useTauriChat.ts::queuedInputsRef`                           |
+| F06 | P0     | interrupt 先建 placeholder，backend 只 emit prompt 后返回        | `useTauriChat.ts` + `chat.rs`                                |
+| F07 | P0     | send/steer/cancel/replay/save 从 mutable focus 推导目标          | 多个 Tauri commands                                          |
+| F08 | P0     | live Agent delivery 在 steer accepted 时提前 Delivered           | `state.rs::deliver_agent_message_live`                       |
+| F09 | P0     | conversation 删除用 workspace transcript + global pool/runtime   | `AppState::delete_conversation_owned`                        |
+| F10 | P0     | workspace 删除未 shutdown/evict host                             | `workspace.rs::delete_workspace`                             |
+| F11 | P1     | chat/execution/tool event 缺 workspace identity                  | app-core event types                                         |
+| F12 | P1     | 返回 active conversation 无法重建 streaming placeholder          | transcript/event projection split                            |
+| F13 | P1     | restore 失败被前端吞掉并标记 ready                               | `conversationStore.ts`                                       |
+| F14 | P1     | startNew/switch workspace 保留旧 TaskRuntime polling/projection  | frontend stores                                              |
+| F15 | P1     | ordinary stream/HITL crash 后 UI 可复活但 response waiter 不存在 | Tauri memory-only pending map                                |
+| F16 | P1     | delivery retry 紧循环耗尽；一个坏 workspace 中止全局 recovery    | delivery supervisor                                          |
+| F17 | P1     | per-workspace/per-run semaphore 使全局并发上限成倍放大           | pool/executor limits                                         |
+| F18 | P1     | frontend overlapping workspace switch 无 generation 防旧响应覆盖 | `workspaceStore.switchTo`                                    |
 
 ## 6. 权威身份模型
 
@@ -437,12 +441,12 @@ TaskRunConflict {
 
 dialog 操作是 app-core 命令，不是前端拼接多个竞态 IPC：
 
-| 操作 | 精确语义 |
-|---|---|
-| Guide current | exact steer 当前 turn；不可 steer 时保持 durable queued，不丢输入 |
-| Queue after current | 保持 FIFO，当前 run terminal 后启动新 turn |
-| Edit | 标记 ReturnedForEdit；server 保留 receipt，直到 replacement/remove |
-| Cancel and start | cancel 精确旧 run/turn，await exact settlement，再以同一 input_id admit 新 turn |
+| 操作                | 精确语义                                                                        |
+| ------------------- | ------------------------------------------------------------------------------- |
+| Guide current       | exact steer 当前 turn；不可 steer 时保持 durable queued，不丢输入               |
+| Queue after current | 保持 FIFO，当前 run terminal 后启动新 turn                                      |
+| Edit                | 标记 ReturnedForEdit；server 保留 receipt，直到 replacement/remove              |
+| Cancel and start    | cancel 精确旧 run/turn，await exact settlement，再以同一 input_id admit 新 turn |
 
 每个 action 必须幂等。重复点击或响应重放不能启动两个 turn。任何 action 完成后，原
 placeholder、queue item、foreground lease 和 TaskRun 都必须处于可解释状态。
@@ -512,13 +516,13 @@ chat journal replay 重建：
 
 ### 10.2 普通 turn 的恢复分类
 
-| 情况 | 行为 |
-|---|---|
-| durable accepted，但尚未 claim | 自动重新排队/claim |
-| claim 已写，但尚未开始 ReAct | 使用稳定 input/root id 安全重试 |
-| 有可证明 framework safe checkpoint | 从 checkpoint 恢复 |
-| 正在 tool/外部副作用且无 safe checkpoint | `RecoveryRequired`，用户选择 retry/discard，不伪装 Running |
-| terminal transcript 已提交但 terminal event 未写 | 从 transcript marker 修复 terminal，不重跑 |
+| 情况                                             | 行为                                                       |
+| ------------------------------------------------ | ---------------------------------------------------------- |
+| durable accepted，但尚未 claim                   | 自动重新排队/claim                                         |
+| claim 已写，但尚未开始 ReAct                     | 使用稳定 input/root id 安全重试                            |
+| 有可证明 framework safe checkpoint               | 从 checkpoint 恢复                                         |
+| 正在 tool/外部副作用且无 safe checkpoint         | `RecoveryRequired`，用户选择 retry/discard，不伪装 Running |
+| terminal transcript 已提交但 terminal event 未写 | 从 transcript marker 修复 terminal，不重跑                 |
 
 ### 10.3 HITL
 
@@ -772,17 +776,17 @@ FIFO 公平，指标按 workspace/run 标注。per-run limit 与 process limit �
 
 每个切片必须切换真实主路径并删除被替代逻辑，禁止只新增 abstraction：
 
-| Slice | 内容 | 回滚边界 |
-|---|---|---|
-| S0 | failing contract tests + docs | 纯测试/文档 |
-| S1 | app-core resolver + TaskRuntime commands | 可整体回滚，不改 event schema |
-| S2 | identity schema + generated TS + frontend address buckets | schema 一次切换，无兼容双写 |
-| S3 | durable input receipt/FIFO + interrupt service | 以 backend receipt 为开关，不保留双 queue |
-| S4 | open snapshot + restore/rebind | 删除 GUI `load_messages` 同 commit |
-| S5 | boot/HITL recovery | 以 per-address reconciler 为单位 |
-| S6 | scoped delete + registry eviction | 删除命令一起切换，不保留危险旧入口 |
-| S7 | delivery Injected/settlement/backoff/reply | inbox schema 一次切换，测试先行 |
-| S8 | governor + surface parity + dead path cleanup + soak | 最终 convergence |
+| Slice | 内容                                                      | 回滚边界                                  |
+| ----- | --------------------------------------------------------- | ----------------------------------------- |
+| S0    | failing contract tests + docs                             | 纯测试/文档                               |
+| S1    | app-core resolver + TaskRuntime commands                  | 可整体回滚，不改 event schema             |
+| S2    | identity schema + generated TS + frontend address buckets | schema 一次切换，无兼容双写               |
+| S3    | durable input receipt/FIFO + interrupt service            | 以 backend receipt 为开关，不保留双 queue |
+| S4    | open snapshot + restore/rebind                            | 删除 GUI `load_messages` 同 commit        |
+| S5    | boot/HITL recovery                                        | 以 per-address reconciler 为单位          |
+| S6    | scoped delete + registry eviction                         | 删除命令一起切换，不保留危险旧入口        |
+| S7    | delivery Injected/settlement/backoff/reply                | inbox schema 一次切换，测试先行           |
+| S8    | governor + surface parity + dead path cleanup + soak      | 最终 convergence                          |
 
 如果一次只能完成阶段迁移，必须在本文账本记录仍存在哪条旧主路径、由哪个下一阶段删除；
 复杂度不能成为长期双实现理由。
@@ -865,21 +869,21 @@ FIFO 公平，指标按 workspace/run 标注。per-run limit 与 process limit �
 
 ### 17.5 故障注入矩阵
 
-| 断点 | 预期 |
-|---|---|
-| InputAccepted 后、claim 前 kill | 重启后仍在 queue，只启动一次 |
-| lease 后、ReAct 前 kill | stable input/root id 恢复，不重复 user message |
-| streaming 中 kill | checkpoint resume 或 RecoveryRequired，无假 live lease |
-| tool side effect 后、transcript 前 kill | 明确 at-least-once blocker，不宣称 exactly-once |
-| transcript terminal 后、event 前 kill | 修复 terminal，不重跑 |
-| HITL request persist 后 kill | 重建 waiter 或 RecoveryRequired，按钮不 NotFound |
-| TaskRun pause persist、driver 未退场 | resume 等待旧 driver settle |
-| delivery claim 后 kill | attempt 递增，stale attempt 不可 settle |
-| live inject 后 target cancel | 不 Delivered；按 policy defer/fail |
-| reply enqueue 后、Delivered 前 kill | stable reply id 去重，修复 receipt |
-| provider 502/429 | 按持久 deadline 重试，无 tight loop |
-| 一个 workspace event log 损坏 | 仅该 workspace blocker，其他 workspace 正常恢复 |
-| 删除 workspace 与后台 run 竞态 | 删除拒绝或先完整 shutdown，绝不先删目录 |
+| 断点                                    | 预期                                                   |
+| --------------------------------------- | ------------------------------------------------------ |
+| InputAccepted 后、claim 前 kill         | 重启后仍在 queue，只启动一次                           |
+| lease 后、ReAct 前 kill                 | stable input/root id 恢复，不重复 user message         |
+| streaming 中 kill                       | checkpoint resume 或 RecoveryRequired，无假 live lease |
+| tool side effect 后、transcript 前 kill | 明确 at-least-once blocker，不宣称 exactly-once        |
+| transcript terminal 后、event 前 kill   | 修复 terminal，不重跑                                  |
+| HITL request persist 后 kill            | 重建 waiter 或 RecoveryRequired，按钮不 NotFound       |
+| TaskRun pause persist、driver 未退场    | resume 等待旧 driver settle                            |
+| delivery claim 后 kill                  | attempt 递增，stale attempt 不可 settle                |
+| live inject 后 target cancel            | 不 Delivered；按 policy defer/fail                     |
+| reply enqueue 后、Delivered 前 kill     | stable reply id 去重，修复 receipt                     |
+| provider 502/429                        | 按持久 deadline 重试，无 tight loop                    |
+| 一个 workspace event log 损坏           | 仅该 workspace blocker，其他 workspace 正常恢复        |
+| 删除 workspace 与后台 run 竞态          | 删除拒绝或先完整 shutdown，绝不先删目录                |
 
 ### 17.6 GUI 验收场景
 
@@ -980,31 +984,31 @@ npm run build
 
 ## 19. 风险与控制
 
-| 风险 | 控制 |
-|---|---|
-| identity schema 改动面广 | S1 先统一 resolver，S2 一次 schema 切换；不双写旧/新 identity |
-| durable FIFO 与 AgentRouter 被误合并 | 明确普通 user input 与跨 Agent inbox 是不同产品语义，只共享已有日志原语 |
-| restore 改动导致历史丢失 | transcript 只读、checkpoint-first、branch fallback 真实测试 |
-| crash 后外部副作用重复 | stable identity、transcript marker、RecoveryRequired；不虚假承诺 exactly-once |
-| force delete 造成数据丢失 | 默认 busy reject；force 明示活动项并严格 cancel/settle/shutdown 顺序 |
-| 全局 governor 导致 starvation | FIFO permit、按 address/run 指标、取消安全测试 |
-| 迁移期间双路径 | 每个 slice 必须删除旧主路径，账本记录唯一 authority |
+| 风险                                 | 控制                                                                          |
+| ------------------------------------ | ----------------------------------------------------------------------------- |
+| identity schema 改动面广             | S1 先统一 resolver，S2 一次 schema 切换；不双写旧/新 identity                 |
+| durable FIFO 与 AgentRouter 被误合并 | 明确普通 user input 与跨 Agent inbox 是不同产品语义，只共享已有日志原语       |
+| restore 改动导致历史丢失             | transcript 只读、checkpoint-first、branch fallback 真实测试                   |
+| crash 后外部副作用重复               | stable identity、transcript marker、RecoveryRequired；不虚假承诺 exactly-once |
+| force delete 造成数据丢失            | 默认 busy reject；force 明示活动项并严格 cancel/settle/shutdown 顺序          |
+| 全局 governor 导致 starvation        | FIFO permit、按 address/run 指标、取消安全测试                                |
+| 迁移期间双路径                       | 每个 slice 必须删除旧主路径，账本记录唯一 authority                           |
 
 ## 20. 阶段账本
 
 每个阶段必须填写以下字段：
 
-| 阶段 | 状态 | 权威路径 | 应用提交 | 框架提交 | 测试命令/结果 | 失败与修复 | 剩余事项 |
-|---|---|---|---|---|---|---|---|
-| M0 | Pending | N/A | N/A | N/A | 待执行 | N/A | F01-F18 failing contracts |
-| M1 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | exact runtime resolver |
-| M2 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | IPC/event identity |
-| M3 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | durable FIFO/interrupt |
-| M4 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | restore/rebind |
-| M5 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | crash/HITL recovery |
-| M6 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | delete/evict |
-| M7 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | delivery settlement |
-| M8 | Pending | 待切换 | N/A | N/A | 待执行 | N/A | governor/parity/soak |
+| 阶段 | 状态        | 权威路径 | 应用提交 | 框架提交 | 测试命令/结果                                     | 失败与修复 | 剩余事项                    |
+| ---- | ----------- | -------- | -------- | -------- | ------------------------------------------------- | ---------- | --------------------------- |
+| M0   | In progress | N/A      | N/A      | N/A      | contract tests 已在当前工作树建立；完整门禁待执行 | N/A        | 提交并冻结 F01-F18 baseline |
+| M1   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | exact runtime resolver      |
+| M2   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | IPC/event identity          |
+| M3   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | durable FIFO/interrupt      |
+| M4   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | restore/rebind              |
+| M5   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | crash/HITL recovery         |
+| M6   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | delete/evict                |
+| M7   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | delivery settlement         |
+| M8   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | governor/parity/soak        |
 
 状态只能是 `Pending`、`In progress`、`Blocked`、`Complete`。只有本阶段验收和所有适用
 门禁全绿才能标 Complete。框架无改动必须明确写 `N/A`，不能把应用 commit 误记为框架
@@ -1045,4 +1049,3 @@ Accepted by:
 - `web-frontend/src/stores/conversationStore.ts`
 - `web-frontend/src/stores/taskRuntimeStore.ts`
 - `web-frontend/src/stores/workspaceStore.ts`
-

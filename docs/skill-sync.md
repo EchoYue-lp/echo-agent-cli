@@ -1,26 +1,35 @@
-# 技能上游同步指南
+# EKO Skill 管理与上游同步
 
 ## 概述
 
 EKO SkillsHub 支持从 git remote 安装和更新技能。内置技能随产品升级更新；
 用户安装的技能通过上游同步命令管理。
 
+Skill 的分类来自 `SKILL.md` metadata，不由目录深度决定。loader 递归扫描
+`skills/**/SKILL.md`，因此仓库同时支持 `skills/<name>/` 和
+`skills/<category>/<name>/`。当前清单以 GUI/TUI/CLI 的 `/skills list` 为准，文档不
+冻结数量，避免新增或删除 Skill 后出现第二份过期目录。
+
 ## 技能分类
 
-| 类型 | 位置 | 更新方式 |
-|---|---|---|
-| **内置技能** | `<echo-agent-cli>/skills/<category>/` | 随产品版本升级 |
-| **用户安装技能** | `~/.echo-agent/skills/` | 显式检查并通过 staging 原子同步 |
+| 类型             | 位置                                  | 更新方式                        |
+| ---------------- | ------------------------------------- | ------------------------------- |
+| **内置技能**     | `<echo-agent-cli>/skills/<category>/` | 随产品版本升级                  |
+| **用户安装技能** | `~/.eko/skills/`                      | 显式检查并通过 staging 原子同步 |
 
 ## enabled-skills.json
 
-管理技能的启用状态和 baseline 标记，位于 `~/.echo-agent/enabled-skills.json`：
+管理技能的启用状态和 baseline 标记，位于 `~/.eko/enabled-skills.json`：
 
 ```json
 {
   "version": 1,
   "skills": {
-    "brainstorming": { "category": "methodology", "enabled": true, "baseline": true },
+    "brainstorming": {
+      "category": "methodology",
+      "enabled": true,
+      "baseline": true
+    },
     "docx": { "category": "document", "enabled": false, "baseline": false }
   }
 }
@@ -29,6 +38,9 @@ EKO SkillsHub 支持从 git remote 安装和更新技能。内置技能随产品
 - `enabled`: 技能是否加载进 agent
 - `baseline`: 仅对 methodology 技能有效。`true` = 正文注入 system prompt
 - 首次启动自动生成默认配置（核心 4 个方法论 baseline-on）
+
+内置和用户 Skill 使用同一个 framework loader；SkillsHub 只负责 EKO 的安装、启停、
+上游记录和 surface 投影，不复制 Skill parser 或 activation runtime。
 
 ## 上游同步
 
