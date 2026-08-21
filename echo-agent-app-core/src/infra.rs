@@ -32,8 +32,32 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// framework keeps 0 as opt-out so other consumers choose their own budget.
 const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize =
     crate::tool_exposure::MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS;
+const EKO_ACTIVE_TOOL_TRACE_TURNS: usize = 1;
+const EKO_MIN_TOOL_TRACE_TOKENS: usize = 4_000;
+const EKO_MAX_TOOL_TRACE_TOKENS: usize = 40_000;
+const EKO_MAX_COMPACTION_SAVINGS_THRESHOLD: usize = 20_000;
 const TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 32 * 1024;
 const TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+
+fn eko_visibility_horizon(
+    token_limit: usize,
+) -> echo_agent::compression::horizon::VisibilityHorizonConfig {
+    let retained_tool_tokens = token_limit
+        .saturating_mul(25)
+        .saturating_div(100)
+        .clamp(EKO_MIN_TOOL_TRACE_TOKENS, EKO_MAX_TOOL_TRACE_TOKENS);
+    let compact_minimum_tokens = retained_tool_tokens.saturating_div(2).clamp(
+        EKO_MIN_TOOL_TRACE_TOKENS,
+        EKO_MAX_COMPACTION_SAVINGS_THRESHOLD,
+    );
+    echo_agent::compression::horizon::VisibilityHorizonConfig {
+        active_window_turns: EKO_ACTIVE_TOOL_TRACE_TURNS,
+        retained_tool_tokens: Some(retained_tool_tokens),
+        compact_minimum_tokens,
+        ..Default::default()
+    }
+}
+
 fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     if configured > 0 {
         configured
@@ -475,6 +499,7 @@ pub async fn create_agent_with_diagnostics(
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
+        .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
         .tool_output_artifacts(tool_output_artifact_config(params.working_dir.as_deref()))
         .max_tokens(Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)))
@@ -1187,6 +1212,7 @@ fn build_writer_subagent_agent(
         .enable_memory()
         .enable_cot()
         .token_limit(token_limit)
+        .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
@@ -1283,6 +1309,7 @@ fn build_readonly_subagent_agent(
         .enable_memory()
         .enable_cot()
         .token_limit(token_limit)
+        .visibility_horizon(eko_visibility_horizon(token_limit))
         .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
@@ -2832,8 +2859,8 @@ mod resolve_subagent_model_tests {
     use super::{
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS, SubagentRuntimeGeneration, TASK_MANAGEMENT_GUIDE,
         build_readonly_subagent_agent, build_writer_subagent_agent, configure_run_code_capability,
-        resolve_subagent_model, resolved_max_tool_output_tokens, subagent_model_binding,
-        tool_output_artifact_config,
+        eko_visibility_horizon, resolve_subagent_model, resolved_max_tool_output_tokens,
+        subagent_model_binding, tool_output_artifact_config,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
@@ -2860,6 +2887,22 @@ mod resolve_subagent_model_tests {
             DEFAULT_MAX_TOOL_OUTPUT_TOKENS
         );
         assert_eq!(resolved_max_tool_output_tokens(4_000), 4_000);
+    }
+
+    #[test]
+    fn tool_trace_budget_scales_with_model_window_and_keeps_latest_turn() {
+        let small = eko_visibility_horizon(16_384);
+        assert_eq!(small.active_window_turns, 1);
+        assert_eq!(small.retained_tool_tokens, Some(4_096));
+        assert_eq!(small.compact_minimum_tokens, 4_000);
+
+        let medium = eko_visibility_horizon(128_000);
+        assert_eq!(medium.retained_tool_tokens, Some(32_000));
+        assert_eq!(medium.compact_minimum_tokens, 16_000);
+
+        let large = eko_visibility_horizon(396_000);
+        assert_eq!(large.retained_tool_tokens, Some(40_000));
+        assert_eq!(large.compact_minimum_tokens, 20_000);
     }
 
     #[test]
