@@ -80,7 +80,7 @@ interface ChatState {
   recordToolStart: (messageId: string, toolExecutionId: string) => void;
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
-  finalizeAssistantMessage: (id: string, content: string) => void;
+  applyFinalAnswer: (id: string, content: string) => void;
   settleAssistantMessage: (id: string) => void;
   failAssistantMessage: (id: string, error: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
@@ -89,6 +89,7 @@ interface ChatState {
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
+  settleOrphanedTurn: () => void;
   markCancelled: () => void;
   enqueueHitlRequest: (request: PendingHitlRequest) => void;
   removeHitlRequest: (requestId: string) => void;
@@ -357,13 +358,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     scheduleAutoSave();
   },
 
-  finalizeAssistantMessage: (id, content) => {
-    set((s) => ({
-      isStreaming: false,
-      isThinking: false,
-      runStatus: 'completed',
-      pendingHitlRequests: [],
-      messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
+  applyFinalAnswer: (id, content) => {
+    set((state) => ({
+      messages: state.messages.map((message) =>
+        message.id === id ? { ...message, content: content || message.content } : message
+      ),
     }));
     scheduleAutoSave();
   },
@@ -436,6 +435,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ? []
         : state.pendingHitlRequests,
     })),
+
+  settleOrphanedTurn: () => {
+    set((state) => ({
+      isStreaming: false,
+      isThinking: false,
+      runStatus: 'failed',
+      pendingHitlRequests: [],
+      messages: state.messages.map((message) =>
+        message.isStreaming ? { ...message, isStreaming: false } : message
+      ),
+    }));
+    scheduleAutoSave();
+  },
 
   markCancelled: () => {
     set((s) => ({

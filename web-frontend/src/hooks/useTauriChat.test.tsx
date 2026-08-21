@@ -363,22 +363,16 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
-  it('shows a user-visible error when exact identity cannot be recovered', async () => {
+  it('settles stale UI state when no active backend turn can be recovered', async () => {
     mocks.apiInvoke.mockResolvedValue(null);
     const hook = renderHook(() => useTauriChat());
     await act(async () => {
       await hook.result.current.cancel();
     });
-    expect(useToastStore.getState().toasts).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: 'error',
-          message: '无法定位正在运行的任务，请稍后重试',
-        }),
-      ])
-    );
+    expect(useToastStore.getState().toasts).toEqual([]);
     expect(mocks.apiInvoke).not.toHaveBeenCalledWith('cancel_chat', expect.anything());
-    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().runStatus).toBe('failed');
+    expect(useChatStore.getState().isStreaming).toBe(false);
     expect(useChatStore.getState().isCancelled).toBe(false);
     hook.unmount();
   });

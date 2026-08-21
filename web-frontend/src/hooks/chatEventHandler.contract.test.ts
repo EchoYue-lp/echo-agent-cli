@@ -142,7 +142,7 @@ describe('canonical chat event v4 contract', () => {
     expect(useChatStore.getState().isStreaming).toBe(false);
   });
 
-  it('does not let a contradictory completed terminal override a cancelled fact', () => {
+  it('uses turn_status as the terminal authority over an agent-local cancellation', () => {
     const base = fixture[0];
     if (!base || base.payload.source !== 'agent') throw new Error('expected agent fixture');
     const assistantId = useChatStore.getState().startAssistantMessage('assistant-cancelled');
@@ -173,10 +173,42 @@ describe('canonical chat event v4 contract', () => {
     handleChatEventEnvelope(contradictoryTerminal, refs);
     handleChatEventEnvelope(lateToken, refs);
 
-    expect(useChatStore.getState().runStatus).toBe('cancelled');
+    expect(useChatStore.getState().runStatus).toBe('completed');
     expect(useChatStore.getState().isStreaming).toBe(false);
     expect(useChatStore.getState().messages.at(-1)?.content).not.toContain('late token');
     expect(refs.isCancelledRef.current).toBe(false);
+  });
+
+  it('lets a failed turn_status override a preceding final answer', () => {
+    const base = fixture[0];
+    if (!base || base.payload.source !== 'agent') throw new Error('expected agent fixture');
+    const assistantId = useChatStore.getState().startAssistantMessage('assistant-failed');
+    const refs = context();
+    refs.assistantIdRef.current = assistantId;
+    handleChatEventEnvelope(
+      {
+        ...base,
+        payload: {
+          source: 'agent',
+          event: { ...base.payload.event, payload: { type: 'final_answer', data: 'answer' } },
+        },
+      } as ChatEventEnvelope,
+      refs
+    );
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+
+    handleChatEventEnvelope(
+      {
+        ...base,
+        sequence: 2,
+        payload: { source: 'turn_status', event: { status: 'failed' } },
+      } as ChatEventEnvelope,
+      refs
+    );
+    expect(useChatStore.getState().runStatus).toBe('failed');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().messages.at(-1)?.content).toBe('answer');
   });
 
   it('fails closed for an unknown run status', () => {

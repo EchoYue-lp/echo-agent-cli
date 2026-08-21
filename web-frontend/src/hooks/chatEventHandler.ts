@@ -33,14 +33,7 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
   }
   switch (payload.source) {
     case 'agent': {
-      const terminalStatus = agentTerminalStatus(payload.event.payload);
-      if (!terminalStatus && terminalAlreadyEstablished) return;
-      if (
-        terminalStatus &&
-        !recordTerminalStatusForTurn(envelope.stream_id, envelope.turn_id, terminalStatus)
-      ) {
-        return;
-      }
+      if (terminalAlreadyEstablished) return;
       handleAgentEvent(payload.event.payload, ctx);
       break;
     }
@@ -82,21 +75,6 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       break;
     default:
       assertNever(payload, 'chat driver event');
-  }
-}
-
-function agentTerminalStatus(
-  event: AgentEvent
-): Extract<ChatRunStatus, 'completed' | 'failed' | 'cancelled'> | null {
-  switch (event.type) {
-    case 'final_answer':
-      return 'completed';
-    case 'cancelled':
-      return 'cancelled';
-    case 'error':
-      return event.data.failure.terminal_kind === 'cancelled' ? 'cancelled' : 'failed';
-    default:
-      return null;
   }
 }
 
@@ -258,13 +236,11 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     case 'final_answer': {
       if (ctx.isCancelledRef.current) break;
       store.clearHitlRequests();
-      ctx.isCancelledRef.current = false;
       ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
       if (id) {
-        store.finalizeAssistantMessage(id, event.data);
+        store.applyFinalAnswer(id, event.data);
       }
-      ctx.assistantIdRef.current = null;
       break;
     }
     case 'approval_request': {
@@ -316,13 +292,14 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
         store.settleAssistantMessage(ctx.assistantIdRef.current);
       }
       ctx.assistantIdRef.current = null;
-      // Preserve the terminal guard until TurnStatus closes the stream. This
-      // rejects late deltas and a contradictory completed status.
+      // Preserve the local guard until TurnStatus closes the stream. This
+      // rejects late deltas while still allowing the canonical status to win.
       ctx.isCancelledRef.current = true;
       break;
     }
     case 'run_status': {
-      if (!ctx.isCancelledRef.current) {
+      const terminal = ['completed', 'failed', 'cancelled'].includes(event.status);
+      if (!ctx.isCancelledRef.current || terminal) {
         switch (event.status) {
           case 'idle':
           case 'running':
@@ -368,14 +345,8 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'done': {
       store.clearHitlRequests();
-      const terminalStatus = useChatStore.getState().runStatus;
-      const preservesFailure = terminalStatus === 'failed' || terminalStatus === 'cancelled';
       if (ctx.assistantIdRef.current) {
-        if (preservesFailure) {
-          store.settleAssistantMessage(ctx.assistantIdRef.current);
-        } else if (!ctx.isCancelledRef.current) {
-          store.finalizeAssistantMessage(ctx.assistantIdRef.current, '');
-        }
+        store.settleAssistantMessage(ctx.assistantIdRef.current);
       }
       ctx.assistantIdRef.current = null;
       ctx.currentMessageKeyRef.current = null;

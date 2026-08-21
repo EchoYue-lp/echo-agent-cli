@@ -148,13 +148,6 @@ export function useTauriChat() {
         currentThinkingIdRef: thinkingIdRef,
       });
       if (
-        event.payload.source === 'agent' &&
-        (event.payload.event.payload.type === 'cancelled' ||
-          event.payload.event.payload.type === 'error')
-      ) {
-        activeTurnIdRef.current = null;
-      }
-      if (
         event.payload.source === 'turn_status' &&
         ['completed', 'failed', 'cancelled'].includes(event.payload.event.status)
       ) {
@@ -457,7 +450,23 @@ export function useTauriChat() {
         }
       }
       if (!rootTurnId || !conversationId) {
-        useToastStore.getState().addToast('error', '无法定位正在运行的任务，请稍后重试');
+        const activeConversation = useConversationStore.getState().activeId;
+        if (activeConversation) {
+          const streamId = `conversation:${activeConversation}`;
+          const replay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+            conversationId: activeConversation,
+            conversation_id: activeConversation,
+            afterCursor: eventSequencerRef.current.cursor(streamId),
+            after_cursor: eventSequencerRef.current.cursor(streamId),
+          });
+          eventSequencerRef.current.ingestReplay(replay, handleEvent);
+        }
+        if (useChatStore.getState().isStreaming) {
+          useChatStore.getState().settleOrphanedTurn();
+        }
+        activeTurnIdRef.current = null;
+        currentMessageKeyRef.current = null;
+        assistantIdRef.current = null;
         return;
       }
       const settlement = await apiInvoke<CancelChatResponse>('cancel_chat', {
@@ -476,7 +485,7 @@ export function useTauriChat() {
       console.error('[TauriChat] Failed to cancel:', e);
       useToastStore.getState().addToast('error', `停止任务失败：${errorMessage(e)}`);
     }
-  }, [getActiveTurnSnapshot, restoreActiveTurnRefs]);
+  }, [getActiveTurnSnapshot, handleEvent, restoreActiveTurnRefs]);
 
   const clearQueuedMessages = useCallback(() => {
     replaceQueue([]);
