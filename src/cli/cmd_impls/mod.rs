@@ -4,6 +4,7 @@
 //! a group of related commands and exports a `register_all()` function.
 
 pub mod advanced;
+pub mod agent_router;
 pub mod all;
 pub mod analysis;
 pub mod coding;

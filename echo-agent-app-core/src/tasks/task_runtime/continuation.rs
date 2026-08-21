@@ -73,6 +73,7 @@ impl TaskContinuationRuntime {
             .continuation_sink()
             .unwrap_or_else(|| resources.sink.clone());
         let retained = Arc::new(ChatResources {
+            execution_scope: resources.execution_scope.clone(),
             pool: resources.pool.clone(),
             store: None,
             sink: retained_sink,
@@ -194,6 +195,7 @@ impl TaskContinuationRuntime {
                 transcript_visibility: TurnVisibility::Internal,
             };
             let resources = Arc::new(ChatResources {
+                execution_scope: launcher.resources.execution_scope.clone(),
                 pool: launcher.resources.pool.clone(),
                 store: Some(Arc::clone(&store)),
                 sink: launcher.resources.sink.clone(),

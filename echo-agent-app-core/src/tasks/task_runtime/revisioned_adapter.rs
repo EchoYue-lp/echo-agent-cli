@@ -15,8 +15,8 @@ use super::profiles::default_subagent_for;
 use super::store::{InitialRunTriggerMetadata, StoreError, TaskRuntimeStore};
 use super::task_tools::{TaskCapabilityCatalog, current_run_id, formal_run_id_for_turn};
 use super::types::{
-    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskMetadata, PlanTaskKind, TaskRun,
-    TaskUpdateRequest,
+    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskMetadata, PlanTaskKind,
+    TaskExecutionTarget, TaskRun, TaskUpdateRequest,
 };
 
 #[derive(Clone)]
@@ -168,10 +168,34 @@ impl EkoTaskToolPolicy {
 #[async_trait]
 impl TaskToolPolicy for EkoTaskToolPolicy {
     fn task_input_schema_extensions(&self) -> serde_json::Map<String, serde_json::Value> {
-        serde_json::Map::from_iter([(
-            "parallel_group".to_string(),
-            serde_json::json!({ "type": "string" }),
-        )])
+        serde_json::Map::from_iter([
+            (
+                "parallel_group".to_string(),
+                serde_json::json!({ "type": "string" }),
+            ),
+            (
+                "execution_target".to_string(),
+                serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "description": "Optional persistent Agent-group member that executes this PlanTask. Copy the exact group, role, and address returned by the Agent group service.",
+                    "properties": {
+                        "group_id": { "type": "string" },
+                        "subagent_role": { "type": "string" },
+                        "address": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "workspace_id": { "type": "string" },
+                                "conversation_id": { "type": "string" }
+                            },
+                            "required": ["workspace_id", "conversation_id"]
+                        }
+                    },
+                    "required": ["group_id", "subagent_role", "address"]
+                }),
+            ),
+        ])
     }
 
     async fn resolve_scope(&self, context: &ToolContext) -> Result<String, TaskPolicyError> {
@@ -286,19 +310,45 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
+        let agent_role = draft.subagent.clone().unwrap_or_else(|| {
+            default_subagent_for(run.domain_profile, PlanTaskKind::from_task_kind(draft.kind))
+                .to_string()
+        });
+        let execution_target = draft
+            .extensions
+            .get("execution_target")
+            .cloned()
+            .map(serde_json::from_value::<TaskExecutionTarget>)
+            .transpose()
+            .map_err(|error| TaskPolicyError::Rejected {
+                message: format!("task '{}' has invalid execution_target: {error}", draft.id),
+            })?;
+        if let Some(target) = execution_target.as_ref() {
+            target
+                .validate()
+                .map_err(|message| TaskPolicyError::Rejected {
+                    message: format!("task '{}': {message}", draft.id),
+                })?;
+            if target.subagent_role != agent_role {
+                return Err(TaskPolicyError::Rejected {
+                    message: format!(
+                        "task '{}' execution_target role '{}' does not match Subagent role '{}'",
+                        draft.id, target.subagent_role, agent_role
+                    ),
+                });
+            }
+        }
         let metadata = serde_json::to_value(EkoTaskMetadata {
             domain_profile: run.domain_profile,
             parallel_group,
+            execution_target,
             sort_order: i64::try_from(position).unwrap_or(i64::MAX),
         })
         .map_err(|error| TaskPolicyError::Backend {
             message: format!("Failed to encode EKO task metadata: {error}"),
         })?;
         Ok(PreparedTaskPolicy {
-            agent_role: draft.subagent.clone().unwrap_or_else(|| {
-                default_subagent_for(run.domain_profile, PlanTaskKind::from_task_kind(draft.kind))
-                    .to_string()
-            }),
+            agent_role,
             metadata,
         })
     }

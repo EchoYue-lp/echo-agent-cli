@@ -260,6 +260,7 @@ pub fn build_fix_task(original: &PlanTask, review: &ReviewResult) -> PlanTask {
         domain_profile: original.domain_profile,
         depends_on: original.depends_on.clone(),
         parallel_group: None, // fixes always serialize
+        execution_target: original.execution_target.clone(),
         files: original.files.clone(),
         allowed_tools: original.allowed_tools.clone(),
         required_artifacts: original.required_artifacts.clone(),

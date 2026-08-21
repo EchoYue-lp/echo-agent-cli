@@ -1209,6 +1209,7 @@ export function TaskRuntimePanel() {
                     domain_profile: plan.domain_profile,
                     depends_on: [],
                     parallel_group: null,
+                    execution_target: null,
                     files: [],
                     allowed_tools: [],
                     required_artifacts: [],

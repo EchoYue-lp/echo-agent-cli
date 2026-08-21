@@ -587,8 +587,8 @@ impl ReviewIntegration {
         Ok(())
     }
 
-    /// Settle the prepared workspace generation without reopening pool
-    /// admission between workspace publication and instruction publication.
+    /// Test-only coverage for the retired process-wide workspace rebind path.
+    #[cfg(test)]
     pub(crate) async fn settle_rebind_rule_promotions(
         &self,
         pool_transition: Option<&crate::agent_pool::AgentPoolWorkspaceTransition<'_>>,
@@ -759,15 +759,6 @@ impl ReviewIntegration {
         state.pending_rule_receipts.clear();
     }
 
-    pub(crate) fn has_pending_rule_projection(&self) -> bool {
-        self.binding
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .pending_rule_projection
-            .is_some()
-    }
-
     fn has_rule_projection_primary(&self) -> bool {
         self.rule_projection_targets
             .read()
@@ -868,14 +859,6 @@ impl ReviewIntegration {
         } else {
             false
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_pool_projection_fault_for_test(&self) {
-        *self
-            .rule_projection_fault
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(RuleProjectionFault::Pool);
     }
 
     /// Attach the runtime observer used by memory, candidate and health paths.

@@ -1105,6 +1105,7 @@ mod tests {
             domain_profile: DomainProfile::AiCoding,
             depends_on: Vec::new(),
             parallel_group: None,
+            execution_target: None,
             files: vec!["src/a.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: Vec::new(),

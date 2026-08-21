@@ -45,6 +45,7 @@ use crate::model_config::ModelRuntimeConfig;
 use crate::plugin_components::{PreparedPluginAgent, register_plugin_agents};
 use crate::workspace::WorkspaceKind;
 use echo_agent::config::AppConfig;
+use echo_agent::mcp::McpConfigFile;
 
 /// Immutable EKO projection of the plugin catalog installed into primary,
 /// existing pooled, and future pooled agents as one generation.
@@ -169,6 +170,16 @@ pub struct SharedResources {
     /// the main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+}
+
+pub(crate) struct WorkspaceAgentPoolResources {
+    pub root: std::path::PathBuf,
+    pub kind: WorkspaceKind,
+    pub conversation_store: Arc<dyn echo_agent::memory::ConversationStore>,
+    pub state_store: Arc<dyn echo_agent::state::RuntimeStateStore>,
+    pub memory_store: Arc<dyn echo_agent::memory::Store>,
+    pub task_runtime_store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
+    pub review_integration: Arc<crate::evolution::ReviewIntegration>,
 }
 
 impl SharedResources {
@@ -404,6 +415,16 @@ impl PooledAgent {
 pub struct AgentPool {
     shared: SharedResources,
     agents: RwLock<HashMap<String, PooledAgent>>,
+    /// Primary Agent owned by this pool generation. Workspace forks create a
+    /// dedicated primary; the bootstrap pool references the process primary.
+    primary_agent: RwLock<Option<AgentHandle>>,
+    /// Model consumers for a primary that is owned by this pool. The bootstrap
+    /// primary remains owned by `AppState`; workspace primary Agents are
+    /// published through the same pool transaction as cached conversation Agents.
+    primary_model_consumers: RwLock<Option<infra::AgentModelConsumers>>,
+    /// Latest durable user MCP snapshot for future Agents and future workspace
+    /// forks. Live ToolManagers are reconciled separately by McpConfigRuntime.
+    mcp_config_snapshot: RwLock<Option<McpConfigFile>>,
     workspace_transitioning: AtomicBool,
     shutting_down: AtomicBool,
     admission: Arc<AgentPoolAdmission>,
@@ -436,6 +457,10 @@ pub struct AgentPool {
     /// Last strictly-read instruction generation. Existing and future pool
     /// agents are always projected from this same snapshot.
     instruction_projection: RwLock<Option<crate::unified_memory::InstructionProjectionSnapshot>>,
+    /// Explicit Mock transport used only by integration tests that must fork
+    /// real workspace pools without contacting an external model provider.
+    #[cfg(test)]
+    llm_client_override: RwLock<Option<Arc<dyn echo_agent::llm::LlmClient>>>,
 }
 
 pub(crate) struct AgentPoolWorkspaceTransition<'a> {
@@ -641,6 +666,7 @@ impl PreparedAgentPoolInstructionPublication<'_> {
 }
 
 impl AgentPoolWorkspaceTransition<'_> {
+    #[cfg(test)]
     pub(crate) async fn commit(&mut self) {
         if self.committed {
             return;
@@ -734,6 +760,9 @@ impl AgentPool {
         let pool = Arc::new(Self {
             shared,
             agents: RwLock::new(HashMap::new()),
+            primary_agent: RwLock::new(Some(runtime.agent_handle.clone())),
+            primary_model_consumers: RwLock::new(None),
+            mcp_config_snapshot: RwLock::new(Some(runtime.mcp_config_runtime.snapshot().await)),
             workspace_transitioning: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(AgentPoolAdmission::default()),
@@ -754,6 +783,8 @@ impl AgentPool {
             tool_output_artifacts: RwLock::new(tool_output_artifacts),
             workspace_kind: RwLock::new(WorkspaceKind::General),
             instruction_projection: RwLock::new(None),
+            #[cfg(test)]
+            llm_client_override: RwLock::new(None),
         });
 
         // Bind before creating the background agent so it and every later
@@ -781,6 +812,147 @@ impl AgentPool {
         }
 
         Ok(pool)
+    }
+
+    /// Fork an independently admitted pool for one immutable workspace host.
+    ///
+    /// Expensive process-safe primitives remain shared, while every resource
+    /// whose contents or tool behavior depend on workspace identity is replaced
+    /// by the host-owned instance. Agents inside one host share that host's
+    /// ToolManager (including its MCP clients); different hosts never share it.
+    pub(crate) async fn fork_for_workspace(
+        &self,
+        resources: WorkspaceAgentPoolResources,
+    ) -> anyhow::Result<(
+        Arc<Self>,
+        Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
+        Arc<crate::mcp_config_runtime::McpNameOwnershipRegistry>,
+    )> {
+        let WorkspaceAgentPoolResources {
+            root,
+            kind,
+            conversation_store,
+            state_store,
+            memory_store,
+            task_runtime_store,
+            review_integration,
+        } = resources;
+        let mcp_config_snapshot = self.mcp_config_snapshot.read().await.clone();
+        let shared = SharedResources {
+            tool_manager: None,
+            hook_registry: None,
+            sandbox_manager: self.shared.sandbox_manager.clone(),
+            store: Some(memory_store),
+            conversation_store: Some(conversation_store),
+            run_store: self.shared.run_store.clone(),
+            token_tracker: self.shared.token_tracker.clone(),
+            permission_service: self.shared.permission_service.clone(),
+            state_store: Some(state_store),
+            tool_execution_pipeline: self.shared.tool_execution_pipeline.clone(),
+            review_integration: Some(review_integration),
+            task_runtime_store: Some(task_runtime_store.clone()),
+            browser_runtime: self.shared.browser_runtime.clone(),
+        };
+        let mut pool = Arc::new(Self {
+            shared,
+            agents: RwLock::new(HashMap::new()),
+            primary_agent: RwLock::new(None),
+            primary_model_consumers: RwLock::new(None),
+            mcp_config_snapshot: RwLock::new(mcp_config_snapshot.clone()),
+            workspace_transitioning: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            admission: Arc::new(AgentPoolAdmission::default()),
+            config: self.config.clone(),
+            app_config: RwLock::new(self.app_config.read().await.clone()),
+            working_dir: RwLock::new(Some(root.clone())),
+            permission_mode: RwLock::new(self.permission_mode.read().await.clone()),
+            agent_generation: RwLock::new(self.agent_generation.read().await.clone()),
+            cleanup_cancel: CancellationToken::new(),
+            cleanup_handle: Mutex::new(None),
+            memory_store_override: RwLock::new(None),
+            conversation_store_override: RwLock::new(None),
+            state_store_override: RwLock::new(None),
+            tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(Some(
+                &root,
+            ))),
+            workspace_kind: RwLock::new(kind),
+            instruction_projection: RwLock::new(self.instruction_projection.read().await.clone()),
+            #[cfg(test)]
+            llm_client_override: RwLock::new(self.llm_client_override.read().await.clone()),
+        });
+
+        let primary = pool.create_agent("__workspace_primary__").await?;
+        let app_config = self.app_config.read().await.clone();
+        crate::infra::load_user_hooks(&primary.handle, &app_config).await;
+        let lsp_runtime = if mcp_config_snapshot.is_some() {
+            Some(crate::runtime::register_lsp_tools(&primary.handle).await)
+        } else {
+            None
+        };
+        primary
+            .handle
+            .write(|agent| {
+                crate::research_connectors::install_auto_ingest_tools(agent);
+                agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
+            })
+            .await;
+        let primary_tool_manager = primary
+            .handle
+            .read(|agent| agent.tool_manager().clone())
+            .await;
+        let primary_hook_registry = primary
+            .handle
+            .read(|agent| agent.hook_registry().clone())
+            .await;
+        let pool_mut = Arc::get_mut(&mut pool).ok_or_else(|| {
+            anyhow::anyhow!("workspace AgentPool escaped before host resources were installed")
+        })?;
+        pool_mut.shared.tool_manager = Some(primary_tool_manager);
+        pool_mut.shared.hook_registry = Some(primary_hook_registry);
+        *pool.primary_agent.write().await = Some(primary.handle.clone());
+        *pool.primary_model_consumers.write().await = Some(primary.model_consumers.clone());
+        crate::tasks::task_runtime::bind_task_execute_to_pool(
+            &primary.handle,
+            task_runtime_store,
+            &pool,
+        )
+        .await;
+        let (plugin_runtime, mcp_ownership) = match (lsp_runtime, mcp_config_snapshot.as_ref()) {
+            (Some(lsp_runtime), Some(mcp_config)) => {
+                let ownership = crate::mcp_config_runtime::McpNameOwnershipRegistry::new(
+                    mcp_config.mcp_servers.keys().cloned(),
+                );
+                let runtime = crate::plugin_runtime::PluginRuntimeService::new(
+                    primary.handle.clone(),
+                    lsp_runtime,
+                    Arc::clone(&ownership),
+                )
+                .await;
+                runtime.bind_agent_pool(Arc::downgrade(&pool)).await?;
+                (Some(runtime), ownership)
+            }
+            _ => (
+                None,
+                crate::mcp_config_runtime::McpNameOwnershipRegistry::new(Vec::<String>::new()),
+            ),
+        };
+        crate::infra::fire_startup_hook(&primary.handle).await;
+
+        if pool.config.enable_background_agent {
+            match pool.create_agent("__background__").await {
+                Ok(pooled) => {
+                    pool.agents
+                        .write()
+                        .await
+                        .insert("__background__".to_string(), pooled);
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "workspace AgentPool background agent unavailable");
+                }
+            }
+        }
+        pool.spawn_cleanup_monitor().await;
+        Ok((pool, plugin_runtime, mcp_ownership))
     }
 
     #[cfg(test)]
@@ -830,6 +1002,9 @@ impl AgentPool {
         Self {
             shared,
             agents: RwLock::new(HashMap::new()),
+            primary_agent: RwLock::new(Some(agent.clone())),
+            primary_model_consumers: RwLock::new(None),
+            mcp_config_snapshot: RwLock::new(None),
             workspace_transitioning: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(AgentPoolAdmission::default()),
@@ -850,12 +1025,23 @@ impl AgentPool {
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
             instruction_projection: RwLock::new(None),
+            #[cfg(test)]
+            llm_client_override: RwLock::new(None),
         }
+    }
+
+    #[cfg(test)]
+    pub async fn set_llm_client_override_for_test(
+        &self,
+        client: Arc<dyn echo_agent::llm::LlmClient>,
+    ) {
+        *self.llm_client_override.write().await = Some(client);
     }
 
     /// Whether this key consumes one user-conversation capacity slot.
     fn is_conversation_agent(key: &str) -> bool {
         key != "__background__"
+            && key != "__workspace_primary__"
             && !key.starts_with("__task__:")
             && !key.starts_with("__continuation__:")
     }
@@ -1048,6 +1234,26 @@ impl AgentPool {
         *self.app_config.write().await = app_config;
     }
 
+    /// Publish the durable user MCP snapshot used by future conversation Agents
+    /// and by workspace hosts opened after this generation commits.
+    pub(crate) async fn update_mcp_config_snapshot(&self, snapshot: McpConfigFile) {
+        *self.mcp_config_snapshot.write().await = Some(snapshot);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mcp_config_snapshot_for_test(&self) -> Option<McpConfigFile> {
+        self.mcp_config_snapshot.read().await.clone()
+    }
+
+    /// Number of exact execution receipts currently retaining this pool.
+    pub(crate) fn active_execution_count(&self) -> usize {
+        self.admission
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .total
+    }
+
     /// Admit every existing and future pool consumer before persistence.
     pub(crate) async fn prepare_model_publication(
         &self,
@@ -1061,7 +1267,25 @@ impl AgentPool {
             .map_err(|error| error.to_string())?;
         let agents = self.agents.write().await;
         let token_limit = infra::effective_token_limit(&app_config, Some(&runtime));
-        let mut publications = Vec::with_capacity(agents.len());
+        let primary_consumers = self.primary_model_consumers.read().await.clone();
+        let primary_agent = self.primary_agent.read().await.clone();
+        let mut publications = Vec::with_capacity(
+            agents
+                .len()
+                .saturating_add(usize::from(primary_consumers.is_some())),
+        );
+        if let (Some(primary), Some(consumers)) = (primary_agent, primary_consumers) {
+            publications.push(
+                infra::prepare_agent_model_publication(
+                    &primary,
+                    consumers,
+                    &runtime,
+                    &prepared,
+                    token_limit,
+                )
+                .await?,
+            );
+        }
         let mut pooled_agents: Vec<(&String, &PooledAgent)> = agents.iter().collect();
         pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
         for (_, pooled) in pooled_agents {
@@ -1096,7 +1320,16 @@ impl AgentPool {
             .await
             .map_err(|error| error.to_string())?;
         let agents = self.agents.write().await;
-        let mut publications = Vec::with_capacity(agents.len());
+        let primary_consumers = self.primary_model_consumers.read().await.clone();
+        let primary_agent = self.primary_agent.read().await.clone();
+        let mut publications = Vec::with_capacity(
+            agents
+                .len()
+                .saturating_add(usize::from(primary_consumers.is_some())),
+        );
+        if let (Some(primary), Some(consumers)) = (primary_agent, primary_consumers) {
+            publications.push(infra::prepare_agent_model_deactivation(&primary, consumers).await);
+        }
         let mut pooled_agents: Vec<(&String, &PooledAgent)> = agents.iter().collect();
         pooled_agents.sort_by(|left, right| left.0.cmp(right.0));
         for (_, pooled) in pooled_agents {
@@ -1404,6 +1637,15 @@ impl AgentPool {
         self.agents.read().await.len()
     }
 
+    /// Return the primary Agent for this pool generation.
+    pub(crate) async fn primary_agent(&self) -> anyhow::Result<AgentHandle> {
+        self.primary_agent
+            .read()
+            .await
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("AgentPool primary Agent is unavailable"))
+    }
+
     /// Maximum number of non-background agents this pool may create.
     pub fn max_agents(&self) -> usize {
         self.config.max_agents
@@ -1684,6 +1926,16 @@ impl AgentPool {
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut agent = created.agent;
         let model_consumers = created.model_consumers;
+        #[cfg(test)]
+        if let Some(client) = self.llm_client_override.read().await.clone() {
+            agent.set_llm_client(client);
+        }
+        if self.shared.tool_manager.is_none()
+            && let Some(snapshot) = self.mcp_config_snapshot.read().await.clone()
+            && let Err(error) = agent.load_mcp_config(snapshot).await
+        {
+            tracing::warn!(conversation_id, %error, "workspace pooled agent MCP connection failed");
+        }
         agent.set_tool_output_artifacts(Some(self.tool_output_artifacts.read().await.clone()));
 
         // 2. Inject non-model shared resources. The model transport produced by
@@ -1776,6 +2028,16 @@ impl AgentPool {
 
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
+
+        // Workspace pools own their ToolManagers, so complete the same task
+        // tool suite used by the bootstrap primary. The execute tool captures
+        // this exact Agent and host store; no process-global pool lookup is
+        // needed or allowed here.
+        if self.shared.tool_manager.is_none()
+            && let Some(store) = self.shared.task_runtime_store.as_ref()
+        {
+            crate::tasks::task_runtime::register_task_tools_on_agent(&handle, store.clone()).await;
+        }
 
         // TaskRuntime's formal Subagents are created by the framework registry,
         // not by this conversation pool. Their invocation policy continues to

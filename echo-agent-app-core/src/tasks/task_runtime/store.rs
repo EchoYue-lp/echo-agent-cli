@@ -314,6 +314,7 @@ fn prepare_revisioned_graph_commit(
             domain_profile: metadata.domain_profile,
             depends_on: task.spec.depends_on.clone(),
             parallel_group: metadata.parallel_group,
+            execution_target: metadata.execution_target,
             files: task.spec.files.clone(),
             allowed_tools: task.spec.allowed_tools.clone(),
             required_artifacts: task.spec.required_artifacts.clone(),
@@ -503,6 +504,12 @@ pub struct TaskRuntimeStore {
     /// keeps only a weak store reference, so this does not create an Arc cycle.
     pub(super) continuation_runtime:
         std::sync::OnceLock<std::sync::Arc<super::continuation::TaskContinuationRuntime>>,
+    /// Process routing adapter for optional cross-workspace PlanTask targets.
+    /// The adapter owns no task state and is intentionally absent in tests or
+    /// embedding applications that only execute local tasks.
+    execution_target_resolver: std::sync::RwLock<
+        Option<std::sync::Arc<dyn super::execution_target::TaskExecutionTargetResolver>>,
+    >,
     #[cfg(test)]
     run_driver_shutdown_started: tokio::sync::Notify,
     #[cfg(test)]
@@ -870,10 +877,7 @@ pub(crate) struct TaskRuntimeWorkspaceTransition<'a> {
 }
 
 impl TaskRuntimeWorkspaceTransition<'_> {
-    pub(crate) fn active_shadow_root(&self) -> PathBuf {
-        self.store.shadow.root()
-    }
-
+    #[cfg(test)]
     pub(crate) fn list_runs_in(
         &self,
         statuses: &[TaskRunStatus],
@@ -1136,7 +1140,27 @@ impl TaskRuntimeStore {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(
             super::file_shadow::FileTaskShadow::default_root(),
         ));
-        Ok(Self {
+        Ok(Self::with_shadow(shadow, "global"))
+    }
+
+    /// Open one workspace-owned runtime store at its immutable task root.
+    ///
+    /// Unlike [`Self::rebind_shadow_root`], this constructor never changes an
+    /// existing runtime generation. Independent workspace hosts therefore keep
+    /// distinct cancellation, continuation, hook, and file-authority owners.
+    pub fn open_for_workspace(
+        shadow_root: impl Into<PathBuf>,
+        workspace_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
+        Ok(Self::with_shadow(shadow, workspace_id.into()))
+    }
+
+    fn with_shadow(
+        shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
+        workspace_id: impl Into<String>,
+    ) -> Self {
+        Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_subagent_controls: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1144,6 +1168,7 @@ impl TaskRuntimeStore {
             run_driver_admission_idle: tokio::sync::Notify::new(),
             run_driver_idle: tokio::sync::Notify::new(),
             continuation_runtime: std::sync::OnceLock::new(),
+            execution_target_resolver: std::sync::RwLock::new(None),
             #[cfg(test)]
             run_driver_shutdown_started: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -1161,12 +1186,12 @@ impl TaskRuntimeStore {
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
-                workspace_id: "global".to_string(),
+                workspace_id: workspace_id.into(),
                 transitioning: false,
             }),
             hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
-        })
+        }
     }
 
     /// In-memory store for tests / fallback. The file shadow is backed by a
@@ -1186,37 +1211,7 @@ impl TaskRuntimeStore {
     /// under a known directory. Replaces the old `attach_shadow` test hook.
     pub fn new_in_memory_with_shadow_root(shadow_root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
-        Ok(Self {
-            task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            active_subagent_controls: std::sync::Mutex::new(std::collections::HashMap::new()),
-            run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
-            run_driver_admission_idle: tokio::sync::Notify::new(),
-            run_driver_idle: tokio::sync::Notify::new(),
-            continuation_runtime: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            run_driver_shutdown_started: tokio::sync::Notify::new(),
-            #[cfg(test)]
-            abort_next_run_driver_shutdown_reporter: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            run_driver_admission_test_barrier: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            run_driver_registration_test_barrier: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            fail_next_run_driver_registration: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            fail_next_recovery_commit: std::sync::atomic::AtomicBool::new(false),
-            #[cfg(test)]
-            fail_next_recovery_projection: std::sync::atomic::AtomicBool::new(false),
-            shadow,
-            shadow_generation: std::sync::Mutex::new(ShadowGeneration {
-                active_operations: 0,
-                workspace_id: "test".to_string(),
-                transitioning: false,
-            }),
-            hook_event_dispatcher: std::sync::Mutex::new(None),
-            plan_locks: dashmap::DashMap::new(),
-        })
+        Ok(Self::with_shadow(shadow, "test"))
     }
 
     /// Attach the application-layer HookEventDispatcher so every event written
@@ -1249,6 +1244,25 @@ impl TaskRuntimeStore {
         }
         *owned_dispatcher = Some(dispatcher);
         Ok(true)
+    }
+
+    pub fn attach_execution_target_resolver(
+        &self,
+        resolver: std::sync::Arc<dyn super::execution_target::TaskExecutionTargetResolver>,
+    ) {
+        *self
+            .execution_target_resolver
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(resolver);
+    }
+
+    pub(crate) fn execution_target_resolver(
+        &self,
+    ) -> Option<std::sync::Arc<dyn super::execution_target::TaskExecutionTargetResolver>> {
+        self.execution_target_resolver
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Wait for every persisted task/subagent hook event to finish firing.
@@ -1534,7 +1548,6 @@ impl TaskRuntimeStore {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn active_run_driver_count(&self) -> Result<usize, String> {
         self.run_driver_supervisor
             .lock()
@@ -1629,7 +1642,6 @@ impl TaskRuntimeStore {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    #[cfg(test)]
     pub(crate) fn active_run_driver_receipt_count(&self) -> Result<usize, String> {
         self.run_driver_supervisor
             .lock()
@@ -3463,6 +3475,7 @@ impl TaskRuntimeStore {
             let metadata = serde_json::to_value(EkoTaskMetadata {
                 domain_profile: spec.domain_profile,
                 parallel_group: spec.parallel_group,
+                execution_target: spec.execution_target,
                 sort_order: spec.sort_order,
             })?;
             tasks.push(echo_agent::tasks::Task {
@@ -10356,6 +10369,7 @@ mod tests {
             domain_profile: DomainProfile::General,
             depends_on: Vec::new(),
             parallel_group: None,
+            execution_target: None,
             files: Vec::new(),
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: Vec::new(),

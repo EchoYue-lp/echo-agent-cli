@@ -1580,6 +1580,114 @@ export const workspaceApi = {
       : get<{ default_root: string }>(`/workspaces/default-root/${encodeURIComponent(name)}`),
 };
 
+// ── Cross-workspace Agent messaging ──
+
+export interface AgentAddress {
+  workspace_id: string;
+  conversation_id: string;
+}
+
+export interface AgentEndpoint {
+  address: AgentAddress;
+  workspace_name: string;
+  conversation_title: string | null;
+  updated_at: string;
+}
+
+export type AgentDeliveryStatus = 'queued' | 'claimed' | 'delivered' | 'failed';
+
+export interface AgentDeliveryReceipt {
+  message_id: string;
+  target: AgentAddress;
+  status: AgentDeliveryStatus;
+  accepted_at: string;
+  duplicate: boolean;
+}
+
+export interface AgentDeliveryRecord {
+  message_id: string;
+  target: AgentAddress;
+  status: AgentDeliveryStatus;
+  accepted_at: string;
+  attempt: number;
+  settled_at: string | null;
+  turn_id: string | null;
+  reply_message_id: string | null;
+  error: string | null;
+}
+
+export interface AgentGroupMember {
+  address: AgentAddress;
+  subagent_role: string;
+  label: string | null;
+}
+
+export interface AgentGroup {
+  group_id: string;
+  name: string;
+  leader: AgentAddress;
+  members: AgentGroupMember[];
+  created_at: string;
+  updated_at: string;
+}
+
+export const agentApi = {
+  list: () =>
+    isTauri()
+      ? apiInvoke<{ endpoints: AgentEndpoint[]; count: number }>('list_agent_endpoints')
+      : get<{ endpoints: AgentEndpoint[]; count: number }>('/agent/endpoints'),
+  send: (request: {
+    toWorkspaceId: string;
+    toConversationId: string;
+    text: string;
+    fromWorkspaceId?: string;
+    fromConversationId?: string;
+    messageId?: string;
+    correlationId?: string;
+  }) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; receipt: AgentDeliveryReceipt }>(
+          'send_agent_message',
+          request
+        )
+      : post<{ success: boolean; receipt: AgentDeliveryReceipt }>('/agent/messages', request),
+  status: (workspaceId: string, conversationId: string, messageId?: string) =>
+    isTauri()
+      ? apiInvoke<{ records: AgentDeliveryRecord[]; count: number }>('get_agent_delivery_status', {
+          workspaceId,
+          conversationId,
+          messageId,
+        })
+      : get<{ records: AgentDeliveryRecord[]; count: number }>(
+          `/agent/deliveries/${encodeURIComponent(workspaceId)}/${encodeURIComponent(conversationId)}${messageId ? `?message_id=${encodeURIComponent(messageId)}` : ''}`
+        ),
+  listGroups: () =>
+    isTauri()
+      ? apiInvoke<{ groups: AgentGroup[]; count: number }>('list_agent_groups')
+      : get<{ groups: AgentGroup[]; count: number }>('/agent/groups'),
+  createGroup: (request: { name: string; leader: AgentAddress; members: AgentGroupMember[] }) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; group: AgentGroup }>('create_agent_group', request)
+      : post<{ success: boolean; group: AgentGroup }>('/agent/groups', request),
+  updateGroup: (
+    groupId: string,
+    request: { name: string; leader: AgentAddress; members: AgentGroupMember[] }
+  ) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; group: AgentGroup }>('update_agent_group', {
+          groupId,
+          ...request,
+        })
+      : post<{ success: boolean; group: AgentGroup }>(
+          `/agent/groups/${encodeURIComponent(groupId)}`,
+          request
+        ),
+  deleteGroup: (groupId: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; deleted: boolean }>('delete_agent_group', { groupId })
+      : del<{ success: boolean; deleted: boolean }>(`/agent/groups/${encodeURIComponent(groupId)}`),
+};
+
 // ── Evolution API (自进化) ─────────────────────────────────────────
 
 export const evolutionApi = {

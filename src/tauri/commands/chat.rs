@@ -450,20 +450,22 @@ pub async fn send_chat_message(
     let active_turn_key = conversation_id
         .clone()
         .unwrap_or_else(|| format!("message:{message_key}"));
-    let foreground_lease = state
+    let (scoped_runtime, foreground_lease) = state
         .app_state
-        .begin_conversation_turn_owned(
+        .begin_scoped_chat_turn_owned(
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
             &active_turn_key,
             message_key.clone(),
         )
         .await
-        .map_err(|error| match error {
-            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy {
-                    active_turn_id,
-                    ..
-                },
+        .map_err(|error| match &error {
+            echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+                echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                    echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy {
+                        active_turn_id,
+                        ..
+                    },
+                ),
             ) => IpcError::Validation(format!("chat_turn_busy:{active_turn_id}")),
             other => IpcError::Validation(other.to_string()),
         })?;
@@ -474,9 +476,7 @@ pub async fn send_chat_message(
     // both settled, so workspace publication cannot race an issued handle.
     let pool_execution = match conversation_id.as_deref() {
         Some(conversation_id) => Some(
-            state
-                .app_state
-                .connection
+            scoped_runtime
                 .agent_for(conversation_id)
                 .await
                 .map_err(|error| IpcError::Validation(error.to_string()))?,
@@ -486,7 +486,7 @@ pub async fn send_chat_message(
     let agent_handle = pool_execution
         .as_ref()
         .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
-        .unwrap_or_else(|| state.app_state.connection.primary_agent());
+        .unwrap_or_else(|| scoped_runtime.primary_agent());
 
     // Ensure stable cache_user_id for KVCache isolation (DeepSeek requires this
     // for prompt cache reuse across requests; without it, cache hit rate drops
@@ -578,8 +578,9 @@ pub async fn send_chat_message(
         }
     };
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-        pool: state.app_state.connection.pool.clone(),
-        store: state.app_state.tasks.runtime.clone(),
+        execution_scope: scoped_runtime.execution_scope().clone(),
+        pool: scoped_runtime.pool(),
+        store: scoped_runtime.task_runtime(),
         sink: sink.clone(),
         webhook_emitter: Some(state.app_state.webhook.emitter.clone()),
         conv_id: Some(active_turn_key.clone()),
@@ -587,7 +588,7 @@ pub async fn send_chat_message(
         attachments: prepared_turn.inline_attachment_refs(),
         cancel: cancel_token.clone(),
         interaction_mode,
-        review_integration: state.app_state.review_integration.clone(),
+        review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(hitl_handler),
@@ -653,11 +654,17 @@ pub async fn steer_chat_message(
     if message.trim().is_empty() && attachments.as_ref().is_none_or(Vec::is_empty) {
         return Err(IpcError::Validation("steer input is empty".to_string()));
     }
+    let scoped_runtime = state
+        .app_state
+        .current_chat_runtime()
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
     let expected_turn_id = state
         .app_state
         .session
         .foreground_turns
-        .snapshot(
+        .snapshot_scoped(
+            scoped_runtime.execution_scope().workspace_id(),
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
             &conversation_id,
         )
@@ -714,7 +721,7 @@ pub async fn steer_chat_message(
             return Err(IpcError::Validation(format!("{error}{suffix}")));
         }
     };
-    let agent_execution = match state.app_state.connection.agent_for(&conversation_id).await {
+    let agent_execution = match scoped_runtime.agent_for(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
             let cleanup = prepared.cleanup_resources(&spill_dir).err();
@@ -770,16 +777,22 @@ pub async fn steer_chat_message(
 
 fn select_active_chat_turn(
     control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    workspace_id: &str,
     conversation_id: Option<&str>,
 ) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
     use echo_agent_app_core::foreground_turn::ForegroundTurnSurface;
 
     if let Some(conversation_id) = conversation_id {
-        return Ok(control.snapshot(ForegroundTurnSurface::Gui, conversation_id));
+        return Ok(control.snapshot_scoped(
+            workspace_id,
+            ForegroundTurnSurface::Gui,
+            conversation_id,
+        ));
     }
     let mut snapshots = control
         .snapshots(ForegroundTurnSurface::Gui)
         .map_err(|error| IpcError::Internal(error.to_string()))?;
+    snapshots.retain(|snapshot| snapshot.workspace_id == workspace_id);
     match snapshots.len() {
         0 => Ok(None),
         1 => Ok(snapshots.pop()),
@@ -795,12 +808,14 @@ fn select_active_chat_turn(
 /// there is exactly one active GUI turn. The returned `conversation_id` is the
 /// registry's real scope key and may therefore be `message:<turn_id>`.
 #[tauri::command]
-pub fn get_active_chat_turn(
+pub async fn get_active_chat_turn(
     state: tauri::State<'_, TauriState>,
     conversation_id: Option<String>,
 ) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
+    let scope = state.app_state.current_execution_scope().await;
     select_active_chat_turn(
         &state.app_state.session.foreground_turns,
+        scope.workspace_id(),
         conversation_id.as_deref(),
     )
 }
@@ -853,11 +868,13 @@ pub async fn cancel_chat(
     conversation_id: String,
     root_turn_id: String,
 ) -> Result<serde_json::Value, IpcError> {
+    let scope = state.app_state.current_execution_scope().await;
     let waiter = state
         .app_state
         .session
         .foreground_turns
-        .request_root_cancel(
+        .request_root_cancel_scoped(
+            scope.workspace_id(),
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
             &conversation_id,
             &root_turn_id,
@@ -1659,7 +1676,7 @@ mod foreground_turn_command_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let control = ForegroundTurnControl::default();
         let lease = control.begin(ForegroundTurnSurface::Gui, "message:turn-1", "turn-1")?;
-        let snapshot = select_active_chat_turn(&control, None)?
+        let snapshot = select_active_chat_turn(&control, "global", None)?
             .ok_or_else(|| "missing active snapshot".to_string())?;
         assert_eq!(snapshot.conversation_id, "message:turn-1");
         assert_eq!(snapshot.root_turn_id, "turn-1");
@@ -1675,11 +1692,11 @@ mod foreground_turn_command_tests {
         let first = control.begin(ForegroundTurnSurface::Gui, "conversation-1", "turn-1")?;
         let second = control.begin(ForegroundTurnSurface::Gui, "conversation-2", "turn-2")?;
         assert!(matches!(
-            select_active_chat_turn(&control, None),
+            select_active_chat_turn(&control, "global", None),
             Err(IpcError::Validation(message))
                 if message == "active_chat_turn_ambiguous:conversation_id_required"
         ));
-        let snapshot = select_active_chat_turn(&control, Some("conversation-2"))?
+        let snapshot = select_active_chat_turn(&control, "global", Some("conversation-2"))?
             .ok_or_else(|| "missing exact active snapshot".to_string())?;
         assert_eq!(snapshot.root_turn_id, "turn-2");
         assert_eq!(snapshot.active_turn_id, "turn-2");

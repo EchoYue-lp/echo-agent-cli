@@ -1797,8 +1797,12 @@ async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError>
     if let Some(ws) = state.app_state.current_workspace().await {
         Ok(ws.project_root.unwrap_or(ws.root))
     } else {
-        std::env::current_dir()
-            .map_err(|e| IpcError::Internal(format!("Failed to resolve current directory: {e}")))
+        Ok(state
+            .app_state
+            .current_execution_scope()
+            .await
+            .root()
+            .to_path_buf())
     }
 }
 

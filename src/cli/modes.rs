@@ -193,7 +193,7 @@ where
 /// Run one prompt through the shared finite chat driver and print only the
 /// canonical, already-journaled application envelope stream.
 pub async fn run_jsonl_mode(
-    agent: AgentHandle,
+    _agent: AgentHandle,
     prompt: &str,
     conversation_id: String,
     services: &HeadlessServices,
@@ -203,15 +203,20 @@ pub async fn run_jsonl_mode(
     }
 
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let lease = services
+    let (scoped_runtime, lease) = services
         .app_state
-        .begin_conversation_turn_owned(
+        .begin_scoped_chat_turn_owned(
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
             &conversation_id,
             turn_id.clone(),
         )
         .await
         .map_err(anyhow::Error::from)?;
+    let pool_execution = scoped_runtime
+        .agent_for(&conversation_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let agent = pool_execution.agent();
     let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(crate::cli::jsonl::JsonlChatSink::stdout());
     let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
@@ -239,9 +244,8 @@ pub async fn run_jsonl_mode(
     }
 
     let title: String = prompt.trim().chars().take(80).collect();
-    if let Err(error) = services
-        .app_state
-        .ensure_conversation_owned(echo_agent::memory::NewConversation {
+    if let Err(error) = scoped_runtime
+        .ensure_conversation(echo_agent::memory::NewConversation {
             conversation_id: conversation_id.clone(),
             user_id: "default".to_string(),
             agent_type: None,
@@ -293,8 +297,9 @@ pub async fn run_jsonl_mode(
         }
     };
     let resources = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-        pool: services.app_state.connection.pool.clone(),
-        store: services.app_state.tasks.runtime.clone(),
+        execution_scope: scoped_runtime.execution_scope().clone(),
+        pool: scoped_runtime.pool(),
+        store: scoped_runtime.task_runtime(),
         sink: sink.clone(),
         webhook_emitter: Some(services.app_state.webhook.emitter.clone()),
         conv_id: Some(conversation_id),
@@ -302,13 +307,14 @@ pub async fn run_jsonl_mode(
         attachments: turn.inline_attachment_refs(),
         cancel: lease.cancellation_token(),
         interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-        review_integration: services.app_state.review_integration.clone(),
+        review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
         human_loop_provider: Some(services.app_state.connection.hitl_dispatcher.clone()
             as std::sync::Arc<dyn echo_agent::human_loop::HumanLoopProvider>),
     });
     let turn_cancel = lease.cancellation_token();
+    let _pool_execution = pool_execution;
     let result = await_jsonl_driver_or_cancel(
         echo_agent_app_core::foreground_turn::drive_foreground_chat(
             lease, &agent, &turn, resources,
@@ -398,10 +404,14 @@ pub async fn start_headless_services(
         .await?;
     let task_service = state.tasks.service.clone();
     let scheduler = state.scheduler.runner.clone();
+    let app_state = std::sync::Arc::new(state);
+    if let Err(error) = app_state.recover_agent_deliveries().await {
+        tracing::warn!(%error, "failed to resume durable Agent deliveries during headless startup");
+    }
     Ok(HeadlessServices {
         task_service,
         scheduler_runner: scheduler,
-        app_state: std::sync::Arc::new(state),
+        app_state,
     })
 }
 
@@ -469,6 +479,15 @@ pub async fn shutdown_headless_services(
     let background_review_integration = review_integration;
     let run_session_review = session_exit_agent.is_some();
     let steps = vec![
+        CliShutdownStep {
+            name: "Agent deliveries",
+            future: Box::pin(async {
+                app_state
+                    .shutdown_agent_deliveries()
+                    .await
+                    .map_err(anyhow::Error::from)
+            }),
+        },
         CliShutdownStep {
             name: "foreground turns",
             future: Box::pin(async {

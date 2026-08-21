@@ -489,7 +489,12 @@ async fn get_workspace_scope(state: &TauriState) -> WorkspaceScope {
         let root = workspace.project_root.unwrap_or(workspace.root);
         (namespace, root)
     } else {
-        let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let root = state
+            .app_state
+            .current_execution_scope()
+            .await
+            .root()
+            .to_path_buf();
         ("global".to_string(), root)
     };
     let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);

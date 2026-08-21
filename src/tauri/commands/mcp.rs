@@ -235,13 +235,7 @@ pub async fn connect_mcp_server(
 
     let generation = state
         .app_state
-        .plugins
-        .mcp_config
-        .upsert_and_reconcile(
-            state.app_state.connection.primary_agent(),
-            name.clone(),
-            entry,
-        )
+        .upsert_mcp_server_owned(name.clone(), entry)
         .await
         .map_err(map_mcp_config_error)?;
 
@@ -260,9 +254,7 @@ pub async fn disconnect_mcp_server(
 ) -> Result<serde_json::Value, IpcError> {
     let generation = state
         .app_state
-        .plugins
-        .mcp_config
-        .remove_and_reconcile(state.app_state.connection.primary_agent(), &name)
+        .remove_mcp_server_owned(&name)
         .await
         .map_err(map_mcp_config_error)?;
 
@@ -290,9 +282,7 @@ pub async fn toggle_mcp_server(
 ) -> Result<serde_json::Value, IpcError> {
     let generation = state
         .app_state
-        .plugins
-        .mcp_config
-        .set_enabled_and_reconcile(state.app_state.connection.primary_agent(), &name, enabled)
+        .set_mcp_server_enabled_owned(&name, enabled)
         .await
         .map_err(map_mcp_config_error)?;
 
@@ -417,9 +407,7 @@ pub async fn update_mcp_config(
         serde_json::from_value(config).map_err(|e| IpcError::Validation(e.to_string()))?;
     let generation = state
         .app_state
-        .plugins
-        .mcp_config
-        .replace_and_reconcile(state.app_state.connection.primary_agent(), new_config)
+        .replace_mcp_config_owned(new_config)
         .await
         .map_err(map_mcp_config_error)?;
 

@@ -125,6 +125,29 @@ struct McpConfigCommit {
     cancel: CancellationToken,
 }
 
+/// One independently isolated Agent/ToolManager namespace that must converge
+/// to the process-wide durable user MCP generation.
+#[derive(Clone)]
+pub(crate) struct McpReconcileTarget {
+    agent: AgentHandle,
+    ownership: Arc<McpNameOwnershipRegistry>,
+    pool: Option<Arc<crate::agent_pool::AgentPool>>,
+}
+
+impl McpReconcileTarget {
+    pub(crate) fn new(
+        agent: AgentHandle,
+        ownership: Arc<McpNameOwnershipRegistry>,
+        pool: Option<Arc<crate::agent_pool::AgentPool>>,
+    ) -> Self {
+        Self {
+            agent,
+            ownership,
+            pool,
+        }
+    }
+}
+
 struct ReconcileTask {
     cancel: CancellationToken,
     handle: tokio::task::JoinHandle<()>,
@@ -197,7 +220,6 @@ impl McpNameOwnershipRegistry {
         }
     }
 
-    #[cfg(test)]
     pub(crate) async fn claim_user_names(&self, names: impl IntoIterator<Item = String>) {
         let mut state = self.state.lock().await;
         for name in names {
@@ -218,6 +240,14 @@ impl McpNameOwnershipRegistry {
     #[cfg(test)]
     async fn owner(&self, name: &str) -> Option<McpNameOwner> {
         self.state.lock().await.owners.get(name).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn is_user_owned(&self, name: &str) -> bool {
+        matches!(
+            self.state.lock().await.owners.get(name),
+            Some(McpNameOwner::User)
+        )
     }
 }
 
@@ -308,7 +338,7 @@ impl McpNameOwnershipGuard {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct ReconcilePlan {
     disconnect: Vec<String>,
     connect: Vec<(String, McpServerEntry)>,
@@ -437,45 +467,49 @@ impl McpConfigRuntime {
             .map_err(|error| McpConfigRuntimeError::MutationTask(error.to_string()))?
     }
 
-    pub async fn replace_and_reconcile(
+    pub(crate) async fn replace_and_reconcile(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         candidate: McpConfigFile,
     ) -> Result<u64, McpConfigRuntimeError> {
         self.run_owned_mutation(move |runtime| async move {
-            runtime.replace_and_reconcile_inner(agent, candidate).await
+            runtime
+                .replace_and_reconcile_inner(targets, candidate)
+                .await
         })
         .await
     }
 
     async fn replace_and_reconcile_inner(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         candidate: McpConfigFile,
     ) -> Result<u64, McpConfigRuntimeError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         self.ensure_open()?;
         let commit = self.commit_candidate_locked(candidate).await?;
         let generation = commit.generation;
-        self.start_reconcile(agent, commit).await;
+        self.start_reconcile(targets, commit).await;
         Ok(generation)
     }
 
-    pub async fn upsert_and_reconcile(
+    pub(crate) async fn upsert_and_reconcile(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         name: String,
         entry: McpServerEntry,
     ) -> Result<u64, McpConfigRuntimeError> {
         self.run_owned_mutation(move |runtime| async move {
-            runtime.upsert_and_reconcile_inner(agent, name, entry).await
+            runtime
+                .upsert_and_reconcile_inner(targets, name, entry)
+                .await
         })
         .await
     }
 
     async fn upsert_and_reconcile_inner(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         name: String,
         entry: McpServerEntry,
     ) -> Result<u64, McpConfigRuntimeError> {
@@ -483,20 +517,20 @@ impl McpConfigRuntime {
         self.ensure_open()?;
         let commit = self.commit_upsert_locked(name, entry).await?;
         let generation = commit.generation;
-        self.start_reconcile(agent, commit).await;
+        self.start_reconcile(targets, commit).await;
         Ok(generation)
     }
 
-    pub async fn set_enabled_and_reconcile(
+    pub(crate) async fn set_enabled_and_reconcile(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         name: &str,
         enabled: bool,
     ) -> Result<u64, McpConfigRuntimeError> {
         let name = name.to_string();
         self.run_owned_mutation(move |runtime| async move {
             runtime
-                .set_enabled_and_reconcile_inner(agent, &name, enabled)
+                .set_enabled_and_reconcile_inner(targets, &name, enabled)
                 .await
         })
         .await
@@ -504,7 +538,7 @@ impl McpConfigRuntime {
 
     async fn set_enabled_and_reconcile_inner(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         name: &str,
         enabled: bool,
     ) -> Result<u64, McpConfigRuntimeError> {
@@ -512,32 +546,32 @@ impl McpConfigRuntime {
         self.ensure_open()?;
         let commit = self.commit_toggle_locked(name, enabled).await?;
         let generation = commit.generation;
-        self.start_reconcile(agent, commit).await;
+        self.start_reconcile(targets, commit).await;
         Ok(generation)
     }
 
-    pub async fn remove_and_reconcile(
+    pub(crate) async fn remove_and_reconcile(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         name: &str,
     ) -> Result<u64, McpConfigRuntimeError> {
         let name = name.to_string();
         self.run_owned_mutation(move |runtime| async move {
-            runtime.remove_and_reconcile_inner(agent, &name).await
+            runtime.remove_and_reconcile_inner(targets, &name).await
         })
         .await
     }
 
     async fn remove_and_reconcile_inner(
         self: &Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         name: &str,
     ) -> Result<u64, McpConfigRuntimeError> {
         let _mutation_guard = self.mutation_lock.lock().await;
         self.ensure_open()?;
         let commit = self.commit_remove_locked(name).await?;
         let generation = commit.generation;
-        self.start_reconcile(agent, commit).await;
+        self.start_reconcile(targets, commit).await;
         Ok(generation)
     }
 
@@ -638,17 +672,37 @@ impl McpConfigRuntime {
         })
     }
 
-    async fn start_reconcile(self: &Arc<Self>, agent: AgentHandle, commit: McpConfigCommit) {
+    async fn start_reconcile(
+        self: &Arc<Self>,
+        targets: Vec<McpReconcileTarget>,
+        commit: McpConfigCommit,
+    ) {
         let plan = {
             let mut names = self.unreconciled_user_names.lock().await;
             names.extend(commit.previous.mcp_servers.keys().cloned());
             names.extend(commit.current.mcp_servers.keys().cloned());
             ReconcilePlan::with_disconnect_names(names.iter().cloned(), &commit.current)
         };
+        let current_names = commit
+            .current
+            .mcp_servers
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for target in &targets {
+            target
+                .ownership
+                .claim_user_names(current_names.iter().cloned())
+                .await;
+            if let Some(pool) = target.pool.as_ref() {
+                pool.update_mcp_config_snapshot(commit.current.clone())
+                    .await;
+            }
+        }
         let cancel = commit.cancel.clone();
         let runtime = Arc::clone(self);
         self.start_tracked_reconcile(cancel, async move {
-            runtime.reconcile(agent, commit, plan).await
+            runtime.reconcile(targets, commit, plan).await
         })
         .await;
     }
@@ -741,7 +795,7 @@ impl McpConfigRuntime {
 
     async fn reconcile(
         self: Arc<Self>,
-        agent: AgentHandle,
+        targets: Vec<McpReconcileTarget>,
         commit: McpConfigCommit,
         plan: ReconcilePlan,
     ) {
@@ -755,9 +809,39 @@ impl McpConfigRuntime {
             .cloned()
             .collect::<BTreeSet<_>>();
         let generation = commit.generation;
-        let runtime = Arc::clone(&self);
-        let wait_cancel = commit.cancel.clone();
-        let reconcile_cancel = commit.cancel.clone();
+        let reconciliations = targets.iter().map(|target| {
+            Self::reconcile_target(
+                target.agent.clone(),
+                Arc::clone(&self),
+                generation,
+                commit.cancel.clone(),
+                plan.clone(),
+            )
+        });
+        let converged = futures::future::join_all(reconciliations)
+            .await
+            .into_iter()
+            .all(|converged| converged);
+        if converged && self.generation() == generation {
+            let mut names = self.unreconciled_user_names.lock().await;
+            if self.generation() == generation {
+                *names = current_names.clone();
+                self.ownership.settle_user_names(&current_names).await;
+                for target in targets {
+                    target.ownership.settle_user_names(&current_names).await;
+                }
+            }
+        }
+    }
+
+    async fn reconcile_target(
+        agent: AgentHandle,
+        runtime: Arc<Self>,
+        generation: u64,
+        reconcile_cancel: CancellationToken,
+        plan: ReconcilePlan,
+    ) -> bool {
+        let wait_cancel = reconcile_cancel.clone();
         let reconcile = agent.write_async(|agent| {
                 Box::pin(async move {
                     for name in plan.disconnect {
@@ -797,17 +881,10 @@ impl McpConfigRuntime {
                     true
                 })
             });
-        let converged = tokio::select! {
+        tokio::select! {
             biased;
             _ = wait_cancel.cancelled() => false,
             converged = reconcile => converged,
-        };
-        if converged && self.generation() == generation {
-            let mut names = self.unreconciled_user_names.lock().await;
-            if self.generation() == generation {
-                *names = current_names;
-                self.ownership.settle_user_names(&names).await;
-            }
         }
     }
 

@@ -16,8 +16,8 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 
 async fn workspace_root(state: &TauriState) -> PathBuf {
-    match state.app_state.workspace.current.read().await.as_ref() {
-        Some(workspace) => workspace.root.clone(),
+    match state.app_state.current_workspace().await {
+        Some(workspace) => workspace.root,
         None => {
             let agent = state.app_state.connection.primary_agent();
             echo_agent_app_core::analysis::workspace_root_for_agent(&agent).await

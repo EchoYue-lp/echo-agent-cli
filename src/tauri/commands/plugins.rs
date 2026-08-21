@@ -82,12 +82,14 @@ fn entry_to_info(entry: &PluginEntry) -> PluginInfo {
 /// service is not constructed (no primary agent is exposed for IPC). Plugin
 /// IPC only exists in GUI/Tauri mode, so this is a hard configuration error
 /// rather than a recoverable condition.
-fn require_service(state: &TauriState) -> Result<std::sync::Arc<PluginRuntimeService>, IpcError> {
+async fn require_service(
+    state: &TauriState,
+) -> Result<std::sync::Arc<PluginRuntimeService>, IpcError> {
     state
         .app_state
-        .plugin_runtime
-        .clone()
-        .ok_or_else(|| IpcError::Internal("Plugin runtime service is not initialized".to_string()))
+        .current_plugin_runtime_owned()
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 // ── IPC Commands ────────────────────────────────────────────────────────────
@@ -96,7 +98,7 @@ fn require_service(state: &TauriState) -> Result<std::sync::Arc<PluginRuntimeSer
 pub async fn list_plugins(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
+    let service = require_service(&state).await?;
     let plugins: Vec<PluginInfo> = service.list().await.iter().map(entry_to_info).collect();
     Ok(serde_json::to_value(plugins).unwrap_or_default())
 }
@@ -106,7 +108,7 @@ pub async fn get_plugin(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
+    let service = require_service(&state).await?;
     match service.get(&name).await {
         Some(entry) => {
             let info = entry_to_info(&entry);
@@ -122,7 +124,6 @@ pub async fn install_plugin(
     source: String,
     scope: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
     let scope = scope
         .and_then(|s| PluginScope::from_arg(&s))
         .unwrap_or(PluginScope::User);
@@ -137,10 +138,11 @@ pub async fn install_plugin(
             .map_err(|_| IpcError::NotFound(format!("插件源目录不存在: {}", src_path.display())))?;
     }
 
-    match service.install(&source, scope).await {
+    match state.app_state.install_plugin_owned(&source, scope).await {
         Ok((id, summary)) => {
             // Reuse the shared registry snapshot (already refreshed by reload
             // inside install) for the response info.
+            let service = require_service(&state).await?;
             let info = service.get(&id).await.map(|e| entry_to_info(&e));
             let wiring_ok = summary.errors.is_empty();
             Ok(serde_json::json!({
@@ -161,8 +163,11 @@ pub async fn uninstall_plugin(
     name: String,
     keep_data: Option<bool>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
-    match service.uninstall(&name, keep_data.unwrap_or(false)).await {
+    match state
+        .app_state
+        .uninstall_plugin_owned(&name, keep_data.unwrap_or(false))
+        .await
+    {
         Ok(summary) => Ok(serde_json::json!({
             "success": true,
             "message": format!("Plugin '{}' uninstalled", name),
@@ -178,8 +183,7 @@ pub async fn enable_plugin(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
-    match service.enable(&name).await {
+    match state.app_state.set_plugin_enabled_owned(&name, true).await {
         Ok(summary) => Ok(serde_json::json!({
             "success": true,
             "message": format!("Plugin '{}' enabled", name),
@@ -195,8 +199,7 @@ pub async fn disable_plugin(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
-    match service.disable(&name).await {
+    match state.app_state.set_plugin_enabled_owned(&name, false).await {
         Ok(summary) => Ok(serde_json::json!({
             "success": true,
             "message": format!("Plugin '{}' disabled", name),
@@ -213,9 +216,9 @@ pub async fn configure_plugin(
     name: String,
     values: std::collections::HashMap<String, serde_json::Value>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
-    let summary = service
-        .configure(&name, values)
+    let summary = state
+        .app_state
+        .configure_plugin_owned(&name, values)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
     Ok(serde_json::json!({
@@ -229,8 +232,7 @@ pub async fn configure_plugin(
 pub async fn reload_plugins(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
-    match service.reload().await {
+    match state.app_state.reload_plugins_owned().await {
         Ok(summary) => {
             let success = summary.errors.is_empty();
             let error = (!success).then(|| summary.errors.join("; "));
@@ -259,7 +261,7 @@ pub async fn reload_plugins(
 pub async fn list_plugin_themes(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
+    let service = require_service(&state).await?;
     let themes = service.themes().await;
     let active = service.active_theme().await;
     Ok(serde_json::json!({ "themes": themes, "active": active }))
@@ -270,7 +272,7 @@ pub async fn activate_plugin_theme(
     state: tauri::State<'_, TauriState>,
     name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
+    let service = require_service(&state).await?;
     let selected = name.filter(|value| !value.trim().is_empty());
     let theme = service
         .activate_theme(selected.as_deref())
@@ -287,7 +289,7 @@ pub async fn activate_plugin_theme(
 pub async fn list_plugin_output_styles(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
+    let service = require_service(&state).await?;
     let styles = service.output_styles().await;
     let active = service.active_output_style().await;
     Ok(serde_json::json!({ "styles": styles, "active": active }))
@@ -298,7 +300,7 @@ pub async fn activate_plugin_output_style(
     state: tauri::State<'_, TauriState>,
     name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let service = require_service(&state)?;
+    let service = require_service(&state).await?;
     let selected = name.filter(|value| !value.trim().is_empty());
     service
         .activate_output_style(selected.as_deref())

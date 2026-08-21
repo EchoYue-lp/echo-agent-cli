@@ -13,7 +13,8 @@ import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { SubagentDetailView } from '../task/SubagentDetailView';
 import { FailureToast } from './FailureToast';
-import { CornerUpLeft, GripVertical, PanelRightOpen, X } from 'lucide-react';
+import { CornerUpLeft, GripVertical, MessagesSquare, PanelRightOpen, X } from 'lucide-react';
+import { AgentMessageDialog } from './AgentMessageDialog';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
@@ -46,6 +47,7 @@ export function ChatPanel() {
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
+  const [agentMessagesOpen, setAgentMessagesOpen] = useState(false);
 
   // Reset failure toast dismiss when a new run starts (status changes)
   useEffect(() => {
@@ -189,6 +191,15 @@ export function ChatPanel() {
             <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
             <span>{runStatusLabel(runStatus, isStreaming)}</span>
           </div>
+          <button
+            type="button"
+            onClick={() => setAgentMessagesOpen(true)}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            title="Agent 消息"
+            aria-label="打开 Agent 消息"
+          >
+            <MessagesSquare size={15} />
+          </button>
           <button
             type="button"
             onClick={rightWorkspace.openWorkspace}
@@ -403,6 +414,7 @@ export function ChatPanel() {
           queuedCount={queuedInputs.length}
         />
       </div>
+      <AgentMessageDialog isOpen={agentMessagesOpen} onClose={() => setAgentMessagesOpen(false)} />
     </div>
   );
 }

@@ -1,5 +1,6 @@
 pub mod agent_handle;
 pub mod agent_pool;
+pub mod agent_router;
 pub mod analysis;
 pub mod analysis_runtime;
 pub mod attachments;

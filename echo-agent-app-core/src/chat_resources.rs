@@ -21,6 +21,9 @@ use crate::tasks::task_runtime::store::TaskRuntimeStore;
 /// (TUI `handle_enter`, channel `handle_stream`, GUI) and scoped by
 /// `drive_chat` via [`with_chat_resources`].
 pub struct ChatResources {
+    /// Immutable identity/root for every foreground, pooled, and continuation
+    /// operation spawned by this turn.
+    pub execution_scope: crate::workspace::WorkspaceExecutionScope,
     /// Pool for acquiring an isolated agent per background run. `None` in
     /// contexts without a pool (tests); `create_complex_task` errors then.
     pub pool: Option<Arc<AgentPool>>,

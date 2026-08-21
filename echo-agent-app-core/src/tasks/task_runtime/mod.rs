@@ -34,6 +34,7 @@ pub mod compact_context;
 pub mod completion_gate;
 pub mod continuation;
 pub mod event_rebuild;
+pub mod execution_target;
 pub mod executor;
 pub mod file_shadow;
 pub mod file_store;
@@ -53,6 +54,7 @@ pub mod types;
 pub mod worktree;
 
 pub use completion_gate::requirements_for_plan;
+pub use execution_target::TaskExecutionTargetResolver;
 pub(crate) use executor::drive_unattended_run;
 pub use executor::{
     EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, RunOutcome, execute_run,

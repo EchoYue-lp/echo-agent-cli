@@ -6,13 +6,28 @@ use std::sync::Arc;
 
 // ── PluginsCommand ───────────────────────────────────────────────────
 
+async fn current_plugin_runtime(
+    ctx: &CommandContext,
+) -> Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>> {
+    if let Some(state) = ctx.app_state.as_ref() {
+        match state.current_plugin_runtime_owned().await {
+            Ok(runtime) => return Some(runtime),
+            Err(error) => {
+                println!("Plugin runtime is not initialized: {error}");
+                return None;
+            }
+        }
+    }
+    ctx.plugin_runtime.clone()
+}
+
 async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("list");
     let rest: &[&str] = args.get(1..).unwrap_or(&[]);
 
     match sub {
         "list" | "ls" | "" => {
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
@@ -62,11 +77,15 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let source = InstallSource::parse(source_str);
             println!("Installing plugin from {source} (scope: {scope})...");
 
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
-            match runtime.install(&source, scope).await {
+            let result = match ctx.app_state.as_ref() {
+                Some(state) => state.install_plugin_owned(&source, scope).await,
+                None => runtime.install(&source, scope).await,
+            };
+            match result {
                 Ok((id, summary)) => {
                     println!("Plugin '{id}' installed successfully.");
                     let mut enabled = false;
@@ -107,13 +126,17 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             };
             let keep_data = rest.contains(&"--keep-data");
 
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
 
             println!("Uninstalling plugin '{name}'...");
-            match runtime.uninstall(name, keep_data).await {
+            let result = match ctx.app_state.as_ref() {
+                Some(state) => state.uninstall_plugin_owned(name, keep_data).await,
+                None => runtime.uninstall(name, keep_data).await,
+            };
+            match result {
                 Ok(summary) => {
                     println!("Plugin '{name}' uninstalled.");
                     if keep_data {
@@ -132,12 +155,16 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plugins enable <name>");
                 return CommandOutcome::Continue;
             };
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
 
-            match runtime.enable(name).await {
+            let result = match ctx.app_state.as_ref() {
+                Some(state) => state.set_plugin_enabled_owned(name, true).await,
+                None => runtime.enable(name).await,
+            };
+            match result {
                 Ok(summary) => {
                     if summary.errors.is_empty() {
                         println!("Plugin '{name}' enabled and activated.");
@@ -159,12 +186,16 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plugins disable <name>");
                 return CommandOutcome::Continue;
             };
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
 
-            match runtime.disable(name).await {
+            let result = match ctx.app_state.as_ref() {
+                Some(state) => state.set_plugin_enabled_owned(name, false).await,
+                None => runtime.disable(name).await,
+            };
+            match result {
                 Ok(summary) => {
                     println!("Plugin '{name}' disabled and unloaded.");
                     for error in summary.errors {
@@ -180,7 +211,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plugins info <name>");
                 return CommandOutcome::Continue;
             };
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
@@ -245,11 +276,15 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
         "reload" => {
             println!("Reloading plugins...");
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
-            match runtime.reload().await {
+            let result = match ctx.app_state.as_ref() {
+                Some(state) => state.reload_plugins_owned().await,
+                None => runtime.reload().await,
+            };
+            match result {
                 Ok(summary) => {
                     println!(
                         "Loaded {} plugins ({} enabled).",
@@ -269,7 +304,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "themes" => {
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
@@ -299,7 +334,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plugins theme <name|default>");
                 return CommandOutcome::Continue;
             };
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
@@ -332,11 +367,15 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     return CommandOutcome::Continue;
                 }
             };
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
-            match runtime.configure(name, values).await {
+            let result = match ctx.app_state.as_ref() {
+                Some(state) => state.configure_plugin_owned(name, values).await,
+                None => runtime.configure(name, values).await,
+            };
+            match result {
                 Ok(summary) if summary.errors.is_empty() => {
                     println!("Plugin '{name}' configured and reloaded.");
                 }
@@ -349,7 +388,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
 
         "styles" => {
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };
@@ -379,7 +418,7 @@ async fn cmd_plugins(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plugins style <name|default>");
                 return CommandOutcome::Continue;
             };
-            let Some(runtime) = ctx.plugin_runtime.as_ref() else {
+            let Some(runtime) = current_plugin_runtime(ctx).await else {
                 println!("Plugin runtime is not initialized.");
                 return CommandOutcome::Continue;
             };

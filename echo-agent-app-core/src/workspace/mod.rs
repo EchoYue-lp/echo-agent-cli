@@ -23,18 +23,21 @@
 pub mod layout;
 pub mod migration;
 pub mod registry;
+pub(crate) mod runtime;
 pub mod templates;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use ts_rs::TS;
 
 // ── WorkspaceId ─────────────────────────────────────────────────────
 
 /// 工作区标识符 — 目录安全名称。
 ///
 /// 该标识符同时作为目录名，因此必须满足文件系统安全要求。
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "WorkspaceId")]
 pub struct WorkspaceId(String);
 
 impl WorkspaceId {
@@ -107,6 +110,45 @@ impl WorkspaceId {
 impl std::fmt::Display for WorkspaceId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+// ── WorkspaceExecutionScope ──────────────────────────────────
+
+/// Immutable workspace identity and root carried by one execution path.
+///
+/// This is an application-layer scope: it selects EKO's per-workspace
+/// runtime projection while the framework receives only the generic
+/// per-invocation working directory.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct WorkspaceExecutionScope {
+    workspace_id: String,
+    root: PathBuf,
+}
+
+impl WorkspaceExecutionScope {
+    /// Scope execution to the application-wide, non-workspace runtime.
+    pub fn global(root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_id: "global".to_string(),
+            root: root.into(),
+        }
+    }
+
+    /// Scope execution to a registered workspace.
+    pub fn workspace(workspace_id: &WorkspaceId, root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_id: workspace_id.to_string(),
+            root: root.into(),
+        }
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 }
 

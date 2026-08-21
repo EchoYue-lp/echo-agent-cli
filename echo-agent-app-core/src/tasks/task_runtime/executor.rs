@@ -786,12 +786,53 @@ trait TaskDispatcher: Send + Sync {
     }
 }
 
-/// Production dispatcher: delegates to [`execute_task`] against the primary agent.
+/// Production dispatcher: delegates to [`execute_task`] against the task's
+/// local or frozen cross-workspace Agent target.
 ///
 /// Review remains in the EKO runtime controller after a Subagent returns. The
 /// dispatcher only needs the Agent and product-specific concurrency primitives.
 struct RealTaskDispatcher {
     primary_agent: crate::agent_handle::AgentHandle,
+}
+
+async fn resolve_task_execution_agent(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+    task: &PlanTask,
+    local_agent: crate::agent_handle::AgentHandle,
+) -> Result<
+    (
+        crate::agent_handle::AgentHandle,
+        Option<crate::agent_pool::AgentPoolExecutionLease>,
+    ),
+    String,
+> {
+    let Some(target) = task.execution_target.as_ref() else {
+        return Ok((local_agent, None));
+    };
+    if target.subagent_role != task.agent_role {
+        return Err(format!(
+            "task '{}' target role '{}' does not match Subagent role '{}'",
+            task.id, target.subagent_role, task.agent_role
+        ));
+    }
+    let run = store
+        .get_run(run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("TaskRun '{run_id}' does not exist"))?;
+    let leader = crate::agent_router::AgentAddress::new(
+        crate::workspace::WorkspaceId::from_raw(run.workspace_id),
+        run.conversation_id,
+    );
+    let resolver = store.execution_target_resolver().ok_or_else(|| {
+        format!(
+            "task '{}' targets Agent group '{}' but no cross-workspace resolver is installed",
+            task.id, target.group_id
+        )
+    })?;
+    let lease = resolver.acquire(&leader, target).await?;
+    let agent = lease.agent();
+    Ok((agent, Some(lease)))
 }
 
 impl TaskDispatcher for RealTaskDispatcher {
@@ -807,11 +848,16 @@ impl TaskDispatcher for RealTaskDispatcher {
         file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
         trace_sink: Option<ExecSink>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>> {
-        let primary_agent = self.primary_agent.clone();
+        let local_agent = self.primary_agent.clone();
         Box::pin(async move {
             let run_id = context.run_id;
             let cancel = context.cancel;
             let delegation_policy = context.delegation_policy;
+            let task_id = task.id.clone();
+            let (execution_agent, target_lease) =
+                resolve_task_execution_agent(&store, &run_id, &task, local_agent)
+                    .await
+                    .map_err(|error| TaskDispatchFailure::failed(task_id, error))?;
             // Scope run_id + cancel + trace_sink into task-local so Subagent-internal
             // tools (task_*/task_execute, and their execute_with_context
             // fallback path) and L3 nested Subagents can read them.
@@ -821,24 +867,31 @@ impl TaskDispatcher for RealTaskDispatcher {
             // path that reads CURRENT_TRACE_SINK/CURRENT_CANCEL directly.
             let sink_clone = trace_sink.clone();
             let cancel_clone = cancel.clone();
-            super::task_tools::with_run_context(run_id.clone(), cancel_clone, sink_clone, async {
-                execute_task(
-                    store,
-                    primary_agent,
-                    write_sem,
-                    shell_sem,
-                    llm_sem,
-                    file_write_locks,
-                    trace_sink,
-                    run_id,
-                    claim,
-                    task,
-                    cancel,
-                    delegation_policy,
-                )
-                .await
-            })
-            .await
+            let result = super::task_tools::with_run_context(
+                run_id.clone(),
+                cancel_clone,
+                sink_clone,
+                async {
+                    execute_task(
+                        store,
+                        execution_agent,
+                        write_sem,
+                        shell_sem,
+                        llm_sem,
+                        file_write_locks,
+                        trace_sink,
+                        run_id,
+                        claim,
+                        task,
+                        cancel,
+                        delegation_policy,
+                    )
+                    .await
+                },
+            )
+            .await;
+            drop(target_lease);
+            result
         })
     }
 
@@ -857,7 +910,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                 > + Send,
         >,
     > {
-        let primary_agent = self.primary_agent.clone();
+        let local_agent = self.primary_agent.clone();
         Box::pin(async move {
             if !matches!(
                 task.kind,
@@ -869,7 +922,10 @@ impl TaskDispatcher for RealTaskDispatcher {
                 return Err("cancelled before worktree integration".to_string());
             }
 
-            let working_dir = primary_agent
+            let (execution_agent, target_lease) =
+                resolve_task_execution_agent(&store, &run_id, &task, local_agent).await?;
+
+            let working_dir = execution_agent
                 .read(|agent| agent.working_dir())
                 .await
                 .ok_or_else(|| "writer integration requires a Git working directory".to_string())?;
@@ -926,7 +982,7 @@ impl TaskDispatcher for RealTaskDispatcher {
             .await
             .map_err(|error| format!("failed to join worktree integration: {error}"))?;
 
-            match outcome {
+            let result = match outcome {
                 Ok(outcome) => {
                     let summary = outcome.summary();
                     let _ = store.note(&run_id, Some(&task.id), &summary);
@@ -980,7 +1036,9 @@ impl TaskDispatcher for RealTaskDispatcher {
                     );
                     Err(message)
                 }
-            }
+            };
+            drop(target_lease);
+            result
         })
     }
 }
@@ -4449,6 +4507,7 @@ mod tests {
             domain_profile: DomainProfile::General,
             depends_on: Vec::new(),
             parallel_group: None,
+            execution_target: None,
             files: Vec::new(),
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
             required_artifacts: Vec::new(),
@@ -5137,6 +5196,30 @@ Read the runtime path and found one missing branch.
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
 
+    struct RecordingExecutionTargetResolver {
+        agent: crate::agent_handle::AgentHandle,
+        calls: StdMutex<Vec<(crate::agent_router::AgentAddress, TaskExecutionTarget)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::super::execution_target::TaskExecutionTargetResolver
+        for RecordingExecutionTargetResolver
+    {
+        async fn acquire(
+            &self,
+            leader: &crate::agent_router::AgentAddress,
+            target: &TaskExecutionTarget,
+        ) -> Result<crate::agent_pool::AgentPoolExecutionLease, String> {
+            self.calls
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((leader.clone(), target.clone()));
+            Ok(crate::agent_pool::AgentPoolExecutionLease::unpooled(
+                self.agent.clone(),
+            ))
+        }
+    }
+
     type ScriptedDispatchResult = Result<(SubagentTaskResult, String), String>;
 
     /// A dispatcher that returns scripted results per task id and records the
@@ -5646,6 +5729,106 @@ Read the runtime path and found one missing branch.
             .transition_run(&run_id, TaskRunStatus::Running)
             .map_err(|error| error.to_string())?;
         Ok(run_id)
+    }
+
+    #[tokio::test]
+    async fn real_dispatcher_executes_frozen_cross_workspace_target_in_leader_run()
+    -> Result<(), String> {
+        use echo_agent::testing::MockLlmClient;
+
+        const REMOTE_MARKER: &str = "REMOTE_AGENT_EXECUTED";
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let target = TaskExecutionTarget {
+            group_id: "group-alpha".to_string(),
+            subagent_role: "verifier".to_string(),
+            address: crate::agent_router::AgentAddress::new(
+                crate::workspace::WorkspaceId::from_raw("ws_remote".to_string()),
+                "conv_remote",
+            ),
+        };
+        let task = PlanTask {
+            id: "remote-verification".to_string(),
+            title: "Verify remotely".to_string(),
+            description: "Return the verification marker".to_string(),
+            kind: PlanTaskKind::Verification,
+            agent_role: "verifier".to_string(),
+            execution_target: Some(target.clone()),
+            ..PlanTask::default()
+        };
+        let run_id = seed_run(&store, vec![task])?;
+
+        let remote_agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("remote-test")
+                .llm_client(Arc::new(
+                    MockLlmClient::new()
+                        .with_model_name("remote-test")
+                        .with_response(REMOTE_MARKER),
+                ))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let local_agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("local-test")
+                .llm_client(Arc::new(
+                    MockLlmClient::new()
+                        .with_model_name("local-test")
+                        .with_response("LOCAL_AGENT_MUST_NOT_RUN"),
+                ))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let resolver = Arc::new(RecordingExecutionTargetResolver {
+            agent: remote_agent,
+            calls: StdMutex::new(Vec::new()),
+        });
+        store.attach_execution_target_resolver(resolver.clone());
+
+        let outcome = execute_runtime_plan(
+            store.clone(),
+            RealTaskDispatcher {
+                primary_agent: local_agent,
+            },
+            None,
+            &run_id,
+            EkoExecutionLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert!(matches!(outcome, RunOutcome::Completed));
+
+        let calls = resolver
+            .calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (leader, acquired_target) = calls
+            .first()
+            .ok_or_else(|| "cross-workspace resolver was not called".to_string())?;
+        assert_eq!(leader.workspace_id.as_str(), "ws_test");
+        assert_eq!(leader.conversation_id, "conv_test");
+        assert_eq!(acquired_target, &target);
+        drop(calls);
+
+        let subagent_runs = store
+            .list_subagent_runs(&run_id)
+            .map_err(|error| error.to_string())?;
+        let subagent_run = subagent_runs
+            .first()
+            .ok_or_else(|| "leader TaskRun has no SubagentRun".to_string())?;
+        assert_eq!(subagent_runs.len(), 1);
+        assert_eq!(subagent_run.run_id, run_id);
+        assert_eq!(subagent_run.task_id, "remote-verification");
+        assert_eq!(subagent_run.status, SubagentRunStatus::Completed);
+        let result = subagent_run
+            .result
+            .as_ref()
+            .ok_or_else(|| "SubagentRun result is missing".to_string())?;
+        assert!(result.summary.contains(REMOTE_MARKER));
+        assert!(!result.summary.contains("LOCAL_AGENT_MUST_NOT_RUN"));
+        Ok(())
     }
 
     #[tokio::test]

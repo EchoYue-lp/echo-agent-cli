@@ -3,4 +3,4 @@
 /**
  * Interactive product surface that owns a foreground turn.
  */
-export type ForegroundTurnSurface = 'gui' | 'tui' | 'cli' | 'channel';
+export type ForegroundTurnSurface = 'gui' | 'tui' | 'cli' | 'channel' | 'agent';

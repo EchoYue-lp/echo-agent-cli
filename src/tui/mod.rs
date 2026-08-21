@@ -303,6 +303,10 @@ pub struct TuiApp {
     pub is_processing: bool,
     /// UI correlation id for the authoritative application foreground turn.
     pub active_turn_id: Option<String>,
+    /// Workspace identity captured with the active turn.
+    pub active_turn_workspace_id: Option<String>,
+    /// Exact workspace agent retained for steering the active turn.
+    pub active_turn_agent: Option<AgentHandle>,
     /// FIFO turns submitted while the foreground agent is busy.
     pub queued_turns: VecDeque<QueuedTurn>,
     /// Current streaming text being received.
@@ -433,6 +437,8 @@ pub struct TuiApp {
     pub terminal_output: Vec<u8>,
     /// Active workspace root used by attachments, long-input artifacts and file views.
     pub workspace_root: Option<std::path::PathBuf>,
+    /// Immutable execution scope captured for newly dispatched TUI turns.
+    pub workspace_execution_scope: echo_agent_app_core::workspace::WorkspaceExecutionScope,
     /// Runtime-ready configured models exposed by the product configuration.
     pub configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
     /// Static prompt-module report captured during runtime bootstrap.
@@ -847,6 +853,8 @@ impl TuiApp {
             message_groups: vec![],
             is_processing: false,
             active_turn_id: None,
+            active_turn_workspace_id: None,
+            active_turn_agent: None,
             queued_turns: VecDeque::new(),
             streaming_text: String::new(),
             suggestions: vec![],
@@ -904,6 +912,8 @@ impl TuiApp {
             active_terminal_id: None,
             terminal_output: Vec::new(),
             workspace_root: None,
+            workspace_execution_scope:
+                echo_agent_app_core::workspace::WorkspaceExecutionScope::global("."),
             configured_models: Vec::new(),
             prompt_assembly: None,
             inline_mode: false,
@@ -1861,7 +1871,7 @@ mod state_tests {
             let _ = lease.settle(TurnOutcome::Cancelled);
         });
 
-        super::settle_tui_foreground_on_exit(&control, "conversation")
+        super::settle_tui_foreground_on_exit(&control, "global", "conversation")
             .await
             .map_err(|error| error.to_string())?;
         driver.await.map_err(|error| error.to_string())?;
@@ -1952,16 +1962,20 @@ impl Drop for TerminalGuard {
 
 async fn settle_tui_foreground_on_exit(
     control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    workspace_id: &str,
     conversation_id: &str,
 ) -> Result<(), echo_agent_app_core::foreground_turn::ForegroundTurnError> {
     use echo_agent_app_core::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
 
     loop {
-        let Some(snapshot) = control.snapshot(ForegroundTurnSurface::Tui, conversation_id) else {
+        let Some(snapshot) =
+            control.snapshot_scoped(workspace_id, ForegroundTurnSurface::Tui, conversation_id)
+        else {
             return Ok(());
         };
         match control
-            .cancel_and_wait(
+            .cancel_and_wait_scoped(
+                workspace_id,
                 ForegroundTurnSurface::Tui,
                 conversation_id,
                 &snapshot.active_turn_id,
@@ -2067,6 +2081,7 @@ pub async fn run_tui(
         .current_workspace()
         .await
         .map(|workspace| workspace.root);
+    app.workspace_execution_scope = app_state.current_execution_scope().await;
     app.configured_models = configured_models;
     app.prompt_assembly = Some(prompt_assembly);
     app.plugin_runtime = Some(plugin_runtime);
@@ -2109,8 +2124,16 @@ pub async fn run_tui(
     // Main event loop.
     let result = events::run_event_loop(&mut terminal, &mut app, agent).await;
 
-    let foreground_shutdown =
-        settle_tui_foreground_on_exit(&app_state.session.foreground_turns, &conversation_id).await;
+    let foreground_workspace_id = app
+        .active_turn_workspace_id
+        .clone()
+        .unwrap_or_else(|| app.workspace_execution_scope.workspace_id().to_string());
+    let foreground_shutdown = settle_tui_foreground_on_exit(
+        &app_state.session.foreground_turns,
+        &foreground_workspace_id,
+        &conversation_id,
+    )
+    .await;
     let attachment_cleanup = app.discard_unsubmitted_attachments();
     // Guard drop will restore the terminal.
     match (result, foreground_shutdown, attachment_cleanup) {

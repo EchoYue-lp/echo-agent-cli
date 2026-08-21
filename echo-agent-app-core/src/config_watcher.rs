@@ -1,14 +1,13 @@
-//! Hooks-config file watcher — monitors the app config plus global/project
-//! `hooks.yaml` files and hot-reloads user **hooks and webhook endpoints** (and fires the
-//! `ConfigChange` lifecycle hook).
+//! Hooks-config file watcher — monitors the app config plus every registered
+//! workspace's `hooks.yaml` and hot-reloads user **hooks and webhook endpoints**
+//! (and fires the `ConfigChange` lifecycle hook).
 //!
 //! ## Scope (intentional)
 //!
-//! Hooks and webhook endpoints are reloaded live. Other config domains (model
-//! selection, MCP server topology, runtime limits) require a restart because
-//! they are wired into long-lived subsystems at agent construction. The watcher's name and
-//! this doc reflect that scope; do not widen it without a parallel story for
-//! safely tearing down and rebuilding those subsystems.
+//! Hooks and webhook endpoints are reloaded here. Model, MCP, and plugin
+//! generations have separate application-owned publication paths; runtime
+//! limits still require a restart. Keeping these owners separate prevents the
+//! filesystem watcher from becoming a second mutation state machine.
 //!
 //! ## Robustness features
 //!
@@ -43,24 +42,31 @@ use crate::agent_handle::AgentHandle;
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(500);
 
 enum WatcherCommand {
-    Rebind {
+    Register {
         root: PathBuf,
-        ack: oneshot::Sender<anyhow::Result<ConfigWatcherRebindReceipt>>,
+        agent: AgentHandle,
+        ack: oneshot::Sender<anyhow::Result<ConfigWatcherRegistrationReceipt>>,
     },
 }
 
 #[derive(Debug, Clone)]
-pub struct ConfigWatcherRebindReceipt {
-    pub settled_root: PathBuf,
-    pub stale_watch_roots: Vec<PathBuf>,
+pub struct ConfigWatcherRegistrationReceipt {
+    pub registered_root: PathBuf,
+    pub watched_roots: Vec<PathBuf>,
     pub errors: Vec<String>,
+}
+
+#[derive(Clone)]
+struct RegisteredConfigTarget {
+    root: PathBuf,
+    agent: AgentHandle,
 }
 
 /// Owns the config watcher's control channel, cancellation, and background task.
 pub struct ConfigWatcherHandle {
     config_path: Option<PathBuf>,
     control: mpsc::Sender<WatcherCommand>,
-    settled_root: Arc<tokio::sync::RwLock<PathBuf>>,
+    registered_roots: Arc<tokio::sync::RwLock<Vec<PathBuf>>>,
     cancel: CancellationToken,
     join: Mutex<Option<JoinHandle<()>>>,
 }
@@ -80,23 +86,24 @@ impl ConfigWatcherHandle {
         }
     }
 
-    /// Retarget the watcher and rebuild workspace hooks before returning.
-    pub async fn rebind_workspace(
+    /// Add or refresh one workspace target without evicting existing hosts.
+    pub async fn register_workspace(
         &self,
         root: PathBuf,
-    ) -> anyhow::Result<ConfigWatcherRebindReceipt> {
+        agent: AgentHandle,
+    ) -> anyhow::Result<ConfigWatcherRegistrationReceipt> {
         let (ack, result) = oneshot::channel();
         self.control
-            .send(WatcherCommand::Rebind { root, ack })
+            .send(WatcherCommand::Register { root, agent, ack })
             .await
             .map_err(|_| anyhow::anyhow!("config watcher is not running"))?;
-        result
-            .await
-            .map_err(|_| anyhow::anyhow!("config watcher stopped before acknowledging rebind"))?
+        result.await.map_err(|_| {
+            anyhow::anyhow!("config watcher stopped before acknowledging registration")
+        })?
     }
 
-    pub async fn settled_root(&self) -> PathBuf {
-        self.settled_root.read().await.clone()
+    pub async fn registered_roots(&self) -> Vec<PathBuf> {
+        self.registered_roots.read().await.clone()
     }
 
     /// Cancel and await the watcher. Repeated calls are harmless.
@@ -166,11 +173,17 @@ pub fn spawn_config_watcher(
     let (control, mut commands) = mpsc::channel(8);
     let handle_config_path = config_path.clone();
     let initial_root = current_workspace_root();
-    let settled_root = Arc::new(tokio::sync::RwLock::new(initial_root.clone()));
-    let task_settled_root = Arc::clone(&settled_root);
+    let registered_roots = Arc::new(tokio::sync::RwLock::new(vec![initial_root.clone()]));
+    let task_registered_roots = Arc::clone(&registered_roots);
     let join = tokio::spawn(async move {
-        let mut workspace_root = initial_root;
-        let mut targets = config_watch_targets(config_path.as_deref(), &workspace_root);
+        let mut registered = vec![RegisteredConfigTarget {
+            root: initial_root,
+            agent,
+        }];
+        let mut targets = config_watch_targets(
+            config_path.as_deref(),
+            registered.iter().map(|target| target.root.as_path()),
+        );
 
         // Use a bounded async channel to receive filesystem events.
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -205,20 +218,18 @@ pub fn spawn_config_watcher(
                     break;
                 }
                 command = commands.recv() => {
-                    let Some(WatcherCommand::Rebind { root, ack }) = command else {
+                    let Some(WatcherCommand::Register { root, agent, ack }) = command else {
                         debug!("Config watcher control channel closed");
                         break;
                     };
-                    let result = rebind_workspace(
-                        root,
+                    let result = register_workspace_target(
+                        RegisteredConfigTarget { root, agent },
                         config_path.as_deref(),
-                        &agent,
-                        webhook_emitter.as_deref(),
                         &mut watcher,
                         &mut watched,
                         &mut targets,
-                        &mut workspace_root,
-                        &task_settled_root,
+                        &mut registered,
+                        &task_registered_roots,
                     ).await;
                     let _ = ack.send(Ok(result));
                 }
@@ -273,8 +284,7 @@ pub fn spawn_config_watcher(
                     handle_config_change(
                         &changed_path,
                         config_path.as_deref(),
-                        &workspace_root,
-                        &agent,
+                        &registered,
                         webhook_emitter.as_deref(),
                     )
                     .await;
@@ -285,46 +295,55 @@ pub fn spawn_config_watcher(
     ConfigWatcherHandle {
         config_path: handle_config_path,
         control,
-        settled_root,
+        registered_roots,
         cancel,
         join: Mutex::new(Some(join)),
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn rebind_workspace(
-    root: PathBuf,
+async fn register_workspace_target(
+    new_target: RegisteredConfigTarget,
     config_path: Option<&Path>,
-    agent: &AgentHandle,
-    webhook_emitter: Option<&crate::webhook::WebhookEmitter>,
     watcher: &mut notify::RecommendedWatcher,
     watched: &mut HashSet<PathBuf>,
     targets: &mut Vec<PathBuf>,
-    workspace_root: &mut PathBuf,
-    settled_root: &tokio::sync::RwLock<PathBuf>,
-) -> ConfigWatcherRebindReceipt {
-    let next_targets = config_watch_targets(config_path, &root);
-    let desired = desired_watch_directories(&next_targets);
+    registered: &mut Vec<RegisteredConfigTarget>,
+    registered_roots: &tokio::sync::RwLock<Vec<PathBuf>>,
+) -> ConfigWatcherRegistrationReceipt {
+    let root = new_target.root.clone();
+    match registered
+        .iter_mut()
+        .find(|target| Arc::ptr_eq(target.agent.inner(), new_target.agent.inner()))
+    {
+        Some(target) => target.root = root.clone(),
+        None => registered.push(new_target.clone()),
+    }
+    let next_targets = config_watch_targets(
+        config_path,
+        registered.iter().map(|target| target.root.as_path()),
+    );
     let mut errors = Vec::new();
     if let Err(error) = reconcile_watched_directories(watcher, &next_targets, watched) {
         errors.push(error.to_string());
     }
-    let mut stale_watch_roots = watched.difference(&desired).cloned().collect::<Vec<_>>();
-    stale_watch_roots.sort();
     *targets = next_targets;
-    *workspace_root = root;
-    *settled_root.write().await = workspace_root.clone();
+    let mut roots = registered
+        .iter()
+        .map(|target| target.root.clone())
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots.dedup();
+    *registered_roots.write().await = roots.clone();
 
-    let workspace_hook = workspace_root.join(".eko").join("hooks.yaml");
-    let reload =
-        reload_live_config(config_path, workspace_root, agent, webhook_emitter, false).await;
-    info!(path = %workspace_hook.display(), "Config watcher retargeted to workspace");
+    let workspace_hook = root.join(".eko").join("hooks.yaml");
+    let reload = reload_live_hooks(config_path, &root, &new_target.agent, false).await;
+    info!(path = %workspace_hook.display(), "Config watcher registered workspace host");
     if let Err(error) = reload {
         errors.push(format!("target hook rebuild failed: {error}"));
     }
-    ConfigWatcherRebindReceipt {
-        settled_root: workspace_root.clone(),
-        stale_watch_roots,
+    ConfigWatcherRegistrationReceipt {
+        registered_root: root,
+        watched_roots: roots,
         errors,
     }
 }
@@ -432,13 +451,20 @@ fn event_touched_target(event: &notify::Event, targets: &[PathBuf]) -> Option<Pa
     None
 }
 
-fn config_watch_targets(config_path: Option<&Path>, workspace_root: &Path) -> Vec<PathBuf> {
+fn config_watch_targets<'a>(
+    config_path: Option<&Path>,
+    workspace_roots: impl IntoIterator<Item = &'a Path>,
+) -> Vec<PathBuf> {
     let mut targets = Vec::new();
     if let Some(path) = config_path {
         targets.push(path.to_path_buf());
     }
     targets.push(echo_agent::paths::user_data_path("hooks.yaml"));
-    targets.push(workspace_root.join(".eko").join("hooks.yaml"));
+    targets.extend(
+        workspace_roots
+            .into_iter()
+            .map(|root| root.join(".eko").join("hooks.yaml")),
+    );
     targets.sort();
     targets.dedup();
     targets
@@ -465,48 +491,50 @@ fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
 async fn handle_config_change(
     changed_path: &std::path::Path,
     config_path: Option<&std::path::Path>,
-    workspace_root: &Path,
-    agent: &AgentHandle,
+    registered: &[RegisteredConfigTarget],
     webhook_emitter: Option<&crate::webhook::WebhookEmitter>,
 ) {
     let path_str = changed_path.to_string_lossy().to_string();
 
-    // 1. Fire ConfigChange hook
-    let path_for_hook = path_str.clone();
-    agent
-        .read_async(|a| {
-            Box::pin(async move {
-                a.fire_lifecycle_hook(
-                    echo_agent::skills::hooks::HookEvent::ConfigChange,
-                    Some(&path_for_hook),
-                )
-                .await;
+    for target in registered {
+        let path_for_hook = path_str.clone();
+        target
+            .agent
+            .read_async(|agent| {
+                Box::pin(async move {
+                    agent
+                        .fire_lifecycle_hook(
+                            echo_agent::skills::hooks::HookEvent::ConfigChange,
+                            Some(&path_for_hook),
+                        )
+                        .await;
+                })
             })
-        })
-        .await;
-
-    // 2. Reload config and re-register the live-reloadable domains.
-    if let Err(error) =
-        reload_live_config(config_path, workspace_root, agent, webhook_emitter, true).await
-    {
-        warn!(%error, "Hook config reload rejected; keeping last known-good hooks");
+            .await;
+        if let Err(error) = reload_live_hooks(config_path, &target.root, &target.agent, true).await
+        {
+            warn!(
+                workspace_root = %target.root.display(),
+                %error,
+                "Hook config reload rejected; keeping last known-good hooks"
+            );
+        }
+    }
+    if let Some(emitter) = webhook_emitter {
+        let new_config = config_path
+            .and_then(Path::to_str)
+            .map(|path| echo_agent::config::load_config(Some(path)))
+            .unwrap_or_else(|| echo_agent::config::load_config(None));
+        emitter.reload_from_config(&new_config).await;
     }
 }
 
-async fn reload_live_config(
+async fn reload_live_hooks(
     config_path: Option<&Path>,
     workspace_root: &Path,
     agent: &AgentHandle,
-    webhook_emitter: Option<&crate::webhook::WebhookEmitter>,
     preserve_hooks_on_error: bool,
 ) -> anyhow::Result<()> {
-    // Model selection, MCP topology, and runtime limits are wired into
-    // long-lived subsystems at agent build time and are NOT reloaded here — a
-    // restart is required for those to take effect (see module docs).
-    let new_config = config_path
-        .and_then(Path::to_str)
-        .map(|path| echo_agent::config::load_config(Some(path)))
-        .unwrap_or_else(|| echo_agent::config::load_config(None));
     let loaded = crate::hook_config_loader::HookConfigLoader::load_merged_from_disk_for_workspace(
         config_path,
         Some(workspace_root),
@@ -534,9 +562,6 @@ async fn reload_live_config(
         let mut errors = loaded.errors;
         errors.extend(fallback.errors);
         return Err(anyhow::anyhow!(errors.join("; ")));
-    }
-    if let Some(emitter) = webhook_emitter {
-        emitter.reload_from_config(&new_config).await;
     }
     Ok(())
 }
@@ -569,7 +594,7 @@ mod tests {
     fn watch_targets_include_app_global_and_project_hook_files() -> Result<(), String> {
         let current = std::env::current_dir().map_err(|error| error.to_string())?;
         let app = current.join("echo-agent.test.yaml");
-        let targets = config_watch_targets(Some(&app), &current);
+        let targets = config_watch_targets(Some(&app), [current.as_path()]);
 
         assert!(targets.contains(&app));
         assert!(targets.contains(&echo_agent::paths::user_data_path("hooks.yaml")));
@@ -612,12 +637,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_handle_acknowledges_rebind_and_rebuilds_workspace_hooks() -> Result<(), String> {
+    async fn owned_handle_registers_three_independent_workspace_hook_targets() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let first = temp.path().join("first");
         let second = temp.path().join("second");
+        let third = temp.path().join("third");
         let malformed = temp.path().join("malformed");
-        for (root, marker) in [(&first, "workspace-a"), (&second, "workspace-b")] {
+        for (root, marker) in [
+            (&first, "workspace-a"),
+            (&second, "workspace-b"),
+            (&third, "workspace-c"),
+        ] {
             let hooks_dir = root.join(".eko");
             std::fs::create_dir_all(&hooks_dir).map_err(|error| error.to_string())?;
             std::fs::write(
@@ -635,38 +666,64 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
 
-        let agent = ReactAgentBuilder::new()
-            .llm_client(Arc::new(MockLlmClient::new()))
-            .system_prompt("config watcher test")
-            .build()
-            .map_err(|error| error.to_string())?;
-        let agent = AgentHandle::new(agent);
-        let handle = spawn_config_watcher(None, agent.clone(), None, CancellationToken::new());
+        let bootstrap = test_agent()?;
+        let first_agent = test_agent()?;
+        let second_agent = test_agent()?;
+        let third_agent = test_agent()?;
+        let handle = spawn_config_watcher(None, bootstrap, None, CancellationToken::new());
 
+        for (root, agent) in [
+            (first.clone(), first_agent.clone()),
+            (second.clone(), second_agent.clone()),
+            (third.clone(), third_agent.clone()),
+        ] {
+            let receipt = handle
+                .register_workspace(root.clone(), agent)
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(receipt.registered_root, root);
+            assert!(receipt.errors.is_empty());
+        }
+        assert_eq!(hook_match_count(&first_agent, "workspace-a").await, 1);
+        assert_eq!(hook_match_count(&first_agent, "workspace-b").await, 0);
+        assert_eq!(hook_match_count(&second_agent, "workspace-b").await, 1);
+        assert_eq!(hook_match_count(&third_agent, "workspace-c").await, 1);
+
+        std::fs::write(
+            first.join(".eko/hooks.yaml"),
+            "SessionStart:\n  - matcher: \"workspace-a2\"\n    hooks:\n      - type: prompt\n        prompt: \"workspace-a2\"\n",
+        )
+        .map_err(|error| error.to_string())?;
         handle
-            .rebind_workspace(first)
+            .register_workspace(first.clone(), first_agent.clone())
             .await
             .map_err(|error| error.to_string())?;
-        assert_eq!(hook_match_count(&agent, "workspace-a").await, 1);
+        assert_eq!(hook_match_count(&first_agent, "workspace-a").await, 0);
+        assert_eq!(hook_match_count(&first_agent, "workspace-a2").await, 1);
+        assert_eq!(hook_match_count(&second_agent, "workspace-b").await, 1);
+        assert_eq!(hook_match_count(&third_agent, "workspace-c").await, 1);
 
-        handle
-            .rebind_workspace(second)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(hook_match_count(&agent, "workspace-a").await, 0);
-        assert_eq!(hook_match_count(&agent, "workspace-b").await, 1);
         assert!(handle.preflight_workspace(&malformed).is_err());
-        assert_eq!(hook_match_count(&agent, "workspace-b").await, 1);
         let degraded = handle
-            .rebind_workspace(malformed.clone())
+            .register_workspace(malformed.clone(), third_agent.clone())
             .await
             .map_err(|error| error.to_string())?;
-        assert_eq!(degraded.settled_root, malformed);
+        assert_eq!(degraded.registered_root, malformed);
         assert!(!degraded.errors.is_empty());
-        assert_eq!(hook_match_count(&agent, "workspace-b").await, 0);
+        assert_eq!(hook_match_count(&third_agent, "workspace-c").await, 0);
+        assert_eq!(hook_match_count(&second_agent, "workspace-b").await, 1);
         handle.shutdown().await.map_err(|error| error.to_string())?;
         handle.shutdown().await.map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    fn test_agent() -> Result<AgentHandle, String> {
+        ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("config watcher test")
+            .build()
+            .map(AgentHandle::new)
+            .map_err(|error| error.to_string())
     }
 
     async fn hook_match_count(agent: &AgentHandle, matcher: &str) -> usize {

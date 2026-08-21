@@ -36,6 +36,7 @@ enum ChannelTaskRunControl {
     Resume {
         run_id: String,
         root_message_id: String,
+        runtime: echo_agent_app_core::state::ScopedChatRuntime,
     },
 }
 
@@ -132,9 +133,6 @@ fn channel_render_event_stream(
 #[cfg(feature = "channels")]
 pub struct AppChannelMessageHandler {
     app_state: Arc<echo_agent_app_core::state::AppState>,
-    pool: Arc<AgentPool>,
-    store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     hitl: Arc<ChannelHumanLoopProvider>,
     foreground_turns: ForegroundTurnControl,
@@ -146,17 +144,14 @@ pub struct AppChannelMessageHandler {
 impl AppChannelMessageHandler {
     pub fn new(
         app_state: Arc<echo_agent_app_core::state::AppState>,
-        pool: Arc<AgentPool>,
-        store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-        review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+        _pool: Arc<AgentPool>,
+        _store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+        _review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
         webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
         foreground_turns: ForegroundTurnControl,
     ) -> Self {
         Self {
             app_state,
-            pool,
-            store,
-            review_integration,
             webhook_emitter,
             hitl: Arc::new(ChannelHumanLoopProvider::new()),
             foreground_turns,
@@ -177,17 +172,17 @@ impl AppChannelMessageHandler {
     }
 
     fn generation_receipts(
-        &self,
+        runtime: &echo_agent_app_core::state::ScopedChatRuntime,
     ) -> Result<echo_agent_app_core::foreground_turn::ForegroundExecutionReceipts, String> {
-        let task_generation = self
-            .store
+        let task_generation = runtime
+            .task_runtime()
             .as_ref()
             .map(|store| store.lease_foreground_generation())
             .transpose()
             .map_err(|error| format!("TaskRuntime generation is unavailable: {error}"))?;
         let mut receipts =
             echo_agent_app_core::foreground_turn::ForegroundExecutionReceipts::new(task_generation);
-        if let Some(integration) = self.review_integration.as_ref() {
+        if let Some(integration) = runtime.review_integration().as_ref() {
             let memory_generation = integration
                 .lease_generation()
                 .map_err(|error| format!("Memory generation is unavailable: {error}"))?;
@@ -197,7 +192,7 @@ impl AppChannelMessageHandler {
     }
 
     fn current_task_run(
-        &self,
+        store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
         conv: &str,
         requested_run_id: Option<&str>,
     ) -> Result<
@@ -207,10 +202,7 @@ impl AppChannelMessageHandler {
         ),
         String,
     > {
-        let store = self
-            .store
-            .clone()
-            .ok_or_else(|| "TaskRuntime store is unavailable".to_string())?;
+        let store = store.ok_or_else(|| "TaskRuntime store is unavailable".to_string())?;
         let run = match requested_run_id.filter(|run_id| !run_id.trim().is_empty()) {
             Some(run_id) => store.get_run(run_id).map_err(|error| error.to_string())?,
             None => store
@@ -231,6 +223,92 @@ impl AppChannelMessageHandler {
         Ok((store, snapshot))
     }
 
+    async fn agent_router_command_response(
+        &self,
+        message: &str,
+        conversation_id: &str,
+    ) -> Option<String> {
+        let trimmed = message.trim();
+        let (command, arguments) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+        match command {
+            "/agent-list" => Some(
+                crate::cli::cmd_impls::agent_router::list_agent_endpoints(Some(&self.app_state))
+                    .await,
+            ),
+            "/agent-send" => {
+                let mut parts = arguments.splitn(3, char::is_whitespace);
+                let (Some(workspace_id), Some(target_conversation_id), Some(text)) =
+                    (parts.next(), parts.next(), parts.next())
+                else {
+                    return Some(
+                        "Usage: /agent-send <workspace-id> <conversation-id> <message>".to_string(),
+                    );
+                };
+                if text.trim().is_empty() {
+                    return Some(
+                        "Usage: /agent-send <workspace-id> <conversation-id> <message>".to_string(),
+                    );
+                }
+                let from = match self
+                    .app_state
+                    .current_agent_address(Some(conversation_id))
+                    .await
+                {
+                    Ok(address) => address,
+                    Err(error) => {
+                        return Some(format!("Agent source resolution failed: {error}"));
+                    }
+                };
+                Some(
+                    crate::cli::cmd_impls::agent_router::send_agent_text(
+                        Some(&self.app_state),
+                        from,
+                        workspace_id,
+                        target_conversation_id,
+                        text,
+                    )
+                    .await,
+                )
+            }
+            "/agent-status" => {
+                let mut parts = arguments.split_whitespace();
+                let (Some(workspace_id), Some(target_conversation_id)) =
+                    (parts.next(), parts.next())
+                else {
+                    return Some(
+                        "Usage: /agent-status <workspace-id> <conversation-id> [message-id]"
+                            .to_string(),
+                    );
+                };
+                Some(
+                    crate::cli::cmd_impls::agent_router::agent_delivery_status(
+                        Some(&self.app_state),
+                        workspace_id,
+                        target_conversation_id,
+                        parts
+                            .next()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty()),
+                    )
+                    .await,
+                )
+            }
+            "/agent-group" => {
+                let args = arguments.split_whitespace().collect::<Vec<_>>();
+                Some(
+                    crate::cli::cmd_impls::agent_router::execute_agent_group_command(
+                        Some(&self.app_state),
+                        &args,
+                    )
+                    .await,
+                )
+            }
+            _ => None,
+        }
+    }
+
     async fn task_run_command_response(
         &self,
         message: &str,
@@ -238,6 +316,15 @@ impl AppChannelMessageHandler {
     ) -> Option<ChannelTaskRunControl> {
         let mut parts = message.split_whitespace();
         let command = parts.next()?;
+        let runtime = match self.app_state.current_chat_runtime().await {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return Some(ChannelTaskRunControl::Reply(format!(
+                    "Workspace runtime is unavailable: {error}"
+                )));
+            }
+        };
+        let task_runtime = runtime.task_runtime();
         if matches!(
             command,
             "/subagent-message" | "/subagent-followup" | "/subagent-interrupt"
@@ -257,7 +344,11 @@ impl AppChannelMessageHandler {
                 Ok(parsed) => parsed,
                 Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
             };
-            let (store, _) = match self.current_task_run(conv, Some(&parsed.identity.run_id)) {
+            let (store, _) = match Self::current_task_run(
+                task_runtime.clone(),
+                conv,
+                Some(&parsed.identity.run_id),
+            ) {
                 Ok(value) => value,
                 Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
             };
@@ -317,11 +408,14 @@ impl AppChannelMessageHandler {
                 Ok(parsed) => parsed,
                 Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
             };
-            let (store, snapshot) =
-                match self.current_task_run(conv, parsed.requested_run_id.as_deref()) {
-                    Ok(value) => value,
-                    Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
-                };
+            let (store, snapshot) = match Self::current_task_run(
+                task_runtime.clone(),
+                conv,
+                parsed.requested_run_id.as_deref(),
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
             let reply = match store.update_run_goal(
                 &snapshot.run.run_id,
                 parsed.expected_goal_revision,
@@ -339,10 +433,11 @@ impl AppChannelMessageHandler {
         }
         if command == "/task-requirements" {
             let requested_run_id = parts.next();
-            let (store, snapshot) = match self.current_task_run(conv, requested_run_id) {
-                Ok(value) => value,
-                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
-            };
+            let (store, snapshot) =
+                match Self::current_task_run(task_runtime.clone(), conv, requested_run_id) {
+                    Ok(value) => value,
+                    Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+                };
             let reply = match store.completion_gate_report(&snapshot.run.run_id) {
                 Ok(report) => format_channel_completion_gate(&report),
                 Err(error) => format!("Unable to read completion gate: {error}"),
@@ -355,11 +450,14 @@ impl AppChannelMessageHandler {
                 Ok(parsed) => parsed,
                 Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
             };
-            let (store, snapshot) =
-                match self.current_task_run(conv, parsed.requested_run_id.as_deref()) {
-                    Ok(value) => value,
-                    Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
-                };
+            let (store, snapshot) = match Self::current_task_run(
+                task_runtime.clone(),
+                conv,
+                parsed.requested_run_id.as_deref(),
+            ) {
+                Ok(value) => value,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
             let reply = match store.skip_goal_requirement(
                 &snapshot.run.run_id,
                 parsed.expected_goal_revision,
@@ -417,7 +515,7 @@ impl AppChannelMessageHandler {
             }
             _ => return None,
         };
-        let (store, snapshot) = match self.current_task_run(conv, requested_run_id) {
+        let (store, snapshot) = match Self::current_task_run(task_runtime, conv, requested_run_id) {
             Ok(value) => value,
             Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
         };
@@ -446,6 +544,7 @@ impl AppChannelMessageHandler {
                     return Some(ChannelTaskRunControl::Resume {
                         run_id,
                         root_message_id: snapshot.run.root_message_id.clone(),
+                        runtime,
                     });
                 }
             }
@@ -476,6 +575,16 @@ impl AppChannelMessageHandler {
         let mut parts = message.trim().splitn(2, char::is_whitespace);
         let command = parts.next()?;
         let argument = parts.next().map(str::trim).unwrap_or_default();
+        let scoped_runtime = if matches!(command, "/stop" | "/reset" | "/steer") {
+            match self.app_state.current_chat_runtime().await {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    return Some(format!("Workspace runtime is unavailable: {error}"));
+                }
+            }
+        } else {
+            None
+        };
         match command {
             "/workflow" => Some(
                 self.app_state
@@ -512,16 +621,19 @@ impl AppChannelMessageHandler {
                 )
             }
             "/stop" => {
-                let Some(snapshot) = self
-                    .foreground_turns
-                    .snapshot(ForegroundTurnSurface::Channel, conv)
-                else {
+                let runtime = scoped_runtime.as_ref()?;
+                let Some(snapshot) = self.foreground_turns.snapshot_scoped(
+                    runtime.execution_scope().workspace_id(),
+                    ForegroundTurnSurface::Channel,
+                    conv,
+                ) else {
                     return Some("No active channel turn to stop.".to_string());
                 };
                 Some(
                     match self
                         .foreground_turns
-                        .cancel_and_wait(
+                        .cancel_and_wait_scoped(
+                            runtime.execution_scope().workspace_id(),
                             ForegroundTurnSurface::Channel,
                             conv,
                             &snapshot.active_turn_id,
@@ -548,17 +660,20 @@ impl AppChannelMessageHandler {
                 | ChannelHumanLoopResolution::Invalid(message) => message,
             }),
             "/reset" => {
-                if let Some(snapshot) = self
+                let runtime = scoped_runtime.as_ref()?;
+                if let Some(snapshot) = self.foreground_turns.snapshot_scoped(
+                    runtime.execution_scope().workspace_id(),
+                    ForegroundTurnSurface::Channel,
+                    conv,
+                ) && let Err(error) = self
                     .foreground_turns
-                    .snapshot(ForegroundTurnSurface::Channel, conv)
-                    && let Err(error) = self
-                        .foreground_turns
-                        .cancel_and_wait(
-                            ForegroundTurnSurface::Channel,
-                            conv,
-                            &snapshot.active_turn_id,
-                        )
-                        .await
+                    .cancel_and_wait_scoped(
+                        runtime.execution_scope().workspace_id(),
+                        ForegroundTurnSurface::Channel,
+                        conv,
+                        &snapshot.active_turn_id,
+                    )
+                    .await
                     && !matches!(error, ForegroundTurnError::NoActiveTurn { .. })
                 {
                     return Some(format!(
@@ -566,9 +681,9 @@ impl AppChannelMessageHandler {
                     ));
                 }
                 let reset_turn_id = uuid::Uuid::new_v4().to_string();
-                let reset_lease = match self
-                    .app_state
-                    .begin_conversation_turn_owned(
+                let reset_lease = match runtime
+                    .begin_turn(
+                        &self.foreground_turns,
                         ForegroundTurnSurface::Channel,
                         conv,
                         reset_turn_id,
@@ -585,7 +700,7 @@ impl AppChannelMessageHandler {
                     }
                     Err(error) => return Some(format!("Unable to admit reset: {error}")),
                 };
-                let generation_receipts = match self.generation_receipts() {
+                let generation_receipts = match Self::generation_receipts(runtime) {
                     Ok(receipts) => receipts,
                     Err(message) => {
                         reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
@@ -597,7 +712,16 @@ impl AppChannelMessageHandler {
                         return Some(message);
                     }
                 };
-                let pool = Arc::clone(&self.pool);
+                let Some(pool) = runtime.pool() else {
+                    reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message(
+                            "agent_pool",
+                            "AgentPool is unavailable",
+                        ),
+                    ));
+                    generation_receipts.release_lifo();
+                    return Some("AgentPool is unavailable".to_string());
+                };
                 let hitl = Arc::clone(&self.hitl);
                 let conv_owned = conv.to_string();
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -643,13 +767,18 @@ impl AppChannelMessageHandler {
                 if argument.is_empty() {
                     return Some("Usage: /steer <additional instruction>".to_string());
                 }
-                let Some(snapshot) = self
-                    .foreground_turns
-                    .snapshot(ForegroundTurnSurface::Channel, conv)
-                else {
+                let runtime = scoped_runtime.as_ref()?;
+                let Some(snapshot) = self.foreground_turns.snapshot_scoped(
+                    runtime.execution_scope().workspace_id(),
+                    ForegroundTurnSurface::Channel,
+                    conv,
+                ) else {
                     return Some("No active channel turn to steer.".to_string());
                 };
-                let execution = match self.pool.lease_existing(conv).await {
+                let Some(pool) = runtime.pool() else {
+                    return Some("The active workspace has no AgentPool.".to_string());
+                };
+                let execution = match pool.lease_existing(conv).await {
                     Ok(Some(execution)) => execution,
                     Ok(None) => {
                         return Some("The active channel turn has no attached agent.".to_string());
@@ -972,6 +1101,9 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         }
         let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id());
         let cache_id = Self::cache_user_id(&msg.channel_id, msg.conversation_id());
+        if let Some(message) = self.agent_router_command_response(&msg.text, &conv).await {
+            return Ok(immediate_channel_response(&msg, message));
+        }
         let mut resume_task_run = None;
         if let Some(control) = self.task_run_command_response(&msg.text, &conv).await {
             match control {
@@ -981,7 +1113,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 ChannelTaskRunControl::Resume {
                     run_id,
                     root_message_id,
-                } => resume_task_run = Some((run_id, root_message_id)),
+                    runtime,
+                } => resume_task_run = Some((run_id, root_message_id, runtime)),
             }
         }
         // Product control commands always outrank HITL parsing. `/stop` owns
@@ -1000,9 +1133,9 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         }
         if msg.text.split_whitespace().next() == Some("/mode") {
             let command_id = uuid::Uuid::new_v4().to_string();
-            let lease = match self
+            let (_runtime, lease) = match self
                 .app_state
-                .begin_conversation_turn_owned(
+                .begin_scoped_chat_turn_owned(
                     ForegroundTurnSurface::Channel,
                     &conv,
                     command_id,
@@ -1010,8 +1143,10 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 .await
             {
                 Ok(lease) => lease,
-                Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                    ForegroundTurnError::Busy { active_turn_id, .. },
+                Err(echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+                    echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                        ForegroundTurnError::Busy { active_turn_id, .. },
+                    ),
                 )) => {
                     return Ok(immediate_channel_response(
                         &msg,
@@ -1037,9 +1172,9 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         // any admission step fails.
         if is_agent_management_command(&msg.text) {
             let command_id = uuid::Uuid::new_v4().to_string();
-            let lease = match self
+            let (runtime, lease) = match self
                 .app_state
-                .begin_conversation_turn_owned(
+                .begin_scoped_chat_turn_owned(
                     ForegroundTurnSurface::Channel,
                     &conv,
                     command_id,
@@ -1047,8 +1182,10 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 .await
             {
                 Ok(lease) => lease,
-                Err(echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                    ForegroundTurnError::Busy { active_turn_id, .. },
+                Err(echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+                    echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                        ForegroundTurnError::Busy { active_turn_id, .. },
+                    ),
                 )) => {
                     return Ok(immediate_channel_response(
                         &msg,
@@ -1062,7 +1199,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     ));
                 }
             };
-            let generation_receipts = match self.generation_receipts() {
+            let generation_receipts = match Self::generation_receipts(&runtime) {
                 Ok(receipts) => receipts,
                 Err(message) => {
                     lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
@@ -1074,7 +1211,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     return Ok(immediate_channel_response(&msg, message));
                 }
             };
-            let pool_execution = match self.pool.acquire(&conv).await {
+            let pool_execution = match runtime.agent_for(&conv).await {
                 Ok(execution) => execution,
                 Err(error) => {
                     generation_receipts.release_lifo();
@@ -1105,17 +1242,34 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         }
 
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let foreground_lease = match self
-            .app_state
-            .begin_conversation_turn_owned(ForegroundTurnSurface::Channel, &conv, turn_id.clone())
-            .await
-        {
-            Ok(lease) => lease,
-            Err(
+        let admission = match resume_task_run.as_ref() {
+            Some((_, _, runtime)) => runtime
+                .begin_turn(
+                    &self.foreground_turns,
+                    ForegroundTurnSurface::Channel,
+                    &conv,
+                    turn_id.clone(),
+                )
+                .await
+                .map(|lease| (runtime.clone(), lease))
+                .map_err(echo_agent_app_core::state::ScopedChatTurnError::from),
+            None => {
+                self.app_state
+                    .begin_scoped_chat_turn_owned(
+                        ForegroundTurnSurface::Channel,
+                        &conv,
+                        turn_id.clone(),
+                    )
+                    .await
+            }
+        };
+        let (scoped_runtime, foreground_lease) = match admission {
+            Ok(admission) => admission,
+            Err(echo_agent_app_core::state::ScopedChatTurnError::Conversation(
                 echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
                     ForegroundTurnError::Busy { active_turn_id, .. },
                 ),
-            ) => {
+            )) => {
                 return Ok(immediate_channel_response(
                     &msg,
                     format!(
@@ -1133,7 +1287,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let stream_cancel = foreground_lease.cancellation_token();
         let text = resume_task_run.as_ref().map_or_else(
             || msg.text.clone(),
-            |(run_id, _)| {
+            |(run_id, _, _)| {
                 format!(
                     "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection and continue the next useful work."
                 )
@@ -1196,15 +1350,27 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             echo_agent_app_core::chat_driver::ChatDriverEvent,
         >();
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
-        let pool = self.pool.clone();
-        let store = self.store.clone();
+        let Some(pool) = scoped_runtime.pool() else {
+            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "agent_pool",
+                    "The active workspace has no AgentPool",
+                ),
+            ));
+            return Ok(immediate_channel_response(
+                &msg,
+                "The active workspace has no AgentPool.",
+            ));
+        };
+        let store = scoped_runtime.task_runtime();
+        let execution_scope = scoped_runtime.execution_scope().clone();
         let app_state = self.app_state.clone();
         let webhook_emitter = self.webhook_emitter.clone();
-        let review_integration = self.review_integration.clone();
+        let review_integration = scoped_runtime.review_integration();
         let hitl = Arc::clone(&self.hitl);
         let prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
-        let explicit_binding = resume_task_run.map(|(run_id, root_message_id)| {
+        let explicit_binding = resume_task_run.map(|(run_id, root_message_id, _)| {
             echo_agent_app_core::tasks::task_runtime::RunTurnBinding {
                 run_id: Some(run_id),
                 turn_id: turn_id.clone(),
@@ -1234,6 +1400,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     );
                     let res =
                         std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+                            execution_scope,
                             pool: Some(pool.clone()),
                             store,
                             sink,

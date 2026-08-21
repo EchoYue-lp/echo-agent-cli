@@ -146,12 +146,32 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "durable run trace",
         ],
     },
+    CapabilityRow {
+        capability: "cross_workspace_agent_messaging",
+        evidence: [
+            "Agent message dialog with durable receipts",
+            "/agent-list /agent-send /agent-status",
+            "/agent-list /agent-send /agent-status",
+            "/agent-list /agent-send /agent-status",
+            "N/A: scheduled runs consume messages but do not originate interactive sends",
+        ],
+    },
+    CapabilityRow {
+        capability: "cross_workspace_agent_groups",
+        evidence: [
+            "Agent group editor and frozen PlanTask target",
+            "/agent-group and shared TaskRuntime target adapter",
+            "/agent-group and shared TaskRuntime target adapter",
+            "/agent-group and shared TaskRuntime target adapter",
+            "scheduled TaskRuntime honors frozen Agent-group targets",
+        ],
+    },
 ];
 
 #[test]
 fn capability_matrix_has_evidence_for_every_surface() {
     assert_eq!(ProductSurface::ALL.len(), 5);
-    assert_eq!(CAPABILITY_MATRIX.len(), 12);
+    assert_eq!(CAPABILITY_MATRIX.len(), 14);
     for row in CAPABILITY_MATRIX {
         assert!(!row.capability.trim().is_empty());
         assert_eq!(row.evidence.len(), ProductSurface::ALL.len());

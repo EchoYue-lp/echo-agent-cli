@@ -1044,6 +1044,8 @@ fn apply_turn_settlement(app: &mut TuiApp, turn_id: &str, outcome: &TurnOutcome)
     }
     app.is_processing = false;
     app.active_turn_id = None;
+    app.active_turn_workspace_id = None;
+    app.active_turn_agent = None;
     app.status_msg = match outcome {
         TurnOutcome::Completed => "Ready".to_string(),
         TurnOutcome::Cancelled => "Cancelled".to_string(),
@@ -1542,7 +1544,7 @@ enum TurnDispatchResult {
 
 async fn dispatch_turn(
     app: &mut TuiApp,
-    agent: &AgentHandle,
+    _agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
     turn: QueuedTurn,
 ) -> TurnDispatchResult {
@@ -1559,15 +1561,17 @@ async fn dispatch_turn(
         }
     };
     let foreground_turns = app_state.session.foreground_turns.clone();
-    let lease = match begin_tui_foreground_turn(app, &turn_id).await {
-        Ok(lease) => lease,
+    let (scoped_runtime, lease) = match begin_tui_foreground_turn(app, &turn_id).await {
+        Ok(admission) => admission,
         Err(error) => {
             tracing::warn!(%error, turn_id, "failed to acquire TUI foreground turn");
             let retryable = matches!(
                 &error,
-                echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                    echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
-                        | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
+                echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+                    echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                        echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
+                            | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
+                    )
                 )
             );
             return TurnDispatchResult::Rejected {
@@ -1577,10 +1581,40 @@ async fn dispatch_turn(
             };
         }
     };
+    let conversation_id = match app.conversation_id.as_deref() {
+        Some(conversation_id) => conversation_id,
+        None => {
+            lease.settle(TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "conversation_id",
+                    "TUI conversation id is unavailable",
+                ),
+            ));
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: "TUI conversation id is unavailable".to_string(),
+                retryable: false,
+            };
+        }
+    };
+    let pool_execution = match scoped_runtime.agent_for(conversation_id).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            let detail = format!("TUI AgentPool admission failed: {error}");
+            lease.settle(TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("agent_pool", detail.clone()),
+            ));
+            return TurnDispatchResult::Rejected {
+                turn,
+                error: detail,
+                retryable: true,
+            };
+        }
+    };
     if let Some(conversation_id) = app.conversation_id.as_deref() {
         let title: String = turn.text.chars().take(80).collect();
-        if let Err(error) = app_state
-            .ensure_conversation_owned(echo_agent::memory::NewConversation {
+        if let Err(error) = scoped_runtime
+            .ensure_conversation(echo_agent::memory::NewConversation {
                 conversation_id: conversation_id.to_string(),
                 user_id: "default".to_string(),
                 agent_type: None,
@@ -1644,8 +1678,9 @@ async fn dispatch_turn(
         turn.text.clone()
     };
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-        pool: app.pool.clone(),
-        store: app.task_runtime_store.clone(),
+        execution_scope: scoped_runtime.execution_scope().clone(),
+        pool: scoped_runtime.pool(),
+        store: scoped_runtime.task_runtime(),
         sink,
         webhook_emitter: app.webhook_emitter.clone(),
         // TUI/GUI parity (AGENTS.md): bind this turn to the session's
@@ -1656,16 +1691,19 @@ async fn dispatch_turn(
         attachments: task_attachments,
         cancel: lease.cancellation_token(),
         interaction_mode: turn.interaction_mode,
-        review_integration: app.review_integration.clone(),
+        review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
         human_loop_provider: app.human_loop_provider.clone().map(|provider| {
             provider as std::sync::Arc<dyn echo_agent::human_loop::HumanLoopProvider>
         }),
     });
-    let agent_owned = agent.clone();
+    let agent_owned = pool_execution.agent();
+    let active_turn_agent = agent_owned.clone();
+    let active_turn_workspace_id = scoped_runtime.execution_scope().workspace_id().to_string();
     let settled_turn_id = turn_id.clone();
     if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
+        let _pool_execution = pool_execution;
         let outcome = match std::panic::AssertUnwindSafe(send_to_agent(
             &agent_owned,
             prepared,
@@ -1695,6 +1733,8 @@ async fn dispatch_turn(
     }
     app.start_turn(&display_text);
     app.active_turn_id = Some(turn_id);
+    app.active_turn_workspace_id = Some(active_turn_workspace_id);
+    app.active_turn_agent = Some(active_turn_agent);
     TurnDispatchResult::Started
 }
 
@@ -1714,21 +1754,26 @@ async fn begin_tui_foreground_turn(
     app: &TuiApp,
     turn_id: &str,
 ) -> Result<
-    ForegroundTurnLease,
-    echo_agent_app_core::conversation_deletion::ConversationDeletionError,
+    (
+        echo_agent_app_core::state::ScopedChatRuntime,
+        ForegroundTurnLease,
+    ),
+    echo_agent_app_core::state::ScopedChatTurnError,
 > {
-    let app_state = app.app_state.as_ref().ok_or(
-        echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-            echo_agent_app_core::foreground_turn::ForegroundTurnError::StateUnavailable,
-        ),
-    )?;
-    let conversation_id = app.conversation_id.as_deref().ok_or(
-        echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-            echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId,
-        ),
-    )?;
+    let app_state = app.app_state.as_ref().ok_or_else(|| {
+        echo_agent_app_core::state::ScopedChatTurnError::Runtime(
+            "TUI application state is unavailable".to_string(),
+        )
+    })?;
+    let conversation_id = app.conversation_id.as_deref().ok_or({
+        echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId,
+            ),
+        )
+    })?;
     app_state
-        .begin_conversation_turn_owned(ForegroundTurnSurface::Tui, conversation_id, turn_id)
+        .begin_scoped_chat_turn_owned(ForegroundTurnSurface::Tui, conversation_id, turn_id)
         .await
 }
 
@@ -1763,10 +1808,14 @@ fn active_tui_turn(app: &TuiApp) -> Result<ForegroundTurnSnapshot, String> {
         .active_turn_id
         .as_deref()
         .ok_or_else(|| "TUI turn projection is unavailable".to_string())?;
+    let workspace_id = app
+        .active_turn_workspace_id
+        .as_deref()
+        .ok_or_else(|| "TUI workspace projection is unavailable".to_string())?;
     let snapshot = app_state
         .session
         .foreground_turns
-        .snapshot(ForegroundTurnSurface::Tui, conversation_id)
+        .snapshot_scoped(workspace_id, ForegroundTurnSurface::Tui, conversation_id)
         .ok_or_else(|| "No active TUI foreground turn".to_string())?;
     if snapshot.active_turn_id != expected_turn_id {
         return Err(format!(
@@ -2320,7 +2369,8 @@ async fn cancel_active_tui_turn(app: &mut TuiApp) -> Result<(), String> {
         .clone();
     app.status_msg = "Cancelling...".to_string();
     control
-        .cancel_and_wait(
+        .cancel_and_wait_scoped(
+            &snapshot.workspace_id,
             ForegroundTurnSurface::Tui,
             &snapshot.conversation_id,
             &snapshot.active_turn_id,
@@ -2720,11 +2770,7 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
     };
     let subcommand = tokens.first().map(String::as_str).unwrap_or("list");
     let run_id = tokens.get(1).cloned();
-    let current_dir = match std::env::current_dir() {
-        Ok(path) => path,
-        Err(error) => return format!("Failed to resolve the current workspace: {error}"),
-    };
-    let repo_root = match git_repo_root(&current_dir) {
+    let repo_root = match git_repo_root(app.workspace_execution_scope.root()) {
         Ok(path) => path,
         Err(error) => return format!("Current workspace is not a Git repository: {error}"),
     };
@@ -3004,6 +3050,7 @@ async fn refresh_workspace_generation(
         .current_workspace()
         .await
         .map(|workspace| workspace.root);
+    app.workspace_execution_scope = state.current_execution_scope().await;
     app.conversation_store = state.conversation_store().await;
     app.conversation_id = agent
         .read(|value| value.conversation_id().map(str::to_string))
@@ -4113,9 +4160,7 @@ async fn handle_slash_command(
                                 Ok(config) => {
                                     let server_count = config.mcp_servers.len();
                                     match state
-                                        .plugins
-                                        .mcp_config
-                                        .replace_and_reconcile(agent.clone(), config)
+                                        .replace_mcp_config_owned(config)
                                         .await
                                     {
                                         Ok(_) => format!(
@@ -4131,12 +4176,7 @@ async fn handle_slash_command(
                     }
                 }
                 "disconnect" if !target.is_empty() => match app.app_state.as_ref() {
-                    Some(state) => match state
-                        .plugins
-                        .mcp_config
-                        .remove_and_reconcile(agent.clone(), &target)
-                        .await
-                    {
+                    Some(state) => match state.remove_mcp_server_owned(&target).await {
                         Ok(_) => format!("Removed MCP server from the user config: {target}"),
                         Err(error) => format!("MCP removal failed: {error}"),
                     },
@@ -4238,8 +4278,13 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::Plugins) => {
-            let content = match app.plugin_runtime.clone() {
-                Some(runtime) => handle_tui_plugin_command(app, runtime, args).await,
+            let app_state = app.app_state.clone();
+            let runtime = match app_state.as_ref() {
+                Some(state) => state.current_plugin_runtime_owned().await.ok(),
+                None => app.plugin_runtime.clone(),
+            };
+            let content = match runtime {
+                Some(runtime) => handle_tui_plugin_command(app, runtime, app_state, args).await,
                 None => "Plugin runtime is not initialized.".to_string(),
             };
             app.messages.push(ChatMessage {
@@ -4854,6 +4899,75 @@ async fn handle_slash_command(
             }
             push_system_message(app, result.output);
         }
+        Some(SlashCommand::AgentList) => {
+            let content =
+                crate::cli::cmd_impls::agent_router::list_agent_endpoints(app.app_state.as_ref())
+                    .await;
+            push_system_message(app, content);
+        }
+        Some(SlashCommand::AgentSend) => {
+            let parts = args.split_whitespace().collect::<Vec<_>>();
+            let content = match (parts.first(), parts.get(1), parts.get(2..)) {
+                (Some(workspace_id), Some(conversation_id), Some(message_parts))
+                    if !message_parts.is_empty() =>
+                {
+                    let Some(state) = app.app_state.as_ref() else {
+                        push_system_message(app, "Agent routing is not initialized.".to_string());
+                        return;
+                    };
+                    let from = match state
+                        .current_agent_address(app.conversation_id.as_deref())
+                        .await
+                    {
+                        Ok(address) => address,
+                        Err(error) => {
+                            push_system_message(
+                                app,
+                                format!("Agent source resolution failed: {error}"),
+                            );
+                            return;
+                        }
+                    };
+                    crate::cli::cmd_impls::agent_router::send_agent_text(
+                        app.app_state.as_ref(),
+                        from,
+                        workspace_id,
+                        conversation_id,
+                        &message_parts.join(" "),
+                    )
+                    .await
+                }
+                _ => "Usage: /agent-send <workspace-id> <conversation-id> <message>".to_string(),
+            };
+            push_system_message(app, content);
+        }
+        Some(SlashCommand::AgentStatus) => {
+            let parts = args.split_whitespace().collect::<Vec<_>>();
+            let content = match (parts.first(), parts.get(1)) {
+                (Some(workspace_id), Some(conversation_id)) => {
+                    crate::cli::cmd_impls::agent_router::agent_delivery_status(
+                        app.app_state.as_ref(),
+                        workspace_id,
+                        conversation_id,
+                        parts.get(2).copied(),
+                    )
+                    .await
+                }
+                _ => {
+                    "Usage: /agent-status <workspace-id> <conversation-id> [message-id]".to_string()
+                }
+            };
+            push_system_message(app, content);
+        }
+        Some(SlashCommand::AgentGroup) => {
+            let parts = args.split_whitespace().collect::<Vec<_>>();
+            let content = crate::cli::cmd_impls::agent_router::execute_agent_group_command(
+                app.app_state.as_ref(),
+                &parts,
+            )
+            .await;
+            push_system_message(app, content);
+        }
         Some(SlashCommand::Cost) => {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -5084,7 +5198,11 @@ async fn handle_slash_command(
                     return;
                 }
             };
-            match agent
+            let Some(active_agent) = app.active_turn_agent.as_ref() else {
+                queue_steer_follow_up(app, instruction, attachments);
+                return;
+            };
+            match active_agent
                 .steer_input(Some(&snapshot.active_turn_id), message)
                 .await
             {
@@ -5576,7 +5694,7 @@ async fn handle_slash_command(
             refresh_task_runtime_view(app);
         }
         Some(SlashCommand::Preview) => {
-            match resolve_tui_workspace_file(args) {
+            match resolve_tui_workspace_file(app.workspace_execution_scope.root(), args) {
                 Ok(path) => match std::fs::read_to_string(&path) {
                     Ok(content) => {
                         let limit = 40_000;
@@ -5604,19 +5722,21 @@ async fn handle_slash_command(
             }
             app.rebuild_message_groups();
         }
-        Some(SlashCommand::Edit) => match resolve_tui_workspace_file(args) {
-            Ok(path) => {
-                app.external_file_editor_requested = Some(path);
-                app.status_msg = "Opening file editor...".to_string();
+        Some(SlashCommand::Edit) => {
+            match resolve_tui_workspace_file(app.workspace_execution_scope.root(), args) {
+                Ok(path) => {
+                    app.external_file_editor_requested = Some(path);
+                    app.status_msg = "Opening file editor...".to_string();
+                }
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Edit failed: {error}"),
+                    });
+                    app.rebuild_message_groups();
+                }
             }
-            Err(error) => {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!("Edit failed: {error}"),
-                });
-                app.rebuild_message_groups();
-            }
-        },
+        }
         Some(SlashCommand::Browser) => {
             let Some(runtime) = app.browser_runtime.clone() else {
                 app.messages.push(ChatMessage {
@@ -5965,12 +6085,15 @@ where
     Ok(prepared)
 }
 
-fn resolve_tui_workspace_file(value: &str) -> anyhow::Result<std::path::PathBuf> {
+fn resolve_tui_workspace_file(
+    root: &std::path::Path,
+    value: &str,
+) -> anyhow::Result<std::path::PathBuf> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(anyhow::anyhow!("a file path is required"));
     }
-    let root = std::env::current_dir()?.canonicalize()?;
+    let root = root.canonicalize()?;
     let requested = std::path::PathBuf::from(trimmed);
     let target = if requested.is_absolute() {
         requested
@@ -6010,6 +6133,8 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
         tracing::warn!(%error, "failed to clean staged attachments during TUI reset");
     }
     app.active_turn_id = None;
+    app.active_turn_workspace_id = None;
+    app.active_turn_agent = None;
     app.task_runtime_view = None;
     app.subagent_runs.clear();
     app.is_processing = false;
@@ -6445,6 +6570,7 @@ async fn sync_tui_plugin_theme(
 async fn handle_tui_plugin_command(
     app: &mut TuiApp,
     runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
+    app_state: Option<std::sync::Arc<echo_agent_app_core::state::AppState>>,
     args: &str,
 ) -> String {
     use echo_agent::plugin::{InstallSource, PluginScope};
@@ -6483,10 +6609,12 @@ async fn handle_tui_plugin_command(
                 .and_then(|pair| pair.get(1))
                 .and_then(|value| PluginScope::from_arg(value))
                 .unwrap_or(PluginScope::User);
-            match runtime
-                .install(&InstallSource::parse(source_text), scope)
-                .await
-            {
+            let source = InstallSource::parse(source_text);
+            let result = match app_state.as_ref() {
+                Some(state) => state.install_plugin_owned(&source, scope).await,
+                None => runtime.install(&source, scope).await,
+            };
+            match result {
                 Ok((plugin_id, summary)) => {
                     sync_tui_plugin_theme(app, &runtime).await;
                     let enabled = runtime
@@ -6512,7 +6640,11 @@ async fn handle_tui_plugin_command(
                 return "Usage: /plugins uninstall <name> [--keep-data]".to_string();
             };
             let keep_data = rest.contains(&"--keep-data");
-            match runtime.uninstall(name, keep_data).await {
+            let result = match app_state.as_ref() {
+                Some(state) => state.uninstall_plugin_owned(name, keep_data).await,
+                None => runtime.uninstall(name, keep_data).await,
+            };
+            match result {
                 Ok(summary) => {
                     sync_tui_plugin_theme(app, &runtime).await;
                     with_plugin_wiring_errors(
@@ -6527,10 +6659,12 @@ async fn handle_tui_plugin_command(
             let Some(name) = rest.first() else {
                 return format!("Usage: /plugins {sub} <name>");
             };
-            let result = if sub == "enable" {
-                runtime.enable(name).await
-            } else {
-                runtime.disable(name).await
+            let result = match app_state.as_ref() {
+                Some(state) => state
+                    .set_plugin_enabled_owned(name, sub == "enable")
+                    .await,
+                None if sub == "enable" => runtime.enable(name).await,
+                None => runtime.disable(name).await,
             };
             match result {
                 Ok(summary) => {
@@ -6572,30 +6706,36 @@ async fn handle_tui_plugin_command(
                 None => format!("Plugin '{name}' not found."),
             }
         }
-        "reload" => match runtime.reload().await {
-            Ok(summary) => {
-                sync_tui_plugin_theme(app, &runtime).await;
-                let mut content = format!(
-                    "Reloaded {} plugins ({} enabled).\nSkills: {} · Hooks: {} · MCP: {} · Agents: {} · LSP: {} · Monitors: {} · Themes: {} · Styles: {}",
-                    summary.total,
-                    summary.enabled,
-                    summary.skills_loaded,
-                    summary.hooks_registered,
-                    summary.mcp_connected,
-                    summary.agents_loaded,
-                    summary.lsp_languages_loaded,
-                    summary.monitors_loaded,
-                    summary.themes_loaded,
-                    summary.output_styles_loaded
-                );
-                if !summary.errors.is_empty() {
-                    content.push_str("\nErrors:\n");
-                    content.push_str(&summary.errors.join("\n"));
+        "reload" => {
+            let result = match app_state.as_ref() {
+                Some(state) => state.reload_plugins_owned().await,
+                None => runtime.reload().await,
+            };
+            match result {
+                Ok(summary) => {
+                    sync_tui_plugin_theme(app, &runtime).await;
+                    let mut content = format!(
+                        "Reloaded {} plugins ({} enabled).\nSkills: {} · Hooks: {} · MCP: {} · Agents: {} · LSP: {} · Monitors: {} · Themes: {} · Styles: {}",
+                        summary.total,
+                        summary.enabled,
+                        summary.skills_loaded,
+                        summary.hooks_registered,
+                        summary.mcp_connected,
+                        summary.agents_loaded,
+                        summary.lsp_languages_loaded,
+                        summary.monitors_loaded,
+                        summary.themes_loaded,
+                        summary.output_styles_loaded
+                    );
+                    if !summary.errors.is_empty() {
+                        content.push_str("\nErrors:\n");
+                        content.push_str(&summary.errors.join("\n"));
+                    }
+                    content
                 }
-                content
+                Err(error) => format!("Plugin reload failed: {error}"),
             }
-            Err(error) => format!("Plugin reload failed: {error}"),
-        },
+        }
         "themes" => {
             let active = runtime.active_theme().await;
             let themes = runtime.themes().await;
@@ -6644,7 +6784,11 @@ async fn handle_tui_plugin_command(
                 Ok(values) => values,
                 Err(error) => return format!("Plugin config JSON is invalid: {error}"),
             };
-            match runtime.configure(name, values).await {
+            let result = match app_state.as_ref() {
+                Some(state) => state.configure_plugin_owned(name, values).await,
+                None => runtime.configure(name, values).await,
+            };
+            match result {
                 Ok(summary) => {
                     sync_tui_plugin_theme(app, &runtime).await;
                     with_plugin_wiring_errors(
@@ -7566,9 +7710,12 @@ mod tests {
     }
 
     #[test]
-    fn tui_workspace_file_resolution_accepts_repo_files_and_rejects_empty_input() {
-        assert!(resolve_tui_workspace_file("Cargo.toml").is_ok());
-        assert!(resolve_tui_workspace_file("").is_err());
+    fn tui_workspace_file_resolution_accepts_repo_files_and_rejects_empty_input()
+    -> Result<(), String> {
+        let root = std::env::current_dir().map_err(|error| error.to_string())?;
+        assert!(resolve_tui_workspace_file(&root, "Cargo.toml").is_ok());
+        assert!(resolve_tui_workspace_file(&root, "").is_err());
+        Ok(())
     }
 
     #[test]

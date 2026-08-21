@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-08-19
+Last updated: 2026-08-20
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -82,8 +82,51 @@ evidence, and the next bounded step.
 | Background command cells + awaiter role (Phase C1-C4) | Complete | Design: `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11 (C track). Framework commits `58e6733`, `7f66ff5`: one `CommandCellRegistry`, sandbox-preserving launch, durable output artifacts, retry-safe multi-waiter cursors, explicit owner cancellation, and UTF-8-safe bounded output. Application commit `5cf49c2`: process-wide registry, low-thinking `awaiter`, `watch_cell`, TaskRuntime start/finish events, recovery-capsule projection, active-cell completion blocker, explicit-cancel propagation, and boot recovery that closes orphaned cells without replaying external commands. Pause keeps cells alive; only explicit run cancellation stops them. |
 | Long-horizon TaskRun continuation control plane (Phase C5) | Complete | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, durable provider retry, typed boot admission, stable surface HITL replay, versioned Requirement/Evidence, cross-surface controls, and discardable checkpoint projections. The automated fault matrix and the accepted 12-hour real soak are complete; detailed evidence is governed by `docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`. |
 | Long-horizon runtime M0-M5 implementation | Complete | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal complete. App `de09946` makes `TaskRun.goal` the revision/hash-bound authority. Framework `cd4fccf` and app `9d59a0b` close M1. Framework `6d7d0cf` plus app `f4771f3` close M2 with exact-attempt controls through the existing `TurnSteerMailbox`. App `aa92178` closes M3 with event-folded provider retry, typed boot admission, exact orphan recovery and safe staged run creation. App `54d8bc4` closes M4 through one store-owned Requirement/Evidence completion report shared by execution and GUI/TUI/CLI/channel. App `3e409d0` closes M5a with a schema/hash-validated discardable checkpoint, suffix-only event fold, crash-window snapshot repair and fixed release performance gates while preserving `events.jsonl` as sole authority. App `82d8eda` adds the resumable, commit-pinned long-horizon harness; its canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix is all green. The 12-hour ledger passed with 1,439 ended turns, 143 compactions, 11 production recoveries, zero failed turns and complete final hashes. On 2026-08-19 the user accepted 12 hours as the final real-soak gate and waived 24/48-hour completion; those services were stopped and their durable ledger snapshots retained without being represented as passes. |
+| Cross-workspace Agent messaging and groups | Complete | Applications `00bf3d4`, `f3b6f2c`, `15d3ad3`, `e13a309`, `b97bb23`, `9ee2312`, `de867e3`; `docs/2026-08-20-cross-workspace-agent-groups.md`; independent loaded hosts and cross-host generations pass three-host gates. The application-owned `AgentRouter` discovers persisted addresses, owns durable inboxes and persistent Agent groups, and all interactive surfaces project the same service. A frozen PlanTask target acquires the exact remote conversation Agent while the leader TaskRuntime remains the sole DAG, retry, cancellation, review, and canonical SubagentRun authority. M8 adds transcript-owned completed-turn deduplication, stable correlated replies, concurrent three-inbox restart gates, and removes the remaining mutable-cwd transition naming without adding another executor/store/queue. |
 
 ## Current Decisions
+
+### Cross-workspace Agent messaging and groups
+
+The governing design is
+`docs/2026-08-20-cross-workspace-agent-groups.md`. EKO owns global
+workspace/session discovery, durable file inboxes, workspace runtime lifetime,
+surface projection, and persistent Agent groups. The framework already owns
+the required ReAct, steer, Task DAG, cancellation, revision, and Subagent
+mechanisms and receives no new EKO routing model.
+
+`AgentAddress` is the stable `(workspace_id, conversation_id)` identity.
+Accepted delivery is persisted before wake, is at-least-once, and becomes
+effectively once at transcript commit through message-id deduplication. Incoming
+Agent content does not inherit user approval. Cross-workspace task execution
+retains one leader-owned TaskRun and records remote work as its canonical
+SubagentRun; do not add `GroupRun`, another DAG loop, another mailbox, a mirror
+TaskRun, SQLite, or a permission gate.
+
+M1 is complete: immutable workspace paths and file stores are centralized in
+one `WorkspaceRuntimeResources` factory, and the existing workspace path uses
+it. Application commit `00bf3d4` passed the full Rust submission gate on
+2026-08-20. Application commit `f3b6f2c` closes M2: a process registry owns one
+stable host per workspace identity, the focused workspace is a private host
+reference, metadata refresh preserves immutable resources, and root drift is
+rejected. M3 is complete: process-global cwd and pool/store rebinding are gone,
+loaded hosts own their execution resources, all four live configuration
+generations publish across loaded hosts, and three-host isolation/activity
+gates pass. M4 adds one application-owned durable inbox with registry/store
+address validation, restart replay, message-id deduplication, and unloaded-host
+acceptance. M5 is complete: the application supervisor persists claim/settle
+attempts, reclaims incomplete claims at boot, uses the existing exact-turn steer
+mailbox for live targets, waits for foreground settlement when a target is busy,
+and runs cold targets through the shared `drive_chat` path. Agent/runtime input
+cannot approve HITL, correlated replies return through the same router, and no
+second transcript writer, executor, or mailbox was introduced. The explicit
+M5 transcript/receipt crash window is closed by M8 for completed transcript
+turns: deterministic turn IDs, transcript markers, and stable reply IDs recover
+without rerunning the model. Side effects before transcript completion remain
+explicitly at-least-once. M6 projects one service across GUI/TUI/CLI/channels;
+M7 adds persistent groups through the existing TaskRuntime target adapter; M8
+also passes concurrent three-inbox restart/soak gates and removes the remaining
+mutable-cwd transition naming.
 
 ### MCP Resources
 
@@ -628,6 +671,16 @@ the sole TaskRuntime/Memory/pool generation authority; TUI does not snapshot a
 legacy layer manager or add a framework lifecycle API.
 
 ## Next Step
+
+Cross-workspace messaging M0-M8 is complete in
+`feature/cross-workspace-agent-groups`. Before integration, merge the latest
+application `main` into the worktree branch, preserve the relative framework
+dependency paths, rerun the applicable full submission gates, and then merge
+the application branch. The accepted architecture remains one leader TaskRun,
+one canonical SubagentRun attempt identity, one AgentRouter, and the shared
+`drive_chat` transcript writer.
+
+### Completed long-horizon objective
 
 The Codex Runtime Goal is complete with this exact objective:
 

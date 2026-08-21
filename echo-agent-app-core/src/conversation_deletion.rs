@@ -187,12 +187,30 @@ impl ConversationDeletionService {
         conversation_id: &str,
         turn_id: impl Into<String>,
     ) -> Result<ForegroundTurnLease, ConversationDeletionError> {
+        self.begin_foreground_turn_scoped(
+            foreground_turns,
+            "global",
+            surface,
+            conversation_id,
+            turn_id,
+        )
+        .await
+    }
+
+    pub async fn begin_foreground_turn_scoped(
+        &self,
+        foreground_turns: &ForegroundTurnControl,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        turn_id: impl Into<String>,
+    ) -> Result<ForegroundTurnLease, ConversationDeletionError> {
         let conversation_id = validated_id(conversation_id)?.to_string();
         let registration = self.lock_registration(&conversation_id);
         let _identity_lock = registration.lock.lock().await;
         self.ensure_admission_allowed(&conversation_id)?;
         foreground_turns
-            .begin(surface, conversation_id, turn_id)
+            .begin_scoped(workspace_id, surface, conversation_id, turn_id)
             .map_err(ConversationDeletionError::Foreground)
     }
 

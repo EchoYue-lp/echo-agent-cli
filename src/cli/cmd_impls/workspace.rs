@@ -229,7 +229,12 @@ async fn ws_link(state: &AppState, path: Option<&str>) -> String {
         .link_project(&current.id, project_path)
     {
         Ok(ws) => {
-            *state.workspace.current.write().await = Some(ws.clone());
+            let ws = match state.refresh_current_workspace_metadata(ws).await {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    return format!("Failed to refresh linked workspace runtime: {error}");
+                }
+            };
             format!(
                 "Linked project to workspace '{}': {}",
                 ws.name,

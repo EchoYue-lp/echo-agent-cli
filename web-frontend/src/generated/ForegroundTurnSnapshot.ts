@@ -5,6 +5,7 @@ import type { ForegroundTurnSurface } from './ForegroundTurnSurface';
  * Read-only identity and cancellation state for an active foreground turn.
  */
 export type ForegroundTurnSnapshot = {
+  workspace_id: string;
   surface: ForegroundTurnSurface;
   conversation_id: string;
   /**

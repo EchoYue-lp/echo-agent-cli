@@ -213,6 +213,7 @@ mod tests {
             domain_profile: DomainProfile::General,
             depends_on: Vec::new(),
             parallel_group: None,
+            execution_target: None,
             files: files.iter().map(|s| s.to_string()).collect(),
             allowed_tools: Vec::new(),
             required_artifacts: Vec::new(),

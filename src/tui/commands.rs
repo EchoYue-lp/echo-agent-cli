@@ -71,6 +71,10 @@ pub enum SlashCommand {
     Copy,
     OpenArtifact,
     Workspace,
+    AgentList,
+    AgentSend,
+    AgentStatus,
+    AgentGroup,
 
     // -- Context --
     Model,
@@ -165,6 +169,10 @@ impl SlashCommand {
             Self::Copy => "Copy the last response to clipboard (or Ctrl+Y)",
             Self::OpenArtifact => "Open the latest or specified tool-output artifact",
             Self::Workspace => "Manage workspaces",
+            Self::AgentList => "List addressable Agent conversations",
+            Self::AgentSend => "Queue a message for another Agent conversation",
+            Self::AgentStatus => "Show durable Agent delivery status",
+            Self::AgentGroup => "Manage persistent cross-workspace Agent groups",
 
             Self::Model => "List, add, test, select, or delete models",
             Self::Provider => "List, add, update, or delete model providers",
@@ -249,7 +257,11 @@ impl SlashCommand {
             | Self::Compact
             | Self::Copy
             | Self::OpenArtifact
-            | Self::Workspace => Category::Session,
+            | Self::Workspace
+            | Self::AgentList
+            | Self::AgentSend
+            | Self::AgentStatus
+            | Self::AgentGroup => Category::Session,
             Self::Model
             | Self::Provider
             | Self::Think
@@ -364,6 +376,10 @@ impl SlashCommand {
             Self::DeleteSession => "<conversation-id>",
             Self::OpenArtifact => "[call-id|path]",
             Self::Workspace => "[new|list|switch|exit|link|migrate|info] [args]",
+            Self::AgentList => "",
+            Self::AgentSend => "<workspace-id> <conversation-id> <message>",
+            Self::AgentStatus => "<workspace-id> <conversation-id> [message-id]",
+            Self::AgentGroup => "<list|create|update|delete> [args]",
             Self::CodeReview => "[file-or-dir]",
             Self::Attach => "<file-path>",
             Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",

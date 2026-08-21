@@ -1,7 +1,7 @@
 //! Application-owned foreground turn admission and cancellation.
 //!
 //! The framework owns execution and same-turn steering. EKO owns the product
-//! rule that one `(surface, conversation)` pair has at most one foreground
+//! rule that one `(workspace, surface, conversation)` tuple has at most one foreground
 //! turn, and that cancellation never releases that ownership before the
 //! existing [`crate::chat_driver::TurnOutcome`] has settled.
 
@@ -26,6 +26,8 @@ pub enum ForegroundTurnSurface {
     Tui,
     Cli,
     Channel,
+    /// Application-owned cross-workspace inbox delivery.
+    Agent,
 }
 
 impl fmt::Display for ForegroundTurnSurface {
@@ -35,12 +37,14 @@ impl fmt::Display for ForegroundTurnSurface {
             Self::Tui => "tui",
             Self::Cli => "cli",
             Self::Channel => "channel",
+            Self::Agent => "agent",
         })
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ForegroundTurnKey {
+    workspace_id: String,
     surface: ForegroundTurnSurface,
     conversation_id: String,
 }
@@ -49,6 +53,7 @@ struct ForegroundTurnKey {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[ts(export, rename = "ForegroundTurnSnapshot")]
 pub struct ForegroundTurnSnapshot {
+    pub workspace_id: String,
     pub surface: ForegroundTurnSurface,
     pub conversation_id: String,
     /// Stable root identity used by the surface message and its events.
@@ -61,6 +66,7 @@ pub struct ForegroundTurnSnapshot {
 /// Terminal receipt delivered after the foreground execution future settles.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundTurnSettlement {
+    pub workspace_id: String,
     pub surface: ForegroundTurnSurface,
     pub conversation_id: String,
     pub turn_id: String,
@@ -135,6 +141,7 @@ impl ActiveForegroundTurn {
 
     fn snapshot(&self) -> ForegroundTurnSnapshot {
         ForegroundTurnSnapshot {
+            workspace_id: self.key.workspace_id.clone(),
             surface: self.key.surface,
             conversation_id: self.key.conversation_id.clone(),
             root_turn_id: self.root_turn_id.clone(),
@@ -306,6 +313,18 @@ impl ForegroundTurnControl {
         conversation_id: impl Into<String>,
         turn_id: impl Into<String>,
     ) -> Result<ForegroundTurnLease, ForegroundTurnError> {
+        self.begin_scoped("global", surface, conversation_id, turn_id)
+    }
+
+    /// Acquire one exact workspace-qualified foreground turn.
+    pub fn begin_scoped(
+        &self,
+        workspace_id: impl Into<String>,
+        surface: ForegroundTurnSurface,
+        conversation_id: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> Result<ForegroundTurnLease, ForegroundTurnError> {
+        let workspace_id = workspace_id.into();
         let conversation_id = conversation_id.into();
         if conversation_id.trim().is_empty() {
             return Err(ForegroundTurnError::EmptyConversationId);
@@ -315,6 +334,7 @@ impl ForegroundTurnControl {
             return Err(ForegroundTurnError::EmptyTurnId);
         }
         let key = ForegroundTurnKey {
+            workspace_id,
             surface,
             conversation_id,
         };
@@ -334,7 +354,14 @@ impl ForegroundTurnControl {
                 conversation_id: key.conversation_id,
             });
         }
-        if let Some(existing) = state.active.get(&key) {
+        let conflict = state.active.values().find(|existing| {
+            existing.key.workspace_id == key.workspace_id
+                && existing.key.conversation_id == key.conversation_id
+                && (existing.key.surface == key.surface
+                    || existing.key.surface == ForegroundTurnSurface::Agent
+                    || key.surface == ForegroundTurnSurface::Agent)
+        });
+        if let Some(existing) = conflict {
             return Err(ForegroundTurnError::Busy {
                 surface,
                 conversation_id: key.conversation_id.clone(),
@@ -364,10 +391,20 @@ impl ForegroundTurnControl {
         surface: ForegroundTurnSurface,
         conversation_id: &str,
     ) -> Option<ForegroundTurnSnapshot> {
+        self.snapshot_scoped("global", surface, conversation_id)
+    }
+
+    pub fn snapshot_scoped(
+        &self,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+    ) -> Option<ForegroundTurnSnapshot> {
         let state = self.inner.state.lock().ok()?;
         state
             .active
             .get(&ForegroundTurnKey {
+                workspace_id: workspace_id.to_string(),
                 surface,
                 conversation_id: conversation_id.to_string(),
             })
@@ -391,11 +428,78 @@ impl ForegroundTurnControl {
             .map(|entry| entry.snapshot())
             .collect::<Vec<_>>();
         snapshots.sort_by(|left, right| {
-            left.conversation_id
-                .cmp(&right.conversation_id)
+            left.workspace_id
+                .cmp(&right.workspace_id)
+                .then_with(|| left.conversation_id.cmp(&right.conversation_id))
                 .then_with(|| left.root_turn_id.cmp(&right.root_turn_id))
         });
         Ok(snapshots)
+    }
+
+    /// Snapshot every active surface for one exact workspace conversation.
+    pub fn snapshots_for_conversation_scoped(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<ForegroundTurnSnapshot>, ForegroundTurnError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+        let mut snapshots = state
+            .active
+            .values()
+            .filter(|entry| {
+                entry.key.workspace_id == workspace_id
+                    && entry.key.conversation_id == conversation_id
+            })
+            .map(|entry| entry.snapshot())
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            left.surface
+                .to_string()
+                .cmp(&right.surface.to_string())
+                .then_with(|| left.root_turn_id.cmp(&right.root_turn_id))
+        });
+        Ok(snapshots)
+    }
+
+    /// Subscribe to settlement without requesting cancellation.
+    pub fn settlement_waiter_scoped(
+        &self,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        expected_root_turn_id: &str,
+    ) -> Result<ForegroundTurnSettlementWaiter, ForegroundTurnError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+        let entry = state
+            .active
+            .get(&ForegroundTurnKey {
+                workspace_id: workspace_id.to_string(),
+                surface,
+                conversation_id: conversation_id.to_string(),
+            })
+            .ok_or_else(|| ForegroundTurnError::NoActiveTurn {
+                surface,
+                conversation_id: conversation_id.to_string(),
+            })?;
+        if entry.root_turn_id != expected_root_turn_id {
+            return Err(ForegroundTurnError::TurnMismatch {
+                surface,
+                conversation_id: conversation_id.to_string(),
+                expected_turn_id: expected_root_turn_id.to_string(),
+                actual_turn_id: entry.root_turn_id.clone(),
+            });
+        }
+        Ok(ForegroundTurnSettlementWaiter {
+            settlement_rx: entry.settlement_tx.subscribe(),
+        })
     }
 
     /// True when any surface owns a turn for this conversation.
@@ -577,7 +681,18 @@ impl ForegroundTurnControl {
         conversation_id: &str,
         expected_turn_id: &str,
     ) -> Result<ForegroundTurnSettlementWaiter, ForegroundTurnError> {
+        self.request_cancel_scoped("global", surface, conversation_id, expected_turn_id)
+    }
+
+    pub fn request_cancel_scoped(
+        &self,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        expected_turn_id: &str,
+    ) -> Result<ForegroundTurnSettlementWaiter, ForegroundTurnError> {
         let key = ForegroundTurnKey {
+            workspace_id: workspace_id.to_string(),
             surface,
             conversation_id: conversation_id.to_string(),
         };
@@ -620,7 +735,18 @@ impl ForegroundTurnControl {
         conversation_id: &str,
         expected_root_turn_id: &str,
     ) -> Result<ForegroundTurnSettlementWaiter, ForegroundTurnError> {
+        self.request_root_cancel_scoped("global", surface, conversation_id, expected_root_turn_id)
+    }
+
+    pub fn request_root_cancel_scoped(
+        &self,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        expected_root_turn_id: &str,
+    ) -> Result<ForegroundTurnSettlementWaiter, ForegroundTurnError> {
         let key = ForegroundTurnKey {
+            workspace_id: workspace_id.to_string(),
             surface,
             conversation_id: conversation_id.to_string(),
         };
@@ -659,6 +785,18 @@ impl ForegroundTurnControl {
         expected_turn_id: &str,
     ) -> Result<ForegroundTurnSettlement, ForegroundTurnError> {
         self.request_cancel(surface, conversation_id, expected_turn_id)?
+            .wait()
+            .await
+    }
+
+    pub async fn cancel_and_wait_scoped(
+        &self,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        expected_turn_id: &str,
+    ) -> Result<ForegroundTurnSettlement, ForegroundTurnError> {
+        self.request_cancel_scoped(workspace_id, surface, conversation_id, expected_turn_id)?
             .wait()
             .await
     }
@@ -763,6 +901,7 @@ impl ForegroundTurnControl {
 
     fn settle(&self, entry: &Arc<ActiveForegroundTurn>, outcome: TurnOutcome) {
         let settlement = ForegroundTurnSettlement {
+            workspace_id: entry.key.workspace_id.clone(),
             surface: entry.key.surface,
             conversation_id: entry.key.conversation_id.clone(),
             turn_id: entry.root_turn_id.clone(),
@@ -813,6 +952,10 @@ pub struct ForegroundTurnLease {
 }
 
 impl ForegroundTurnLease {
+    pub fn workspace_id(&self) -> &str {
+        &self.entry.key.workspace_id
+    }
+
     pub fn surface(&self) -> ForegroundTurnSurface {
         self.entry.key.surface
     }
@@ -831,6 +974,7 @@ impl ForegroundTurnLease {
 
     pub fn settle(mut self, outcome: TurnOutcome) -> ForegroundTurnSettlement {
         let settlement = ForegroundTurnSettlement {
+            workspace_id: self.workspace_id().to_string(),
             surface: self.surface(),
             conversation_id: self.conversation_id().to_string(),
             turn_id: self.turn_id().to_string(),
@@ -1087,6 +1231,7 @@ where
     // `memory_generation` into this controlled view. This wrapper must never
     // reacquire a generation while decorating the sink.
     let controlled_resources = Arc::new(ChatResources {
+        execution_scope: resources.execution_scope.clone(),
         pool: resources.pool.clone(),
         store: resources.store.clone(),
         sink,
@@ -1246,6 +1391,7 @@ mod tests {
         assert_eq!(
             control.snapshots(ForegroundTurnSurface::Gui)?,
             vec![ForegroundTurnSnapshot {
+                workspace_id: "global".to_string(),
                 surface: ForegroundTurnSurface::Gui,
                 conversation_id: "conversation".to_string(),
                 root_turn_id: "gui-turn".to_string(),
@@ -1256,6 +1402,79 @@ mod tests {
         gui.settle(TurnOutcome::Completed);
         tui.settle(TurnOutcome::Completed);
         assert!(!control.has_active_turns());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_delivery_is_conversation_exclusive_across_surfaces() -> Result<(), ForegroundTurnError>
+    {
+        let control = ForegroundTurnControl::default();
+        let gui = control.begin_scoped(
+            "workspace-a",
+            ForegroundTurnSurface::Gui,
+            "conversation",
+            "gui-turn",
+        )?;
+        assert!(matches!(
+            control.begin_scoped(
+                "workspace-a",
+                ForegroundTurnSurface::Agent,
+                "conversation",
+                "Agent-turn",
+            ),
+            Err(ForegroundTurnError::Busy { .. })
+        ));
+        gui.settle(TurnOutcome::Completed);
+
+        let agent = control.begin_scoped(
+            "workspace-a",
+            ForegroundTurnSurface::Agent,
+            "conversation",
+            "Agent-turn",
+        )?;
+        assert!(matches!(
+            control.begin_scoped(
+                "workspace-a",
+                ForegroundTurnSurface::Tui,
+                "conversation",
+                "tui-turn",
+            ),
+            Err(ForegroundTurnError::Busy { .. })
+        ));
+        agent.settle(TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn scopes_same_conversation_identity_by_workspace() -> Result<(), ForegroundTurnError> {
+        let control = ForegroundTurnControl::default();
+        let workspace_a = control.begin_scoped(
+            "workspace-a",
+            ForegroundTurnSurface::Gui,
+            "conversation",
+            "turn-a",
+        )?;
+        let workspace_b = control.begin_scoped(
+            "workspace-b",
+            ForegroundTurnSurface::Gui,
+            "conversation",
+            "turn-b",
+        )?;
+
+        assert_eq!(
+            control
+                .snapshot_scoped("workspace-a", ForegroundTurnSurface::Gui, "conversation")
+                .map(|snapshot| snapshot.active_turn_id),
+            Some("turn-a".to_string())
+        );
+        assert_eq!(
+            control
+                .snapshot_scoped("workspace-b", ForegroundTurnSurface::Gui, "conversation")
+                .map(|snapshot| snapshot.active_turn_id),
+            Some("turn-b".to_string())
+        );
+        workspace_a.settle(TurnOutcome::Completed);
+        workspace_b.settle(TurnOutcome::Completed);
         Ok(())
     }
 

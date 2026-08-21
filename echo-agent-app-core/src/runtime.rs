@@ -559,7 +559,9 @@ pub(crate) fn configure_intent_router(
     keyword_classifier
 }
 
-async fn register_lsp_tools(agent_handle: &AgentHandle) -> crate::plugin_runtime::PluginLspRuntime {
+pub(crate) async fn register_lsp_tools(
+    agent_handle: &AgentHandle,
+) -> crate::plugin_runtime::PluginLspRuntime {
     use echo_agent::lsp::{LspConfig, LspManager};
     use std::sync::Arc;
     use tokio::sync::RwLock;

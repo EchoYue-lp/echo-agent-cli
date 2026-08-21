@@ -469,6 +469,7 @@ fn soak_plan(run_id: &str) -> TaskPlan {
             domain_profile: DomainProfile::General,
             depends_on: Vec::new(),
             parallel_group: None,
+            execution_target: None,
             files: Vec::new(),
             allowed_tools: Vec::new(),
             required_artifacts: Vec::new(),

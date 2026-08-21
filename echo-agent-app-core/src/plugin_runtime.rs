@@ -1197,6 +1197,11 @@ impl PluginRuntimeService {
             .collect()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn generation_for_test(&self) -> u64 {
+        self.state.lock().await.generation
+    }
+
     pub async fn get(&self, name: &str) -> Option<PluginEntry> {
         self.state.lock().await.registry.get(name).cloned()
     }

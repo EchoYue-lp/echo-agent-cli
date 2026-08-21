@@ -286,6 +286,9 @@ async fn run_desktop() -> anyhow::Result<()> {
         tracing::warn!(%error, "failed to bind plugin monitors to GUI scheduler");
     }
     let state = Arc::new(state_inner);
+    if let Err(error) = state.recover_agent_deliveries().await {
+        tracing::warn!(%error, "failed to resume durable Agent deliveries during GUI startup");
+    }
 
     let health_task = infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
 
@@ -310,6 +313,9 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
+    if let Err(error) = state.shutdown_agent_deliveries().await {
+        tracing::warn!(%error, "failed to settle GUI Agent deliveries");
+    }
     if let Err(error) = state.session.foreground_turns.shutdown().await {
         tracing::warn!(%error, "failed to settle GUI foreground turns");
     }

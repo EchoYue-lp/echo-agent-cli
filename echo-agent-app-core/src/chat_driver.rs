@@ -634,6 +634,16 @@ fn prepare_chat_execution(
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
 ) -> Result<ChatExecutionPreparation, String> {
+    if let Some(store) = res.store.as_ref() {
+        let active_workspace_id = store.active_workspace_id();
+        if active_workspace_id != res.execution_scope.workspace_id() {
+            return Err(format!(
+                "Chat execution scope {} does not match TaskRuntime workspace {}",
+                res.execution_scope.workspace_id(),
+                active_workspace_id
+            ));
+        }
+    }
     // Scope a per-turn run_id so task tools (task_create /
     // task_execute / create_complex_task) can read it via require_run_id().
     // Use root_message_id (unique per turn, set by all callers); fall back to
@@ -747,6 +757,7 @@ fn prepare_chat_execution(
         .map_err(|error| format!("Memory layer unavailable: {error}"))?
         .or_else(|| res.layer_manager.clone());
     let res = std::sync::Arc::new(crate::chat_resources::ChatResources {
+        execution_scope: res.execution_scope.clone(),
         pool: res.pool.clone(),
         store: res.store.clone(),
         sink: res.sink.clone(),
@@ -1388,7 +1399,7 @@ async fn drive_chat_inner(
     // Scope the chat resources into a task_local so tools the agent calls
     // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
     // can reach pool/store/sink via `current_chat_resources()`.
-    crate::chat_resources::with_chat_resources(res, async move {
+    crate::chat_resources::with_chat_resources(res.clone(), async move {
         // The RwLock read guard is held for the stream's lifetime because the
         // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
@@ -1438,7 +1449,7 @@ async fn drive_chat_inner(
                 trace_sink: Some(framework_trace_sink_for(&sink)),
                 delegation_policy: None,
             }),
-            working_dir: None,
+            working_dir: Some(res.execution_scope.root().to_path_buf()),
             cancel: None,
             disabled_tools,
             visible_tools,
@@ -1644,6 +1655,13 @@ impl ChatSink for ChannelChatSink {
 mod tests {
     use super::*;
 
+    fn test_execution_scope() -> crate::workspace::WorkspaceExecutionScope {
+        crate::workspace::WorkspaceExecutionScope::workspace(
+            &crate::workspace::WorkspaceId::from_name("test"),
+            ".",
+        )
+    }
+
     /// Build a minimal [`PreparedUserTurn`] for tests that do not exercise
     /// spill or attachment logic.
     fn make_turn(text: &str) -> crate::prepared_turn::PreparedUserTurn {
@@ -1782,6 +1800,7 @@ mod tests {
         ));
         let agent = AgentHandle::new(raw_agent);
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -1968,6 +1987,39 @@ mod tests {
         }
     }
 
+    struct WorkingDirProbeTool {
+        observed: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
+    }
+
+    impl echo_core::tools::Tool for WorkingDirProbeTool {
+        fn name(&self) -> &str {
+            "web_fetch"
+        }
+
+        fn description(&self) -> &str {
+            "record the invocation working directory"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn execute_with_context<'a>(
+            &'a self,
+            _parameters: echo_core::tools::ToolParameters,
+            context: &'a echo_core::tools::ToolContext,
+        ) -> futures::future::BoxFuture<'a, echo_core::error::Result<echo_core::tools::ToolResult>>
+        {
+            Box::pin(async move {
+                *self
+                    .observed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = context.working_dir.clone();
+                Ok(echo_core::tools::ToolResult::success("recorded"))
+            })
+        }
+    }
+
     /// Test-only sink that records received events for assertions.
     struct MockChatSink {
         events: std::sync::Mutex<Vec<EventEnvelope>>,
@@ -2126,6 +2178,7 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let resources = crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: None,
             sink: std::sync::Arc::new(MockChatSink::default()),
@@ -2177,6 +2230,7 @@ mod tests {
         let configured = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let configured_for_call = configured.clone();
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: Some(pool.clone()),
             store: Some(store),
             sink: Arc::new(MockChatSink::default()),
@@ -2237,6 +2291,7 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2329,6 +2384,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let cancel = CancellationToken::new();
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2445,6 +2501,7 @@ mod tests {
             .configure_run_continuation("pre-driver-shutdown-run", true, false, None, None)
             .map_err(|error| error.to_string())?;
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2562,6 +2619,7 @@ mod tests {
 
         let resources_for = |turn_id: &str| {
             Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: test_execution_scope(),
                 pool: None,
                 store: Some(store.clone()),
                 sink: Arc::new(MockChatSink::default()),
@@ -2667,6 +2725,7 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2786,6 +2845,7 @@ mod tests {
         );
         let chat_sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(store.clone()),
             sink: chat_sink.clone(),
@@ -2940,6 +3000,7 @@ mod tests {
         }
         let sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(store.clone()),
             sink,
@@ -3026,6 +3087,7 @@ mod tests {
             &auto_agent,
             &make_turn("continue"),
             Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: test_execution_scope(),
                 pool: None,
                 store: Some(store.clone()),
                 sink: Arc::new(MockChatSink::default()),
@@ -3125,6 +3187,7 @@ mod tests {
         crate::tasks::task_runtime::register_task_tools_on_agent(&agent, store.clone()).await;
         let sink: Arc<dyn ChatSink> = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(store.clone()),
             sink,
@@ -3299,6 +3362,7 @@ mod tests {
             parked: std::sync::atomic::AtomicBool::new(false),
         });
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink,
@@ -3403,6 +3467,7 @@ mod tests {
             );
             let turn_id = format!("{}-rejected", mode.as_str());
             let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: test_execution_scope(),
                 pool: None,
                 store: Some(store.clone()),
                 sink: Arc::new(MockChatSink::default()),
@@ -3464,6 +3529,7 @@ mod tests {
                 .expect("in-memory store"),
         );
         let res = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(Arc::clone(&store)),
             sink,
@@ -3541,6 +3607,7 @@ mod tests {
         );
         let chat_sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: None,
             sink: chat_sink.clone(),
@@ -3651,6 +3718,7 @@ mod tests {
         let chat_sink = Arc::new(MockChatSink::default());
         let sink: Arc<dyn ChatSink> = chat_sink;
         let res = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(Arc::clone(&store)),
             sink,
@@ -3748,6 +3816,7 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         let res = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
             pool: None,
             store: Some(store),
             sink,
@@ -3831,6 +3900,7 @@ mod tests {
         ] {
             let sink: Arc<dyn ChatSink> = Arc::new(MockChatSink::default());
             let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: test_execution_scope(),
                 pool: None,
                 store: None,
                 sink,
@@ -3850,6 +3920,108 @@ mod tests {
 
         if calls.load(std::sync::atomic::Ordering::SeqCst) != 1 {
             return Err("Chat exclusion leaked or Auto tool execution was blocked".to_string());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_execution_scope_reaches_tool_context() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp
+            .path()
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let observed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mock = std::sync::Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("scope-test")
+                .then_tool_call("scope-call", "web_fetch", "{}")
+                .with_response("done"),
+        );
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("scope-test")
+                .llm_client(mock)
+                .tool(Box::new(WorkingDirProbeTool {
+                    observed: std::sync::Arc::clone(&observed),
+                }))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let resources = std::sync::Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::workspace(
+                &crate::workspace::WorkspaceId::from_name("scope-test"),
+                root.clone(),
+            ),
+            pool: None,
+            store: None,
+            sink: std::sync::Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("scope-conversation".to_string()),
+            root_message_id: "scope-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+
+        drive_chat(&agent, &make_turn("probe"), resources).await?;
+        let actual = observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if actual.as_ref() != Some(&root) {
+            return Err(format!(
+                "tool observed working directory {actual:?}, expected {root:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mismatched_task_runtime_workspace_is_rejected_before_agent_execution()
+    -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("scope-test")
+                .llm_client(std::sync::Arc::new(
+                    echo_agent::testing::MockLlmClient::new()
+                        .with_model_name("scope-test")
+                        .with_response("must not execute"),
+                ))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let resources = std::sync::Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: crate::workspace::WorkspaceExecutionScope::global("."),
+            pool: None,
+            store: Some(store),
+            sink: std::sync::Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("scope-conversation".to_string()),
+            root_message_id: "scope-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: echo_agent::agent::CancellationToken::new(),
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+
+        let error = drive_chat(&agent, &make_turn("probe"), resources)
+            .await
+            .err()
+            .ok_or_else(|| "mismatched workspace scope was accepted".to_string())?;
+        if !error.contains("does not match TaskRuntime workspace") {
+            return Err(format!("unexpected scope mismatch error: {error}"));
         }
         Ok(())
     }

@@ -125,6 +125,17 @@ impl ReplTurnStartError {
         }
     }
 
+    fn from_scoped_admission(error: echo_agent_app_core::state::ScopedChatTurnError) -> Self {
+        match error {
+            echo_agent_app_core::state::ScopedChatTurnError::Conversation(error) => {
+                Self::from_conversation_admission(error)
+            }
+            echo_agent_app_core::state::ScopedChatTurnError::Runtime(error) => {
+                Self::Permanent(error)
+            }
+        }
+    }
+
     fn should_retain_fifo_head(&self) -> bool {
         matches!(self, Self::Retryable(_))
     }
@@ -138,6 +149,8 @@ impl ReplTurnStartError {
 }
 
 struct PreparedReplTurnStart {
+    scoped_runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    pool_execution: echo_agent_app_core::agent_pool::AgentPoolExecutionLease,
     conversation_id: String,
     turn_id: String,
     turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
@@ -146,6 +159,7 @@ struct PreparedReplTurnStart {
 }
 
 struct ActiveReplTurn {
+    workspace_id: String,
     conversation_id: String,
     turn_id: String,
     control: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
@@ -175,7 +189,8 @@ impl Drop for ActiveReplTurn {
         {
             return;
         }
-        if let Err(error) = self.control.request_cancel(
+        if let Err(error) = self.control.request_cancel_scoped(
+            &self.workspace_id,
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
             &self.conversation_id,
             &self.turn_id,
@@ -1138,6 +1153,7 @@ async fn run_repl_inner(
     // Build command registry with trait-based commands
     let mut registry = crate::cli::command::CommandRegistry::new();
     crate::cli::cmd_impls::analysis::register_all(&mut registry);
+    crate::cli::cmd_impls::agent_router::register_all(&mut registry);
     crate::cli::cmd_impls::coding::register_all(&mut registry);
     crate::cli::cmd_impls::diff_cmd::register_all(&mut registry);
     crate::cli::cmd_impls::developer::register_all(&mut registry);
@@ -1744,7 +1760,8 @@ async fn cancel_and_drain_active(
     output: &OutputRenderer,
 ) -> Option<PendingGitAction> {
     let identity = active.as_ref()?;
-    let waiter = match control.request_cancel(
+    let waiter = match control.request_cancel_scoped(
+        &identity.workspace_id,
         echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
         &identity.conversation_id,
         &identity.turn_id,
@@ -1951,14 +1968,24 @@ async fn prepare_repl_turn_start(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| config.conversation_id.clone());
     let control = app_state.session.foreground_turns.clone();
-    let lease = app_state
-        .begin_conversation_turn_owned(
+    let (scoped_runtime, lease) = app_state
+        .begin_scoped_chat_turn_owned(
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
             &conversation_id,
             turn_id.clone(),
         )
         .await
-        .map_err(ReplTurnStartError::from_conversation_admission)?;
+        .map_err(ReplTurnStartError::from_scoped_admission)?;
+    let pool_execution = match scoped_runtime.agent_for(&conversation_id).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            let detail = format!("CLI AgentPool admission failed: {error}");
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("agent_pool", detail.clone()),
+            ));
+            return Err(ReplTurnStartError::Permanent(detail));
+        }
+    };
     let workspace_root = match config.app_state.as_ref() {
         Some(state) => state
             .current_workspace()
@@ -1993,6 +2020,8 @@ async fn prepare_repl_turn_start(
         }
     };
     Ok(PreparedReplTurnStart {
+        scoped_runtime,
+        pool_execution,
         conversation_id,
         turn_id,
         turn,
@@ -2002,7 +2031,7 @@ async fn prepare_repl_turn_start(
 }
 
 fn spawn_prepared_repl_turn(
-    agent: &AgentHandle,
+    _agent: &AgentHandle,
     input: QueuedReplTurn,
     output: &OutputRenderer,
     live_output: ReplExternalOutput,
@@ -2010,6 +2039,8 @@ fn spawn_prepared_repl_turn(
     prepared: PreparedReplTurnStart,
 ) -> ActiveReplTurn {
     let PreparedReplTurnStart {
+        scoped_runtime,
+        pool_execution,
         conversation_id,
         turn_id,
         turn,
@@ -2034,8 +2065,9 @@ fn spawn_prepared_repl_turn(
         });
     let _ = live_output.bind_turn_cancel(cancel.clone());
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-        pool: config.pool.clone(),
-        store: config.task_runtime_store.clone(),
+        execution_scope: scoped_runtime.execution_scope().clone(),
+        pool: scoped_runtime.pool(),
+        store: scoped_runtime.task_runtime(),
         sink,
         webhook_emitter: config.webhook_emitter.clone(),
         conv_id: Some(conversation_id.clone()),
@@ -2043,7 +2075,7 @@ fn spawn_prepared_repl_turn(
         attachments: turn.inline_attachment_refs(),
         cancel,
         interaction_mode: input.interaction_mode,
-        review_integration: config.review_integration.clone(),
+        review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
         human_loop_provider: config.app_state.as_ref().map(|state| {
@@ -2051,10 +2083,12 @@ fn spawn_prepared_repl_turn(
                 as Arc<dyn echo_agent::human_loop::HumanLoopProvider>
         }),
     });
-    let agent_owned = agent.clone();
+    let agent_owned = pool_execution.agent();
+    let workspace_id = scoped_runtime.execution_scope().workspace_id().to_string();
     let bound_turn_id = turn_id.clone();
     let (completion_tx, completion) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
+        let _pool_execution = pool_execution;
         let _ = live_output.print_user_message(&input.message);
         let _ = live_output.emit("Connecting to model...");
         let result = match input.task_run_resume {
@@ -2092,6 +2126,7 @@ fn spawn_prepared_repl_turn(
     });
 
     ActiveReplTurn {
+        workspace_id,
         conversation_id,
         turn_id,
         control,
@@ -2485,6 +2520,7 @@ mod tests {
             0
         });
         let mut active = Some(ActiveReplTurn {
+            workspace_id: "global".to_string(),
             conversation_id: "queued-follow-up-conversation".to_string(),
             turn_id: "queued-follow-up-turn".to_string(),
             control: control.clone(),
@@ -2589,6 +2625,7 @@ mod tests {
             0
         });
         let mut active = Some(ActiveReplTurn {
+            workspace_id: "global".to_string(),
             conversation_id: "interrupt-conversation".to_string(),
             turn_id: "interrupt-turn".to_string(),
             control: control.clone(),
@@ -2675,6 +2712,7 @@ mod tests {
             0
         });
         let mut active = Some(ActiveReplTurn {
+            workspace_id: "global".to_string(),
             conversation_id: "sink-failure-conversation".to_string(),
             turn_id: "sink-failure-turn".to_string(),
             control: control.clone(),
@@ -2873,6 +2911,7 @@ mod tests {
                 .map_err(|error| error.to_string())?,
         );
         let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+            execution_scope: echo_agent_app_core::workspace::WorkspaceExecutionScope::global("."),
             pool: None,
             store: None,
             sink,
@@ -2935,6 +2974,7 @@ mod tests {
             0
         });
         let active = ActiveReplTurn {
+            workspace_id: "global".to_string(),
             conversation_id: "drop-conversation".to_string(),
             turn_id: "drop-turn".to_string(),
             control: control.clone(),
@@ -3000,6 +3040,7 @@ mod tests {
         let conversation_id = format!("conversation-{reason}");
         let turn_id = format!("turn-{reason}");
         let mut active = Some(ActiveReplTurn {
+            workspace_id: "global".to_string(),
             conversation_id: conversation_id.clone(),
             turn_id,
             control: control.clone(),

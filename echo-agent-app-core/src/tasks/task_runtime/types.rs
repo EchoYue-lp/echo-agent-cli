@@ -1120,6 +1120,29 @@ pub struct CompletionGateReport {
     pub blockers: Vec<RunCompletionBlocker>,
 }
 
+/// Frozen product-layer address for one cross-workspace PlanTask dispatch.
+/// `group_id` and `subagent_role` retain the user's group intent while the
+/// concrete address prevents later group edits from retargeting this revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskExecutionTarget")]
+pub struct TaskExecutionTarget {
+    pub group_id: String,
+    pub subagent_role: String,
+    pub address: crate::agent_router::AgentAddress,
+}
+
+impl TaskExecutionTarget {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.group_id.trim().is_empty() || self.group_id.chars().count() > 128 {
+            return Err("execution_target.group_id must contain 1-128 characters".to_string());
+        }
+        if self.subagent_role.trim().is_empty() || self.subagent_role.chars().count() > 128 {
+            return Err("execution_target.subagent_role must contain 1-128 characters".to_string());
+        }
+        self.address.validate().map_err(|error| error.to_string())
+    }
+}
+
 /// EKO file/UI projection of the immutable framework task specification.
 ///
 /// This DTO preserves EKO metadata for `plan.json` and generated TypeScript;
@@ -1135,6 +1158,8 @@ pub struct EkoTaskSpec {
     pub domain_profile: DomainProfile,
     pub depends_on: Vec<String>,
     pub parallel_group: Option<String>,
+    #[serde(default)]
+    pub execution_target: Option<TaskExecutionTarget>,
     pub files: Vec<String>,
     pub allowed_tools: Vec<String>,
     pub required_artifacts: Vec<String>,
@@ -1150,6 +1175,7 @@ impl EkoTaskSpec {
         let metadata = serde_json::to_value(EkoTaskMetadata {
             domain_profile: self.domain_profile,
             parallel_group: self.parallel_group.clone(),
+            execution_target: self.execution_target.clone(),
             sort_order: self.sort_order,
         })
         .map_err(|error| format!("task '{}' has invalid EKO metadata: {error}", self.id))?;
@@ -1190,6 +1216,8 @@ pub struct EkoTaskExecution {
 pub struct EkoTaskMetadata {
     pub domain_profile: DomainProfile,
     pub parallel_group: Option<String>,
+    #[serde(default)]
+    pub execution_target: Option<TaskExecutionTarget>,
     pub sort_order: i64,
 }
 
@@ -1561,6 +1589,11 @@ pub struct PlanTask {
     pub domain_profile: DomainProfile,
     pub depends_on: Vec<String>,
     pub parallel_group: Option<String>,
+    /// Optional cross-workspace member selected from a persistent Agent group.
+    /// The full address is frozen into the plan revision so later group edits
+    /// cannot silently retarget an accepted task.
+    #[serde(default)]
+    pub execution_target: Option<TaskExecutionTarget>,
     /// Read targets for read-only tasks. For mutating tasks, exact
     /// workspace-relative files are exclusive ownership; empty/broad/invalid
     /// declarations are unknown ownership and serialize with every writer.
@@ -1611,6 +1644,7 @@ impl Default for PlanTask {
             domain_profile: DomainProfile::General,
             depends_on: Vec::new(),
             parallel_group: None,
+            execution_target: None,
             files: Vec::new(),
             allowed_tools: Vec::new(),
             required_artifacts: Vec::new(),
@@ -1638,6 +1672,7 @@ impl PlanTask {
             domain_profile: self.domain_profile,
             depends_on: self.depends_on.clone(),
             parallel_group: self.parallel_group.clone(),
+            execution_target: self.execution_target.clone(),
             files: self.files.clone(),
             allowed_tools: self.allowed_tools.clone(),
             required_artifacts: self.required_artifacts.clone(),
@@ -1668,6 +1703,7 @@ impl PlanTask {
             domain_profile: spec.domain_profile,
             depends_on: spec.depends_on,
             parallel_group: spec.parallel_group,
+            execution_target: spec.execution_target,
             files: spec.files,
             allowed_tools: spec.allowed_tools,
             required_artifacts: spec.required_artifacts,
@@ -1696,6 +1732,10 @@ impl PlanTask {
                     .clone()
                     .map(serde_json::Value::String)
                     .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "execution_target".to_string(),
+                serde_json::to_value(&self.execution_target).unwrap_or(serde_json::Value::Null),
             ),
             (
                 "sort_order".to_string(),
@@ -1754,6 +1794,7 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
             domain_profile: metadata.domain_profile,
             depends_on: spec.depends_on,
             parallel_group: metadata.parallel_group,
+            execution_target: metadata.execution_target,
             files: spec.files,
             allowed_tools: spec.allowed_tools,
             required_artifacts: spec.required_artifacts,
@@ -2596,6 +2637,14 @@ mod tests {
             domain_profile: DomainProfile::AiCoding,
             depends_on: vec!["t0".to_string()],
             parallel_group: Some("g1".to_string()),
+            execution_target: Some(TaskExecutionTarget {
+                group_id: "group-1".to_string(),
+                subagent_role: "explorer".to_string(),
+                address: crate::agent_router::AgentAddress::new(
+                    crate::workspace::WorkspaceId::from_name("remote"),
+                    "remote-conversation",
+                ),
+            }),
             files: vec!["src/lib.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: vec!["report.md".to_string()],
@@ -2638,6 +2687,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(metadata.domain_profile, DomainProfile::AiCoding);
         assert_eq!(metadata.parallel_group.as_deref(), Some("g1"));
+        assert_eq!(metadata.execution_target, task.execution_target);
         assert_eq!(metadata.sort_order, 10);
 
         let round_trip = PlanTask::try_from(runtime)?;
@@ -2645,6 +2695,7 @@ mod tests {
         assert_eq!(round_trip.kind, task.kind);
         assert_eq!(round_trip.domain_profile, task.domain_profile);
         assert_eq!(round_trip.depends_on, task.depends_on);
+        assert_eq!(round_trip.execution_target, task.execution_target);
         assert_eq!(round_trip.required_artifacts, task.required_artifacts);
         assert_eq!(round_trip.execution_checks, task.execution_checks);
         assert_eq!(round_trip.acceptance_criteria, task.acceptance_criteria);
@@ -2664,6 +2715,7 @@ mod tests {
             domain_profile: DomainProfile::AiCoding,
             depends_on: Vec::new(),
             parallel_group: None,
+            execution_target: None,
             files: Vec::new(),
             allowed_tools: Vec::new(),
             required_artifacts: Vec::new(),

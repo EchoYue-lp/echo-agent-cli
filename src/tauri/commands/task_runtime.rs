@@ -545,7 +545,9 @@ async fn resume_continuation_run(
     let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn::runtime_instruction(format!(
         "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative runtime projection and continue the next useful work."
     ));
+    let execution_scope = state.app_state.current_execution_scope().await;
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+        execution_scope,
         pool: state.app_state.connection.pool.clone(),
         store: Some(store.clone()),
         sink: sink.clone(),
@@ -834,12 +836,13 @@ pub async fn get_progress_ledger(
     run_id: String,
 ) -> Result<String, IpcError> {
     let store = store(&state)?;
-    // Use CWD as the workspace root — AppState::set_workspace does
-    // std::env::set_current_dir to the workspace root, so CWD is correct
-    // in the normal case. Falls back gracefully if CWD is unavailable.
-    let base = std::env::current_dir().ok();
-    echo_agent_app_core::tasks::task_runtime::write_progress(&store, &run_id, base.as_deref())
-        .map_err(internal)
+    let execution_scope = state.app_state.current_execution_scope().await;
+    echo_agent_app_core::tasks::task_runtime::write_progress(
+        &store,
+        &run_id,
+        Some(execution_scope.root()),
+    )
+    .map_err(internal)
 }
 
 #[cfg(test)]
