@@ -636,23 +636,36 @@ impl ToolExecutionRepository {
                 stream: stream_path_for_manifest(&path),
                 manifest: path,
             };
-            repair_torn_stream_tail(&location.stream)?;
-            let mut manifest = read_manifest_path(&location.manifest)?;
-            if manifest.summary.status == ToolExecutionStatus::Running {
-                let finished_at = now_millis();
-                manifest.summary.status = ToolExecutionStatus::Interrupted;
-                manifest.summary.finished_at = Some(finished_at);
-                manifest.summary.duration_ms =
-                    Some(finished_at.saturating_sub(manifest.summary.started_at));
-                manifest.output_bytes = stream_output_bytes(&location.stream)?.unwrap_or(0);
-                write_manifest(&location.manifest, &manifest)?;
-            }
+            let recovered = (|| -> ToolExecutionResult<StoredManifest> {
+                repair_torn_stream_tail(&location.stream)?;
+                let mut manifest = read_manifest_path(&location.manifest)?;
+                if manifest.summary.status == ToolExecutionStatus::Running {
+                    let finished_at = now_millis();
+                    manifest.summary.status = ToolExecutionStatus::Interrupted;
+                    manifest.summary.finished_at = Some(finished_at);
+                    manifest.summary.duration_ms =
+                        Some(finished_at.saturating_sub(manifest.summary.started_at));
+                    manifest.output_bytes = stream_output_bytes(&location.stream)?.unwrap_or(0);
+                    write_manifest(&location.manifest, &manifest)?;
+                }
+                Ok(manifest)
+            })();
+            let manifest = match recovered {
+                Ok(manifest) => manifest,
+                Err(error) => {
+                    quarantine_manifest(&location.manifest, &error);
+                    continue;
+                }
+            };
             let key = execution_key(&manifest.summary.owner, &manifest.summary.call_id);
             let mut state = self.lock_state();
             if state.summaries.contains_key(&key) {
-                return Err(ToolExecutionError::ProjectionConflict(format!(
+                let error = ToolExecutionError::ProjectionConflict(format!(
                     "duplicate persisted identity {key:?}"
-                )));
+                ));
+                drop(state);
+                quarantine_manifest(&location.manifest, &error);
+                continue;
             }
             state
                 .details
@@ -964,6 +977,24 @@ fn write_manifest(path: &Path, manifest: &StoredManifest) -> ToolExecutionResult
 fn read_manifest_path(path: &Path) -> ToolExecutionResult<StoredManifest> {
     let bytes = echo_core::utils::fs::read_existing(path)?;
     Ok(serde_json::from_slice(&bytes)?)
+}
+
+fn quarantine_manifest(path: &Path, error: &dyn std::fmt::Display) {
+    let target = path.with_extension(format!("json.corrupt-{}", uuid::Uuid::new_v4()));
+    match fs::rename(path, &target) {
+        Ok(()) => tracing::warn!(
+            path = %path.display(),
+            quarantine = %target.display(),
+            %error,
+            "isolated unreadable tool execution manifest"
+        ),
+        Err(rename_error) => tracing::warn!(
+            path = %path.display(),
+            %error,
+            %rename_error,
+            "failed to isolate unreadable tool execution manifest"
+        ),
+    }
 }
 
 fn find_manifest_files(root: &Path) -> ToolExecutionResult<Vec<PathBuf>> {
@@ -1300,6 +1331,31 @@ mod tests {
                 .summaries_for_conversation("conversation-1")
                 .is_empty()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn open_isolates_unreadable_manifest_and_keeps_repository_available()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let details = temp.path().join("scope/run/details");
+        fs::create_dir_all(&details)?;
+        let manifest = details.join("broken.json");
+        fs::write(&manifest, b"{not-json}\n")?;
+
+        let repository = ToolExecutionRepository::open(temp.path())?;
+        assert!(
+            repository
+                .summaries_for_conversation("conversation")
+                .is_empty()
+        );
+        assert!(!manifest.exists());
+        assert!(fs::read_dir(details)?.any(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.file_name().to_str().map(str::to_string))
+                .is_some_and(|name| name.starts_with("broken.json.corrupt-"))
+        }));
         Ok(())
     }
 

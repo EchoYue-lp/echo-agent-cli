@@ -66,11 +66,8 @@ fn install_panic_hook() {
 
 /// Run the Tauri desktop app and report startup failures to a crash log.
 pub async fn run_desktop_entry() -> anyhow::Result<()> {
-    // 统一全局根目录为 ~/.eko。必须在 crash_log_path()/init_logging 等任何路径
-    // 解析之前调用(dedicated echo-agent-tauri bin 直接进这里)。
-    let _ = echo_agent::paths::set_user_data_dir_name(".eko");
-    // 插件数据同步落到 ~/.eko/plugins(默认 ~/.echo-agent/plugins,审计 P0-3)。
-    let _ = echo_agent::plugin::set_plugin_data_base_dir_name(".eko");
+    // Must run before crash_log_path(), logging, or any Store resolves a path.
+    crate::configure_data_root()?;
 
     install_panic_hook();
 

@@ -9,6 +9,8 @@
 
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
+
 use super::checkpoint::RuntimeCheckpoint;
 use super::event_rebuild::EventFoldState;
 use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
@@ -18,17 +20,9 @@ use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTask
 #[derive(Clone)]
 pub struct FileTaskShadow {
     root: std::sync::Arc<std::sync::RwLock<PathBuf>>,
-    /// In-memory seq cache (run_id → last assigned seq) to avoid reading the
-    /// tail of `events.jsonl` on every append. Seeded lazily from the final
-    /// durable event on first append per run, so it self-heals across restarts.
-    /// Shared across clones via `Arc` so all clones of this shadow agree on seq.
-    /// Contention is low: the store holds
-    /// a single `Mutex` serializing all writes (the in-memory usage/conv-event
-    /// mutexes, not a DB connection).
-    seq_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
     /// Per-run write locks shared by event append and snapshot rewrite.
-    /// `append_event_line` holds the lock across seq allocation → append →
-    /// cache update; `rewrite_plan` acquires it again after append returns.
+    /// `append_event_line` holds the lock across seq allocation and append;
+    /// `rewrite_plan` acquires it again after append returns.
     /// This prevents duplicate seq allocation and stale plan.json renames.
     /// Different runs still run in parallel; only same-run writes serialize.
     run_write_locks: std::sync::Arc<
@@ -59,7 +53,6 @@ impl FileTaskShadow {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let shadow = Self {
             root: std::sync::Arc::new(std::sync::RwLock::new(root.into())),
-            seq_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             run_write_locks: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
@@ -106,10 +99,6 @@ impl FileTaskShadow {
             .root
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = root;
-        self.seq_cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
         self.run_write_locks
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -275,11 +264,6 @@ impl FileTaskShadow {
             return stage_result;
         }
 
-        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
-        self.seq_cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(run_id.to_string(), last_seq);
         if let Some(hook) = self.event_hook.get() {
             for event in events {
                 hook(event);
@@ -305,10 +289,11 @@ impl FileTaskShadow {
     /// incrementally refresh the snapshots. seq is per-run (each run has its own
     /// `events.jsonl`), so appending to run B does not advance run A's seq.
     ///
-    /// Atomicity: the append is serialized by the store mutex (single writer),
-    /// and the line is written with a trailing newline. A crash mid-append can
-    /// at worst leave the last partial line; the next append repairs that torn
-    /// tail before allocating its sequence.
+    /// Atomicity: the append is serialized by both the in-process per-run mutex
+    /// and an OS advisory lock. The latter is required because independent
+    /// stores and processes can point at the same local data root. A crash
+    /// mid-append can at worst leave the last partial line; the next append
+    /// repairs that torn tail before allocating its sequence.
     pub fn append_event_line(
         &self,
         run_id: &str,
@@ -317,7 +302,7 @@ impl FileTaskShadow {
         event_type: super::types::RuntimeEventKind,
         payload: serde_json::Value,
     ) -> Result<RuntimeTaskEvent, ShadowError> {
-        // Hold the per-run write lock across seq alloc → append → cache bump.
+        // Hold the per-run write lock across seq allocation and durable append.
         // This closes the duplicate-seq race that arose when callers entered
         // `next_seq` concurrently and each observed the same cached value
         // before any append landed (observed in production events.jsonl as
@@ -328,11 +313,12 @@ impl FileTaskShadow {
 
         let dir = self.run_dir(run_id);
         std::fs::create_dir_all(&dir).map_err(|e| ShadowError::Io(e.to_string()))?;
+        let _file_guard = self.lock_run_file(run_id)?;
         repair_torn_tail(&self.events_path(run_id))?;
+        self.validate_event_stream_for_append(run_id)?;
 
-        // seq = last assigned + 1 (1-based). Cached in memory per run to avoid
-        // reading the events.jsonl tail on every append; seeded from the final
-        // durable event on first touch per run so it self-heals across restarts.
+        // seq = durable last assigned + 1 (1-based). The file lock makes the
+        // read/allocate/append sequence atomic across processes.
         let next_seq = self.next_seq(run_id)?;
 
         let event = RuntimeTaskEvent {
@@ -353,13 +339,8 @@ impl FileTaskShadow {
         append_line(&self.events_path(run_id), line.as_bytes())
             .map_err(|e| ShadowError::Io(e.to_string()))?;
 
-        // Advance the in-memory cache so the next append doesn't re-read the file.
-        if let Ok(mut cache) = self.seq_cache.lock() {
-            cache.insert(run_id.to_string(), next_seq);
-        }
-        // Fire the event hook (if attached) AFTER the cache bump and OUTSIDE
-        // the seq-allocation critical section, but still under the per-run
-        // write lock. The bounded HookEventDispatcher normally makes this a
+        // Fire the event hook after the durable append, while still under the
+        // per-run write lock. The bounded HookEventDispatcher normally makes this a
         // cheap enqueue; when saturated it deliberately applies backpressure
         // instead of dropping lifecycle events. This is the single point
         // the HookEventDispatcher observes every RuntimeEventKind transition
@@ -379,7 +360,7 @@ impl FileTaskShadow {
     /// the map is bounded by total runs ever written.
     fn run_write_lock(&self, run_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
         // Mutex::lock only fails on poison; recover the inner guard rather than
-        // panicking (matches the existing seq_cache pattern in this module).
+        // panicking and losing the local serialization authority.
         let mut map = self
             .run_write_locks
             .lock()
@@ -387,6 +368,41 @@ impl FileTaskShadow {
         map.entry(run_id.to_string())
             .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
             .clone()
+    }
+
+    fn lock_run_file(&self, run_id: &str) -> Result<std::fs::File, ShadowError> {
+        use sha2::Digest;
+
+        let root = self.root();
+        let lock_root = root
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join(".task-runtime-locks");
+        std::fs::create_dir_all(&lock_root).map_err(|error| ShadowError::Io(error.to_string()))?;
+        let mut identity = root.to_string_lossy().as_bytes().to_vec();
+        identity.push(0);
+        identity.extend_from_slice(run_id.as_bytes());
+        let digest = sha2::Sha256::digest(&identity);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_root.join(hex::encode(digest)))
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+        lock.lock_exclusive()
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+        Ok(lock)
+    }
+
+    fn validate_event_stream_for_append(&self, run_id: &str) -> Result<(), ShadowError> {
+        match self.load_checkpoint_suffix(run_id) {
+            Some(Ok(_)) => Ok(()),
+            Some(Err(_)) | None => {
+                let events = self.read_events(run_id)?;
+                validate_event_suffix(run_id, 0, &events)
+            }
+        }
     }
 
     /// Refresh the projections affected by the latest event.
@@ -433,6 +449,7 @@ impl FileTaskShadow {
         // would rebuild and rename plan.json without serialization.
         let lock = self.run_write_lock(run_id);
         let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _file_guard = self.lock_run_file(run_id)?;
 
         let (mut state, events, used_checkpoint) = match self.load_checkpoint_suffix(run_id) {
             Some(Ok((checkpoint, suffix))) => (checkpoint.state, suffix, true),
@@ -547,23 +564,12 @@ impl FileTaskShadow {
         })())
     }
 
-    /// Compute the next seq for `run_id`: last assigned + 1 (1-based).
-    ///
-    /// Uses the in-memory `seq_cache` on the steady path. On first touch after
-    /// restart, reads only the final complete JSONL event rather than parsing
-    /// the entire history. Returns 1 if the file does not exist yet.
+    /// Compute the next seq for `run_id`: durable last assigned + 1 (1-based).
+    /// The caller must hold the run's advisory file lock.
     fn next_seq(&self, run_id: &str) -> Result<i64, ShadowError> {
-        // Fast path: cached.
-        if let Ok(cache) = self.seq_cache.lock()
-            && let Some(&last) = cache.get(run_id)
-        {
-            return last
-                .checked_add(1)
-                .ok_or_else(|| ShadowError::Rebuild("event seq overflow".to_string()));
-        }
-        // Restart path: seed from the final durable event in bounded backwards
-        // reads. Event lines may be large, so the scan continues by block until
-        // it finds the preceding newline without assuming a maximum line size.
+        // Event lines may be large, so the bounded backwards scan continues by
+        // block until it finds the preceding newline without assuming a maximum
+        // line size.
         let last = read_last_event(&self.events_path(run_id))?;
         match last {
             Some(event) if event.run_id != run_id => Err(ShadowError::Rebuild(format!(
@@ -679,10 +685,6 @@ impl FileTaskShadow {
         drop(guards);
 
         for run_id in &run_ids {
-            self.seq_cache
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .remove(run_id);
             self.run_write_locks
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -2325,5 +2327,53 @@ mod tests {
         // Seqs are 2..=(97), because RunCreated took seq=1.
         let expected: Vec<i64> = (2..=(1 + threads * per_thread) as i64).collect();
         assert_eq!(all_seqs, expected, "seq must be strictly contiguous");
+    }
+
+    #[test]
+    fn independent_shadows_share_durable_sequence_lock() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let first = FileTaskShadow::new(tmp.path().to_path_buf());
+        let second = FileTaskShadow::new(tmp.path().to_path_buf());
+        let run_id = "r-independent";
+        first.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunCreated,
+            serde_json::json!({"goal": "x"}),
+        )?;
+
+        let handles = [first.clone(), second]
+            .into_iter()
+            .map(|shadow| {
+                std::thread::spawn(move || -> Result<Vec<i64>, ShadowError> {
+                    let mut sequences = Vec::new();
+                    for index in 0..24 {
+                        let event = shadow.append_event_line(
+                            run_id,
+                            None,
+                            None,
+                            RuntimeEventKind::Note,
+                            serde_json::json!({"index": index}),
+                        )?;
+                        sequences.push(event.seq);
+                    }
+                    Ok(sequences)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut sequences = Vec::new();
+        for handle in handles {
+            let joined = handle
+                .join()
+                .map_err(|_| std::io::Error::other("append thread panicked"))?;
+            sequences.extend(joined?);
+        }
+        sequences.sort_unstable();
+        assert_eq!(sequences, (2_i64..=49).collect::<Vec<_>>());
+        let events = first.read_events(run_id)?;
+        assert_eq!(events.len(), 49);
+        validate_event_suffix(run_id, 0, &events)?;
+        Ok(())
     }
 }

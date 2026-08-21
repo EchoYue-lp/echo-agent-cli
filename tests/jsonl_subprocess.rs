@@ -233,7 +233,27 @@ fn serve_fixture_request(
     if !uses_tools {
         return write_sse(&mut stream, final_answer_sse());
     }
-    let request_index = requests.fetch_add(1, Ordering::AcqRel);
+    let request_index = match mode {
+        #[cfg(unix)]
+        FixtureMode::Stall => {
+            stream.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            )?;
+            stream.flush()?;
+            // The cancellation test treats the request count as its readiness
+            // barrier. Publish it only after the streaming response is live.
+            requests.fetch_add(1, Ordering::AcqRel);
+            while !stop.load(Ordering::Acquire) {
+                if stream.write_all(b": fixture keepalive\n\n").is_err() || stream.flush().is_err()
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            return Ok(());
+        }
+        _ => requests.fetch_add(1, Ordering::AcqRel),
+    };
 
     match mode {
         FixtureMode::ToolThenAnswer if request_index == 0 => {
@@ -252,20 +272,7 @@ fn serve_fixture_request(
         FixtureMode::TaskThenAnswer => write_sse(&mut stream, final_answer_sse()),
         FixtureMode::Error => write_http_error(&mut stream),
         #[cfg(unix)]
-        FixtureMode::Stall => {
-            stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-            )?;
-            stream.flush()?;
-            while !stop.load(Ordering::Acquire) {
-                if stream.write_all(b": fixture keepalive\n\n").is_err() || stream.flush().is_err()
-                {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(())
-        }
+        FixtureMode::Stall => Ok(()),
     }
 }
 
@@ -447,7 +454,7 @@ fn spawn_jsonl(root: &IsolatedRoot, endpoint: &str) -> Result<std::process::Chil
         .arg(config)
         .arg("--project")
         .arg(root.path())
-        // EKO resolves its user data root as `$HOME/.eko` during process startup.
+        .env("EKO_DATA_DIR", root.path().join(".eko"))
         .env("HOME", root.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -777,7 +784,13 @@ fn jsonl_subprocess_sigint_emits_one_cancelled_fact_and_terminal() -> Result<()>
     let output = wait_for_output(child, Duration::from_secs(30))?;
     server.shutdown()?;
     let events = parse_stdout(&output)?;
-    assert_ordered_single_stream(&events, "cancelled")?;
+    assert_ordered_single_stream(&events, "cancelled").with_context(|| {
+        format!(
+            "SIGINT JSONL stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
 
     assert!(!output.status.success());
     assert_eq!(

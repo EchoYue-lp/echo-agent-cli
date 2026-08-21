@@ -24,6 +24,18 @@ pub struct FileTaskStore {
     shadow: FileTaskShadow,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunLoadIssue {
+    pub run_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Default)]
+pub struct TaskRunScan {
+    pub runs: Vec<TaskRun>,
+    pub issues: Vec<TaskRunLoadIssue>,
+}
+
 impl FileTaskStore {
     pub fn new(shadow: FileTaskShadow) -> Self {
         Self { shadow }
@@ -91,17 +103,35 @@ impl FileTaskStore {
     /// `events.jsonl` or rebuild, so this is O(runs) not O(events). The
     /// collection-query methods (`latest_run_for_conversation` etc.) build on
     /// this and stay cheap even with many long runs.
-    pub fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
+    pub fn scan_runs(&self) -> Result<TaskRunScan, FileReadError> {
         let mut runs = Vec::new();
+        let mut issues = Vec::new();
         for run_id in self.shadow.list_run_ids()? {
-            if let Some(state) = self.read_run_state_resilient(&run_id)? {
-                runs.push(state.run);
+            match self.read_run_state_resilient(&run_id) {
+                Ok(Some(state)) => runs.push(state.run),
+                Ok(None) => {}
+                Err(error) => issues.push(TaskRunLoadIssue {
+                    run_id,
+                    error: error.to_string(),
+                }),
             }
         }
         // Descending by created_at (stable on ties, matching SQL behavior closely
         // enough for the run-list UI; exact tie-break is not load-bearing here).
         runs.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-        Ok(runs)
+        Ok(TaskRunScan { runs, issues })
+    }
+
+    pub fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
+        let scan = self.scan_runs()?;
+        for issue in scan.issues {
+            tracing::warn!(
+                run_id = %issue.run_id,
+                error = %issue.error,
+                "isolating unreadable TaskRun from collection query"
+            );
+        }
+        Ok(scan.runs)
     }
 
     /// Most recent run for a conversation (replaces
@@ -836,5 +866,30 @@ mod tests {
         let pending = file.list_runs_in(&[TaskRunStatus::Pending]).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].run_id, "r2");
+    }
+
+    #[test]
+    fn scan_runs_isolates_unreadable_run_from_healthy_results()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
+        store.create_run(
+            "healthy",
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "goal",
+            "",
+            AttendedMode::Attended,
+        )?;
+        let broken = tmp.path().join("broken");
+        std::fs::create_dir_all(&broken)?;
+        std::fs::write(broken.join("events.jsonl"), b"{not-json}\n")?;
+
+        let scan = FileTaskStore::from_root(tmp.path()).scan_runs()?;
+        assert!(scan.runs.iter().any(|run| run.run_id == "healthy"));
+        assert!(scan.issues.iter().any(|issue| issue.run_id == "broken"));
+        Ok(())
     }
 }
