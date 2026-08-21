@@ -2,7 +2,13 @@
 
 Date: 2026-08-20
 
-Status: M0-M8 complete
+Status: M0-M8 implementation landed; integration acceptance reopened 2026-08-21
+
+> The 2026-08-21 end-to-end review found unresolved GUI scoped-control,
+> live-delivery settlement, retry, recovery, and deletion-lifetime defects.
+> [`2026-08-21-workspace-conversation-runtime-reliability.md`](./2026-08-21-workspace-conversation-runtime-reliability.md)
+> now governs closure. The implementation ledger below remains historical
+> evidence and must not be read as current end-to-end acceptance.
 
 ## Objective
 

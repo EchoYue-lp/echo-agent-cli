@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   restoreConversation: vi.fn(),
   branchConversation: vi.fn(),
   listConversations: vi.fn(),
+  updateConversation: vi.fn(),
   resetSession: vi.fn(),
 }));
 
@@ -15,7 +16,7 @@ vi.mock('../api/endpoints', () => ({
     list: mocks.listConversations,
     get: mocks.getConversation,
     save: vi.fn(),
-    update: vi.fn(),
+    update: mocks.updateConversation,
     delete: vi.fn(),
     restore: mocks.restoreConversation,
     branch: mocks.branchConversation,
@@ -40,6 +41,7 @@ beforeEach(() => {
   mocks.listToolExecutions.mockResolvedValue([]);
   mocks.restoreConversation.mockResolvedValue(undefined);
   mocks.listConversations.mockResolvedValue([]);
+  mocks.updateConversation.mockResolvedValue(undefined);
   mocks.branchConversation.mockResolvedValue({
     success: true,
     id: 'branch-1',
@@ -49,7 +51,12 @@ beforeEach(() => {
   });
   mocks.resetSession.mockResolvedValue(undefined);
   useChatStore.getState().clearMessages();
-  useConversationStore.setState({ activeId: null, isLoading: false, conversations: [] });
+  useConversationStore.setState({
+    activeId: null,
+    newConversationEpoch: 0,
+    isLoading: false,
+    conversations: [],
+  });
 });
 
 describe('conversation message identity', () => {
@@ -143,6 +150,26 @@ describe('conversation message identity', () => {
 
     expect(useConversationStore.getState()).toMatchObject({ activeId: null, isLoading: false });
     expect(mocks.restoreConversation).not.toHaveBeenCalled();
+  });
+
+  it('opens a blank conversation immediately without resetting a running conversation agent', async () => {
+    const pendingUpdate = deferred<undefined>();
+    mocks.updateConversation.mockReturnValueOnce(pendingUpdate.promise);
+    useConversationStore.setState({ activeId: 'conversation-running' });
+    useChatStore.getState().addUserMessage('keep this conversation running');
+
+    const startNew = useConversationStore.getState().startNew();
+
+    expect(useConversationStore.getState()).toMatchObject({
+      activeId: null,
+      newConversationEpoch: 1,
+      isLoading: false,
+    });
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(mocks.resetSession).not.toHaveBeenCalled();
+
+    pendingUpdate.resolve(undefined);
+    await startNew;
   });
 
   it('activates only the canonical branch returned by the backend', async () => {

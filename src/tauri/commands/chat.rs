@@ -862,6 +862,27 @@ pub fn replay_chat_events(
 }
 
 /// Cancel an active chat stream.
+fn request_chat_cancel(
+    control: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    workspace_id: &str,
+    conversation_id: &str,
+    root_turn_id: &str,
+) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSettlementWaiter>, IpcError>
+{
+    use echo_agent_app_core::foreground_turn::{ForegroundTurnError, ForegroundTurnSurface};
+
+    match control.request_root_cancel_scoped(
+        workspace_id,
+        ForegroundTurnSurface::Gui,
+        conversation_id,
+        root_turn_id,
+    ) {
+        Ok(waiter) => Ok(Some(waiter)),
+        Err(ForegroundTurnError::NoActiveTurn { .. }) => Ok(None),
+        Err(error) => Err(IpcError::Validation(error.to_string())),
+    }
+}
+
 #[tauri::command]
 pub async fn cancel_chat(
     state: tauri::State<'_, TauriState>,
@@ -869,17 +890,19 @@ pub async fn cancel_chat(
     root_turn_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let scope = state.app_state.current_execution_scope().await;
-    let waiter = state
-        .app_state
-        .session
-        .foreground_turns
-        .request_root_cancel_scoped(
-            scope.workspace_id(),
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
-            &conversation_id,
-            &root_turn_id,
-        )
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let Some(waiter) = request_chat_cancel(
+        &state.app_state.session.foreground_turns,
+        scope.workspace_id(),
+        &conversation_id,
+        &root_turn_id,
+    )?
+    else {
+        return Ok(serde_json::json!({
+            "success": true,
+            "turn_id": root_turn_id,
+            "status": "already_settled",
+        }));
+    };
 
     // Reject pending HITL before waiting so parked execution can reach its
     // terminal outcome. Ownership remains registered until that settlement.
@@ -1702,6 +1725,49 @@ mod foreground_turn_command_tests {
         assert_eq!(snapshot.active_turn_id, "turn-2");
         first.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
         second.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[test]
+    fn stop_is_idempotent_after_the_exact_gui_turn_settles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "workspace-1",
+            ForegroundTurnSurface::Gui,
+            "conversation-1",
+            "turn-1",
+        )?;
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+
+        let waiter = request_chat_cancel(&control, "workspace-1", "conversation-1", "turn-1")?;
+
+        assert!(waiter.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn stop_still_rejects_a_stale_root_when_another_gui_turn_is_active()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin_scoped(
+            "workspace-1",
+            ForegroundTurnSurface::Gui,
+            "conversation-1",
+            "current-turn",
+        )?;
+
+        assert!(matches!(
+            request_chat_cancel(
+                &control,
+                "workspace-1",
+                "conversation-1",
+                "stale-turn",
+            ),
+            Err(IpcError::Validation(message)) if message.contains("foreground turn mismatch")
+        ));
+        assert!(!lease.cancellation_token().is_cancelled());
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
         Ok(())
     }
 }

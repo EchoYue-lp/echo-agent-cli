@@ -25,11 +25,12 @@ export type QueuedChatInput = {
 type CancelChatResponse = {
   success: boolean;
   turn_id: string;
-  status: 'completed' | 'cancelled' | 'failed';
+  status: 'completed' | 'cancelled' | 'failed' | 'already_settled';
 };
 
 export function useTauriChat() {
   const activeConversationId = useConversationStore((state) => state.activeId);
+  const newConversationEpoch = useConversationStore((state) => state.newConversationEpoch);
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
   const activeTurnIdRef = useRef<string | null>(null);
@@ -37,6 +38,7 @@ export function useTauriChat() {
   const currentConversationIdRef = useRef<string | null>(null);
   const identityGenerationRef = useRef(0);
   const previousActiveConversationIdRef = useRef(activeConversationId);
+  const previousNewConversationEpochRef = useRef(newConversationEpoch);
   const thinkingIdRef = useRef<string | null>(null);
   const eventSequencerRef = useRef(new ChatEventSequencer());
   const queuedInputsRef = useRef<QueuedChatInput[]>([]);
@@ -46,9 +48,13 @@ export function useTauriChat() {
   const [queuedInputs, setQueuedInputs] = useState<QueuedChatInput[]>([]);
 
   const getActiveTurnSnapshot = useCallback(async () => {
+    // Every dispatched GUI turn receives a durable conversation id before it
+    // reaches Rust. An unscoped lookup from a blank new-chat view can only
+    // attach an unrelated running conversation when the project has one.
+    if (!activeConversationId) return null;
     return apiInvoke<ForegroundTurnSnapshot | null>('get_active_chat_turn', {
-      conversationId: activeConversationId ?? undefined,
-      conversation_id: activeConversationId ?? undefined,
+      conversationId: activeConversationId,
+      conversation_id: activeConversationId,
     });
   }, [activeConversationId]);
 
@@ -72,12 +78,17 @@ export function useTauriChat() {
 
   useEffect(() => {
     const previous = previousActiveConversationIdRef.current;
-    if (previous === activeConversationId) return;
+    const startsNewConversation = previousNewConversationEpochRef.current !== newConversationEpoch;
+    if (previous === activeConversationId && !startsNewConversation) return;
     previousActiveConversationIdRef.current = activeConversationId;
+    previousNewConversationEpochRef.current = newConversationEpoch;
     identityGenerationRef.current += 1;
 
     const adoptsCurrentTurn =
-      previous === null && activeConversationId !== null && activeTurnIdRef.current !== null;
+      !startsNewConversation &&
+      previous === null &&
+      activeConversationId !== null &&
+      activeTurnIdRef.current !== null;
     currentConversationIdRef.current = activeConversationId;
     if (adoptsCurrentTurn) return;
 
@@ -88,7 +99,7 @@ export function useTauriChat() {
     isCancelledRef.current = false;
     queuedInputsRef.current = [];
     setQueuedInputs([]);
-  }, [activeConversationId]);
+  }, [activeConversationId, newConversationEpoch]);
 
   const dispatchNextQueued = useCallback(() => {
     const [next, ...remaining] = queuedInputsRef.current;
@@ -376,13 +387,23 @@ export function useTauriChat() {
 
   const sendMessage = useCallback(
     async (text: string, attachments?: Attachment[]) => {
-      if (activeTurnIdRef.current) {
+      const activeConversation = useConversationStore.getState().activeId;
+      const belongsToActiveConversation = activeConversation
+        ? currentConversationIdRef.current === activeConversation
+        : currentConversationIdRef.current === null && currentMessageKeyRef.current !== null;
+      if (activeTurnIdRef.current && belongsToActiveConversation) {
         const id =
           typeof crypto !== 'undefined' && 'randomUUID' in crypto
             ? crypto.randomUUID()
             : `queued-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         replaceQueue([...queuedInputsRef.current, { id, text, attachments }]);
         return true;
+      }
+      if (activeTurnIdRef.current) {
+        activeTurnIdRef.current = null;
+        currentMessageKeyRef.current = null;
+        assistantIdRef.current = null;
+        replaceQueue([]);
       }
       return dispatchMessage(text, attachments);
     },
@@ -477,6 +498,29 @@ export function useTauriChat() {
       });
       if (!settlement.success) {
         throw new Error(`取消请求未完成（${settlement.status}）`);
+      }
+      if (settlement.status === 'already_settled') {
+        const streamId = `conversation:${conversationId}`;
+        try {
+          const replay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+            conversationId,
+            conversation_id: conversationId,
+            messageKey: rootTurnId,
+            message_key: rootTurnId,
+            afterCursor: eventSequencerRef.current.cursor(streamId),
+            after_cursor: eventSequencerRef.current.cursor(streamId),
+          });
+          eventSequencerRef.current.ingestReplay(replay, handleEvent);
+        } catch (error) {
+          console.warn('[TauriChat] Failed to reconcile an already-settled turn:', error);
+        }
+        if (useChatStore.getState().isStreaming) {
+          useChatStore.getState().settleOrphanedTurn();
+        }
+        activeTurnIdRef.current = null;
+        currentMessageKeyRef.current = null;
+        assistantIdRef.current = null;
+        return;
       }
       // The existing chat terminal event is the sole UI projection authority.
       // Keep refs until that event arrives so the versioned event is accepted

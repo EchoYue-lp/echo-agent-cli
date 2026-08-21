@@ -107,7 +107,7 @@ describe('useTauriChat foreground turn recovery', () => {
         return () => mocks.listeners.delete(eventName);
       }
     );
-    useConversationStore.setState({ activeId: null });
+    useConversationStore.setState({ activeId: null, newConversationEpoch: 0 });
     useChatStore.getState().clearMessages();
     useChatStore.setState({ pendingHitlRequests: [] });
     useChatStore.getState().setRunStatus('running');
@@ -122,11 +122,12 @@ describe('useTauriChat foreground turn recovery', () => {
   });
 
   it('restores the real message scope after remount and cancels that exact turn', async () => {
+    useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
     const first = renderHook(() => useTauriChat());
     await waitFor(() => {
       expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
-        conversationId: undefined,
-        conversation_id: undefined,
+        conversationId: activeSnapshot.conversation_id,
+        conversation_id: activeSnapshot.conversation_id,
       });
     });
     first.unmount();
@@ -135,8 +136,8 @@ describe('useTauriChat foreground turn recovery', () => {
     const remounted = renderHook(() => useTauriChat());
     await waitFor(() => {
       expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
-        conversationId: undefined,
-        conversation_id: undefined,
+        conversationId: activeSnapshot.conversation_id,
+        conversation_id: activeSnapshot.conversation_id,
       });
     });
     await act(async () => {
@@ -149,6 +150,62 @@ describe('useTauriChat foreground turn recovery', () => {
       root_turn_id: activeSnapshot.root_turn_id,
     });
     remounted.unmount();
+  });
+
+  it('does not adopt another conversation turn from a blank new-chat view', async () => {
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === 'get_active_chat_turn') {
+        return args?.conversationId ? null : activeSnapshot;
+      }
+      if (command === 'save_conversation') return { success: true, id: 'conversation-new' };
+      if (command === 'list_conversations') return [];
+      if (command === 'send_chat_message') return { success: true };
+      if (command === 'replay_chat_events') return emptyReplay();
+      return null;
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(mocks.listeners.has('chat://event')).toBe(true);
+    });
+    await act(async () => {
+      await hook.result.current.sendMessage('start an independent conversation');
+    });
+
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('get_active_chat_turn', {
+      conversationId: undefined,
+      conversation_id: undefined,
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith(
+      'send_chat_message',
+      expect.objectContaining({ message: 'start an independent conversation' })
+    );
+    expect(hook.result.current.queuedInputs).toEqual([]);
+    hook.unmount();
+  });
+
+  it('clears the previous conversation queue when starting another chat', async () => {
+    useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
+        conversationId: activeSnapshot.conversation_id,
+        conversation_id: activeSnapshot.conversation_id,
+      });
+    });
+
+    await act(async () => {
+      await hook.result.current.sendMessage('queued for the running conversation');
+    });
+    expect(hook.result.current.queuedInputs).toHaveLength(1);
+
+    await act(async () => {
+      await useConversationStore.getState().startNew();
+    });
+    expect(useConversationStore.getState().activeId).toBeNull();
+    expect(hook.result.current.queuedInputs).toEqual([]);
+    expect(mocks.apiInvoke).not.toHaveBeenCalledWith('reset_session');
+    hook.unmount();
   });
 
   it('keeps a continuation turn separate from its root assistant message', async () => {
@@ -303,6 +360,7 @@ describe('useTauriChat foreground turn recovery', () => {
   });
 
   it('resolves exact identity when Stop wins the mount-recovery race', async () => {
+    useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
     let resolveMountLookup: (value: typeof activeSnapshot) => void = () => {};
     const pendingMountLookup = new Promise<typeof activeSnapshot>((resolve) => {
       resolveMountLookup = resolve;
@@ -377,8 +435,117 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it('replays terminal state when Stop races with backend turn settlement', async () => {
+    const conversationId = 'conversation-stop-settlement-race';
+    const rootTurnId = 'root-stop-settlement-race';
+    const snapshot = {
+      surface: 'gui',
+      conversation_id: conversationId,
+      root_turn_id: rootTurnId,
+      active_turn_id: rootTurnId,
+      cancellation_requested: false,
+    };
+    const replay: ChatEventReplay = {
+      events: [turnStatusEnvelope(rootTurnId, rootTurnId, 1, 'completed', conversationId)],
+      retained_earliest_cursor: 1,
+      returned_earliest_cursor: 1,
+      latest_cursor: 1,
+      truncated: false,
+    };
+    useConversationStore.setState({ activeId: conversationId });
+    useChatStore.getState().startAssistantMessage(rootTurnId);
+    let replayCount = 0;
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return snapshot;
+      if (command === 'cancel_chat') {
+        return { success: true, turn_id: rootTurnId, status: 'already_settled' };
+      }
+      if (command === 'replay_chat_events') {
+        replayCount += 1;
+        return replayCount === 1 ? emptyReplay() : replay;
+      }
+      return null;
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(replayCount).toBe(1);
+    });
+    expect(useChatStore.getState().runStatus).toBe('running');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      conversationId,
+      conversation_id: conversationId,
+      rootTurnId,
+      root_turn_id: rootTurnId,
+    });
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
+      conversationId,
+      conversation_id: conversationId,
+      messageKey: rootTurnId,
+      message_key: rootTurnId,
+      afterCursor: expect.any(Number),
+      after_cursor: expect.any(Number),
+    });
+    expect(useToastStore.getState().toasts).toEqual([]);
+    expect(useChatStore.getState().runStatus).toBe('completed');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    hook.unmount();
+  });
+
+  it('settles stale UI without a Stop error when terminal replay is unavailable', async () => {
+    const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const conversationId = 'conversation-stop-replay-failure';
+    const rootTurnId = 'root-stop-replay-failure';
+    const snapshot = {
+      surface: 'gui',
+      conversation_id: conversationId,
+      root_turn_id: rootTurnId,
+      active_turn_id: rootTurnId,
+      cancellation_requested: false,
+    };
+    useConversationStore.setState({ activeId: conversationId });
+    useChatStore.getState().startAssistantMessage(rootTurnId);
+    let replayCount = 0;
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return snapshot;
+      if (command === 'cancel_chat') {
+        return { success: true, turn_id: rootTurnId, status: 'already_settled' };
+      }
+      if (command === 'replay_chat_events') {
+        replayCount += 1;
+        if (replayCount === 1) return emptyReplay();
+        throw new Error('journal unavailable');
+      }
+      return null;
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(replayCount).toBe(1);
+    });
+    await act(async () => {
+      await hook.result.current.cancel();
+    });
+
+    expect(useToastStore.getState().toasts).toEqual([]);
+    expect(useChatStore.getState().runStatus).toBe('failed');
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(consoleWarn).toHaveBeenCalledWith(
+      '[TauriChat] Failed to reconcile an already-settled turn:',
+      expect.any(Error)
+    );
+    consoleWarn.mockRestore();
+    hook.unmount();
+  });
+
   it('keeps the running terminal projection when snapshot IPC fails', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
     mocks.apiInvoke.mockRejectedValue(new Error('snapshot unavailable'));
     const hook = renderHook(() => useTauriChat());
     await act(async () => {

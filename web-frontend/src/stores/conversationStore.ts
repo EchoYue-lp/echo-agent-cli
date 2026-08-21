@@ -26,6 +26,8 @@ interface ConversationState {
   conversations: ConversationMeta[];
   /** Currently active conversation ID */
   activeId: string | null;
+  /** Increments for every explicit new-chat action, including null -> null transitions. */
+  newConversationEpoch: number;
   /** Whether we're loading a conversation */
   isLoading: boolean;
 
@@ -206,6 +208,7 @@ export function restoredMessageId(
 export const useConversationStore = create<ConversationState>((set, get) => ({
   conversations: [],
   activeId: null,
+  newConversationEpoch: 0,
   isLoading: false,
 
   init: async () => {
@@ -439,28 +442,31 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   startNew: async () => {
     loadGeneration += 1;
     loadingConversationId = null;
-    set({ isLoading: false });
-    // Save current conversation first — must not block clearing even if save fails
+    // The backend is the canonical transcript writer. Only refresh metadata for
+    // an already-persisted conversation; a blank draft must not be materialized
+    // merely because the user starts another chat.
+    const activeId = get().activeId;
     const currentMessages = useChatStore.getState().messages;
-    if (currentMessages.length > 0) {
+    const pendingSave =
+      activeId && currentMessages.length > 0 ? get().saveCurrent(currentMessages) : null;
+
+    // Detach the UI immediately. Existing conversation agents are intentionally
+    // left running in their own pool slots and can be resumed from the sidebar.
+    useChatStore.getState().clearMessages();
+    useToolExecutionStore.getState().clear();
+    set((state) => ({
+      activeId: null,
+      newConversationEpoch: state.newConversationEpoch + 1,
+      isLoading: false,
+    }));
+
+    if (pendingSave) {
       try {
-        await get().saveCurrent(currentMessages);
+        await pendingSave;
       } catch (e) {
         console.error('Failed to save conversation before new chat:', e);
       }
     }
-
-    // Reset backend session
-    try {
-      await sessionApi.reset();
-    } catch {
-      // ignore
-    }
-
-    // Always clear — this is the user's expected outcome
-    useChatStore.getState().clearMessages();
-    useToolExecutionStore.getState().clear();
-    set({ activeId: null, isLoading: false });
   },
 
   clearCurrent: async () => {

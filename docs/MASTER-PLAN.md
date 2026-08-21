@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-08-20
+Last updated: 2026-08-21
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -78,14 +78,40 @@ evidence, and the next bounded step.
 | Typed TaskRuntime lifecycle and hook delivery | Complete | `TodoStatus` and `RuntimeEventKind` preserve cancelled/timed-out terminal states through store, executor, Hook bridges, GUI/TUI/CLI/channel projections, and generated TypeScript. `HookEventDispatcher` uses a bounded ordered queue with producer backpressure plus explicit flush/idempotent shutdown. |
 | Dynamic Provider/model protocol convergence | Complete | Users own a dynamic Provider registry and any number of models per Provider. Every model explicitly selects Chat Completions, Responses, or Anthropic plus text/image/audio/video input capabilities. A single framework `ThinkingProfile` registry resolves verified model-specific levels from provider endpoint + API protocol + model id; GLM starts at 5.2, Claude at 4.6, unknown models remain usable with auto only, and GUI/TUI/CLI consume the same choices. Framework endpoint resolution is provider-neutral, while all surfaces share the AppState mutation and connection-test paths without a second provider or thinking mapping. |
 | MCP Resource model surface | Complete | `docs/2026-08-19-mcp-resource-tool-surface.md`; the existing MCP manager now projects three canonical, read-only list/template/read tools from connected resource-capable clients. EKO keeps them searchable but out of every mode's first-turn schema. |
-| Foreground turn ownership convergence | Complete | `echo-agent-app-core/src/foreground_turn.rs` is the EKO authority for exact `(surface, conversation, turn)` admission, cancellation, supervised driver settlement, and ordered generation receipts. GUI, CLI REPL, channel, and TUI now use it end to end; each surface retains only transport and renderer projection state. |
+| Foreground turn ownership convergence | In progress | `echo-agent-app-core/src/foreground_turn.rs` remains the sole EKO admission/cancellation authority and its supervised settlement path remains valid. Acceptance is reopened because the current key still permits the same workspace conversation to acquire separate GUI/TUI/CLI/channel turns, some Tauri controls omit exact workspace/turn identity, and ordinary GUI input still has a surface-local queue. Closure is governed by the 2026-08-21 reliability spec M2-M5. |
 | Background command cells + awaiter role (Phase C1-C4) | Complete | Design: `docs/2026-08-14-eko-long-horizon-task-runtime-design.md` §11 (C track). Framework commits `58e6733`, `7f66ff5`: one `CommandCellRegistry`, sandbox-preserving launch, durable output artifacts, retry-safe multi-waiter cursors, explicit owner cancellation, and UTF-8-safe bounded output. Application commit `5cf49c2`: process-wide registry, low-thinking `awaiter`, `watch_cell`, TaskRuntime start/finish events, recovery-capsule projection, active-cell completion blocker, explicit-cancel propagation, and boot recovery that closes orphaned cells without replaying external commands. Pause keeps cells alive; only explicit run cancellation stops them. |
 | Long-horizon TaskRun continuation control plane (Phase C5) | Complete | One app-layer `TaskContinuationRuntime` owns idle continuation without a second graph/executor/store. Finite RunTurns have event-folded claim, exact driver settlement, token/time budgets, compaction accounting, Goal Contract/Recovery Capsule, blocker audit, cell wakeup, durable provider retry, typed boot admission, stable surface HITL replay, versioned Requirement/Evidence, cross-surface controls, and discardable checkpoint projections. The automated fault matrix and the accepted 12-hour real soak are complete; detailed evidence is governed by `docs/2026-08-17-eko-long-horizon-runtime-m5-evaluation.md`. |
 | Long-horizon runtime M0-M5 implementation | Complete | `docs/2026-08-16-eko-long-horizon-runtime-implementation-plan.md`; Runtime Goal complete. App `de09946` makes `TaskRun.goal` the revision/hash-bound authority. Framework `cd4fccf` and app `9d59a0b` close M1. Framework `6d7d0cf` plus app `f4771f3` close M2 with exact-attempt controls through the existing `TurnSteerMailbox`. App `aa92178` closes M3 with event-folded provider retry, typed boot admission, exact orphan recovery and safe staged run creation. App `54d8bc4` closes M4 through one store-owned Requirement/Evidence completion report shared by execution and GUI/TUI/CLI/channel. App `3e409d0` closes M5a with a schema/hash-validated discardable checkpoint, suffix-only event fold, crash-window snapshot repair and fixed release performance gates while preserving `events.jsonl` as sole authority. App `82d8eda` adds the resumable, commit-pinned long-horizon harness; its canonical provider/crash/disk/HITL/Subagent/cell/Goal-drift matrix is all green. The 12-hour ledger passed with 1,439 ended turns, 143 compactions, 11 production recoveries, zero failed turns and complete final hashes. On 2026-08-19 the user accepted 12 hours as the final real-soak gate and waived 24/48-hour completion; those services were stopped and their durable ledger snapshots retained without being represented as passes. |
-| Cross-workspace Agent messaging and groups | Complete | Applications `00bf3d4`, `f3b6f2c`, `15d3ad3`, `e13a309`, `b97bb23`, `9ee2312`, `de867e3`; `docs/2026-08-20-cross-workspace-agent-groups.md`; independent loaded hosts and cross-host generations pass three-host gates. The application-owned `AgentRouter` discovers persisted addresses, owns durable inboxes and persistent Agent groups, and all interactive surfaces project the same service. A frozen PlanTask target acquires the exact remote conversation Agent while the leader TaskRuntime remains the sole DAG, retry, cancellation, review, and canonical SubagentRun authority. M8 adds transcript-owned completed-turn deduplication, stable correlated replies, concurrent three-inbox restart gates, and removes the remaining mutable-cwd transition naming without adding another executor/store/queue. |
-| Local runtime recovery and surface settlement hardening | Complete | Framework `7417634` atomically replaces live memory/HITL tools and quarantines corrupt run logs. EKO keeps `events.jsonl` as the only TaskRuntime sequence authority under a cross-process lock, isolates unreadable run/tool projections without hiding healthy records, configures one explicit process data root, performs create-and-switch through one backend transition, and lets durable `turn_status` own GUI terminal settlement. |
+| Workspace/conversation runtime reliability closure | In progress | `docs/2026-08-21-workspace-conversation-runtime-reliability.md`; the 2026-08-21 end-to-end review found F01-F18 across scoped TaskRuntime control, Agent restore, IPC/event identity, durable user input, interrupt settlement, deletion, boot recovery, and live Agent delivery. M0-M8 must close the contract and fault matrix before this row can become Complete. |
+| Cross-workspace Agent messaging and groups | In progress | Core host isolation, durable cold delivery, groups, and one leader TaskRun remain implemented by applications `00bf3d4`, `f3b6f2c`, `15d3ad3`, `e13a309`, `b97bb23`, `9ee2312`, `de867e3`. Acceptance is reopened because live steer currently settles `Delivered` before target completion, expects-reply has no live-path reply settlement, retry lacks durable backoff, and GUI scoped control/event projection is incomplete. Governed by the 2026-08-21 reliability spec. |
+| Local runtime recovery and surface settlement hardening | In progress | Framework `7417634` and the TaskRuntime event/checkpoint authority remain valid. Acceptance is reopened for ordinary chat/HITL boot recovery, exact workspace TaskRuntime resume/control, active-conversation rebind, durable terminal repair, and per-workspace recovery isolation under `docs/2026-08-21-workspace-conversation-runtime-reliability.md`. |
 
 ## Current Decisions
+
+### Workspace and conversation runtime reliability closure
+
+The governing repair specification is
+`docs/2026-08-21-workspace-conversation-runtime-reliability.md`. The existing
+`AgentAddress`, `WorkspaceExecutionScope`, `WorkspaceRuntimeHost`,
+`ForegroundTurnControl`, TaskRuntime, `TurnSteerMailbox`, and `AgentRouter`
+remain the only authorities; do not add another runtime, pool, DAG, mailbox,
+router, conversation store, or SQLite persistence path.
+
+Every accepted workspace operation must bind an explicit workspace,
+conversation, and, where applicable, exact turn/run identity. Current workspace
+is GUI focus only. Workspace-sensitive Tauri commands must resolve the exact
+host-owned AgentPool, TaskRuntimeStore, ConversationStore, and roots through one
+app-core resolver; they must not fall back to process-global state. Ordinary
+accepted user input becomes a durable, address-scoped chat-journal receipt, and
+surfaces render that projection instead of owning a private FIFO. A delivery is
+terminal only after the target transcript safe point; expects-reply also
+requires a durably accepted correlated reply.
+
+The 2026-08-20 cross-workspace implementation and prior recovery hardening are
+not discarded. Their valid core mechanisms remain, but their integration
+acceptance is reopened until the new specification's M0-M8 tests, deletion
+lifecycle, recovery matrix, surface parity, resource governor, and soak gates
+are complete.
 
 ### Cross-workspace Agent messaging and groups
 
@@ -95,6 +121,11 @@ workspace/session discovery, durable file inboxes, workspace runtime lifetime,
 surface projection, and persistent Agent groups. The framework already owns
 the required ReAct, steer, Task DAG, cancellation, revision, and Subagent
 mechanisms and receives no new EKO routing model.
+
+The milestone summary below records the implementation that landed on
+2026-08-20/21; its former end-to-end Complete claim is superseded by the
+reliability closure section above. In particular, live delivery settlement,
+durable backoff/reply completion, scoped GUI controls, and recovery remain open.
 
 `AgentAddress` is the stable `(workspace_id, conversation_id)` identity.
 Accepted delivery is persisted before wake, is at-least-once, and becomes
@@ -673,13 +704,14 @@ legacy layer manager or add a framework lifecycle API.
 
 ## Next Step
 
-Cross-workspace messaging M0-M8 is complete in
-`feature/cross-workspace-agent-groups`. Before integration, merge the latest
-application `main` into the worktree branch, preserve the relative framework
-dependency paths, rerun the applicable full submission gates, and then merge
-the application branch. The accepted architecture remains one leader TaskRun,
-one canonical SubagentRun attempt identity, one AgentRouter, and the shared
-`drive_chat` transcript writer.
+Start M0 of
+`docs/2026-08-21-workspace-conversation-runtime-reliability.md`: add deterministic
+failing contract tests for F01-F18 before changing product code. The first real
+cutover after that is one app-core exact runtime resolver plus workspace-scoped
+TaskRuntime query/control; each later milestone must switch a real path and
+delete its replaced focus/global adapter. Cross-workspace messaging and local
+recovery remain In progress until M8 and every applicable submission, fault,
+GUI, and soak gate are green.
 
 ### Completed long-horizon objective
 
