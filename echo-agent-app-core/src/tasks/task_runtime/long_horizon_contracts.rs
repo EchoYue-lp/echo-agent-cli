@@ -1,8 +1,8 @@
 //! LH0 source-reachability contracts for the long-horizon closure.
 //!
-//! These tests freeze the reviewed failure baseline without making the normal
-//! suite red. Each later repair slice must replace the matching assertion with
-//! a behavioral regression test for the corrected authority.
+//! These tests freeze the reviewed baseline without making the normal suite
+//! red. Each repair slice replaces its matching failure assertion with a
+//! reachability assertion for the corrected authority.
 
 const APP_COMMAND_CELLS: &str = include_str!("command_cells.rs");
 const APP_EXECUTOR: &str = include_str!("executor.rs");
@@ -173,18 +173,17 @@ fn lh_f06_hot_state_still_bypasses_existing_checkpoint_read() -> Result<(), Stri
 }
 
 #[test]
-fn lh_f07_framework_runner_still_spawns_before_registry_publication() -> Result<(), String> {
-    let launch = between(
+fn lh_f07_framework_now_publishes_before_start_supervision() -> Result<(), String> {
+    require(
         FRAMEWORK_CELL_RUNTIME,
-        "fn launch(&self, request: CommandCellRequest)",
-        "fn wait(",
-        "LH-F07 framework launch could not be isolated",
+        "pub async fn prepare_launch",
+        "LH-F07 repair regressed: prepared launch is missing",
     )?;
     ordered(
-        launch,
-        "tokio::spawn(async move",
-        "self.cells.insert(cell_id.clone(), handle)",
-        "LH-F07 baseline changed: registry publication now precedes runner spawn",
+        FRAMEWORK_CELL_RUNTIME,
+        "self.cells.insert(cell_id.clone(), handle.clone())",
+        "self.tasks.spawn_on(",
+        "LH-F07 repair regressed: supervision starts before registry publication",
     )
 }
 
@@ -211,13 +210,13 @@ fn lh_f08_historical_soak_still_exercises_only_the_store_core() -> Result<(), St
 fn lh_f09_eko_still_launches_before_started_is_durable() -> Result<(), String> {
     let launch = between(
         APP_COMMAND_CELLS,
-        "fn launch(&self, request: CommandCellRequest)",
+        "impl CommandCellRegistry for EkoCommandCellRegistry",
         "fn wait(",
         "LH-F09 EKO launch adapter could not be isolated",
     )?;
     ordered(
         launch,
-        "let cell_id = self.inner.launch(request)?;",
+        "let receipt = self.inner.launch(request).await?;",
         "store.record_background_cell_started(",
         "LH-F09 baseline changed: Started now precedes process launch",
     )
@@ -252,42 +251,36 @@ fn lh_f11_fast_model_still_rewrites_only_the_parent_model_name() -> Result<(), S
 }
 
 #[test]
-fn lh_f12_wait_lease_still_ends_after_each_wait_round() -> Result<(), String> {
-    let wait = between(
-        FRAMEWORK_CELL_RUNTIME,
-        "fn wait(",
-        "fn stop(",
-        "LH-F12 framework wait could not be isolated",
+fn lh_f12_observation_lease_now_spans_multiple_wait_rounds() -> Result<(), String> {
+    require(
+        FRAMEWORK_CELL_CONTRACT,
+        "pub struct CommandCellObservationLease",
+        "LH-F12 repair regressed: the cross-round observation lease is missing",
     )?;
     require(
-        wait,
-        "let (handle, _lease) = self.acquire_waiter_lease(&cell_id)?;",
-        "LH-F12 baseline changed: wait no longer owns only a local per-round lease",
-    )?;
-    require_absent(
-        FRAMEWORK_CELL_CONTRACT,
-        "CommandCellObservationLease",
-        "LH-F12 baseline changed: an explicit cross-round observation lease already exists",
+        APP_COMMAND_CELLS,
+        "let observation = self.inner.observe(&cell_id)?;",
+        "LH-F12 repair regressed: EKO terminal observer does not retain the cell",
     )
 }
 
 #[test]
-fn lh_f13_ordinary_chat_cell_still_lacks_exact_owner_identity() -> Result<(), String> {
+fn lh_f13_owner_identity_is_carried_but_chat_projection_remains_run_only() -> Result<(), String> {
     let owner = between(
         FRAMEWORK_CELL_CONTRACT,
         "pub struct CommandCellOwner",
         "pub struct CommandCellRequest",
         "LH-F13 CommandCellOwner could not be isolated",
     )?;
-    require_absent(
+    require(
         owner,
         "conversation_id",
-        "LH-F13 baseline changed: conversation identity is already carried",
+        "LH-F13 owner repair regressed: conversation identity is missing",
     )?;
-    require_absent(
+    require(
         owner,
         "message_id",
-        "LH-F13 baseline changed: root message identity is already carried",
+        "LH-F13 owner repair regressed: root message identity is missing",
     )?;
     require(
         APP_COMMAND_CELLS,

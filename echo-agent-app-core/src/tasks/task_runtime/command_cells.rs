@@ -11,7 +11,8 @@ use std::time::Duration;
 use echo_agent::sandbox::{SandboxExecutor, SandboxManager};
 use echo_agent::tasks::{BackgroundCommandManager, BackgroundCommandManagerConfig};
 use echo_agent::tools::cell::{
-    CommandCellDelta, CommandCellRegistry, CommandCellRequest, CommandCellSnapshot,
+    CommandCellDelta, CommandCellError, CommandCellLaunchReceipt, CommandCellObservationLease,
+    CommandCellRegistry, CommandCellRequest, CommandCellSnapshot,
 };
 use echo_agent::tools::{Tool, ToolContext, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
@@ -195,7 +196,7 @@ impl Tool for WatchCellTool {
             let snapshot = registry.wait(cell_id, 0, 0).await.map_err(|error| {
                 echo_agent::error::ToolError::ExecutionFailed {
                     tool: "watch_cell".to_string(),
-                    message: error,
+                    message: error.to_string(),
                 }
             })?;
             if snapshot.snapshot.phase.is_terminal() {
@@ -226,53 +227,63 @@ impl Tool for WatchCellTool {
 }
 
 impl CommandCellRegistry for EkoCommandCellRegistry {
-    fn launch(&self, request: CommandCellRequest) -> Result<String, String> {
-        let owner = request.owner.clone();
-        let name = request.command.chars().take(80).collect::<String>();
-        let command_hash = format!("{:x}", Sha256::digest(request.command.as_bytes()));
-        let store = owner.run_id.as_deref().and_then(store_for_run);
-        let cell_id = self.inner.launch(request)?;
+    fn launch(
+        &self,
+        request: CommandCellRequest,
+    ) -> BoxFuture<'_, Result<CommandCellLaunchReceipt, CommandCellError>> {
+        Box::pin(async move {
+            let owner = request.owner.clone();
+            let name = request.command.chars().take(80).collect::<String>();
+            let command_hash = format!("{:x}", Sha256::digest(request.command.as_bytes()));
+            let store = owner.run_id.as_deref().and_then(store_for_run);
+            let receipt = self.inner.launch(request).await?;
+            let cell_id = receipt.cell_id.clone();
 
-        if let Some(run_id) = owner.run_id.as_deref() {
-            self.track(run_id, &cell_id);
-        }
-
-        if let (Some(run_id), Some(store)) = (owner.run_id.clone(), store) {
-            if let Err(error) = store.record_background_cell_started(
-                &run_id,
-                &cell_id,
-                &name,
-                &command_hash,
-                owner.turn_id.as_deref(),
-                owner.execution_id.as_deref(),
-                owner.call_id.as_deref(),
-            ) {
-                self.inner.stop(&cell_id);
-                self.forget(&run_id, &cell_id);
-                return Err(format!(
-                    "cell launched but TaskRuntime start event could not be persisted: {error}"
-                ));
+            if let Some(run_id) = owner.run_id.as_deref() {
+                self.track(run_id, &cell_id);
             }
-            let registry = Arc::clone(&self.inner);
-            let cells_by_run = Arc::clone(&self.cells_by_run);
-            let observed_cell_id = cell_id.clone();
-            tokio::spawn(async move {
-                let tracked_run_id = run_id.clone();
-                let tracked_cell_id = observed_cell_id.clone();
-                observe_terminal_cell(
-                    registry,
-                    store,
-                    run_id,
-                    observed_cell_id,
-                    name,
-                    owner.call_id,
-                )
-                .await;
-                forget_cell(&cells_by_run, &tracked_run_id, &tracked_cell_id);
-            });
-        }
 
-        Ok(cell_id)
+            if let (Some(run_id), Some(store)) = (owner.run_id.clone(), store) {
+                if let Err(error) = store.record_background_cell_started(
+                    &run_id,
+                    &cell_id,
+                    &name,
+                    &command_hash,
+                    owner.turn_id.as_deref(),
+                    owner.execution_id.as_deref(),
+                    owner.call_id.as_deref(),
+                ) {
+                    self.inner.stop(&cell_id);
+                    self.forget(&run_id, &cell_id);
+                    return Err(CommandCellError::Runtime {
+                        message: format!(
+                            "cell launched but TaskRuntime start event could not be persisted: {error}"
+                        ),
+                    });
+                }
+                let observation = self.inner.observe(&cell_id)?;
+                let registry = Arc::clone(&self.inner);
+                let cells_by_run = Arc::clone(&self.cells_by_run);
+                let observed_cell_id = cell_id.clone();
+                tokio::spawn(async move {
+                    let _observation = observation;
+                    let tracked_run_id = run_id.clone();
+                    let tracked_cell_id = observed_cell_id.clone();
+                    observe_terminal_cell(
+                        registry,
+                        store,
+                        run_id,
+                        observed_cell_id,
+                        name,
+                        owner.call_id,
+                    )
+                    .await;
+                    forget_cell(&cells_by_run, &tracked_run_id, &tracked_cell_id);
+                });
+            }
+
+            Ok(receipt)
+        })
     }
 
     fn wait(
@@ -280,8 +291,12 @@ impl CommandCellRegistry for EkoCommandCellRegistry {
         cell_id: &str,
         cursor: u64,
         yield_ms: u64,
-    ) -> BoxFuture<'_, Result<CommandCellDelta, String>> {
+    ) -> BoxFuture<'_, Result<CommandCellDelta, CommandCellError>> {
         self.inner.wait(cell_id, cursor, yield_ms)
+    }
+
+    fn observe(&self, cell_id: &str) -> Result<CommandCellObservationLease, CommandCellError> {
+        self.inner.observe(cell_id)
     }
 
     fn stop(&self, cell_id: &str) -> bool {
@@ -290,6 +305,10 @@ impl CommandCellRegistry for EkoCommandCellRegistry {
 
     fn list(&self) -> BoxFuture<'_, Vec<CommandCellSnapshot>> {
         self.inner.list()
+    }
+
+    fn shutdown(&self) -> BoxFuture<'_, Result<(), CommandCellError>> {
+        self.inner.shutdown()
     }
 }
 
@@ -324,6 +343,7 @@ async fn observe_terminal_cell(
         let delta = match registry.wait(&cell_id, cursor, OBSERVER_YIELD_MS).await {
             Ok(delta) => delta,
             Err(error) => {
+                let error_message = error.to_string();
                 let persisted = persist_terminal_with_retry(
                     &store,
                     &run_id,
@@ -333,7 +353,7 @@ async fn observe_terminal_cell(
                     None,
                     0,
                     false,
-                    Some(&error),
+                    Some(&error_message),
                     None,
                     None,
                     call_id.as_deref(),
@@ -484,13 +504,17 @@ mod tests {
             .launch(CommandCellRequest {
                 command: "echo projected-cell-result".to_string(),
                 owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
                     run_id: Some("cell-run".to_string()),
                     turn_id: Some("turn-1".to_string()),
+                    message_id: Some("message".to_string()),
                     execution_id: Some("execution-1".to_string()),
                     call_id: Some("call-1".to_string()),
                 },
                 ..Default::default()
             })
+            .await
+            .map(|receipt| receipt.cell_id)
             .map_err(|error| error.to_string())?;
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -539,17 +563,25 @@ mod tests {
             inner: Arc::new(BackgroundCommandManager::default()),
             cells_by_run: Arc::new(RwLock::new(HashMap::new())),
         };
-        let cell_id = registry.launch(CommandCellRequest {
-            command: "sleep 30".to_string(),
-            owner: CommandCellOwner {
-                run_id: Some("cancel-owned-cells".to_string()),
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "sleep 30".to_string(),
+                owner: CommandCellOwner {
+                    run_id: Some("cancel-owned-cells".to_string()),
+                    ..Default::default()
+                },
                 ..Default::default()
-            },
-            ..Default::default()
-        })?;
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
 
         assert_eq!(registry.stop_run("cancel-owned-cells"), 1);
-        let terminal = registry.inner.wait(&cell_id, 0, 5_000).await?;
+        let terminal = registry
+            .inner
+            .wait(&cell_id, 0, 5_000)
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(
             terminal.snapshot.phase,
             echo_agent::tools::cell::CommandCellPhase::Cancelled
