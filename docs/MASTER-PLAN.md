@@ -65,18 +65,19 @@ FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter sett
 
 ### Long-Horizon Runtime Closure
 
-状态：In progress；LH0-LH1 已完成，framework `3711e90`、application `4ab7407`/`fff1267`；
-LH2-LH6 Pending。P0 的 resolver、address identity、event routing 和 host recovery 已可直接
-复用，不再等待未来 cutover；最终 LH6 仍依赖 P0 GUI/2h soak closeout。
+状态：In progress；LH0-LH2 已完成，framework `3711e90`、application
+`4ab7407`/`fff1267`/`ad951b5`；LH3-LH6 Pending。P0 的 resolver、address identity、event
+routing 和 host recovery 已可直接复用，不再等待未来 cutover；最终 LH6 仍依赖 P0 GUI/2h
+soak closeout。
 
 规格：[`design/specs/long-horizon-runtime-closure.md`](../design/specs/long-horizon-runtime-closure.md)
 
 最新审查确认 Goal、RunTurn、provider retry、正式 PlanTask Subagent 控制、
 Requirement/Evidence、checkpoint/suffix 投影和 12 小时 deterministic ledger 真实存在；
-同时冻结 LH-F01..LH-F13：普通 conversation boot resume、Awaiter owned receipt/回传、
-Started-before-side-effect、跨轮 drain retention、普通 Chat cell 精确地址、terminal repair、
-typed projection、process governor 覆盖、完整 Provider profile 和 hot `get_run_state` 尚未闭环。
-完成 LH0-LH6 与真实 Agent/Awaiter soak 前，不再把长程产品级验收标为 Complete。
+LH1/LH2 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
+typed terminal/artifact projection 和 owned repair。剩余缺口是普通 conversation boot resume、
+Awaiter owned receipt/回传与 process Subagent permit、完整 Provider profile、hot `get_run_state`
+以及真实 Agent/Awaiter soak。完成 LH3-LH6 前，不把长程产品级验收标为 Complete。
 
 ### Surface Parity Cleanup
 
@@ -90,11 +91,13 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-Long-horizon 的 LH1 已完成：framework 现有 bounded async prepare/start、publish-before-run、
-tracked capacity、Prepared/Queued phase、typed wait/launch errors、跨轮 observation lease、
-统一 deadline 和 task-tracked shutdown；EKO 已迁移 typed adapter。下一实施阶段直接执行完整
-LH2：删除 process-global store/cell 路由，建立 scoped CommandCellRuntimeService，并一次完成
-Started-before-side-effect、typed terminal projection、repair owner 和 process governor 接入。
+Long-horizon 的 LH2 已完成：process-global store/cell 路由和 run scan 已删除；app-owned
+`CommandCellRuntimeService` 通过 immutable workspace facade、精确 store binding 和 owned
+`ChatEventLog` 覆盖 TaskRun 与普通 Chat。Started 在任何 shell permit/进程 side effect 前持久化，
+terminal cause/message/artifact 状态完整 typed round-trip，observer 持有 retention/shell permit，
+projection failure 由 capped-backoff owner 修复，GUI/TUI/CLI/channel 消费相同 journal fact。
+下一实施阶段执行 LH3：替换 `watch_cell -> agent_tool` 的 handle-dropping 路径，建立 owned Awaiter
+receipt、exact interrupt、typed result handoff 与 pending/ack journal replay。
 
 ## 文档生命周期
 

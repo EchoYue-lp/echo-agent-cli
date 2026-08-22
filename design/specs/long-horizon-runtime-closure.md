@@ -1,7 +1,7 @@
 # EKO Long-Horizon Runtime Closure
 
-> Date: 2026-08-22 (recalibrated against framework `49db907` and application `5603958`)
-> Status: LH0-LH1 Complete (`4ab7407`, framework `3711e90`, application `fff1267`); LH2-LH6 Pending
+> Date: 2026-08-22 (recalibrated through framework `3711e90` and application `ad951b5`)
+> Status: LH0-LH2 Complete (`4ab7407`, framework `3711e90`, application `fff1267`/`ad951b5`); LH3-LH6 Pending
 > Priority: P0; identity cutover is complete, while final LH6 acceptance still depends on the
 > runtime-reliability GUI/soak closeout
 > Scope: CommandCell, Awaiter, continuation boot recovery, terminal evidence, hot-state performance,
@@ -14,7 +14,8 @@ provider retry, exact PlanTask Subagent control, Requirement/Evidence completion
 checkpoint projections, and a retained 12-hour deterministic soak ledger. This specification does
 not replace those systems.
 
-The remaining work closes thirteen gaps confirmed by the 2026-08-22 source review:
+The staged closure addresses thirteen gaps confirmed by the 2026-08-22 source review. The list is
+the historical baseline; the Stage Ledger is authoritative for which gaps are now closed:
 
 1. ordinary global/workspace conversation TaskRuns do not auto-resume after boot;
 2. `watch_cell -> agent_tool -> dispatch_background` serializes a start receipt and drops the
@@ -96,7 +97,7 @@ and LH6 must not silently substitute its own evidence for that dependency.
 
 ### 3.2 Review findings frozen as failing contracts
 
-| ID     | Severity | Current defect                                                               |
+| ID     | Severity | Reviewed baseline defect                                                     |
 | ------ | -------- | ---------------------------------------------------------------------------- |
 | LH-F01 | P1       | boot auto-resume production path filters to `background:` conversations      |
 | LH-F02 | P1       | `agent_tool` drops the Awaiter `BackgroundSubagentHandle` after start        |
@@ -496,12 +497,15 @@ Delete `SHARED_COMMAND_CELLS`, `TASK_RUNTIME_STORES`, the weak store scan, and t
 re-discovering ownership from globals.
 
 Each workspace/global Agent generation receives a facade that captures the immutable
-`WorkspaceExecutionScope` and host `TaskRuntimeStore`/`ChatEventLog`. The per-invocation
-`ToolContext` supplies conversation, root message, run, execution, and call identities:
+`WorkspaceExecutionScope`. `CommandCellRuntimeService` directly owns `ChatEventLog` and an exact
+`workspace_id -> Weak<TaskRuntimeStore>` binding. The explicit binding is necessary because the
+primary Agent is constructed before GUI/TUI bootstrap creates its TaskRuntime store; it is not a
+run scan or focused-workspace fallback. The per-invocation `ToolContext` supplies conversation,
+root message, run, execution, and call identities:
 
 ```text
 WorkspaceExecutionScope
-Arc<TaskRuntimeStore> or Arc<ChatEventLog>
+CommandCellRuntimeService -> exact TaskRuntimeStore binding or owned ChatEventLog
 ToolContext -> AgentAddress + root_turn_id + run_id?
 ```
 
@@ -558,7 +562,8 @@ failure:
 1. retain exact cell ownership;
 2. publish an in-memory typed `ProjectionDegraded` diagnostic;
 3. retry with capped exponential backoff while the process lives;
-4. expose degraded state to diagnostics/surfaces;
+4. expose degraded state through a typed app-core diagnostic query; LH4 projects that one query
+   consistently across product surfaces;
 5. do not wake continuation or release ownership until terminal fact is durable;
 6. on shutdown, perform a bounded final flush and leave Started for boot recovery if persistence
    remains impossible.
@@ -1188,7 +1193,7 @@ logic; no two authorities remain active.
 | ----- | -------- | ---------------- | ------------------ | -------------------------------------------- | ---------------------------- |
 | LH0   | Complete | N/A              | `4ab7407`          | 13 contracts; release fixture; full gate     | N/A                          |
 | LH1   | Complete | `3711e90`        | `fff1267`          | 31 cell tests; full gates; 12-feature matrix | N/A                          |
-| LH2   | Pending  | N/A              | N/A                | pending                                      | scoped projection/repair     |
+| LH2   | Complete | N/A              | `ad951b5`          | 6 runtime + 13 contracts; all app gates      | N/A                          |
 | LH3   | Pending  | N/A              | N/A                | pending                                      | owned Awaiter handoff        |
 | LH4   | Pending  | N/A              | N/A                | pending                                      | parity + all-run boot resume |
 | LH5   | Pending  | N/A              | N/A                | pending                                      | hot-state performance        |
