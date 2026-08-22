@@ -14,11 +14,11 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::types::{
-    AttendedMode, BackgroundCellState, BlockerAudit, DomainProfile, EkoTaskExecution,
-    ExecutionMode, PlanRevision, PlanTask, ProviderRetryState, RunContinuationState, RunPause,
-    RunPauseReason, RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary,
-    RuntimeEventKind, RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus,
-    TurnVisibility,
+    AttendedMode, BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
+    BackgroundCellTerminalCause, BlockerAudit, DomainProfile, EkoTaskExecution, ExecutionMode,
+    PlanRevision, PlanTask, ProviderRetryState, RunContinuationState, RunPause, RunPauseReason,
+    RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
+    RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus, TurnVisibility,
 };
 
 /// Rebuilt plan snapshot — the shape `plan.json` will take.
@@ -371,8 +371,14 @@ impl EventFoldState {
                             turn_id: json_string(&ev.payload, "turn_id"),
                             execution_id: json_string(&ev.payload, "execution_id"),
                             call_id: json_string(&ev.payload, "call_id"),
-                            phase: "running".to_string(),
+                            phase: json_enum(&ev.payload, "phase")
+                                .unwrap_or(BackgroundCellPhase::Running),
+                            terminal_cause: None,
+                            terminal_message: None,
                             exit_code: None,
+                            artifact_status: json_enum(&ev.payload, "artifact_status")
+                                .unwrap_or(BackgroundCellArtifactStatus::NotRequested),
+                            artifact_message: None,
                             total_output_bytes: 0,
                             output_truncated: false,
                             output_excerpt: None,
@@ -396,8 +402,12 @@ impl EventFoldState {
                             turn_id: None,
                             execution_id: None,
                             call_id: None,
-                            phase: "unknown".to_string(),
+                            phase: BackgroundCellPhase::Unknown,
+                            terminal_cause: None,
+                            terminal_message: None,
                             exit_code: None,
+                            artifact_status: BackgroundCellArtifactStatus::NotRequested,
+                            artifact_message: None,
                             total_output_bytes: 0,
                             output_truncated: false,
                             output_excerpt: None,
@@ -407,7 +417,9 @@ impl EventFoldState {
                             finished_at: None,
                         });
                     cell.phase =
-                        json_string(&ev.payload, "phase").unwrap_or_else(|| "unknown".to_string());
+                        json_enum(&ev.payload, "phase").unwrap_or(BackgroundCellPhase::Unknown);
+                    cell.terminal_cause = json_enum(&ev.payload, "terminal_cause");
+                    cell.terminal_message = json_string(&ev.payload, "terminal_message");
                     cell.exit_code = ev
                         .payload
                         .get("exit_code")
@@ -424,6 +436,9 @@ impl EventFoldState {
                         .and_then(serde_json::Value::as_bool)
                         .unwrap_or(false);
                     cell.output_excerpt = json_string(&ev.payload, "output_excerpt");
+                    cell.artifact_status = json_enum(&ev.payload, "artifact_status")
+                        .unwrap_or(BackgroundCellArtifactStatus::NotRequested);
+                    cell.artifact_message = json_string(&ev.payload, "artifact_message");
                     cell.artifact_path = json_string(&ev.payload, "artifact_path");
                     cell.artifact_sha256 = json_string(&ev.payload, "artifact_sha256");
                     cell.finished_at = Some(ev.timestamp);
@@ -750,6 +765,13 @@ fn json_string(payload: &serde_json::Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn json_enum<T: serde::de::DeserializeOwned>(payload: &serde_json::Value, key: &str) -> Option<T> {
+    payload
+        .get(key)
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
 fn apply_boot_recovery(
     event: &RuntimeTaskEvent,
     tasks: &mut [PlanTask],
@@ -800,8 +822,12 @@ fn apply_boot_recovery(
                     turn_id: None,
                     execution_id: None,
                     call_id: json_string(recovered, "call_id"),
-                    phase: "unknown".to_string(),
+                    phase: BackgroundCellPhase::Unknown,
+                    terminal_cause: None,
+                    terminal_message: None,
                     exit_code: None,
+                    artifact_status: BackgroundCellArtifactStatus::NotRequested,
+                    artifact_message: None,
                     total_output_bytes: 0,
                     output_truncated: false,
                     output_excerpt: None,
@@ -810,7 +836,10 @@ fn apply_boot_recovery(
                     started_at: event.timestamp,
                     finished_at: None,
                 });
-            cell.phase = "interrupted".to_string();
+            cell.phase = BackgroundCellPhase::Failed;
+            cell.terminal_cause = Some(BackgroundCellTerminalCause::Interrupted);
+            cell.terminal_message =
+                Some("command cell was interrupted by process restart".to_string());
             cell.exit_code = None;
             cell.total_output_bytes = recovered
                 .get("total_output_bytes")

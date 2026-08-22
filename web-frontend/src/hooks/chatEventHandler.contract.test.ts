@@ -211,6 +211,57 @@ describe('canonical chat event v4 contract', () => {
     expect(useChatStore.getState().messages.at(-1)?.content).toBe('answer');
   });
 
+  it('delivers a typed command-cell settlement after its foreground turn is terminal', () => {
+    const base = fixture[0];
+    if (!base) throw new Error('contract fixture is incomplete');
+    const refs = context();
+    handleChatEventEnvelope(
+      {
+        ...base,
+        sequence: 2,
+        payload: { source: 'turn_status', event: { status: 'completed' } },
+      } as ChatEventEnvelope,
+      refs
+    );
+    handleChatEventEnvelope(
+      {
+        ...base,
+        sequence: 3,
+        payload: {
+          source: 'command_cell_settled',
+          event: {
+            cell: {
+              cell_id: 'cell-late',
+              name: 'long build',
+              command_hash: 'sha256:test',
+              turn_id: base.turn_id,
+              execution_id: null,
+              call_id: 'call-late',
+              phase: 'succeeded',
+              terminal_cause: 'exited',
+              terminal_message: null,
+              exit_code: 0,
+              artifact_status: 'below_threshold',
+              artifact_message: null,
+              total_output_bytes: 12,
+              output_truncated: false,
+              output_excerpt: 'build passed',
+              artifact_path: null,
+              artifact_sha256: null,
+              started_at: '2026-08-22T00:00:00Z',
+              finished_at: '2026-08-22T00:00:01Z',
+            },
+          },
+        },
+      } as ChatEventEnvelope,
+      refs
+    );
+
+    expect(useChatStore.getState().messages.at(-1)?.content).toContain(
+      'cell-late settled: succeeded'
+    );
+  });
+
   it('fails closed for an unknown run status', () => {
     const base = fixture[0];
     if (!base) throw new Error('contract fixture is incomplete');

@@ -81,6 +81,12 @@ pub enum ChatDriverEvent {
         before_tokens: usize,
         after_tokens: usize,
     },
+    CommandCellStarted {
+        cell: Box<crate::tasks::task_runtime::BackgroundCellState>,
+    },
+    CommandCellSettled {
+        cell: Box<crate::tasks::task_runtime::BackgroundCellState>,
+    },
 }
 
 /// Runtime-owned terminal result for one interactive turn.
@@ -618,10 +624,9 @@ impl PreparedChatExecution {
                         store,
                         &self.formal_run_id,
                     );
-                    crate::tasks::task_runtime::command_cells::stop_cells_for_run(
-                        &self.formal_run_id,
-                    )
-                    .map_err(|error| error.to_string())?;
+                    store
+                        .stop_owned_command_cells(&self.formal_run_id)
+                        .map_err(|error| error.to_string())?;
                     Ok(())
                 } else {
                     store
@@ -1195,7 +1200,8 @@ fn finalize_run_turn(
             store
                 .transition_run(run_id, TaskRunStatus::Cancelled)
                 .map_err(|error| error.to_string())?;
-            crate::tasks::task_runtime::command_cells::stop_cells_for_run(run_id)
+            store
+                .stop_owned_command_cells(run_id)
                 .map_err(|error| error.to_string())?;
             if let Some(trace_sink) = trace_sink {
                 trace_sink(ExecEvent::run(
@@ -2078,6 +2084,8 @@ mod tests {
                 | ChatDriverEvent::ApprovalRequest { .. }
                 | ChatDriverEvent::InputRequest { .. }
                 | ChatDriverEvent::SelectionRequest { .. }
+                | ChatDriverEvent::CommandCellStarted { .. }
+                | ChatDriverEvent::CommandCellSettled { .. }
                 | ChatDriverEvent::ContextCompressed { .. } => {}
             }
             true

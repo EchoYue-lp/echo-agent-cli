@@ -163,6 +163,8 @@ async fn run_desktop() -> anyhow::Result<()> {
         // `register_task_tools_on_agent` once AppState is built.
         task_runtime_store: None,
         browser_runtime: None,
+        command_cell_runtime: None,
+        execution_scope: None,
     };
 
     let runtime =
@@ -211,7 +213,8 @@ async fn run_desktop() -> anyhow::Result<()> {
         .with_review_integration(runtime.review_integration.clone())
         .with_prompt_assembly(runtime.prompt_assembly.clone())
         .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
-        .with_config_watcher(Some(config_watcher.clone()));
+        .with_config_watcher(Some(config_watcher.clone()))
+        .with_command_cell_runtime(runtime.command_cell_runtime.clone());
     state_inner.webhook.emitter = webhook_emitter;
     match state_inner.recover_committed_conversation_deletions().await {
         Ok(receipts) if !receipts.is_empty() => tracing::info!(
@@ -344,6 +347,9 @@ async fn run_desktop() -> anyhow::Result<()> {
         && let Err(error) = pool.shutdown().await
     {
         tracing::warn!(%error, "failed to shut down GUI agent pool");
+    }
+    if let Err(error) = state.shutdown_command_cells().await {
+        tracing::warn!(%error, "failed to settle GUI command cells");
     }
     if let Err(error) = runtime.plugin_runtime.shutdown().await {
         tracing::warn!(%error, "failed to shut down GUI plugin runtime");

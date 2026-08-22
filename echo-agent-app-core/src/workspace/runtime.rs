@@ -253,6 +253,7 @@ impl WorkspaceRuntimeHost {
                         memory_store: self.resources.memory_store(),
                         task_runtime_store: task_runtime.clone(),
                         review_integration: review_integration.clone(),
+                        execution_scope: self.execution_scope(),
                     })
                     .await?;
                 let primary_agent = pool.primary_agent().await?;

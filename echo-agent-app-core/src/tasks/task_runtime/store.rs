@@ -68,8 +68,6 @@ pub enum StoreError {
         plan_goal_revision: u64,
         run_goal_revision: u64,
     },
-    #[error("command cell registry: {0}")]
-    CommandCell(String),
     #[error("file shadow: {0}")]
     Shadow(#[from] super::file_shadow::ShadowError),
     #[error("run {run_id} has unresolved recovery barriers: {details}")]
@@ -85,6 +83,12 @@ pub enum StoreError {
 pub enum ClaimWriteOutcome {
     Applied,
     Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackgroundCellStartCommit {
+    Durable,
+    CommittedProjectionDegraded { detail: String },
 }
 
 /// Canonical result of preparing a user-requested task retry while one
@@ -510,6 +514,8 @@ pub struct TaskRuntimeStore {
     execution_target_resolver: std::sync::RwLock<
         Option<std::sync::Arc<dyn super::execution_target::TaskExecutionTargetResolver>>,
     >,
+    command_cell_runtime:
+        std::sync::RwLock<Option<std::sync::Weak<super::command_cells::CommandCellRuntimeService>>>,
     #[cfg(test)]
     run_driver_shutdown_started: tokio::sync::Notify,
     #[cfg(test)]
@@ -525,6 +531,10 @@ pub struct TaskRuntimeStore {
     fail_next_recovery_commit: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_recovery_projection: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_cell_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_cell_terminal_remaining: std::sync::atomic::AtomicUsize,
     /// File-backed event authority and deterministic projections.
     pub(super) shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     shadow_generation: std::sync::Mutex<ShadowGeneration>,
@@ -906,7 +916,20 @@ impl TaskRuntimeWorkspaceTransition<'_> {
             ));
         }
         self.store.shadow.rebind_root(root);
-        generation.workspace_id = workspace_id.into();
+        let previous_workspace_id = generation.workspace_id.clone();
+        let workspace_id = workspace_id.into();
+        generation.workspace_id = workspace_id.clone();
+        drop(generation);
+        if let Some(runtime) = self
+            .store
+            .command_cell_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            runtime.rebind_store_workspace(&previous_workspace_id, &workspace_id);
+        }
         Ok(())
     }
 }
@@ -1169,6 +1192,7 @@ impl TaskRuntimeStore {
             run_driver_idle: tokio::sync::Notify::new(),
             continuation_runtime: std::sync::OnceLock::new(),
             execution_target_resolver: std::sync::RwLock::new(None),
+            command_cell_runtime: std::sync::RwLock::new(None),
             #[cfg(test)]
             run_driver_shutdown_started: tokio::sync::Notify::new(),
             #[cfg(test)]
@@ -1183,6 +1207,10 @@ impl TaskRuntimeStore {
             fail_next_recovery_commit: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_recovery_projection: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_cell_started: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_cell_terminal_remaining: std::sync::atomic::AtomicUsize::new(0),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
                 active_operations: 0,
@@ -1640,6 +1668,18 @@ impl TaskRuntimeStore {
     pub(crate) fn fail_next_recovery_projection_for_test(&self) {
         self.fail_next_recovery_projection
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_cell_started_for_test(&self) {
+        self.fail_next_cell_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_cell_terminal_writes_for_test(&self, count: usize) {
+        self.fail_cell_terminal_remaining
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn active_run_driver_receipt_count(&self) -> Result<usize, String> {
@@ -2421,6 +2461,28 @@ impl TaskRuntimeStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .workspace_id
             .clone()
+    }
+
+    pub(crate) fn bind_command_cell_runtime(
+        &self,
+        runtime: std::sync::Weak<super::command_cells::CommandCellRuntimeService>,
+    ) {
+        *self
+            .command_cell_runtime
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(runtime);
+    }
+
+    pub(crate) fn stop_owned_command_cells(&self, run_id: &str) -> Result<usize, StoreError> {
+        let runtime = self
+            .command_cell_runtime
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        Ok(runtime
+            .map(|runtime| runtime.stop_run(&self.active_workspace_id(), run_id))
+            .unwrap_or(0))
     }
 
     #[cfg(test)]
@@ -3307,7 +3369,7 @@ impl TaskRuntimeStore {
         let _operation = self.shadow_operation()?;
         if self.cancel_active_run(run_id) {
             super::continuation::clear_launcher(self, run_id);
-            super::command_cells::stop_cells_for_run(run_id).map_err(StoreError::CommandCell)?;
+            self.stop_owned_command_cells(run_id)?;
             return Ok(true);
         }
         let Some(run) = self.get_run(run_id)? else {
@@ -3317,15 +3379,13 @@ impl TaskRuntimeStore {
             TaskRunStatus::Pending | TaskRunStatus::Paused | TaskRunStatus::Failed => {
                 self.transition_run(run_id, TaskRunStatus::Cancelled)?;
                 super::continuation::clear_launcher(self, run_id);
-                super::command_cells::stop_cells_for_run(run_id)
-                    .map_err(StoreError::CommandCell)?;
+                self.stop_owned_command_cells(run_id)?;
                 Ok(true)
             }
             TaskRunStatus::Running => {
                 self.transition_run(run_id, TaskRunStatus::Cancelled)?;
                 super::continuation::clear_launcher(self, run_id);
-                super::command_cells::stop_cells_for_run(run_id)
-                    .map_err(StoreError::CommandCell)?;
+                self.stop_owned_command_cells(run_id)?;
                 Ok(true)
             }
             TaskRunStatus::Cancelled | TaskRunStatus::Completed => Ok(false),
@@ -4504,7 +4564,7 @@ impl TaskRuntimeStore {
 
         let run_ids = runs.into_iter().map(|run| run.run_id).collect::<Vec<_>>();
         for run_id in &run_ids {
-            super::command_cells::stop_cells_for_run(run_id).map_err(StoreError::CommandCell)?;
+            self.stop_owned_command_cells(run_id)?;
         }
         self.shadow.remove_runs(&run_ids)?;
         for run_id in &run_ids {
@@ -5697,11 +5757,34 @@ impl TaskRuntimeStore {
         turn_id: Option<&str>,
         execution_id: Option<&str>,
         call_id: Option<&str>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<BackgroundCellStartCommit, StoreError> {
         self.with_run_lock(run_id, || {
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            let already_recorded = self.list_events(run_id, 0)?.iter().any(|event| {
+            #[cfg(test)]
+            if self
+                .fail_next_cell_started
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::InvalidPlan(
+                    "injected BackgroundCellStarted append failure".to_string(),
+                ));
+            }
+            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
+                max_string_chars: 240,
+                ..Default::default()
+            };
+            let payload = serde_json::json!({
+                "cell_id": cell_id,
+                "name": retention.sanitize_text(name),
+                "command_hash": command_hash,
+                "turn_id": turn_id,
+                "execution_id": execution_id,
+                "call_id": call_id,
+                "phase": BackgroundCellPhase::Prepared,
+                "artifact_status": BackgroundCellArtifactStatus::NotRequested,
+            });
+            let existing = self.list_events(run_id, 0)?.into_iter().find(|event| {
                 event.event_type == RuntimeEventKind::BackgroundCellStarted
                     && event
                         .payload
@@ -5709,29 +5792,27 @@ impl TaskRuntimeStore {
                         .and_then(serde_json::Value::as_str)
                         == Some(cell_id)
             });
-            if already_recorded {
-                return Ok(());
+            if let Some(existing) = existing {
+                if existing.payload != payload {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "conflicting BackgroundCellStarted fact for cell {cell_id}"
+                    )));
+                }
+            } else {
+                self.shadow.append_event_line(
+                    run_id,
+                    None,
+                    call_id,
+                    RuntimeEventKind::BackgroundCellStarted,
+                    payload,
+                )?;
             }
-            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
-                max_string_chars: 240,
-                ..Default::default()
-            };
-            self.shadow.append_event_line(
-                run_id,
-                None,
-                call_id,
-                RuntimeEventKind::BackgroundCellStarted,
-                serde_json::json!({
-                    "cell_id": cell_id,
-                    "name": retention.sanitize_text(name),
-                    "command_hash": command_hash,
-                    "turn_id": turn_id,
-                    "execution_id": execution_id,
-                    "call_id": call_id,
+            match self.shadow.rewrite_plan(run_id) {
+                Ok(()) => Ok(BackgroundCellStartCommit::Durable),
+                Err(error) => Ok(BackgroundCellStartCommit::CommittedProjectionDegraded {
+                    detail: error.to_string(),
                 }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
-            Ok(())
+            }
         })
     }
 
@@ -5743,8 +5824,12 @@ impl TaskRuntimeStore {
         run_id: &str,
         cell_id: &str,
         name: &str,
-        phase: &str,
+        phase: BackgroundCellPhase,
+        terminal_cause: Option<BackgroundCellTerminalCause>,
+        terminal_message: Option<&str>,
         exit_code: Option<i32>,
+        artifact_status: BackgroundCellArtifactStatus,
+        artifact_message: Option<&str>,
         total_output_bytes: u64,
         output_truncated: bool,
         output_excerpt: Option<&str>,
@@ -5755,7 +5840,41 @@ impl TaskRuntimeStore {
         self.with_run_lock(run_id, || {
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            let already_recorded = self.list_events(run_id, 0)?.iter().any(|event| {
+            #[cfg(test)]
+            if self
+                .fail_cell_terminal_remaining
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                return Err(StoreError::InvalidPlan(
+                    "injected BackgroundCellFinished append failure".to_string(),
+                ));
+            }
+            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
+                max_string_chars: 1_200,
+                ..Default::default()
+            };
+            let payload = serde_json::json!({
+                "cell_id": cell_id,
+                "name": retention.sanitize_text(name),
+                "phase": phase,
+                "terminal_cause": terminal_cause,
+                "terminal_message": terminal_message.map(|text| retention.sanitize_text(text)),
+                "exit_code": exit_code,
+                "artifact_status": artifact_status,
+                "artifact_message": artifact_message.map(|text| retention.sanitize_text(text)),
+                "total_output_bytes": total_output_bytes,
+                "output_truncated": output_truncated,
+                "output_excerpt": output_excerpt.map(|text| retention.sanitize_text(text)),
+                "artifact_path": artifact_path,
+                "artifact_sha256": artifact_sha256,
+                "call_id": call_id,
+            });
+            let existing = self.list_events(run_id, 0)?.into_iter().find(|event| {
                 event.event_type == RuntimeEventKind::BackgroundCellFinished
                     && event
                         .payload
@@ -5763,31 +5882,21 @@ impl TaskRuntimeStore {
                         .and_then(serde_json::Value::as_str)
                         == Some(cell_id)
             });
-            if already_recorded {
-                return Ok(());
+            if let Some(existing) = existing {
+                if existing.payload != payload {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "conflicting BackgroundCellFinished fact for cell {cell_id}"
+                    )));
+                }
+            } else {
+                self.shadow.append_event_line(
+                    run_id,
+                    None,
+                    call_id,
+                    RuntimeEventKind::BackgroundCellFinished,
+                    payload,
+                )?;
             }
-            let retention = echo_agent::utils::retention::ContentRetentionPolicy {
-                max_string_chars: 1_200,
-                ..Default::default()
-            };
-            self.shadow.append_event_line(
-                run_id,
-                None,
-                call_id,
-                RuntimeEventKind::BackgroundCellFinished,
-                serde_json::json!({
-                    "cell_id": cell_id,
-                    "name": retention.sanitize_text(name),
-                    "phase": phase,
-                    "exit_code": exit_code,
-                    "total_output_bytes": total_output_bytes,
-                    "output_truncated": output_truncated,
-                    "output_excerpt": output_excerpt.map(|text| retention.sanitize_text(text)),
-                    "artifact_path": artifact_path,
-                    "artifact_sha256": artifact_sha256,
-                    "call_id": call_id,
-                }),
-            )?;
             self.shadow.rewrite_plan(run_id)?;
             Ok(())
         })
@@ -8078,8 +8187,12 @@ mod tests {
                 "r1",
                 "cell-1",
                 "cargo test",
-                "completed",
+                BackgroundCellPhase::Succeeded,
+                Some(BackgroundCellTerminalCause::Exited),
+                None,
                 Some(0),
+                BackgroundCellArtifactStatus::NotRequested,
+                None,
                 2,
                 false,
                 Some("ok"),
@@ -9172,7 +9285,11 @@ mod tests {
             .iter()
             .find(|cell| cell.cell_id == "orphan-cell")
             .ok_or_else(|| StoreError::InvalidPlan("orphan cell was not rebuilt".to_string()))?;
-        assert_eq!(cell.phase, "interrupted");
+        assert_eq!(cell.phase, BackgroundCellPhase::Failed);
+        assert_eq!(
+            cell.terminal_cause,
+            Some(BackgroundCellTerminalCause::Interrupted)
+        );
         assert!(!cell.is_active());
         let recovered_cell_count = store
             .list_events("r1", 0)?

@@ -170,6 +170,9 @@ pub struct SharedResources {
     /// the main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    pub command_cell_runtime:
+        Option<Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>>,
+    pub execution_scope: Option<crate::workspace::WorkspaceExecutionScope>,
 }
 
 pub(crate) struct WorkspaceAgentPoolResources {
@@ -180,6 +183,7 @@ pub(crate) struct WorkspaceAgentPoolResources {
     pub memory_store: Arc<dyn echo_agent::memory::Store>,
     pub task_runtime_store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
     pub review_integration: Arc<crate::evolution::ReviewIntegration>,
+    pub execution_scope: crate::workspace::WorkspaceExecutionScope,
 }
 
 impl SharedResources {
@@ -222,6 +226,8 @@ impl SharedResources {
                     // agents can register task-management tools.
                     task_runtime_store: None,
                     browser_runtime: None,
+                    command_cell_runtime: None,
+                    execution_scope: None,
                 }
             })
             .await
@@ -747,6 +753,7 @@ impl AgentPool {
         let mut shared = shared;
         shared.browser_runtime = Some(runtime.browser_runtime.clone());
         shared.task_runtime_store = task_runtime_store;
+        shared.command_cell_runtime = Some(runtime.command_cell_runtime.clone());
 
         // Extract skill descriptors from primary agent (avoids re-reading from disk)
         let skill_descriptors = runtime.agent_handle.read(|a| a.skill_descriptors()).await;
@@ -756,6 +763,11 @@ impl AgentPool {
             .await
             .unwrap_or_else(|| crate::infra::tool_output_artifact_config(None));
         let working_dir = runtime.agent_handle.read(|agent| agent.working_dir()).await;
+        shared.execution_scope = Some(crate::workspace::WorkspaceExecutionScope::global(
+            working_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        ));
 
         let pool = Arc::new(Self {
             shared,
@@ -836,6 +848,7 @@ impl AgentPool {
             memory_store,
             task_runtime_store,
             review_integration,
+            execution_scope,
         } = resources;
         let mcp_config_snapshot = self.mcp_config_snapshot.read().await.clone();
         let shared = SharedResources {
@@ -852,6 +865,8 @@ impl AgentPool {
             review_integration: Some(review_integration),
             task_runtime_store: Some(task_runtime_store.clone()),
             browser_runtime: self.shared.browser_runtime.clone(),
+            command_cell_runtime: self.shared.command_cell_runtime.clone(),
+            execution_scope: Some(execution_scope),
         };
         let mut pool = Arc::new(Self {
             shared,
@@ -1920,6 +1935,8 @@ impl AgentPool {
             // disabled by invocation policy; pool conversation agents may drive it.
             task_runtime_store: self.shared.task_runtime_store.clone(),
             browser_runtime: self.shared.browser_runtime.clone(),
+            command_cell_runtime: self.shared.command_cell_runtime.clone(),
+            execution_scope: self.shared.execution_scope.clone(),
         };
         let created = infra::create_agent_with_diagnostics(&params, &app_config)
             .await

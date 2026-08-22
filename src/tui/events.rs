@@ -2504,6 +2504,14 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 "Selection requested [{request_id}]: {prompt} ({})",
                 options.join(", ")
             )),
+            ChatDriverEvent::CommandCellStarted { cell } => AgentEvent::Notice(format!(
+                "Command cell {} started: {}",
+                cell.cell_id, cell.name
+            )),
+            ChatDriverEvent::CommandCellSettled { cell } => AgentEvent::Notice(format!(
+                "Command cell {} settled: {}",
+                cell.cell_id, cell.phase
+            )),
             ChatDriverEvent::ContextCompressed {
                 before_count,
                 after_count,

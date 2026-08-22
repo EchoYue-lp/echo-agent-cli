@@ -193,6 +193,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         working_dir: None,
         task_runtime_store: None,
         browser_runtime: None,
+        command_cell_runtime: None,
+        execution_scope: None,
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let runtime =
@@ -306,6 +308,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 plugin_runtime: runtime.plugin_runtime.clone(),
                 config_watcher: config_watcher.clone(),
                 foreground_turns: foreground_turns.clone(),
+                command_cell_runtime: runtime.command_cell_runtime.clone(),
             },
         )
         .await;
@@ -437,6 +440,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             plugin_runtime: runtime.plugin_runtime.clone(),
             config_watcher: config_watcher.clone(),
             foreground_turns: foreground_turns.clone(),
+            command_cell_runtime: runtime.command_cell_runtime.clone(),
         },
     )
     .await
@@ -672,6 +676,8 @@ mod tests {
             working_dir: None,
             task_runtime_store: None,
             browser_runtime: None,
+            command_cell_runtime: None,
+            execution_scope: None,
         };
         let mut app_config = config::AppConfig::default();
         app_config.model.provider = "local-test".to_string();

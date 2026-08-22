@@ -1540,6 +1540,73 @@ impl Default for RunContinuationState {
     }
 }
 
+/// Stable application projection of the framework command-cell phase.
+/// Stable typed reason for a terminal application cell projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "BackgroundCellPhase")]
+pub enum BackgroundCellPhase {
+    Prepared,
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    LaunchFailed,
+    Unknown,
+}
+
+impl BackgroundCellPhase {
+    pub const fn is_terminal(self) -> bool {
+        !matches!(self, Self::Prepared | Self::Queued | Self::Running)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::LaunchFailed => "launch_failed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for BackgroundCellPhase {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Stable application projection of complete-output artifact settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "BackgroundCellTerminalCause")]
+pub enum BackgroundCellTerminalCause {
+    Exited,
+    TimedOut,
+    Cancelled,
+    LaunchFailed,
+    WaitFailed,
+    OutputDrainFailed,
+    ObserverFailed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "BackgroundCellArtifactStatus")]
+pub enum BackgroundCellArtifactStatus {
+    NotRequested,
+    Writing,
+    BelowThreshold,
+    Available,
+    Failed,
+}
+
 /// Durable TaskRuntime projection of one process-scoped command cell.
 ///
 /// The OS handle is never persisted. A started record without `finished_at`
@@ -1554,8 +1621,12 @@ pub struct BackgroundCellState {
     pub turn_id: Option<String>,
     pub execution_id: Option<String>,
     pub call_id: Option<String>,
-    pub phase: String,
+    pub phase: BackgroundCellPhase,
+    pub terminal_cause: Option<BackgroundCellTerminalCause>,
+    pub terminal_message: Option<String>,
     pub exit_code: Option<i32>,
+    pub artifact_status: BackgroundCellArtifactStatus,
+    pub artifact_message: Option<String>,
     #[ts(type = "number")]
     pub total_output_bytes: u64,
     pub output_truncated: bool,
@@ -1572,7 +1643,7 @@ pub struct BackgroundCellState {
 
 impl BackgroundCellState {
     pub fn is_active(&self) -> bool {
-        self.finished_at.is_none()
+        !self.phase.is_terminal()
     }
 }
 

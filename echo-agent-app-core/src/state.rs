@@ -991,6 +991,9 @@ pub struct AppState {
     pub plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
     /// Sole acknowledged hook/config watcher lifecycle handle.
     pub config_watcher: Option<Arc<crate::config_watcher::ConfigWatcherHandle>>,
+    /// Application-owned command-cell runtime shared by every Agent surface.
+    pub command_cell_runtime:
+        Option<Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>>,
     /// Interactive terminal authority shared by GUI, TUI, CLI, and channels.
     pub terminal: Arc<crate::terminal::TerminalService>,
     /// Durable cross-workspace conversation inbox authority.
@@ -1185,6 +1188,7 @@ impl AppState {
             review_integration: None,
             plugin_runtime: None,
             config_watcher: None,
+            command_cell_runtime: None,
             terminal: crate::terminal::TerminalService::new(),
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
             agent_deliveries: Arc::new(crate::agent_router::AgentDeliverySupervisor::default()),
@@ -1556,6 +1560,25 @@ impl AppState {
     ) -> Self {
         self.config_watcher = config_watcher;
         self
+    }
+
+    pub fn with_command_cell_runtime(
+        mut self,
+        runtime: Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
+    ) -> Self {
+        self.storage.chat_events = runtime.chat_events();
+        if let Some(store) = self.tasks.runtime.as_ref() {
+            runtime.bind_store(store);
+        }
+        self.command_cell_runtime = Some(runtime);
+        self
+    }
+
+    pub async fn shutdown_command_cells(&self) -> Result<(), String> {
+        match self.command_cell_runtime.as_ref() {
+            Some(runtime) => runtime.shutdown().await,
+            None => Ok(()),
+        }
     }
 
     pub fn with_agent_router(

@@ -696,7 +696,9 @@ export function TaskRuntimePanel() {
     );
   }).length;
   const currentTurn = continuation?.active_turn ?? continuation?.last_turn;
-  const activeCellCount = backgroundCells.filter((cell) => cell.phase === 'running').length;
+  const activeCellCount = backgroundCells.filter((cell) =>
+    ['prepared', 'queued', 'running'].includes(cell.phase)
+  ).length;
   const budgetLabels = continuation?.enabled ? continuationBudgetLabels(continuation) : null;
   const planGoalCurrent =
     plan?.goal_revision === activeRun.goal_revision && plan?.goal_sha256 === activeRun.goal_sha256;

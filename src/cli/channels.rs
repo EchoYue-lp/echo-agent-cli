@@ -1857,6 +1857,24 @@ async fn aggregate_by_sentence<'a>(
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::InputRemoved { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::InputReordered { .. }) => {}
+                ChannelRenderEvent::Driver(ChatDriverEvent::CommandCellStarted { cell }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[cell:{}] started: {}", cell.cell_id, cell.name),
+                    );
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::CommandCellSettled { cell }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[cell:{}] settled: {}", cell.cell_id, cell.phase),
+                    );
+                }
                 ChannelRenderEvent::Driver(ChatDriverEvent::ApprovalRequest {
                     request_id,
                     tool_name,

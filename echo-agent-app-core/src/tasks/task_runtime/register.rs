@@ -28,7 +28,6 @@ pub async fn task_revision_service_for_agent(
     agent_handle: &AgentHandle,
     store: Arc<TaskRuntimeStore>,
 ) -> Arc<echo_agent::tasks::TaskRevisionService> {
-    super::command_cells::register_task_runtime_store(&store);
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
     let registry = agent_handle
         .read(|agent| agent.subagent_registry().clone())
@@ -47,7 +46,6 @@ pub async fn register_task_tools_on_agent(
     agent_handle: &AgentHandle,
     store: Arc<TaskRuntimeStore>,
 ) {
-    super::command_cells::register_task_runtime_store(&store);
     let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
     let registry = agent_handle
         .read(|agent| agent.subagent_registry().clone())

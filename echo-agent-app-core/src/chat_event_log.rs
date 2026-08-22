@@ -866,6 +866,8 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         ChatDriverEvent::Execution(_)
         | ChatDriverEvent::ExecutionPath { .. }
         | ChatDriverEvent::Interrupt { .. }
+        | ChatDriverEvent::CommandCellStarted { .. }
+        | ChatDriverEvent::CommandCellSettled { .. }
         | ChatDriverEvent::InputQueued { .. }
         | ChatDriverEvent::InputRemoved { .. }
         | ChatDriverEvent::InputReordered { .. }
@@ -1033,6 +1035,23 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
         return Err(ChatEventLogError::InvalidEvent(
             "queued input order contains an empty identity".to_string(),
         ));
+    }
+    match event {
+        ChatDriverEvent::CommandCellStarted { cell }
+            if cell.cell_id.trim().is_empty() || !cell.is_active() =>
+        {
+            return Err(ChatEventLogError::InvalidEvent(
+                "command-cell Started fact must have an active typed state".to_string(),
+            ));
+        }
+        ChatDriverEvent::CommandCellSettled { cell }
+            if cell.cell_id.trim().is_empty() || cell.is_active() || cell.finished_at.is_none() =>
+        {
+            return Err(ChatEventLogError::InvalidEvent(
+                "command-cell terminal fact must have a settled typed state".to_string(),
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }

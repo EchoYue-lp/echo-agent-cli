@@ -44,23 +44,33 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 /// Process-wide EKO resource ceiling shared by every workspace and TaskRun.
 /// Per-run limits still apply; a dispatch must hold both permits, so opening
 /// more workspace hosts cannot multiply provider or machine concurrency.
-struct ProcessExecutionGovernor {
-    subagent: Semaphore,
-    write: Semaphore,
-    shell: Semaphore,
-    llm: Semaphore,
+pub(crate) struct ProcessExecutionGovernor {
+    subagent: Arc<Semaphore>,
+    write: Arc<Semaphore>,
+    shell: Arc<Semaphore>,
+    llm: Arc<Semaphore>,
 }
 
-static PROCESS_EXECUTION_GOVERNOR: std::sync::LazyLock<ProcessExecutionGovernor> =
+static PROCESS_EXECUTION_GOVERNOR: std::sync::LazyLock<Arc<ProcessExecutionGovernor>> =
     std::sync::LazyLock::new(|| {
         let limits = EkoExecutionLimits::default();
-        ProcessExecutionGovernor {
-            subagent: Semaphore::new(limits.max_concurrent_subagents.max(1)),
-            write: Semaphore::new(limits.max_concurrent_writes.max(1)),
-            shell: Semaphore::new(limits.max_concurrent_shells.max(1)),
-            llm: Semaphore::new(limits.max_parallel_llm_calls.max(1)),
-        }
+        Arc::new(ProcessExecutionGovernor {
+            subagent: Arc::new(Semaphore::new(limits.max_concurrent_subagents.max(1))),
+            write: Arc::new(Semaphore::new(limits.max_concurrent_writes.max(1))),
+            shell: Arc::new(Semaphore::new(limits.max_concurrent_shells.max(1))),
+            llm: Arc::new(Semaphore::new(limits.max_parallel_llm_calls.max(1))),
+        })
     });
+
+pub(crate) fn process_execution_governor() -> Arc<ProcessExecutionGovernor> {
+    PROCESS_EXECUTION_GOVERNOR.clone()
+}
+
+impl ProcessExecutionGovernor {
+    pub(crate) fn shell_semaphore(&self) -> Arc<Semaphore> {
+        self.shell.clone()
+    }
+}
 
 use super::completion_gate::{artifact_matches, verification_matches};
 use super::store::{ClaimWriteOutcome, StoreError, SubagentReleaseRecord, TaskRuntimeStore};
@@ -5809,8 +5819,12 @@ Read the runtime path and found one missing branch.
                 &run_id,
                 "cell-running",
                 "cargo test --workspace",
-                "succeeded",
+                BackgroundCellPhase::Succeeded,
+                Some(BackgroundCellTerminalCause::Exited),
+                None,
                 Some(0),
+                BackgroundCellArtifactStatus::NotRequested,
+                None,
                 128,
                 false,
                 Some("128 tests passed"),

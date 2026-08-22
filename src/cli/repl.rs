@@ -863,6 +863,18 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
                 "Selection requested [{request_id}]: {prompt} ({})",
                 options.join(", ")
             )),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::CommandCellStarted { cell } => {
+                self.output.emit(format!(
+                    "Command cell {} started: {}",
+                    cell.cell_id, cell.name
+                ))
+            }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::CommandCellSettled { cell } => {
+                self.output.emit(format!(
+                    "Command cell {} settled: {}",
+                    cell.cell_id, cell.phase
+                ))
+            }
             echo_agent_app_core::chat_driver::ChatDriverEvent::ContextCompressed {
                 before_count,
                 after_count,

@@ -113,22 +113,27 @@ fn lh_f03_tauri_still_suppresses_every_run_owned_framework_subagent() -> Result<
 }
 
 #[test]
-fn lh_f04_terminal_projection_still_gives_up_after_three_attempts() -> Result<(), String> {
-    require(
+fn lh_f04_terminal_projection_keeps_an_owned_repair_loop() -> Result<(), String> {
+    require_absent(
         APP_COMMAND_CELLS,
         "for attempt in 1..=3_u8",
-        "LH-F04 baseline changed: fixed terminal retry count is gone",
+        "LH-F04 repair regressed: fixed terminal retry count returned",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        "delay = delay.saturating_mul(2).min(Duration::from_secs(30))",
+        "LH-F04 repair regressed: capped-backoff repair is missing",
     )?;
     ordered(
         APP_COMMAND_CELLS,
-        "observe_terminal_cell(",
-        "forget_cell(&cells_by_run",
-        "LH-F04 baseline changed: ownership is no longer forgotten after observer settlement",
+        "observe_terminal_cell(\n",
+        "service.forget(&scope, &cell_id)",
+        "LH-F04 repair regressed: ownership is released before terminal repair settles",
     )
 }
 
 #[test]
-fn lh_f05_background_cell_projection_is_still_stringly_and_incomplete() -> Result<(), String> {
+fn lh_f05_background_cell_projection_is_typed_and_complete() -> Result<(), String> {
     let state = between(
         APP_TYPES,
         "pub struct BackgroundCellState",
@@ -137,18 +142,18 @@ fn lh_f05_background_cell_projection_is_still_stringly_and_incomplete() -> Resul
     )?;
     require(
         state,
-        "pub phase: String",
-        "LH-F05 baseline changed: cell phase is no longer stringly typed",
+        "pub phase: BackgroundCellPhase",
+        "LH-F05 repair regressed: cell phase is not typed",
     )?;
-    require_absent(
+    require(
         state,
         "terminal_cause",
-        "LH-F05 baseline changed: terminal cause is already projected",
+        "LH-F05 repair regressed: terminal cause is not projected",
     )?;
-    require_absent(
+    require(
         state,
         "artifact_status",
-        "LH-F05 baseline changed: artifact status is already projected",
+        "LH-F05 repair regressed: artifact status is not projected",
     )
 }
 
@@ -207,32 +212,38 @@ fn lh_f08_historical_soak_still_exercises_only_the_store_core() -> Result<(), St
 }
 
 #[test]
-fn lh_f09_eko_still_launches_before_started_is_durable() -> Result<(), String> {
+fn lh_f09_eko_persists_started_before_process_execution() -> Result<(), String> {
     let launch = between(
         APP_COMMAND_CELLS,
-        "impl CommandCellRegistry for EkoCommandCellRegistry",
+        "impl CommandCellRegistry for ScopedCommandCellRegistry",
         "fn wait(",
         "LH-F09 EKO launch adapter could not be isolated",
     )?;
     ordered(
         launch,
-        "let receipt = self.inner.launch(request).await?;",
+        "prepare_launch(request).await?",
         "store.record_background_cell_started(",
-        "LH-F09 baseline changed: Started now precedes process launch",
+        "LH-F09 repair regressed: Started is attempted before reservation",
+    )?;
+    ordered(
+        launch,
+        "store.record_background_cell_started(",
+        "start_prepared(reservation).await",
+        "LH-F09 repair regressed: process execution can precede durable Started",
     )
 }
 
 #[test]
-fn lh_f10_awaiter_still_bypasses_process_subagent_governor() -> Result<(), String> {
+fn lh_f10_command_cells_share_the_process_shell_governor() -> Result<(), String> {
     require(
         APP_EXECUTOR,
         "static PROCESS_EXECUTION_GOVERNOR",
         "LH-F10 process governor authority is missing",
     )?;
-    require_absent(
+    require(
         APP_COMMAND_CELLS,
-        "PROCESS_EXECUTION_GOVERNOR",
-        "LH-F10 baseline changed: cell/Awaiter adapter already uses the process governor",
+        "process_execution_governor()",
+        "LH-F10 repair regressed: command cells bypass the process shell governor",
     )
 }
 
@@ -259,13 +270,13 @@ fn lh_f12_observation_lease_now_spans_multiple_wait_rounds() -> Result<(), Strin
     )?;
     require(
         APP_COMMAND_CELLS,
-        "let observation = self.inner.observe(&cell_id)?;",
+        "let observation = self.service.inner.observe(&cell_id)?;",
         "LH-F12 repair regressed: EKO terminal observer does not retain the cell",
     )
 }
 
 #[test]
-fn lh_f13_owner_identity_is_carried_but_chat_projection_remains_run_only() -> Result<(), String> {
+fn lh_f13_owner_identity_routes_ordinary_chat_to_its_exact_journal() -> Result<(), String> {
     let owner = between(
         FRAMEWORK_CELL_CONTRACT,
         "pub struct CommandCellOwner",
@@ -284,7 +295,17 @@ fn lh_f13_owner_identity_is_carried_but_chat_projection_remains_run_only() -> Re
     )?;
     require(
         APP_COMMAND_CELLS,
-        "let store = owner.run_id.as_deref().and_then(store_for_run);",
-        "LH-F13 baseline changed: EKO projection is no longer run-only",
+        "ordinary Chat cell requires conversation identity",
+        "LH-F13 repair regressed: ordinary Chat admits missing conversation identity",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        "ordinary Chat cell requires root message identity",
+        "LH-F13 repair regressed: ordinary Chat admits missing root identity",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        "append_chat_cell_fact",
+        "LH-F13 repair regressed: ordinary Chat cell is not durably journaled",
     )
 }

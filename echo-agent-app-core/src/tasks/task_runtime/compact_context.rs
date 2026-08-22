@@ -91,10 +91,6 @@ impl TaskRuntimeProjectionRegistry {
             .map(|registration| Arc::clone(&registration.store))
     }
 
-    pub(crate) fn store_for_run(&self, run_id: &str) -> Option<Arc<TaskRuntimeStore>> {
-        self.store(run_id)
-    }
-
     pub fn contains(&self, run_id: &str) -> bool {
         self.registrations
             .read()
@@ -399,10 +395,11 @@ fn push_background_cells(out: &mut String, cells: &[BackgroundCellState]) {
         .collect::<Vec<_>>();
     active.sort_by_key(|cell| cell.started_at);
     if !active.is_empty() {
-        out.push_str("Running background cells:\n");
+        out.push_str("Active background cells:\n");
         for cell in active.into_iter().take(6) {
             out.push_str(&format!(
-                "- [running] {} ({}, {} bytes); use wait(cell_id={}, cursor=0) to observe or stop_cell to cancel\n",
+                "- [{}] {} ({}, {} bytes); use wait(cell_id={}, cursor=0) to observe or stop_cell to cancel\n",
+                cell.phase,
                 truncate_chars(&cell.name, MAX_TASK_TITLE_CHARS),
                 cell.cell_id,
                 cell.total_output_bytes,

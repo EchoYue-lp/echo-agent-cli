@@ -63,6 +63,8 @@ pub struct AgentRuntime {
     pub plugin_runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
     /// Canonical durable user MCP configuration shared with application state.
     pub mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
+    pub command_cell_runtime:
+        Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
 }
 
 impl AgentRuntime {
@@ -139,6 +141,7 @@ impl AgentRuntime {
         let prompt_assembly = created.prompt_assembly;
         let model_consumers = created.model_consumers;
         let active_runtime_model = created.runtime_model;
+        let command_cell_runtime = created.command_cell_runtime;
         let session_app_config = match active_runtime_model.as_ref() {
             Some(runtime) => crate::model_config::session_config_for_runtime(app_config, runtime)
                 .map_err(anyhow::Error::msg)?,
@@ -360,6 +363,7 @@ impl AgentRuntime {
             prompt_assembly,
             plugin_runtime,
             mcp_config_runtime,
+            command_cell_runtime,
         })
     }
 
@@ -385,7 +389,8 @@ impl AgentRuntime {
         state = state
             .with_review_integration(self.review_integration.clone())
             .with_prompt_assembly(self.prompt_assembly.clone())
-            .with_plugin_runtime(Some(self.plugin_runtime.clone()));
+            .with_plugin_runtime(Some(self.plugin_runtime.clone()))
+            .with_command_cell_runtime(self.command_cell_runtime.clone());
         // Note: task_service and scheduler are started separately by the caller
         // because they need a Store which may be created differently per entry.
         state

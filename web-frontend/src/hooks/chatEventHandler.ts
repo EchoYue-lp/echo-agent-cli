@@ -26,7 +26,9 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
   if (
     terminalAlreadyEstablished &&
     payload.source !== 'agent' &&
-    payload.source !== 'turn_status'
+    payload.source !== 'turn_status' &&
+    payload.source !== 'command_cell_started' &&
+    payload.source !== 'command_cell_settled'
   ) {
     return;
   }
@@ -73,6 +75,30 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
     case 'context_compressed':
       handleChatEvent({ type: 'context_compressed', ...payload.event }, ctx);
       break;
+    case 'command_cell_started':
+      handleChatEvent(
+        {
+          type: 'notice',
+          level: 'info',
+          code: 'command_cell_started',
+          message: `Command cell ${payload.event.cell.cell_id} started: ${payload.event.cell.name}`,
+        },
+        ctx
+      );
+      break;
+    case 'command_cell_settled': {
+      const cell = payload.event.cell;
+      handleChatEvent(
+        {
+          type: 'notice',
+          level: cell.phase === 'succeeded' ? 'info' : 'warning',
+          code: 'command_cell_settled',
+          message: `Command cell ${cell.cell_id} settled: ${cell.phase}`,
+        },
+        ctx
+      );
+      break;
+    }
     case 'execution':
       // The exact payload remains in the durable envelope. The dedicated
       // execution projection updates the TaskRuntime store.

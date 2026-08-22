@@ -159,6 +159,9 @@ pub struct HeadlessServiceResources {
     pub plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
     pub config_watcher: std::sync::Arc<echo_agent_app_core::config_watcher::ConfigWatcherHandle>,
     pub foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    pub command_cell_runtime: std::sync::Arc<
+        echo_agent_app_core::tasks::task_runtime::command_cells::CommandCellRuntimeService,
+    >,
 }
 
 /// Composition receipt for the single headless bootstrap shared by CLI and
@@ -389,6 +392,7 @@ pub async fn start_headless_services(
     state.webhook.emitter = resources.webhook_emitter;
     state.connection.pool = Some(resources.pool);
     state.tasks.runtime = resources.task_runtime_store;
+    state = state.with_command_cell_runtime(resources.command_cell_runtime);
     match state.recover_committed_conversation_deletions().await {
         Ok(receipts) if !receipts.is_empty() => tracing::info!(
             count = receipts.len(),
@@ -575,6 +579,15 @@ pub async fn shutdown_headless_services(
                     pool.shutdown().await.map_err(anyhow::Error::msg)?;
                 }
                 Ok(())
+            }),
+        },
+        CliShutdownStep {
+            name: "command cells",
+            future: Box::pin(async {
+                app_state
+                    .shutdown_command_cells()
+                    .await
+                    .map_err(anyhow::Error::msg)
             }),
         },
         CliShutdownStep {

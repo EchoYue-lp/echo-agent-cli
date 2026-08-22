@@ -17,6 +17,7 @@ export type {
   ToolInfo,
 } from '../generated';
 import type {
+  BackgroundCellState,
   McpServerInfo as GeneratedMcpServerInfo,
   McpToolInfo as GeneratedMcpToolInfo,
   SkillInfo as GeneratedSkillInfo,
@@ -355,7 +356,9 @@ export type ChatDriverEvent =
         before_tokens: number;
         after_tokens: number;
       };
-    };
+    }
+  | { source: 'command_cell_started'; event: { cell: BackgroundCellState } }
+  | { source: 'command_cell_settled'; event: { cell: BackgroundCellState } };
 
 export interface ChatEventEnvelope {
   schema_version: number;

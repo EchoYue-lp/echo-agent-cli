@@ -329,6 +329,9 @@ pub struct AgentCreateParams {
     /// task-management tools (task_create/task_update/task_list) so the
     /// main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    pub command_cell_runtime:
+        Option<Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>>,
+    pub execution_scope: Option<crate::workspace::WorkspaceExecutionScope>,
     /// Shared application-owned managed browser runtime. The same instance is
     /// installed on the primary agent and all built-in subagents so one
     /// Playwright MCP sidecar owns the managed browser profile.
@@ -372,6 +375,8 @@ pub struct CreatedAgent {
     pub prompt_assembly: crate::project::prompt::PromptAssembly,
     pub model_consumers: AgentModelConsumers,
     pub runtime_model: Option<model_config::ModelRuntimeConfig>,
+    pub command_cell_runtime:
+        Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
 }
 
 /// Create an Agent instance without retaining build diagnostics.
@@ -389,9 +394,6 @@ pub async fn create_agent_with_diagnostics(
     params: &AgentCreateParams,
     app_config: &AppConfig,
 ) -> std::result::Result<CreatedAgent, String> {
-    if let Some(store) = &params.task_runtime_store {
-        crate::tasks::task_runtime::command_cells::register_task_runtime_store(store);
-    }
     // EKO can boot before the user configures a provider. An explicit selector
     // must still resolve, while an absent selector leaves the Agent detached
     // from LLM transport until the first model mutation is published.
@@ -469,8 +471,23 @@ pub async fn create_agent_with_diagnostics(
     let script_execution_profile_resolver: Arc<
         dyn echo_agent::tools::ScriptExecutionProfileResolver,
     > = Arc::new(crate::analysis_runtime::AnalyticsRuntime::default());
+    let command_cell_runtime = match params.command_cell_runtime.clone() {
+        Some(runtime) => runtime,
+        None => crate::tasks::task_runtime::command_cells::CommandCellRuntimeService::new(
+            sandbox_manager.clone(),
+            Arc::new(crate::chat_event_log::ChatEventLog::at_default_root()),
+        )?,
+    };
+    let execution_scope = params.execution_scope.clone().unwrap_or_else(|| {
+        crate::workspace::WorkspaceExecutionScope::global(
+            params
+                .working_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        )
+    });
     let command_cells =
-        crate::tasks::task_runtime::command_cells::shared_command_cells(sandbox_manager.clone())?;
+        command_cell_runtime.scoped(execution_scope, params.task_runtime_store.clone());
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
     let subagent_registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
@@ -762,6 +779,7 @@ pub async fn create_agent_with_diagnostics(
         prompt_assembly,
         model_consumers,
         runtime_model,
+        command_cell_runtime,
     })
 }
 
@@ -2869,10 +2887,9 @@ mod resolve_subagent_model_tests {
 
     fn test_command_cells()
     -> echo_agent::error::Result<Arc<dyn echo_agent::tools::cell::CommandCellRegistry>> {
-        crate::tasks::task_runtime::command_cells::shared_command_cells(Arc::new(
-            SandboxManager::local_sandbox(),
+        Ok(Arc::new(
+            echo_agent::tasks::BackgroundCommandManager::default(),
         ))
-        .map_err(echo_agent::error::ReactError::Other)
     }
 
     #[test]
