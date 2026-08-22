@@ -65,20 +65,20 @@ FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter sett
 
 ### Long-Horizon Runtime Closure
 
-状态：In progress；LH0-LH3 已完成，framework `3711e90`、application
-`4ab7407`/`fff1267`/`ad951b5`/`09b9fc5`；LH4-LH6 Pending。P0 的 resolver、address identity、event
-routing 和 host recovery 已可直接复用，不再等待未来 cutover；最终 LH6 仍依赖 P0 GUI/2h
-soak closeout。
+状态：In progress；LH0-LH4 已完成，framework `3711e90`、application
+`4ab7407`/`fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`；LH5-LH6 Pending。P0 的 resolver、address
+identity、event routing 和 host recovery 已可直接复用，不再等待未来 cutover；最终 LH6 仍依赖
+P0 GUI/2h soak closeout。
 
 规格：[`design/specs/long-horizon-runtime-closure.md`](../design/specs/long-horizon-runtime-closure.md)
 
 最新审查确认 Goal、RunTurn、provider retry、正式 PlanTask Subagent 控制、
 Requirement/Evidence、checkpoint/suffix 投影和 12 小时 deterministic ledger 真实存在；
-LH1-LH3 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
+LH1-LH4 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
 typed terminal/artifact projection、owned repair，以及 Awaiter direct controlled dispatch、exact
-interrupt、process Subagent permit、Ready/Acknowledged replay 和完整 Provider profile。剩余缺口是
-普通 conversation boot resume、dedicated surface projector、hot `get_run_state` 与真实
-Agent/Awaiter soak。完成 LH4-LH6 前，不把长程产品级验收标为 Complete。
+interrupt、process Subagent permit、Ready/Acknowledged replay、完整 Provider profile、dedicated
+surface projector 与 global/workspace 普通 conversation boot resume。剩余缺口是 hot
+`get_run_state` 与真实 Agent/Awaiter soak。完成 LH5-LH6 前，不把长程产品级验收标为 Complete。
 
 ### Surface Parity Cleanup
 
@@ -92,13 +92,13 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-Long-horizon 的 LH3 已完成：`watch_cell` 直接使用 framework exact-attempt dispatch，app-core
-持有 handle/join、observation lease、独立 cancel 与进程 Subagent permit；receipt generation 幂等且
-`interrupt_awaiter` 不会停止 cell。Ready/Acknowledged 由同一 `ChatEventLog` 幂等折叠，未确认
-Ready pin 住连续 journal suffix；active turn 走 exact steer，未命中则在下一 model boundary 投影。
-`EKO_FAST_MODEL` 只解析 configured profile，Provider/protocol/auth/client/context 一起切换或完整
-回退 parent generation。下一实施阶段执行 LH4：建立唯一 dedicated Awaiter surface projector，删除
-generic Tauri suppression 缺口，并统一 global/workspace 普通 conversation TaskRun boot auto-resume。
+Long-horizon 的 LH4 已完成：一个 store-scoped `TaskRunBootReconciler` 统一 recover-once、eligibility、
+provider deadline 与原子 resume；AppState 枚举 global/registered workspace 并隔离损坏 scope，workspace
+host 通过独立 TaskRuntime OnceCell 实现 lazy recovery。合格 unattended normal conversation 使用
+journal-only sink 与 exact conversation pool key 恢复；attended run 等待 owner。app-core dedicated
+Awaiter projector 被 CLI/TUI/channel 复用，GUI/JSONL 保留同一 typed journal envelope，generic Tauri
+bridge 无条件排除 Awaiter 和正式 TaskRuntime Subagent。下一实施阶段执行 LH5：让 hot
+`get_run_state` 收敛到 checkpoint-backed read authority，并完成 10k/100k 性能门。
 
 ## 文档生命周期
 

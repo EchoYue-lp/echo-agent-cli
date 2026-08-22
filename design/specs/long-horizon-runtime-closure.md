@@ -1,8 +1,8 @@
 # EKO Long-Horizon Runtime Closure
 
-> Date: 2026-08-22 (recalibrated through framework `3711e90` and application `09b9fc5`)
-> Status: LH0-LH3 Complete (`4ab7407`, framework `3711e90`, application
-> `fff1267`/`ad951b5`/`09b9fc5`); LH4-LH6 Pending
+> Date: 2026-08-22 (recalibrated through framework `3711e90` and application `57be5c5`)
+> Status: LH0-LH4 Complete (`4ab7407`, framework `3711e90`, application
+> `fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`); LH5-LH6 Pending
 > Priority: P0; identity cutover is complete, while final LH6 acceptance still depends on the
 > runtime-reliability GUI/soak closeout
 > Scope: CommandCell, Awaiter, continuation boot recovery, terminal evidence, hot-state performance,
@@ -738,6 +738,14 @@ execution reuse the same instance. For each address domain independently:
 only `background:` conversations are auto-resumable. Global TUI/CLI/channel startup and GUI
 workspace startup call the same service and differ only in runtime/sink adapters.
 
+The selected implementation stores one `TaskRunBootReconciler` per `TaskRuntimeStore`; its
+`OnceCell` makes crash recovery stable across AppState and BackgroundTaskService adapters.
+`WorkspaceRuntimeHost` owns a separate lazy TaskRuntime `OnceCell`, so boot inspection does not
+construct AgentPool/plugin/MCP/review generations. AppState enumerates global plus registered
+workspace scopes, isolates scope failures, constructs an exact runtime only after an unattended
+candidate passes policy, registers a journal-only continuation sink, and uses the conversation id
+as the resumed pool key. Attended runs remain Paused without an exact interactive owner.
+
 Recovery rules:
 
 - process cells become `interrupted`; never replay commands;
@@ -1206,7 +1214,7 @@ logic; no two authorities remain active.
 | LH1   | Complete | `3711e90`        | `fff1267`          | 31 cell tests; full gates; 12-feature matrix | N/A                          |
 | LH2   | Complete | N/A              | `ad951b5`          | 6 runtime + 13 contracts; all app gates      | N/A                          |
 | LH3   | Complete | N/A              | `09b9fc5`          | 11 runtime + 13 contracts; all app gates     | N/A                          |
-| LH4   | Pending  | N/A              | N/A                | pending                                      | parity + all-run boot resume |
+| LH4   | Complete | N/A              | `57be5c5`          | 5 boot/parity tests; all app gates           | N/A                          |
 | LH5   | Pending  | N/A              | N/A                | pending                                      | hot-state performance        |
 | LH6   | Pending  | N/A              | N/A                | pending                                      | fault matrix + real soak     |
 

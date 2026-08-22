@@ -73,7 +73,7 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 TaskRuntime 进程级资源上限已接入生产路径并通过自动门禁。端到端可靠性仍未最终验收：
 真实 GUI 证据和两小时多 workspace soak 尚未记录；CommandCell/Awaiter 已共享进程资源
 governor并拥有 typed terminal receipt，普通 conversation boot resume 与 dedicated Awaiter
-surface projector 仍由 LH4 收口。
+surface projector 已收口；hot-state checkpoint 性能仍由 LH5 跟踪。
 
 这些未完成项由
 [`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)
