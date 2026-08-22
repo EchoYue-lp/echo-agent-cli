@@ -1,7 +1,7 @@
 # EKO Long-Horizon Runtime Closure
 
 > Date: 2026-08-22 (recalibrated against framework `49db907` and application `5603958`)
-> Status: Pending; implementation-ready after the 2026-08-22 source calibration
+> Status: LH0 Complete (`4ab7407`); LH1-LH6 Pending
 > Priority: P0; identity cutover is complete, while final LH6 acceptance still depends on the
 > runtime-reliability GUI/soak closeout
 > Scope: CommandCell, Awaiter, continuation boot recovery, terminal evidence, hot-state performance,
@@ -1184,15 +1184,15 @@ logic; no two authorities remain active.
 
 ## 18. Stage Ledger
 
-| Stage | Status  | Framework commit | Application commit | Tests/evidence            | Remaining                    |
-| ----- | ------- | ---------------- | ------------------ | ------------------------- | ---------------------------- |
-| LH0   | Pending | N/A              | N/A                | failing contracts pending | freeze LH-F01..LH-F13        |
-| LH1   | Pending | N/A              | N/A                | pending                   | framework cell correctness   |
-| LH2   | Pending | N/A              | N/A                | pending                   | scoped projection/repair     |
-| LH3   | Pending | N/A              | N/A                | pending                   | owned Awaiter handoff        |
-| LH4   | Pending | N/A              | N/A                | pending                   | parity + all-run boot resume |
-| LH5   | Pending | N/A              | N/A                | pending                   | hot-state performance        |
-| LH6   | Pending | N/A              | N/A                | pending                   | fault matrix + real soak     |
+| Stage | Status   | Framework commit | Application commit | Tests/evidence                           | Remaining                    |
+| ----- | -------- | ---------------- | ------------------ | ---------------------------------------- | ---------------------------- |
+| LH0   | Complete | N/A              | `4ab7407`          | 13 contracts; release fixture; full gate | N/A                          |
+| LH1   | Pending  | N/A              | N/A                | pending                                  | framework cell correctness   |
+| LH2   | Pending  | N/A              | N/A                | pending                                  | scoped projection/repair     |
+| LH3   | Pending  | N/A              | N/A                | pending                                  | owned Awaiter handoff        |
+| LH4   | Pending  | N/A              | N/A                | pending                                  | parity + all-run boot resume |
+| LH5   | Pending  | N/A              | N/A                | pending                                  | hot-state performance        |
+| LH6   | Pending  | N/A              | N/A                | pending                                  | fault matrix + real soak     |
 
 Allowed status: `Pending`, `In progress`, `Blocked`, `Complete`. Complete requires the stage gate and
 all applicable repository gates.
