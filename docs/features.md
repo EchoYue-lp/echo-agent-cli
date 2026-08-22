@@ -24,7 +24,7 @@
 | 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint projection         | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
 | Subagent 执行     | direct、planned、fork、teammate、team 共用 prompt compiler 和结果合同                | `echo-agent-app-core/src/subagent_prompt.rs`                     |
 | Subagent 控制     | message、follow-up、interrupt、attempt identity 与 durable result                    | `echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs` |
-| 后台 command cell | durable output、cursor wait、owner cancel、boot orphan closure                       | `echo-agent-app-core/src/tasks/task_runtime/command_cells.rs`    |
+| 后台 command cell | bounded async admission、typed cursor wait、owner cancel、boot orphan closure        | framework cell runtime + app-core `command_cells.rs`             |
 | Worktree 隔离     | 逻辑任务复用、content-aware cleanup、review/merge/discard                            | `echo-agent-app-core/src/tasks/task_runtime/worktree.rs`         |
 
 TaskRuntime 的框架/应用边界是稳定的：框架拥有 DAG、状态迁移和通用 task tools；

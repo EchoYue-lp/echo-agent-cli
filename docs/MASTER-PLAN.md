@@ -65,9 +65,9 @@ FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter sett
 
 ### Long-Horizon Runtime Closure
 
-状态：In progress；LH0 已由应用提交 `4ab7407` 完成，LH1-LH6 Pending。P0 的 resolver、
-address identity、event routing 和 host recovery 已可直接复用，不再等待未来 cutover；
-最终 LH6 仍依赖 P0 GUI/2h soak closeout。
+状态：In progress；LH0-LH1 已完成，framework `3711e90`、application `4ab7407`/`fff1267`；
+LH2-LH6 Pending。P0 的 resolver、address identity、event routing 和 host recovery 已可直接
+复用，不再等待未来 cutover；最终 LH6 仍依赖 P0 GUI/2h soak closeout。
 
 规格：[`design/specs/long-horizon-runtime-closure.md`](../design/specs/long-horizon-runtime-closure.md)
 
@@ -90,11 +90,11 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-Long-horizon 的 LH0 已完成：LH-F01..LH-F13 可运行合同、调用图、18 处生产全扫描、
-资源边界、10k release fixture 和历史 soak 证据均已冻结。下一实施切片是 framework
-LH1a：async bounded prepare/start、publish-before-run 和 tracked capacity；framework 合并后
-再进入 typed wait/shutdown 的 LH1b。P0 runtime reliability 的真实 GUI 验收和 2 小时并发
-soak 可独立完成，但必须在 LH6 前记录 artifact、资源峰值与零串扰结果。
+Long-horizon 的 LH1 已完成：framework 现有 bounded async prepare/start、publish-before-run、
+tracked capacity、Prepared/Queued phase、typed wait/launch errors、跨轮 observation lease、
+统一 deadline 和 task-tracked shutdown；EKO 已迁移 typed adapter。下一实施阶段直接执行完整
+LH2：删除 process-global store/cell 路由，建立 scoped CommandCellRuntimeService，并一次完成
+Started-before-side-effect、typed terminal projection、repair owner 和 process governor 接入。
 
 ## 文档生命周期
 
