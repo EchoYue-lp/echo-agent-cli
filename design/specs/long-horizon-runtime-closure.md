@@ -1,7 +1,8 @@
 # EKO Long-Horizon Runtime Closure
 
-> Date: 2026-08-22 (recalibrated through framework `3711e90` and application `ad951b5`)
-> Status: LH0-LH2 Complete (`4ab7407`, framework `3711e90`, application `fff1267`/`ad951b5`); LH3-LH6 Pending
+> Date: 2026-08-22 (recalibrated through framework `3711e90` and application `09b9fc5`)
+> Status: LH0-LH3 Complete (`4ab7407`, framework `3711e90`, application
+> `fff1267`/`ad951b5`/`09b9fc5`); LH4-LH6 Pending
 > Priority: P0; identity cutover is complete, while final LH6 acceptance still depends on the
 > runtime-reliability GUI/soak closeout
 > Scope: CommandCell, Awaiter, continuation boot recovery, terminal evidence, hot-state performance,
@@ -642,6 +643,11 @@ increments `watch_generation`; the receipt carries `attempt` so exact message/in
 guesses. Active entries are capacity-bounded. Settled in-memory receipts use bounded retention;
 durable journals remain the replay authority. No second mailbox is added.
 
+The application implementation stores only active/latest receipt metadata in the scoped
+`CommandCellRuntimeService`; `ChatEventLog` remains the sole durable result authority. The primary
+or pooled conversation Agent is held weakly for one exact active-turn steer attempt, so Awaiter
+ownership cannot keep an evicted Agent alive.
+
 ### 9.3 Result handoff
 
 Merge runtime-derived cell snapshot with bounded Awaiter observation:
@@ -681,6 +687,11 @@ Retention cannot prune an unacknowledged Ready fact. Before a normal segment cap
 fold pending receipts into a bounded, hash/cursor-validated stream checkpoint and retain the
 contiguous suffix, or keep the containing segment pinned. The pending count/result size is bounded
 by Awaiter admission. This remains part of `ChatEventLog`; it is not an independent result store.
+
+The selected implementation pins the contiguous suffix beginning with the earliest unacknowledged
+Ready segment. Active-turn delivery is attempted once through exact steer; otherwise the existing
+`EkoContextProjector` injects every pending result at the next model-input safe point and appends
+Acknowledged. Ordinary Chat is never auto-started solely for Awaiter delivery.
 
 ### 9.4 Stop and failure
 
@@ -1194,7 +1205,7 @@ logic; no two authorities remain active.
 | LH0   | Complete | N/A              | `4ab7407`          | 13 contracts; release fixture; full gate     | N/A                          |
 | LH1   | Complete | `3711e90`        | `fff1267`          | 31 cell tests; full gates; 12-feature matrix | N/A                          |
 | LH2   | Complete | N/A              | `ad951b5`          | 6 runtime + 13 contracts; all app gates      | N/A                          |
-| LH3   | Pending  | N/A              | N/A                | pending                                      | owned Awaiter handoff        |
+| LH3   | Complete | N/A              | `09b9fc5`          | 11 runtime + 13 contracts; all app gates     | N/A                          |
 | LH4   | Pending  | N/A              | N/A                | pending                                      | parity + all-run boot resume |
 | LH5   | Pending  | N/A              | N/A                | pending                                      | hot-state performance        |
 | LH6   | Pending  | N/A              | N/A                | pending                                      | fault matrix + real soak     |

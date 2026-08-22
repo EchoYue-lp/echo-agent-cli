@@ -65,8 +65,8 @@ FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter sett
 
 ### Long-Horizon Runtime Closure
 
-状态：In progress；LH0-LH2 已完成，framework `3711e90`、application
-`4ab7407`/`fff1267`/`ad951b5`；LH3-LH6 Pending。P0 的 resolver、address identity、event
+状态：In progress；LH0-LH3 已完成，framework `3711e90`、application
+`4ab7407`/`fff1267`/`ad951b5`/`09b9fc5`；LH4-LH6 Pending。P0 的 resolver、address identity、event
 routing 和 host recovery 已可直接复用，不再等待未来 cutover；最终 LH6 仍依赖 P0 GUI/2h
 soak closeout。
 
@@ -74,10 +74,11 @@ soak closeout。
 
 最新审查确认 Goal、RunTurn、provider retry、正式 PlanTask Subagent 控制、
 Requirement/Evidence、checkpoint/suffix 投影和 12 小时 deterministic ledger 真实存在；
-LH1/LH2 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
-typed terminal/artifact projection 和 owned repair。剩余缺口是普通 conversation boot resume、
-Awaiter owned receipt/回传与 process Subagent permit、完整 Provider profile、hot `get_run_state`
-以及真实 Agent/Awaiter soak。完成 LH3-LH6 前，不把长程产品级验收标为 Complete。
+LH1-LH3 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
+typed terminal/artifact projection、owned repair，以及 Awaiter direct controlled dispatch、exact
+interrupt、process Subagent permit、Ready/Acknowledged replay 和完整 Provider profile。剩余缺口是
+普通 conversation boot resume、dedicated surface projector、hot `get_run_state` 与真实
+Agent/Awaiter soak。完成 LH4-LH6 前，不把长程产品级验收标为 Complete。
 
 ### Surface Parity Cleanup
 
@@ -91,13 +92,13 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-Long-horizon 的 LH2 已完成：process-global store/cell 路由和 run scan 已删除；app-owned
-`CommandCellRuntimeService` 通过 immutable workspace facade、精确 store binding 和 owned
-`ChatEventLog` 覆盖 TaskRun 与普通 Chat。Started 在任何 shell permit/进程 side effect 前持久化，
-terminal cause/message/artifact 状态完整 typed round-trip，observer 持有 retention/shell permit，
-projection failure 由 capped-backoff owner 修复，GUI/TUI/CLI/channel 消费相同 journal fact。
-下一实施阶段执行 LH3：替换 `watch_cell -> agent_tool` 的 handle-dropping 路径，建立 owned Awaiter
-receipt、exact interrupt、typed result handoff 与 pending/ack journal replay。
+Long-horizon 的 LH3 已完成：`watch_cell` 直接使用 framework exact-attempt dispatch，app-core
+持有 handle/join、observation lease、独立 cancel 与进程 Subagent permit；receipt generation 幂等且
+`interrupt_awaiter` 不会停止 cell。Ready/Acknowledged 由同一 `ChatEventLog` 幂等折叠，未确认
+Ready pin 住连续 journal suffix；active turn 走 exact steer，未命中则在下一 model boundary 投影。
+`EKO_FAST_MODEL` 只解析 configured profile，Provider/protocol/auth/client/context 一起切换或完整
+回退 parent generation。下一实施阶段执行 LH4：建立唯一 dedicated Awaiter surface projector，删除
+generic Tauri suppression 缺口，并统一 global/workspace 普通 conversation TaskRun boot auto-resume。
 
 ## 文档生命周期
 

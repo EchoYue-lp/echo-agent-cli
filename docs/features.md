@@ -71,8 +71,9 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 跨 workspace/conversation 的 host、精确 IPC/event identity、durable ordinary-input FIFO、
 消息 journal、Agent groups、live delivery settlement、删除/eviction、boot recovery 和
 TaskRuntime 进程级资源上限已接入生产路径并通过自动门禁。端到端可靠性仍未最终验收：
-真实 GUI 证据和两小时多 workspace soak 尚未记录；CommandCell 已复用同一进程级 shell
-governor，Awaiter 仍需在 LH3 持有进程级 Subagent permit 和 owned terminal receipt。
+真实 GUI 证据和两小时多 workspace soak 尚未记录；CommandCell/Awaiter 已共享进程资源
+governor并拥有 typed terminal receipt，普通 conversation boot resume 与 dedicated Awaiter
+surface projector 仍由 LH4 收口。
 
 这些未完成项由
 [`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)
