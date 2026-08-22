@@ -8,7 +8,7 @@ const APP_COMMAND_CELLS: &str = include_str!("command_cells.rs");
 const APP_EXECUTOR: &str = include_str!("executor.rs");
 const APP_FILE_STORE: &str = include_str!("file_store.rs");
 const APP_INFRA: &str = include_str!("../../infra.rs");
-const APP_SERVICE: &str = include_str!("../service.rs");
+const APP_STATE: &str = include_str!("../../state.rs");
 const APP_STORE: &str = include_str!("store.rs");
 const APP_TYPES: &str = include_str!("types.rs");
 const APP_TAURI: &str = include_str!("../../../../src/tauri/mod.rs");
@@ -62,11 +62,27 @@ fn between<'a>(source: &'a str, start: &str, end: &str, failure: &str) -> Result
 }
 
 #[test]
-fn lh_f01_boot_resume_is_still_background_service_only() -> Result<(), String> {
+fn lh_f01_boot_resume_accepts_normal_conversation_runs() -> Result<(), String> {
+    let reconciler = between(
+        APP_STATE,
+        "async fn reconcile_task_runs_at_boot",
+        "/// 启动后台任务服务",
+        "LH-F01 app-core boot reconciler could not be isolated",
+    )?;
+    require_absent(
+        reconciler,
+        "starts_with(\"background:\")",
+        "LH-F01 repair regressed: app boot resume is restricted to background conversations",
+    )?;
     require(
-        APP_SERVICE,
-        ".filter(|run| run.conversation_id.starts_with(\"background:\"))",
-        "LH-F01 baseline changed: background-only boot filter is no longer reachable",
+        APP_STATE,
+        "reconcile_task_runs_at_boot",
+        "LH-F01 repair regressed: app-core boot reconciler is not wired",
+    )?;
+    require(
+        include_str!("boot_reconciler.rs"),
+        "pub struct TaskRunBootReconciler",
+        "LH-F01 repair regressed: store-scoped boot owner is missing",
     )
 }
 
@@ -90,7 +106,8 @@ fn lh_f02_watch_cell_owns_the_direct_controlled_background_handle() -> Result<()
 }
 
 #[test]
-fn lh_f03_tauri_still_suppresses_every_run_owned_framework_subagent() -> Result<(), String> {
+fn lh_f03_tauri_excludes_awaiter_and_formal_subagents_from_generic_projection() -> Result<(), String>
+{
     let predicate = between(
         APP_TAURI,
         "fn framework_subagent_event_needs_app_projection",
@@ -100,7 +117,12 @@ fn lh_f03_tauri_still_suppresses_every_run_owned_framework_subagent() -> Result<
     require(
         predicate,
         "run_id.is_none()",
-        "LH-F03 baseline changed: run-owned events are no longer suppressed by the generic predicate",
+        "LH-F03 repair regressed: formal TaskRuntime events reach the generic bridge",
+    )?;
+    require(
+        predicate,
+        "agent != \"awaiter\"",
+        "LH-F03 repair regressed: Awaiter reaches the generic Tauri bridge",
     )
 }
 

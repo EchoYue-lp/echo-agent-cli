@@ -2456,6 +2456,14 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
     fn on_event(&self, event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
         use echo_agent_app_core::chat_driver::ChatDriverEvent;
 
+        if let Some(projection) =
+            echo_agent_app_core::tasks::task_runtime::project_awaiter_surface_event(&event)
+        {
+            return self
+                .tx
+                .send(AgentEvent::Notice(projection.display_message()))
+                .is_ok();
+        }
         let mapped = match event {
             ChatDriverEvent::Execution(event) => AgentEvent::Execution(event),
             ChatDriverEvent::TurnStatus { status } => AgentEvent::TurnStatus(status),
@@ -2512,15 +2520,9 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 "Command cell {} settled: {}",
                 cell.cell_id, cell.phase
             )),
-            ChatDriverEvent::AwaiterResultReady { result } => AgentEvent::Notice(format!(
-                "Awaiter {} ready: cell {} {}",
-                result.receipt.execution_id, result.cell.cell_id, result.cell.phase
-            )),
-            ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
-                AgentEvent::Notice(format!(
-                    "Awaiter {} delivered to turn {}",
-                    acknowledgement.execution_id, acknowledgement.acknowledged_turn_id
-                ))
+            ChatDriverEvent::AwaiterResultReady { .. }
+            | ChatDriverEvent::AwaiterResultAcknowledged { .. } => {
+                AgentEvent::Notice("Awaiter projection unavailable".to_string())
             }
             ChatDriverEvent::ContextCompressed {
                 before_count,

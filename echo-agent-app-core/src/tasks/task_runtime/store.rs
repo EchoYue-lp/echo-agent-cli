@@ -508,6 +508,8 @@ pub struct TaskRuntimeStore {
     /// keeps only a weak store reference, so this does not create an Arc cycle.
     pub(super) continuation_runtime:
         std::sync::OnceLock<std::sync::Arc<super::continuation::TaskContinuationRuntime>>,
+    pub(super) boot_reconciler:
+        std::sync::OnceLock<std::sync::Arc<super::boot_reconciler::TaskRunBootReconciler>>,
     /// Process routing adapter for optional cross-workspace PlanTask targets.
     /// The adapter owns no task state and is intentionally absent in tests or
     /// embedding applications that only execute local tasks.
@@ -1191,6 +1193,7 @@ impl TaskRuntimeStore {
             run_driver_admission_idle: tokio::sync::Notify::new(),
             run_driver_idle: tokio::sync::Notify::new(),
             continuation_runtime: std::sync::OnceLock::new(),
+            boot_reconciler: std::sync::OnceLock::new(),
             execution_target_resolver: std::sync::RwLock::new(None),
             command_cell_runtime: std::sync::RwLock::new(None),
             #[cfg(test)]

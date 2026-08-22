@@ -64,8 +64,8 @@ fn terminate_subagent_tools(
     }
 }
 
-fn framework_subagent_event_needs_app_projection(run_id: Option<&str>) -> bool {
-    run_id.is_none()
+fn framework_subagent_event_needs_app_projection(agent: &str, run_id: Option<&str>) -> bool {
+    agent != "awaiter" && run_id.is_none()
 }
 
 pub fn build_tauri_app(
@@ -489,7 +489,7 @@ pub fn build_tauri_app(
                                         run_id,
                                         ..
                                     } => {
-                                        if !framework_subagent_event_needs_app_projection(run_id.as_deref()) {
+                                        if !framework_subagent_event_needs_app_projection(agent, run_id.as_deref()) {
                                             continue;
                                         }
                                         let Some(subagent_run_id) = execution_id.as_deref() else {
@@ -548,7 +548,7 @@ pub fn build_tauri_app(
                                         run_id,
                                         ..
                                     } => {
-                                        if !framework_subagent_event_needs_app_projection(run_id.as_deref()) {
+                                        if !framework_subagent_event_needs_app_projection(agent, run_id.as_deref()) {
                                             continue;
                                         }
                                         let Some(subagent_run_id) = execution_id.as_deref() else {
@@ -579,6 +579,7 @@ pub fn build_tauri_app(
                                         run_id,
                                         ..
                                     } if framework_subagent_event_needs_app_projection(
+                                        agent,
                                         run_id.as_deref(),
                                     ) => {
                                         terminate_subagent_tools(
@@ -596,6 +597,7 @@ pub fn build_tauri_app(
                                         run_id,
                                         ..
                                     } if framework_subagent_event_needs_app_projection(
+                                        agent,
                                         run_id.as_deref(),
                                     ) => {
                                         let tool_status = match *status {
@@ -624,6 +626,7 @@ pub fn build_tauri_app(
                                         run_id,
                                         ..
                                     } if framework_subagent_event_needs_app_projection(
+                                        agent,
                                         run_id.as_deref(),
                                     ) => {
                                         terminate_subagent_tools(
@@ -638,12 +641,13 @@ pub fn build_tauri_app(
                                 }
                                 let (event_type, execution_id, run_id, agent_name, extra) =
                                     match event.as_ref() {
-                                        SubagentEvent::DispatchStarted { run_id, .. }
-                                        | SubagentEvent::DispatchIsolationObserved { run_id, .. }
-                                        | SubagentEvent::DispatchCompleted { run_id, .. }
-                                        | SubagentEvent::DispatchFailed { run_id, .. }
-                                        | SubagentEvent::DispatchCancelled { run_id, .. }
+                                        SubagentEvent::DispatchStarted { agent, run_id, .. }
+                                        | SubagentEvent::DispatchIsolationObserved { agent, run_id, .. }
+                                        | SubagentEvent::DispatchCompleted { agent, run_id, .. }
+                                        | SubagentEvent::DispatchFailed { agent, run_id, .. }
+                                        | SubagentEvent::DispatchCancelled { agent, run_id, .. }
                                             if !framework_subagent_event_needs_app_projection(
+                                                agent,
                                                 run_id.as_deref(),
                                             ) =>
                                         {
@@ -897,10 +901,16 @@ mod tests {
 
     #[test]
     fn task_runtime_subagent_tools_have_only_the_exec_event_projector() {
-        assert!(!framework_subagent_event_needs_app_projection(Some(
-            "run-1"
-        )));
-        assert!(framework_subagent_event_needs_app_projection(None));
+        assert!(!framework_subagent_event_needs_app_projection(
+            "explorer",
+            Some("run-1")
+        ));
+        assert!(framework_subagent_event_needs_app_projection(
+            "explorer", None
+        ));
+        assert!(!framework_subagent_event_needs_app_projection(
+            "awaiter", None
+        ));
     }
 
     #[test]

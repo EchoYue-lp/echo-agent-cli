@@ -28,6 +28,7 @@
 //! The framework already re-exports a `TaskEvent` from `echo_agent::tasks`.
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
+pub mod boot_reconciler;
 mod checkpoint;
 pub mod command_cells;
 pub mod compact_context;
@@ -56,6 +57,8 @@ pub mod worktree;
 #[cfg(test)]
 mod long_horizon_contracts;
 
+pub use boot_reconciler::{TaskRunBootOutcome, TaskRunBootReconciler};
+pub use command_cells::{AwaiterSurfaceProjection, project_awaiter_surface_event};
 pub use completion_gate::requirements_for_plan;
 pub use execution_target::TaskExecutionTargetResolver;
 pub(crate) use executor::drive_unattended_run;

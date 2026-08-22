@@ -26,7 +26,7 @@ use clap::Parser;
 
 /// Build a `TaskRuntimeStore` for headless (non-GUI) entry points (TUI / channels).
 ///
-/// Opens the on-disk store (recovering any incomplete runs), falling back to an
+/// Opens the on-disk store, falling back to an
 /// in-memory store if the file-backed store is unavailable. Returned as `Option<Arc<...>>`
 /// because `drive_chat` takes `Option<&TaskRuntimeStore>` (normal-only callers
 /// pass `None`). Headless modes support complex tasks (TUI/GUI parity,
@@ -49,13 +49,6 @@ fn build_task_runtime_store_for_headless()
             }
         }
     };
-    match store.recover_incomplete() {
-        Ok(recovered) if recovered > 0 => {
-            tracing::info!(recovered, "recovered incomplete task_runtime runs");
-        }
-        Ok(_) => {}
-        Err(error) => tracing::warn!(%error, "failed to recover incomplete task_runtime runs"),
-    }
     Some(std::sync::Arc::new(store))
 }
 

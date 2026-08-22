@@ -215,9 +215,13 @@ impl TaskContinuationRuntime {
             ));
             let human_loop_provider = resources.human_loop_provider.clone();
             let result = if let Some(pool) = resources.pool.clone() {
+                let pool_key = resources
+                    .conv_id
+                    .clone()
+                    .unwrap_or_else(|| format!("__continuation__:{run_id}"));
                 crate::chat_driver::drive_pooled_chat_turn(
                     pool,
-                    &format!("__continuation__:{run_id}"),
+                    &pool_key,
                     move |agent| async move {
                         if let Some(provider) = human_loop_provider {
                             agent

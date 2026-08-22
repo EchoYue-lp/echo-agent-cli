@@ -106,6 +106,67 @@ pub struct AwaiterResultAcknowledgement {
     pub acknowledged_turn_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AwaiterSurfaceProjection {
+    Ready {
+        execution_id: String,
+        cell_id: String,
+        phase: BackgroundCellPhase,
+        terminal_cause: Option<BackgroundCellTerminalCause>,
+        exit_code: Option<i32>,
+        artifact_status: BackgroundCellArtifactStatus,
+    },
+    Acknowledged {
+        execution_id: String,
+        cell_id: String,
+        acknowledged_turn_id: String,
+    },
+}
+
+impl AwaiterSurfaceProjection {
+    pub fn display_message(&self) -> String {
+        match self {
+            Self::Ready {
+                execution_id,
+                cell_id,
+                phase,
+                ..
+            } => format!("Awaiter {execution_id} ready: cell {cell_id} {phase}"),
+            Self::Acknowledged {
+                execution_id,
+                acknowledged_turn_id,
+                ..
+            } => format!("Awaiter {execution_id} delivered to turn {acknowledged_turn_id}"),
+        }
+    }
+}
+
+pub fn project_awaiter_surface_event(
+    event: &crate::chat_driver::ChatDriverEvent,
+) -> Option<AwaiterSurfaceProjection> {
+    match event {
+        crate::chat_driver::ChatDriverEvent::AwaiterResultReady { result } => {
+            Some(AwaiterSurfaceProjection::Ready {
+                execution_id: result.receipt.execution_id.clone(),
+                cell_id: result.cell.cell_id.clone(),
+                phase: result.cell.phase,
+                terminal_cause: result.cell.terminal_cause,
+                exit_code: result.cell.exit_code,
+                artifact_status: result.cell.artifact_status,
+            })
+        }
+        crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
+            Some(AwaiterSurfaceProjection::Acknowledged {
+                execution_id: acknowledgement.execution_id.clone(),
+                cell_id: acknowledgement.cell_id.clone(),
+                acknowledged_turn_id: acknowledgement.acknowledged_turn_id.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
 struct ActiveAwaiterWatch {
     receipt: AwaiterWatchReceipt,
     executor: Arc<echo_agent::agent::subagent::SubagentExecutor>,
@@ -2083,6 +2144,42 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(pending.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn dedicated_surface_projection_preserves_typed_runtime_truth() {
+        let result = awaiter_result("awaiter-surface", "cell-surface");
+        let ready = crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+            result: Box::new(result.clone()),
+        };
+        assert_eq!(
+            project_awaiter_surface_event(&ready),
+            Some(AwaiterSurfaceProjection::Ready {
+                execution_id: "awaiter-surface".to_string(),
+                cell_id: "cell-surface".to_string(),
+                phase: BackgroundCellPhase::Succeeded,
+                terminal_cause: Some(BackgroundCellTerminalCause::Exited),
+                exit_code: Some(0),
+                artifact_status: BackgroundCellArtifactStatus::BelowThreshold,
+            })
+        );
+        let acknowledgement = crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+            acknowledgement: AwaiterResultAcknowledgement {
+                execution_id: result.receipt.execution_id,
+                attempt: 1,
+                watch_generation: 1,
+                cell_id: result.cell.cell_id,
+                acknowledged_turn_id: "safe-turn".to_string(),
+            },
+        };
+        assert_eq!(
+            project_awaiter_surface_event(&acknowledgement),
+            Some(AwaiterSurfaceProjection::Acknowledged {
+                execution_id: "awaiter-surface".to_string(),
+                cell_id: "cell-surface".to_string(),
+                acknowledged_turn_id: "safe-turn".to_string(),
+            })
+        );
     }
 
     #[test]

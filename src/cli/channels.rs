@@ -1877,16 +1877,15 @@ async fn aggregate_by_sentence<'a>(
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultReady { result }) => {
                     flush_all!();
+                    let event = ChatDriverEvent::AwaiterResultReady { result };
+                    let message = echo_agent_app_core::tasks::task_runtime::project_awaiter_surface_event(&event)
+                        .map(|projection| projection.display_message())
+                        .unwrap_or_else(|| "Awaiter result is unavailable".to_string());
                     yield OutboundMessage::new(
                         &channel_id,
                         &to,
                         chat_type,
-                        format!(
-                            "[awaiter:{}] cell {} {}",
-                            result.receipt.execution_id,
-                            result.cell.cell_id,
-                            result.cell.phase,
-                        ),
+                        message,
                     );
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultAcknowledged { .. }) => {}

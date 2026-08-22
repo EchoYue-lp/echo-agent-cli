@@ -146,6 +146,7 @@ pub enum ChatSurface {
     Tui,
     Cli,
     Channel,
+    BootRecovery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +211,32 @@ pub fn bind_surface_chat_sink(
         workspace_id,
         conversation_id,
         turn_id,
+    )
+}
+
+struct JournalOnlySink;
+
+impl crate::chat_driver::ChatSink for JournalOnlySink {
+    fn on_event(&self, _event: ChatDriverEvent) -> bool {
+        true
+    }
+}
+
+pub fn bind_boot_recovery_chat_sink(
+    log: Arc<ChatEventLog>,
+    tool_executions: Arc<ToolExecutionRepository>,
+    workspace_id: impl Into<String>,
+    conversation_id: String,
+    root_turn_id: impl Into<String>,
+) -> Arc<dyn crate::chat_driver::ChatSink> {
+    bind_surface_chat_sink(
+        ChatSurface::BootRecovery,
+        Arc::new(JournalOnlySink),
+        log,
+        tool_executions,
+        workspace_id,
+        Some(conversation_id),
+        root_turn_id,
     )
 }
 

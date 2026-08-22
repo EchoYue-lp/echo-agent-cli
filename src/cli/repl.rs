@@ -799,6 +799,11 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
         if self.output.delivery_failed() {
             return false;
         }
+        if let Some(projection) =
+            echo_agent_app_core::tasks::task_runtime::project_awaiter_surface_event(&event)
+        {
+            return self.output.emit(projection.display_message());
+        }
         let mut state = match self.state.lock() {
             Ok(state) => state,
             Err(error) => {
@@ -875,13 +880,8 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
                     cell.cell_id, cell.phase
                 ))
             }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultReady { result } => {
-                self.output.emit(format!(
-                    "Awaiter {} ready: cell {} {}",
-                    result.receipt.execution_id, result.cell.cell_id, result.cell.phase
-                ))
-            }
-            echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+            echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultReady { .. }
+            | echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
                 ..
             } => true,
             echo_agent_app_core::chat_driver::ChatDriverEvent::ContextCompressed {

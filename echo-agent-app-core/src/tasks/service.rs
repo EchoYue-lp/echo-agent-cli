@@ -13,12 +13,13 @@ use echo_agent::tasks::progress::TaskProgress;
 
 use super::background::BackgroundTaskKind;
 use super::task_runtime::{
-    AttendedMode, BootAutoResumeDecision, BootAutoResumeOutcome, DomainProfile, ExecuteTaskTool,
-    ExecutionMode, MemoryPolicy, PlanTask, RecoveryBlocker, RecoveryDecision, TaskPlan,
-    TaskRetryPreparation, TaskRun, TaskRunStatus, TaskRuntimeStore, TodoStatus,
-    UnattendedWriteMode,
+    AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanTask,
+    RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun, TaskRunBootOutcome,
+    TaskRunBootReconciler, TaskRunStatus, TaskRuntimeStore, TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
+#[cfg(test)]
+use crate::tasks::task_runtime::BootAutoResumeDecision;
 
 #[derive(Debug, Clone)]
 pub struct BackgroundTaskServiceConfig {
@@ -139,6 +140,7 @@ pub struct BackgroundTaskService {
     agent_provider: Arc<dyn TaskAgentProvider>,
     run_semaphore: Arc<tokio::sync::Semaphore>,
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    boot_reconciler: Arc<TaskRunBootReconciler>,
 }
 
 impl BackgroundTaskService {
@@ -181,6 +183,7 @@ impl BackgroundTaskService {
     ) -> anyhow::Result<Self> {
         let task_runtime_store = task_runtime_store
             .ok_or_else(|| anyhow::anyhow!("TaskRuntimeStore is required for background tasks"))?;
+        let boot_reconciler = TaskRunBootReconciler::for_store(&task_runtime_store);
         Ok(Self {
             cancel,
             run_semaphore: Arc::new(tokio::sync::Semaphore::new(config.max_concurrent.max(1))),
@@ -188,6 +191,7 @@ impl BackgroundTaskService {
             task_runtime_store,
             agent_provider,
             review_integration: None,
+            boot_reconciler,
         })
     }
 
@@ -560,6 +564,10 @@ impl BackgroundTaskService {
     }
 
     pub async fn resume_pending(&self) -> anyhow::Result<usize> {
+        self.boot_reconciler
+            .recover_once()
+            .await
+            .map_err(anyhow::Error::msg)?;
         let mut runs = self
             .task_runtime_store
             .list_runs_in(&[TaskRunStatus::Pending, TaskRunStatus::Paused])?;
@@ -569,31 +577,6 @@ impl BackgroundTaskService {
             .into_iter()
             .filter(|run| run.conversation_id.starts_with("background:"))
         {
-            if run.status == TaskRunStatus::Paused {
-                match self
-                    .task_runtime_store
-                    .boot_auto_resume_decision(&run.run_id, true, false)?
-                {
-                    BootAutoResumeDecision::Blocked(blockers) => {
-                        tracing::info!(
-                            run_id = %run.run_id,
-                            blockers = ?blockers.iter().map(|blocker| blocker.as_str()).collect::<Vec<_>>(),
-                            "background run remains paused after boot admission"
-                        );
-                        continue;
-                    }
-                    BootAutoResumeDecision::Ready {
-                        retry_not_before: Some(deadline),
-                    } => {
-                        let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
-                        tokio::select! {
-                            _ = self.cancel.cancelled() => return Ok(resumed),
-                            _ = tokio::time::sleep(delay) => {}
-                        }
-                    }
-                    BootAutoResumeDecision::Ready { .. } => {}
-                }
-            }
             let cancel = self.cancel.child_token();
             let admission = self
                 .task_runtime_store
@@ -608,20 +591,14 @@ impl BackgroundTaskService {
             let prompt = metadata.prompt.unwrap_or(run.goal);
             registration.mark_preparation_started();
             if run.status == TaskRunStatus::Paused {
-                match self.task_runtime_store.resume_task_run_after_boot(
-                    &run.run_id,
-                    true,
-                    false,
-                )? {
-                    BootAutoResumeOutcome::Resumed(_) => {}
-                    BootAutoResumeOutcome::WaitingUntil(deadline) => {
-                        registration.reject(format!(
-                            "provider retry for {} is not due until {deadline}",
-                            run.run_id
-                        ));
-                        continue;
-                    }
-                    BootAutoResumeOutcome::Blocked(blockers) => {
+                match self
+                    .boot_reconciler
+                    .resume(&run.run_id, true, false, &cancel)
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                {
+                    TaskRunBootOutcome::Resumed(_) => {}
+                    TaskRunBootOutcome::Blocked(blockers) => {
                         registration.reject(format!(
                             "boot auto-resume rejected for {}: {}",
                             run.run_id,
@@ -632,6 +609,11 @@ impl BackgroundTaskService {
                                 .join(",")
                         ));
                         continue;
+                    }
+                    TaskRunBootOutcome::Cancelled => {
+                        registration
+                            .reject(format!("boot auto-resume cancelled for {}", run.run_id));
+                        return Ok(resumed);
                     }
                 }
             }

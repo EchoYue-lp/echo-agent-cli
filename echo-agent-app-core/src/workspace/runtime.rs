@@ -40,6 +40,7 @@ pub(crate) struct WorkspaceRuntimeResources {
 pub(crate) struct WorkspaceRuntimeHost {
     workspace: RwLock<Workspace>,
     resources: WorkspaceRuntimeResources,
+    task_runtime: OnceCell<Arc<TaskRuntimeStore>>,
     execution: OnceCell<Arc<WorkspaceExecutionRuntime>>,
 }
 
@@ -185,6 +186,7 @@ impl WorkspaceRuntimeHost {
         Ok(Arc::new(Self {
             workspace: RwLock::new(workspace),
             resources,
+            task_runtime: OnceCell::new(),
             execution: OnceCell::new(),
         }))
     }
@@ -209,6 +211,26 @@ impl WorkspaceRuntimeHost {
         WorkspaceExecutionScope::workspace(self.id(), self.root())
     }
 
+    /// Open the host's TaskRuntime authority without constructing AgentPool,
+    /// plugin, MCP, or review generations.
+    pub(crate) async fn task_runtime(&self) -> anyhow::Result<Arc<TaskRuntimeStore>> {
+        let store = self
+            .task_runtime
+            .get_or_try_init(|| async {
+                let store = Arc::new(TaskRuntimeStore::open_for_workspace(
+                    self.resources.tasks_dir(),
+                    self.id().to_string(),
+                )?);
+                crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store)
+                    .recover_once()
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                Ok::<Arc<TaskRuntimeStore>, anyhow::Error>(store)
+            })
+            .await?;
+        Ok(Arc::clone(store))
+    }
+
     /// Lazily build the one execution generation owned by this host.
     ///
     /// `seed_pool` supplies process-safe model/plugin/tool primitives. All
@@ -221,23 +243,7 @@ impl WorkspaceRuntimeHost {
         let runtime = self
             .execution
             .get_or_try_init(|| async {
-                let task_runtime = Arc::new(TaskRuntimeStore::open_for_workspace(
-                    self.resources.tasks_dir(),
-                    self.id().to_string(),
-                )?);
-                match task_runtime.recover_incomplete() {
-                    Ok(recovered) if recovered > 0 => tracing::info!(
-                        workspace = %self.id(),
-                        recovered,
-                        "Recovered interrupted workspace TaskRuns"
-                    ),
-                    Ok(_) => {}
-                    Err(error) => tracing::warn!(
-                        workspace = %self.id(),
-                        %error,
-                        "Failed to recover interrupted workspace TaskRuns"
-                    ),
-                }
+                let task_runtime = self.task_runtime().await?;
                 let review_integration = Arc::new(ReviewIntegration::new(
                     echo_agent::evolution::ReviewConfig::default(),
                     self.resources.state_dir().to_path_buf(),
@@ -567,6 +573,30 @@ mod tests {
         );
         assert!(WorkspaceLayout::conversations(&canonical_root).is_dir());
         assert!(WorkspaceLayout::memory(&canonical_root).is_dir());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_runtime_recovery_does_not_eagerly_load_execution_generation() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("lazy-runtime");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let host = WorkspaceRuntimeHost::open(workspace("lazy", root))
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let first = host
+            .task_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let second = host
+            .task_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(host.execution.get().is_none());
+        assert_eq!(first.active_workspace_id(), "lazy");
         Ok(())
     }
 

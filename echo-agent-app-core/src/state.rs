@@ -547,6 +547,14 @@ pub struct TaskState {
     pub interaction_mode: std::sync::atomic::AtomicU8,
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct TaskRunBootReport {
+    recovered: usize,
+    resumed: usize,
+    blocked: usize,
+    failed_scopes: Vec<String>,
+}
+
 /// Webhook 状态
 pub struct WebhookState {
     pub emitter: Arc<crate::webhook::WebhookEmitter>,
@@ -1133,24 +1141,7 @@ impl AppState {
                         );
                         crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                     });
-                    store.ok().map(|store| {
-                        // P1-8: proactively recover runs interrupted by a previous
-                        // process crash into resumable Paused runs.
-                        match store.recover_incomplete() {
-                            Ok(recovered) if recovered > 0 => {
-                                tracing::info!(
-                                    count = recovered,
-                                    "Recovered interrupted task-runtime runs at boot"
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(error) => tracing::warn!(
-                                %error,
-                                "Failed to recover interrupted task-runtime runs at boot"
-                            ),
-                        }
-                        Arc::new(store)
-                    })
+                    store.ok().map(Arc::new)
                 },
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
             },
@@ -1838,11 +1829,198 @@ impl AppState {
         backend: Option<Arc<dyn echo_agent::memory::Store>>,
     ) -> echo_agent::error::Result<()> {
         self.start_scheduler_with_store(backend).await?;
+        let report = self.reconcile_task_runs_at_boot().await;
+        tracing::info!(
+            recovered = report.recovered,
+            resumed = report.resumed,
+            blocked = report.blocked,
+            failed_scopes = report.failed_scopes.len(),
+            "TaskRun boot reconciliation settled"
+        );
+        for failure in report.failed_scopes {
+            tracing::warn!(%failure, "TaskRun boot scope remains unreconciled");
+        }
         self.start_task_service().await;
         if let Some(pool) = self.connection.pool.as_ref() {
             pool.spawn_cleanup_monitor().await;
         }
         Ok(())
+    }
+
+    async fn reconcile_task_runs_at_boot(&self) -> TaskRunBootReport {
+        let mut report = TaskRunBootReport::default();
+        if let Some(store) = self.tasks.runtime.clone() {
+            self.reconcile_task_run_scope("global", store, &mut report)
+                .await;
+        }
+        let workspaces = match self.workspace.registry.list() {
+            Ok(workspaces) => workspaces,
+            Err(error) => {
+                report
+                    .failed_scopes
+                    .push(format!("workspace registry: {error}"));
+                return report;
+            }
+        };
+        for workspace in workspaces {
+            let workspace_id = workspace.id.to_string();
+            let store = match self.workspace.runtimes.get_or_open(workspace).await {
+                Ok(host) => match host.task_runtime().await {
+                    Ok(store) => store,
+                    Err(error) => {
+                        report
+                            .failed_scopes
+                            .push(format!("workspace {workspace_id}: {error}"));
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    report
+                        .failed_scopes
+                        .push(format!("workspace {workspace_id}: {error}"));
+                    continue;
+                }
+            };
+            self.reconcile_task_run_scope(&workspace_id, store, &mut report)
+                .await;
+        }
+        report
+    }
+
+    async fn reconcile_task_run_scope(
+        &self,
+        workspace_id: &str,
+        store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
+        report: &mut TaskRunBootReport,
+    ) {
+        let reconciler = crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store);
+        match reconciler.recover_once().await {
+            Ok(recovered) => report.recovered = report.recovered.saturating_add(recovered),
+            Err(error) => {
+                report
+                    .failed_scopes
+                    .push(format!("{workspace_id}: {error}"));
+                return;
+            }
+        }
+        let candidates = match reconciler.paused_candidates().await {
+            Ok(candidates) => candidates,
+            Err(error) => {
+                report
+                    .failed_scopes
+                    .push(format!("{workspace_id}: {error}"));
+                return;
+            }
+        };
+        for run in candidates {
+            if run.attended_mode == crate::tasks::task_runtime::AttendedMode::Attended {
+                report.blocked = report.blocked.saturating_add(1);
+                continue;
+            }
+            match reconciler.decision(&run.run_id, true, false).await {
+                Ok(crate::tasks::task_runtime::BootAutoResumeDecision::Blocked(_)) => {
+                    report.blocked = report.blocked.saturating_add(1);
+                    continue;
+                }
+                Ok(crate::tasks::task_runtime::BootAutoResumeDecision::Ready { .. }) => {}
+                Err(error) => {
+                    report
+                        .failed_scopes
+                        .push(format!("{workspace_id}/{} admission: {error}", run.run_id));
+                    continue;
+                }
+            }
+            let runtime = match self.chat_runtime_for_scope(workspace_id).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    report
+                        .failed_scopes
+                        .push(format!("{workspace_id}/{} runtime: {error}", run.run_id));
+                    continue;
+                }
+            };
+            let sink = crate::chat_event_log::bind_boot_recovery_chat_sink(
+                self.storage.chat_events.clone(),
+                self.storage.tool_executions.clone(),
+                workspace_id.to_string(),
+                run.conversation_id.clone(),
+                run.root_message_id.clone(),
+            );
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                execution_scope: runtime.execution_scope().clone(),
+                pool: runtime.pool(),
+                store: Some(store.clone()),
+                sink,
+                webhook_emitter: Some(self.webhook.emitter.clone()),
+                conv_id: Some(run.conversation_id.clone()),
+                root_message_id: run.root_message_id.clone(),
+                attachments: Vec::new(),
+                cancel: CancellationToken::new(),
+                interaction_mode: crate::tasks::task_runtime::InteractionMode::Task,
+                review_integration: runtime.review_integration(),
+                layer_manager: None,
+                memory_generation: None,
+                human_loop_provider: None,
+            });
+            crate::tasks::task_runtime::continuation::register_launcher(
+                &store,
+                &run.run_id,
+                runtime.primary_agent(),
+                resources,
+                run.root_message_id.clone(),
+            );
+            match reconciler
+                .resume(&run.run_id, true, false, &self.tasks.cancel_token)
+                .await
+            {
+                Ok(crate::tasks::task_runtime::TaskRunBootOutcome::Resumed(_)) => {
+                    match crate::tasks::task_runtime::continuation::request_continue(
+                        &store,
+                        &run.run_id,
+                        crate::tasks::task_runtime::RunTurnOrigin::Recovery,
+                    ) {
+                        crate::tasks::task_runtime::continuation::ContinueRequestOutcome::Started
+                        | crate::tasks::task_runtime::continuation::ContinueRequestOutcome::AlreadyRunning => {
+                            report.resumed = report.resumed.saturating_add(1);
+                        }
+                        outcome => {
+                            crate::tasks::task_runtime::continuation::clear_launcher(
+                                &store,
+                                &run.run_id,
+                            );
+                            report.failed_scopes.push(format!(
+                                "{workspace_id}/{} launcher: {outcome:?}",
+                                run.run_id
+                            ));
+                        }
+                    }
+                }
+                Ok(crate::tasks::task_runtime::TaskRunBootOutcome::Blocked(_)) => {
+                    crate::tasks::task_runtime::continuation::clear_launcher(
+                        &store,
+                        &run.run_id,
+                    );
+                    report.blocked = report.blocked.saturating_add(1);
+                }
+                Ok(crate::tasks::task_runtime::TaskRunBootOutcome::Cancelled) => {
+                    crate::tasks::task_runtime::continuation::clear_launcher(
+                        &store,
+                        &run.run_id,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    crate::tasks::task_runtime::continuation::clear_launcher(
+                        &store,
+                        &run.run_id,
+                    );
+                    report.failed_scopes.push(format!(
+                        "{workspace_id}/{} resume: {error}",
+                        run.run_id
+                    ));
+                }
+            }
+        }
     }
 
     /// 启动后台任务服务（所有模式都应调用）
@@ -5767,6 +5945,52 @@ mod service_bootstrap_tests {
     use echo_agent::testing::MockLlmClient;
     use futures::future::BoxFuture;
 
+    fn seed_recoverable_attended_run(
+        store: &crate::tasks::task_runtime::TaskRuntimeStore,
+    ) -> Result<(), String> {
+        use crate::tasks::task_runtime::{
+            AttendedMode, DomainProfile, ExecutionMode, PlanTask, TaskPlan, TaskRunStatus,
+        };
+        let workspace_id = store.active_workspace_id();
+        store
+            .create_run(
+                "healthy-global-run",
+                &workspace_id,
+                "ordinary-conversation",
+                "root-message",
+                DomainProfile::General,
+                "healthy global goal",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: "healthy-plan".to_string(),
+                run_id: "healthy-global-run".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: crate::tasks::task_runtime::task_goal_sha256("healthy global goal"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "healthy-task".to_string(),
+                    title: "Wait for owner".to_string(),
+                    ..Default::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("healthy-global-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("healthy-global-run", true, true, None, None)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     struct SchedulerInitFailureStore;
 
     fn scheduler_store_failure<T>() -> echo_agent::error::Result<T> {
@@ -5860,6 +6084,72 @@ mod service_bootstrap_tests {
         assert!(state.scheduler.runner.is_none());
         assert!(state.tasks.service.is_none());
         assert_eq!(runtime_store.active_run_driver_count()?, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn corrupt_workspace_does_not_block_healthy_global_boot_recovery()
+    -> std::result::Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("boot isolation test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let mcp_runtime = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let mut state = AppState::from_shared(
+            AgentHandle::new(agent),
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            mcp_runtime,
+        );
+        let global = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        seed_recoverable_attended_run(&global)?;
+        state.tasks.runtime = Some(global.clone());
+        let registry_root = temp.path().join("registry");
+        let registry = Arc::new(
+            crate::workspace::registry::WorkspaceRegistry::with_base_dir(registry_root)
+                .map_err(|error| error.to_string())?,
+        );
+        let corrupt_root = temp.path().join("corrupt-workspace");
+        registry
+            .create_at(
+                "corrupt",
+                crate::workspace::WorkspaceKind::General,
+                corrupt_root.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        let tasks_root = crate::workspace::layout::WorkspaceLayout::tasks(&corrupt_root);
+        std::fs::remove_dir_all(&tasks_root).map_err(|error| error.to_string())?;
+        std::fs::write(&tasks_root, "not a directory").map_err(|error| error.to_string())?;
+        state.workspace.registry = registry;
+
+        let report = state.reconcile_task_runs_at_boot().await;
+        assert_eq!(report.recovered, 1);
+        assert_eq!(report.blocked, 1);
+        assert_eq!(report.resumed, 0);
+        assert!(
+            report
+                .failed_scopes
+                .iter()
+                .any(|failure| failure.contains("corrupt"))
+        );
+        assert_eq!(
+            global
+                .get_run("healthy-global-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(crate::tasks::task_runtime::TaskRunStatus::Paused)
+        );
         Ok(())
     }
 }
