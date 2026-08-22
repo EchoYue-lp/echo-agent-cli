@@ -24,6 +24,8 @@ describe('MessageBubble completed execution', () => {
     };
     useSubagentRunStore.getState().ingest({
       kind: 'subagent',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
       subagent_run_id: 'task-1:1:1',
       run_id: 'run-1',
       task_id: 'task-1',

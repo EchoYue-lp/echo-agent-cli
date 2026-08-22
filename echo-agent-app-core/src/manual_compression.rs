@@ -11,6 +11,7 @@ use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub struct ManualCompressionRequest {
+    pub workspace_id: String,
     pub conversation_id: String,
     pub surface: ForegroundTurnSurface,
     pub focus: Option<String>,
@@ -62,11 +63,26 @@ impl AppState {
         if conversation_id.is_empty() {
             return Err(ManualCompressionError::EmptyConversationId);
         }
+        let workspace_id = request.workspace_id.trim().to_string();
+        if workspace_id.is_empty() {
+            return Err(ManualCompressionError::Compression(
+                "workspace id must not be empty".to_string(),
+            ));
+        }
+        let runtime = self
+            .chat_runtime_for_scope(&workspace_id)
+            .await
+            .map_err(|error| ManualCompressionError::Compression(error.to_string()))?;
         let turn_id = format!("manual-compression:{}", uuid::Uuid::new_v4());
-        let lease = self
-            .begin_conversation_turn_owned(request.surface, &conversation_id, turn_id.clone())
+        let lease = runtime
+            .begin_turn(
+                &self.session.foreground_turns,
+                request.surface,
+                &conversation_id,
+                turn_id.clone(),
+            )
             .await?;
-        let execution = match self.connection.agent_for(&conversation_id).await {
+        let execution = match runtime.agent_for(&conversation_id).await {
             Ok(execution) => execution,
             Err(error) => {
                 let detail = error.to_string();
@@ -125,21 +141,21 @@ impl AppState {
             before_tokens: stats.before_tokens,
             after_tokens: stats.after_tokens,
         };
-        let envelope =
-            match self
-                .storage
-                .chat_events
-                .append(Some(&conversation_id), &turn_id, event)
-            {
-                Ok(envelope) => envelope,
-                Err(error) => {
-                    lease.settle(TurnOutcome::Failed(AgentFailure::message(
-                        "chat_event_log",
-                        error.to_string(),
-                    )));
-                    return Err(error.into());
-                }
-            };
+        let envelope = match self.storage.chat_events.append(
+            &workspace_id,
+            Some(&conversation_id),
+            &turn_id,
+            event,
+        ) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                lease.settle(TurnOutcome::Failed(AgentFailure::message(
+                    "chat_event_log",
+                    error.to_string(),
+                )));
+                return Err(error.into());
+            }
+        };
         lease.settle(TurnOutcome::Completed);
         Ok(ManualCompressionReceipt {
             conversation_id,
@@ -223,6 +239,7 @@ mod tests {
         let (state, _temp) = state_fixture(id).await?;
         let receipt = state
             .compress_conversation_owned(ManualCompressionRequest {
+                workspace_id: "global".to_string(),
                 conversation_id: id.to_string(),
                 surface: ForegroundTurnSurface::Cli,
                 focus: None,
@@ -234,10 +251,12 @@ mod tests {
             receipt.envelope.payload,
             ChatDriverEvent::ContextCompressed { .. }
         ));
-        let replay = state
-            .storage
-            .chat_events
-            .replay(Some(id), &receipt.envelope.turn_id, 0)?;
+        let replay = state.storage.chat_events.replay(
+            "global",
+            Some(id),
+            &receipt.envelope.root_turn_id,
+            0,
+        )?;
         assert_eq!(replay.events.len(), 1);
         assert!(
             state
@@ -255,6 +274,7 @@ mod tests {
         let (state, _temp) = state_fixture("actual-conversation").await?;
         let error = state
             .compress_conversation_owned(ManualCompressionRequest {
+                workspace_id: "global".to_string(),
                 conversation_id: "requested-conversation".to_string(),
                 surface: ForegroundTurnSurface::Tui,
                 focus: None,

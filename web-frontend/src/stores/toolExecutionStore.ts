@@ -7,7 +7,11 @@ interface ToolExecutionState {
   idsByOwner: Record<string, string[]>;
   ingest: (tool: ToolExecution) => void;
   replaceAll: (tools: ToolExecution[]) => void;
-  hydrateConversation: (conversationId: string, tools: ToolExecution[]) => void;
+  hydrateConversation: (
+    workspaceId: string,
+    conversationId: string,
+    tools: ToolExecution[]
+  ) => void;
   clear: () => void;
 }
 
@@ -43,8 +47,10 @@ function eventTimestamp(timestamp: string): number {
   return Number.isFinite(parsed) ? parsed : Date.now();
 }
 
-function executionIdentity(tool: Pick<ToolExecution, 'owner' | 'call_id' | 'run_id'>): string {
-  return `${toolExecutionOwnerKey(tool.owner, tool.run_id)}\u0000${tool.call_id}`;
+function executionIdentity(
+  tool: Pick<ToolExecution, 'workspace_id' | 'owner' | 'call_id' | 'run_id'>
+): string {
+  return `${tool.workspace_id}\u0000${toolExecutionOwnerKey(tool.owner, tool.run_id)}\u0000${tool.call_id}`;
 }
 
 function toolStatusRank(tool: ToolExecution): number {
@@ -161,6 +167,7 @@ export function taskRuntimeToolExecutions(
     const startedAt = previous?.started_at ?? timestamp;
     tools.set(id, {
       id,
+      workspace_id: run.workspace_id,
       call_id: callId,
       owner: { kind: 'subagent', subagent_run_id: subagentRunId },
       conversation_id: run.conversation_id,
@@ -221,13 +228,15 @@ export const useToolExecutionStore = create<ToolExecutionState>((set) => ({
     set(() => indexTools(tools));
   },
 
-  hydrateConversation: (conversationId, tools) => {
+  hydrateConversation: (workspaceId, conversationId, tools) => {
     set((state) => {
       const currentTools = Object.values(state.tools);
       const otherConversationTools = currentTools.filter(
-        (tool) => tool.conversation_id !== conversationId
+        (tool) => tool.workspace_id !== workspaceId || tool.conversation_id !== conversationId
       );
-      const liveTools = currentTools.filter((tool) => tool.conversation_id === conversationId);
+      const liveTools = currentTools.filter(
+        (tool) => tool.workspace_id === workspaceId && tool.conversation_id === conversationId
+      );
       return indexTools([
         ...otherConversationTools,
         ...mergeHydratedToolExecutions(liveTools, tools),

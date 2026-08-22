@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useConversationStore } from '../stores/conversationStore';
 import { useChatStore } from '../stores/chatStore';
 import { useToastStore } from '../stores/toastStore';
+import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import type { AgentEvent, ChatEventEnvelope, ChatEventReplay } from '../types/api';
 import { resetChatEventCursorsForTest } from './chatEventSequencer';
 import { useTauriChat } from './useTauriChat';
@@ -29,12 +30,14 @@ const agentEnvelope = (
   conversationId: string | null,
   messageId: string
 ): ChatEventEnvelope => ({
-  schema_version: 1,
+  schema_version: 2,
+  workspace_id: 'global',
   event_id: `chat-event-${sequence}`,
   content_hash: `content-hash-${sequence}`,
   sequence,
-  stream_id: conversationId ? `conversation:${conversationId}` : `message:${messageId}`,
+  stream_id: JSON.stringify(['global', conversationId ?? messageId]),
   conversation_id: conversationId,
+  root_turn_id: messageId,
   turn_id: turnId,
   message_id: messageId,
   timestamp: '2026-08-18T00:00:00Z',
@@ -65,12 +68,14 @@ const turnStatusEnvelope = (
   status: 'completed' | 'failed' | 'cancelled',
   conversationId: string
 ): ChatEventEnvelope => ({
-  schema_version: 1,
+  schema_version: 2,
+  workspace_id: 'global',
   event_id: `chat-status-${sequence}`,
   content_hash: `status-hash-${sequence}`,
   sequence,
-  stream_id: `conversation:${conversationId}`,
+  stream_id: JSON.stringify(['global', conversationId]),
   conversation_id: conversationId,
+  root_turn_id: messageId,
   turn_id: turnId,
   message_id: messageId,
   timestamp: '2026-08-18T00:00:00Z',
@@ -89,6 +94,7 @@ vi.mock('@tauri-apps/api/event', () => ({
 
 describe('useTauriChat foreground turn recovery', () => {
   const activeSnapshot = {
+    workspace_id: 'global',
     surface: 'gui',
     conversation_id: 'conversation-before-remount',
     root_turn_id: 'root-turn-before-remount',
@@ -112,11 +118,23 @@ describe('useTauriChat foreground turn recovery', () => {
     useChatStore.setState({ pendingHitlRequests: [] });
     useChatStore.getState().setRunStatus('running');
     useToastStore.getState().clearAll();
-    mocks.apiInvoke.mockImplementation(async (command: string) => {
+    useTaskRuntimeStore.getState().reset();
+    mocks.apiInvoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
       if (command === 'get_active_chat_turn') {
         return activeSnapshot;
       }
       if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') return [];
+      if (command === 'queue_chat_input') {
+        return {
+          input_id: String(args?.inputId ?? 'queued-input'),
+          workspace_id: String(args?.workspaceId ?? 'global'),
+          conversation_id: String(args?.conversationId ?? ''),
+          text: String(args?.text ?? ''),
+          attachments: args?.attachments ?? [],
+          submitted_at_ms: Date.now(),
+        };
+      }
       return { success: true, turn_id: activeSnapshot.root_turn_id, status: 'cancelled' };
     });
   });
@@ -126,8 +144,8 @@ describe('useTauriChat foreground turn recovery', () => {
     const first = renderHook(() => useTauriChat());
     await waitFor(() => {
       expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
+        workspaceId: 'global',
         conversationId: activeSnapshot.conversation_id,
-        conversation_id: activeSnapshot.conversation_id,
       });
     });
     first.unmount();
@@ -136,18 +154,18 @@ describe('useTauriChat foreground turn recovery', () => {
     const remounted = renderHook(() => useTauriChat());
     await waitFor(() => {
       expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
+        workspaceId: 'global',
         conversationId: activeSnapshot.conversation_id,
-        conversation_id: activeSnapshot.conversation_id,
       });
     });
     await act(async () => {
       await remounted.result.current.cancel();
     });
     expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      workspaceId: 'global',
       conversationId: activeSnapshot.conversation_id,
-      conversation_id: activeSnapshot.conversation_id,
-      rootTurnId: activeSnapshot.root_turn_id,
-      root_turn_id: activeSnapshot.root_turn_id,
+      expectedRootTurnId: activeSnapshot.root_turn_id,
+      expectedActiveTurnId: activeSnapshot.active_turn_id,
     });
     remounted.unmount();
   });
@@ -173,8 +191,8 @@ describe('useTauriChat foreground turn recovery', () => {
     });
 
     expect(mocks.apiInvoke).not.toHaveBeenCalledWith('get_active_chat_turn', {
+      workspaceId: 'global',
       conversationId: undefined,
-      conversation_id: undefined,
     });
     expect(mocks.apiInvoke).toHaveBeenCalledWith(
       'send_chat_message',
@@ -184,14 +202,121 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it('does not create a streaming placeholder before backend admission', async () => {
+    let resolveSend: (value: unknown) => void = () => undefined;
+    const sendResult = new Promise((resolve) => {
+      resolveSend = resolve;
+    });
+    useConversationStore.setState({ activeId: 'conversation-admission' });
+    useChatStore.getState().setRunStatus('idle');
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'send_chat_message') return sendResult;
+      if (command === 'list_conversations') return [];
+      return { success: true };
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        'replay_chat_events',
+        expect.objectContaining({ conversationId: 'conversation-admission' })
+      );
+    });
+    let sending: Promise<boolean> = Promise.resolve(false);
+    await act(async () => {
+      sending = hook.result.current.sendMessage('new request');
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        'send_chat_message',
+        expect.objectContaining({
+          workspaceId: 'global',
+          conversationId: 'conversation-admission',
+        })
+      );
+    });
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+
+    await act(async () => {
+      resolveSend({
+        kind: 'task_run_conflict',
+        run_id: 'run-existing',
+        input_id: 'input-accepted',
+      });
+      await sending;
+    });
+    expect(useChatStore.getState().messages).toEqual([]);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(hook.result.current.queuedInputs).toEqual([
+      expect.objectContaining({ id: 'input-accepted', backendManaged: true }),
+    ]);
+    hook.unmount();
+  });
+
+  it('cancels the exact conflicting run before starting the new input once', async () => {
+    useConversationStore.setState({ activeId: 'conversation-conflict' });
+    let sendCount = 0;
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') return null;
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'send_chat_message') {
+        sendCount += 1;
+        return sendCount === 1
+          ? {
+              kind: 'task_run_conflict',
+              run_id: 'run-existing',
+              goal: 'old goal',
+              new_message: 'replacement request',
+            }
+          : {
+              kind: 'started',
+              success: true,
+              root_turn_id: 'replacement-root',
+              active_turn_id: 'replacement-root',
+            };
+      }
+      if (command === 'cancel_task_run') return { success: true, run_id: 'run-existing' };
+      return { success: true };
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await act(async () => {
+      await hook.result.current.sendMessage('replacement request');
+    });
+    const prompt = useTaskRuntimeStore.getState().interruptPrompt;
+    expect(prompt?.runId).toBe('run-existing');
+
+    await act(async () => {
+      await prompt?.resolve('cancel_and_start');
+    });
+
+    expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_task_run', {
+      workspaceId: 'global',
+      runId: 'run-existing',
+    });
+    expect(sendCount).toBe(2);
+    expect(
+      useChatStore.getState().messages.filter((message) => message.role === 'user')
+    ).toHaveLength(1);
+    hook.unmount();
+  });
+
   it('clears the previous conversation queue when starting another chat', async () => {
     useConversationStore.setState({ activeId: activeSnapshot.conversation_id });
     const hook = renderHook(() => useTauriChat());
     await waitFor(() => {
       expect(mocks.apiInvoke).toHaveBeenCalledWith('get_active_chat_turn', {
+        workspaceId: 'global',
         conversationId: activeSnapshot.conversation_id,
-        conversation_id: activeSnapshot.conversation_id,
       });
+      expect(mocks.apiInvoke).toHaveBeenCalledWith(
+        'replay_chat_events',
+        expect.objectContaining({ conversationId: activeSnapshot.conversation_id })
+      );
     });
 
     await act(async () => {
@@ -208,11 +333,49 @@ describe('useTauriChat foreground turn recovery', () => {
     hook.unmount();
   });
 
+  it('rehydrates a backend-managed queue for the exact workspace conversation', async () => {
+    const conversationId = 'conversation-durable-queue';
+    useConversationStore.setState({ activeId: conversationId });
+    mocks.apiInvoke.mockImplementation(async (command: string) => {
+      if (command === 'get_active_chat_turn') {
+        return { ...activeSnapshot, conversation_id: conversationId };
+      }
+      if (command === 'replay_chat_events') return emptyReplay();
+      if (command === 'list_queued_chat_inputs') {
+        return [
+          {
+            input_id: 'durable-input',
+            workspace_id: 'global',
+            conversation_id: conversationId,
+            text: 'continue after restart',
+            attachments: [],
+            submitted_at_ms: 1,
+          },
+        ];
+      }
+      return { success: true };
+    });
+
+    const hook = renderHook(() => useTauriChat());
+    await waitFor(() => {
+      expect(hook.result.current.queuedInputs).toEqual([
+        expect.objectContaining({
+          id: 'durable-input',
+          workspaceId: 'global',
+          conversationId,
+          backendManaged: true,
+        }),
+      ]);
+    });
+    hook.unmount();
+  });
+
   it('keeps a continuation turn separate from its root assistant message', async () => {
     const conversationId = 'conversation-continuation';
     const rootTurnId = 'root-message';
     const activeTurnId = 'continuation-turn';
     const snapshot = {
+      workspace_id: 'global',
       surface: 'gui',
       conversation_id: conversationId,
       root_turn_id: rootTurnId,
@@ -252,10 +415,10 @@ describe('useTauriChat foreground turn recovery', () => {
       await hook.result.current.cancel();
     });
     expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      workspaceId: 'global',
       conversationId,
-      conversation_id: conversationId,
-      rootTurnId,
-      root_turn_id: rootTurnId,
+      expectedRootTurnId: rootTurnId,
+      expectedActiveTurnId: activeTurnId,
     });
     hook.unmount();
   });
@@ -387,10 +550,10 @@ describe('useTauriChat foreground turn recovery', () => {
       await hook.result.current.cancel();
     });
     expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      workspaceId: 'global',
       conversationId: activeSnapshot.conversation_id,
-      conversation_id: activeSnapshot.conversation_id,
-      rootTurnId: activeSnapshot.root_turn_id,
-      root_turn_id: activeSnapshot.root_turn_id,
+      expectedRootTurnId: activeSnapshot.root_turn_id,
+      expectedActiveTurnId: activeSnapshot.active_turn_id,
     });
     expect(useChatStore.getState().runStatus).toBe('running');
     await act(async () => {
@@ -439,6 +602,7 @@ describe('useTauriChat foreground turn recovery', () => {
     const conversationId = 'conversation-stop-settlement-race';
     const rootTurnId = 'root-stop-settlement-race';
     const snapshot = {
+      workspace_id: 'global',
       surface: 'gui',
       conversation_id: conversationId,
       root_turn_id: rootTurnId,
@@ -478,18 +642,16 @@ describe('useTauriChat foreground turn recovery', () => {
     });
 
     expect(mocks.apiInvoke).toHaveBeenCalledWith('cancel_chat', {
+      workspaceId: 'global',
       conversationId,
-      conversation_id: conversationId,
-      rootTurnId,
-      root_turn_id: rootTurnId,
+      expectedRootTurnId: rootTurnId,
+      expectedActiveTurnId: rootTurnId,
     });
     expect(mocks.apiInvoke).toHaveBeenCalledWith('replay_chat_events', {
+      workspaceId: 'global',
       conversationId,
-      conversation_id: conversationId,
       messageKey: rootTurnId,
-      message_key: rootTurnId,
       afterCursor: expect.any(Number),
-      after_cursor: expect.any(Number),
     });
     expect(useToastStore.getState().toasts).toEqual([]);
     expect(useChatStore.getState().runStatus).toBe('completed');
@@ -502,6 +664,7 @@ describe('useTauriChat foreground turn recovery', () => {
     const conversationId = 'conversation-stop-replay-failure';
     const rootTurnId = 'root-stop-replay-failure';
     const snapshot = {
+      workspace_id: 'global',
       surface: 'gui',
       conversation_id: conversationId,
       root_turn_id: rootTurnId,
@@ -585,8 +748,11 @@ describe('useTauriChat foreground turn recovery', () => {
     });
 
     expect(mocks.apiInvoke).toHaveBeenCalledWith('send_approval_response', {
+      workspaceId: 'global',
+      conversationId: null,
+      expectedRootTurnId: null,
+      expectedActiveTurnId: null,
       requestId: 'approval-first',
-      request_id: 'approval-first',
       approved: true,
       reason: undefined,
       scope: undefined,

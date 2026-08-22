@@ -16,6 +16,7 @@ import { pluginApi } from './api/endpoints';
 import { useWorkspaceStore } from './stores/workspaceStore';
 import { useTaskRuntimeStore } from './stores/taskRuntimeStore';
 import { RequireAuth } from './components/Auth/RequireAuth';
+import { workspaceIdForView } from './lib/viewAddress';
 
 function App() {
   const initConversations = useConversationStore((s) => s.init);
@@ -27,14 +28,19 @@ function App() {
   const toggleTheme = useUiStore((s) => s.toggleTheme);
   const toggleTerminal = useUiStore((s) => s.toggleTerminal);
   const initWorkspaces = useWorkspaceStore((s) => s.init);
+  const currentWorkspaceId = useWorkspaceStore((s) => workspaceIdForView(s.current?.id));
 
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [newTaskOpen, setNewTaskOpen] = useState(false);
 
   // Initialize workspace and conversation stores on mount
   useEffect(() => {
-    initWorkspaces();
-    initConversations();
+    const initialize = async () => {
+      await initWorkspaces();
+      const workspaceId = workspaceIdForView(useWorkspaceStore.getState().current?.id);
+      await initConversations(workspaceId);
+    };
+    void initialize();
   }, [initWorkspaces, initConversations]);
 
   useEffect(() => {
@@ -51,8 +57,12 @@ function App() {
   // ParallelExecutionBlock and the RightRail can render subagent state.
   // (Previously this was triggered by the now-removed TaskRuntimePanel.)
   useEffect(() => {
-    if (activeId) loadTaskRun(activeId);
-  }, [activeId, loadTaskRun]);
+    if (activeId) {
+      void loadTaskRun(currentWorkspaceId, activeId);
+    } else {
+      useTaskRuntimeStore.getState().reset();
+    }
+  }, [activeId, currentWorkspaceId, loadTaskRun]);
 
   const handleNewTask = useCallback(() => {
     setNewTaskOpen(true);

@@ -313,6 +313,7 @@ impl ConversationDeletionService {
     #[allow(clippy::too_many_arguments)]
     pub async fn delete(
         &self,
+        workspace_id: &str,
         conversation_id: &str,
         conversation_store: Option<Arc<dyn ConversationStore>>,
         agent_pool: Option<Arc<crate::agent_pool::AgentPool>>,
@@ -326,8 +327,8 @@ impl ConversationDeletionService {
         let conversation_id = validated_id(conversation_id)?.to_string();
         let registration = self.lock_registration(&conversation_id);
         let _identity_lock = registration.lock.lock().await;
-        let _foreground_suspension =
-            foreground_turns.suspend_conversation_admission_if_idle(&conversation_id)?;
+        let _foreground_suspension = foreground_turns
+            .suspend_conversation_admission_if_idle_scoped(workspace_id, &conversation_id)?;
         let tombstone_path = self.tombstone_path(&conversation_id);
         let (mut tombstone, resumed) =
             match self.load_tombstone(&tombstone_path, &conversation_id)? {
@@ -377,9 +378,9 @@ impl ConversationDeletionService {
         }
         self.complete_step(&tombstone_path, &mut tombstone, DeletionStep::TaskRuntime)?;
 
-        terminate_active_tools(&tool_executions, &conversation_id)?;
+        terminate_active_tools(&tool_executions, workspace_id, &conversation_id)?;
         tool_executions
-            .remove_conversation(&conversation_id)
+            .remove_conversation(workspace_id, &conversation_id)
             .map_err(|error| ConversationDeletionError::ToolExecution(error.to_string()))?;
         self.complete_step(
             &tombstone_path,
@@ -388,7 +389,7 @@ impl ConversationDeletionService {
         )?;
 
         chat_events
-            .remove_conversation(&conversation_id)
+            .remove_conversation(workspace_id, &conversation_id)
             .map_err(|error| ConversationDeletionError::ChatEvents(error.to_string()))?;
         self.complete_step(&tombstone_path, &mut tombstone, DeletionStep::ChatEvents)?;
 
@@ -699,16 +700,18 @@ async fn quiesce_task_runs(
 
 fn terminate_active_tools(
     repository: &ToolExecutionRepository,
+    workspace_id: &str,
     conversation_id: &str,
 ) -> Result<(), ConversationDeletionError> {
     let active = repository
-        .summaries_for_conversation(conversation_id)
+        .summaries_for_conversation(workspace_id, conversation_id)
         .into_iter()
         .filter(|summary| summary.status == ToolExecutionStatus::Running)
         .collect::<Vec<ToolExecutionSummary>>();
     for execution in active {
         repository
             .terminate_orphan(
+                workspace_id,
                 &execution.owner,
                 &execution.call_id,
                 ToolExecutionStatus::Interrupted,
@@ -846,6 +849,7 @@ mod tests {
 
         let error = service
             .delete(
+                "global",
                 id,
                 Some(store.clone()),
                 None,
@@ -887,6 +891,7 @@ mod tests {
 
         let receipt = service
             .delete(
+                "global",
                 id,
                 Some(store.clone()),
                 None,
@@ -944,6 +949,7 @@ mod tests {
             message_id: turn_id.to_string(),
         };
         tools.project_start(
+            "global",
             owner,
             Some(id),
             Some(run_id),
@@ -958,6 +964,7 @@ mod tests {
         )?;
 
         events.append(
+            "global",
             Some(id),
             turn_id,
             crate::chat_driver::ChatDriverEvent::TurnStatus {
@@ -997,6 +1004,7 @@ mod tests {
 
         let receipt = service
             .delete(
+                "global",
                 id,
                 Some(store.clone()),
                 None,
@@ -1013,8 +1021,13 @@ mod tests {
         assert!(!receipt.cleanup_pending);
         assert!(store.get_conversation(id).await?.is_none());
         assert!(task_runtime.list_runs_for_conversation(id)?.is_empty());
-        assert!(tools.summaries_for_conversation(id).is_empty());
-        assert!(events.replay(Some(id), turn_id, 0)?.events.is_empty());
+        assert!(tools.summaries_for_conversation("global", id).is_empty());
+        assert!(
+            events
+                .replay("global", Some(id), turn_id, 0)?
+                .events
+                .is_empty()
+        );
         assert!(runtime_state.get_checkpoint(id).await?.is_none());
         assert!(!tool_artifact.path.exists());
         assert!(!user_input.exists());

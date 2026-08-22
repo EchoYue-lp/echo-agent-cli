@@ -1229,7 +1229,7 @@ export function TaskRuntimePanel() {
 
       {runId && (
         <button
-          onClick={() => refresh(runId)}
+          onClick={() => refresh(activeRun.workspace_id, runId)}
           className="ml-auto flex items-center gap-1 text-[10px]"
           style={{ color: 'var(--text-tertiary)' }}
         >
@@ -1247,7 +1247,6 @@ export function TaskRuntimePanel() {
 export function InterruptPromptDialog() {
   const interruptPrompt = useTaskRuntimeStore((s) => s.interruptPrompt);
   const dismiss = useTaskRuntimeStore((s) => s.dismissInterruptPrompt);
-  const resume = useTaskRuntimeStore((s) => s.resumeTaskRun);
 
   if (!interruptPrompt) return null;
 
@@ -1282,7 +1281,7 @@ export function InterruptPromptDialog() {
             className="flex items-center gap-2 rounded-md px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
             onClick={() => {
-              resume();
+              void interruptPrompt.resolve('continue');
             }}
           >
             <Play size={12} /> 继续执行旧计划
@@ -1291,8 +1290,7 @@ export function InterruptPromptDialog() {
             className="flex items-center gap-2 rounded-md px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
             onClick={async () => {
-              // Just dismiss the prompt — the user will be able to edit and re-run.
-              dismiss();
+              await interruptPrompt.resolve('edit');
             }}
           >
             <Edit3 size={12} /> 编辑计划后继续
@@ -1301,14 +1299,7 @@ export function InterruptPromptDialog() {
             className="flex items-center gap-2 rounded-md px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-primary)', color: 'var(--color-error)' }}
             onClick={async () => {
-              const runId = interruptPrompt.runId;
-              try {
-                const { invoke } = await import('@tauri-apps/api/core');
-                await invoke('cancel_task_run', { runId });
-              } catch {
-                // ignore
-              }
-              dismiss();
+              await interruptPrompt.resolve('cancel_and_start');
             }}
           >
             <Trash2 size={12} /> 废弃旧计划，开始新任务

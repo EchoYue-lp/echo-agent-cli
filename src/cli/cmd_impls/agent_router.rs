@@ -232,6 +232,7 @@ fn format_delivery_records(records: Vec<AgentDeliveryRecord>, message_id: Option
             let status = match record.status {
                 AgentDeliveryStatus::Queued => "queued",
                 AgentDeliveryStatus::Claimed => "claimed",
+                AgentDeliveryStatus::Injected => "injected",
                 AgentDeliveryStatus::Delivered => "delivered",
                 AgentDeliveryStatus::Failed => "failed",
             };
@@ -380,6 +381,7 @@ mod tests {
             turn_id: Some("turn-1".to_string()),
             reply_message_id: Some("reply-1".to_string()),
             error: None,
+            next_attempt_at: None,
         }];
         let rendered = format_delivery_records(records, Some(&message_id));
         assert!(rendered.contains("delivered"));

@@ -118,7 +118,7 @@ mod tests {
         ];
         for event in events {
             let envelope = log
-                .append(Some("jsonl-conversation"), "jsonl-turn", event)
+                .append("global", Some("jsonl-conversation"), "jsonl-turn", event)
                 .map_err(|error| error.to_string())?;
             assert!(sink.on_journaled_event(envelope));
         }

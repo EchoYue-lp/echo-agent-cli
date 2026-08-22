@@ -1,11 +1,13 @@
 [
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "event_id": "chat-event-1",
     "content_hash": "chat-hash-1",
     "sequence": 1,
-    "stream_id": "conversation:fixture-conversation",
+    "stream_id": "[\"fixture-workspace\",\"fixture-conversation\"]",
+    "workspace_id": "fixture-workspace",
     "conversation_id": "fixture-conversation",
+    "root_turn_id": "fixture-message",
     "turn_id": "fixture-turn",
     "message_id": "fixture-message",
     "timestamp": "2026-08-16T00:00:00Z",
@@ -41,12 +43,14 @@
     }
   },
   {
-    "schema_version": 1,
+    "schema_version": 2,
     "event_id": "chat-event-2",
     "content_hash": "chat-hash-2",
     "sequence": 2,
-    "stream_id": "conversation:fixture-conversation",
+    "stream_id": "[\"fixture-workspace\",\"fixture-conversation\"]",
+    "workspace_id": "fixture-workspace",
     "conversation_id": "fixture-conversation",
+    "root_turn_id": "fixture-message",
     "turn_id": "fixture-turn",
     "message_id": "fixture-message",
     "timestamp": "2026-08-16T00:00:01Z",

@@ -45,6 +45,18 @@ pub enum ChatDriverEvent {
         goal: String,
         new_message: String,
     },
+    InputQueued {
+        input_id: String,
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+        submitted_at_ms: u64,
+    },
+    InputRemoved {
+        input_id: String,
+    },
+    InputReordered {
+        input_ids: Vec<String>,
+    },
     ApprovalRequest {
         request_id: String,
         tool_name: String,
@@ -1095,6 +1107,8 @@ fn ensure_task_mode_run(
             .map_err(|error| error.to_string())?;
         if let Some(trace_sink) = trace_sink {
             trace_sink(ExecEvent::run(
+                run.workspace_id.clone(),
+                run.conversation_id.clone(),
                 run_id.to_string(),
                 RuntimeEventKind::RunStarted,
                 serde_json::json!({
@@ -1185,6 +1199,8 @@ fn finalize_run_turn(
                 .map_err(|error| error.to_string())?;
             if let Some(trace_sink) = trace_sink {
                 trace_sink(ExecEvent::run(
+                    run.workspace_id.clone(),
+                    run.conversation_id.clone(),
                     run_id.to_string(),
                     RuntimeEventKind::RunCancelled,
                     serde_json::json!({ "status": "cancelled", "mode": "task" }),
@@ -1278,6 +1294,8 @@ fn finalize_run_turn(
         .map_err(|error| error.to_string())?;
     if let Some(trace_sink) = trace_sink {
         trace_sink(ExecEvent::run(
+            run.workspace_id,
+            run.conversation_id,
             run_id.to_string(),
             RuntimeEventKind::RunFailed,
             serde_json::json!({ "error": reason, "mode": "task" }),
@@ -2054,6 +2072,9 @@ mod tests {
                 ChatDriverEvent::Execution(_)
                 | ChatDriverEvent::TurnStatus { .. }
                 | ChatDriverEvent::Interrupt { .. }
+                | ChatDriverEvent::InputQueued { .. }
+                | ChatDriverEvent::InputRemoved { .. }
+                | ChatDriverEvent::InputReordered { .. }
                 | ChatDriverEvent::ApprovalRequest { .. }
                 | ChatDriverEvent::InputRequest { .. }
                 | ChatDriverEvent::SelectionRequest { .. }

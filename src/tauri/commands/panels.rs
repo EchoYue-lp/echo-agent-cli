@@ -971,6 +971,7 @@ pub async fn execute_sandbox(
 pub async fn compress_context(
     app: tauri::AppHandle,
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let conversation_id = match conversation_id.filter(|value| !value.trim().is_empty()) {
@@ -989,6 +990,7 @@ pub async fn compress_context(
         .app_state
         .compress_conversation_owned(
             echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                workspace_id,
                 conversation_id,
                 surface: echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
                 focus: None,
@@ -1016,13 +1018,17 @@ pub async fn compress_context(
 #[tauri::command]
 pub async fn get_compression_stats(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     let execution = match conversation_id.filter(|value| !value.trim().is_empty()) {
         Some(conversation_id) => Some(
-            state
-                .app_state
-                .connection
+            runtime
                 .agent_for(&conversation_id)
                 .await
                 .map_err(|error| IpcError::Validation(error.to_string()))?,
@@ -1032,7 +1038,7 @@ pub async fn get_compression_stats(
     let agent = execution
         .as_ref()
         .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
-        .unwrap_or_else(|| state.app_state.connection.primary_agent());
+        .unwrap_or_else(|| runtime.primary_agent());
     let (
         message_count,
         current_tokens,
@@ -1793,16 +1799,35 @@ struct WorktreeInfo {
     head: String,
 }
 
-async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError> {
-    if let Some(ws) = state.app_state.current_workspace().await {
-        Ok(ws.project_root.unwrap_or(ws.root))
-    } else {
-        Ok(state
+async fn workspace_project_root_for(
+    state: &TauriState,
+    workspace_id: &str,
+) -> Result<PathBuf, IpcError> {
+    if workspace_id == "global" {
+        return state
             .app_state
-            .current_execution_scope()
+            .chat_runtime_for_scope(workspace_id)
             .await
-            .root()
-            .to_path_buf())
+            .map(|runtime| runtime.execution_scope().root().to_path_buf())
+            .map_err(|error| IpcError::Validation(error.to_string()));
+    }
+    state
+        .app_state
+        .workspace
+        .registry
+        .list()
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .into_iter()
+        .find(|workspace| workspace.id.as_str() == workspace_id)
+        .map(|workspace| workspace.project_root.unwrap_or(workspace.root))
+        .ok_or_else(|| IpcError::NotFound(format!("Workspace '{workspace_id}' not found")))
+}
+
+async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError> {
+    if let Some(workspace) = state.app_state.current_workspace().await {
+        Ok(workspace.project_root.unwrap_or(workspace.root))
+    } else {
+        workspace_project_root_for(state, "global").await
     }
 }
 
@@ -2053,10 +2078,15 @@ pub async fn remove_worktree(
 #[tauri::command]
 pub async fn list_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root(&state).await?;
-    // 任务运行时存储在 AppState.tasks.runtime(Option<Arc<TaskRuntimeStore>>);ConnectionState 无此字段。
-    let store = state.app_state.tasks.runtime.clone();
+    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
+    let store = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?
+        .task_runtime();
 
     let unattended = tokio::task::spawn_blocking(move || {
         echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
@@ -2094,10 +2124,25 @@ pub async fn list_unattended_worktrees(
 #[tauri::command]
 pub async fn merge_unattended_worktree(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root(&state).await?;
-    let store = state.app_state.tasks.runtime.clone();
+    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
+    let store = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?
+        .task_runtime();
+    if store
+        .as_ref()
+        .and_then(|store| store.get_run(&run_id).ok().flatten())
+        .is_none_or(|run| run.workspace_id != workspace_id)
+    {
+        return Err(IpcError::Validation(format!(
+            "TaskRun '{run_id}' does not belong to workspace '{workspace_id}'"
+        )));
+    }
     let merge_lock =
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
@@ -2127,10 +2172,16 @@ pub async fn merge_unattended_worktree(
 #[tauri::command]
 pub async fn discard_unattended_worktree(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root(&state).await?;
-    let store = state.app_state.tasks.runtime.clone();
+    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
+    let store = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?
+        .task_runtime();
     let merge_lock =
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
@@ -2154,9 +2205,15 @@ pub async fn discard_unattended_worktree(
 #[tauri::command]
 pub async fn cleanup_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root(&state).await?;
-    let store = state.app_state.tasks.runtime.clone();
+    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
+    let store = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?
+        .task_runtime();
     let merge_lock =
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;

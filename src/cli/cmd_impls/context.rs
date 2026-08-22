@@ -314,6 +314,11 @@ async fn run_manual_compression(
     match app_state
         .compress_conversation_owned(
             echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                workspace_id: app_state
+                    .current_execution_scope()
+                    .await
+                    .workspace_id()
+                    .to_string(),
                 conversation_id: conversation_id.clone(),
                 surface: echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
                 focus,

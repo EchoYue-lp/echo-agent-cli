@@ -432,6 +432,33 @@ impl WorkspaceRuntimeRegistry {
         Ok(activity)
     }
 
+    /// Shut down and remove one loaded host only after its runtime proves idle.
+    /// An unloaded workspace needs no runtime settlement and returns `false`.
+    pub(crate) async fn shutdown_and_evict_if_idle(
+        &self,
+        workspace_id: &WorkspaceId,
+    ) -> anyhow::Result<bool> {
+        let mut hosts = self.hosts.lock().await;
+        let Some(host) = hosts.get(workspace_id).cloned() else {
+            return Ok(false);
+        };
+        if let Some(runtime) = host.execution.get() {
+            let activity = runtime.activity(workspace_id.clone())?;
+            if !activity.is_idle() {
+                anyhow::bail!(
+                    "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {})",
+                    workspace_id,
+                    activity.active_pool_executions,
+                    activity.active_run_drivers,
+                    activity.active_run_driver_receipts
+                );
+            }
+            runtime.shutdown().await?;
+        }
+        hosts.remove(workspace_id);
+        Ok(true)
+    }
+
     pub(crate) async fn shutdown(&self) -> anyhow::Result<()> {
         let hosts = self
             .hosts
@@ -681,6 +708,61 @@ mod tests {
             std::env::current_dir().map_err(|error| error.to_string())?,
             process_cwd
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_host_evicts_only_after_execution_is_idle() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("evict");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let primary = echo_agent::agent::ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("workspace eviction seed")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let seed = Arc::new(
+            crate::agent_pool::AgentPool::new_for_test(
+                AgentHandle::new(primary),
+                None,
+                None,
+                2,
+                false,
+            )
+            .await,
+        );
+        let registry = WorkspaceRuntimeRegistry::new();
+        let workspace = workspace("evict", root);
+        let host = registry
+            .get_or_open(workspace.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = host
+            .get_or_open_execution(&seed)
+            .await
+            .map_err(|error| error.to_string())?;
+        let lease = runtime
+            .pool()
+            .acquire("conversation")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace.id)
+                .await
+                .is_err()
+        );
+        assert_eq!(registry.host_count().await, 1);
+
+        drop(lease);
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace.id)
+                .await
+                .map_err(|error| error.to_string())?
+        );
+        assert_eq!(registry.host_count().await, 0);
         Ok(())
     }
 

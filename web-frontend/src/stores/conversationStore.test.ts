@@ -181,7 +181,7 @@ describe('conversation message identity', () => {
 
     const result = await useConversationStore.getState().branchCurrent(2);
 
-    expect(mocks.branchConversation).toHaveBeenCalledWith('conversation-1', 2);
+    expect(mocks.branchConversation).toHaveBeenCalledWith('global', 'conversation-1', 2);
     expect(result).toEqual({ id: 'branch-1', targetContent: 'canonical user prompt' });
     expect(useConversationStore.getState().activeId).toBe('branch-1');
   });

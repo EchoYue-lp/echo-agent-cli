@@ -160,7 +160,7 @@ pub enum AttachmentSource {
     Message,
 }
 
-#[derive(Debug, Clone, Deserialize, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "AttachmentData")]
 pub struct AttachmentData {
     pub name: String,

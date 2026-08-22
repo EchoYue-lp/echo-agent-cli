@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use chrono::{DateTime, Utc};
+use echo_core::retry::RetryPolicy;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -267,6 +268,7 @@ impl AgentMessage {
 pub enum AgentDeliveryStatus {
     Queued,
     Claimed,
+    Injected,
     Delivered,
     Failed,
 }
@@ -301,6 +303,7 @@ pub struct AgentDeliveryRecord {
     pub turn_id: Option<String>,
     pub reply_message_id: Option<String>,
     pub error: Option<String>,
+    pub next_attempt_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -324,11 +327,19 @@ enum AgentInboxEvent {
         attempt: u32,
         claimed_at: DateTime<Utc>,
     },
+    Injected {
+        message_id: String,
+        attempt_id: String,
+        injected_at: DateTime<Utc>,
+        turn_id: String,
+    },
     Deferred {
         message_id: String,
         attempt_id: String,
         deferred_at: DateTime<Utc>,
         reason: String,
+        #[serde(default)]
+        next_attempt_at: Option<DateTime<Utc>>,
     },
     Delivered {
         message_id: String,
@@ -343,6 +354,8 @@ enum AgentInboxEvent {
         failed_at: DateTime<Utc>,
         error: String,
         retryable: bool,
+        #[serde(default)]
+        next_attempt_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -410,6 +423,18 @@ impl Default for AgentDeliverySupervisor {
 impl AgentDeliverySupervisor {
     pub fn cancellation_token(&self) -> echo_agent::agent::CancellationToken {
         self.cancel.clone()
+    }
+
+    pub fn has_active_workspace(&self, workspace_id: &WorkspaceId) -> bool {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .active
+                    .iter()
+                    .any(|target| &target.workspace_id == workspace_id)
+            })
+            .unwrap_or(true)
     }
 
     /// Start one target-owned delivery task or mark the already-running task
@@ -613,15 +638,44 @@ impl AgentRouter {
             .map_err(|error| AgentRouterError::Task(error.to_string()))?
     }
 
+    pub async fn next_attempt_at(
+        &self,
+        target: &AgentAddress,
+    ) -> Result<Option<DateTime<Utc>>, AgentRouterError> {
+        target.validate()?;
+        let _mutation = self.mutation.lock().await;
+        let root = self.root.clone();
+        let target = target.clone();
+        tokio::task::spawn_blocking(move || next_attempt_at_sync(&root, &target))
+            .await
+            .map_err(|error| AgentRouterError::Task(error.to_string()))?
+    }
+
     pub async fn defer(
         &self,
         claim: &AgentDeliveryClaim,
         reason: impl Into<String>,
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
+        let next_attempt_at = retry_deadline(claim.attempt);
         self.settle_claim(
             claim,
             ClaimSettlement::Deferred {
                 reason: reason.into(),
+                next_attempt_at,
+            },
+        )
+        .await
+    }
+
+    pub async fn injected(
+        &self,
+        claim: &AgentDeliveryClaim,
+        turn_id: impl Into<String>,
+    ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
+        self.settle_claim(
+            claim,
+            ClaimSettlement::Injected {
+                turn_id: turn_id.into(),
             },
         )
         .await
@@ -649,11 +703,13 @@ impl AgentRouter {
         error: impl Into<String>,
         retryable: bool,
     ) -> Result<AgentDeliveryReceipt, AgentRouterError> {
+        let next_attempt_at = retryable.then(|| retry_deadline(claim.attempt));
         self.settle_claim(
             claim,
             ClaimSettlement::Failed {
                 error: error.into(),
                 retryable,
+                next_attempt_at,
             },
         )
         .await
@@ -687,8 +743,12 @@ impl AgentRouter {
 }
 
 enum ClaimSettlement {
+    Injected {
+        turn_id: String,
+    },
     Deferred {
         reason: String,
+        next_attempt_at: DateTime<Utc>,
     },
     Delivered {
         turn_id: String,
@@ -697,6 +757,7 @@ enum ClaimSettlement {
     Failed {
         error: String,
         retryable: bool,
+        next_attempt_at: Option<DateTime<Utc>>,
     },
 }
 
@@ -773,6 +834,12 @@ fn claim_next_sync(
         let Some(next) = folded.into_iter().find(|entry| !entry.terminal) else {
             return Ok(None);
         };
+        if next
+            .next_attempt_at
+            .is_some_and(|deadline| deadline > Utc::now())
+        {
+            return Ok(None);
+        }
         let attempt = next.attempt.saturating_add(1);
         let attempt_id = uuid::Uuid::new_v4().to_string();
         let claimed_at = Utc::now();
@@ -809,7 +876,10 @@ fn settle_claim_sync(
                 attempt_id: claim.attempt_id.clone(),
             })?;
         if entry.attempt_id.as_deref() != Some(claim.attempt_id.as_str())
-            || entry.status != AgentDeliveryStatus::Claimed
+            || !matches!(
+                entry.status,
+                AgentDeliveryStatus::Claimed | AgentDeliveryStatus::Injected
+            )
         {
             return Err(AgentRouterError::StaleClaim {
                 message_id: claim.message.message_id.clone(),
@@ -817,12 +887,25 @@ fn settle_claim_sync(
             });
         }
         let status = match settlement {
-            ClaimSettlement::Deferred { reason } => {
+            ClaimSettlement::Injected { turn_id } => {
+                events.push(AgentInboxEvent::Injected {
+                    message_id: claim.message.message_id.clone(),
+                    attempt_id: claim.attempt_id.clone(),
+                    injected_at: Utc::now(),
+                    turn_id,
+                });
+                AgentDeliveryStatus::Injected
+            }
+            ClaimSettlement::Deferred {
+                reason,
+                next_attempt_at,
+            } => {
                 events.push(AgentInboxEvent::Deferred {
                     message_id: claim.message.message_id.clone(),
                     attempt_id: claim.attempt_id.clone(),
                     deferred_at: Utc::now(),
                     reason,
+                    next_attempt_at: Some(next_attempt_at),
                 });
                 AgentDeliveryStatus::Queued
             }
@@ -839,13 +922,18 @@ fn settle_claim_sync(
                 });
                 AgentDeliveryStatus::Delivered
             }
-            ClaimSettlement::Failed { error, retryable } => {
+            ClaimSettlement::Failed {
+                error,
+                retryable,
+                next_attempt_at,
+            } => {
                 events.push(AgentInboxEvent::Failed {
                     message_id: claim.message.message_id.clone(),
                     attempt_id: claim.attempt_id.clone(),
                     failed_at: Utc::now(),
                     error,
                     retryable,
+                    next_attempt_at,
                 });
                 AgentDeliveryStatus::Failed
             }
@@ -873,6 +961,28 @@ fn records_sync(
             .map(FoldedDelivery::record)
             .collect())
     })
+}
+
+fn next_attempt_at_sync(
+    root: &Path,
+    target: &AgentAddress,
+) -> Result<Option<DateTime<Utc>>, AgentRouterError> {
+    with_inbox_lock(root, target, |events_path| {
+        let events = read_events(events_path)?;
+        Ok(fold_events(events_path, &events)?
+            .into_iter()
+            .find(|entry| !entry.terminal)
+            .and_then(|entry| entry.next_attempt_at))
+    })
+}
+
+fn retry_deadline(attempt: u32) -> DateTime<Utc> {
+    let delay = RetryPolicy::default()
+        .delay_for(attempt.max(1))
+        .max(std::time::Duration::from_millis(100));
+    let chrono_delay =
+        chrono::Duration::from_std(delay).unwrap_or_else(|_| chrono::Duration::seconds(30));
+    Utc::now() + chrono_delay
 }
 
 fn list_groups_sync(root: &Path) -> Result<Vec<AgentGroup>, AgentRouterError> {
@@ -1025,6 +1135,7 @@ struct FoldedDelivery {
     turn_id: Option<String>,
     reply_message_id: Option<String>,
     error: Option<String>,
+    next_attempt_at: Option<DateTime<Utc>>,
     terminal: bool,
 }
 
@@ -1043,6 +1154,7 @@ impl FoldedDelivery {
             turn_id: self.turn_id,
             reply_message_id: self.reply_message_id,
             error: self.error,
+            next_attempt_at: self.next_attempt_at,
         }
     }
 }
@@ -1078,6 +1190,7 @@ fn fold_events(
                         turn_id: None,
                         reply_message_id: None,
                         error: None,
+                        next_attempt_at: None,
                         terminal: false,
                     },
                 );
@@ -1100,16 +1213,30 @@ fn fold_events(
                 entry.attempt = *attempt;
                 entry.settled_at = None;
                 entry.error = None;
+                entry.next_attempt_at = None;
+            }
+            AgentInboxEvent::Injected {
+                message_id,
+                attempt_id,
+                injected_at,
+                turn_id,
+            } => {
+                let entry = claimed_entry_mut(path, &mut entries, message_id, attempt_id)?;
+                entry.status = AgentDeliveryStatus::Injected;
+                entry.settled_at = Some(*injected_at);
+                entry.turn_id = Some(turn_id.clone());
             }
             AgentInboxEvent::Deferred {
                 message_id,
                 attempt_id,
                 deferred_at,
                 reason: _,
+                next_attempt_at,
             } => {
                 let entry = claimed_entry_mut(path, &mut entries, message_id, attempt_id)?;
                 entry.status = AgentDeliveryStatus::Queued;
                 entry.settled_at = Some(*deferred_at);
+                entry.next_attempt_at = *next_attempt_at;
             }
             AgentInboxEvent::Delivered {
                 message_id,
@@ -1124,6 +1251,7 @@ fn fold_events(
                 entry.turn_id = Some(turn_id.clone());
                 entry.reply_message_id = reply_message_id.clone();
                 entry.terminal = true;
+                entry.next_attempt_at = None;
             }
             AgentInboxEvent::Failed {
                 message_id,
@@ -1131,12 +1259,14 @@ fn fold_events(
                 failed_at,
                 error,
                 retryable,
+                next_attempt_at,
             } => {
                 let entry = claimed_entry_mut(path, &mut entries, message_id, attempt_id)?;
                 entry.status = AgentDeliveryStatus::Failed;
                 entry.settled_at = Some(*failed_at);
                 entry.error = Some(error.clone());
                 entry.terminal = !retryable;
+                entry.next_attempt_at = *next_attempt_at;
             }
         }
     }
@@ -1173,8 +1303,10 @@ fn claimed_entry_mut<'a>(
     attempt_id: &str,
 ) -> Result<&'a mut FoldedDelivery, AgentRouterError> {
     let entry = delivery_entry_mut(path, entries, message_id)?;
-    if entry.status != AgentDeliveryStatus::Claimed
-        || entry.attempt_id.as_deref() != Some(attempt_id)
+    if !matches!(
+        entry.status,
+        AgentDeliveryStatus::Claimed | AgentDeliveryStatus::Injected
+    ) || entry.attempt_id.as_deref() != Some(attempt_id)
     {
         return Err(corrupt_event(
             path,
@@ -1562,6 +1694,18 @@ mod tests {
             .defer(&first_claim, "busy")
             .await
             .map_err(|error| error.to_string())?;
+        let deadline = router
+            .next_attempt_at(&address())
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "deferred claim lost its retry deadline".to_string())?;
+        let delay = deadline
+            .signed_duration_since(Utc::now())
+            .to_std()
+            .unwrap_or(std::time::Duration::ZERO);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay.saturating_add(std::time::Duration::from_millis(5))).await;
+        }
         let retry = router
             .claim_next(&address())
             .await

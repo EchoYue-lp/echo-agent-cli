@@ -6,7 +6,29 @@ use echo_agent::agent::Agent;
 use echo_agent::llm::types::{Message, Role};
 use echo_agent::memory::{NewConversation, StoredMessage};
 use echo_agent_app_core::conversation_projection::{AttachmentsPayload, SavedMessage};
+use echo_agent_app_core::state::ScopedChatRuntime;
 use std::collections::BTreeMap;
+
+async fn scoped_runtime(
+    state: &TauriState,
+    workspace_id: &str,
+) -> Result<ScopedChatRuntime, IpcError> {
+    state
+        .app_state
+        .chat_runtime_for_scope(workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))
+}
+
+async fn scoped_store(
+    state: &TauriState,
+    workspace_id: &str,
+) -> Result<std::sync::Arc<dyn echo_agent::memory::ConversationStore>, IpcError> {
+    scoped_runtime(state, workspace_id)
+        .await?
+        .conversation_store()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))
+}
 
 fn pack_ui_projection(message: &mut SavedMessage) -> Option<String> {
     let has_display_content = message.content.is_some();
@@ -202,13 +224,11 @@ fn strip_branch_ui_references(raw: Option<String>) -> Option<String> {
 }
 
 async fn load_agent_transcript(
-    state: &TauriState,
+    runtime: &ScopedChatRuntime,
     conversation_id: &str,
     stored: &[StoredMessage],
 ) -> Result<usize, IpcError> {
-    let agent_execution = state
-        .app_state
-        .connection
+    let agent_execution = runtime
         .agent_for(conversation_id)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
@@ -527,12 +547,9 @@ mod tests {
 #[tauri::command]
 pub async fn list_conversations(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = state
-        .app_state
-        .conversation_store()
-        .await
-        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let store = scoped_store(&state, &workspace_id).await?;
 
     let filter = echo_agent::memory::ConversationFilter::default();
     let list = store
@@ -550,14 +567,14 @@ pub async fn list_conversations(
 #[tauri::command]
 pub async fn save_conversation(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     id: String,
     title: String,
     messages: Vec<SavedMessage>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = state
-        .app_state
+    let runtime = scoped_runtime(&state, &workspace_id).await?;
+    let store = runtime
         .conversation_store()
-        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     tracing::info!(
@@ -589,9 +606,8 @@ pub async fn save_conversation(
             agent_type: None,
             title: Some(title),
         };
-        let conv = state
-            .app_state
-            .create_conversation_owned(new_conv)
+        let conv = runtime
+            .ensure_conversation(new_conv)
             .await
             .map_err(|e| IpcError::Internal(e.to_string()))?;
         conv.conversation_id
@@ -617,13 +633,10 @@ pub async fn save_conversation(
 #[tauri::command]
 pub async fn get_conversation(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = state
-        .app_state
-        .conversation_store()
-        .await
-        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let store = scoped_store(&state, &workspace_id).await?;
 
     let conv = store
         .get_conversation(&id)
@@ -709,15 +722,12 @@ pub async fn get_conversation(
 #[tauri::command]
 pub async fn update_conversation(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     id: String,
     title: Option<String>,
     messages: Option<Vec<SavedMessage>>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = state
-        .app_state
-        .conversation_store()
-        .await
-        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let store = scoped_store(&state, &workspace_id).await?;
 
     let conv = store
         .get_conversation(&id)
@@ -747,23 +757,25 @@ pub async fn update_conversation(
 #[tauri::command]
 pub async fn branch_conversation(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     id: String,
     user_turn_index: usize,
 ) -> Result<serde_json::Value, IpcError> {
-    if state
+    if !state
         .app_state
         .session
         .foreground_turns
-        .has_active_conversation(&id)
+        .snapshots_for_conversation_scoped(&workspace_id, &id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .is_empty()
     {
         return Err(IpcError::Validation(
             "cannot branch a conversation while its turn is active".to_string(),
         ));
     }
-    let store = state
-        .app_state
+    let runtime = scoped_runtime(&state, &workspace_id).await?;
+    let store = runtime
         .conversation_store()
-        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
     let source = store
         .get_conversation(&id)
@@ -801,9 +813,8 @@ pub async fn branch_conversation(
         .as_deref()
         .map(|title| format!("{title} (branch)"))
         .unwrap_or_else(|| "Conversation branch".to_string());
-    state
-        .app_state
-        .create_conversation_owned(NewConversation {
+    runtime
+        .ensure_conversation(NewConversation {
             conversation_id: branch_id.clone(),
             user_id: source.user_id,
             agent_type: source.agent_type,
@@ -812,13 +823,21 @@ pub async fn branch_conversation(
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
     if let Err(error) = store.save_messages(&branch_id, &prefix).await {
-        if let Err(cleanup_error) = state.app_state.delete_conversation_owned(&branch_id).await {
+        if let Err(cleanup_error) = state
+            .app_state
+            .delete_conversation_scoped(&workspace_id, &branch_id)
+            .await
+        {
             tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back incomplete conversation branch");
         }
         return Err(IpcError::Internal(error.to_string()));
     }
-    if let Err(error) = load_agent_transcript(&state, &branch_id, &prefix).await {
-        if let Err(cleanup_error) = state.app_state.delete_conversation_owned(&branch_id).await {
+    if let Err(error) = load_agent_transcript(&runtime, &branch_id, &prefix).await {
+        if let Err(cleanup_error) = state
+            .app_state
+            .delete_conversation_scoped(&workspace_id, &branch_id)
+            .await
+        {
             tracing::warn!(conversation_id = %branch_id, %cleanup_error, "Failed to roll back unusable conversation branch");
         }
         return Err(error);
@@ -836,11 +855,12 @@ pub async fn branch_conversation(
 #[tauri::command]
 pub async fn delete_conversation(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let receipt = state
         .app_state
-        .delete_conversation_owned(&id)
+        .delete_conversation_scoped(&workspace_id, &id)
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
     Ok(serde_json::json!({
@@ -854,13 +874,10 @@ pub async fn delete_conversation(
 #[tauri::command]
 pub async fn export_conversation(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = state
-        .app_state
-        .conversation_store()
-        .await
-        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let store = scoped_store(&state, &workspace_id).await?;
 
     let conv = store
         .get_conversation(&id)
@@ -892,12 +909,12 @@ pub async fn export_conversation(
 #[tauri::command]
 pub async fn restore_conversation(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = state
-        .app_state
+    let runtime = scoped_runtime(&state, &workspace_id).await?;
+    let store = runtime
         .conversation_store()
-        .await
         .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
 
     let conv = store
@@ -911,18 +928,35 @@ pub async fn restore_conversation(
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
 
-    let message_count = load_agent_transcript(&state, &id, &stored).await?;
+    let active = state
+        .app_state
+        .session
+        .foreground_turns
+        .snapshots_for_conversation_scoped(&workspace_id, &id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let (message_count, readiness) = if active.is_empty() {
+        (
+            load_agent_transcript(&runtime, &id, &stored).await?,
+            "ready",
+        )
+    } else {
+        (stored.len(), "active")
+    };
 
     Ok(serde_json::json!({
         "success": true,
         "message_count": message_count,
         "conversation_id": conv.conversation_id,
+        "workspace_id": workspace_id,
+        "readiness": readiness,
+        "active_turn": active.first(),
     }))
 }
 
 #[tauri::command]
 pub async fn search_conversations(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     query: String,
     limit: Option<usize>,
 ) -> Result<serde_json::Value, IpcError> {
@@ -930,11 +964,7 @@ pub async fn search_conversations(
         return Ok(serde_json::json!([]));
     }
 
-    let store = state
-        .app_state
-        .conversation_store()
-        .await
-        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    let store = scoped_store(&state, &workspace_id).await?;
 
     let results = store
         .search_conversations(&query, limit.unwrap_or(20))

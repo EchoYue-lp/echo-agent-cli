@@ -12,7 +12,9 @@ import {
 } from 'lucide-react';
 import { toolExecutionApi } from '../../api/endpoints';
 import { errorMessage } from '../../lib/tauri-bridge';
+import { workspaceIdForView } from '../../lib/viewAddress';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import type { ToolExecutionDetailChunk, ToolExecutionDetailManifest } from '../../types/api';
 
 interface InlineToolCallProps {
@@ -42,6 +44,7 @@ function formatBytes(bytes: number): string {
 
 export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToolCallProps) {
   const tool = useToolExecutionStore((state) => state.tools[toolId]);
+  const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
   const [expanded, setExpanded] = useState(false);
   const [manifest, setManifest] = useState<ToolExecutionDetailManifest | null>(null);
   const [chunks, setChunks] = useState<ToolExecutionDetailChunk[]>([]);
@@ -66,9 +69,9 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
       try {
         const [nextManifest, page] = await Promise.all([
           initial || !manifest || manifest.status !== tool.status
-            ? toolExecutionApi.detail(tool.detail_ref)
+            ? toolExecutionApi.detail(workspaceId, tool.detail_ref)
             : Promise.resolve(manifest),
-          toolExecutionApi.readOutput(tool.detail_ref, initial ? null : cursor),
+          toolExecutionApi.readOutput(workspaceId, tool.detail_ref, initial ? null : cursor),
         ]);
         setManifest(nextManifest);
         setChunks((current) => (initial ? page.chunks : [...current, ...page.chunks]));
@@ -80,7 +83,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolId }: InlineToo
         setLoading(false);
       }
     },
-    [complete, cursor, loading, manifest, tool]
+    [complete, cursor, loading, manifest, tool, workspaceId]
   );
 
   useEffect(() => {

@@ -58,9 +58,10 @@ Last updated: 2026-08-21
 5. 删除先 settle/shutdown/evict，进程级资源上限不会随 workspace 数量倍增。
 6. GUI/TUI/CLI/channel fault matrix 与 2 小时 soak 全绿后才标记 Complete。
 
-当前工作树已有合同测试和部分 scoped IPC/event、delivery retry 路径，但尚未提交，且
-M0-M8 的整体验收没有完成。因此本条仍为 In progress，不能把局部类型或 adapter 改动
-当成闭环。
+当前工作树已完成 M0-M7 和 M8 自动实现：workspace-scoped IPC/event、durable input
+FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter settlement/backoff
+以及 process governor 均通过完整自动门禁。最终状态仍为 In progress，因为真实 GUI
+验收证据和规格要求的 2 小时多 workspace soak 尚未记录；完成这两项后才能改为 Complete。
 
 ### Long-Horizon Runtime Closure
 
@@ -87,11 +88,9 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-先完成当前 P0 未提交切片的最小相关测试，确认 M0 合同基线和 M1 scoped runtime
-resolver 真实切换至少一条 GUI 主路径；framework LH1 可在不依赖应用 identity 的前提下
-并行推进。每个后续 milestone 都必须删除被替代的 focus/global adapter，并在本文件更新
-已切换权威、剩余重复和下一删除目标。P0 与 long-horizon closure 验收后再执行
-surface parity cleanup。
+先完成 P0 runtime reliability 的真实 GUI 验收和 2 小时并发 soak，记录 artifact、
+资源峰值与零串扰结果，再提交并把该里程碑改为 Complete；framework LH1 可并行推进。
+P0 与 long-horizon closure 验收后再执行 surface parity cleanup。
 
 ## 文档生命周期
 

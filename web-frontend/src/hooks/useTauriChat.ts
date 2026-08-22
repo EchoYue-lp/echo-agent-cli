@@ -9,7 +9,9 @@ import {
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
 import { useToolExecutionStore } from '../stores/toolExecutionStore';
+import { useWorkspaceStore } from '../stores/workspaceStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
+import { viewAddress, viewAddressKey, workspaceIdForView } from '../lib/viewAddress';
 import { handleChatEventEnvelope } from './chatEventHandler';
 import { ChatEventSequencer } from './chatEventSequencer';
 import { reorderById } from './queuedChat';
@@ -20,6 +22,30 @@ export type QueuedChatInput = {
   id: string;
   text: string;
   attachments?: Attachment[];
+  workspaceId: string;
+  conversationId: string;
+  backendManaged?: boolean;
+};
+
+type SendChatResult = {
+  success?: boolean;
+  kind?: 'started' | 'queued' | 'task_run_conflict' | 'interrupt_prompt';
+  run_id?: string;
+  runId?: string;
+  root_turn_id?: string;
+  active_turn_id?: string;
+  input_id?: string;
+  goal?: string;
+  new_message?: string;
+};
+
+type QueuedChatInputWire = {
+  input_id: string;
+  workspace_id: string;
+  conversation_id: string;
+  text: string;
+  attachments: Attachment[];
+  submitted_at_ms: number;
 };
 
 type CancelChatResponse = {
@@ -28,22 +54,44 @@ type CancelChatResponse = {
   status: 'completed' | 'cancelled' | 'failed' | 'already_settled';
 };
 
+// The queue is a projection keyed by exact address. Keeping the buckets above
+// the hook preserves accepted local fallbacks across ChatPanel remounts while
+// the backend-managed entries are reconciled from their durable receipts.
+const queuedInputBuckets = new Map<string, QueuedChatInput[]>();
+const queuedDispatches = new Set<string>();
+
+function chatStreamId(workspaceId: string, conversationId?: string, messageKey?: string): string {
+  return JSON.stringify([workspaceId, conversationId ?? messageKey ?? '']);
+}
+
 export function useTauriChat() {
   const activeConversationId = useConversationStore((state) => state.activeId);
   const newConversationEpoch = useConversationStore((state) => state.newConversationEpoch);
+  const currentWorkspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
   const activeTurnIdRef = useRef<string | null>(null);
   const currentMessageKeyRef = useRef<string | null>(null);
-  const currentConversationIdRef = useRef<string | null>(null);
+  const currentConversationIdRef = useRef<string | null>(activeConversationId);
+  const currentWorkspaceIdRef = useRef(currentWorkspaceId);
   const identityGenerationRef = useRef(0);
   const previousActiveConversationIdRef = useRef(activeConversationId);
   const previousNewConversationEpochRef = useRef(newConversationEpoch);
   const thinkingIdRef = useRef<string | null>(null);
   const eventSequencerRef = useRef(new ChatEventSequencer());
-  const queuedInputsRef = useRef<QueuedChatInput[]>([]);
+  const queuedInputsByAddressRef = useRef(queuedInputBuckets);
+  const visibleQueueKeyRef = useRef<string | null>(
+    activeConversationId
+      ? viewAddressKey(viewAddress(currentWorkspaceId, activeConversationId))
+      : null
+  );
+  const pendingAdmissionRef = useRef<{
+    messageKey: string;
+    events: ChatEventEnvelope[];
+  } | null>(null);
   const dispatchMessageRef = useRef<
-    ((text: string, attachments: Attachment[] | undefined) => Promise<boolean>) | null
+    | ((text: string, attachments: Attachment[] | undefined, inputId?: string) => Promise<boolean>)
+    | null
   >(null);
   const [queuedInputs, setQueuedInputs] = useState<QueuedChatInput[]>([]);
 
@@ -53,33 +101,42 @@ export function useTauriChat() {
     // attach an unrelated running conversation when the project has one.
     if (!activeConversationId) return null;
     return apiInvoke<ForegroundTurnSnapshot | null>('get_active_chat_turn', {
+      workspaceId: currentWorkspaceId,
       conversationId: activeConversationId,
-      conversation_id: activeConversationId,
     });
-  }, [activeConversationId]);
+  }, [activeConversationId, currentWorkspaceId]);
 
   const restoreActiveTurnRefs = useCallback((snapshot: ForegroundTurnSnapshot | null) => {
-    if (snapshot) {
+    const activeConversation = useConversationStore.getState().activeId;
+    if (
+      snapshot &&
+      snapshot.workspace_id === currentWorkspaceIdRef.current &&
+      snapshot.conversation_id === activeConversation
+    ) {
+      currentWorkspaceIdRef.current = snapshot.workspace_id;
       currentConversationIdRef.current = snapshot.conversation_id;
       activeTurnIdRef.current = snapshot.active_turn_id;
-      if (
-        useChatStore.getState().messages.some((message) => message.id === snapshot.root_turn_id)
-      ) {
-        currentMessageKeyRef.current = snapshot.root_turn_id;
-        assistantIdRef.current = snapshot.root_turn_id;
+      const chat = useChatStore.getState();
+      if (!chat.messages.some((message) => message.id === snapshot.root_turn_id)) {
+        chat.startAssistantMessage(snapshot.root_turn_id);
       }
+      currentMessageKeyRef.current = snapshot.root_turn_id;
+      assistantIdRef.current = snapshot.root_turn_id;
     }
   }, []);
 
-  const replaceQueue = (next: QueuedChatInput[]) => {
-    queuedInputsRef.current = next;
-    setQueuedInputs(next);
-  };
+  const replaceQueue = useCallback((addressKey: string, next: QueuedChatInput[]) => {
+    if (next.length === 0) queuedInputsByAddressRef.current.delete(addressKey);
+    else queuedInputsByAddressRef.current.set(addressKey, next);
+    if (visibleQueueKeyRef.current === addressKey) setQueuedInputs(next);
+  }, []);
 
   useEffect(() => {
     const previous = previousActiveConversationIdRef.current;
     const startsNewConversation = previousNewConversationEpochRef.current !== newConversationEpoch;
-    if (previous === activeConversationId && !startsNewConversation) return;
+    const workspaceChanged = currentWorkspaceIdRef.current !== currentWorkspaceId;
+    if (previous === activeConversationId && !startsNewConversation && !workspaceChanged) return;
+    currentWorkspaceIdRef.current = currentWorkspaceId;
     previousActiveConversationIdRef.current = activeConversationId;
     previousNewConversationEpochRef.current = newConversationEpoch;
     identityGenerationRef.current += 1;
@@ -90,6 +147,14 @@ export function useTauriChat() {
       activeConversationId !== null &&
       activeTurnIdRef.current !== null;
     currentConversationIdRef.current = activeConversationId;
+    visibleQueueKeyRef.current = activeConversationId
+      ? viewAddressKey(viewAddress(currentWorkspaceId, activeConversationId))
+      : null;
+    setQueuedInputs(
+      visibleQueueKeyRef.current
+        ? (queuedInputsByAddressRef.current.get(visibleQueueKeyRef.current) ?? [])
+        : []
+    );
     if (adoptsCurrentTurn) return;
 
     activeTurnIdRef.current = null;
@@ -97,21 +162,55 @@ export function useTauriChat() {
     assistantIdRef.current = null;
     thinkingIdRef.current = null;
     isCancelledRef.current = false;
-    queuedInputsRef.current = [];
-    setQueuedInputs([]);
-  }, [activeConversationId, newConversationEpoch]);
+    pendingAdmissionRef.current = null;
+  }, [activeConversationId, currentWorkspaceId, newConversationEpoch]);
 
-  const dispatchNextQueued = useCallback(() => {
-    const [next, ...remaining] = queuedInputsRef.current;
-    replaceQueue(remaining);
-    if (next) {
+  const dispatchNextQueued = useCallback(
+    (workspaceId: string, conversationId: string) => {
+      const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
+      if (visibleQueueKeyRef.current !== addressKey) return;
+      const queued = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+      const next = queued[0];
+      if (!next) return;
+      if (next.backendManaged) {
+        if (queuedDispatches.has(next.id)) return;
+        queuedDispatches.add(next.id);
+        queueMicrotask(() => {
+          void (async () => {
+            try {
+              const started = await dispatchMessageRef.current?.(
+                next.text,
+                next.attachments,
+                next.id
+              );
+              if (!started) return;
+              await apiInvoke('remove_queued_chat_input', {
+                workspaceId,
+                conversationId,
+                inputId: next.id,
+              });
+              const current = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+              replaceQueue(
+                addressKey,
+                current.filter((item) => item.id !== next.id)
+              );
+            } finally {
+              queuedDispatches.delete(next.id);
+            }
+          })();
+        });
+        return;
+      }
+      replaceQueue(addressKey, queued.slice(1));
       queueMicrotask(() => {
         void dispatchMessageRef.current?.(next.text, next.attachments);
       });
-    }
-  }, []);
+    },
+    [replaceQueue]
+  );
 
   const isCurrentStreamEvent = useCallback((event: ChatEventEnvelope) => {
+    if (!event.workspace_id || event.workspace_id !== currentWorkspaceIdRef.current) return false;
     if (event.conversation_id) {
       const activeConversation =
         useConversationStore.getState().activeId ?? currentConversationIdRef.current;
@@ -119,10 +218,10 @@ export function useTauriChat() {
     }
     return (
       activeTurnIdRef.current === event.turn_id ||
-      currentMessageKeyRef.current === event.message_id ||
+      currentMessageKeyRef.current === event.root_turn_id ||
       useChatStore
         .getState()
-        .messages.some((message) => message.id === event.message_id && message.isStreaming)
+        .messages.some((message) => message.id === event.root_turn_id && message.isStreaming)
     );
   }, []);
 
@@ -131,7 +230,7 @@ export function useTauriChat() {
       if (!isCurrentStreamEvent(event)) return false;
       if (!event.conversation_id) return true;
       const rootMessageId = currentMessageKeyRef.current;
-      return !rootMessageId || rootMessageId === event.message_id;
+      return !rootMessageId || rootMessageId === event.root_turn_id;
     },
     [isCurrentStreamEvent]
   );
@@ -140,14 +239,14 @@ export function useTauriChat() {
     activeTurnIdRef.current = event.turn_id;
     const message = useChatStore
       .getState()
-      .messages.find((candidate) => candidate.id === event.message_id && candidate.isStreaming);
+      .messages.find((candidate) => candidate.id === event.root_turn_id && candidate.isStreaming);
     if (!message) return;
     currentConversationIdRef.current = event.conversation_id;
-    currentMessageKeyRef.current = event.message_id;
-    assistantIdRef.current = event.message_id;
+    currentMessageKeyRef.current = event.root_turn_id;
+    assistantIdRef.current = event.root_turn_id;
   }, []);
 
-  const handleEvent = useCallback(
+  const applyEvent = useCallback(
     (event: ChatEventEnvelope) => {
       if (!isCurrentRunEvent(event)) return;
       rebindEventRefs(event);
@@ -158,15 +257,35 @@ export function useTauriChat() {
         isCancelledRef,
         currentThinkingIdRef: thinkingIdRef,
       });
-      if (
+      const terminalStatus =
         event.payload.source === 'turn_status' &&
-        ['completed', 'failed', 'cancelled'].includes(event.payload.event.status)
-      ) {
+        ['completed', 'failed', 'cancelled'].includes(event.payload.event.status);
+      const terminalAgent =
+        event.payload.source === 'agent' &&
+        ['final_answer', 'cancelled', 'error'].includes(event.payload.event.payload.type);
+      if (terminalStatus || terminalAgent) {
         activeTurnIdRef.current = null;
-        dispatchNextQueued();
+        currentMessageKeyRef.current = null;
+        assistantIdRef.current = null;
+        thinkingIdRef.current = null;
+        if (terminalStatus && event.conversation_id) {
+          dispatchNextQueued(event.workspace_id, event.conversation_id);
+        }
       }
     },
     [dispatchNextQueued, isCurrentRunEvent, rebindEventRefs]
+  );
+
+  const handleEvent = useCallback(
+    (event: ChatEventEnvelope) => {
+      const pendingAdmission = pendingAdmissionRef.current;
+      if (pendingAdmission && pendingAdmission.messageKey === event.message_id) {
+        pendingAdmission.events.push(event);
+        return;
+      }
+      applyEvent(event);
+    },
+    [applyEvent]
   );
 
   // Set up event listener on mount.
@@ -209,6 +328,21 @@ export function useTauriChat() {
         if (aborted) return;
         const payload = event.payload;
         const kind = payload.kind as string | undefined;
+        const workspaceId =
+          typeof payload.workspace_id === 'string' ? payload.workspace_id : undefined;
+        const conversationId =
+          typeof payload.conversation_id === 'string' ? payload.conversation_id : undefined;
+        const activeConversation = useConversationStore.getState().activeId;
+        if (!workspaceId || !conversationId) {
+          console.error('[TauriChat] Ignored execution event without workspace address', payload);
+          return;
+        }
+        if (
+          workspaceId !== currentWorkspaceIdRef.current ||
+          conversationId !== activeConversation
+        ) {
+          return;
+        }
         if (kind === 'subagent') {
           const subagentRunId = String(payload.subagent_run_id ?? '');
           const taskRunId = String(payload.run_id ?? '');
@@ -236,15 +370,15 @@ export function useTauriChat() {
           }
         } else if (kind === 'run' && payload.event === 'run_started') {
           // 正式 plan / 自主 run 通过 run_started 事件激活右侧面板。
-          const convId =
-            (payload.conversation_id as string | undefined) ??
-            useConversationStore.getState().activeId;
-          if (convId) {
-            useTaskRuntimeStore
-              .getState()
-              .loadByConversation(convId)
-              .catch((e) => console.warn('[TauriChat] Failed to load task run on run_started:', e));
-          }
+          useTaskRuntimeStore
+            .getState()
+            .loadByConversation(workspaceId, conversationId)
+            .catch((e) => console.warn('[TauriChat] Failed to load task run on run_started:', e));
+        } else if (
+          kind === 'run' &&
+          ['run_completed', 'run_failed', 'run_cancelled'].includes(String(payload.event))
+        ) {
+          dispatchNextQueued(workspaceId, conversationId);
         }
       });
       // 卸载发生在第二个 listen 之后、push 之前: 立即注销。
@@ -264,19 +398,72 @@ export function useTauriChat() {
             : (activeConversation ?? snapshot?.conversation_id);
           const messageKey = snapshot?.root_turn_id;
           if (conversationId || messageKey) {
-            const streamId = conversationId
-              ? `conversation:${conversationId}`
-              : `message:${messageKey}`;
+            const streamId = chatStreamId(currentWorkspaceId, conversationId, messageKey);
             const replay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+              workspaceId: currentWorkspaceId,
               conversationId,
-              conversation_id: conversationId,
               messageKey,
-              message_key: messageKey,
               afterCursor: eventSequencerRef.current.cursor(streamId),
-              after_cursor: eventSequencerRef.current.cursor(streamId),
             });
             if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
               eventSequencerRef.current.ingestReplay(replay, handleEvent);
+              if (!snapshot) {
+                const hasTerminal = replay.events.some((event) => {
+                  if (event.payload.source === 'turn_status') {
+                    return ['completed', 'failed', 'cancelled'].includes(
+                      event.payload.event.status
+                    );
+                  }
+                  return (
+                    event.payload.source === 'agent' &&
+                    ['final_answer', 'cancelled', 'error'].includes(
+                      event.payload.event.payload.type
+                    )
+                  );
+                });
+                const orphanRoot = replay.events.at(-1)?.root_turn_id;
+                if (!hasTerminal && orphanRoot && conversationId) {
+                  await apiInvoke('cancel_chat', {
+                    workspaceId: currentWorkspaceId,
+                    conversationId,
+                    expectedRootTurnId: orphanRoot,
+                    expectedActiveTurnId: null,
+                  });
+                  const repaired = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+                    workspaceId: currentWorkspaceId,
+                    conversationId,
+                    messageKey: orphanRoot,
+                    afterCursor: eventSequencerRef.current.cursor(streamId),
+                  });
+                  eventSequencerRef.current.ingestReplay(repaired, handleEvent);
+                }
+              }
+            }
+          }
+          if (activeConversation) {
+            const queuedResult = await apiInvoke<QueuedChatInputWire[]>('list_queued_chat_inputs', {
+              workspaceId: currentWorkspaceId,
+              conversationId: activeConversation,
+            });
+            const queued = Array.isArray(queuedResult) ? queuedResult : [];
+            if (!aborted && setupIdentityGeneration === identityGenerationRef.current) {
+              const addressKey = viewAddressKey(
+                viewAddress(currentWorkspaceId, activeConversation)
+              );
+              replaceQueue(
+                addressKey,
+                queued.map((input) => ({
+                  id: input.input_id,
+                  text: input.text,
+                  attachments: input.attachments,
+                  workspaceId: input.workspace_id,
+                  conversationId: input.conversation_id,
+                  backendManaged: true,
+                }))
+              );
+              if (!snapshot) {
+                dispatchNextQueued(currentWorkspaceId, activeConversation);
+              }
             }
           }
         }
@@ -287,7 +474,9 @@ export function useTauriChat() {
       }
     };
 
-    setupListener();
+    void setupListener().catch((error) => {
+      if (!aborted) console.warn('[TauriChat] Failed to attach event listeners:', error);
+    });
 
     return () => {
       aborted = true;
@@ -295,10 +484,18 @@ export function useTauriChat() {
       pendingCleanup.forEach((fn) => fn());
       pendingCleanup.length = 0;
     };
-  }, [getActiveTurnSnapshot, handleEvent, isCurrentStreamEvent, restoreActiveTurnRefs]);
+  }, [
+    currentWorkspaceId,
+    dispatchNextQueued,
+    getActiveTurnSnapshot,
+    handleEvent,
+    isCurrentStreamEvent,
+    restoreActiveTurnRefs,
+    replaceQueue,
+  ]);
 
   const dispatchMessage = useCallback(
-    async (text: string, attachments?: Attachment[]) => {
+    async (text: string, attachments?: Attachment[], inputId?: string) => {
       const store = useChatStore.getState();
       const displayAttachments = attachments?.map((a) => ({
         name: a.name,
@@ -307,80 +504,154 @@ export function useTauriChat() {
         size: a.size,
         source: a.source,
       }));
-      const userMessageId = store.addUserMessage(text || '(附件)', displayAttachments);
-      let pendingAssistantId: string | null = null;
+      const messageKey =
+        inputId ??
+        (typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+      const workspaceId = currentWorkspaceIdRef.current;
 
       try {
         identityGenerationRef.current += 1;
         isCancelledRef.current = false;
         thinkingIdRef.current = null;
-        const message_key =
-          typeof crypto !== 'undefined' && 'randomUUID' in crypto
-            ? crypto.randomUUID()
-            : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        currentMessageKeyRef.current = message_key;
-        activeTurnIdRef.current = message_key;
-        pendingAssistantId = store.startAssistantMessage(message_key);
-        assistantIdRef.current = pendingAssistantId;
 
         // TaskRuntime runs are keyed by conversation_id. On the first turn there
         // is no active conversation yet, so create it before routing; otherwise
         // the backend falls back to a message-scoped id and the right rail loses
         // the run as soon as the conversation is later saved as conv-*.
         if (!useConversationStore.getState().activeId) {
-          await useConversationStore.getState().saveCurrent(useChatStore.getState().messages);
+          await useConversationStore.getState().saveCurrent([
+            {
+              id: messageKey,
+              role: 'user',
+              content: text || '(附件)',
+              timestamp: Date.now(),
+              attachments: displayAttachments,
+            },
+          ]);
         }
 
-        // Pass conversation_id for pool-based parallel execution and TaskRuntime
-        // run binding.
-        const conversation_id = useConversationStore.getState().activeId;
-        if (!conversation_id) {
+        const conversationState = useConversationStore.getState();
+        const conversationId = conversationState.activeId;
+        if (!conversationId || conversationState.workspaceId !== workspaceId) {
           throw new Error('创建会话失败，无法启动 TaskRuntime。');
         }
-        currentConversationIdRef.current = conversation_id ?? null;
-        const chatResult = await apiInvoke<{
-          success: boolean;
-          run_id?: string;
-          status?: string;
-          mode?: string;
-          route?: string;
-          runId?: string;
-        }>('send_chat_message', {
+        currentConversationIdRef.current = conversationId;
+        pendingAdmissionRef.current = { messageKey, events: [] };
+        const chatResult = await apiInvoke<SendChatResult>('send_chat_message', {
+          workspaceId,
           message: text,
           // Multimodal: forward attachments (base64-encoded) so the backend can
           // persist them and build a multimodal Message for the LLM.
           attachments: attachments && attachments.length > 0 ? attachments : undefined,
-          conversationId: conversation_id ?? undefined,
-          conversation_id: conversation_id ?? undefined,
-          messageKey: message_key,
-          message_key,
+          conversationId,
+          messageKey,
         });
+        const pendingEvents = pendingAdmissionRef.current?.events ?? [];
+        pendingAdmissionRef.current = null;
+        const outcome = chatResult.kind ?? (chatResult.success === false ? undefined : 'started');
+
+        if (
+          outcome === 'queued' ||
+          outcome === 'task_run_conflict' ||
+          outcome === 'interrupt_prompt'
+        ) {
+          const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
+          const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+          replaceQueue(addressKey, [
+            ...currentQueue,
+            {
+              id: chatResult.input_id ?? messageKey,
+              text,
+              attachments,
+              workspaceId,
+              conversationId,
+              backendManaged: Boolean(chatResult.input_id),
+            },
+          ]);
+          for (const event of pendingEvents) applyEvent(event);
+          if (outcome !== 'queued' && chatResult.run_id && chatResult.goal) {
+            useTaskRuntimeStore.getState().openInterruptPrompt({
+              runId: chatResult.run_id,
+              goal: chatResult.goal,
+              newMessage: chatResult.new_message ?? text,
+              resolve: async (action) => {
+                if (action === 'continue') {
+                  const run = useTaskRuntimeStore.getState().activeRun;
+                  if (run?.status === 'paused') {
+                    await useTaskRuntimeStore.getState().resumeTaskRun();
+                  }
+                  useTaskRuntimeStore.getState().dismissInterruptPrompt();
+                  return;
+                }
+                if (action === 'edit') {
+                  useTaskRuntimeStore.getState().dismissInterruptPrompt();
+                  return;
+                }
+                await apiInvoke('cancel_task_run', {
+                  workspaceId,
+                  runId: chatResult.run_id,
+                });
+                useTaskRuntimeStore.getState().dismissInterruptPrompt();
+                const started = await dispatchMessageRef.current?.(
+                  text,
+                  attachments,
+                  chatResult.input_id
+                );
+                if (started && chatResult.input_id) {
+                  await apiInvoke('remove_queued_chat_input', {
+                    workspaceId,
+                    conversationId,
+                    inputId: chatResult.input_id,
+                  });
+                  const queue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+                  replaceQueue(
+                    addressKey,
+                    queue.filter((item) => item.id !== chatResult.input_id)
+                  );
+                }
+              },
+            });
+          }
+          currentMessageKeyRef.current = null;
+          activeTurnIdRef.current = null;
+          assistantIdRef.current = null;
+          return true;
+        }
+
+        if (outcome !== 'started') {
+          throw new Error('后端未接受本次消息');
+        }
+
+        store.addUserMessage(text || '(附件)', displayAttachments);
+        currentMessageKeyRef.current = chatResult.root_turn_id ?? messageKey;
+        activeTurnIdRef.current = chatResult.active_turn_id ?? messageKey;
+        assistantIdRef.current = store.startAssistantMessage(currentMessageKeyRef.current);
+        for (const event of pendingEvents) applyEvent(event);
+
         // If the backend created a TaskRuntime run, load it so the right rail
         // panel can show plan/todos/subagents/tokens (replaces the old plan_ready
         // event handler deleted in the 13→6 state machine migration).
         const createdRunId = chatResult?.run_id ?? chatResult?.runId;
-        if (createdRunId && conversation_id) {
+        if (createdRunId) {
           useTaskRuntimeStore
             .getState()
-            .loadByConversation(conversation_id)
+            .loadByConversation(workspaceId, conversationId)
             .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
         }
         return true;
       } catch (e) {
+        pendingAdmissionRef.current = null;
         console.error('[TauriChat] Failed to send message:', e);
-        store.removeMessages(
-          pendingAssistantId ? [userMessageId, pendingAssistantId] : [userMessageId]
-        );
         useToastStore.getState().addToast('error', `发送失败：${errorMessage(e)}`);
-        store.setRunStatus('failed');
         assistantIdRef.current = null;
         currentMessageKeyRef.current = null;
         activeTurnIdRef.current = null;
-        dispatchNextQueued();
         return false;
       }
     },
-    [dispatchNextQueued]
+    [applyEvent, replaceQueue]
   );
 
   dispatchMessageRef.current = dispatchMessage;
@@ -396,26 +667,50 @@ export function useTauriChat() {
           typeof crypto !== 'undefined' && 'randomUUID' in crypto
             ? crypto.randomUUID()
             : `queued-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-        replaceQueue([...queuedInputsRef.current, { id, text, attachments }]);
+        if (!activeConversation) return false;
+        const workspaceId = currentWorkspaceIdRef.current;
+        const addressKey = viewAddressKey(viewAddress(workspaceId, activeConversation));
+        const accepted = await apiInvoke<QueuedChatInputWire>('queue_chat_input', {
+          workspaceId,
+          conversationId: activeConversation,
+          inputId: id,
+          text,
+          attachments: attachments && attachments.length > 0 ? attachments : undefined,
+        });
+        const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+        replaceQueue(addressKey, [
+          ...currentQueue,
+          {
+            id: accepted.input_id,
+            text: accepted.text,
+            attachments: accepted.attachments,
+            workspaceId: accepted.workspace_id,
+            conversationId: accepted.conversation_id,
+            backendManaged: true,
+          },
+        ]);
         return true;
       }
       if (activeTurnIdRef.current) {
         activeTurnIdRef.current = null;
         currentMessageKeyRef.current = null;
         assistantIdRef.current = null;
-        replaceQueue([]);
       }
       return dispatchMessage(text, attachments);
     },
-    [dispatchMessage]
+    [dispatchMessage, replaceQueue]
   );
 
   const sendApproval = useCallback(
     async (requestId: string, approved: boolean, reason?: string, scope?: string) => {
       try {
         await apiInvoke('send_approval_response', {
+          workspaceId: currentWorkspaceIdRef.current,
+          conversationId:
+            currentConversationIdRef.current ?? useConversationStore.getState().activeId,
+          expectedRootTurnId: currentMessageKeyRef.current,
+          expectedActiveTurnId: activeTurnIdRef.current,
           requestId,
-          request_id: requestId,
           approved,
           reason,
           scope,
@@ -431,7 +726,15 @@ export function useTauriChat() {
 
   const sendInput = useCallback(async (requestId: string, text: string) => {
     try {
-      await apiInvoke('send_input_response', { requestId, request_id: requestId, text });
+      await apiInvoke('send_input_response', {
+        workspaceId: currentWorkspaceIdRef.current,
+        conversationId:
+          currentConversationIdRef.current ?? useConversationStore.getState().activeId,
+        expectedRootTurnId: currentMessageKeyRef.current,
+        expectedActiveTurnId: activeTurnIdRef.current,
+        requestId,
+        text,
+      });
       useChatStore.getState().removeHitlRequest(requestId);
     } catch (e) {
       console.error('[TauriChat] Failed to send input:', e);
@@ -442,8 +745,12 @@ export function useTauriChat() {
     async (requestId: string, selection: string, instructions?: string) => {
       try {
         await apiInvoke('send_selection_response', {
+          workspaceId: currentWorkspaceIdRef.current,
+          conversationId:
+            currentConversationIdRef.current ?? useConversationStore.getState().activeId,
+          expectedRootTurnId: currentMessageKeyRef.current,
+          expectedActiveTurnId: activeTurnIdRef.current,
           requestId,
-          request_id: requestId,
           selection,
           instructions,
         });
@@ -462,25 +769,28 @@ export function useTauriChat() {
     try {
       // Mount recovery is asynchronous. Stop must independently recover the
       // exact registry identity when the effect has not populated refs yet.
-      if (!rootTurnId || !conversationId) {
+      if (!activeTurnIdRef.current || !rootTurnId || !conversationId) {
         const snapshot = await getActiveTurnSnapshot();
         if (snapshot) {
           restoreActiveTurnRefs(snapshot);
           rootTurnId = snapshot.root_turn_id;
           conversationId = snapshot.conversation_id;
+        } else {
+          rootTurnId = null;
+          activeTurnIdRef.current = null;
         }
       }
       if (!rootTurnId || !conversationId) {
         const activeConversation = useConversationStore.getState().activeId;
         if (activeConversation) {
-          const streamId = `conversation:${activeConversation}`;
+          const workspaceId = currentWorkspaceIdRef.current;
+          const streamId = chatStreamId(workspaceId, activeConversation);
           const replay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+            workspaceId,
             conversationId: activeConversation,
-            conversation_id: activeConversation,
             afterCursor: eventSequencerRef.current.cursor(streamId),
-            after_cursor: eventSequencerRef.current.cursor(streamId),
           });
-          eventSequencerRef.current.ingestReplay(replay, handleEvent);
+          if (replay?.events) eventSequencerRef.current.ingestReplay(replay, handleEvent);
         }
         if (useChatStore.getState().isStreaming) {
           useChatStore.getState().settleOrphanedTurn();
@@ -491,26 +801,25 @@ export function useTauriChat() {
         return;
       }
       const settlement = await apiInvoke<CancelChatResponse>('cancel_chat', {
+        workspaceId: currentWorkspaceIdRef.current,
         conversationId,
-        conversation_id: conversationId,
-        rootTurnId,
-        root_turn_id: rootTurnId,
+        expectedRootTurnId: rootTurnId,
+        expectedActiveTurnId: activeTurnIdRef.current,
       });
       if (!settlement.success) {
         throw new Error(`取消请求未完成（${settlement.status}）`);
       }
       if (settlement.status === 'already_settled') {
-        const streamId = `conversation:${conversationId}`;
+        const workspaceId = currentWorkspaceIdRef.current;
+        const streamId = chatStreamId(workspaceId, conversationId);
         try {
           const replay = await apiInvoke<ChatEventReplay>('replay_chat_events', {
+            workspaceId,
             conversationId,
-            conversation_id: conversationId,
             messageKey: rootTurnId,
-            message_key: rootTurnId,
             afterCursor: eventSequencerRef.current.cursor(streamId),
-            after_cursor: eventSequencerRef.current.cursor(streamId),
           });
-          eventSequencerRef.current.ingestReplay(replay, handleEvent);
+          if (replay?.events) eventSequencerRef.current.ingestReplay(replay, handleEvent);
         } catch (error) {
           console.warn('[TauriChat] Failed to reconcile an already-settled turn:', error);
         }
@@ -532,28 +841,92 @@ export function useTauriChat() {
   }, [getActiveTurnSnapshot, handleEvent, restoreActiveTurnRefs]);
 
   const clearQueuedMessages = useCallback(() => {
-    replaceQueue([]);
-  }, []);
+    const addressKey = visibleQueueKeyRef.current;
+    if (!addressKey) return;
+    const queue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+    void (async () => {
+      for (const item of queue.filter((candidate) => candidate.backendManaged)) {
+        await apiInvoke('remove_queued_chat_input', {
+          workspaceId: item.workspaceId,
+          conversationId: item.conversationId,
+          inputId: item.id,
+        });
+      }
+      replaceQueue(addressKey, []);
+    })().catch((error) => {
+      useToastStore.getState().addToast('error', `清空排队消息失败：${errorMessage(error)}`);
+    });
+  }, [replaceQueue]);
 
-  const removeQueuedMessage = useCallback((id: string) => {
-    replaceQueue(queuedInputsRef.current.filter((item) => item.id !== id));
-  }, []);
+  const removeQueuedMessage = useCallback(
+    (id: string) => {
+      const addressKey = visibleQueueKeyRef.current;
+      if (!addressKey) return;
+      const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+      const item = currentQueue.find((candidate) => candidate.id === id);
+      if (item?.backendManaged) {
+        void apiInvoke('remove_queued_chat_input', {
+          workspaceId: item.workspaceId,
+          conversationId: item.conversationId,
+          inputId: item.id,
+        })
+          .then(() => {
+            const latest = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+            replaceQueue(
+              addressKey,
+              latest.filter((candidate) => candidate.id !== id)
+            );
+          })
+          .catch((error) => {
+            useToastStore.getState().addToast('error', `删除排队消息失败：${errorMessage(error)}`);
+          });
+        return;
+      }
+      replaceQueue(
+        addressKey,
+        currentQueue.filter((candidate) => candidate.id !== id)
+      );
+    },
+    [replaceQueue]
+  );
 
-  const reorderQueuedMessage = useCallback((sourceId: string, targetId: string) => {
-    replaceQueue(reorderById(queuedInputsRef.current, sourceId, targetId));
-  }, []);
+  const reorderQueuedMessage = useCallback(
+    (sourceId: string, targetId: string) => {
+      const addressKey = visibleQueueKeyRef.current;
+      if (!addressKey) return;
+      const currentQueue = queuedInputsByAddressRef.current.get(addressKey) ?? [];
+      const next = reorderById(currentQueue, sourceId, targetId);
+      replaceQueue(addressKey, next);
+      const addressed = next.find((item) => item.backendManaged);
+      if (!addressed) return;
+      void apiInvoke('reorder_queued_chat_inputs', {
+        workspaceId: addressed.workspaceId,
+        conversationId: addressed.conversationId,
+        inputIds: next.filter((item) => item.backendManaged).map((item) => item.id),
+      }).catch((error) => {
+        replaceQueue(addressKey, currentQueue);
+        useToastStore.getState().addToast('error', `调整排队顺序失败：${errorMessage(error)}`);
+      });
+    },
+    [replaceQueue]
+  );
 
   const steerQueuedMessage = useCallback(
     async (id: string) => {
-      const queued = queuedInputsRef.current.find((item) => item.id === id);
+      const addressKey = visibleQueueKeyRef.current;
+      const queued = addressKey
+        ? queuedInputsByAddressRef.current.get(addressKey)?.find((item) => item.id === id)
+        : undefined;
       const conversationId = useConversationStore.getState().activeId;
       if (!queued || !conversationId) return false;
       try {
         const result = await apiInvoke<{ kind: string }>('steer_chat_message', {
+          workspaceId: queued.workspaceId,
           message: queued.text,
           attachments: queued.attachments,
           conversationId,
-          conversation_id: conversationId,
+          expectedRootTurnId: currentMessageKeyRef.current,
+          expectedActiveTurnId: activeTurnIdRef.current,
         });
         if (result.kind !== 'accepted') {
           useToastStore.getState().addToast('info', '当前阶段不能插入，已保留在排队队列中');

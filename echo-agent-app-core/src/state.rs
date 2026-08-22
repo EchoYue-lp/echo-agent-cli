@@ -652,6 +652,7 @@ pub struct ScopedChatRuntime {
     task_runtime: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     conversation_store: Option<Arc<dyn ConversationStore>>,
+    runtime_state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
     deletions: Arc<crate::conversation_deletion::ConversationDeletionService>,
 }
 
@@ -670,6 +671,14 @@ impl ScopedChatRuntime {
 
     pub fn review_integration(&self) -> Option<Arc<crate::evolution::ReviewIntegration>> {
         self.review_integration.clone()
+    }
+
+    pub fn conversation_store(&self) -> Option<Arc<dyn ConversationStore>> {
+        self.conversation_store.clone()
+    }
+
+    pub fn runtime_state_store(&self) -> Option<Arc<dyn echo_agent::state::RuntimeStateStore>> {
+        self.runtime_state_store.clone()
     }
 
     pub async fn ensure_conversation(
@@ -1642,22 +1651,59 @@ impl AppState {
         crate::conversation_deletion::ConversationDeletionError,
     > {
         let _workspace = self.workspace.transition.lock().await;
-        let binding = self.storage.conversation.read().await;
-        let artifact_config = self
-            .connection
-            .agent
+        let runtime = self.current_chat_runtime_inner().await.map_err(|error| {
+            crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                error.to_string(),
+            )
+        })?;
+        self.delete_conversation_with_runtime(&runtime, conversation_id)
+            .await
+    }
+
+    /// Delete one exact workspace conversation without consulting UI focus.
+    pub async fn delete_conversation_scoped(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> std::result::Result<
+        crate::conversation_deletion::ConversationDeletionReceipt,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| {
+                crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                    error.to_string(),
+                )
+            })?;
+        self.delete_conversation_with_runtime(&runtime, conversation_id)
+            .await
+    }
+
+    async fn delete_conversation_with_runtime(
+        &self,
+        runtime: &ScopedChatRuntime,
+        conversation_id: &str,
+    ) -> std::result::Result<
+        crate::conversation_deletion::ConversationDeletionReceipt,
+        crate::conversation_deletion::ConversationDeletionError,
+    > {
+        let artifact_config = runtime
+            .primary_agent()
             .read(|agent| agent.tool_output_artifacts())
             .await;
-        binding
+        runtime
             .deletions
             .delete(
+                runtime.execution_scope().workspace_id(),
                 conversation_id,
-                binding.store.clone(),
-                self.connection.pool.clone(),
-                self.tasks.runtime.clone(),
+                runtime.conversation_store(),
+                runtime.pool(),
+                runtime.task_runtime(),
                 self.storage.tool_executions.clone(),
                 self.storage.chat_events.clone(),
-                binding.runtime_state.clone(),
+                runtime.runtime_state_store(),
                 &self.session.foreground_turns,
                 artifact_config,
             )
@@ -1956,6 +2002,55 @@ impl AppState {
         }
     }
 
+    /// Reject workspace deletion while any application-owned execution is
+    /// still attached to the target host.
+    pub async fn ensure_workspace_idle_for_delete(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+    ) -> anyhow::Result<()> {
+        let foreground = self
+            .session
+            .foreground_turns
+            .snapshots_for_workspace(workspace_id.as_str())
+            .map_err(anyhow::Error::msg)?;
+        if !foreground.is_empty() {
+            anyhow::bail!(
+                "workspace '{}' has {} active foreground turn(s)",
+                workspace_id,
+                foreground.len()
+            );
+        }
+        if self.agent_deliveries.has_active_workspace(workspace_id) {
+            anyhow::bail!("workspace '{}' has active Agent delivery", workspace_id);
+        }
+        let activities = self.workspace.runtimes.activity_snapshot().await?;
+        if let Some(activity) = activities
+            .into_iter()
+            .find(|activity| &activity.workspace_id == workspace_id)
+            && !activity.is_idle()
+        {
+            anyhow::bail!(
+                "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {})",
+                workspace_id,
+                activity.active_pool_executions,
+                activity.active_run_drivers,
+                activity.active_run_driver_receipts
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn evict_workspace_for_delete(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+    ) -> anyhow::Result<bool> {
+        self.ensure_workspace_idle_for_delete(workspace_id).await?;
+        self.workspace
+            .runtimes
+            .shutdown_and_evict_if_idle(workspace_id)
+            .await
+    }
+
     /// Discover persisted conversation addresses from the existing workspace
     /// registry and per-workspace ConversationStores.
     pub async fn discover_agent_endpoints(
@@ -1968,18 +2063,25 @@ impl AppState {
             .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
         let mut endpoints = Vec::new();
         for workspace in workspaces {
-            let host = self
-                .workspace
-                .runtimes
-                .get_or_open(workspace.clone())
-                .await
-                .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
-            let conversations = host
+            let host = match self.workspace.runtimes.get_or_open(workspace.clone()).await {
+                Ok(host) => host,
+                Err(error) => {
+                    tracing::warn!(workspace = %workspace.id, %error, "Agent endpoint discovery skipped an unavailable workspace");
+                    continue;
+                }
+            };
+            let conversations = match host
                 .resources()
                 .conversation_store()
                 .list_conversations(Default::default())
                 .await
-                .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?;
+            {
+                Ok(conversations) => conversations,
+                Err(error) => {
+                    tracing::warn!(workspace = %workspace.id, %error, "Agent endpoint discovery skipped an unreadable conversation store");
+                    continue;
+                }
+            };
             endpoints.extend(conversations.into_iter().map(|conversation| {
                 crate::agent_router::AgentEndpoint {
                     address: crate::agent_router::AgentAddress::new(
@@ -2159,22 +2261,49 @@ impl AppState {
         &self,
         address: &crate::agent_router::AgentAddress,
     ) -> Result<ScopedChatRuntime, AgentMessageSendError> {
-        let workspace = self.registered_workspace_for_agent(address)?;
-        let host = self
-            .workspace
-            .runtimes
-            .get_or_open(workspace)
+        self.chat_runtime_for_scope(address.workspace_id.as_str())
             .await
-            .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
+            .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))
+    }
+
+    /// Resolve one immutable execution runtime by explicit workspace identity.
+    ///
+    /// `current_workspace` is deliberately not consulted. Once a command has
+    /// accepted a workspace identity, later UI focus changes cannot retarget it.
+    pub async fn chat_runtime_for_scope(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<ScopedChatRuntime> {
+        if workspace_id == "global" {
+            let binding = self.storage.conversation.read().await;
+            return Ok(ScopedChatRuntime {
+                execution_scope: crate::workspace::WorkspaceExecutionScope::global(
+                    self.workspace.global_execution_root.clone(),
+                ),
+                primary_agent: self.connection.primary_agent(),
+                pool: self.connection.pool.clone(),
+                task_runtime: self.tasks.runtime.clone(),
+                review_integration: self.review_integration.clone(),
+                conversation_store: binding.store.clone(),
+                runtime_state_store: binding.runtime_state.clone(),
+                deletions: binding.deletions.clone(),
+            });
+        }
+
+        let workspace = self
+            .workspace
+            .registry
+            .list()?
+            .into_iter()
+            .find(|workspace| workspace.id.as_str() == workspace_id)
+            .ok_or_else(|| anyhow::anyhow!("workspace '{workspace_id}' is not registered"))?;
+        let host = self.workspace.runtimes.get_or_open(workspace).await?;
         let seed_pool = self.connection.pool.as_ref().ok_or_else(|| {
-            AgentMessageSendError::Workspace(
-                "Agent delivery requires the application AgentPool to be initialized".to_string(),
+            anyhow::anyhow!(
+                "Workspace execution requires the application AgentPool to be initialized"
             )
         })?;
-        let execution = host
-            .get_or_open_execution(seed_pool)
-            .await
-            .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
+        let execution = host.get_or_open_execution(seed_pool).await?;
         let task_runtime = execution.task_runtime();
         self.attach_task_execution_target_resolver(&task_runtime, seed_pool);
         Ok(ScopedChatRuntime {
@@ -2184,6 +2313,7 @@ impl AppState {
             task_runtime: Some(task_runtime),
             review_integration: Some(execution.review_integration()),
             conversation_store: Some(host.resources().conversation_store()),
+            runtime_state_store: Some(host.resources().runtime_state_store()),
             deletions: host.resources().deletion_service(),
         })
     }
@@ -2244,6 +2374,25 @@ impl AppState {
             };
             if pending.is_empty() {
                 return;
+            }
+            if let Some(next_attempt_at) = match self.agent_router.next_attempt_at(target).await {
+                Ok(deadline) => deadline,
+                Err(error) => {
+                    tracing::error!(%error, "Agent inbox retry deadline could not be read");
+                    return;
+                }
+            } {
+                let delay = next_attempt_at
+                    .signed_duration_since(chrono::Utc::now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO);
+                if !delay.is_zero() {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
             }
             let active = match self
                 .session
@@ -2307,7 +2456,7 @@ impl AppState {
     }
 
     async fn deliver_agent_message_live(
-        &self,
+        self: &Arc<Self>,
         target: &crate::agent_router::AgentAddress,
         active: &[crate::foreground_turn::ForegroundTurnSnapshot],
     ) -> Result<bool, AgentMessageSendError> {
@@ -2333,6 +2482,15 @@ impl AppState {
             if snapshot.surface == crate::foreground_turn::ForegroundTurnSurface::Agent {
                 continue;
             }
+            let waiter = match self.session.foreground_turns.settlement_waiter_scoped(
+                target.workspace_id.as_str(),
+                snapshot.surface,
+                &target.conversation_id,
+                &snapshot.root_turn_id,
+            ) {
+                Ok(waiter) => waiter,
+                Err(_) => continue,
+            };
             let steer = agent
                 .steer_input(
                     Some(&snapshot.active_turn_id),
@@ -2341,7 +2499,63 @@ impl AppState {
                 .await;
             match steer {
                 Ok(turn_id) => {
-                    self.agent_router.delivered(&claim, turn_id, None).await?;
+                    self.agent_router.injected(&claim, turn_id.clone()).await?;
+                    let settlement = waiter
+                        .wait()
+                        .await
+                        .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
+                    match settlement.outcome {
+                        crate::chat_driver::TurnOutcome::Completed => {
+                            let conversation_store =
+                                runtime.conversation_store().ok_or_else(|| {
+                                    AgentMessageSendError::Conversation(
+                                        "target conversation store is not available".to_string(),
+                                    )
+                                })?;
+                            let transcript = conversation_store
+                                .get_messages(&target.conversation_id)
+                                .await
+                                .map_err(|error| {
+                                    AgentMessageSendError::Conversation(error.to_string())
+                                })?;
+                            let answer = completed_agent_delivery_answer(&transcript, &instruction);
+                            let reply_message_id = self
+                                .queue_agent_delivery_reply(&claim.message, answer)
+                                .await;
+                            if claim.message.expects_reply() && reply_message_id.is_none() {
+                                self.agent_router
+                                    .failed(
+                                        &claim,
+                                        "live Agent delivery completed without a durable correlated reply",
+                                        claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
+                                    )
+                                    .await?;
+                                return Ok(true);
+                            }
+                            self.agent_router
+                                .delivered(&claim, turn_id, reply_message_id)
+                                .await?;
+                        }
+                        crate::chat_driver::TurnOutcome::Cancelled => {
+                            self.agent_router
+                                .failed(
+                                    &claim,
+                                    "live Agent delivery target turn was cancelled",
+                                    claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
+                                )
+                                .await?;
+                        }
+                        crate::chat_driver::TurnOutcome::Failed(failure) => {
+                            self.agent_router
+                                .failed(
+                                    &claim,
+                                    format!("{}: {}", failure.code, failure.message),
+                                    failure.retryable
+                                        && claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
+                                )
+                                .await?;
+                        }
+                    }
                     return Ok(true);
                 }
                 Err(
@@ -2414,6 +2628,17 @@ impl AppState {
             let reply_message_id = self
                 .queue_agent_delivery_reply(&claim.message, Some(answer))
                 .await;
+            if claim.message.expects_reply() && reply_message_id.is_none() {
+                self.agent_router
+                    .failed(
+                        &claim,
+                        "completed Agent delivery reply could not be durably queued",
+                        claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
+                    )
+                    .await?;
+                lease.settle(crate::chat_driver::TurnOutcome::Completed);
+                return Ok(true);
+            }
             self.agent_router
                 .delivered(&claim, root_turn_id, reply_message_id)
                 .await?;
@@ -2499,9 +2724,19 @@ impl AppState {
                 let reply_message_id = self
                     .queue_agent_delivery_reply(&claim.message, capture.final_answer())
                     .await;
-                self.agent_router
-                    .delivered(&claim, root_turn_id, reply_message_id)
-                    .await?;
+                if claim.message.expects_reply() && reply_message_id.is_none() {
+                    self.agent_router
+                        .failed(
+                            &claim,
+                            "Agent delivery completed without a durable correlated reply",
+                            claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
+                        )
+                        .await?;
+                } else {
+                    self.agent_router
+                        .delivered(&claim, root_turn_id, reply_message_id)
+                        .await?;
+                }
             }
             Ok(crate::chat_driver::TurnOutcome::Failed(failure)) => {
                 let retryable = failure.retryable && claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS;
@@ -2578,14 +2813,18 @@ impl AppState {
         let endpoints = self.discover_agent_endpoints().await?;
         let mut resumed = 0usize;
         for endpoint in endpoints {
-            if !self
-                .agent_router
-                .pending(&endpoint.address)
-                .await?
-                .is_empty()
-            {
-                self.kick_agent_delivery(endpoint.address)?;
-                resumed = resumed.saturating_add(1);
+            match self.agent_router.pending(&endpoint.address).await {
+                Ok(pending) if !pending.is_empty() => {
+                    if let Err(error) = self.kick_agent_delivery(endpoint.address.clone()) {
+                        tracing::warn!(workspace = %endpoint.address.workspace_id, conversation = %endpoint.address.conversation_id, %error, "Agent delivery recovery could not schedule one endpoint");
+                        continue;
+                    }
+                    resumed = resumed.saturating_add(1);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(workspace = %endpoint.address.workspace_id, conversation = %endpoint.address.conversation_id, %error, "Agent delivery recovery skipped one corrupt inbox");
+                }
             }
         }
         Ok(resumed)
@@ -2789,6 +3028,7 @@ impl AppState {
                     task_runtime: Some(task_runtime),
                     review_integration: Some(execution.review_integration()),
                     conversation_store: Some(host.resources().conversation_store()),
+                    runtime_state_store: Some(host.resources().runtime_state_store()),
                     deletions: host.resources().deletion_service(),
                 })
             }
@@ -2803,6 +3043,7 @@ impl AppState {
                     task_runtime: self.tasks.runtime.clone(),
                     review_integration: self.review_integration.clone(),
                     conversation_store: binding.store.clone(),
+                    runtime_state_store: binding.runtime_state.clone(),
                     deletions: binding.deletions.clone(),
                 })
             }
@@ -3326,6 +3567,9 @@ fn resolve_active_model_runtime(
         .map(Some)
         .map_err(|error| ModelMutationError::Validation(error.to_string()))
 }
+
+#[cfg(test)]
+mod reliability_contracts;
 
 #[cfg(test)]
 mod model_mutation_tests {
@@ -5119,10 +5363,6 @@ mod workspace_transition_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         };
         assert_eq!(live_record.turn_id.as_deref(), Some("active-target-turn"));
-        assert!(
-            !active_task.is_finished(),
-            "steer receipt must not wait for target turn settlement"
-        );
         let active_outcome = active_task.await.map_err(|error| error.to_string())??;
         assert_eq!(active_outcome, crate::chat_driver::TurnOutcome::Completed);
 

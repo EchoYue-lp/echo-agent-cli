@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard};
 
-pub const CHAT_EVENT_SCHEMA_VERSION: u16 = 1;
+pub const CHAT_EVENT_SCHEMA_VERSION: u16 = 2;
 const SEGMENT_SUFFIX: &str = ".jsonl";
 
 #[derive(Debug, Clone, Copy)]
@@ -56,10 +56,13 @@ pub struct ChatEventEnvelope {
     pub schema_version: u16,
     pub event_id: String,
     pub content_hash: String,
-    /// Monotonic application cursor within one conversation stream.
+    /// Monotonic application cursor within one workspace/conversation stream,
+    /// or one workspace/root-message stream when no conversation exists.
     pub sequence: u64,
     pub stream_id: String,
+    pub workspace_id: String,
     pub conversation_id: Option<String>,
+    pub root_turn_id: String,
     pub turn_id: String,
     pub message_id: String,
     pub timestamp: DateTime<Utc>,
@@ -76,6 +79,16 @@ pub struct ChatEventReplay {
     pub latest_cursor: u64,
     /// True when retention or the replay cap omitted events after the requested cursor.
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedChatInput {
+    pub input_id: String,
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub text: String,
+    pub attachments: Vec<crate::types::AttachmentData>,
+    pub submitted_at_ms: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +163,7 @@ pub struct JournaledChatSink {
     log: Arc<ChatEventLog>,
     tool_execution_projector: Arc<ToolExecutionProjector>,
     surface: ChatSurface,
+    workspace_id: String,
     conversation_id: Option<String>,
     turn_id: String,
 }
@@ -160,6 +174,7 @@ impl JournaledChatSink {
         log: Arc<ChatEventLog>,
         tool_execution_projector: Arc<ToolExecutionProjector>,
         surface: ChatSurface,
+        workspace_id: impl Into<String>,
         conversation_id: Option<String>,
         turn_id: impl Into<String>,
     ) -> Arc<dyn crate::chat_driver::ChatSink> {
@@ -168,6 +183,7 @@ impl JournaledChatSink {
             log,
             tool_execution_projector,
             surface,
+            workspace_id: workspace_id.into(),
             conversation_id,
             turn_id: turn_id.into(),
         })
@@ -182,6 +198,7 @@ pub fn bind_surface_chat_sink(
     inner: Arc<dyn crate::chat_driver::ChatSink>,
     log: Arc<ChatEventLog>,
     tool_executions: Arc<ToolExecutionRepository>,
+    workspace_id: impl Into<String>,
     conversation_id: Option<String>,
     turn_id: impl Into<String>,
 ) -> Arc<dyn crate::chat_driver::ChatSink> {
@@ -190,6 +207,7 @@ pub fn bind_surface_chat_sink(
         log,
         Arc::new(ToolExecutionProjector::new(tool_executions, None)),
         surface,
+        workspace_id,
         conversation_id,
         turn_id,
     )
@@ -197,10 +215,12 @@ pub fn bind_surface_chat_sink(
 
 impl crate::chat_driver::ChatSink for JournaledChatSink {
     fn on_event(&self, event: ChatDriverEvent) -> bool {
-        match self
-            .log
-            .append(self.conversation_id.as_deref(), &self.turn_id, event)
-        {
+        match self.log.append(
+            &self.workspace_id,
+            self.conversation_id.as_deref(),
+            &self.turn_id,
+            event,
+        ) {
             Ok(envelope) => match self.tool_execution_projector.project_envelope(&envelope) {
                 Ok(updates) => {
                     for update in &updates {
@@ -241,6 +261,7 @@ impl crate::chat_driver::ChatSink for JournaledChatSink {
                 self.log.clone(),
                 self.tool_execution_projector.clone(),
                 self.surface,
+                self.workspace_id.clone(),
                 self.conversation_id.clone(),
                 self.turn_id.clone(),
             )
@@ -289,18 +310,28 @@ impl ChatEventLog {
 
     pub fn append(
         &self,
+        workspace_id: &str,
         conversation_id: Option<&str>,
         root_turn_id: &str,
         event: ChatDriverEvent,
     ) -> Result<ChatEventEnvelope, ChatEventLogError> {
-        validate_event_stream_identity(conversation_id, &event)?;
+        validate_event_stream_identity(workspace_id, conversation_id, &event)?;
         validate_driver_event(&event)?;
-        let selected_stream_id = stream_id(conversation_id, root_turn_id)?;
-        let (turn_id, message_id) = event_identity(&event, root_turn_id);
-        if stream_id(conversation_id, &message_id)? != selected_stream_id {
+        if matches!(
+            &event,
+            ChatDriverEvent::InputQueued { input_id, .. }
+                | ChatDriverEvent::InputRemoved { input_id }
+                if input_id != root_turn_id
+        ) {
             return Err(ChatEventLogError::InvalidIdentity(
-                "conversation/message identity does not match the selected journal stream"
-                    .to_string(),
+                "queued chat input identity does not match the journal root".to_string(),
+            ));
+        }
+        let selected_stream_id = stream_id(workspace_id, conversation_id, root_turn_id)?;
+        let (turn_id, message_id) = event_identity(&event, root_turn_id);
+        if message_id != root_turn_id {
+            return Err(ChatEventLogError::InvalidIdentity(
+                "event root message does not match the selected journal turn".to_string(),
             ));
         }
         let stream_dir = self.stream_dir(&selected_stream_id);
@@ -330,15 +361,18 @@ impl ChatEventLog {
         }
 
         let timestamp = Utc::now();
-        let content_hash = envelope_content_hash(
-            &selected_stream_id,
-            conversation_id,
-            &turn_id,
-            &message_id,
+        let content_hash = envelope_content_hash(EnvelopeIntegrity {
+            schema_version: CHAT_EVENT_SCHEMA_VERSION,
             sequence,
+            stream_id: &selected_stream_id,
+            workspace_id,
+            conversation_id,
+            root_turn_id,
+            turn_id: &turn_id,
+            message_id: &message_id,
             timestamp,
-            &event,
-        )?;
+            payload: &event,
+        })?;
         let event_id = stable_event_id(&selected_stream_id, sequence, &content_hash);
         let envelope = ChatEventEnvelope {
             schema_version: CHAT_EVENT_SCHEMA_VERSION,
@@ -346,7 +380,9 @@ impl ChatEventLog {
             content_hash,
             sequence,
             stream_id: selected_stream_id,
+            workspace_id: workspace_id.to_string(),
             conversation_id: conversation_id.map(ToString::to_string),
+            root_turn_id: root_turn_id.to_string(),
             turn_id,
             message_id,
             timestamp,
@@ -399,11 +435,12 @@ impl ChatEventLog {
 
     pub fn replay(
         &self,
+        workspace_id: &str,
         conversation_id: Option<&str>,
         turn_id: &str,
         after_cursor: u64,
     ) -> Result<ChatEventReplay, ChatEventLogError> {
-        let stream_id = stream_id(conversation_id, turn_id)?;
+        let stream_id = stream_id(workspace_id, conversation_id, turn_id)?;
         let stream_dir = self.stream_dir(&stream_id);
         let stream_state = self.stream_state(&stream_id);
         let mut state = lock_stream_state(&stream_state);
@@ -461,49 +498,205 @@ impl ChatEventLog {
         })
     }
 
+    pub fn enqueue_chat_input(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+        text: String,
+        attachments: Vec<crate::types::AttachmentData>,
+    ) -> Result<QueuedChatInput, ChatEventLogError> {
+        if text.trim().is_empty() && attachments.is_empty() {
+            return Err(ChatEventLogError::InvalidEvent(
+                "queued chat input must contain text or attachments".to_string(),
+            ));
+        }
+        let submitted_at_ms = echo_agent::utils::time::now_millis();
+        self.append(
+            workspace_id,
+            Some(conversation_id),
+            input_id,
+            ChatDriverEvent::InputQueued {
+                input_id: input_id.to_string(),
+                text: text.clone(),
+                attachments: attachments.clone(),
+                submitted_at_ms,
+            },
+        )?;
+        Ok(QueuedChatInput {
+            input_id: input_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            text,
+            attachments,
+            submitted_at_ms,
+        })
+    }
+
+    pub fn queued_chat_inputs(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<QueuedChatInput>, ChatEventLogError> {
+        let replay = self.replay(workspace_id, Some(conversation_id), conversation_id, 0)?;
+        let mut order = Vec::new();
+        let mut queued = std::collections::HashMap::<String, QueuedChatInput>::new();
+        for envelope in replay.events {
+            match envelope.payload {
+                ChatDriverEvent::InputQueued {
+                    input_id,
+                    text,
+                    attachments,
+                    submitted_at_ms,
+                } => {
+                    if !queued.contains_key(&input_id) {
+                        order.push(input_id.clone());
+                    }
+                    queued.insert(
+                        input_id.clone(),
+                        QueuedChatInput {
+                            input_id,
+                            workspace_id: workspace_id.to_string(),
+                            conversation_id: conversation_id.to_string(),
+                            text,
+                            attachments,
+                            submitted_at_ms,
+                        },
+                    );
+                }
+                ChatDriverEvent::InputRemoved { input_id } => {
+                    queued.remove(&input_id);
+                }
+                ChatDriverEvent::InputReordered { input_ids } => {
+                    let mut next = input_ids
+                        .into_iter()
+                        .filter(|input_id| queued.contains_key(input_id))
+                        .collect::<Vec<_>>();
+                    let remaining = order
+                        .iter()
+                        .filter(|input_id| queued.contains_key(*input_id))
+                        .filter(|input_id| !next.contains(input_id))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    next.extend(remaining);
+                    order = next;
+                }
+                _ => {}
+            }
+        }
+        Ok(order
+            .into_iter()
+            .filter_map(|input_id| queued.remove(&input_id))
+            .collect())
+    }
+
+    pub fn remove_queued_chat_input(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        input_id: &str,
+    ) -> Result<(), ChatEventLogError> {
+        self.append(
+            workspace_id,
+            Some(conversation_id),
+            input_id,
+            ChatDriverEvent::InputRemoved {
+                input_id: input_id.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    pub fn reorder_queued_chat_inputs(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        input_ids: Vec<String>,
+    ) -> Result<(), ChatEventLogError> {
+        if input_ids.is_empty() || input_ids.iter().any(|input_id| input_id.trim().is_empty()) {
+            return Err(ChatEventLogError::InvalidEvent(
+                "queued input order must contain non-empty identities".to_string(),
+            ));
+        }
+        let root_turn_id = format!("queue-order:{}", uuid::Uuid::new_v4());
+        self.append(
+            workspace_id,
+            Some(conversation_id),
+            &root_turn_id,
+            ChatDriverEvent::InputReordered { input_ids },
+        )?;
+        Ok(())
+    }
+
     /// Remove the ordinary-chat journal for one conversation. Append and
     /// replay take the same per-stream lock, so callers that have suspended
     /// foreground admission cannot observe or recreate a partially removed
     /// stream. Message-only streams are intentionally outside this scope.
-    pub fn remove_conversation(&self, conversation_id: &str) -> Result<(), ChatEventLogError> {
-        if conversation_id.trim().is_empty() {
+    pub fn remove_conversation(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), ChatEventLogError> {
+        if workspace_id.trim().is_empty() || conversation_id.trim().is_empty() {
             return Err(ChatEventLogError::InvalidIdentity(
-                "conversation_id must not be empty".to_string(),
+                "workspace_id and conversation_id must not be empty".to_string(),
             ));
         }
-        let stream_id = format!("conversation:{conversation_id}");
-        let stream_dir = self.stream_dir(&stream_id);
-        let stream_state = self.stream_state(&stream_id);
-        let mut state = lock_stream_state(&stream_state);
         if !ensure_real_directory(&self.root, false)? {
-            *state = StreamState::default();
             return Ok(());
         }
-        let metadata = match fs::symlink_metadata(&stream_dir) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-                *state = StreamState::default();
-                return Ok(());
-            }
-            Err(source) => {
-                return Err(ChatEventLogError::Io {
-                    path: stream_dir,
-                    source,
-                });
-            }
-        };
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
-            return Err(ChatEventLogError::Corrupt {
+        for (stream_id, stream_dir) in self.conversation_streams(workspace_id, conversation_id)? {
+            let stream_state = self.stream_state(&stream_id);
+            let mut state = lock_stream_state(&stream_state);
+            fs::remove_dir_all(&stream_dir).map_err(|source| ChatEventLogError::Io {
                 path: stream_dir,
-                message: "chat event stream path is not a real directory".to_string(),
-            });
+                source,
+            })?;
+            *state = StreamState::default();
+            self.streams.remove(&stream_id);
         }
-        fs::remove_dir_all(&stream_dir).map_err(|source| ChatEventLogError::Io {
-            path: stream_dir,
+        Ok(())
+    }
+
+    fn conversation_streams(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<(String, PathBuf)>, ChatEventLogError> {
+        let mut matches = Vec::new();
+        let entries = fs::read_dir(&self.root).map_err(|source| ChatEventLogError::Io {
+            path: self.root.clone(),
             source,
         })?;
-        *state = StreamState::default();
-        Ok(())
+        for entry in entries {
+            let entry = entry.map_err(|source| ChatEventLogError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|source| ChatEventLogError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(ChatEventLogError::Corrupt {
+                    path,
+                    message: "chat event stream must not be a symlink".to_string(),
+                });
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            let Some(envelope) = first_stream_envelope(&path)? else {
+                continue;
+            };
+            if envelope.workspace_id == workspace_id
+                && envelope.conversation_id.as_deref() == Some(conversation_id)
+            {
+                matches.push((envelope.stream_id, path));
+            }
+        }
+        Ok(matches)
     }
 
     fn initialize_stream(
@@ -673,6 +866,9 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         ChatDriverEvent::Execution(_)
         | ChatDriverEvent::ExecutionPath { .. }
         | ChatDriverEvent::Interrupt { .. }
+        | ChatDriverEvent::InputQueued { .. }
+        | ChatDriverEvent::InputRemoved { .. }
+        | ChatDriverEvent::InputReordered { .. }
         | ChatDriverEvent::ApprovalRequest { .. }
         | ChatDriverEvent::InputRequest { .. }
         | ChatDriverEvent::SelectionRequest { .. }
@@ -720,19 +916,26 @@ fn ensure_real_directory(path: &Path, create: bool) -> Result<bool, ChatEventLog
     Ok(true)
 }
 
-fn stream_id(conversation_id: Option<&str>, turn_id: &str) -> Result<String, ChatEventLogError> {
-    if turn_id.trim().is_empty() {
+fn stream_id(
+    workspace_id: &str,
+    conversation_id: Option<&str>,
+    root_turn_id: &str,
+) -> Result<String, ChatEventLogError> {
+    if workspace_id.trim().is_empty() || root_turn_id.trim().is_empty() {
         return Err(ChatEventLogError::InvalidIdentity(
-            "turn_id must not be empty".to_string(),
+            "workspace_id and root_turn_id must not be empty".to_string(),
+        ));
+    }
+    if conversation_id.is_some_and(|value| value.trim().is_empty()) {
+        return Err(ChatEventLogError::InvalidIdentity(
+            "conversation_id must not be empty".to_string(),
         ));
     }
     match conversation_id {
-        Some(value) if value.trim().is_empty() => Err(ChatEventLogError::InvalidIdentity(
-            "conversation_id must not be empty".to_string(),
-        )),
-        Some(value) => Ok(format!("conversation:{value}")),
-        None => Ok(format!("message:{turn_id}")),
+        Some(conversation_id) => serde_json::to_string(&(workspace_id, conversation_id)),
+        None => serde_json::to_string(&(workspace_id, root_turn_id)),
     }
+    .map_err(|error| ChatEventLogError::Serialization(error.to_string()))
 }
 
 fn event_identity(event: &ChatDriverEvent, root_turn_id: &str) -> (String, String) {
@@ -750,20 +953,31 @@ fn event_identity(event: &ChatDriverEvent, root_turn_id: &str) -> (String, Strin
 }
 
 fn validate_event_stream_identity(
+    workspace_id: &str,
     conversation_id: Option<&str>,
     event: &ChatDriverEvent,
 ) -> Result<(), ChatEventLogError> {
-    let ChatDriverEvent::Agent(envelope) = event else {
-        return Ok(());
-    };
-    let event_conversation_id = envelope
-        .conversation_id
-        .as_ref()
-        .map(|identity| identity.as_str());
-    if event_conversation_id != conversation_id {
-        return Err(ChatEventLogError::InvalidIdentity(format!(
-            "framework envelope conversation {event_conversation_id:?} does not match journal stream {conversation_id:?}"
-        )));
+    match event {
+        ChatDriverEvent::Agent(envelope) => {
+            let event_conversation_id = envelope
+                .conversation_id
+                .as_ref()
+                .map(|identity| identity.as_str());
+            if event_conversation_id != conversation_id {
+                return Err(ChatEventLogError::InvalidIdentity(format!(
+                    "framework envelope conversation {event_conversation_id:?} does not match journal stream {conversation_id:?}"
+                )));
+            }
+        }
+        ChatDriverEvent::Execution(execution)
+            if execution.workspace_id != workspace_id
+                || Some(execution.conversation_id.as_str()) != conversation_id =>
+        {
+            return Err(ChatEventLogError::InvalidIdentity(
+                "execution event address does not match journal stream".to_string(),
+            ));
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -793,6 +1007,32 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
         return Err(ChatEventLogError::InvalidEvent(format!(
             "unknown turn status {status:?} for chat event schema {CHAT_EVENT_SCHEMA_VERSION}"
         )));
+    }
+    if let ChatDriverEvent::InputQueued {
+        input_id,
+        text,
+        attachments,
+        ..
+    } = event
+        && (input_id.trim().is_empty() || (text.trim().is_empty() && attachments.is_empty()))
+    {
+        return Err(ChatEventLogError::InvalidEvent(
+            "queued chat input has an invalid identity or empty payload".to_string(),
+        ));
+    }
+    if let ChatDriverEvent::InputRemoved { input_id } = event
+        && input_id.trim().is_empty()
+    {
+        return Err(ChatEventLogError::InvalidEvent(
+            "removed chat input id must not be empty".to_string(),
+        ));
+    }
+    if let ChatDriverEvent::InputReordered { input_ids } = event
+        && (input_ids.is_empty() || input_ids.iter().any(|input_id| input_id.trim().is_empty()))
+    {
+        return Err(ChatEventLogError::InvalidEvent(
+            "queued input order contains an empty identity".to_string(),
+        ));
     }
     Ok(())
 }
@@ -832,35 +1072,20 @@ struct EnvelopeIntegrity<'a> {
     schema_version: u16,
     sequence: u64,
     stream_id: &'a str,
+    workspace_id: &'a str,
     conversation_id: Option<&'a str>,
+    root_turn_id: &'a str,
     turn_id: &'a str,
     message_id: &'a str,
     timestamp: DateTime<Utc>,
     payload: &'a ChatDriverEvent,
 }
 
-fn envelope_content_hash(
-    stream_id: &str,
-    conversation_id: Option<&str>,
-    turn_id: &str,
-    message_id: &str,
-    sequence: u64,
-    timestamp: DateTime<Utc>,
-    payload: &ChatDriverEvent,
-) -> Result<String, ChatEventLogError> {
+fn envelope_content_hash(integrity: EnvelopeIntegrity<'_>) -> Result<String, ChatEventLogError> {
     // Integrity must validate after restart, not only in-process. The shared
     // encoder recursively sorts nested maps such as ToolResult metadata.
-    let encoded = echo_core::utils::canonical_json::canonical_json_bytes(&EnvelopeIntegrity {
-        schema_version: CHAT_EVENT_SCHEMA_VERSION,
-        sequence,
-        stream_id,
-        conversation_id,
-        turn_id,
-        message_id,
-        timestamp,
-        payload,
-    })
-    .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+    let encoded = echo_core::utils::canonical_json::canonical_json_bytes(&integrity)
+        .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
     Ok(digest(&encoded))
 }
 
@@ -909,6 +1134,44 @@ fn list_segments(stream_dir: &Path) -> Result<Vec<(u64, PathBuf)>, ChatEventLogE
     }
     segments.sort_by_key(|(start, _)| *start);
     Ok(segments)
+}
+
+fn first_stream_envelope(
+    stream_dir: &Path,
+) -> Result<Option<ChatEventEnvelope>, ChatEventLogError> {
+    let Some((_, path)) = list_segments(stream_dir)?.into_iter().next() else {
+        return Ok(None);
+    };
+    let bytes =
+        echo_core::utils::fs::read_existing(&path).map_err(|source| ChatEventLogError::Io {
+            path: path.clone(),
+            source,
+        })?;
+    let Some(line) = bytes.split(|byte| *byte == b'\n').next() else {
+        return Ok(None);
+    };
+    if line.is_empty() {
+        return Ok(None);
+    }
+    let raw = serde_json::from_slice::<serde_json::Value>(line).map_err(|error| {
+        ChatEventLogError::Corrupt {
+            path: path.clone(),
+            message: format!("invalid first chat event record: {error}"),
+        }
+    })?;
+    if raw
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        != Some(u64::from(CHAT_EVENT_SCHEMA_VERSION))
+    {
+        return Ok(None);
+    }
+    serde_json::from_value(raw)
+        .map(Some)
+        .map_err(|error| ChatEventLogError::Corrupt {
+            path,
+            message: format!("invalid first chat event envelope: {error}"),
+        })
 }
 
 struct SegmentScan {
@@ -1039,12 +1302,15 @@ fn validate_envelope(
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    validate_event_stream_identity(event.conversation_id.as_deref(), &event.payload).map_err(
-        |error| ChatEventLogError::Corrupt {
-            path: path.to_path_buf(),
-            message: error.to_string(),
-        },
-    )?;
+    validate_event_stream_identity(
+        &event.workspace_id,
+        event.conversation_id.as_deref(),
+        &event.payload,
+    )
+    .map_err(|error| ChatEventLogError::Corrupt {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
     if event.stream_id != stream_id {
         return Err(ChatEventLogError::Corrupt {
             path: path.to_path_buf(),
@@ -1062,8 +1328,12 @@ fn validate_envelope(
             message: "conversation/message identity does not match stream id".to_string(),
         });
     }
-    let (expected_turn_id, expected_message_id) = event_identity(&event.payload, &event.message_id);
-    if event.turn_id != expected_turn_id || event.message_id != expected_message_id {
+    let (expected_turn_id, expected_message_id) =
+        event_identity(&event.payload, &event.root_turn_id);
+    if event.turn_id != expected_turn_id
+        || event.message_id != expected_message_id
+        || event.message_id != event.root_turn_id
+    {
         return Err(ChatEventLogError::Corrupt {
             path: path.to_path_buf(),
             message: "outer turn/message identity does not match its payload".to_string(),
@@ -1081,15 +1351,18 @@ fn validate_envelope(
             ),
         });
     }
-    let content_hash = envelope_content_hash(
-        &event.stream_id,
-        event.conversation_id.as_deref(),
-        &event.turn_id,
-        &event.message_id,
-        event.sequence,
-        event.timestamp,
-        &event.payload,
-    )?;
+    let content_hash = envelope_content_hash(EnvelopeIntegrity {
+        schema_version: CHAT_EVENT_SCHEMA_VERSION,
+        sequence: event.sequence,
+        stream_id: &event.stream_id,
+        workspace_id: &event.workspace_id,
+        conversation_id: event.conversation_id.as_deref(),
+        root_turn_id: &event.root_turn_id,
+        turn_id: &event.turn_id,
+        message_id: &event.message_id,
+        timestamp: event.timestamp,
+        payload: &event.payload,
+    })?;
     if event.content_hash != content_hash
         || event.event_id != stable_event_id(stream_id, event.sequence, &content_hash)
     {
@@ -1102,7 +1375,11 @@ fn validate_envelope(
 }
 
 fn expected_stream_id_for_envelope(event: &ChatEventEnvelope) -> Result<String, ChatEventLogError> {
-    stream_id(event.conversation_id.as_deref(), &event.message_id)
+    stream_id(
+        &event.workspace_id,
+        event.conversation_id.as_deref(),
+        &event.root_turn_id,
+    )
 }
 
 #[cfg(test)]
@@ -1110,6 +1387,8 @@ mod tests {
     use super::*;
     use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity, ToolInvocation};
     use echo_agent::tools::ToolResult;
+
+    const TEST_TURN_1_STREAM_ID: &str = r#"["workspace-1","conversation-1"]"#;
 
     #[derive(Default)]
     struct CapturingSink {
@@ -1227,25 +1506,31 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .with_timezone(&Utc))
         };
-        let first_hash = envelope_content_hash(
-            "conversation:fixture-conversation",
-            Some("fixture-conversation"),
-            "fixture-turn",
-            "fixture-message",
-            2,
-            timestamp()?,
-            &first,
-        )
+        let first_hash = envelope_content_hash(EnvelopeIntegrity {
+            schema_version: CHAT_EVENT_SCHEMA_VERSION,
+            sequence: 2,
+            stream_id: "[\"workspace-1\",\"fixture-conversation\"]",
+            workspace_id: "workspace-1",
+            conversation_id: Some("fixture-conversation"),
+            root_turn_id: "fixture-message",
+            turn_id: "fixture-turn",
+            message_id: "fixture-message",
+            timestamp: timestamp()?,
+            payload: &first,
+        })
         .map_err(|error| error.to_string())?;
-        let second_hash = envelope_content_hash(
-            "conversation:fixture-conversation",
-            Some("fixture-conversation"),
-            "fixture-turn",
-            "fixture-message",
-            2,
-            timestamp()?,
-            &second,
-        )
+        let second_hash = envelope_content_hash(EnvelopeIntegrity {
+            schema_version: CHAT_EVENT_SCHEMA_VERSION,
+            sequence: 2,
+            stream_id: "[\"workspace-1\",\"fixture-conversation\"]",
+            workspace_id: "workspace-1",
+            conversation_id: Some("fixture-conversation"),
+            root_turn_id: "fixture-message",
+            turn_id: "fixture-turn",
+            message_id: "fixture-message",
+            timestamp: timestamp()?,
+            payload: &second,
+        })
         .map_err(|error| error.to_string())?;
 
         assert_eq!(first_hash, second_hash);
@@ -1259,6 +1544,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let first = log
             .append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", 7, "你")?,
@@ -1266,6 +1552,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let second = log
             .append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::TurnStatus {
@@ -1279,7 +1566,12 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         let replay = rebound
-            .replay(Some("conversation-1"), "ignored-for-conversation", 0)
+            .replay(
+                "workspace-1",
+                Some("conversation-1"),
+                "ignored-for-conversation",
+                0,
+            )
             .map_err(|error| error.to_string())?;
         assert_eq!(replay.latest_cursor, 2);
         let first = replay
@@ -1320,6 +1612,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let envelope = log
             .append(
+                "workspace-1",
                 Some("conversation-1"),
                 "root-message",
                 ChatDriverEvent::Agent(Box::new(event)),
@@ -1328,7 +1621,65 @@ mod tests {
 
         assert_eq!(envelope.turn_id, "continuation-turn");
         assert_eq!(envelope.message_id, "root-message");
-        assert_eq!(envelope.stream_id, "conversation:conversation-1");
+        assert_eq!(envelope.workspace_id, "workspace-1");
+        assert_eq!(envelope.root_turn_id, "root-message");
+        assert_eq!(envelope.stream_id, r#"["workspace-1","conversation-1"]"#);
+        Ok(())
+    }
+
+    #[test]
+    fn identical_conversation_turn_is_isolated_by_workspace() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        for workspace_id in ["workspace-a", "workspace-b"] {
+            log.append(
+                workspace_id,
+                Some("conversation-1"),
+                "turn-1",
+                agent_event("turn-1", 1, workspace_id)?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+
+        let workspace_a = log
+            .replay("workspace-a", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        let workspace_b = log
+            .replay("workspace-b", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(workspace_a.events.len(), 1);
+        assert_eq!(workspace_b.events.len(), 1);
+        assert_eq!(
+            workspace_a
+                .events
+                .first()
+                .map(|event| event.workspace_id.as_str()),
+            Some("workspace-a")
+        );
+        assert_eq!(
+            workspace_b
+                .events
+                .first()
+                .map(|event| event.workspace_id.as_str()),
+            Some("workspace-b")
+        );
+
+        log.remove_conversation("workspace-a", "conversation-1")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            log.replay("workspace-a", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .is_empty()
+        );
+        assert_eq!(
+            log.replay("workspace-b", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .len(),
+            1
+        );
         Ok(())
     }
 
@@ -1338,6 +1689,7 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         let result = log.append(
+            "workspace-1",
             Some("conversation-2"),
             "root-message",
             agent_event("root-message", 1, "wrong stream")?,
@@ -1345,7 +1697,7 @@ mod tests {
 
         assert!(matches!(result, Err(ChatEventLogError::InvalidIdentity(_))));
         assert!(
-            log.replay(Some("conversation-2"), "root-message", 0)
+            log.replay("workspace-1", Some("conversation-2"), "root-message", 0)
                 .map_err(|error| error.to_string())?
                 .events
                 .is_empty()
@@ -1370,6 +1722,7 @@ mod tests {
 
         for sequence in 1..=128 {
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", sequence, "delta")?,
@@ -1379,6 +1732,7 @@ mod tests {
         assert_eq!(sync_count.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             ChatDriverEvent::TurnStatus {
@@ -1391,7 +1745,7 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         let replay = rebound
-            .replay(Some("conversation-1"), "turn-1", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .map_err(|error| error.to_string())?;
         assert_eq!(replay.events.len(), 129);
         assert_eq!(replay.latest_cursor, 129);
@@ -1433,6 +1787,7 @@ mod tests {
 
         for sequence in 1..=2 {
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", sequence, "delta")?,
@@ -1440,6 +1795,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         }
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             ChatDriverEvent::TurnStatus {
@@ -1456,7 +1812,7 @@ mod tests {
             "flush:record,sync:barrier,flush:record,sync:barrier,sync:record"
         );
         assert_eq!(
-            list_segments(&log.stream_dir("conversation:conversation-1"))
+            list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
                 .map_err(|error| error.to_string())?
                 .len(),
             1
@@ -1484,9 +1840,12 @@ mod tests {
 
         for sequence in 1..=128 {
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::Execution(ExecEvent::subagent(
+                    "workspace-1",
+                    "conversation-1",
                     "run-1",
                     "task-1",
                     "subagent-1",
@@ -1499,9 +1858,12 @@ mod tests {
         assert_eq!(sync_count.load(std::sync::atomic::Ordering::SeqCst), 0);
 
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             ChatDriverEvent::Execution(ExecEvent::subagent(
+                "workspace-1",
+                "conversation-1",
                 "run-1",
                 "task-1",
                 "subagent-1",
@@ -1540,6 +1902,7 @@ mod tests {
 
         assert!(
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", 1, "partial")?,
@@ -1548,6 +1911,7 @@ mod tests {
         );
         let recovered = log
             .append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::TurnStatus {
@@ -1557,7 +1921,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(recovered.sequence, 1);
         let replay = log
-            .replay(Some("conversation-1"), "turn-1", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .map_err(|error| error.to_string())?;
         assert_eq!(replay.events.len(), 1);
         assert_eq!(replay.latest_cursor, 1);
@@ -1595,6 +1959,7 @@ mod tests {
         .with_append_file(append_file);
 
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             agent_event("turn-1", 1, "first")?,
@@ -1602,28 +1967,30 @@ mod tests {
         .map_err(|error| error.to_string())?;
         assert!(
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
-                "turn-2",
-                agent_event("turn-2", 1, "partial")?,
+                "turn-1",
+                agent_event("turn-1", 2, "partial")?,
             )
             .is_err()
         );
         let retained = log
-            .replay(Some("conversation-1"), "turn-2", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .map_err(|error| error.to_string())?;
         assert_eq!(retained.latest_cursor, 1);
         assert_eq!(retained.events.len(), 1);
         assert_eq!(retained.events.first().map(|event| event.sequence), Some(1));
         assert_eq!(
-            list_segments(&log.stream_dir("conversation:conversation-1"))
+            list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
                 .map_err(|error| error.to_string())?
                 .len(),
             2
         );
         let recovered = log
             .append(
+                "workspace-1",
                 Some("conversation-1"),
-                "turn-2",
+                "turn-1",
                 ChatDriverEvent::TurnStatus {
                     status: "completed".to_string(),
                 },
@@ -1631,13 +1998,13 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(recovered.sequence, 2);
         let replay = log
-            .replay(Some("conversation-1"), "turn-2", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .map_err(|error| error.to_string())?;
         assert_eq!(replay.latest_cursor, 2);
         assert_eq!(replay.events.len(), 1);
         assert_eq!(replay.retained_earliest_cursor, Some(2));
         assert_eq!(
-            list_segments(&log.stream_dir("conversation:conversation-1"))
+            list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
                 .map_err(|error| error.to_string())?
                 .len(),
             1
@@ -1651,12 +2018,13 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             agent_event("turn-1", 1, "ok")?,
         )
         .map_err(|error| error.to_string())?;
-        let stream_dir = log.stream_dir("conversation:conversation-1");
+        let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
         let segment = list_segments(&stream_dir)
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -1673,6 +2041,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let appended = rebound
             .append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-2",
                 ChatDriverEvent::TurnStatus {
@@ -1683,7 +2052,7 @@ mod tests {
         assert_eq!(appended.sequence, 2);
         assert_eq!(
             rebound
-                .replay(Some("conversation-1"), "turn-2", 0)
+                .replay("workspace-1", Some("conversation-1"), "turn-2", 0)
                 .map_err(|error| error.to_string())?
                 .events
                 .len(),
@@ -1703,13 +2072,14 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
         for sequence in 1..=2 {
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", sequence, "ok")?,
             )
             .map_err(|error| error.to_string())?;
         }
-        let stream_dir = log.stream_dir("conversation:conversation-1");
+        let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
         let first_segment = list_segments(&stream_dir)
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -1725,7 +2095,7 @@ mod tests {
         let rebound =
             ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
         assert!(matches!(
-            rebound.replay(Some("conversation-1"), "turn-1", 0),
+            rebound.replay("workspace-1", Some("conversation-1"), "turn-1", 0),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         Ok(())
@@ -1737,12 +2107,13 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             agent_event("turn-1", 1, "ok")?,
         )
         .map_err(|error| error.to_string())?;
-        let stream_dir = log.stream_dir("conversation:conversation-1");
+        let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
         let segment = list_segments(&stream_dir)
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -1757,7 +2128,7 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         let error = rebound
-            .replay(Some("conversation-1"), "turn-1", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .err()
             .ok_or_else(|| "corrupt record was accepted".to_string())?;
         assert!(matches!(error, ChatEventLogError::Corrupt { .. }));
@@ -1770,12 +2141,13 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             agent_event("turn-1", 1, "ok")?,
         )
         .map_err(|error| error.to_string())?;
-        let stream_dir = log.stream_dir("conversation:conversation-1");
+        let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
         let segment = list_segments(&stream_dir)
             .map_err(|error| error.to_string())?
             .into_iter()
@@ -1791,7 +2163,7 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         let error = rebound
-            .replay(Some("conversation-1"), "turn-1", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .err()
             .ok_or_else(|| "unknown complete record was repaired as a torn tail".to_string())?;
         assert!(matches!(error, ChatEventLogError::Corrupt { .. }));
@@ -1804,12 +2176,13 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             agent_event("turn-1", 1, "ok")?,
         )
         .map_err(|error| error.to_string())?;
-        let segment = list_segments(&log.stream_dir("conversation:conversation-1"))
+        let segment = list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
             .map_err(|error| error.to_string())?
             .into_iter()
             .next()
@@ -1829,7 +2202,7 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         assert!(matches!(
-            rebound.replay(Some("conversation-1"), "turn-1", 0),
+            rebound.replay("workspace-1", Some("conversation-1"), "turn-1", 0),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         Ok(())
@@ -1842,12 +2215,13 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             agent_event("turn-1", 1, "ok")?,
         )
         .map_err(|error| error.to_string())?;
-        let segment = list_segments(&log.stream_dir("conversation:conversation-1"))
+        let segment = list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
             .map_err(|error| error.to_string())?
             .into_iter()
             .next()
@@ -1871,7 +2245,7 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         assert!(matches!(
-            rebound.replay(Some("conversation-1"), "turn-1", 0),
+            rebound.replay("workspace-1", Some("conversation-1"), "turn-1", 0),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         Ok(())
@@ -1889,12 +2263,13 @@ mod tests {
         };
         envelope.schema_version = echo_agent::agent::AGENT_EVENT_SCHEMA_VERSION.saturating_add(1);
         assert!(matches!(
-            log.append(Some("conversation-1"), "turn-1", unsupported),
+            log.append("workspace-1", Some("conversation-1"), "turn-1", unsupported),
             Err(ChatEventLogError::InvalidEvent(_))
         ));
 
         let mut envelope = log
             .append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", 1, "current")?,
@@ -1904,22 +2279,25 @@ mod tests {
             return Err("expected framework envelope".to_string());
         };
         framework.schema_version = echo_agent::agent::AGENT_EVENT_SCHEMA_VERSION.saturating_add(1);
-        envelope.content_hash = envelope_content_hash(
-            &envelope.stream_id,
-            envelope.conversation_id.as_deref(),
-            &envelope.turn_id,
-            &envelope.message_id,
-            envelope.sequence,
-            envelope.timestamp,
-            &envelope.payload,
-        )
+        envelope.content_hash = envelope_content_hash(EnvelopeIntegrity {
+            schema_version: CHAT_EVENT_SCHEMA_VERSION,
+            sequence: envelope.sequence,
+            stream_id: &envelope.stream_id,
+            workspace_id: &envelope.workspace_id,
+            conversation_id: envelope.conversation_id.as_deref(),
+            root_turn_id: &envelope.root_turn_id,
+            turn_id: &envelope.turn_id,
+            message_id: &envelope.message_id,
+            timestamp: envelope.timestamp,
+            payload: &envelope.payload,
+        })
         .map_err(|error| error.to_string())?;
         envelope.event_id = stable_event_id(
             &envelope.stream_id,
             envelope.sequence,
             &envelope.content_hash,
         );
-        let segment = list_segments(&log.stream_dir("conversation:conversation-1"))
+        let segment = list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
             .map_err(|error| error.to_string())?
             .into_iter()
             .next()
@@ -1932,7 +2310,7 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         assert!(matches!(
-            rebound.replay(Some("conversation-1"), "turn-1", 0),
+            rebound.replay("workspace-1", Some("conversation-1"), "turn-1", 0),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         Ok(())
@@ -1945,6 +2323,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert!(matches!(
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::TurnStatus {
@@ -1954,7 +2333,7 @@ mod tests {
             Err(ChatEventLogError::InvalidEvent(_))
         ));
         assert!(
-            log.replay(Some("conversation-1"), "turn-1", 0)
+            log.replay("workspace-1", Some("conversation-1"), "turn-1", 0)
                 .map_err(|error| error.to_string())?
                 .events
                 .is_empty()
@@ -1962,6 +2341,7 @@ mod tests {
 
         let mut envelope = log
             .append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::TurnStatus {
@@ -1973,22 +2353,25 @@ mod tests {
             return Err("expected turn status envelope".to_string());
         };
         *status = "future_terminal".to_string();
-        envelope.content_hash = envelope_content_hash(
-            &envelope.stream_id,
-            envelope.conversation_id.as_deref(),
-            &envelope.turn_id,
-            &envelope.message_id,
-            envelope.sequence,
-            envelope.timestamp,
-            &envelope.payload,
-        )
+        envelope.content_hash = envelope_content_hash(EnvelopeIntegrity {
+            schema_version: CHAT_EVENT_SCHEMA_VERSION,
+            sequence: envelope.sequence,
+            stream_id: &envelope.stream_id,
+            workspace_id: &envelope.workspace_id,
+            conversation_id: envelope.conversation_id.as_deref(),
+            root_turn_id: &envelope.root_turn_id,
+            turn_id: &envelope.turn_id,
+            message_id: &envelope.message_id,
+            timestamp: envelope.timestamp,
+            payload: &envelope.payload,
+        })
         .map_err(|error| error.to_string())?;
         envelope.event_id = stable_event_id(
             &envelope.stream_id,
             envelope.sequence,
             &envelope.content_hash,
         );
-        let segment = list_segments(&log.stream_dir("conversation:conversation-1"))
+        let segment = list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
             .map_err(|error| error.to_string())?
             .into_iter()
             .next()
@@ -2001,7 +2384,7 @@ mod tests {
         let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         assert!(matches!(
-            rebound.replay(Some("conversation-1"), "turn-1", 0),
+            rebound.replay("workspace-1", Some("conversation-1"), "turn-1", 0),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         Ok(())
@@ -2019,6 +2402,7 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
         for sequence in 1..=4 {
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", sequence, "event")?,
@@ -2026,6 +2410,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         }
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             ChatDriverEvent::TurnStatus {
@@ -2033,7 +2418,7 @@ mod tests {
             },
         )
         .map_err(|error| error.to_string())?;
-        let stream_dir = log.stream_dir("conversation:conversation-1");
+        let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
         assert_eq!(
             list_segments(&stream_dir)
                 .map_err(|error| error.to_string())?
@@ -2041,7 +2426,7 @@ mod tests {
             2
         );
         let replay = log
-            .replay(Some("conversation-1"), "turn-1", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .map_err(|error| error.to_string())?;
         assert!(replay.truncated);
         assert_eq!(replay.latest_cursor, 5);
@@ -2106,14 +2491,16 @@ mod tests {
         .map_err(|error| error.to_string())?
         .with_append_file(append_file);
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             agent_event("turn-1", 1, "delta")?,
         )
         .map_err(|error| error.to_string())?;
-        let stream_dir = log.stream_dir("conversation:conversation-1");
+        let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
 
         let committed = log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             ChatDriverEvent::TurnStatus {
@@ -2141,6 +2528,7 @@ mod tests {
         );
 
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             ChatDriverEvent::TurnStatus {
@@ -2168,6 +2556,7 @@ mod tests {
         let log = ChatEventLog::open(temp.path(), retention).map_err(|error| error.to_string())?;
         for sequence in 1..=4 {
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", sequence, "event")?,
@@ -2176,7 +2565,7 @@ mod tests {
         }
 
         let replay = log
-            .replay(Some("conversation-1"), "turn-1", 0)
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
             .map_err(|error| error.to_string())?;
         assert!(replay.truncated);
         assert_eq!(replay.retained_earliest_cursor, Some(1));
@@ -2200,12 +2589,13 @@ mod tests {
             let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
                 .map_err(|error| error.to_string())?;
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 agent_event("turn-1", 1, "ok")?,
             )
             .map_err(|error| error.to_string())?;
-            let stream_dir = log.stream_dir("conversation:conversation-1");
+            let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
             let segment = list_segments(&stream_dir)
                 .map_err(|error| error.to_string())?
                 .into_iter()
@@ -2230,7 +2620,7 @@ mod tests {
             let rebound = ChatEventLog::open(temp.path(), ChatEventRetention::default())
                 .map_err(|error| error.to_string())?;
             let error = rebound
-                .replay(Some("conversation-1"), "turn-1", 0)
+                .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
                 .err()
                 .ok_or_else(|| format!("{field} tampering was accepted"))?;
             assert!(matches!(error, ChatEventLogError::Corrupt { .. }));
@@ -2263,6 +2653,7 @@ mod tests {
                 renderer,
                 log.clone(),
                 tool_executions.clone(),
+                "workspace-1",
                 Some("conversation-1".to_string()),
                 format!("turn-{offset}"),
             );
@@ -2315,10 +2706,10 @@ mod tests {
             assert_eq!(delivered.len(), 3);
         }
         let replay = log
-            .replay(Some("conversation-1"), "ignored", 0)
+            .replay("workspace-1", Some("conversation-1"), "ignored", 0)
             .map_err(|error| error.to_string())?;
         assert_eq!(replay.events.len(), 12);
-        let summaries = tool_executions.summaries_for_conversation("conversation-1");
+        let summaries = tool_executions.summaries_for_conversation("workspace-1", "conversation-1");
         assert_eq!(summaries.len(), 4);
         assert!(summaries.iter().all(|summary| {
             summary.status == crate::tool_execution::ToolExecutionStatus::Succeeded
@@ -2347,6 +2738,7 @@ mod tests {
             renderer,
             log,
             tool_executions,
+            "workspace-1",
             Some("conversation-1".to_string()),
             "turn-1",
         );
@@ -2360,7 +2752,9 @@ mod tests {
     #[test]
     fn a_blocked_stream_does_not_block_another_conversation() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let blocked_dir = temp.path().join(digest("conversation:blocked".as_bytes()));
+        let blocked_stream_id = stream_id("workspace-1", Some("blocked"), "turn-blocked")
+            .map_err(|error| error.to_string())?;
+        let blocked_dir = temp.path().join(digest(blocked_stream_id.as_bytes()));
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let release_rx = Arc::new(Mutex::new(release_rx));
@@ -2387,6 +2781,7 @@ mod tests {
         let blocked = std::thread::spawn(move || {
             blocked_log
                 .append(
+                    "workspace-1",
                     Some("blocked"),
                     "turn-blocked",
                     ChatDriverEvent::TurnStatus {
@@ -2404,6 +2799,7 @@ mod tests {
         let free = std::thread::spawn(move || {
             let result = free_log
                 .append(
+                    "workspace-1",
                     Some("free"),
                     "turn-free",
                     ChatDriverEvent::TurnStatus {
@@ -2432,6 +2828,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         for conversation in ["removed", "retained"] {
             log.append(
+                "workspace-1",
                 Some(conversation),
                 "turn",
                 ChatDriverEvent::TurnStatus {
@@ -2441,22 +2838,22 @@ mod tests {
             .map_err(|error| error.to_string())?;
         }
 
-        log.remove_conversation("removed")
+        log.remove_conversation("workspace-1", "removed")
             .map_err(|error| error.to_string())?;
         assert!(
-            log.replay(Some("removed"), "turn", 0)
+            log.replay("workspace-1", Some("removed"), "turn", 0)
                 .map_err(|error| error.to_string())?
                 .events
                 .is_empty()
         );
         assert_eq!(
-            log.replay(Some("retained"), "turn", 0)
+            log.replay("workspace-1", Some("retained"), "turn", 0)
                 .map_err(|error| error.to_string())?
                 .events
                 .len(),
             1
         );
-        log.remove_conversation("removed")
+        log.remove_conversation("workspace-1", "removed")
             .map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -2474,11 +2871,12 @@ mod tests {
         fs::create_dir_all(&outside).map_err(|error| error.to_string())?;
         let marker = outside.join("keep.txt");
         fs::write(&marker, b"keep").map_err(|error| error.to_string())?;
-        let stream_dir = log.stream_dir("conversation:conversation-1");
+        let stream_dir = log.stream_dir(TEST_TURN_1_STREAM_ID);
         symlink(&outside, &stream_dir).map_err(|error| error.to_string())?;
 
         assert!(matches!(
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::TurnStatus {
@@ -2488,11 +2886,11 @@ mod tests {
             Err(ChatEventLogError::Corrupt { .. })
         ));
         assert!(matches!(
-            log.replay(Some("conversation-1"), "turn-1", 0),
+            log.replay("workspace-1", Some("conversation-1"), "turn-1", 0),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         assert!(matches!(
-            log.remove_conversation("conversation-1"),
+            log.remove_conversation("workspace-1", "conversation-1"),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         assert_eq!(
@@ -2520,6 +2918,7 @@ mod tests {
 
         assert!(matches!(
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::TurnStatus {
@@ -2529,11 +2928,11 @@ mod tests {
             Err(ChatEventLogError::Corrupt { .. })
         ));
         assert!(matches!(
-            log.replay(Some("conversation-1"), "turn-1", 0),
+            log.replay("workspace-1", Some("conversation-1"), "turn-1", 0),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         assert!(matches!(
-            log.remove_conversation("conversation-1"),
+            log.remove_conversation("workspace-1", "conversation-1"),
             Err(ChatEventLogError::Corrupt { .. })
         ));
         assert_eq!(
@@ -2552,6 +2951,7 @@ mod tests {
         let log = ChatEventLog::open(temp.path().join("events"), ChatEventRetention::default())
             .map_err(|error| error.to_string())?;
         log.append(
+            "workspace-1",
             Some("conversation-1"),
             "turn-1",
             ChatDriverEvent::TurnStatus {
@@ -2559,7 +2959,7 @@ mod tests {
             },
         )
         .map_err(|error| error.to_string())?;
-        let segment = list_segments(&log.stream_dir("conversation:conversation-1"))
+        let segment = list_segments(&log.stream_dir(TEST_TURN_1_STREAM_ID))
             .map_err(|error| error.to_string())?
             .into_iter()
             .next()
@@ -2572,6 +2972,7 @@ mod tests {
 
         assert!(
             log.append(
+                "workspace-1",
                 Some("conversation-1"),
                 "turn-1",
                 ChatDriverEvent::TurnStatus {
@@ -2583,6 +2984,62 @@ mod tests {
         assert_eq!(
             fs::read(&outside).map_err(|error| error.to_string())?,
             b"outside\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queued_inputs_survive_reopen_reorder_and_scoped_removal() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("events");
+        let log = ChatEventLog::open(&root, ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        for (input_id, text) in [("input-a", "first"), ("input-b", "second")] {
+            log.enqueue_chat_input(
+                "workspace-a",
+                "conversation-1",
+                input_id,
+                text.to_string(),
+                Vec::new(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        log.enqueue_chat_input(
+            "workspace-b",
+            "conversation-1",
+            "input-other",
+            "other workspace".to_string(),
+            Vec::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        log.reorder_queued_chat_inputs(
+            "workspace-a",
+            "conversation-1",
+            vec!["input-b".to_string(), "input-a".to_string()],
+        )
+        .map_err(|error| error.to_string())?;
+        log.remove_queued_chat_input("workspace-a", "conversation-1", "input-b")
+            .map_err(|error| error.to_string())?;
+
+        let reopened = ChatEventLog::open(root, ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        let workspace_a = reopened
+            .queued_chat_inputs("workspace-a", "conversation-1")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            workspace_a
+                .iter()
+                .map(|input| input.input_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["input-a"]
+        );
+        let workspace_b = reopened
+            .queued_chat_inputs("workspace-b", "conversation-1")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(workspace_b.len(), 1);
+        assert_eq!(
+            workspace_b.first().map(|input| input.input_id.as_str()),
+            Some("input-other")
         );
         Ok(())
     }

@@ -24,6 +24,8 @@ const STREAM_CURSOR_PREFIX: &str = "stream-v1";
 
 #[derive(Debug, Error)]
 pub enum ToolExecutionError {
+    #[error("invalid tool execution identity: {0}")]
+    InvalidIdentity(String),
     #[error("tool execution not found: {0}")]
     NotFound(String),
     #[error("invalid detail cursor: {0}")]
@@ -110,6 +112,7 @@ pub struct ToolExecutionSummary {
     pub id: String,
     pub call_id: String,
     pub owner: ToolExecutionOwner,
+    pub workspace_id: String,
     pub conversation_id: Option<String>,
     pub run_id: Option<String>,
     pub name: String,
@@ -242,6 +245,7 @@ impl ToolExecutionRepository {
 
     pub fn project_start(
         &self,
+        workspace_id: &str,
         owner: ToolExecutionOwner,
         conversation_id: Option<&str>,
         run_id: Option<&str>,
@@ -249,10 +253,12 @@ impl ToolExecutionRepository {
         invocation: &ToolInvocation,
     ) -> ToolExecutionResult<ToolExecutionMutation> {
         let _projection = lock_recover(&self.projection_lock, "tool execution projection");
-        if let Some(existing) = self.summary_for(&owner, call_id) {
-            let manifest = self.read_manifest(&existing.detail_ref)?;
+        validate_workspace_id(workspace_id)?;
+        if let Some(existing) = self.summary_for(workspace_id, &owner, call_id) {
+            let manifest = self.read_manifest(workspace_id, &existing.detail_ref)?;
             let identity_matches = manifest.invocation == *invocation
                 && existing.owner == owner
+                && existing.workspace_id == workspace_id
                 && existing.conversation_id.as_deref() == conversation_id
                 && existing.run_id.as_deref() == run_id;
             if identity_matches {
@@ -267,24 +273,36 @@ impl ToolExecutionRepository {
                 call_id
             )));
         }
-        self.start_new(owner, conversation_id, run_id, call_id, invocation)
-            .map(|summary| ToolExecutionMutation {
-                summary,
-                changed: true,
-            })
+        self.start_new(
+            workspace_id,
+            owner,
+            conversation_id,
+            run_id,
+            call_id,
+            invocation,
+        )
+        .map(|summary| ToolExecutionMutation {
+            summary,
+            changed: true,
+        })
     }
 
     fn start_new(
         &self,
+        workspace_id: &str,
         owner: ToolExecutionOwner,
         conversation_id: Option<&str>,
         run_id: Option<&str>,
         call_id: &str,
         invocation: &ToolInvocation,
     ) -> ToolExecutionResult<ToolExecutionSummary> {
-        let detail_ref = uuid::Uuid::new_v4().to_string();
+        let detail_ref = format!(
+            "{}-{}",
+            echo_agent::tools::artifact::artifact_scope_component(workspace_id),
+            uuid::Uuid::new_v4()
+        );
         let detail_dir = self
-            .scope_dir(conversation_id, run_id.or(Some(owner.key())))
+            .scope_dir(workspace_id, conversation_id, run_id.or(Some(owner.key())))
             .join("details");
         fs::create_dir_all(&detail_dir)?;
         let location = DetailLocation {
@@ -296,6 +314,7 @@ impl ToolExecutionRepository {
             id: detail_ref.clone(),
             call_id: call_id.to_string(),
             owner,
+            workspace_id: workspace_id.to_string(),
             conversation_id: conversation_id.map(str::to_string),
             run_id: run_id.map(str::to_string),
             name: invocation.name.clone(),
@@ -314,7 +333,7 @@ impl ToolExecutionRepository {
         };
         write_manifest(&location.manifest, &manifest)?;
 
-        let key = execution_key(&summary.owner, call_id);
+        let key = execution_key(workspace_id, &summary.owner, call_id);
         let mut state = self.lock_state();
         state.details.insert(detail_ref, location);
         state.summaries.insert(key, summary.clone());
@@ -324,6 +343,7 @@ impl ToolExecutionRepository {
     /// Append non-terminal tool output without changing the canonical result.
     pub fn project_stream(
         &self,
+        workspace_id: &str,
         owner: &ToolExecutionOwner,
         call_id: &str,
         channel: ToolExecutionDetailChannel,
@@ -334,7 +354,7 @@ impl ToolExecutionRepository {
         }
         let _projection = lock_recover(&self.projection_lock, "tool execution projection");
         let summary = self
-            .summary_for(owner, call_id)
+            .summary_for(workspace_id, owner, call_id)
             .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
         if summary.status != ToolExecutionStatus::Running {
             return Err(ToolExecutionError::ProjectionConflict(format!(
@@ -344,7 +364,7 @@ impl ToolExecutionRepository {
                 summary.status
             )));
         }
-        let location = self.detail_location(&summary.detail_ref)?;
+        let location = self.detail_location(workspace_id, &summary.detail_ref)?;
         append_stream_chunk(
             &location.stream,
             &StoredStreamChunk {
@@ -356,15 +376,16 @@ impl ToolExecutionRepository {
 
     pub fn project_finish(
         &self,
+        workspace_id: &str,
         owner: &ToolExecutionOwner,
         call_id: &str,
         result: &ToolResult,
     ) -> ToolExecutionResult<ToolExecutionMutation> {
         let _projection = lock_recover(&self.projection_lock, "tool execution projection");
         let existing = self
-            .summary_for(owner, call_id)
+            .summary_for(workspace_id, owner, call_id)
             .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
-        let location = self.detail_location(&existing.detail_ref)?;
+        let location = self.detail_location(workspace_id, &existing.detail_ref)?;
         let mut manifest = read_manifest_path(&location.manifest)?;
         if let Some(persisted) = manifest.result.as_ref() {
             if canonical_json(persisted)? == canonical_json(result)? {
@@ -393,7 +414,7 @@ impl ToolExecutionRepository {
         let summary = manifest.summary;
         self.lock_state()
             .summaries
-            .insert(execution_key(owner, call_id), summary.clone());
+            .insert(execution_key(workspace_id, owner, call_id), summary.clone());
         Ok(ToolExecutionMutation {
             summary,
             changed: true,
@@ -402,6 +423,7 @@ impl ToolExecutionRepository {
 
     pub fn terminate_orphan(
         &self,
+        workspace_id: &str,
         owner: &ToolExecutionOwner,
         call_id: &str,
         status: ToolExecutionStatus,
@@ -411,7 +433,7 @@ impl ToolExecutionRepository {
             return Err(ToolExecutionError::InvalidTerminalStatus(status));
         }
         let existing = self
-            .summary_for(owner, call_id)
+            .summary_for(workspace_id, owner, call_id)
             .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
         if existing.status != ToolExecutionStatus::Running {
             return Ok(ToolExecutionMutation {
@@ -419,7 +441,7 @@ impl ToolExecutionRepository {
                 changed: false,
             });
         }
-        let location = self.detail_location(&existing.detail_ref)?;
+        let location = self.detail_location(workspace_id, &existing.detail_ref)?;
         let mut manifest = read_manifest_path(&location.manifest)?;
         let finished_at = now_millis();
         manifest.summary.status = status;
@@ -432,7 +454,7 @@ impl ToolExecutionRepository {
         let summary = manifest.summary;
         self.lock_state()
             .summaries
-            .insert(execution_key(owner, call_id), summary.clone());
+            .insert(execution_key(workspace_id, owner, call_id), summary.clone());
         Ok(ToolExecutionMutation {
             summary,
             changed: true,
@@ -441,9 +463,10 @@ impl ToolExecutionRepository {
 
     pub fn detail_manifest(
         &self,
+        workspace_id: &str,
         detail_ref: &str,
     ) -> ToolExecutionResult<ToolExecutionDetailManifest> {
-        let location = self.detail_location(detail_ref)?;
+        let location = self.detail_location(workspace_id, detail_ref)?;
         let manifest = read_manifest_path(&location.manifest)?;
         Ok(ToolExecutionDetailManifest {
             id: manifest.summary.id,
@@ -456,11 +479,12 @@ impl ToolExecutionRepository {
 
     pub fn read_output(
         &self,
+        workspace_id: &str,
         detail_ref: &str,
         cursor: Option<&str>,
         limit: usize,
     ) -> ToolExecutionResult<ToolExecutionDetailPage> {
-        let location = self.detail_location(detail_ref)?;
+        let location = self.detail_location(workspace_id, detail_ref)?;
         let manifest = read_manifest_path(&location.manifest)?;
         if stream_has_output(&location.stream)? {
             return read_stream_output_page(
@@ -524,12 +548,19 @@ impl ToolExecutionRepository {
         })
     }
 
-    pub fn summaries_for_conversation(&self, conversation_id: &str) -> Vec<ToolExecutionSummary> {
+    pub fn summaries_for_conversation(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Vec<ToolExecutionSummary> {
         let state = self.lock_state();
         let mut summaries = state
             .summaries
             .values()
-            .filter(|summary| summary.conversation_id.as_deref() == Some(conversation_id))
+            .filter(|summary| {
+                summary.workspace_id == workspace_id
+                    && summary.conversation_id.as_deref() == Some(conversation_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
         summaries.sort_by_key(|summary| summary.started_at);
@@ -538,17 +569,19 @@ impl ToolExecutionRepository {
 
     pub fn summary_for(
         &self,
+        workspace_id: &str,
         owner: &ToolExecutionOwner,
         call_id: &str,
     ) -> Option<ToolExecutionSummary> {
         self.lock_state()
             .summaries
-            .get(&execution_key(owner, call_id))
+            .get(&execution_key(workspace_id, owner, call_id))
             .cloned()
     }
 
     pub fn terminate_running_for_owner(
         &self,
+        workspace_id: &str,
         owner: &ToolExecutionOwner,
         status: ToolExecutionStatus,
     ) -> ToolExecutionResult<Vec<ToolExecutionSummary>> {
@@ -560,6 +593,7 @@ impl ToolExecutionRepository {
             state
                 .summaries
                 .values()
+                .filter(|summary| summary.workspace_id == workspace_id)
                 .filter(|summary| summary.owner == *owner)
                 .filter(|summary| summary.status == ToolExecutionStatus::Running)
                 .map(|summary| summary.call_id.clone())
@@ -567,7 +601,7 @@ impl ToolExecutionRepository {
         };
         let mut summaries = Vec::with_capacity(call_ids.len());
         for call_id in call_ids {
-            let mutation = self.terminate_orphan(owner, &call_id, status)?;
+            let mutation = self.terminate_orphan(workspace_id, owner, &call_id, status)?;
             if mutation.changed {
                 summaries.push(mutation.summary);
             }
@@ -575,16 +609,25 @@ impl ToolExecutionRepository {
         Ok(summaries)
     }
 
-    pub fn remove_conversation(&self, conversation_id: &str) -> ToolExecutionResult<()> {
+    pub fn remove_conversation(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> ToolExecutionResult<()> {
+        validate_workspace_id(workspace_id)?;
         let scope = self
             .root
+            .join(echo_agent::tools::artifact::artifact_scope_component(
+                workspace_id,
+            ))
             .join(echo_agent::tools::artifact::artifact_scope_component(
                 conversation_id,
             ));
         {
             let state = self.lock_state();
             if state.summaries.values().any(|summary| {
-                summary.conversation_id.as_deref() == Some(conversation_id)
+                summary.workspace_id == workspace_id
+                    && summary.conversation_id.as_deref() == Some(conversation_id)
                     && summary.status == ToolExecutionStatus::Running
             }) {
                 return Err(ToolExecutionError::ActiveConversation(
@@ -610,12 +653,16 @@ impl ToolExecutionRepository {
             let removed_details = state
                 .summaries
                 .values()
-                .filter(|summary| summary.conversation_id.as_deref() == Some(conversation_id))
+                .filter(|summary| {
+                    summary.workspace_id == workspace_id
+                        && summary.conversation_id.as_deref() == Some(conversation_id)
+                })
                 .map(|summary| summary.detail_ref.clone())
                 .collect::<Vec<_>>();
-            state
-                .summaries
-                .retain(|_, summary| summary.conversation_id.as_deref() != Some(conversation_id));
+            state.summaries.retain(|_, summary| {
+                summary.workspace_id != workspace_id
+                    || summary.conversation_id.as_deref() != Some(conversation_id)
+            });
             for detail_ref in removed_details {
                 state.details.remove(&detail_ref);
             }
@@ -657,7 +704,11 @@ impl ToolExecutionRepository {
                     continue;
                 }
             };
-            let key = execution_key(&manifest.summary.owner, &manifest.summary.call_id);
+            let key = execution_key(
+                &manifest.summary.workspace_id,
+                &manifest.summary.owner,
+                &manifest.summary.call_id,
+            );
             let mut state = self.lock_state();
             if state.summaries.contains_key(&key) {
                 let error = ToolExecutionError::ProjectionConflict(format!(
@@ -689,25 +740,45 @@ impl ToolExecutionRepository {
         })
     }
 
-    fn scope_dir(&self, conversation_id: Option<&str>, run_id: Option<&str>) -> PathBuf {
+    fn scope_dir(
+        &self,
+        workspace_id: &str,
+        conversation_id: Option<&str>,
+        run_id: Option<&str>,
+    ) -> PathBuf {
+        let workspace = echo_agent::tools::artifact::artifact_scope_component(workspace_id);
         let conversation = echo_agent::tools::artifact::artifact_scope_component(
             conversation_id.unwrap_or("unscoped-conversation"),
         );
         let run =
             echo_agent::tools::artifact::artifact_scope_component(run_id.unwrap_or("unscoped-run"));
-        self.root.join(conversation).join(run)
+        self.root.join(workspace).join(conversation).join(run)
     }
 
-    fn detail_location(&self, detail_ref: &str) -> ToolExecutionResult<DetailLocation> {
-        self.lock_state()
+    fn detail_location(
+        &self,
+        workspace_id: &str,
+        detail_ref: &str,
+    ) -> ToolExecutionResult<DetailLocation> {
+        let location = self
+            .lock_state()
             .details
             .get(detail_ref)
             .cloned()
-            .ok_or_else(|| ToolExecutionError::NotFound(detail_ref.to_string()))
+            .ok_or_else(|| ToolExecutionError::NotFound(detail_ref.to_string()))?;
+        let manifest = read_manifest_path(&location.manifest)?;
+        if manifest.summary.workspace_id != workspace_id {
+            return Err(ToolExecutionError::NotFound(detail_ref.to_string()));
+        }
+        Ok(location)
     }
 
-    fn read_manifest(&self, detail_ref: &str) -> ToolExecutionResult<StoredManifest> {
-        read_manifest_path(&self.detail_location(detail_ref)?.manifest)
+    fn read_manifest(
+        &self,
+        workspace_id: &str,
+        detail_ref: &str,
+    ) -> ToolExecutionResult<StoredManifest> {
+        read_manifest_path(&self.detail_location(workspace_id, detail_ref)?.manifest)
     }
 
     fn lock_state(&self) -> MutexGuard<'_, RepositoryState> {
@@ -936,11 +1007,22 @@ fn canonicalize_json(value: &mut serde_json::Value) {
     }
 }
 
-fn execution_key(owner: &ToolExecutionOwner, call_id: &str) -> String {
+fn validate_workspace_id(workspace_id: &str) -> ToolExecutionResult<()> {
+    if workspace_id.trim().is_empty() {
+        return Err(ToolExecutionError::InvalidIdentity(
+            "workspace_id must not be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn execution_key(workspace_id: &str, owner: &ToolExecutionOwner, call_id: &str) -> String {
     match owner {
-        ToolExecutionOwner::Chat { message_id } => format!("chat\0{message_id}\0{call_id}"),
+        ToolExecutionOwner::Chat { message_id } => {
+            format!("{workspace_id}\0chat\0{message_id}\0{call_id}")
+        }
         ToolExecutionOwner::Subagent { subagent_run_id } => {
-            format!("subagent\0{subagent_run_id}\0{call_id}")
+            format!("{workspace_id}\0subagent\0{subagent_run_id}\0{call_id}")
         }
     }
 }
@@ -1094,18 +1176,19 @@ mod tests {
         let detail_ref = {
             let repository = ToolExecutionRepository::open(temp.path())?;
             let mutation = repository.project_start(
+                "workspace-1",
                 owner.clone(),
                 Some("conversation-1"),
                 Some("run-1"),
                 "call-1",
                 &invocation,
             )?;
-            repository.project_finish(&owner, "call-1", &result)?;
+            repository.project_finish("workspace-1", &owner, "call-1", &result)?;
             mutation.summary.detail_ref
         };
 
         let reopened = ToolExecutionRepository::open(temp.path())?;
-        let detail = reopened.detail_manifest(&detail_ref)?;
+        let detail = reopened.detail_manifest("workspace-1", &detail_ref)?;
         assert_eq!(detail.invocation, invocation);
         assert_eq!(
             canonical_json(&detail.result)?,
@@ -1121,6 +1204,7 @@ mod tests {
         let repository = ToolExecutionRepository::open(temp.path())?;
         let owner = chat_owner();
         repository.project_start(
+            "workspace-1",
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
@@ -1130,7 +1214,7 @@ mod tests {
         let mut result = ToolResult::success("deadline exceeded");
         result.failure = Some(ToolFailure::new(ToolFailureCategory::Timeout));
 
-        let mutation = repository.project_finish(&owner, "call-timeout", &result)?;
+        let mutation = repository.project_finish("workspace-1", &owner, "call-timeout", &result)?;
         assert_eq!(mutation.summary.status, ToolExecutionStatus::TimedOut);
         Ok(())
     }
@@ -1143,6 +1227,7 @@ mod tests {
         let owner = chat_owner();
         let original_invocation = invocation("shell", serde_json::json!({"command": "true"}));
         let first = repository.project_start(
+            "workspace-1",
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
@@ -1150,6 +1235,7 @@ mod tests {
             &original_invocation,
         )?;
         let replayed = repository.project_start(
+            "workspace-1",
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
@@ -1162,6 +1248,7 @@ mod tests {
 
         assert!(matches!(
             repository.project_start(
+                "workspace-1",
                 owner,
                 Some("conversation-1"),
                 Some("run-1"),
@@ -1182,6 +1269,7 @@ mod tests {
             let repository = ToolExecutionRepository::open(temp.path())?;
             repository
                 .project_start(
+                    "workspace-1",
                     owner.clone(),
                     Some("conversation-1"),
                     Some("run-1"),
@@ -1193,11 +1281,11 @@ mod tests {
         };
         let reopened = ToolExecutionRepository::open(temp.path())?;
         assert_eq!(
-            reopened.detail_manifest(&detail_ref)?.status,
+            reopened.detail_manifest("workspace-1", &detail_ref)?.status,
             ToolExecutionStatus::Interrupted
         );
         let result = ToolResult::success("done");
-        let corrected = reopened.project_finish(&owner, "call-1", &result)?;
+        let corrected = reopened.project_finish("workspace-1", &owner, "call-1", &result)?;
         assert_eq!(corrected.summary.status, ToolExecutionStatus::Succeeded);
         assert_eq!(corrected.summary.detail_ref, detail_ref);
         Ok(())
@@ -1210,15 +1298,21 @@ mod tests {
         let repository = ToolExecutionRepository::open(temp.path())?;
         let owner = chat_owner();
         let mutation = repository.project_start(
+            "workspace-1",
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
             "call-1",
             &invocation("shell", serde_json::json!({"command": "printf hello"})),
         )?;
-        repository.project_finish(&owner, "call-1", &ToolResult::success("hello"))?;
+        repository.project_finish(
+            "workspace-1",
+            &owner,
+            "call-1",
+            &ToolResult::success("hello"),
+        )?;
 
-        let page = repository.read_output(&mutation.summary.detail_ref, None, 4)?;
+        let page = repository.read_output("workspace-1", &mutation.summary.detail_ref, None, 4)?;
         assert_eq!(
             page.chunks.first().map(|chunk| chunk.text.as_str()),
             Some("hello")
@@ -1235,6 +1329,7 @@ mod tests {
         let repository = ToolExecutionRepository::open(temp.path())?;
         let owner = chat_owner();
         let mutation = repository.project_start(
+            "workspace-1",
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
@@ -1242,18 +1337,19 @@ mod tests {
             &invocation("shell", serde_json::json!({"command": "build"})),
         )?;
         repository.project_stream(
+            "workspace-1",
             &owner,
             "call-stream",
             ToolExecutionDetailChannel::Stdout,
             "building",
         )?;
 
-        let detail = repository.detail_manifest(&mutation.summary.detail_ref)?;
+        let detail = repository.detail_manifest("workspace-1", &mutation.summary.detail_ref)?;
         assert_eq!(detail.status, ToolExecutionStatus::Running);
         assert!(detail.result.is_none());
         assert_eq!(detail.output_bytes, 8);
 
-        let first = repository.read_output(&mutation.summary.detail_ref, None, 4)?;
+        let first = repository.read_output("workspace-1", &mutation.summary.detail_ref, None, 4)?;
         assert_eq!(
             first.chunks,
             vec![ToolExecutionDetailChunk {
@@ -1264,6 +1360,7 @@ mod tests {
         assert!(!first.complete);
         let cursor = first.next_cursor.ok_or("running stream cursor missing")?;
         let another = repository.project_start(
+            "workspace-1",
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
@@ -1271,25 +1368,42 @@ mod tests {
             &invocation("shell", serde_json::json!({"command": "other"})),
         )?;
         repository.project_stream(
+            "workspace-1",
             &owner,
             "call-other",
             ToolExecutionDetailChannel::Stdout,
             "other",
         )?;
         assert!(matches!(
-            repository.read_output(&another.summary.detail_ref, Some(&cursor), 4),
+            repository.read_output("workspace-1", &another.summary.detail_ref, Some(&cursor), 4),
             Err(ToolExecutionError::InvalidCursor(_))
         ));
 
         repository.project_stream(
+            "workspace-1",
             &owner,
             "call-stream",
             ToolExecutionDetailChannel::Stderr,
             "warning",
         )?;
-        repository.project_finish(&owner, "call-stream", &ToolResult::success("done"))?;
-        repository.terminate_orphan(&owner, "call-other", ToolExecutionStatus::Unknown)?;
-        let second = repository.read_output(&mutation.summary.detail_ref, Some(&cursor), 4)?;
+        repository.project_finish(
+            "workspace-1",
+            &owner,
+            "call-stream",
+            &ToolResult::success("done"),
+        )?;
+        repository.terminate_orphan(
+            "workspace-1",
+            &owner,
+            "call-other",
+            ToolExecutionStatus::Unknown,
+        )?;
+        let second = repository.read_output(
+            "workspace-1",
+            &mutation.summary.detail_ref,
+            Some(&cursor),
+            4,
+        )?;
         assert_eq!(
             second.chunks,
             vec![ToolExecutionDetailChunk {
@@ -1301,7 +1415,7 @@ mod tests {
         assert!(second.next_cursor.is_none());
         assert_eq!(
             repository
-                .detail_manifest(&mutation.summary.detail_ref)?
+                .detail_manifest("workspace-1", &mutation.summary.detail_ref)?
                 .output_bytes,
             15
         );
@@ -1314,6 +1428,7 @@ mod tests {
         let repository = ToolExecutionRepository::open(temp.path())?;
         let owner = chat_owner();
         repository.project_start(
+            "workspace-1",
             owner.clone(),
             Some("conversation-1"),
             Some("run-1"),
@@ -1321,15 +1436,73 @@ mod tests {
             &invocation("shell", serde_json::json!({"command": "true"})),
         )?;
         assert!(matches!(
-            repository.remove_conversation("conversation-1"),
+            repository.remove_conversation("workspace-1", "conversation-1"),
             Err(ToolExecutionError::ActiveConversation(_))
         ));
-        repository.terminate_orphan(&owner, "call-1", ToolExecutionStatus::Unknown)?;
-        repository.remove_conversation("conversation-1")?;
+        repository.terminate_orphan(
+            "workspace-1",
+            &owner,
+            "call-1",
+            ToolExecutionStatus::Unknown,
+        )?;
+        repository.remove_conversation("workspace-1", "conversation-1")?;
         assert!(
             repository
-                .summaries_for_conversation("conversation-1")
+                .summaries_for_conversation("workspace-1", "conversation-1")
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn identical_tool_identity_is_isolated_by_workspace() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let repository = ToolExecutionRepository::open(temp.path())?;
+        let owner = chat_owner();
+        let invocation = invocation("shell", serde_json::json!({"command": "true"}));
+        let first = repository.project_start(
+            "workspace-a",
+            owner.clone(),
+            Some("conversation-1"),
+            Some("run-1"),
+            "call-1",
+            &invocation,
+        )?;
+        let second = repository.project_start(
+            "workspace-b",
+            owner.clone(),
+            Some("conversation-1"),
+            Some("run-1"),
+            "call-1",
+            &invocation,
+        )?;
+
+        assert_ne!(first.summary.detail_ref, second.summary.detail_ref);
+        assert_eq!(first.summary.workspace_id, "workspace-a");
+        assert_eq!(second.summary.workspace_id, "workspace-b");
+        assert!(matches!(
+            repository.detail_manifest("workspace-b", &first.summary.detail_ref),
+            Err(ToolExecutionError::NotFound(_))
+        ));
+
+        repository.terminate_orphan(
+            "workspace-a",
+            &owner,
+            "call-1",
+            ToolExecutionStatus::Interrupted,
+        )?;
+        repository.remove_conversation("workspace-a", "conversation-1")?;
+        assert!(
+            repository
+                .summaries_for_conversation("workspace-a", "conversation-1")
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .summaries_for_conversation("workspace-b", "conversation-1")
+                .len(),
+            1
         );
         Ok(())
     }
@@ -1346,7 +1519,7 @@ mod tests {
         let repository = ToolExecutionRepository::open(temp.path())?;
         assert!(
             repository
-                .summaries_for_conversation("conversation")
+                .summaries_for_conversation("workspace-1", "conversation")
                 .is_empty()
         );
         assert!(!manifest.exists());

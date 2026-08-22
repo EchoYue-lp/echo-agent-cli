@@ -225,6 +225,12 @@ pub async fn delete_workspace(
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id.clone());
 
+    state
+        .app_state
+        .ensure_workspace_idle_for_delete(&ws_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+
     if let Some(ref current) = state.app_state.current_workspace().await
         && current.id == ws_id
     {
@@ -234,6 +240,12 @@ pub async fn delete_workspace(
             .await
             .map_err(|error| IpcError::Internal(error.to_string()))?;
     }
+
+    state
+        .app_state
+        .evict_workspace_for_delete(&ws_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
 
     match state.app_state.workspace.registry.delete(&ws_id) {
         Ok(()) => {

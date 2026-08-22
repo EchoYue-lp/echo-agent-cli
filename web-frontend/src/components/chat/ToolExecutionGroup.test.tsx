@@ -6,6 +6,7 @@ describe('ToolExecutionGroup', () => {
   it('hides individual tool calls by default', () => {
     const tools: ToolExecution[] = ['call-a', 'call-b'].map((id, index) => ({
       id,
+      workspace_id: 'workspace-1',
       call_id: id,
       owner: { kind: 'chat', message_id: 'assistant-1' },
       name: `tool_${index + 1}`,
@@ -39,6 +40,7 @@ describe('ToolExecutionGroup', () => {
   it('does not present interrupted and timed-out tools as successful', () => {
     const interrupted = {
       id: 'call-a',
+      workspace_id: 'workspace-1',
       call_id: 'call-a',
       owner: { kind: 'chat', message_id: 'assistant-1' },
       name: 'shell',

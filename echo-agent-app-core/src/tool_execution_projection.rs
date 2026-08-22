@@ -48,6 +48,17 @@ pub struct ToolExecutionProjectionUpdate {
     pub summary: ToolExecutionSummary,
 }
 
+#[derive(Clone, Copy)]
+pub struct SubagentToolStart<'a> {
+    pub workspace_id: &'a str,
+    pub subagent_run_id: &'a str,
+    pub conversation_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
+    pub call_id: &'a str,
+    pub invocation: &'a ToolInvocation,
+    pub agent: &'a str,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ToolStartedPayload {
@@ -97,6 +108,7 @@ impl ToolExecutionProjector {
     ) -> Result<Vec<ToolExecutionProjectionUpdate>, ToolExecutionProjectionError> {
         match &envelope.payload {
             ChatDriverEvent::Agent(event) => self.project_agent_event(
+                &envelope.workspace_id,
                 &event.payload,
                 envelope.conversation_id.as_deref(),
                 &envelope.message_id,
@@ -137,6 +149,7 @@ impl ToolExecutionProjector {
 
     pub fn project_agent_event(
         &self,
+        workspace_id: &str,
         event: &AgentEvent,
         conversation_id: Option<&str>,
         message_id: &str,
@@ -151,6 +164,7 @@ impl ToolExecutionProjector {
                 invocation,
             } => {
                 let mutation = self.repository.project_start(
+                    workspace_id,
                     owner,
                     conversation_id,
                     Some(turn_id),
@@ -168,8 +182,10 @@ impl ToolExecutionProjector {
                 name,
                 result,
             } => {
-                self.ensure_name_matches(&owner, call_id, name, "tool_result")?;
-                let mutation = self.repository.project_finish(&owner, call_id, result)?;
+                self.ensure_name_matches(workspace_id, &owner, call_id, name, "tool_result")?;
+                let mutation =
+                    self.repository
+                        .project_finish(workspace_id, &owner, call_id, result)?;
                 Ok(projection_updates_from_mutation(
                     ToolExecutionProjectionKind::Finished,
                     "echo-assistant",
@@ -181,10 +197,11 @@ impl ToolExecutionProjector {
                 name,
                 event,
             } => {
-                self.ensure_name_matches(&owner, call_id, name, "tool_stream")?;
+                self.ensure_name_matches(workspace_id, &owner, call_id, name, "tool_stream")?;
                 match event {
                     ToolStreamEvent::Progress { message, percent } => {
                         self.repository.project_stream(
+                            workspace_id,
                             &owner,
                             call_id,
                             ToolExecutionDetailChannel::Log,
@@ -192,6 +209,7 @@ impl ToolExecutionProjector {
                         )?
                     }
                     ToolStreamEvent::Output { channel, chunk } => self.repository.project_stream(
+                        workspace_id,
                         &owner,
                         call_id,
                         detail_channel(*channel),
@@ -201,9 +219,12 @@ impl ToolExecutionProjector {
                 }
                 Ok(Vec::new())
             }
-            AgentEvent::Cancelled => {
-                self.terminate_owner(&owner, ToolExecutionStatus::Cancelled, "echo-assistant")
-            }
+            AgentEvent::Cancelled => self.terminate_owner(
+                workspace_id,
+                &owner,
+                ToolExecutionStatus::Cancelled,
+                "echo-assistant",
+            ),
             AgentEvent::Error { failure, .. } => {
                 let status = if failure.terminal_kind
                     == echo_agent::error::AgentTerminalKind::Cancelled
@@ -214,11 +235,14 @@ impl ToolExecutionProjector {
                 } else {
                     ToolExecutionStatus::Unknown
                 };
-                self.terminate_owner(&owner, status, "echo-assistant")
+                self.terminate_owner(workspace_id, &owner, status, "echo-assistant")
             }
-            AgentEvent::FinalAnswer(_) => {
-                self.terminate_owner(&owner, ToolExecutionStatus::Unknown, "echo-assistant")
-            }
+            AgentEvent::FinalAnswer(_) => self.terminate_owner(
+                workspace_id,
+                &owner,
+                ToolExecutionStatus::Unknown,
+                "echo-assistant",
+            ),
             _ => Ok(Vec::new()),
         }
     }
@@ -252,10 +276,19 @@ impl ToolExecutionProjector {
         match event.event {
             RuntimeEventKind::ToolStarted => {
                 let payload = decode_payload::<ToolStartedPayload>(&event.payload, "tool_started")?;
-                let conversation_id = self.conversation_id(&event.run_id, known_conversation_id)?;
+                let resolved_conversation_id =
+                    self.conversation_id(&event.run_id, known_conversation_id)?;
+                if resolved_conversation_id != event.conversation_id {
+                    return Err(invalid_payload(
+                        "execution event",
+                        "conversation identity does not match its journal envelope",
+                    ));
+                }
+                let conversation_id = &event.conversation_id;
                 let mutation = self.repository.project_start(
+                    &event.workspace_id,
                     owner,
-                    Some(&conversation_id),
+                    Some(conversation_id),
                     Some(&event.run_id),
                     &payload.call_id,
                     &payload.invocation,
@@ -270,14 +303,18 @@ impl ToolExecutionProjector {
                 let payload =
                     decode_payload::<ToolCompletedPayload>(&event.payload, "tool_completed")?;
                 self.ensure_name_matches(
+                    &event.workspace_id,
                     &owner,
                     &payload.call_id,
                     &payload.name,
                     "tool_completed",
                 )?;
-                let mutation =
-                    self.repository
-                        .project_finish(&owner, &payload.call_id, &payload.result)?;
+                let mutation = self.repository.project_finish(
+                    &event.workspace_id,
+                    &owner,
+                    &payload.call_id,
+                    &payload.result,
+                )?;
                 Ok(projection_updates_from_mutation(
                     ToolExecutionProjectionKind::Finished,
                     agent,
@@ -286,7 +323,13 @@ impl ToolExecutionProjector {
             }
             RuntimeEventKind::ToolOutput => {
                 let payload = decode_payload::<ToolOutputPayload>(&event.payload, "tool_output")?;
-                self.ensure_name_matches(&owner, &payload.call_id, &payload.name, "tool_output")?;
+                self.ensure_name_matches(
+                    &event.workspace_id,
+                    &owner,
+                    &payload.call_id,
+                    &payload.name,
+                    "tool_output",
+                )?;
                 let (channel, text) = match (payload.channel, payload.chunk, payload.message) {
                     (Some(channel), Some(chunk), None) => (detail_channel_name(&channel)?, chunk),
                     (None, None, Some(message)) => (
@@ -300,29 +343,45 @@ impl ToolExecutionProjector {
                         ));
                     }
                 };
-                self.repository
-                    .project_stream(&owner, &payload.call_id, channel, &text)?;
+                self.repository.project_stream(
+                    &event.workspace_id,
+                    &owner,
+                    &payload.call_id,
+                    channel,
+                    &text,
+                )?;
                 Ok(Vec::new())
             }
-            RuntimeEventKind::Cancelled => {
-                self.terminate_owner(&owner, ToolExecutionStatus::Cancelled, agent)
-            }
-            RuntimeEventKind::TimedOut => {
-                self.terminate_owner(&owner, ToolExecutionStatus::TimedOut, agent)
-            }
-            RuntimeEventKind::Completed | RuntimeEventKind::Failed => {
-                self.terminate_owner(&owner, ToolExecutionStatus::Unknown, agent)
-            }
+            RuntimeEventKind::Cancelled => self.terminate_owner(
+                &event.workspace_id,
+                &owner,
+                ToolExecutionStatus::Cancelled,
+                agent,
+            ),
+            RuntimeEventKind::TimedOut => self.terminate_owner(
+                &event.workspace_id,
+                &owner,
+                ToolExecutionStatus::TimedOut,
+                agent,
+            ),
+            RuntimeEventKind::Completed | RuntimeEventKind::Failed => self.terminate_owner(
+                &event.workspace_id,
+                &owner,
+                ToolExecutionStatus::Unknown,
+                agent,
+            ),
             _ => Ok(Vec::new()),
         }
     }
 
     pub fn terminate_chat(
         &self,
+        workspace_id: &str,
         message_id: &str,
         status: ToolExecutionStatus,
     ) -> Result<Vec<ToolExecutionProjectionUpdate>, ToolExecutionProjectionError> {
         self.terminate_owner(
+            workspace_id,
             &ToolExecutionOwner::Chat {
                 message_id: message_id.to_string(),
             },
@@ -333,31 +392,28 @@ impl ToolExecutionProjector {
 
     pub fn project_subagent_started(
         &self,
-        subagent_run_id: &str,
-        conversation_id: Option<&str>,
-        run_id: Option<&str>,
-        call_id: &str,
-        invocation: &ToolInvocation,
-        agent: &str,
+        start: SubagentToolStart<'_>,
     ) -> Result<Vec<ToolExecutionProjectionUpdate>, ToolExecutionProjectionError> {
         let mutation = self.repository.project_start(
+            start.workspace_id,
             ToolExecutionOwner::Subagent {
-                subagent_run_id: subagent_run_id.to_string(),
+                subagent_run_id: start.subagent_run_id.to_string(),
             },
-            conversation_id,
-            run_id,
-            call_id,
-            invocation,
+            start.conversation_id,
+            start.run_id,
+            start.call_id,
+            start.invocation,
         )?;
         Ok(projection_updates_from_mutation(
             ToolExecutionProjectionKind::Started,
-            agent,
+            start.agent,
             mutation,
         ))
     }
 
     pub fn project_subagent_completed(
         &self,
+        workspace_id: &str,
         subagent_run_id: &str,
         call_id: &str,
         name: &str,
@@ -367,8 +423,16 @@ impl ToolExecutionProjector {
         let owner = ToolExecutionOwner::Subagent {
             subagent_run_id: subagent_run_id.to_string(),
         };
-        self.ensure_name_matches(&owner, call_id, name, "subagent_tool_completed")?;
-        let mutation = self.repository.project_finish(&owner, call_id, result)?;
+        self.ensure_name_matches(
+            workspace_id,
+            &owner,
+            call_id,
+            name,
+            "subagent_tool_completed",
+        )?;
+        let mutation = self
+            .repository
+            .project_finish(workspace_id, &owner, call_id, result)?;
         Ok(projection_updates_from_mutation(
             ToolExecutionProjectionKind::Finished,
             agent,
@@ -378,11 +442,13 @@ impl ToolExecutionProjector {
 
     pub fn terminate_subagent(
         &self,
+        workspace_id: &str,
         subagent_run_id: &str,
         status: ToolExecutionStatus,
         agent: &str,
     ) -> Result<Vec<ToolExecutionProjectionUpdate>, ToolExecutionProjectionError> {
         self.terminate_owner(
+            workspace_id,
             &ToolExecutionOwner::Subagent {
                 subagent_run_id: subagent_run_id.to_string(),
             },
@@ -414,6 +480,7 @@ impl ToolExecutionProjector {
 
     fn ensure_name_matches(
         &self,
+        workspace_id: &str,
         owner: &ToolExecutionOwner,
         call_id: &str,
         name: &str,
@@ -421,7 +488,7 @@ impl ToolExecutionProjector {
     ) -> Result<(), ToolExecutionProjectionError> {
         let summary = self
             .repository
-            .summary_for(owner, call_id)
+            .summary_for(workspace_id, owner, call_id)
             .ok_or_else(|| ToolExecutionError::NotFound(call_id.to_string()))?;
         if summary.name == name {
             Ok(())
@@ -438,12 +505,13 @@ impl ToolExecutionProjector {
 
     fn terminate_owner(
         &self,
+        workspace_id: &str,
         owner: &ToolExecutionOwner,
         status: ToolExecutionStatus,
         agent: &str,
     ) -> Result<Vec<ToolExecutionProjectionUpdate>, ToolExecutionProjectionError> {
         self.repository
-            .terminate_running_for_owner(owner, status)?
+            .terminate_running_for_owner(workspace_id, owner, status)?
             .into_iter()
             .map(|summary| {
                 Ok(projection_update(
@@ -545,6 +613,8 @@ mod tests {
 
     fn tool_started(run_id: &str) -> ExecEvent {
         ExecEvent::subagent(
+            "workspace-1",
+            "conversation-1",
             run_id,
             "task-1",
             format!("{run_id}:task-1:1:1"),
@@ -563,6 +633,7 @@ mod tests {
         let repository = Arc::new(ToolExecutionRepository::open(temp.path())?);
         let projector = ToolExecutionProjector::new(repository.clone(), None);
         let started = projector.project_agent_event(
+            "workspace-1",
             &AgentEvent::ToolCall {
                 call_id: "call-1".to_string(),
                 invocation: invocation(),
@@ -582,6 +653,7 @@ mod tests {
             .metadata
             .insert("attempt".to_string(), "1".to_string());
         projector.project_agent_event(
+            "workspace-1",
             &AgentEvent::ToolResult {
                 call_id: "call-1".to_string(),
                 name: "shell".to_string(),
@@ -592,7 +664,7 @@ mod tests {
             "turn-1",
         )?;
 
-        let detail = repository.detail_manifest(&started.summary.detail_ref)?;
+        let detail = repository.detail_manifest("workspace-1", &started.summary.detail_ref)?;
         assert_eq!(detail.invocation.requested_name, "run");
         assert_eq!(detail.invocation.name, "shell");
         assert_eq!(detail.invocation.rewrites.len(), 1);
@@ -616,6 +688,7 @@ mod tests {
         let repository = Arc::new(ToolExecutionRepository::open(temp.path())?);
         let projector = ToolExecutionProjector::new(repository.clone(), None);
         let started = projector.project_agent_event(
+            "workspace-1",
             &AgentEvent::ToolCall {
                 call_id: "call-stream".to_string(),
                 invocation: invocation(),
@@ -626,6 +699,7 @@ mod tests {
         )?;
         let started = started.first().ok_or("started projection missing")?;
         let updates = projector.project_agent_event(
+            "workspace-1",
             &AgentEvent::ToolStream {
                 call_id: "call-stream".to_string(),
                 name: "shell".to_string(),
@@ -639,10 +713,10 @@ mod tests {
             "turn-1",
         )?;
         assert!(updates.is_empty());
-        let detail = repository.detail_manifest(&started.summary.detail_ref)?;
+        let detail = repository.detail_manifest("workspace-1", &started.summary.detail_ref)?;
         assert_eq!(detail.status, ToolExecutionStatus::Running);
         assert!(detail.result.is_none());
-        let page = repository.read_output(&started.summary.detail_ref, None, 64)?;
+        let page = repository.read_output("workspace-1", &started.summary.detail_ref, None, 64)?;
         assert_eq!(
             page.chunks.first().map(|chunk| chunk.text.as_str()),
             Some("live output")
@@ -677,6 +751,8 @@ mod tests {
         )?;
         let started = started.first().ok_or("started projection missing")?;
         let output = ExecEvent::subagent(
+            "workspace-1",
+            "conversation-1",
             "run-1",
             "task-1",
             "run-1:task-1:1:1",
@@ -693,7 +769,7 @@ mod tests {
                 .project_execution_event_for_conversation(&output, Some("conversation-1"))?
                 .is_empty()
         );
-        let page = repository.read_output(&started.summary.detail_ref, None, 64)?;
+        let page = repository.read_output("workspace-1", &started.summary.detail_ref, None, 64)?;
         assert_eq!(
             page.chunks,
             vec![crate::tool_execution::ToolExecutionDetailChunk {
@@ -719,7 +795,7 @@ mod tests {
         ));
         assert!(
             repository
-                .summaries_for_conversation("conversation-1")
+                .summaries_for_conversation("workspace-1", "conversation-1")
                 .is_empty()
         );
         Ok(())
@@ -732,6 +808,7 @@ mod tests {
         let repository = Arc::new(ToolExecutionRepository::open(temp.path())?);
         let projector = ToolExecutionProjector::new(repository.clone(), None);
         projector.project_agent_event(
+            "workspace-1",
             &AgentEvent::ToolCall {
                 call_id: "call-1".to_string(),
                 invocation: invocation(),
@@ -741,6 +818,7 @@ mod tests {
             "turn-1",
         )?;
         let updates = projector.project_agent_event(
+            "workspace-1",
             &AgentEvent::error_message("test", "provider failed"),
             Some("conversation-1"),
             "message-1",
@@ -761,27 +839,24 @@ mod tests {
         let repository = Arc::new(ToolExecutionRepository::open(temp.path())?);
         let projector = ToolExecutionProjector::new(repository, None);
 
-        let first = projector.project_subagent_started(
-            "subagent-run-1",
-            Some("conversation-1"),
-            Some("run-1"),
-            "call-1",
-            &invocation(),
-            "explorer",
-        )?;
-        let replay = projector.project_subagent_started(
-            "subagent-run-1",
-            Some("conversation-1"),
-            Some("run-1"),
-            "call-1",
-            &invocation(),
-            "explorer",
-        )?;
+        let tool_invocation = invocation();
+        let start = SubagentToolStart {
+            workspace_id: "workspace-1",
+            subagent_run_id: "subagent-run-1",
+            conversation_id: Some("conversation-1"),
+            run_id: Some("run-1"),
+            call_id: "call-1",
+            invocation: &tool_invocation,
+            agent: "explorer",
+        };
+        let first = projector.project_subagent_started(start)?;
+        let replay = projector.project_subagent_started(start)?;
         assert_eq!(first.len(), 1);
         assert!(replay.is_empty());
 
         let result = ToolResult::success("done");
         let first = projector.project_subagent_completed(
+            "workspace-1",
             "subagent-run-1",
             "call-1",
             "shell",
@@ -789,6 +864,7 @@ mod tests {
             "explorer",
         )?;
         let replay = projector.project_subagent_completed(
+            "workspace-1",
             "subagent-run-1",
             "call-1",
             "shell",

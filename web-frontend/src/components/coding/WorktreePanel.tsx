@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -13,10 +13,13 @@ import {
   X,
 } from 'lucide-react';
 import { worktreeApi, type UnattendedWorktreeInfo, type WorktreeInfo } from '../../api/endpoints';
+import { workspaceIdForView } from '../../lib/viewAddress';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 type ReviewAction = 'merge' | 'discard';
 
 export function WorktreePanel() {
+  const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [unattended, setUnattended] = useState<UnattendedWorktreeInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -33,13 +36,13 @@ export function WorktreePanel() {
   const [reviewing, setReviewing] = useState<string | null>(null);
   const [cleaning, setCleaning] = useState(false);
 
-  const fetchWorktrees = async () => {
+  const fetchWorktrees = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
       const [allWorktrees, unattendedWorktrees] = await Promise.all([
         worktreeApi.list(),
-        worktreeApi.listUnattended(),
+        worktreeApi.listUnattended(workspaceId),
       ]);
       setWorktrees(allWorktrees);
       setUnattended(unattendedWorktrees);
@@ -48,11 +51,11 @@ export function WorktreePanel() {
     } finally {
       setLoading(false);
     }
-  };
+  }, [workspaceId]);
 
   useEffect(() => {
     void fetchWorktrees();
-  }, []);
+  }, [fetchWorktrees]);
 
   const handleCreate = async () => {
     if (!newBranch.trim()) return;
@@ -90,10 +93,10 @@ export function WorktreePanel() {
     setReviewing(runId);
     try {
       if (action === 'merge') {
-        const result = await worktreeApi.mergeUnattended(runId);
+        const result = await worktreeApi.mergeUnattended(workspaceId, runId);
         if (result.cleanup_warning) setError(result.cleanup_warning);
       } else {
-        await worktreeApi.discardUnattended(runId);
+        await worktreeApi.discardUnattended(workspaceId, runId);
       }
       setReviewAction(null);
       await fetchWorktrees();
@@ -107,7 +110,7 @@ export function WorktreePanel() {
   const handleCleanup = async () => {
     setCleaning(true);
     try {
-      const result = await worktreeApi.cleanupUnattended();
+      const result = await worktreeApi.cleanupUnattended(workspaceId);
       if (result.errors.length > 0) setError(result.errors.join('\n'));
       await fetchWorktrees();
     } catch (e) {

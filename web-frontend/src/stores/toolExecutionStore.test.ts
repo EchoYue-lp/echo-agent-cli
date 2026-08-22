@@ -11,6 +11,7 @@ import {
 
 const run = {
   run_id: 'run-1',
+  workspace_id: 'workspace-1',
   conversation_id: 'conversation-1',
 } as TaskRun;
 
@@ -67,6 +68,7 @@ describe('TaskRuntime tool execution recovery', () => {
     const fallback = taskRuntimeToolExecutions(run, runtimeEvents());
     const persisted: ToolExecution = {
       id: 'detail-1',
+      workspace_id: 'workspace-1',
       call_id: 'call-1',
       owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
       conversation_id: 'conversation-1',
@@ -87,6 +89,7 @@ describe('TaskRuntime tool execution recovery', () => {
     const fallback = taskRuntimeToolExecutions(run, runtimeEvents());
     const recovered: ToolExecution = {
       id: 'detail-recovered',
+      workspace_id: 'workspace-1',
       call_id: 'call-1',
       owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
       conversation_id: 'conversation-1',
@@ -115,6 +118,7 @@ describe('TaskRuntime tool execution recovery', () => {
   it('keeps a detailed canonical terminal when a flattened runtime event arrives', () => {
     const recovered: ToolExecution = {
       id: 'detail-recovered',
+      workspace_id: 'workspace-1',
       call_id: 'call-1',
       owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
       conversation_id: 'conversation-1',
@@ -140,6 +144,7 @@ describe('TaskRuntime tool execution recovery', () => {
   it('keeps a live terminal detail when a stale running snapshot arrives later', () => {
     const terminal: ToolExecution = {
       id: 'detail-live',
+      workspace_id: 'workspace-1',
       call_id: 'call-1',
       owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
       conversation_id: 'conversation-1',
@@ -160,6 +165,7 @@ describe('TaskRuntime tool execution recovery', () => {
   it('keeps the newer live terminal state when an older terminal snapshot arrives later', () => {
     const live: ToolExecution = {
       id: 'detail-live',
+      workspace_id: 'workspace-1',
       call_id: 'call-1',
       owner: { kind: 'subagent', subagent_run_id: 'run-1:task-1:1:1' },
       conversation_id: 'conversation-1',
@@ -200,6 +206,7 @@ describe('TaskRuntime tool execution recovery', () => {
   it('hydrates one conversation without deleting live tools from another conversation', () => {
     const background: ToolExecution = {
       id: 'background-tool',
+      workspace_id: 'workspace-background',
       call_id: 'call-background',
       owner: { kind: 'chat', message_id: 'message-background' },
       conversation_id: 'conversation-background',
@@ -214,6 +221,7 @@ describe('TaskRuntime tool execution recovery', () => {
     };
     const restored: ToolExecution = {
       id: 'restored-tool',
+      workspace_id: 'workspace-1',
       call_id: 'call-restored',
       owner: { kind: 'chat', message_id: 'message-restored' },
       conversation_id: 'conversation-1',
@@ -228,7 +236,9 @@ describe('TaskRuntime tool execution recovery', () => {
     };
     useToolExecutionStore.getState().ingest(background);
 
-    useToolExecutionStore.getState().hydrateConversation('conversation-1', [restored]);
+    useToolExecutionStore
+      .getState()
+      .hydrateConversation('workspace-1', 'conversation-1', [restored]);
 
     expect(Object.values(useToolExecutionStore.getState().tools)).toEqual(
       expect.arrayContaining([background, restored])

@@ -8,7 +8,6 @@
  */
 
 import { useChatStore } from '../stores/chatStore';
-import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import type { AgentEvent, ChatEvent, ChatEventEnvelope, ChatRunStatus } from '../types/api';
 import { recordTerminalStatusForTurn, terminalStatusForTurn } from './chatEventSequencer';
 
@@ -56,6 +55,11 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       break;
     case 'interrupt':
       handleChatEvent({ type: 'interrupt_prompt', ...payload.event }, ctx);
+      break;
+    case 'input_queued':
+    case 'input_removed':
+    case 'input_reordered':
+      // Queue projection is hydrated and mutated by useTauriChat.
       break;
     case 'approval_request':
       handleChatEvent({ type: 'approval_request', ...payload.event }, ctx);
@@ -334,13 +338,9 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       break;
     }
     case 'interrupt_prompt': {
-      // An in-progress run was detected — the GUI should show a dialog
-      // letting the user choose: resume / edit-and-resume / abandon.
-      useTaskRuntimeStore.getState().openInterruptPrompt({
-        runId: event.run_id,
-        goal: event.goal,
-        newMessage: event.new_message,
-      });
+      // The typed send admission response owns the decision callback. This
+      // journal event is replay evidence and must not create an actionless
+      // duplicate dialog.
       break;
     }
     case 'done': {

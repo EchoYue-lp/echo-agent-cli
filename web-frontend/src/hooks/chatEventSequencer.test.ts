@@ -9,12 +9,14 @@ import {
 } from './chatEventSequencer';
 
 const envelope = (sequence: number): ChatEventEnvelope => ({
-  schema_version: 1,
+  schema_version: 2,
+  workspace_id: 'workspace-1',
   event_id: `event-${sequence}`,
   content_hash: `hash-${sequence}`,
   sequence,
   stream_id: 'conversation:one',
   conversation_id: 'one',
+  root_turn_id: 'turn-1',
   turn_id: 'turn-1',
   message_id: 'turn-1',
   timestamp: '2026-08-18T00:00:00Z',
@@ -26,6 +28,7 @@ const turnEnvelope = (sequence: number, turnId: string): ChatEventEnvelope => ({
   event_id: `event-${turnId}-${sequence}`,
   content_hash: `hash-${turnId}-${sequence}`,
   turn_id: turnId,
+  root_turn_id: turnId,
   message_id: turnId,
 });
 

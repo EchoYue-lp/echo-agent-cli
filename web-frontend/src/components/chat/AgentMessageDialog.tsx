@@ -31,6 +31,7 @@ interface AgentMessageDialogProps {
 const statusLabels: Record<AgentDeliveryStatus, string> = {
   queued: '排队中',
   claimed: '处理中',
+  injected: '已注入当前任务',
   delivered: '已送达',
   failed: '失败',
 };
@@ -38,7 +39,7 @@ const statusLabels: Record<AgentDeliveryStatus, string> = {
 function StatusIcon({ status }: { status: AgentDeliveryStatus }) {
   if (status === 'delivered') return <Check size={13} aria-hidden="true" />;
   if (status === 'failed') return <XCircle size={13} aria-hidden="true" />;
-  if (status === 'claimed')
+  if (status === 'claimed' || status === 'injected')
     return <LoaderCircle size={13} className="animate-spin" aria-hidden="true" />;
   return <Clock3 size={13} aria-hidden="true" />;
 }

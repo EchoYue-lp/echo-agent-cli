@@ -833,6 +833,13 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
             } => self.output.emit(format!(
                 "Run {run_id} paused ({goal}); new instruction: {new_message}"
             )),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::InputQueued { input_id, .. } => {
+                self.output.emit(format!("Input queued: {input_id}"))
+            }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::InputRemoved { input_id } => self
+                .output
+                .emit(format!("Queued input removed: {input_id}")),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::InputReordered { .. } => true,
             echo_agent_app_core::chat_driver::ChatDriverEvent::ApprovalRequest {
                 request_id,
                 tool_name,
@@ -2059,6 +2066,7 @@ fn spawn_prepared_repl_turn(
                 render_sink,
                 state.storage.chat_events.clone(),
                 state.storage.tool_executions.clone(),
+                scoped_runtime.execution_scope().workspace_id().to_string(),
                 Some(conversation_id.clone()),
                 turn_id.clone(),
             )

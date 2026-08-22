@@ -31,6 +31,17 @@ pub(crate) fn emit_chat_envelope(app: &tauri::AppHandle, envelope: &ChatEventEnv
     true
 }
 
+pub(crate) struct ExecutionEventProjection<'a> {
+    pub workspace_id: &'a str,
+    pub conversation_id: &'a str,
+    pub run_id: &'a str,
+    pub kind: &'a str,
+    pub event: &'a str,
+    pub agent: &'a str,
+    pub subagent_run_id: &'a str,
+    pub payload: serde_json::Value,
+}
+
 /// Emit an event on the unified `execution://event` channel. `kind` is `run`,
 /// `task`, or `subagent`.
 ///
@@ -41,29 +52,26 @@ pub(crate) fn emit_chat_envelope(app: &tauri::AppHandle, envelope: &ChatEventEnv
 /// attaches the field for `kind == "subagent"`.
 pub(crate) fn emit_execution_event(
     app: &tauri::AppHandle,
-    run_id: &str,
-    kind: &str,
-    event: &str,
-    agent: &str,
-    subagent_run_id: &str,
-    payload: serde_json::Value,
+    projection: ExecutionEventProjection<'_>,
 ) {
     let mut map = serde_json::Map::new();
-    map.insert("kind".into(), kind.into());
-    if kind == "subagent" {
+    map.insert("workspace_id".into(), projection.workspace_id.into());
+    map.insert("conversation_id".into(), projection.conversation_id.into());
+    map.insert("kind".into(), projection.kind.into());
+    if projection.kind == "subagent" {
         // Fall back to "main" only when a caller genuinely has no task_id
         // (shouldn't happen for kind="subagent", but guards against empty string).
-        let id = if subagent_run_id.is_empty() {
+        let id = if projection.subagent_run_id.is_empty() {
             "main"
         } else {
-            subagent_run_id
+            projection.subagent_run_id
         };
         map.insert("subagent_run_id".into(), id.into());
-        map.insert("agent".into(), agent.into());
+        map.insert("agent".into(), projection.agent.into());
     }
-    map.insert("run_id".into(), run_id.into());
-    map.insert("event".into(), event.into());
-    if let serde_json::Value::Object(fields) = payload {
+    map.insert("run_id".into(), projection.run_id.into());
+    map.insert("event".into(), projection.event.into());
+    if let serde_json::Value::Object(fields) = projection.payload {
         for (k, v) in fields {
             map.insert(k, v);
         }
@@ -86,12 +94,16 @@ pub(crate) fn emit_tool_execution_summary(
     };
     emit_execution_event(
         app,
-        summary.run_id.as_deref().unwrap_or(""),
-        "tool",
-        event,
-        agent,
-        "",
-        payload,
+        ExecutionEventProjection {
+            workspace_id: &summary.workspace_id,
+            conversation_id: summary.conversation_id.as_deref().unwrap_or(""),
+            run_id: summary.run_id.as_deref().unwrap_or(""),
+            kind: "tool",
+            event,
+            agent,
+            subagent_run_id: "",
+            payload,
+        },
     );
     true
 }
@@ -368,11 +380,18 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
 pub async fn send_chat_message(
     state: tauri::State<'_, TauriState>,
     app: tauri::AppHandle,
+    workspace_id: String,
     message: String,
     conversation_id: Option<String>,
     message_key: Option<String>,
     attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
 ) -> Result<serde_json::Value, IpcError> {
+    let scoped_runtime = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let ws_root = scoped_runtime.execution_scope().root().to_path_buf();
     // ── Persist attachments + build multimodal message (if any) ──────────
     // The frontend base64-encodes uploads; we write them to a per-workspace
     // uploads dir and rebuild a `Message` with the right ContentParts so the
@@ -381,14 +400,13 @@ pub async fn send_chat_message(
     // turn's to_message() rebuilds the multimodal Message from disk (the refs
     // path), so the in-memory `build_message` helper is no longer used here.
     let saved_attachments = attachments.unwrap_or_default();
-    let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
     let (attachment_refs, mut staged_attachment_batch): (
         Vec<echo_agent_app_core::attachments::AttachmentRef>,
         Option<echo_agent_app_core::attachments::StagedAttachmentBatch>,
     ) = if saved_attachments.is_empty() {
         (Vec::new(), None)
     } else {
-        let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
+        let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(Some(&ws_root));
         let saved =
             echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir)
                 .map_err(|error| {
@@ -416,6 +434,7 @@ pub async fn send_chat_message(
     let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
     let sink = tauri_chat_sink(
         app.clone(),
+        workspace_id.clone(),
         message_key.clone(),
         conversation_id.clone(),
         state.app_state.storage.tool_executions.clone(),
@@ -428,10 +447,26 @@ pub async fn send_chat_message(
     // so the GUI can ask the user what to do (resume / edit-and-resume /
     // abandon).
     if let Some(ref conv_id) = conversation_id
-        && let Some(store) = state.app_state.tasks.runtime.as_ref()
+        && let Some(store) = scoped_runtime.task_runtime()
         && let Ok(Some(existing)) = store.find_in_progress_run_by_conversation(conv_id)
-        && existing.status == echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Running
+        && matches!(
+            existing.status,
+            echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Running
+                | echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused
+        )
     {
+        let queued = state
+            .app_state
+            .storage
+            .chat_events
+            .enqueue_chat_input(
+                &workspace_id,
+                conv_id,
+                &message_key,
+                message.clone(),
+                saved_attachments.clone(),
+            )
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
         if !sink.on_event(ChatDriverEvent::Interrupt {
             run_id: existing.run_id.clone(),
             goal: existing.goal.clone(),
@@ -442,30 +477,35 @@ pub async fn send_chat_message(
             ));
         }
         return Ok(serde_json::json!({
-            "kind": "interrupt_prompt",
+            "kind": "task_run_conflict",
+            "workspace_id": workspace_id,
+            "conversation_id": conv_id,
             "run_id": existing.run_id,
+            "run_status": existing.status.as_str(),
+            "goal": existing.goal,
+            "new_message": message,
+            "message_key": message_key,
+            "input_id": queued.input_id,
         }));
     }
 
     let active_turn_key = conversation_id
         .clone()
         .unwrap_or_else(|| format!("message:{message_key}"));
-    let (scoped_runtime, foreground_lease) = state
-        .app_state
-        .begin_scoped_chat_turn_owned(
+    let foreground_lease = scoped_runtime
+        .begin_turn(
+            &state.app_state.session.foreground_turns,
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
             &active_turn_key,
             message_key.clone(),
         )
         .await
         .map_err(|error| match &error {
-            echo_agent_app_core::state::ScopedChatTurnError::Conversation(
-                echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                    echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy {
-                        active_turn_id,
-                        ..
-                    },
-                ),
+            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy {
+                    active_turn_id,
+                    ..
+                },
             ) => IpcError::Validation(format!("chat_turn_busy:{active_turn_id}")),
             other => IpcError::Validation(other.to_string()),
         })?;
@@ -547,7 +587,7 @@ pub async fn send_chat_message(
     // spilled to user-input artifacts). Replaces the old
     // (message, multimodal_message) pair handed to drive_chat.
     let spill_dir =
-        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(ws_root.as_deref());
+        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(&ws_root));
     let prepared_turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &message,
@@ -637,9 +677,38 @@ pub async fn send_chat_message(
         );
     });
 
+    if let Some(conversation_id) = conversation_id.as_deref() {
+        match state
+            .app_state
+            .storage
+            .chat_events
+            .queued_chat_inputs(&workspace_id, conversation_id)
+        {
+            Ok(queued) if queued.iter().any(|input| input.input_id == message_key) => {
+                if let Err(error) = state
+                    .app_state
+                    .storage
+                    .chat_events
+                    .remove_queued_chat_input(&workspace_id, conversation_id, &message_key)
+                {
+                    tracing::warn!(%error, %workspace_id, %conversation_id, %message_key, "started chat turn could not settle its durable queued input");
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, %workspace_id, %conversation_id, %message_key, "started chat turn could not inspect its durable queued input");
+            }
+        }
+    }
+
     Ok(serde_json::json!({
+        "kind": "started",
         "success": true,
+        "workspace_id": workspace_id,
+        "conversation_id": conversation_id,
         "message_key": message_key,
+        "root_turn_id": message_key,
+        "active_turn_id": message_key,
     }))
 }
 
@@ -647,8 +716,10 @@ pub async fn send_chat_message(
 #[tauri::command]
 pub async fn steer_chat_message(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     message: String,
     conversation_id: String,
+    expected_active_turn_id: String,
     attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
 ) -> Result<serde_json::Value, IpcError> {
     if message.trim().is_empty() && attachments.as_ref().is_none_or(Vec::is_empty) {
@@ -656,23 +727,28 @@ pub async fn steer_chat_message(
     }
     let scoped_runtime = state
         .app_state
-        .current_chat_runtime()
+        .chat_runtime_for_scope(&workspace_id)
         .await
         .map_err(|error| IpcError::Internal(error.to_string()))?;
-    let expected_turn_id = state
+    let active = state
         .app_state
         .session
         .foreground_turns
-        .snapshot_scoped(
-            scoped_runtime.execution_scope().workspace_id(),
-            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
-            &conversation_id,
-        )
-        .map(|snapshot| snapshot.active_turn_id)
+        .snapshots_for_conversation_scoped(&workspace_id, &conversation_id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let snapshot = active
+        .first()
         .ok_or_else(|| IpcError::Validation("no active chat turn".to_string()))?;
+    if snapshot.active_turn_id != expected_active_turn_id {
+        return Err(IpcError::Validation(format!(
+            "active chat turn mismatch: expected {expected_active_turn_id}, actual {}",
+            snapshot.active_turn_id
+        )));
+    }
+    let expected_turn_id = snapshot.active_turn_id.clone();
     let saved_attachments = attachments.unwrap_or_default();
-    let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
-    let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
+    let ws_root = scoped_runtime.execution_scope().root();
+    let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(Some(ws_root));
     let saved =
         echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir)
             .map_err(|error| {
@@ -686,8 +762,7 @@ pub async fn steer_chat_message(
             echo_agent_app_core::attachments::AttachmentRef::from_saved(path.clone(), att)
         })
         .collect();
-    let spill_dir =
-        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(ws_root.as_deref());
+    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(ws_root));
     let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &message,
@@ -810,20 +885,21 @@ fn select_active_chat_turn(
 #[tauri::command]
 pub async fn get_active_chat_turn(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: Option<String>,
 ) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, IpcError> {
-    let scope = state.app_state.current_execution_scope().await;
     select_active_chat_turn(
         &state.app_state.session.foreground_turns,
-        scope.workspace_id(),
+        &workspace_id,
         conversation_id.as_deref(),
     )
 }
 
 /// Replay the canonical ordered journal after the WebView's last applied cursor.
 #[tauri::command]
-pub fn replay_chat_events(
+pub async fn replay_chat_events(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: Option<String>,
     message_key: Option<String>,
     after_cursor: Option<u64>,
@@ -840,11 +916,16 @@ pub fn replay_chat_events(
         .app_state
         .storage
         .chat_events
-        .replay(conversation_id.as_deref(), &turn_id, 0)
+        .replay(&workspace_id, conversation_id.as_deref(), &turn_id, 0)
         .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
     ToolExecutionProjector::new(
         state.app_state.storage.tool_executions.clone(),
-        state.app_state.tasks.runtime.clone(),
+        runtime.task_runtime(),
     )
     .rebuild_from_retained(&retained.events)
     .map_err(|error| IpcError::Internal(error.to_string()))?;
@@ -856,9 +937,108 @@ pub fn replay_chat_events(
             .app_state
             .storage
             .chat_events
-            .replay(conversation_id.as_deref(), &turn_id, cursor)
+            .replay(&workspace_id, conversation_id.as_deref(), &turn_id, cursor)
             .map_err(|error| IpcError::Internal(error.to_string()))
     }
+}
+
+async fn validate_queue_address(
+    state: &TauriState,
+    workspace_id: &str,
+    conversation_id: &str,
+) -> Result<(), IpcError> {
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let store = runtime
+        .conversation_store()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+    if store
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .is_none()
+    {
+        return Err(IpcError::NotFound(format!(
+            "Conversation '{conversation_id}' not found in workspace '{workspace_id}'"
+        )));
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn queue_chat_input(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+    input_id: String,
+    text: String,
+    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
+) -> Result<echo_agent_app_core::chat_event_log::QueuedChatInput, IpcError> {
+    validate_queue_address(&state, &workspace_id, &conversation_id).await?;
+    state
+        .app_state
+        .storage
+        .chat_events
+        .enqueue_chat_input(
+            &workspace_id,
+            &conversation_id,
+            &input_id,
+            text,
+            attachments.unwrap_or_default(),
+        )
+        .map_err(|error| IpcError::Internal(error.to_string()))
+}
+
+#[tauri::command]
+pub async fn list_queued_chat_inputs(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+) -> Result<Vec<echo_agent_app_core::chat_event_log::QueuedChatInput>, IpcError> {
+    validate_queue_address(&state, &workspace_id, &conversation_id).await?;
+    state
+        .app_state
+        .storage
+        .chat_events
+        .queued_chat_inputs(&workspace_id, &conversation_id)
+        .map_err(|error| IpcError::Internal(error.to_string()))
+}
+
+#[tauri::command]
+pub async fn remove_queued_chat_input(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+    input_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    validate_queue_address(&state, &workspace_id, &conversation_id).await?;
+    state
+        .app_state
+        .storage
+        .chat_events
+        .remove_queued_chat_input(&workspace_id, &conversation_id, &input_id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    Ok(serde_json::json!({"success": true, "input_id": input_id}))
+}
+
+#[tauri::command]
+pub async fn reorder_queued_chat_inputs(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+    input_ids: Vec<String>,
+) -> Result<serde_json::Value, IpcError> {
+    validate_queue_address(&state, &workspace_id, &conversation_id).await?;
+    state
+        .app_state
+        .storage
+        .chat_events
+        .reorder_queued_chat_inputs(&workspace_id, &conversation_id, input_ids)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    Ok(serde_json::json!({"success": true}))
 }
 
 /// Cancel an active chat stream.
@@ -886,27 +1066,49 @@ fn request_chat_cancel(
 #[tauri::command]
 pub async fn cancel_chat(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
-    root_turn_id: String,
+    expected_root_turn_id: String,
+    expected_active_turn_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let scope = state.app_state.current_execution_scope().await;
+    if let Some(expected_active_turn_id) = expected_active_turn_id
+        && let Some(snapshot) = state.app_state.session.foreground_turns.snapshot_scoped(
+            &workspace_id,
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            &conversation_id,
+        )
+        && snapshot.active_turn_id != expected_active_turn_id
+    {
+        return Err(IpcError::Validation(format!(
+            "active chat turn mismatch: expected {expected_active_turn_id}, actual {}",
+            snapshot.active_turn_id
+        )));
+    }
     let Some(waiter) = request_chat_cancel(
         &state.app_state.session.foreground_turns,
-        scope.workspace_id(),
+        &workspace_id,
         &conversation_id,
-        &root_turn_id,
+        &expected_root_turn_id,
     )?
     else {
+        let _ = state.app_state.storage.chat_events.append(
+            &workspace_id,
+            Some(&conversation_id),
+            &expected_root_turn_id,
+            ChatDriverEvent::TurnStatus {
+                status: "cancelled".to_string(),
+            },
+        );
         return Ok(serde_json::json!({
             "success": true,
-            "turn_id": root_turn_id,
+            "turn_id": expected_root_turn_id,
             "status": "already_settled",
         }));
     };
 
     // Reject pending HITL before waiting so parked execution can reach its
     // terminal outcome. Ownership remains registered until that settlement.
-    cancel_pending_hitl(Some(&root_turn_id), "cancelled by user").await;
+    cancel_pending_hitl(Some(&expected_root_turn_id), "cancelled by user").await;
     let settlement = waiter
         .wait()
         .await
@@ -920,13 +1122,107 @@ pub async fn cancel_chat(
 }
 
 /// Respond to an approval request.
+fn validate_hitl_response_scope(
+    state: &TauriState,
+    workspace_id: &str,
+    conversation_id: &str,
+    expected_root_turn_id: Option<&str>,
+    expected_active_turn_id: Option<&str>,
+) -> Result<(), IpcError> {
+    let root_turn_id = expected_root_turn_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| IpcError::Validation("expected_root_turn_id is required".to_string()))?;
+    let active_turn_id = expected_active_turn_id
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| IpcError::Validation("expected_active_turn_id is required".to_string()))?;
+    let snapshots = state
+        .app_state
+        .session
+        .foreground_turns
+        .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if snapshots.iter().any(|snapshot| {
+        snapshot.root_turn_id == root_turn_id && snapshot.active_turn_id == active_turn_id
+    }) {
+        Ok(())
+    } else {
+        Err(IpcError::Validation(
+            "HITL response does not match an active workspace turn".to_string(),
+        ))
+    }
+}
+
+fn settle_orphaned_hitl_projection(
+    state: &TauriState,
+    workspace_id: &str,
+    conversation_id: &str,
+    root_turn_id: Option<&str>,
+) {
+    let Some(root_turn_id) = root_turn_id.filter(|value| !value.trim().is_empty()) else {
+        return;
+    };
+    if let Ok(snapshots) = state
+        .app_state
+        .session
+        .foreground_turns
+        .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+    {
+        for snapshot in snapshots
+            .into_iter()
+            .filter(|snapshot| snapshot.root_turn_id == root_turn_id)
+        {
+            let _ = state
+                .app_state
+                .session
+                .foreground_turns
+                .request_root_cancel_scoped(
+                    workspace_id,
+                    snapshot.surface,
+                    conversation_id,
+                    root_turn_id,
+                );
+        }
+    }
+    let _ = state.app_state.storage.chat_events.append(
+        workspace_id,
+        Some(conversation_id),
+        root_turn_id,
+        ChatDriverEvent::TurnStatus {
+            status: "failed".to_string(),
+        },
+    );
+}
+
+// Tauri exposes these fields as individual IPC arguments; grouping them would
+// change the frontend wire contract rather than simplify internal logic.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_approval_response(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+    expected_root_turn_id: Option<String>,
+    expected_active_turn_id: Option<String>,
     request_id: String,
     approved: bool,
     reason: Option<String>,
     scope: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    if let Err(error) = validate_hitl_response_scope(
+        &state,
+        &workspace_id,
+        &conversation_id,
+        expected_root_turn_id.as_deref(),
+        expected_active_turn_id.as_deref(),
+    ) {
+        settle_orphaned_hitl_projection(
+            &state,
+            &workspace_id,
+            &conversation_id,
+            expected_root_turn_id.as_deref(),
+        );
+        return Err(error);
+    }
     let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
     if let Some(req) = req {
         let _ = req.tx.send(PendingResponse::Approval {
@@ -936,6 +1232,12 @@ pub async fn send_approval_response(
         });
         Ok(serde_json::json!({"success": true}))
     } else {
+        settle_orphaned_hitl_projection(
+            &state,
+            &workspace_id,
+            &conversation_id,
+            expected_root_turn_id.as_deref(),
+        );
         Err(IpcError::NotFound(format!(
             "Approval request '{}' not found or expired",
             request_id
@@ -946,14 +1248,40 @@ pub async fn send_approval_response(
 /// Respond to an input request.
 #[tauri::command]
 pub async fn send_input_response(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+    expected_root_turn_id: Option<String>,
+    expected_active_turn_id: Option<String>,
     request_id: String,
     text: String,
 ) -> Result<serde_json::Value, IpcError> {
+    if let Err(error) = validate_hitl_response_scope(
+        &state,
+        &workspace_id,
+        &conversation_id,
+        expected_root_turn_id.as_deref(),
+        expected_active_turn_id.as_deref(),
+    ) {
+        settle_orphaned_hitl_projection(
+            &state,
+            &workspace_id,
+            &conversation_id,
+            expected_root_turn_id.as_deref(),
+        );
+        return Err(error);
+    }
     let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
     if let Some(req) = req {
         let _ = req.tx.send(PendingResponse::Input { text });
         Ok(serde_json::json!({"success": true}))
     } else {
+        settle_orphaned_hitl_projection(
+            &state,
+            &workspace_id,
+            &conversation_id,
+            expected_root_turn_id.as_deref(),
+        );
         Err(IpcError::NotFound(format!(
             "Input request '{}' not found or expired",
             request_id
@@ -962,12 +1290,34 @@ pub async fn send_input_response(
 }
 
 /// Respond to a selection request.
+// Keep parity with the selection-response IPC schema consumed by all GUIs.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_selection_response(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+    expected_root_turn_id: Option<String>,
+    expected_active_turn_id: Option<String>,
     request_id: String,
     selection: String,
     instructions: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    if let Err(error) = validate_hitl_response_scope(
+        &state,
+        &workspace_id,
+        &conversation_id,
+        expected_root_turn_id.as_deref(),
+        expected_active_turn_id.as_deref(),
+    ) {
+        settle_orphaned_hitl_projection(
+            &state,
+            &workspace_id,
+            &conversation_id,
+            expected_root_turn_id.as_deref(),
+        );
+        return Err(error);
+    }
     let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
     if let Some(req) = req {
         let _ = req.tx.send(PendingResponse::Selection {
@@ -976,6 +1326,12 @@ pub async fn send_selection_response(
         });
         Ok(serde_json::json!({"success": true}))
     } else {
+        settle_orphaned_hitl_projection(
+            &state,
+            &workspace_id,
+            &conversation_id,
+            expected_root_turn_id.as_deref(),
+        );
         Err(IpcError::NotFound(format!(
             "Selection request '{}' not found or expired",
             request_id
@@ -1066,6 +1422,7 @@ struct TauriChatSink {
 
 pub(crate) fn tauri_chat_sink(
     app: tauri::AppHandle,
+    workspace_id: String,
     message_key: String,
     conversation_id: Option<String>,
     tool_executions: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
@@ -1089,6 +1446,7 @@ pub(crate) fn tauri_chat_sink(
         renderer,
         chat_events,
         tool_executions,
+        workspace_id,
         conversation_id,
         message_key,
     )
@@ -1208,6 +1566,7 @@ mod chat_sink_contract_tests {
             renderer,
             log.clone(),
             repository,
+            "workspace-1",
             Some("conversation-wire".to_string()),
             "root-message",
         );
@@ -1231,7 +1590,7 @@ mod chat_sink_contract_tests {
         let emitted = lock_std(&captured, "captured Tauri chat envelope")
             .clone()
             .ok_or_else(|| std::io::Error::other("Tauri renderer emitted no envelope"))?;
-        let replay = log.replay(Some("conversation-wire"), "ignored", 0)?;
+        let replay = log.replay("workspace-1", Some("conversation-wire"), "root-message", 0)?;
         let persisted = replay
             .events
             .first()
@@ -1266,6 +1625,7 @@ mod chat_sink_contract_tests {
             renderer,
             log,
             repository.clone(),
+            "workspace-1",
             Some("conversation-1".to_string()),
             "message-1",
         );
@@ -1302,7 +1662,7 @@ mod chat_sink_contract_tests {
         assert_eq!(envelope_count.load(Ordering::SeqCst), 1);
 
         let detail_ref = repository
-            .summaries_for_conversation("conversation-1")
+            .summaries_for_conversation("workspace-1", "conversation-1")
             .into_iter()
             .find(|summary| summary.call_id == "call-1")
             .ok_or_else(|| std::io::Error::other("tool result projection missing"))?
@@ -1312,12 +1672,12 @@ mod chat_sink_contract_tests {
 
         let rebound = ToolExecutionRepository::open(tool_root)?;
         let summary = rebound
-            .summaries_for_conversation("conversation-1")
+            .summaries_for_conversation("workspace-1", "conversation-1")
             .into_iter()
             .find(|summary| summary.call_id == "call-1")
             .ok_or_else(|| std::io::Error::other("tool result did not survive reopen"))?;
         assert_eq!(summary.status, ToolExecutionStatus::Succeeded);
-        let detail = rebound.detail_manifest(&detail_ref)?;
+        let detail = rebound.detail_manifest("workspace-1", &detail_ref)?;
         let result = detail
             .result
             .as_ref()
@@ -1361,6 +1721,7 @@ mod chat_sink_contract_tests {
         ] {
             let envelope = EventEnvelope::new(&identity, sequence, None, event)?;
             log.append(
+                "workspace-1",
                 Some("conversation-replay"),
                 "root-replay",
                 ChatDriverEvent::Agent(Box::new(envelope)),
@@ -1368,18 +1729,18 @@ mod chat_sink_contract_tests {
         }
 
         let repository = Arc::new(ToolExecutionRepository::open(temp.path().join("tools"))?);
-        let replay = log.replay(Some("conversation-replay"), "ignored", 0)?;
+        let replay = log.replay("workspace-1", Some("conversation-replay"), "root-replay", 0)?;
         let projector = ToolExecutionProjector::new(repository.clone(), None);
         projector.rebuild_from_retained(&replay.events)?;
         projector.rebuild_from_retained(&replay.events)?;
 
-        let summaries = repository.summaries_for_conversation("conversation-replay");
+        let summaries = repository.summaries_for_conversation("workspace-1", "conversation-replay");
         assert_eq!(summaries.len(), 1);
         let summary = summaries
             .first()
             .ok_or_else(|| std::io::Error::other("replayed tool detail missing"))?;
         assert_eq!(summary.status, ToolExecutionStatus::Succeeded);
-        let detail = repository.detail_manifest(&summary.detail_ref)?;
+        let detail = repository.detail_manifest("workspace-1", &summary.detail_ref)?;
         let result = detail
             .result
             .ok_or_else(|| std::io::Error::other("replayed canonical result missing"))?;
@@ -1406,6 +1767,7 @@ mod chat_sink_contract_tests {
             renderer,
             log.clone(),
             repository,
+            "workspace-1",
             Some("conversation-hitl".to_string()),
             "root-hitl",
         );
@@ -1420,7 +1782,7 @@ mod chat_sink_contract_tests {
         );
         assert!(result.is_err());
 
-        let replay = log.replay(Some("conversation-hitl"), "ignored", 0)?;
+        let replay = log.replay("workspace-1", Some("conversation-hitl"), "root-hitl", 0)?;
         let statuses = replay
             .events
             .iter()
@@ -1442,6 +1804,8 @@ mod chat_sink_contract_tests {
 
 fn emit_tauri_execution_event(app: &tauri::AppHandle, event: ExecEvent) {
     let ExecEvent {
+        workspace_id,
+        conversation_id,
         run_id,
         scope,
         task_id,
@@ -1460,12 +1824,16 @@ fn emit_tauri_execution_event(app: &tauri::AppHandle, event: ExecEvent) {
     }
     emit_execution_event(
         app,
-        &run_id,
-        kind,
-        event.as_str(),
-        agent.as_deref().unwrap_or("echo-assistant"),
-        subagent_run_id.as_deref().unwrap_or(""),
-        payload,
+        ExecutionEventProjection {
+            workspace_id: &workspace_id,
+            conversation_id: &conversation_id,
+            run_id: &run_id,
+            kind,
+            event: event.as_str(),
+            agent: agent.as_deref().unwrap_or("echo-assistant"),
+            subagent_run_id: subagent_run_id.as_deref().unwrap_or(""),
+            payload,
+        },
     );
 }
 
@@ -1583,6 +1951,8 @@ mod execution_projector_tests {
 
         projector.emit(
             ExecEvent::subagent(
+                "workspace-1",
+                "conversation-1",
                 "run-1",
                 "task-1",
                 execution_id,
@@ -1601,6 +1971,8 @@ mod execution_projector_tests {
             .with_agent("explorer"),
         );
         projector.emit(ExecEvent::subagent(
+            "workspace-1",
+            "conversation-1",
             "run-1",
             "task-1",
             execution_id,
@@ -1613,6 +1985,8 @@ mod execution_projector_tests {
             }),
         ));
         projector.emit(ExecEvent::subagent(
+            "workspace-1",
+            "conversation-1",
             "run-1",
             "task-1",
             execution_id,
@@ -1633,14 +2007,14 @@ mod execution_projector_tests {
             }),
         ));
 
-        let summaries = repository.summaries_for_conversation("conversation-1");
+        let summaries = repository.summaries_for_conversation("workspace-1", "conversation-1");
         let completed = summaries
             .iter()
             .find(|summary| summary.call_id == "call-1")
             .ok_or_else(|| "missing completed tool summary".to_string())?;
         assert_eq!(completed.status, ToolExecutionStatus::Succeeded);
         assert_eq!(completed.run_id.as_deref(), Some("run-1"));
-        let detail = repository.detail_manifest(&completed.detail_ref)?;
+        let detail = repository.detail_manifest("workspace-1", &completed.detail_ref)?;
         assert_eq!(
             detail
                 .result
@@ -1649,13 +2023,15 @@ mod execution_projector_tests {
                 .map(String::as_str),
             Some("canonical-result")
         );
-        let output = repository.read_output(&completed.detail_ref, None, 1024)?;
+        let output = repository.read_output("workspace-1", &completed.detail_ref, None, 1024)?;
         assert_eq!(
             output.chunks.first().map(|chunk| chunk.text.as_str()),
             Some("main output")
         );
 
         projector.emit(ExecEvent::subagent(
+            "workspace-1",
+            "conversation-1",
             "run-1",
             "task-1",
             execution_id,
@@ -1672,6 +2048,8 @@ mod execution_projector_tests {
             }),
         ));
         projector.emit(ExecEvent::subagent(
+            "workspace-1",
+            "conversation-1",
             "run-1",
             "task-1",
             execution_id,
@@ -1679,7 +2057,7 @@ mod execution_projector_tests {
             serde_json::json!({}),
         ));
 
-        let summaries = repository.summaries_for_conversation("conversation-1");
+        let summaries = repository.summaries_for_conversation("workspace-1", "conversation-1");
         let orphaned = summaries
             .iter()
             .find(|summary| summary.call_id == "call-2")

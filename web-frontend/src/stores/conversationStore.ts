@@ -3,6 +3,9 @@ import { useChatStore } from './chatStore';
 import { sessionApi, conversationApi, toolExecutionApi } from '../api/endpoints';
 import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
+import { useSubagentRunStore } from './subagentRunStore';
+import { useTaskRuntimeStore } from './taskRuntimeStore';
+import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
 import type { ChatMessage, ExecutionStep, SavedMessage } from '../types/api';
 
 let loadGeneration = 0;
@@ -22,6 +25,8 @@ export interface ConversationMeta {
 }
 
 interface ConversationState {
+  /** Workspace owning this list and active conversation projection. */
+  workspaceId: string;
   /** All conversations sorted by updatedAt desc */
   conversations: ConversationMeta[];
   /** Currently active conversation ID */
@@ -32,7 +37,9 @@ interface ConversationState {
   isLoading: boolean;
 
   /** Initialize: load from backend */
-  init: () => Promise<void>;
+  init: (workspaceId: string) => Promise<void>;
+  /** Immediately detach the visible conversation projection during a workspace transition. */
+  detachForWorkspace: (workspaceId: string) => void;
   /** Save current chat messages as a conversation (upsert) */
   saveCurrent: (messages: ChatMessage[]) => Promise<void>;
   /** Load a conversation and display it */
@@ -206,14 +213,19 @@ export function restoredMessageId(
 // ── Store ──
 
 export const useConversationStore = create<ConversationState>((set, get) => ({
+  workspaceId: GLOBAL_WORKSPACE_ID,
   conversations: [],
   activeId: null,
   newConversationEpoch: 0,
   isLoading: false,
 
-  init: async () => {
+  init: async (workspaceId: string) => {
+    const generation = loadGeneration + 1;
+    loadGeneration = generation;
+    set({ workspaceId });
     try {
-      const items = await conversationApi.list();
+      const items = await conversationApi.list(workspaceId);
+      if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
       if (import.meta.env.DEV)
         console.debug('[conversationStore] init: loaded', items.length, 'conversations');
       const metas: ConversationMeta[] = items
@@ -224,17 +236,33 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           messageCount: item.message_count,
           createdAt: new Date(item.created_at).getTime(),
           updatedAt: new Date(item.updated_at).getTime(),
+          workspaceId,
         }))
         .sort((a, b) => b.updatedAt - a.updatedAt);
       set({ conversations: metas });
     } catch (e) {
       console.error('[conversationStore] init FAILED:', e);
-      set({ conversations: [] });
+      if (generation === loadGeneration && get().workspaceId === workspaceId) {
+        set({ conversations: [] });
+      }
     }
+  },
+
+  detachForWorkspace: (workspaceId: string) => {
+    loadGeneration += 1;
+    loadingConversationId = null;
+    set((state) => ({
+      workspaceId,
+      conversations: [],
+      activeId: null,
+      newConversationEpoch: state.newConversationEpoch + 1,
+      isLoading: false,
+    }));
   },
 
   saveCurrent: async (messages: ChatMessage[]) => {
     const activeId = get().activeId;
+    const workspaceId = get().workspaceId;
     if (messages.length === 0) return;
 
     const firstUserMsg = messages.find((m) => m.role === 'user');
@@ -245,14 +273,14 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     try {
       if (activeId) {
         // Update existing
-        const res = await conversationApi.update(activeId, {
+        const res = await conversationApi.update(workspaceId, activeId, {
           title,
         });
         if (import.meta.env.DEV) console.debug('[saveCurrent] update result:', res);
       } else {
         // Create new
         const newId = generateId();
-        const res = await conversationApi.save({
+        const res = await conversationApi.save(workspaceId, {
           id: newId,
           title,
           // The Agent backend is the sole transcript writer. Creating the
@@ -260,6 +288,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           messages: [],
         });
         if (import.meta.env.DEV) console.debug('[saveCurrent] save result:', res, 'newId:', newId);
+        if (get().workspaceId !== workspaceId) return;
         set({ activeId: newId });
       }
     } catch (e) {
@@ -269,7 +298,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
     // Refresh list (best-effort, must not throw)
     try {
-      const items = await conversationApi.list();
+      const items = await conversationApi.list(workspaceId);
+      if (get().workspaceId !== workspaceId) return;
       if (import.meta.env.DEV)
         console.debug('[saveCurrent] refreshed list:', items.length, 'conversations');
       const metas: ConversationMeta[] = items
@@ -280,6 +310,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           messageCount: item.message_count,
           createdAt: new Date(item.created_at).getTime(),
           updatedAt: new Date(item.updated_at).getTime(),
+          workspaceId,
         }))
         .sort((a, b) => b.updatedAt - a.updatedAt);
       set({ conversations: metas });
@@ -289,26 +320,38 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   loadConversation: async (id: string) => {
+    const workspaceId = get().workspaceId;
     const generation = loadGeneration + 1;
     loadGeneration = generation;
     loadingConversationId = id;
-    set({ isLoading: true });
+    useChatStore.getState().clearMessages();
+    useTaskRuntimeStore.getState().reset();
+    useToolExecutionStore.getState().clear();
+    useSubagentRunStore.getState().clear();
+    // Publish the selected id only after transcript/tool hydration completes.
+    // This makes the chat hook rebind the live turn after `replaceMessages`
+    // instead of creating a placeholder that the late transcript load erases.
+    set({ isLoading: true, activeId: null });
 
     try {
       const [record, tools] = await Promise.all([
-        conversationApi.get(id),
-        toolExecutionApi.list(id),
+        conversationApi.get(workspaceId, id),
+        toolExecutionApi.list(workspaceId, id),
       ]);
-      if (generation !== loadGeneration) return;
+      if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
 
-      // Restore agent context on the backend so conversation can continue
+      // Restore agent context on the backend so conversation can continue.
+      let restoreReady = true;
       try {
-        await conversationApi.restore(id);
+        await conversationApi.restore(workspaceId, id);
       } catch (e) {
+        restoreReady = false;
         console.error('Failed to restore agent context:', e);
+        useToastStore.getState().addToast('error', '会话上下文恢复失败，已切换为只读历史视图');
+        useChatStore.getState().setHistoryView(true);
       }
-      if (generation !== loadGeneration) return;
-      useToolExecutionStore.getState().hydrateConversation(id, tools);
+      if (generation !== loadGeneration || get().workspaceId !== workspaceId) return;
+      useToolExecutionStore.getState().hydrateConversation(workspaceId, id, tools);
 
       // Convert user/assistant messages for display. Tool-role payloads stay in
       // the agent context; the GUI renders tools from lightweight summaries.
@@ -369,7 +412,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
       const chatStore = useChatStore.getState();
       chatStore.replaceMessages(chatMessages);
-      chatStore.setHistoryView(false); // Agent has context, can continue chatting
+      chatStore.setHistoryView(!restoreReady);
 
       set({ activeId: id, isLoading: false });
       loadingConversationId = null;
@@ -384,10 +427,11 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
   branchCurrent: async (userTurnIndex: number) => {
     const activeId = get().activeId;
+    const workspaceId = get().workspaceId;
     if (!activeId) throw new Error('No active conversation to branch');
-    const result = await conversationApi.branch(activeId, userTurnIndex);
+    const result = await conversationApi.branch(workspaceId, activeId, userTurnIndex);
     set({ activeId: result.id, isLoading: false });
-    await get().init();
+    await get().init(workspaceId);
     return { id: result.id, targetContent: result.target_content };
   },
 
@@ -400,7 +444,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       set({ isLoading: false });
     }
     try {
-      const receipt = await conversationApi.delete(id);
+      const receipt = await conversationApi.delete(get().workspaceId, id);
       if (receipt.cleanup_pending) {
         useToastStore.getState().addToast('warning', '会话已删除，剩余本地清理将在下次启动时继续');
       }
@@ -420,14 +464,16 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     });
     if (wasActive) {
       useChatStore.getState().clearMessages();
+      useTaskRuntimeStore.getState().reset();
       useToolExecutionStore.getState().clear();
+      useSubagentRunStore.getState().clear();
     }
   },
 
   renameConversation: async (id: string, title: string) => {
     // P1-12: 同 deleteConversation, API 失败则不更新本地 + 报错。
     try {
-      await conversationApi.update(id, { title });
+      await conversationApi.update(get().workspaceId, id, { title });
     } catch (e) {
       console.error('Failed to rename conversation:', e);
       useToastStore.getState().addToast('error', '重命名会话失败，请重试');
@@ -453,7 +499,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     // Detach the UI immediately. Existing conversation agents are intentionally
     // left running in their own pool slots and can be resumed from the sidebar.
     useChatStore.getState().clearMessages();
+    useTaskRuntimeStore.getState().reset();
     useToolExecutionStore.getState().clear();
+    useSubagentRunStore.getState().clear();
     set((state) => ({
       activeId: null,
       newConversationEpoch: state.newConversationEpoch + 1,
@@ -480,7 +528,9 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     }
 
     useChatStore.getState().clearMessages();
+    useTaskRuntimeStore.getState().reset();
     useToolExecutionStore.getState().clear();
+    useSubagentRunStore.getState().clear();
     set({ activeId: null, isLoading: false });
   },
 

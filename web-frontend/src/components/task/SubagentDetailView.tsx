@@ -16,6 +16,7 @@ import { taskRuntimeApi } from '../../api/endpoints';
 import type { SubagentControlIdentity } from '../../generated';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
 import { useToastStore } from '../../stores/toastStore';
+import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import {
   toolExecutionIdsForOwner,
   toolExecutionOwnerKey,
@@ -67,6 +68,7 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
     null
   );
   const cacheSummary = cacheUsageForRuns([run]);
+  const workspaceId = useTaskRuntimeStore((state) => state.activeRun?.workspace_id ?? null);
   const ownerKey = toolExecutionOwnerKey(
     {
       kind: 'subagent',
@@ -103,7 +105,7 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
 
   const runControl = async (action: 'message' | 'followup' | 'interrupt') => {
     const identity = controlIdentity(action);
-    if (!identity) {
+    if (!identity || !workspaceId) {
       addToast('error', 'Subagent identity is not available yet');
       return;
     }
@@ -114,10 +116,10 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
     try {
       const receipt =
         action === 'message'
-          ? await taskRuntimeApi.sendSubagentMessage(identity, instruction ?? '')
+          ? await taskRuntimeApi.sendSubagentMessage(workspaceId, identity, instruction ?? '')
           : action === 'followup'
-            ? await taskRuntimeApi.queueSubagentGuidance(identity, instruction ?? '')
-            : await taskRuntimeApi.interruptSubagent(identity);
+            ? await taskRuntimeApi.queueSubagentGuidance(workspaceId, identity, instruction ?? '')
+            : await taskRuntimeApi.interruptSubagent(workspaceId, identity);
       addToast(
         receipt.status === 'rejected' ? 'warning' : 'success',
         `Subagent command ${receipt.status}`

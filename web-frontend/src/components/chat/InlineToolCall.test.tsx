@@ -6,6 +6,7 @@ import { toolSummaryText } from './InlineToolCall';
 function summary(overrides: Partial<ToolExecution> = {}): ToolExecution {
   return {
     id: 'detail-1',
+    workspace_id: 'workspace-1',
     call_id: 'call-1',
     owner: { kind: 'chat', message_id: 'message-1' },
     conversation_id: 'conversation-1',

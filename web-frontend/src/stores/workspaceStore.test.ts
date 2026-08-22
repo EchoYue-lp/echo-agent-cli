@@ -8,6 +8,7 @@ const mocks = vi.hoisted(() => ({
   resetSession: vi.fn(),
   clearMessages: vi.fn(),
   initConversations: vi.fn(),
+  detachConversations: vi.fn(),
   markWorkspaceChanged: vi.fn(),
   loadTree: vi.fn(),
   loadChanges: vi.fn(),
@@ -37,6 +38,7 @@ vi.mock('./conversationStore', () => ({
     setState: vi.fn(),
     getState: () => ({
       init: mocks.initConversations,
+      detachForWorkspace: mocks.detachConversations,
       conversations: [],
     }),
   },
@@ -59,6 +61,14 @@ vi.mock('./toastStore', () => ({
 }));
 
 import { useWorkspaceStore } from './workspaceStore';
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((next) => {
+    resolve = next;
+  });
+  return { promise, resolve };
+}
 
 describe('workspaceStore file identity integration', () => {
   beforeEach(() => {
@@ -165,5 +175,40 @@ describe('workspaceStore file identity integration', () => {
       useWorkspaceStore.getState().createAndSwitch('Workspace B', 'code', '/workspace-b')
     ).rejects.toThrow('工作区已创建，但进入失败：runtime transition failed');
     expect(mocks.switchWorkspace).not.toHaveBeenCalled();
+  });
+
+  it('ignores an older workspace transition that resolves after the newest focus', async () => {
+    const first = deferred<any>();
+    const second = deferred<any>();
+    mocks.switchWorkspace.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
+
+    const switchA = useWorkspaceStore.getState().switchTo('workspace-a');
+    const switchB = useWorkspaceStore.getState().switchTo('workspace-b');
+    second.resolve({
+      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      transition: {
+        status: 'committed',
+        previous_workspace_id: 'workspace-a',
+        target_workspace_id: 'workspace-b',
+        target_root: '/workspace-b',
+        degraded_subsystems: [],
+      },
+    });
+    await switchB;
+    first.resolve({
+      workspace: { id: 'workspace-a', name: 'Workspace A' },
+      transition: {
+        status: 'committed',
+        previous_workspace_id: null,
+        target_workspace_id: 'workspace-a',
+        target_root: '/workspace-a',
+        degraded_subsystems: [],
+      },
+    });
+    await switchA;
+
+    expect(useWorkspaceStore.getState().current?.id).toBe('workspace-b');
+    expect(mocks.initConversations).toHaveBeenCalledTimes(1);
+    expect(mocks.initConversations).toHaveBeenCalledWith('workspace-b');
   });
 });

@@ -49,6 +49,8 @@ interface WireSubagentArtifactResult {
 /** One raw event on the wire (the bridge emits these as a serde_json::Object). */
 export interface ExecutionEvent {
   kind: 'subagent';
+  workspace_id: string;
+  conversation_id: string;
   subagent_run_id: string;
   run_id: string;
   agent: string;
@@ -361,6 +363,7 @@ export function taskRuntimeSubagentExecutionEvents(
       agentsByExecution.set(executionId, agent);
       projected.push({
         kind: 'subagent',
+        workspace_id: run.workspace_id,
         subagent_run_id: executionId,
         run_id: run.run_id,
         task_id: taskId,
@@ -383,6 +386,7 @@ export function taskRuntimeSubagentExecutionEvents(
     const output = jsonString(payload?.full_output);
     projected.push({
       kind: 'subagent',
+      workspace_id: run.workspace_id,
       subagent_run_id: executionId,
       run_id: run.run_id,
       task_id: taskId,

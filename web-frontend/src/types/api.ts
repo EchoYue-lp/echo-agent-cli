@@ -131,6 +131,7 @@ export interface ToolExecution {
   id: string;
   call_id: string;
   owner: ToolExecutionOwner;
+  workspace_id: string;
   conversation_id?: string | null;
   run_id?: string | null;
   name: string;
@@ -320,6 +321,17 @@ export type ChatDriverEvent =
   | { source: 'execution_path'; event: { requested_mode: string; observed_path: string } }
   | { source: 'interrupt'; event: { run_id: string; goal: string; new_message: string } }
   | {
+      source: 'input_queued';
+      event: {
+        input_id: string;
+        text: string;
+        attachments: Attachment[];
+        submitted_at_ms: number;
+      };
+    }
+  | { source: 'input_removed'; event: { input_id: string } }
+  | { source: 'input_reordered'; event: { input_ids: string[] } }
+  | {
       source: 'approval_request';
       event: { request_id: string; tool_name: string; args: unknown; prompt: string };
     }
@@ -347,11 +359,13 @@ export type ChatDriverEvent =
 
 export interface ChatEventEnvelope {
   schema_version: number;
+  workspace_id: string;
   event_id: string;
   content_hash: string;
   sequence: number;
   stream_id: string;
   conversation_id: string | null;
+  root_turn_id: string;
   turn_id: string;
   message_id: string;
   timestamp: string;

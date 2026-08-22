@@ -602,6 +602,12 @@ impl AppChannelMessageHandler {
                         .app_state
                         .compress_conversation_owned(
                             echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                                workspace_id: self
+                                    .app_state
+                                    .current_execution_scope()
+                                    .await
+                                    .workspace_id()
+                                    .to_string(),
                                 conversation_id: conv.to_string(),
                                 surface: ForegroundTurnSurface::Channel,
                                 focus,
@@ -1395,6 +1401,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         renderer,
                         app_state.storage.chat_events.clone(),
                         app_state.storage.tool_executions.clone(),
+                        execution_scope.workspace_id().to_string(),
                         Some(conv_owned.clone()),
                         turn_id.clone(),
                     );
@@ -1839,6 +1846,17 @@ async fn aggregate_by_sentence<'a>(
                         format!("[paused:{run_id}] {goal}; new instruction: {new_message}"),
                     );
                 }
+                ChannelRenderEvent::Driver(ChatDriverEvent::InputQueued { input_id, .. }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[queued:{input_id}]"),
+                    );
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::InputRemoved { .. }) => {}
+                ChannelRenderEvent::Driver(ChatDriverEvent::InputReordered { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::ApprovalRequest {
                     request_id,
                     tool_name,

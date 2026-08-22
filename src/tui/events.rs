@@ -1641,6 +1641,7 @@ async fn dispatch_turn(
         renderer,
         app_state.storage.chat_events.clone(),
         app_state.storage.tool_executions.clone(),
+        scoped_runtime.execution_scope().workspace_id().to_string(),
         app.conversation_id.clone(),
         turn_id.clone(),
     );
@@ -2474,6 +2475,15 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 goal,
                 new_message,
             },
+            ChatDriverEvent::InputQueued { input_id, .. } => {
+                AgentEvent::Notice(format!("Input queued: {input_id}"))
+            }
+            ChatDriverEvent::InputRemoved { input_id } => {
+                AgentEvent::Notice(format!("Queued input removed: {input_id}"))
+            }
+            ChatDriverEvent::InputReordered { .. } => {
+                AgentEvent::Notice("Queued inputs reordered".to_string())
+            }
             ChatDriverEvent::ApprovalRequest {
                 request_id,
                 tool_name,
@@ -3855,6 +3865,11 @@ async fn handle_slash_command(
                     app_state
                         .compress_conversation_owned(
                             echo_agent_app_core::manual_compression::ManualCompressionRequest {
+                                workspace_id: app_state
+                                    .current_execution_scope()
+                                    .await
+                                    .workspace_id()
+                                    .to_string(),
                                 conversation_id: conversation_id.clone(),
                                 surface: ForegroundTurnSurface::Tui,
                                 focus: None,

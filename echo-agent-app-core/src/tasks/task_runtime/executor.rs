@@ -41,6 +41,27 @@ use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use futures::StreamExt;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
+/// Process-wide EKO resource ceiling shared by every workspace and TaskRun.
+/// Per-run limits still apply; a dispatch must hold both permits, so opening
+/// more workspace hosts cannot multiply provider or machine concurrency.
+struct ProcessExecutionGovernor {
+    subagent: Semaphore,
+    write: Semaphore,
+    shell: Semaphore,
+    llm: Semaphore,
+}
+
+static PROCESS_EXECUTION_GOVERNOR: std::sync::LazyLock<ProcessExecutionGovernor> =
+    std::sync::LazyLock::new(|| {
+        let limits = EkoExecutionLimits::default();
+        ProcessExecutionGovernor {
+            subagent: Semaphore::new(limits.max_concurrent_subagents.max(1)),
+            write: Semaphore::new(limits.max_concurrent_writes.max(1)),
+            shell: Semaphore::new(limits.max_concurrent_shells.max(1)),
+            llm: Semaphore::new(limits.max_parallel_llm_calls.max(1)),
+        }
+    });
+
 use super::completion_gate::{artifact_matches, verification_matches};
 use super::store::{ClaimWriteOutcome, StoreError, SubagentReleaseRecord, TaskRuntimeStore};
 use super::types::*;
@@ -84,6 +105,8 @@ pub enum ExecEventScope {
 /// (`content`/`name`/`args`/...) as a flat JSON object.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecEvent {
+    pub workspace_id: String,
+    pub conversation_id: String,
     pub run_id: String,
     pub scope: ExecEventScope,
     /// Plan node identity. Present on task and Subagent events.
@@ -100,11 +123,15 @@ pub struct ExecEvent {
 impl ExecEvent {
     /// Construct a run-level event (no task_id).
     pub fn run(
+        workspace_id: impl Into<String>,
+        conversation_id: impl Into<String>,
         run_id: impl Into<String>,
         event: RuntimeEventKind,
         payload: serde_json::Value,
     ) -> Self {
         Self {
+            workspace_id: workspace_id.into(),
+            conversation_id: conversation_id.into(),
             run_id: run_id.into(),
             scope: ExecEventScope::Run,
             task_id: None,
@@ -117,12 +144,16 @@ impl ExecEvent {
 
     /// Construct a plan-task event. These events never mutate Subagent state.
     pub fn task(
+        workspace_id: impl Into<String>,
+        conversation_id: impl Into<String>,
         run_id: impl Into<String>,
         task_id: impl Into<String>,
         event: RuntimeEventKind,
         payload: serde_json::Value,
     ) -> Self {
         Self {
+            workspace_id: workspace_id.into(),
+            conversation_id: conversation_id.into(),
             run_id: run_id.into(),
             scope: ExecEventScope::Task,
             task_id: Some(task_id.into()),
@@ -135,6 +166,8 @@ impl ExecEvent {
 
     /// Construct an event for one concrete Subagent execution attempt.
     pub fn subagent(
+        workspace_id: impl Into<String>,
+        conversation_id: impl Into<String>,
         run_id: impl Into<String>,
         task_id: impl Into<String>,
         subagent_run_id: impl Into<String>,
@@ -142,6 +175,8 @@ impl ExecEvent {
         payload: serde_json::Value,
     ) -> Self {
         Self {
+            workspace_id: workspace_id.into(),
+            conversation_id: conversation_id.into(),
             run_id: run_id.into(),
             scope: ExecEventScope::Subagent,
             task_id: Some(task_id.into()),
@@ -351,6 +386,8 @@ pub async fn execute_run(
     emit_exec(
         trace_sink.as_ref(),
         ExecEvent::run(
+            run.workspace_id.clone(),
+            run.conversation_id.clone(),
             run_id.to_string(),
             RuntimeEventKind::RunStarted,
             serde_json::json!({
@@ -452,6 +489,8 @@ pub async fn execute_run(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
+                    run.workspace_id.clone(),
+                    run.conversation_id.clone(),
                     run_id.to_string(),
                     RuntimeEventKind::RunCompleted,
                     serde_json::json!({ "status": "completed" }),
@@ -485,6 +524,8 @@ pub async fn execute_run(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
+                    run.workspace_id.clone(),
+                    run.conversation_id.clone(),
                     run_id.to_string(),
                     RuntimeEventKind::RunFailed,
                     serde_json::json!({
@@ -514,6 +555,8 @@ pub async fn execute_run(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
+                    run.workspace_id.clone(),
+                    run.conversation_id.clone(),
                     run_id.to_string(),
                     RuntimeEventKind::RunCancelled,
                     serde_json::json!({ "status": "cancelled" }),
@@ -546,6 +589,8 @@ pub async fn execute_run(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
+                    run.workspace_id.clone(),
+                    run.conversation_id.clone(),
                     run_id.to_string(),
                     RuntimeEventKind::RunStatusChanged,
                     serde_json::json!({
@@ -585,6 +630,8 @@ pub async fn execute_run(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
+                    run.workspace_id.clone(),
+                    run.conversation_id.clone(),
                     run_id.to_string(),
                     RuntimeEventKind::RunFailed,
                     serde_json::json!({ "error": e.to_string() }),
@@ -744,8 +791,8 @@ fn assess_task_execution(task: &PlanTask, result: &SubagentTaskResult) -> Comple
 /// tested with a deterministic mock instead of a real LLM-backed Agent. The
 /// production implementation ([`RealTaskDispatcher`]) wraps `execute_task`.
 ///
-/// The dispatcher is given EKO-specific resource semaphores and file locks.
-/// The framework executor owns the global Subagent concurrency permit.
+/// The dispatcher is given EKO-specific per-run semaphores and file locks.
+/// EKO additionally holds one process-wide permit across all workspace runs.
 trait TaskDispatcher: Send + Sync {
     /// Execute `task` for `run_id`. Success carries both the bounded structured
     /// result and the complete model output. The former feeds parent summaries;
@@ -854,6 +901,11 @@ impl TaskDispatcher for RealTaskDispatcher {
             let cancel = context.cancel;
             let delegation_policy = context.delegation_policy;
             let task_id = task.id.clone();
+            let _process_subagent_permit = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for process Subagent permit")),
+                permit = PROCESS_EXECUTION_GOVERNOR.subagent.acquire() => permit.map_err(|error| TaskDispatchFailure::failed(task_id.clone(), error.to_string()))?,
+            };
             let (execution_agent, target_lease) =
                 resolve_task_execution_agent(&store, &run_id, &task, local_agent)
                     .await
@@ -924,6 +976,12 @@ impl TaskDispatcher for RealTaskDispatcher {
 
             let (execution_agent, target_lease) =
                 resolve_task_execution_agent(&store, &run_id, &task, local_agent).await?;
+            let run = store
+                .get_run(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("TaskRun '{run_id}' does not exist"))?;
+            let workspace_id = run.workspace_id;
+            let conversation_id = run.conversation_id;
 
             let working_dir = execution_agent
                 .read(|agent| agent.working_dir())
@@ -955,6 +1013,8 @@ impl TaskDispatcher for RealTaskDispatcher {
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::task(
+                    workspace_id.clone(),
+                    conversation_id.clone(),
                     run_id.clone(),
                     task.id.clone(),
                     RuntimeEventKind::MergeStarted,
@@ -996,6 +1056,8 @@ impl TaskDispatcher for RealTaskDispatcher {
                     emit_exec(
                         trace_sink.as_ref(),
                         ExecEvent::task(
+                            workspace_id.clone(),
+                            conversation_id.clone(),
                             run_id,
                             task.id.clone(),
                             RuntimeEventKind::MergeCompleted,
@@ -1023,6 +1085,8 @@ impl TaskDispatcher for RealTaskDispatcher {
                     emit_exec(
                         trace_sink.as_ref(),
                         ExecEvent::task(
+                            workspace_id,
+                            conversation_id,
                             run_id,
                             task.id.clone(),
                             RuntimeEventKind::MergeFailed,
@@ -1989,8 +2053,9 @@ async fn run_review_gate(
 
 /// Execute a single task through a selected Subagent or the primary Agent.
 ///
-/// The framework executor already holds the global Subagent permit; this
-/// function enforces EKO write/shell/LLM and file-ownership limits.
+/// The framework executor holds the per-run Subagent permit; the dispatcher
+/// also holds EKO's process permit. This function enforces the same two-level
+/// write/shell/LLM limits plus file ownership.
 #[allow(clippy::too_many_arguments)] // store + semaphores + locks + sinks all thread through
 async fn execute_task(
     store: Arc<TaskRuntimeStore>,
@@ -2008,18 +2073,30 @@ async fn execute_task(
 ) -> TaskDispatchResult {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
+    let run_context = store
+        .get_run(&run_id)
+        .map_err(|error| {
+            TaskDispatchFailure::failed(
+                task_id.clone(),
+                format!("failed to load TaskRun identity: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            TaskDispatchFailure::failed(
+                task_id.clone(),
+                format!("TaskRun '{run_id}' does not exist"),
+            )
+        })?;
+    let workspace_id = run_context.workspace_id.clone();
+    let conversation_id = run_context.conversation_id.clone();
+    let root_message_id = run_context.root_message_id.clone();
 
     // ── U1c phase-1 CP B: per-task unattended preflight ──
     // Re-check the task (kind + tools + shell) before acquiring permits.
     // Chat runs (Attended) skip this; only Unattended runs are checked.
     // Terminal fail on violation — never Paused, never awaits a human.
     {
-        let attended_mode = store
-            .get_run(&run_id)
-            .ok()
-            .flatten()
-            .map(|r| r.attended_mode)
-            .unwrap_or_default();
+        let attended_mode = run_context.attended_mode;
         if attended_mode == AttendedMode::Unattended
             && let Err(rejection) =
                 preflight_unattended_task(&task, super::task_tools::current_unattended_write_mode())
@@ -2075,6 +2152,8 @@ async fn execute_task(
 
     emit_task_started(
         trace_sink.as_ref(),
+        &workspace_id,
+        &conversation_id,
         &run_id,
         &execution_id,
         &task,
@@ -2082,19 +2161,24 @@ async fn execute_task(
     );
 
     // Acquire EKO product-resource permits with cancel awareness:
-    // - Read-only tasks need no additional permit; the framework executor
-    //   already owns the global Subagent permit.
+    // - Read-only tasks need no additional write/shell permit; the framework
+    //   and EKO process Subagent permits are already held by the dispatcher.
     // - Write tasks (implementation/debugging) take the write permit.
     // - Verification tasks (shell/build/test) take the write permit + the shell
     //   permit (default 1, plan §678-680 shell_concurrency = 1).
     let is_shell = matches!(task.kind, PlanTaskKind::Verification);
-    let (_write_permit, _shell_permit) = if is_shell {
+    let (_process_write_permit, _write_permit, _process_shell_permit, _shell_permit) = if is_shell {
         tracing::info!(
             run_id = %run_id,
             task_id = %task_id,
             available = write_sem.available_permits(),
             "task_runtime: waiting for write permit"
         );
+        let process_wp = tokio::select! {
+            biased;
+            _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for process write permit")),
+            p = PROCESS_EXECUTION_GOVERNOR.write.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
+        };
         let wp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for write permit")),
@@ -2111,6 +2195,11 @@ async fn execute_task(
             available = shell_sem.available_permits(),
             "task_runtime: waiting for shell permit"
         );
+        let process_sp = tokio::select! {
+            biased;
+            _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for process shell permit")),
+            p = PROCESS_EXECUTION_GOVERNOR.shell.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
+        };
         let sp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for shell permit")),
@@ -2121,7 +2210,7 @@ async fn execute_task(
             task_id = %task_id,
             "task_runtime: acquired shell permit"
         );
-        (Some(wp), Some(sp))
+        (Some(process_wp), Some(wp), Some(process_sp), Some(sp))
     } else if is_write {
         tracing::info!(
             run_id = %run_id,
@@ -2129,6 +2218,11 @@ async fn execute_task(
             available = write_sem.available_permits(),
             "task_runtime: waiting for write permit"
         );
+        let process_wp = tokio::select! {
+            biased;
+            _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for process write permit")),
+            p = PROCESS_EXECUTION_GOVERNOR.write.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
+        };
         let wp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for write permit")),
@@ -2139,9 +2233,9 @@ async fn execute_task(
             task_id = %task_id,
             "task_runtime: acquired write permit"
         );
-        (Some(wp), None)
+        (Some(process_wp), Some(wp), None, None)
     } else {
-        (None, None)
+        (None, None, None, None)
     };
 
     // Physical safety net below the ownership-safe DAG wave: exact file owners
@@ -2211,6 +2305,11 @@ async fn execute_task(
         available = llm_sem.available_permits(),
         "task_runtime: waiting for llm permit"
     );
+    let _process_llm_permit = tokio::select! {
+        biased;
+        _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for process LLM permit")),
+        p = PROCESS_EXECUTION_GOVERNOR.llm.acquire() => p.map_err(|e| TaskDispatchFailure::failed(task_id.clone(), e.to_string()))?,
+    };
     let _llm_permit = tokio::select! {
         biased;
         _ = task_cancel.cancelled() => return Err(TaskDispatchFailure::cancelled(task_id.clone(), "cancelled while waiting for LLM permit")),
@@ -2271,9 +2370,6 @@ async fn execute_task(
     // Resolve the run's root_message_id so the framework can carry it on
     // SubagentEvent::DispatchStarted → execution://event, letting the frontend
     // pin the subagent stream to the right chat message block.
-    let run_context = store.get_run(&run_id).ok().flatten();
-    let root_message_id = run_context.as_ref().map(|run| run.root_message_id.clone());
-    let conversation_id = run_context.as_ref().map(|run| run.conversation_id.clone());
     let controlled_attempt = if is_read_only_task || is_writer_task {
         let framework_executor = primary_agent
             .read(|agent| agent.subagent_executor().clone())
@@ -2342,14 +2438,15 @@ async fn execute_task(
     };
     emit_subagent_started(
         trace_sink.as_ref(),
+        &workspace_id,
         &run_id,
         &execution_id,
         &task,
         &contract,
         claim.revision,
         attempt,
-        conversation_id.as_deref(),
-        root_message_id.as_deref(),
+        &conversation_id,
+        Some(&root_message_id),
     );
     let framework_attempt_identity = controlled_attempt
         .as_ref()
@@ -2366,7 +2463,7 @@ async fn execute_task(
             &primary_agent,
             &run_id,
             &execution_id,
-            root_message_id.as_deref(),
+            Some(&root_message_id),
             &task.agent_role,
             &task_input,
             prompt_payload.clone(),
@@ -2472,6 +2569,8 @@ async fn execute_task(
         });
         emit_primary_subagent_isolation_observed(
             trace_sink.as_ref(),
+            &workspace_id,
+            &conversation_id,
             &run_id,
             &execution_id,
             &task,
@@ -2576,6 +2675,8 @@ async fn execute_task(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::subagent(
+                    workspace_id.clone(),
+                    conversation_id.clone(),
                     run_id.clone(),
                     task_id.clone(),
                     execution_id.clone(),
@@ -2587,6 +2688,8 @@ async fn execute_task(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::task(
+                    workspace_id.clone(),
+                    conversation_id.clone(),
                     run_id.clone(),
                     task_id.clone(),
                     RuntimeEventKind::TaskCompleted,
@@ -2681,6 +2784,8 @@ async fn execute_task(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::subagent(
+                    workspace_id.clone(),
+                    conversation_id.clone(),
                     run_id.clone(),
                     task_id.clone(),
                     execution_id.clone(),
@@ -2692,6 +2797,8 @@ async fn execute_task(
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::task(
+                    workspace_id,
+                    conversation_id,
                     run_id,
                     task_id.clone(),
                     task_terminal_event,
@@ -2893,6 +3000,8 @@ fn runtime_isolation_observed_payload(
 
 fn emit_task_started(
     sink: Option<&ExecSink>,
+    workspace_id: &str,
+    conversation_id: &str,
     run_id: &str,
     execution_id: &str,
     task: &PlanTask,
@@ -2901,6 +3010,8 @@ fn emit_task_started(
     emit_exec(
         sink,
         ExecEvent::task(
+            workspace_id,
+            conversation_id,
             run_id,
             task.id.clone(),
             RuntimeEventKind::TaskStarted,
@@ -2913,22 +3024,21 @@ fn emit_task_started(
 #[allow(clippy::too_many_arguments)]
 fn emit_subagent_started(
     sink: Option<&ExecSink>,
+    workspace_id: &str,
     run_id: &str,
     execution_id: &str,
     task: &PlanTask,
     contract: &SubagentRuntimeContract,
     plan_revision: u64,
     attempt: u32,
-    conversation_id: Option<&str>,
+    conversation_id: &str,
     message_id: Option<&str>,
 ) {
     let mut payload = runtime_contract_started_payload(contract, task, execution_id);
     if let serde_json::Value::Object(fields) = &mut payload {
         fields.insert("plan_revision".to_string(), plan_revision.into());
         fields.insert("attempt".to_string(), attempt.into());
-        if let Some(conversation_id) = conversation_id {
-            fields.insert("conversation_id".to_string(), conversation_id.into());
-        }
+        fields.insert("conversation_id".to_string(), conversation_id.into());
         if let Some(message_id) = message_id {
             fields.insert("message_id".to_string(), message_id.into());
         }
@@ -2936,6 +3046,8 @@ fn emit_subagent_started(
     emit_exec(
         sink,
         ExecEvent::subagent(
+            workspace_id,
+            conversation_id,
             run_id,
             task.id.clone(),
             execution_id,
@@ -2948,6 +3060,8 @@ fn emit_subagent_started(
 
 fn emit_primary_subagent_isolation_observed(
     sink: Option<&ExecSink>,
+    workspace_id: &str,
+    conversation_id: &str,
     run_id: &str,
     execution_id: &str,
     task: &PlanTask,
@@ -2956,6 +3070,8 @@ fn emit_primary_subagent_isolation_observed(
     emit_exec(
         sink,
         ExecEvent::subagent(
+            workspace_id,
+            conversation_id,
             run_id,
             task.id.clone(),
             execution_id,
@@ -3290,16 +3406,23 @@ async fn run_main_agent_task(
 
     // Rebuild a multimodal Message when the run carries user attachments, so
     // writer Subagents see the same images/files as the main agent (#1b).
-    let run_record = store.get_run(&run_id).ok().flatten();
-    let conversation_id = run_record.as_ref().map(|run| run.conversation_id.clone());
-    let root_message_id = run_record.as_ref().map(|run| run.root_message_id.clone());
-    let run_message: Option<echo_core::llm::types::Message> = run_record.as_ref().and_then(|r| {
+    let run_record = store
+        .get_run(&run_id)
+        .map_err(|error| {
+            ExecutionFailure::failed(format!("failed to load TaskRun identity: {error}"))
+        })?
+        .ok_or_else(|| ExecutionFailure::failed(format!("TaskRun '{run_id}' does not exist")))?;
+    let workspace_id = run_record.workspace_id.clone();
+    let conversation_id = run_record.conversation_id.clone();
+    let root_message_id = Some(run_record.root_message_id.clone());
+    let run_message: Option<echo_core::llm::types::Message> = {
+        let r = &run_record;
         if r.attachments.is_empty() {
             None
         } else {
             crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
         }
-    });
+    };
 
     primary_agent
         .read_async(|agent| {
@@ -3321,7 +3444,7 @@ async fn run_main_agent_task(
                 let invocation = echo_core::agent::AgentInvocationContext {
                     history: None,
                     runtime: Some(echo_core::tools::ExternalRunContext {
-                        conversation_id,
+                        conversation_id: Some(conversation_id.clone()),
                         run_id: Some(run_id.clone()),
                         turn_id: root_message_id.clone(),
                         execution_id: Some(execution_id.clone()),
@@ -3387,6 +3510,8 @@ async fn run_main_agent_task(
                                 emit_exec(
                                     trace_sink.as_ref(),
                                     ExecEvent::subagent(
+                                        workspace_id.clone(),
+                                        conversation_id.clone(),
                                         run_id.clone(),
                                         task_id.clone(),
                                         execution_id.clone(),
@@ -3400,6 +3525,8 @@ async fn run_main_agent_task(
                                 emit_exec(
                                     trace_sink.as_ref(),
                                     ExecEvent::subagent(
+                                        workspace_id.clone(),
+                                        conversation_id.clone(),
                                         run_id.clone(),
                                         task_id.clone(),
                                         execution_id.clone(),
@@ -3415,6 +3542,8 @@ async fn run_main_agent_task(
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::subagent(
+                                    workspace_id.clone(),
+                                    conversation_id.clone(),
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
@@ -3432,6 +3561,8 @@ async fn run_main_agent_task(
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::subagent(
+                                    workspace_id.clone(),
+                                    conversation_id.clone(),
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
@@ -3490,6 +3621,8 @@ async fn run_main_agent_task(
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::subagent(
+                                    workspace_id.clone(),
+                                    conversation_id.clone(),
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
@@ -3528,6 +3661,8 @@ async fn run_main_agent_task(
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::subagent(
+                                    workspace_id.clone(),
+                                    conversation_id.clone(),
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
@@ -3612,6 +3747,8 @@ async fn run_main_agent_task(
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::subagent(
+                                    workspace_id.clone(),
+                                    conversation_id.clone(),
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
@@ -3657,6 +3794,8 @@ async fn run_main_agent_task(
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::subagent(
+                                    workspace_id.clone(),
+                                    conversation_id.clone(),
                                     run_id.clone(),
                                     task_id.clone(),
                                     execution_id.clone(),
@@ -4679,20 +4818,31 @@ mod tests {
             returns: "summary".to_string(),
         };
 
-        emit_task_started(Some(&sink), "run-1", "task-1:1", &task, &contract);
+        emit_task_started(
+            Some(&sink),
+            "workspace-1",
+            "conversation-1",
+            "run-1",
+            "task-1:1",
+            &task,
+            &contract,
+        );
         emit_subagent_started(
             Some(&sink),
+            "workspace-1",
             "run-1",
             "task-1:1",
             &task,
             &contract,
             1,
             1,
-            Some("conversation-1"),
+            "conversation-1",
             Some("message-1"),
         );
         emit_primary_subagent_isolation_observed(
             Some(&sink),
+            "workspace-1",
+            "conversation-1",
             "run-1",
             "task-1:1",
             &task,
@@ -4701,6 +4851,8 @@ mod tests {
         emit_exec(
             Some(&sink),
             ExecEvent::subagent(
+                "workspace-1",
+                "conversation-1",
                 "run-1",
                 "task-1",
                 "task-1:1",

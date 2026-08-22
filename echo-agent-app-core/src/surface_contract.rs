@@ -211,6 +211,8 @@ fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
             .map_err(|error| error.to_string())?,
         )),
         ChatDriverEvent::Execution(ExecEvent::subagent(
+            "workspace-1",
+            "conversation-1",
             "run-1",
             "task-1",
             "execution-1",

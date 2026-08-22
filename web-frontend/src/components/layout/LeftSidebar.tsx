@@ -23,6 +23,7 @@ import type { Workspace } from '../../api/endpoints';
 import type { ConversationListItem } from '../../types/api';
 import { getWorkspaceKind } from '../../lib/workspaceKinds';
 import { fileSystem } from '../../lib/tauri-bridge';
+import { workspaceIdForView } from '../../lib/viewAddress';
 
 const MAX_RECENT_CONVERSATIONS = 5;
 
@@ -61,7 +62,10 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       if (controller.signal.aborted) return;
       setIsSearching(true);
       try {
-        const results = await conversationApi.search(searchQuery.trim());
+        const results = await conversationApi.search(
+          workspaceIdForView(current?.id),
+          searchQuery.trim()
+        );
         if (!controller.signal.aborted) {
           setSearchResults(results);
         }
@@ -80,7 +84,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [searchQuery]);
+  }, [current?.id, searchQuery]);
 
   useEffect(() => {
     setShowAllConvs(false);

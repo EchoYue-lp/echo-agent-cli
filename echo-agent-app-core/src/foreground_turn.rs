@@ -75,6 +75,8 @@ pub struct ForegroundTurnSettlement {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ForegroundTurnError {
+    #[error("foreground turn workspace id is empty")]
+    EmptyWorkspaceId,
     #[error("foreground turn conversation id is empty")]
     EmptyConversationId,
     #[error("foreground turn id is empty")]
@@ -195,7 +197,7 @@ struct ForegroundTurnState {
     shutdown: ForegroundShutdownState,
     shutdown_owner: Option<tokio::task::JoinHandle<()>>,
     admission_suspended: bool,
-    suspended_conversations: HashSet<String>,
+    suspended_conversations: HashSet<(String, String)>,
     shutting_down: bool,
 }
 
@@ -285,6 +287,7 @@ impl Drop for ForegroundAdmissionSuspension {
 #[must_use]
 pub(crate) struct ForegroundConversationSuspension {
     control: ForegroundTurnControl,
+    workspace_id: String,
     conversation_id: String,
     active: bool,
 }
@@ -300,7 +303,9 @@ impl Drop for ForegroundConversationSuspension {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.suspended_conversations.remove(&self.conversation_id);
+        state
+            .suspended_conversations
+            .remove(&(self.workspace_id.clone(), self.conversation_id.clone()));
         self.active = false;
     }
 }
@@ -325,6 +330,9 @@ impl ForegroundTurnControl {
         turn_id: impl Into<String>,
     ) -> Result<ForegroundTurnLease, ForegroundTurnError> {
         let workspace_id = workspace_id.into();
+        if workspace_id.trim().is_empty() {
+            return Err(ForegroundTurnError::EmptyWorkspaceId);
+        }
         let conversation_id = conversation_id.into();
         if conversation_id.trim().is_empty() {
             return Err(ForegroundTurnError::EmptyConversationId);
@@ -349,7 +357,10 @@ impl ForegroundTurnControl {
         if state.admission_suspended {
             return Err(ForegroundTurnError::AdmissionSuspended);
         }
-        if state.suspended_conversations.contains(&key.conversation_id) {
+        if state
+            .suspended_conversations
+            .contains(&(key.workspace_id.clone(), key.conversation_id.clone()))
+        {
             return Err(ForegroundTurnError::ConversationAdmissionSuspended {
                 conversation_id: key.conversation_id,
             });
@@ -357,9 +368,6 @@ impl ForegroundTurnControl {
         let conflict = state.active.values().find(|existing| {
             existing.key.workspace_id == key.workspace_id
                 && existing.key.conversation_id == key.conversation_id
-                && (existing.key.surface == key.surface
-                    || existing.key.surface == ForegroundTurnSurface::Agent
-                    || key.surface == ForegroundTurnSurface::Agent)
         });
         if let Some(existing) = conflict {
             return Err(ForegroundTurnError::Busy {
@@ -431,6 +439,30 @@ impl ForegroundTurnControl {
             left.workspace_id
                 .cmp(&right.workspace_id)
                 .then_with(|| left.conversation_id.cmp(&right.conversation_id))
+                .then_with(|| left.root_turn_id.cmp(&right.root_turn_id))
+        });
+        Ok(snapshots)
+    }
+
+    /// Snapshot every active surface for one workspace.
+    pub fn snapshots_for_workspace(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ForegroundTurnSnapshot>, ForegroundTurnError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+        let mut snapshots = state
+            .active
+            .values()
+            .filter(|entry| entry.key.workspace_id == workspace_id)
+            .map(|entry| entry.snapshot())
+            .collect::<Vec<_>>();
+        snapshots.sort_by(|left, right| {
+            left.conversation_id
+                .cmp(&right.conversation_id)
                 .then_with(|| left.root_turn_id.cmp(&right.root_turn_id))
         });
         Ok(snapshots)
@@ -526,10 +558,25 @@ impl ForegroundTurnControl {
     /// Close admission for one conversation only when every surface is idle.
     /// The active-turn check and suspension marker share the same mutex as
     /// [`Self::begin`], so no turn can enter between them.
+    #[cfg(test)]
     pub(crate) fn suspend_conversation_admission_if_idle(
         &self,
         conversation_id: &str,
     ) -> Result<ForegroundConversationSuspension, ForegroundTurnError> {
+        self.suspend_conversation_admission_if_idle_scoped("global", conversation_id)
+    }
+
+    /// Close admission for one exact workspace conversation only when every
+    /// surface is idle. A same-id conversation in another workspace remains
+    /// independent.
+    pub(crate) fn suspend_conversation_admission_if_idle_scoped(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<ForegroundConversationSuspension, ForegroundTurnError> {
+        if workspace_id.trim().is_empty() {
+            return Err(ForegroundTurnError::EmptyWorkspaceId);
+        }
         if conversation_id.trim().is_empty() {
             return Err(ForegroundTurnError::EmptyConversationId);
         }
@@ -544,7 +591,7 @@ impl ForegroundTurnControl {
         if state
             .active
             .keys()
-            .any(|key| key.conversation_id == conversation_id)
+            .any(|key| key.workspace_id == workspace_id && key.conversation_id == conversation_id)
         {
             return Err(ForegroundTurnError::ActiveConversationTurns {
                 conversation_id: conversation_id.to_string(),
@@ -552,9 +599,10 @@ impl ForegroundTurnControl {
         }
         state
             .suspended_conversations
-            .insert(conversation_id.to_string());
+            .insert((workspace_id.to_string(), conversation_id.to_string()));
         Ok(ForegroundConversationSuspension {
             control: self.clone(),
+            workspace_id: workspace_id.to_string(),
             conversation_id: conversation_id.to_string(),
             active: true,
         })
@@ -1376,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn scopes_admission_by_surface_and_conversation() -> Result<(), ForegroundTurnError> {
+    fn conversation_admission_is_exclusive_across_surfaces() -> Result<(), ForegroundTurnError> {
         let control = ForegroundTurnControl::default();
         let gui = control.begin(ForegroundTurnSurface::Gui, "conversation", "gui-turn")?;
         let busy = control.begin(ForegroundTurnSurface::Gui, "conversation", "second");
@@ -1387,7 +1435,13 @@ mod tests {
                 ..
             }) if active_turn_id == "gui-turn"
         ));
-        let tui = control.begin(ForegroundTurnSurface::Tui, "conversation", "tui-turn")?;
+        assert!(matches!(
+            control.begin(ForegroundTurnSurface::Tui, "conversation", "tui-turn"),
+            Err(ForegroundTurnError::Busy {
+                active_turn_id,
+                ..
+            }) if active_turn_id == "gui-turn"
+        ));
         assert_eq!(
             control.snapshots(ForegroundTurnSurface::Gui)?,
             vec![ForegroundTurnSnapshot {
@@ -1400,7 +1454,6 @@ mod tests {
             }]
         );
         gui.settle(TurnOutcome::Completed);
-        tui.settle(TurnOutcome::Completed);
         assert!(!control.has_active_turns());
         Ok(())
     }

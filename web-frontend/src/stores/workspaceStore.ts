@@ -1,9 +1,23 @@
 import { create } from 'zustand';
-import { sessionApi, workspaceApi, type Workspace } from '../api/endpoints';
+import { workspaceApi, type Workspace } from '../api/endpoints';
 import { useChatStore } from './chatStore';
 import { useConversationStore } from './conversationStore';
 import { useFileStore } from './fileStore';
+import { useSubagentRunStore } from './subagentRunStore';
+import { useTaskRuntimeStore } from './taskRuntimeStore';
 import { useToastStore } from './toastStore';
+import { useToolExecutionStore } from './toolExecutionStore';
+import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
+
+let workspaceGeneration = 0;
+
+function detachVisibleWorkspace(workspaceId: string): void {
+  useChatStore.getState().clearMessages();
+  useTaskRuntimeStore.getState().reset();
+  useToolExecutionStore.getState().clear();
+  useSubagentRunStore.getState().clear();
+  useConversationStore.getState().detachForWorkspace(workspaceId);
+}
 
 function showTransitionWarning(
   transition: Awaited<ReturnType<typeof workspaceApi.switch>>['transition']
@@ -43,12 +57,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   isLoading: false,
 
   init: async () => {
+    const generation = workspaceGeneration + 1;
+    workspaceGeneration = generation;
     set({ isLoading: true });
     try {
       const [listRes, currentRes] = await Promise.all([
         workspaceApi.list(),
         workspaceApi.current().catch(() => ({ workspace: null, active: false })),
       ]);
+      if (generation !== workspaceGeneration) return;
       set({
         workspaces: listRes.workspaces || [],
         current: currentRes.workspace || null,
@@ -56,14 +73,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       });
     } catch (e) {
       console.error('Failed to load workspaces:', e);
-      set({ isLoading: false });
+      if (generation === workspaceGeneration) set({ isLoading: false });
     }
   },
 
   switchTo: async (id: string) => {
+    const generation = workspaceGeneration + 1;
+    workspaceGeneration = generation;
+    const previousWorkspaceId = get().current?.id ?? GLOBAL_WORKSPACE_ID;
+    detachVisibleWorkspace(id);
+    set({ isLoading: true });
     try {
       if (import.meta.env.DEV) console.debug('[workspaceStore] switchTo:', id);
       const res = await workspaceApi.switch(id);
+      if (generation !== workspaceGeneration) return;
       if (import.meta.env.DEV)
         console.debug(
           '[workspaceStore] switch API returned:',
@@ -71,26 +94,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           'debug_conv_count:',
           (res as any).debug_conversation_count
         );
-      set({ current: res.workspace });
+      set({ current: res.workspace, isLoading: false });
       showTransitionWarning(res.transition);
       const fileStore = useFileStore.getState();
       fileStore.markWorkspaceChanged();
       void fileStore.loadTree(4);
       void fileStore.loadChanges();
 
-      // Clear current chat
-      useChatStore.getState().clearMessages();
-
-      // Reset agent session (best-effort, must not block)
-      try {
-        await sessionApi.reset();
-      } catch (e) {
-        console.warn('[workspaceStore] session reset failed (non-fatal):', e);
-      }
-
       // Reload conversations from the new workspace's store
-      useConversationStore.setState({ activeId: null });
-      await useConversationStore.getState().init();
+      await useConversationStore.getState().init(res.workspace.id);
+      if (generation !== workspaceGeneration) return;
       if (import.meta.env.DEV)
         console.debug(
           '[workspaceStore] conversations loaded:',
@@ -98,32 +111,39 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         );
     } catch (e) {
       console.error('[workspaceStore] Failed to switch workspace:', e);
+      if (generation === workspaceGeneration) {
+        detachVisibleWorkspace(previousWorkspaceId);
+        await useConversationStore.getState().init(previousWorkspaceId);
+        set({ isLoading: false });
+      }
       throw e;
     }
   },
 
   createAndSwitch: async (name: string, kind?: string, root?: string) => {
+    const generation = workspaceGeneration + 1;
+    workspaceGeneration = generation;
+    const previousWorkspaceId = get().current?.id ?? GLOBAL_WORKSPACE_ID;
+    detachVisibleWorkspace(previousWorkspaceId);
+    set({ isLoading: true });
     const res = await workspaceApi.createAndSwitch(name, kind, root);
-    await get().init();
     if (!res.success) {
+      if (generation === workspaceGeneration) {
+        await useConversationStore.getState().init(previousWorkspaceId);
+        set({ isLoading: false });
+      }
       const prefix = res.created ? '工作区已创建，但进入失败' : '无法创建并进入工作区';
       throw new Error(`${prefix}：${res.error}`);
     }
+    if (generation !== workspaceGeneration) return res.workspace;
     const ws = res.workspace;
-    set({ current: ws });
+    set({ current: ws, isLoading: false });
     showTransitionWarning(res.transition);
     const fileStore = useFileStore.getState();
     fileStore.markWorkspaceChanged();
     void fileStore.loadTree(4);
     void fileStore.loadChanges();
-    useChatStore.getState().clearMessages();
-    try {
-      await sessionApi.reset();
-    } catch (error) {
-      console.warn('[workspaceStore] session reset failed (non-fatal):', error);
-    }
-    useConversationStore.setState({ activeId: null });
-    await useConversationStore.getState().init();
+    await useConversationStore.getState().init(ws.id);
     return ws;
   },
 
@@ -137,9 +157,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   exit: async () => {
+    const generation = workspaceGeneration + 1;
+    workspaceGeneration = generation;
+    detachVisibleWorkspace(GLOBAL_WORKSPACE_ID);
     const res = await workspaceApi.exit();
+    if (generation !== workspaceGeneration) return;
     set({ current: null });
     showTransitionWarning(res.transition);
     useFileStore.getState().markWorkspaceChanged();
+    await useConversationStore.getState().init(GLOBAL_WORKSPACE_ID);
   },
 }));

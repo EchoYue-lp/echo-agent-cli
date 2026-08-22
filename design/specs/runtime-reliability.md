@@ -1,7 +1,7 @@
 # EKO 多项目与多会话运行时可靠性修复规格
 
 > 日期：2026-08-21  
-> 状态：M0-M8 implementation in progress；最终 acceptance pending
+> 状态：M0-M7 Complete；M8 automated implementation Complete；最终 GUI/2h soak acceptance pending
 > 优先级：P0 可靠性修复  
 > 整合范围：workspace/conversation runtime、foreground input/interrupt、本地恢复、
 > AgentRouter live/cold delivery 与 groups
@@ -1000,15 +1000,15 @@ npm run build
 
 | 阶段 | 状态        | 权威路径 | 应用提交 | 框架提交 | 测试命令/结果                                     | 失败与修复 | 剩余事项                    |
 | ---- | ----------- | -------- | -------- | -------- | ------------------------------------------------- | ---------- | --------------------------- |
-| M0   | In progress | N/A      | N/A      | N/A      | contract tests 已在当前工作树建立；完整门禁待执行 | N/A        | 提交并冻结 F01-F18 baseline |
-| M1   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | exact runtime resolver      |
-| M2   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | IPC/event identity          |
-| M3   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | durable FIFO/interrupt      |
-| M4   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | restore/rebind              |
-| M5   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | crash/HITL recovery         |
-| M6   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | delete/evict                |
-| M7   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | delivery settlement         |
-| M8   | Pending     | 待切换   | N/A      | N/A      | 待执行                                            | N/A        | governor/parity/soak        |
+| M0   | Complete    | `state/reliability_contracts.rs` + scoped component tests | Pending | N/A | reliability 6/6；frontend 185/185；完整 workspace gate green | 原 failing contracts 已转为 enabled regression | N/A |
+| M1   | Complete    | `AppState::chat_runtime_for_scope` + scoped TaskRuntime commands | Pending | N/A | 26 个 TaskRuntime command fail-closed；GUI/workspace tests green | 删除 GUI global store helper | N/A |
+| M2   | Complete    | workspace-qualified Chat/Exec/Tool envelopes and Tauri IPC | Pending | N/A | cross-workspace event/tool tests；static authority grep zero | schema v2 一次切换，无旧双写 | N/A |
+| M3   | Complete    | ChatEventLog durable input FIFO + exact interrupt admission | Pending | N/A | queue reopen/reorder/remove；cancel-and-start once；frontend tests green | hook-local queue 降为投影 | N/A |
+| M4   | Complete    | scoped conversation open/restore + exact journal rebind | Pending | N/A | active remount/replay/terminal race tests green | active Agent 不再被 global restore 覆盖 | N/A |
+| M5   | Complete    | TaskRuntime boot recovery + orphan chat/HITL durable terminal repair | Pending | N/A | boot recovery suite、GUI orphan reconciliation、HITL exact identity green | 无 live lease 的 stream 不再假恢复 | N/A |
+| M6   | Complete    | scoped aggregate deletion + idle-proof host shutdown/evict | Pending | N/A | busy reject/idle evict、same-id workspace isolation green | 删除前先 settle owners | N/A |
+| M7   | Complete    | AgentRouter Claimed/Injected/Delivered + persisted retry/reply | Pending | N/A | live cancel、cold reply、restart、three-inbox tests green | Delivered 延后到 transcript/reply safe point | N/A |
+| M8   | In progress | process governor + shared surface identity/projection | Pending | N/A | Clippy/full Rust/GUI/frontend automated gates green | 自动实现已完成 | 真实 GUI 证据与 2h soak |
 
 状态只能是 `Pending`、`In progress`、`Blocked`、`Complete`。只有本阶段验收和所有适用
 门禁全绿才能标 Complete。框架无改动必须明确写 `N/A`，不能把应用 commit 误记为框架

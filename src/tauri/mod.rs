@@ -56,7 +56,7 @@ fn terminate_subagent_tools(
         tracing::error!(%agent, "subagent terminal event is missing a stable execution id");
         return;
     };
-    match projector.terminate_subagent(subagent_run_id, status, agent) {
+    match projector.terminate_subagent("global", subagent_run_id, status, agent) {
         Ok(updates) => emit_tool_projection_updates(app, &updates),
         Err(error) => {
             tracing::warn!(%error, %subagent_run_id, "failed to close orphaned subagent tools");
@@ -261,6 +261,10 @@ pub fn build_tauri_app(
             commands::chat::steer_chat_message,
             commands::chat::get_active_chat_turn,
             commands::chat::replay_chat_events,
+            commands::chat::queue_chat_input,
+            commands::chat::list_queued_chat_inputs,
+            commands::chat::remove_queued_chat_input,
+            commands::chat::reorder_queued_chat_inputs,
             commands::chat::cancel_chat,
             commands::chat::send_approval_response,
             commands::chat::send_input_response,
@@ -515,12 +519,15 @@ pub fn build_tauri_app(
                                             }
                                         }
                                         match tool_projector.project_subagent_started(
-                                            subagent_run_id,
-                                            conversation_id.as_deref(),
-                                            run_id.as_deref(),
-                                            call_id,
-                                            invocation,
-                                            agent,
+                                            echo_agent_app_core::tool_execution_projection::SubagentToolStart {
+                                                workspace_id: "global",
+                                                subagent_run_id,
+                                                conversation_id: conversation_id.as_deref(),
+                                                run_id: run_id.as_deref(),
+                                                call_id,
+                                                invocation,
+                                                agent,
+                                            },
                                         ) {
                                             Ok(updates) => emit_tool_projection_updates(
                                                 &app_handle,
@@ -549,6 +556,7 @@ pub fn build_tauri_app(
                                             continue;
                                         };
                                         match tool_projector.project_subagent_completed(
+                                            "global",
                                             subagent_run_id,
                                             call_id,
                                             name,

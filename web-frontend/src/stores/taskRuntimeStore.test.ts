@@ -92,7 +92,7 @@ describe('taskRuntimeStore recovery controls', () => {
     mocks.updateTasks.mockResolvedValue({ run_id: 'run-1', revision: 4 });
     useTaskRuntimeStore.getState().reset();
     useTaskRuntimeStore.setState({
-      activeRun: { run_id: 'run-1', status: 'paused' } as TaskRun,
+      activeRun: run('paused'),
       error: null,
       refresh,
     });
@@ -105,22 +105,28 @@ describe('taskRuntimeStore recovery controls', () => {
   it('pauses through the shared runtime API and refreshes the canonical run', async () => {
     await useTaskRuntimeStore.getState().pause('run-1');
 
-    expect(mocks.pauseRun).toHaveBeenCalledWith('run-1');
-    expect(refresh).toHaveBeenCalledWith('run-1');
+    expect(mocks.pauseRun).toHaveBeenCalledWith('workspace-1', 'run-1');
+    expect(refresh).toHaveBeenCalledWith('workspace-1', 'run-1');
   });
 
   it('updates continuation budgets and refreshes the canonical projection', async () => {
     await useTaskRuntimeStore.getState().updateContinuationBudgets('run-1', 200_000, null);
 
-    expect(mocks.configureContinuation).toHaveBeenCalledWith('run-1', 200_000, null);
-    expect(refresh).toHaveBeenCalledWith('run-1');
+    expect(mocks.configureContinuation).toHaveBeenCalledWith('workspace-1', 'run-1', 200_000, null);
+    expect(refresh).toHaveBeenCalledWith('workspace-1', 'run-1');
   });
 
   it('updates the Goal with the exact revision and refreshes the canonical projection', async () => {
     await useTaskRuntimeStore.getState().updateGoal('run-1', 1, 'revised goal', 'scope changed');
 
-    expect(mocks.updateGoal).toHaveBeenCalledWith('run-1', 1, 'revised goal', 'scope changed');
-    expect(refresh).toHaveBeenCalledWith('run-1');
+    expect(mocks.updateGoal).toHaveBeenCalledWith(
+      'workspace-1',
+      'run-1',
+      1,
+      'revised goal',
+      'scope changed'
+    );
+    expect(refresh).toHaveBeenCalledWith('workspace-1', 'run-1');
   });
 
   it('surfaces a recovery barrier when resume is rejected', async () => {
@@ -135,16 +141,21 @@ describe('taskRuntimeStore recovery controls', () => {
   it('routes recovery retry through the supervised retry facade', async () => {
     await useTaskRuntimeStore.getState().retryBlockedTask('task-1');
 
-    expect(mocks.retryBlockedTask).toHaveBeenCalledWith('run-1', 'task-1');
+    expect(mocks.retryBlockedTask).toHaveBeenCalledWith('workspace-1', 'run-1', 'task-1');
     expect(mocks.resolveRecoveryTask).not.toHaveBeenCalled();
-    expect(refresh).toHaveBeenCalledWith('run-1');
+    expect(refresh).toHaveBeenCalledWith('workspace-1', 'run-1');
   });
 
   it('keeps skip as an explicit recovery decision', async () => {
     await useTaskRuntimeStore.getState().resolveRecoveryTask('task-1', 'skip');
 
-    expect(mocks.resolveRecoveryTask).toHaveBeenCalledWith('run-1', 'task-1', 'skip');
-    expect(refresh).toHaveBeenCalledWith('run-1');
+    expect(mocks.resolveRecoveryTask).toHaveBeenCalledWith(
+      'workspace-1',
+      'run-1',
+      'task-1',
+      'skip'
+    );
+    expect(refresh).toHaveBeenCalledWith('workspace-1', 'run-1');
   });
 
   it('binds a requirement skip to the current Goal revision and refreshes the gate', async () => {
@@ -157,13 +168,14 @@ describe('taskRuntimeStore recovery controls', () => {
       .skipGoalRequirement('req:manual-review', '用户确认该项不适用');
 
     expect(mocks.skipGoalRequirement).toHaveBeenCalledWith(
+      'workspace-1',
       'run-1',
       1,
       'req:manual-review',
       '用户确认该项不适用'
     );
     expect(useTaskRuntimeStore.getState().completionGate?.ready).toBe(true);
-    expect(refresh).toHaveBeenCalledWith('run-1');
+    expect(refresh).toHaveBeenCalledWith('workspace-1', 'run-1');
   });
 
   it('surfaces rejected supervised recovery retry without refreshing', async () => {
@@ -182,7 +194,7 @@ describe('taskRuntimeStore recovery controls', () => {
 
     await useTaskRuntimeStore.getState().updateTask('task-1', { title: 'Refined title' });
 
-    expect(mocks.updateTasks).toHaveBeenCalledWith('run-1', {
+    expect(mocks.updateTasks).toHaveBeenCalledWith('workspace-1', 'run-1', {
       base_revision: 3,
       reason: '更新任务：task-1',
       operations: [
@@ -205,7 +217,7 @@ describe('taskRuntimeStore recovery controls', () => {
         },
       ],
     });
-    expect(refresh).toHaveBeenCalledWith('run-1');
+    expect(refresh).toHaveBeenCalledWith('workspace-1', 'run-1');
   });
 });
 
@@ -241,13 +253,13 @@ describe('taskRuntimeStore conversation loading', () => {
   it('starts polling for an active run and stops after loading its terminal snapshot', async () => {
     mocks.latestRunForConversation.mockResolvedValueOnce(run('running'));
 
-    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
 
     expect(useTaskRuntimeStore.getState().activeRun?.status).toBe('running');
     expect(useTaskRuntimeStore.getState().pollingInterval).not.toBeNull();
 
     mocks.latestRunForConversation.mockResolvedValueOnce(run('completed'));
-    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
 
     expect(useTaskRuntimeStore.getState().activeRun?.status).toBe('completed');
     expect(useTaskRuntimeStore.getState().pollingInterval).toBeNull();
@@ -274,9 +286,9 @@ describe('taskRuntimeStore conversation loading', () => {
     mocks.latestRunForConversation.mockResolvedValueOnce(run('completed'));
     mocks.getContinuation.mockResolvedValueOnce(continuation);
 
-    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
 
-    expect(mocks.getContinuation).toHaveBeenCalledWith('run-1');
+    expect(mocks.getContinuation).toHaveBeenCalledWith('workspace-1', 'run-1');
     expect(useTaskRuntimeStore.getState().continuation).toEqual(continuation);
   });
 
@@ -304,9 +316,9 @@ describe('taskRuntimeStore conversation loading', () => {
       },
     ]);
 
-    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
 
-    expect(mocks.listEvents).toHaveBeenCalledWith('run-1', '0');
+    expect(mocks.listEvents).toHaveBeenCalledWith('workspace-1', 'run-1', '0');
     expect(useTaskRuntimeStore.getState().lastSeq).toBe('5');
     expect(
       useSubagentRunStore.getState().runs[subagentRunStoreKey('run-1', 'run-1:task-1:1:1')]
@@ -337,9 +349,9 @@ describe('taskRuntimeStore conversation loading', () => {
       },
     ]);
 
-    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+    await useTaskRuntimeStore.getState().loadByConversation('workspace-1', 'conversation-1');
 
-    expect(mocks.listToolExecutions).toHaveBeenCalledWith('conversation-1');
+    expect(mocks.listToolExecutions).toHaveBeenCalledWith('workspace-1', 'conversation-1');
     expect(useToolExecutionStore.getState().tools['tool-detail-1']).toMatchObject({
       name: 'read_file',
       status: 'succeeded',
@@ -359,8 +371,12 @@ describe('taskRuntimeStore conversation loading', () => {
       .mockReturnValueOnce(first.promise)
       .mockResolvedValueOnce(secondRun);
 
-    const firstLoad = useTaskRuntimeStore.getState().loadByConversation('conversation-1');
-    const secondLoad = useTaskRuntimeStore.getState().loadByConversation('conversation-2');
+    const firstLoad = useTaskRuntimeStore
+      .getState()
+      .loadByConversation('workspace-1', 'conversation-1');
+    const secondLoad = useTaskRuntimeStore
+      .getState()
+      .loadByConversation('workspace-1', 'conversation-2');
     await secondLoad;
     first.resolve(run('completed'));
     await firstLoad;
@@ -373,8 +389,8 @@ describe('taskRuntimeStore conversation loading', () => {
     mocks.getRun.mockReturnValueOnce(staleRun.promise).mockResolvedValueOnce(run('completed'));
     mocks.listEvents.mockResolvedValue([]);
 
-    const staleRefresh = useTaskRuntimeStore.getState().refresh('run-1');
-    const terminalRefresh = useTaskRuntimeStore.getState().refresh('run-1');
+    const staleRefresh = useTaskRuntimeStore.getState().refresh('workspace-1', 'run-1');
+    const terminalRefresh = useTaskRuntimeStore.getState().refresh('workspace-1', 'run-1');
     await terminalRefresh;
     staleRun.resolve(run('running'));
     await staleRefresh;

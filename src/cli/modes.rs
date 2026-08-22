@@ -224,6 +224,7 @@ pub async fn run_jsonl_mode(
         renderer,
         services.app_state.storage.chat_events.clone(),
         services.app_state.storage.tool_executions.clone(),
+        scoped_runtime.execution_scope().workspace_id().to_string(),
         Some(conversation_id.clone()),
         turn_id.clone(),
     );

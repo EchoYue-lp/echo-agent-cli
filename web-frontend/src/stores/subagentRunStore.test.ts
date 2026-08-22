@@ -16,6 +16,8 @@ describe('subagentRunStore terminal result', () => {
   it('preserves the complete timed-out result contract', () => {
     const event: ExecutionEvent = {
       kind: 'subagent',
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
       subagent_run_id: 'task-1:1',
       run_id: 'run-1',
       task_id: 'task-1',
@@ -66,6 +68,8 @@ describe('subagentRunStore terminal result', () => {
   it('keeps a terminal Subagent terminal when a duplicate started event arrives', () => {
     const base = {
       kind: 'subagent' as const,
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
       subagent_run_id: 'task-merge:1',
       run_id: 'run-merge',
       task_id: 'task-merge',
@@ -93,6 +97,8 @@ describe('subagentRunStore terminal result', () => {
   it('keeps retry attempts in separate SubagentRun records', () => {
     const base = {
       kind: 'subagent' as const,
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
       run_id: 'run-retry',
       task_id: 'task-retry',
       agent: 'explorer',
@@ -111,6 +117,8 @@ describe('subagentRunStore terminal result', () => {
   it('orders physical claim ids by their exact projected attempt', () => {
     const base = {
       kind: 'subagent' as const,
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
       run_id: 'run-retry',
       task_id: 'task-retry',
       agent: 'explorer',
@@ -138,6 +146,8 @@ describe('subagentRunStore terminal result', () => {
   it('isolates the same legacy execution id across separate TaskRuns', () => {
     const base = {
       kind: 'subagent' as const,
+      workspace_id: 'workspace-1',
+      conversation_id: 'conversation-1',
       subagent_run_id: 'task-shared:1:1',
       task_id: 'task-shared',
       agent: 'explorer',
@@ -165,6 +175,7 @@ describe('subagentRunStore terminal result', () => {
   it('restores the existing Subagent card state from durable TaskRuntime events', () => {
     const taskRun = {
       run_id: 'run-restored',
+      workspace_id: 'workspace-1',
       conversation_id: 'conversation-restored',
       root_message_id: 'message-restored',
     } as TaskRun;

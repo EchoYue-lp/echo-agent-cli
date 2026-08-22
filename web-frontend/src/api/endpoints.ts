@@ -398,15 +398,16 @@ export const sandboxApi = {
 };
 
 export const compressApi = {
-  trigger: (options?: { keep_messages?: number; conversation_id?: string }) =>
+  trigger: (workspaceId: string, options?: { keep_messages?: number; conversation_id?: string }) =>
     isTauri()
       ? apiInvoke<CompressResponse>('compress_context', {
+          workspaceId,
           conversationId: options?.conversation_id,
         })
       : post<CompressResponse>('/compress', options),
-  getStats: (conversationId?: string) =>
+  getStats: (workspaceId: string, conversationId?: string) =>
     isTauri()
-      ? apiInvoke<CompressionStats>('get_compression_stats', { conversationId })
+      ? apiInvoke<CompressionStats>('get_compression_stats', { workspaceId, conversationId })
       : get<CompressionStats>('/compress/stats'),
 };
 
@@ -426,31 +427,36 @@ export const extractApi = {
 };
 
 export const conversationApi = {
-  list: () =>
+  list: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<ConversationListItem[]>('list_conversations')
+      ? apiInvoke<ConversationListItem[]>('list_conversations', { workspaceId })
       : get<ConversationListItem[]>('/conversations'),
-  save: (data: { id: string; title: string; messages: SavedMessage[]; model?: string }) =>
+  save: (
+    workspaceId: string,
+    data: { id: string; title: string; messages: SavedMessage[]; model?: string }
+  ) =>
     isTauri()
       ? apiInvoke<{ success: boolean; id: string }>('save_conversation', {
+          workspaceId,
           id: data.id,
           title: data.title,
           messages: data.messages,
         })
       : post<{ success: boolean; id: string }>('/conversations', data),
-  get: (id: string) =>
+  get: (workspaceId: string, id: string) =>
     isTauri()
-      ? apiInvoke<ConversationRecord>('get_conversation', { id })
+      ? apiInvoke<ConversationRecord>('get_conversation', { workspaceId, id })
       : get<ConversationRecord>(`/conversations/${id}`),
-  update: (id: string, data: { title?: string; messages?: SavedMessage[] }) =>
+  update: (workspaceId: string, id: string, data: { title?: string; messages?: SavedMessage[] }) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('update_conversation', {
+          workspaceId,
           id,
           title: data.title,
           messages: data.messages,
         })
       : put<{ success: boolean }>(`/conversations/${id}`, data),
-  branch: (id: string, userTurnIndex: number) =>
+  branch: (workspaceId: string, id: string, userTurnIndex: number) =>
     isTauri()
       ? apiInvoke<{
           success: boolean;
@@ -458,7 +464,7 @@ export const conversationApi = {
           source_id: string;
           message_count: number;
           target_content: string;
-        }>('branch_conversation', { id, userTurnIndex, user_turn_index: userTurnIndex })
+        }>('branch_conversation', { workspaceId, id, userTurnIndex })
       : post<{
           success: boolean;
           id: string;
@@ -466,46 +472,53 @@ export const conversationApi = {
           message_count: number;
           target_content: string;
         }>(`/conversations/${id}/branch`, { user_turn_index: userTurnIndex }),
-  delete: (id: string) =>
+  delete: (workspaceId: string, id: string) =>
     isTauri()
       ? apiInvoke<{
           success: boolean;
           conversation_id: string;
           resumed: boolean;
           cleanup_pending: boolean;
-        }>('delete_conversation', { id })
+        }>('delete_conversation', { workspaceId, id })
       : del<{
           success: boolean;
           conversation_id?: string;
           resumed?: boolean;
           cleanup_pending?: boolean;
         }>(`/conversations/${id}`),
-  export: (id: string) =>
+  export: (workspaceId: string, id: string) =>
     isTauri()
-      ? apiInvoke<{ format: string; content: string; id: string }>('export_conversation', { id })
+      ? apiInvoke<{ format: string; content: string; id: string }>('export_conversation', {
+          workspaceId,
+          id,
+        })
       : get<{ format: string; content: string; id: string }>(`/conversations/${id}/export`),
-  restore: (id: string) =>
+  restore: (workspaceId: string, id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; message_count: number; conversation_id: string }>(
           'restore_conversation',
-          { id }
+          { workspaceId, id }
         )
       : post<{ success: boolean; message_count: number; conversation_id: string }>(
           `/conversations/${id}/restore`
         ),
-  search: (query: string, limit?: number) =>
+  search: (workspaceId: string, query: string, limit?: number) =>
     isTauri()
-      ? apiInvoke<ConversationListItem[]>('search_conversations', { query, limit })
+      ? apiInvoke<ConversationListItem[]>('search_conversations', { workspaceId, query, limit })
       : get<ConversationListItem[]>(`/conversations/search?q=${encodeURIComponent(query)}`),
 };
 
 export const toolExecutionApi = {
-  list: (conversationId: string) =>
-    apiInvoke<ToolExecution[]>('list_tool_executions', { conversationId }),
-  detail: (detailRef: string) =>
-    apiInvoke<ToolExecutionDetailManifest>('get_tool_execution_detail', { detailRef }),
-  readOutput: (detailRef: string, cursor?: string | null, limit = 64 * 1024) =>
+  list: (workspaceId: string, conversationId: string) =>
+    apiInvoke<ToolExecution[]>('list_tool_executions', { workspaceId, conversationId }),
+  detail: (workspaceId: string, detailRef: string) =>
+    apiInvoke<ToolExecutionDetailManifest>('get_tool_execution_detail', {
+      workspaceId,
+      detailRef,
+    }),
+  readOutput: (workspaceId: string, detailRef: string, cursor?: string | null, limit = 64 * 1024) =>
     apiInvoke<ToolExecutionDetailPage>('read_tool_execution_output', {
+      workspaceId,
       detailRef,
       cursor: cursor ?? null,
       limit,
@@ -565,15 +578,16 @@ export const tasksApi = {
 // All Tauri args are snake_case.
 export const taskRuntimeApi = {
   // ── Reads ────────────────────────────────────────────────────────────
-  getRun: (runId: string) =>
+  getRun: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<TaskRun | null>('get_task_run', { runId })
+      ? apiInvoke<TaskRun | null>('get_task_run', { workspaceId, runId })
       : get<TaskRun | null>(`/task_runtime/runs/${runId}`),
-  getCompletionGate: (runId: string) =>
+  getCompletionGate: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<CompletionGateReport>('get_task_completion_gate', { runId })
+      ? apiInvoke<CompletionGateReport>('get_task_completion_gate', { workspaceId, runId })
       : get<CompletionGateReport>(`/task_runtime/runs/${runId}/completion_gate`),
   skipGoalRequirement: (
+    workspaceId: string,
     runId: string,
     expectedGoalRevision: number,
     requirementId: string,
@@ -581,6 +595,7 @@ export const taskRuntimeApi = {
   ) =>
     isTauri()
       ? apiInvoke<CompletionGateReport>('skip_task_goal_requirement', {
+          workspaceId,
           runId,
           expectedGoalRevision,
           requirementId,
@@ -590,17 +605,19 @@ export const taskRuntimeApi = {
           `/task_runtime/runs/${runId}/requirements/${requirementId}/skip`,
           { expected_goal_revision: expectedGoalRevision, reason }
         ),
-  getContinuation: (runId: string) =>
+  getContinuation: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<RunContinuationState | null>('get_task_continuation', { runId })
+      ? apiInvoke<RunContinuationState | null>('get_task_continuation', { workspaceId, runId })
       : get<RunContinuationState | null>(`/task_runtime/runs/${runId}/continuation`),
   configureContinuation: (
+    workspaceId: string,
     runId: string,
     tokenBudget: number | null,
     timeBudgetSeconds: number | null
   ) =>
     isTauri()
       ? apiInvoke<RunContinuationState>('configure_task_continuation', {
+          workspaceId,
           runId,
           tokenBudget,
           timeBudgetSeconds,
@@ -609,9 +626,16 @@ export const taskRuntimeApi = {
           token_budget: tokenBudget,
           time_budget_seconds: timeBudgetSeconds,
         }),
-  updateGoal: (runId: string, expectedGoalRevision: number, newGoal: string, reason: string) =>
+  updateGoal: (
+    workspaceId: string,
+    runId: string,
+    expectedGoalRevision: number,
+    newGoal: string,
+    reason: string
+  ) =>
     isTauri()
       ? apiInvoke<TaskRun>('update_task_run_goal', {
+          workspaceId,
           runId,
           expectedGoalRevision,
           newGoal,
@@ -622,9 +646,14 @@ export const taskRuntimeApi = {
           new_goal: newGoal,
           reason,
         }),
-  sendSubagentMessage: (identity: SubagentControlIdentity, instruction: string) =>
+  sendSubagentMessage: (
+    workspaceId: string,
+    identity: SubagentControlIdentity,
+    instruction: string
+  ) =>
     isTauri()
       ? apiInvoke<SubagentControlReceipt>('send_task_subagent_message', {
+          workspaceId,
           identity,
           instruction,
         })
@@ -632,9 +661,14 @@ export const taskRuntimeApi = {
           `/task_runtime/runs/${identity.run_id}/subagents/${identity.execution_id}/message`,
           { identity, instruction }
         ),
-  queueSubagentGuidance: (identity: SubagentControlIdentity, instruction: string) =>
+  queueSubagentGuidance: (
+    workspaceId: string,
+    identity: SubagentControlIdentity,
+    instruction: string
+  ) =>
     isTauri()
       ? apiInvoke<SubagentControlReceipt>('queue_task_subagent_guidance', {
+          workspaceId,
           identity,
           instruction,
         })
@@ -642,93 +676,103 @@ export const taskRuntimeApi = {
           `/task_runtime/runs/${identity.run_id}/subagents/${identity.task_id}/guidance`,
           { identity, instruction }
         ),
-  interruptSubagent: (identity: SubagentControlIdentity) =>
+  interruptSubagent: (workspaceId: string, identity: SubagentControlIdentity) =>
     isTauri()
-      ? apiInvoke<SubagentControlReceipt>('interrupt_task_subagent', { identity })
+      ? apiInvoke<SubagentControlReceipt>('interrupt_task_subagent', { workspaceId, identity })
       : post<SubagentControlReceipt>(
           `/task_runtime/runs/${identity.run_id}/subagents/${identity.execution_id}/interrupt`,
           { identity }
         ),
-  listBackgroundCells: (runId: string) =>
+  listBackgroundCells: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<BackgroundCellState[]>('list_task_background_cells', { runId })
+      ? apiInvoke<BackgroundCellState[]>('list_task_background_cells', { workspaceId, runId })
       : get<BackgroundCellState[]>(`/task_runtime/runs/${runId}/background_cells`),
-  latestRunForConversation: (conversationId: string) =>
+  latestRunForConversation: (workspaceId: string, conversationId: string) =>
     isTauri()
       ? apiInvoke<TaskRun | null>('latest_task_run_for_conversation', {
+          workspaceId,
           conversationId,
         })
       : get<TaskRun | null>(`/task_runtime/conversations/${conversationId}/latest_run`),
-  listRuns: (statuses?: string[]) =>
+  listRuns: (workspaceId: string, statuses?: string[]) =>
     isTauri()
-      ? apiInvoke<TaskRun[]>('list_task_runs', { statuses: statuses ?? null })
+      ? apiInvoke<TaskRun[]>('list_task_runs', { workspaceId, statuses: statuses ?? null })
       : get<TaskRun[]>('/task_runtime/runs'),
-  getPlan: (runId: string) =>
+  getPlan: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<TaskPlan | null>('get_task_plan', { runId })
+      ? apiInvoke<TaskPlan | null>('get_task_plan', { workspaceId, runId })
       : get<TaskPlan | null>(`/task_runtime/runs/${runId}/plan`),
-  listTodos: (runId: string) =>
+  listTodos: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<TodoItem[]>('list_task_todos', { runId })
+      ? apiInvoke<TodoItem[]>('list_task_todos', { workspaceId, runId })
       : get<TodoItem[]>(`/task_runtime/runs/${runId}/todos`),
-  listEvents: (runId: string, sinceSeq?: string) =>
+  listEvents: (workspaceId: string, runId: string, sinceSeq?: string) =>
     isTauri()
       ? apiInvoke<RuntimeTaskEvent[]>('list_task_events', {
+          workspaceId,
           runId,
           sinceSeq: sinceSeq ?? null,
         })
       : get<RuntimeTaskEvent[]>(`/task_runtime/runs/${runId}/events`),
-  listArtifacts: (runId: string) =>
+  listArtifacts: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<RuntimeArtifact[]>('list_task_artifacts', { runId })
+      ? apiInvoke<RuntimeArtifact[]>('list_task_artifacts', { workspaceId, runId })
       : get<RuntimeArtifact[]>(`/task_runtime/runs/${runId}/artifacts`),
-  getProgressLedger: (runId: string) =>
+  getProgressLedger: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<string>('get_progress_ledger', { runId })
+      ? apiInvoke<string>('get_progress_ledger', { workspaceId, runId })
       : get<string>(`/task_runtime/runs/${runId}/progress.md`),
-  listReviews: (runId: string, taskId: string) =>
+  listReviews: (workspaceId: string, runId: string, taskId: string) =>
     isTauri()
-      ? apiInvoke<ReviewResult[]>('list_task_reviews', { runId, taskId })
+      ? apiInvoke<ReviewResult[]>('list_task_reviews', { workspaceId, runId, taskId })
       : get<ReviewResult[]>(`/task_runtime/runs/${runId}/tasks/${taskId}/reviews`),
-  getTaskSummary: (runId: string, taskId: string) =>
+  getTaskSummary: (workspaceId: string, runId: string, taskId: string) =>
     isTauri()
-      ? apiInvoke<TaskExecutionSummary | null>('get_task_summary', { runId, taskId })
+      ? apiInvoke<TaskExecutionSummary | null>('get_task_summary', {
+          workspaceId,
+          runId,
+          taskId,
+        })
       : get<TaskExecutionSummary | null>(`/task_runtime/runs/${runId}/tasks/${taskId}/summary`),
-  listRecoveryBlockers: (runId: string) =>
+  listRecoveryBlockers: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<RecoveryBlocker[]>('list_recovery_blockers', { runId })
+      ? apiInvoke<RecoveryBlocker[]>('list_recovery_blockers', { workspaceId, runId })
       : get<RecoveryBlocker[]>(`/task_runtime/runs/${runId}/recovery_blockers`),
 
-  cancelRun: (runId: string) =>
+  cancelRun: (workspaceId: string, runId: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; run_id: string }>('cancel_task_run', {
+          workspaceId,
           runId,
         })
       : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/cancel`),
-  pauseRun: (runId: string) =>
+  pauseRun: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; run_id: string }>('pause_task_run', { runId })
+      ? apiInvoke<{ success: boolean; run_id: string }>('pause_task_run', {
+          workspaceId,
+          runId,
+        })
       : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/pause`),
 
   // ── Dynamic task operations ──────────────────────────────────────────
-  resumeRun: (runId: string) =>
+  resumeRun: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<{ kind: string; run_id: string }>('resume_task_run', { runId })
+      ? apiInvoke<{ kind: string; run_id: string }>('resume_task_run', { workspaceId, runId })
       : post(`/task_runtime/runs/${runId}/resume`),
-  retryBlockedTask: (runId: string, taskId: string) =>
+  retryBlockedTask: (workspaceId: string, runId: string, taskId: string) =>
     isTauri()
       ? apiInvoke<{ kind: string; run_id: string; task_id: string; next_attempt: number | null }>(
           'retry_blocked_task',
-          { runId, taskId }
+          { workspaceId, runId, taskId }
         )
       : post(`/task_runtime/runs/${runId}/tasks/${taskId}/retry`),
-  resolveRecoveryTask: (runId: string, taskId: string, decision: 'skip') =>
+  resolveRecoveryTask: (workspaceId: string, runId: string, taskId: string, decision: 'skip') =>
     isTauri()
-      ? apiInvoke<void>('resolve_recovery_task', { runId, taskId, decision })
+      ? apiInvoke<void>('resolve_recovery_task', { workspaceId, runId, taskId, decision })
       : post(`/task_runtime/runs/${runId}/tasks/${taskId}/resolve_recovery`, { decision }),
-  updateTasks: (runId: string, request: TaskUpdateRequest) =>
+  updateTasks: (workspaceId: string, runId: string, request: TaskUpdateRequest) =>
     isTauri()
-      ? apiInvoke<TaskPlan>('update_tasks', { runId, request })
+      ? apiInvoke<TaskPlan>('update_tasks', { workspaceId, runId, request })
       : post<TaskPlan>(`/task_runtime/runs/${runId}/tasks/update`, request),
 
   // ── Interaction mode ─────────────────────────────────────────────────
@@ -1633,7 +1677,7 @@ export interface AgentEndpoint {
   updated_at: string;
 }
 
-export type AgentDeliveryStatus = 'queued' | 'claimed' | 'delivered' | 'failed';
+export type AgentDeliveryStatus = 'queued' | 'claimed' | 'injected' | 'delivered' | 'failed';
 
 export interface AgentDeliveryReceipt {
   message_id: string;
@@ -1648,11 +1692,13 @@ export interface AgentDeliveryRecord {
   target: AgentAddress;
   status: AgentDeliveryStatus;
   accepted_at: string;
+  attempt_id: string | null;
   attempt: number;
   settled_at: string | null;
   turn_id: string | null;
   reply_message_id: string | null;
   error: string | null;
+  next_attempt_at: string | null;
 }
 
 export interface AgentGroupMember {
@@ -2288,22 +2334,26 @@ export const worktreeApi = {
     isTauri()
       ? apiInvoke<{ success: boolean }>('remove_worktree', { path })
       : del<{ success: boolean }>(`/worktrees?path=${encodeURIComponent(path)}`),
-  listUnattended: () =>
+  listUnattended: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees')
+      ? apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees', { workspaceId })
       : get<UnattendedWorktreeInfo[]>('/worktrees/unattended'),
-  mergeUnattended: (runId: string) =>
+  mergeUnattended: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<UnattendedWorktreeMergeResult>('merge_unattended_worktree', { runId })
+      ? apiInvoke<UnattendedWorktreeMergeResult>('merge_unattended_worktree', {
+          workspaceId,
+          runId,
+        })
       : post<UnattendedWorktreeMergeResult>(`/worktrees/unattended/${runId}/merge`, {}),
-  discardUnattended: (runId: string) =>
+  discardUnattended: (workspaceId: string, runId: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; discarded: string }>('discard_unattended_worktree', {
+          workspaceId,
           runId,
         })
       : del<{ success: boolean; discarded: string }>(`/worktrees/unattended/${runId}`),
-  cleanupUnattended: () =>
+  cleanupUnattended: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees')
+      ? apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { workspaceId })
       : post<UnattendedWorktreeCleanupResult>('/worktrees/unattended/cleanup', {}),
 };

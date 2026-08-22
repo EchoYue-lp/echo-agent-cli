@@ -6,6 +6,8 @@ import {
   type SubmitTaskRequest,
 } from '../../api/endpoints';
 import { Play, XCircle, RefreshCw, Plus, ChevronDown, ChevronUp, HandMetal } from 'lucide-react';
+import { workspaceIdForView } from '../../lib/viewAddress';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'var(--color-warning)',
@@ -48,6 +50,7 @@ interface TaskProgress {
 }
 
 export function TasksPanel() {
+  const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -70,7 +73,7 @@ export function TasksPanel() {
       for (const task of data) {
         if (task.source !== 'run' || task.status !== 'in_progress') continue;
         try {
-          const plan = await taskRuntimeApi.getPlan(task.id);
+          const plan = await taskRuntimeApi.getPlan(workspaceId, task.id);
           if (plan && plan.tasks.length > 0) {
             const done = plan.tasks.filter(
               (t: { status: string }) => t.status === 'completed'
@@ -93,7 +96,7 @@ export function TasksPanel() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [workspaceId]);
 
   useEffect(() => {
     fetchTasks();

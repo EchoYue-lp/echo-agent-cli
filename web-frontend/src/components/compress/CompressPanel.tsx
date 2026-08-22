@@ -35,17 +35,18 @@ export function CompressPanel() {
   const usageAccumulator = useChatStore((s) => s.usageAccumulator);
   const subagentRuns = useSubagentRunStore((s) => s.runs);
   const activeConversationId = useConversationStore((s) => s.activeId);
+  const workspaceId = useConversationStore((s) => s.workspaceId);
   const runtimeConversationId = useTaskRuntimeStore((s) => s.activeRun?.conversation_id ?? null);
   const targetConversationId = activeConversationId ?? runtimeConversationId ?? undefined;
 
   const loadStats = useCallback(async () => {
     try {
-      const data = await compressApi.getStats(targetConversationId);
+      const data = await compressApi.getStats(workspaceId, targetConversationId);
       setStats(data);
     } catch (e) {
       console.error(e);
     }
-  }, [targetConversationId]);
+  }, [targetConversationId, workspaceId]);
 
   useEffect(() => {
     void loadStats();
@@ -55,7 +56,9 @@ export function CompressPanel() {
     setCompressing(true);
     setMsg(null);
     try {
-      const res = await compressApi.trigger({ conversation_id: targetConversationId });
+      const res = await compressApi.trigger(workspaceId, {
+        conversation_id: targetConversationId,
+      });
       if (res.success) {
         setLastCompress(res);
         // 与后端 emit context_compressed 对齐：Snapshot 置空（Accumulator 保留）。
