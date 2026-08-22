@@ -784,8 +784,20 @@ fn build_plugin_agent(
     definition: &crate::subagent_loader::SubagentDefinition,
     resources: &PluginAgentResources,
 ) -> echo_agent::error::Result<ReactAgent> {
-    let model =
-        crate::infra::resolve_subagent_model(definition.model.as_deref(), &resources.parent_model);
+    if definition
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "inherit")
+        .is_some_and(|model| model != resources.parent_model)
+    {
+        tracing::warn!(
+            subagent = definition.name,
+            requested_model = ?definition.model,
+            "Plugin Subagent model override has no configured profile resolver; using the complete parent generation"
+        );
+    }
+    let model = resources.parent_model.clone();
     let mut builder = ReactAgentBuilder::new()
         .name(&definition.name)
         .model(&model)
@@ -815,8 +827,7 @@ fn build_plugin_agent(
     }
     if let Some(client) = resources.llm_client.clone() {
         builder = builder.llm_client(client);
-    } else if let Some(mut config) = resources.llm_config.clone() {
-        config.model = model;
+    } else if let Some(config) = resources.llm_config.clone() {
         builder = builder.llm_config(config);
     }
     builder.build()

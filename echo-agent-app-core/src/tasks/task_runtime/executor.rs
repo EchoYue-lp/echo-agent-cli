@@ -70,6 +70,10 @@ impl ProcessExecutionGovernor {
     pub(crate) fn shell_semaphore(&self) -> Arc<Semaphore> {
         self.shell.clone()
     }
+
+    pub(crate) fn subagent_semaphore(&self) -> Arc<Semaphore> {
+        self.subagent.clone()
+    }
 }
 
 use super::completion_gate::{artifact_matches, verification_matches};

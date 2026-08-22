@@ -2512,6 +2512,16 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 "Command cell {} settled: {}",
                 cell.cell_id, cell.phase
             )),
+            ChatDriverEvent::AwaiterResultReady { result } => AgentEvent::Notice(format!(
+                "Awaiter {} ready: cell {} {}",
+                result.receipt.execution_id, result.cell.cell_id, result.cell.phase
+            )),
+            ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
+                AgentEvent::Notice(format!(
+                    "Awaiter {} delivered to turn {}",
+                    acknowledgement.execution_id, acknowledgement.acknowledged_turn_id
+                ))
+            }
             ChatDriverEvent::ContextCompressed {
                 before_count,
                 after_count,

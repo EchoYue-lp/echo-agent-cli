@@ -162,6 +162,21 @@ impl AgentRuntime {
         }
 
         let agent_handle = AgentHandle::new(agent);
+        if let Some(conversation_id) = params.conversation_id.as_deref() {
+            let execution_scope = params.execution_scope.clone().unwrap_or_else(|| {
+                crate::workspace::WorkspaceExecutionScope::global(
+                    params
+                        .working_dir
+                        .clone()
+                        .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                )
+            });
+            command_cell_runtime.bind_agent(
+                execution_scope.workspace_id(),
+                conversation_id,
+                &agent_handle,
+            );
+        }
 
         // ── NOTE: ExecuteTaskTool + the task-management tools are NOT registered
         // here. The TaskRuntimeStore doesn't exist yet at primary-agent build

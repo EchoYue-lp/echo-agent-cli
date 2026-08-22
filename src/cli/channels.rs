@@ -1875,6 +1875,21 @@ async fn aggregate_by_sentence<'a>(
                         format!("[cell:{}] settled: {}", cell.cell_id, cell.phase),
                     );
                 }
+                ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultReady { result }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!(
+                            "[awaiter:{}] cell {} {}",
+                            result.receipt.execution_id,
+                            result.cell.cell_id,
+                            result.cell.phase,
+                        ),
+                    );
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultAcknowledged { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::ApprovalRequest {
                     request_id,
                     tool_name,

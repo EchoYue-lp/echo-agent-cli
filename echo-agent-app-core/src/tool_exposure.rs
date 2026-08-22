@@ -65,7 +65,13 @@ const TASK_TOOLS: &[&str] = &["task_create", "task_update", "task_list", "task_e
 // Background command cells: long-poll primitives for commands started with
 // shell(background=true). They share the foreground shell safety classifier
 // and are not a second task API.
-const CELL_TOOLS: &[&str] = &["wait", "stop_cell", "list_cells", "watch_cell"];
+const CELL_TOOLS: &[&str] = &[
+    "wait",
+    "stop_cell",
+    "list_cells",
+    "watch_cell",
+    "interrupt_awaiter",
+];
 const SKILL_RESOURCE_TOOLS: &[&str] = &["read_skill_resource"];
 const WEB_SEARCH_TOOLS: &[&str] = &["web_search"];
 const WEB_FETCH_TOOLS: &[&str] = &["web_fetch"];
@@ -207,6 +213,7 @@ mod tests {
                 "final_answer",
                 "glob",
                 "grep",
+                "interrupt_awaiter",
                 "list_cells",
                 "list_dir",
                 "read_artifact",
@@ -232,6 +239,7 @@ mod tests {
                 "final_answer",
                 "glob",
                 "grep",
+                "interrupt_awaiter",
                 "list_cells",
                 "read_artifact",
                 "read_file",
@@ -257,6 +265,7 @@ mod tests {
                 "final_answer",
                 "glob",
                 "grep",
+                "interrupt_awaiter",
                 "list_cells",
                 "list_dir",
                 "read_artifact",

@@ -87,6 +87,12 @@ pub enum ChatDriverEvent {
     CommandCellSettled {
         cell: Box<crate::tasks::task_runtime::BackgroundCellState>,
     },
+    AwaiterResultReady {
+        result: Box<crate::tasks::task_runtime::command_cells::AwaiterResult>,
+    },
+    AwaiterResultAcknowledged {
+        acknowledgement: crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
+    },
 }
 
 /// Runtime-owned terminal result for one interactive turn.
@@ -2086,6 +2092,8 @@ mod tests {
                 | ChatDriverEvent::SelectionRequest { .. }
                 | ChatDriverEvent::CommandCellStarted { .. }
                 | ChatDriverEvent::CommandCellSettled { .. }
+                | ChatDriverEvent::AwaiterResultReady { .. }
+                | ChatDriverEvent::AwaiterResultAcknowledged { .. }
                 | ChatDriverEvent::ContextCompressed { .. } => {}
             }
             true

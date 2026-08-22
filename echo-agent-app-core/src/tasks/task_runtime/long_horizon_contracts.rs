@@ -12,8 +12,6 @@ const APP_SERVICE: &str = include_str!("../service.rs");
 const APP_STORE: &str = include_str!("store.rs");
 const APP_TYPES: &str = include_str!("types.rs");
 const APP_TAURI: &str = include_str!("../../../../src/tauri/mod.rs");
-const FRAMEWORK_AGENT_DISPATCH: &str =
-    include_str!("../../../../../echo-agent/src/tools/builtin/agent_dispatch.rs");
 const FRAMEWORK_CELL_CONTRACT: &str =
     include_str!("../../../../../echo-agent/echo-core/src/tools/cell.rs");
 const FRAMEWORK_CELL_RUNTIME: &str =
@@ -73,27 +71,21 @@ fn lh_f01_boot_resume_is_still_background_service_only() -> Result<(), String> {
 }
 
 #[test]
-fn lh_f02_watch_cell_still_routes_through_handle_dropping_agent_tool() -> Result<(), String> {
-    require(
+fn lh_f02_watch_cell_owns_the_direct_controlled_background_handle() -> Result<(), String> {
+    require_absent(
         APP_COMMAND_CELLS,
         ".execute_tool_with_context(\"agent_tool\", dispatch, context)",
-        "LH-F02 baseline changed: watch_cell no longer delegates through agent_tool",
-    )?;
-    let background_branch = between(
-        FRAMEWORK_AGENT_DISPATCH,
-        "if run_background {",
-        "} else {",
-        "LH-F02 background agent_tool branch could not be isolated",
+        "LH-F02 repair regressed: watch_cell delegates through handle-dropping agent_tool",
     )?;
     require(
-        background_branch,
-        "executor.dispatch_background(req).await",
-        "LH-F02 baseline changed: agent_tool no longer dispatches a background handle",
+        APP_COMMAND_CELLS,
+        ".dispatch_background_attempt(request, identity)",
+        "LH-F02 repair regressed: exact controlled dispatch is missing",
     )?;
-    require_absent(
-        background_branch,
-        ".join().await",
-        "LH-F02 baseline changed: agent_tool now owns the background result",
+    require(
+        APP_COMMAND_CELLS,
+        "let join_result = handle.join().await;",
+        "LH-F02 repair regressed: app-core does not own Awaiter settlement",
     )
 }
 
@@ -244,20 +236,30 @@ fn lh_f10_command_cells_share_the_process_shell_governor() -> Result<(), String>
         APP_COMMAND_CELLS,
         "process_execution_governor()",
         "LH-F10 repair regressed: command cells bypass the process shell governor",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        "self.governor.subagent_semaphore().acquire_owned()",
+        "LH-F10 repair regressed: Awaiter bypasses the process Subagent governor",
     )
 }
 
 #[test]
-fn lh_f11_fast_model_still_rewrites_only_the_parent_model_name() -> Result<(), String> {
-    require(
+fn lh_f11_fast_model_resolves_one_complete_configured_profile() -> Result<(), String> {
+    require_absent(
         APP_INFRA,
-        "Some(\"fast\") => std::env::var(\"EKO_FAST_MODEL\")",
-        "LH-F11 raw fast model alias is no longer reachable",
+        "config.model = model;",
+        "LH-F11 repair regressed: fixed role rewrites only the parent model name",
     )?;
     require(
         APP_INFRA,
-        "config.model = model;",
-        "LH-F11 baseline changed: fixed Subagent binding no longer rewrites the cloned config model",
+        "model_config::resolve_runtime_model_selector(app_config, Some(&selector))",
+        "LH-F11 repair regressed: configured model profile resolver is bypassed",
+    )?;
+    require(
+        APP_INFRA,
+        "prepare_runtime_llm(&runtime)",
+        "LH-F11 repair regressed: resolved Provider profile is not prepared as one generation",
     )
 }
 

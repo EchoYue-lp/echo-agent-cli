@@ -144,29 +144,70 @@ fn subagent_build_thinking(
 fn subagent_model_binding(
     spec: Option<&str>,
     thinking_spec: Option<&str>,
+    app_config: &AppConfig,
     parent_generation: &SubagentRuntimeGeneration,
     inherited_generation: &Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>,
 ) -> SubagentModelBinding {
-    let model = resolve_subagent_model(spec, &parent_generation.model);
     if spec.is_none() {
         // Inherit: no thinking of its own — snapshots follow the shared
         // generation the parent republishes on every model hot-swap.
         SubagentModelBinding::Inherit(inherited_generation.clone())
     } else {
+        let mut generation = resolve_fixed_subagent_generation(spec, app_config, parent_generation);
         // Fixed: resolve the role's thinking spec once; without one keep the
         // parent's thinking as of registration (mirrors temperature/max_tokens).
-        SubagentModelBinding::Fixed(Box::new(SubagentRuntimeGeneration {
-            model: model.clone(),
-            llm_config: parent_generation.llm_config.clone().map(|mut config| {
-                config.model = model;
-                config
-            }),
-            llm_client: None,
-            temperature: parent_generation.temperature,
-            max_tokens: parent_generation.max_tokens,
-            token_limit: parent_generation.token_limit,
-            thinking: subagent_build_thinking(thinking_spec, parent_generation),
-        }))
+        generation.thinking = subagent_build_thinking(thinking_spec, &generation);
+        SubagentModelBinding::Fixed(Box::new(generation))
+    }
+}
+
+fn resolve_fixed_subagent_generation(
+    spec: Option<&str>,
+    app_config: &AppConfig,
+    parent_generation: &SubagentRuntimeGeneration,
+) -> SubagentRuntimeGeneration {
+    let selector = match spec.map(str::trim).filter(|value| !value.is_empty()) {
+        Some("inherit") | None => return parent_generation.clone(),
+        Some("fast") => match std::env::var("EKO_FAST_MODEL")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            Some(selector) => selector,
+            None => return parent_generation.clone(),
+        },
+        Some(selector) => selector.to_string(),
+    };
+    let runtime = match model_config::resolve_runtime_model_selector(app_config, Some(&selector)) {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::warn!(
+                selector,
+                %error,
+                "Configured Subagent model selector is unavailable; using the complete parent generation"
+            );
+            return parent_generation.clone();
+        }
+    };
+    let prepared = match prepare_runtime_llm(&runtime) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            tracing::warn!(
+                selector,
+                %error,
+                "Configured Subagent model profile could not be prepared; using the complete parent generation"
+            );
+            return parent_generation.clone();
+        }
+    };
+    SubagentRuntimeGeneration {
+        model: runtime.model.clone(),
+        llm_config: Some(prepared.config),
+        llm_client: Some(prepared.client),
+        temperature: runtime.temperature,
+        max_tokens: runtime.max_tokens,
+        token_limit: effective_token_limit(app_config, Some(&runtime)),
+        thinking: prepared.thinking,
     }
 }
 
@@ -487,7 +528,7 @@ pub async fn create_agent_with_diagnostics(
         )
     });
     let command_cells =
-        command_cell_runtime.scoped(execution_scope, params.task_runtime_store.clone());
+        command_cell_runtime.scoped(execution_scope.clone(), params.task_runtime_store.clone());
     let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
         Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
     let subagent_registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
@@ -684,7 +725,8 @@ pub async fn create_agent_with_diagnostics(
         crate::turn_context::EkoContextProjector::new(
             crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
             crate::turn_context::turn_prompt_context_registry(),
-        ),
+        )
+        .with_awaiter_results(command_cell_runtime.clone(), execution_scope.clone()),
     )));
     let cache_user_id = load_or_create_cache_user_id();
     agent.config_mut().set_cache_user_id(&cache_user_id);
@@ -723,6 +765,7 @@ pub async fn create_agent_with_diagnostics(
     );
     let model_consumers = register_default_subagents(
         &mut agent,
+        app_config,
         SubagentRuntimeGeneration {
             model: model.to_string(),
             llm_config: injected_llm_config,
@@ -749,7 +792,12 @@ pub async fn create_agent_with_diagnostics(
         run_code_available,
     )
     .await;
-    crate::tasks::task_runtime::command_cells::install_watch_cell_tool(&mut agent, command_cells);
+    crate::tasks::task_runtime::command_cells::install_watch_cell_tool(
+        &mut agent,
+        command_cells,
+        command_cell_runtime.clone(),
+        execution_scope,
+    );
 
     // Register default hooks
     register_default_hooks(&mut agent);
@@ -801,25 +849,6 @@ fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
     }
 }
 
-/// Resolve a subagent model frontmatter value to a concrete model id.
-///
-/// - `None` / omitted → parent model
-/// - `"inherit"` → current parent model, fixed at registration
-/// - `"fast"` → `EKO_FAST_MODEL` env if set, else parent model
-/// - any other string → used as-is
-pub fn resolve_subagent_model(spec: Option<&str>, parent_model: &str) -> String {
-    match spec {
-        None => parent_model.to_string(),
-        Some("inherit") => parent_model.to_string(),
-        Some("fast") => std::env::var("EKO_FAST_MODEL")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| parent_model.to_string()),
-        Some(other) => other.to_string(),
-    }
-}
-
 /// Register readonly subagents on the given agent.
 ///
 /// Subagent definitions are **hot-loaded from `.md` files** (Sprint 6): project
@@ -836,6 +865,7 @@ pub fn resolve_subagent_model(spec: Option<&str>, parent_model: &str) -> String 
 #[allow(clippy::too_many_arguments)]
 async fn register_default_subagents(
     agent: &mut ReactAgent,
+    app_config: &AppConfig,
     parent_generation: SubagentRuntimeGeneration,
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
@@ -881,6 +911,7 @@ async fn register_default_subagents(
         let model_binding = subagent_model_binding(
             subagent_def.model.as_deref(),
             subagent_def.thinking.as_deref(),
+            app_config,
             &parent_generation,
             &inherited_generation,
         );
@@ -2877,11 +2908,12 @@ mod resolve_subagent_model_tests {
     use super::{
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS, SubagentRuntimeGeneration, TASK_MANAGEMENT_GUIDE,
         build_readonly_subagent_agent, build_writer_subagent_agent, configure_run_code_capability,
-        eko_visibility_horizon, resolve_subagent_model, resolved_max_tool_output_tokens,
+        eko_visibility_horizon, resolve_fixed_subagent_generation, resolved_max_tool_output_tokens,
         subagent_model_binding, tool_output_artifact_config,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
+    use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
     use echo_agent::sandbox::SandboxManager;
     use std::sync::Arc;
 
@@ -2934,11 +2966,6 @@ mod resolve_subagent_model_tests {
         Ok(())
     }
 
-    #[test]
-    fn none_inherits_parent() {
-        assert_eq!(resolve_subagent_model(None, "parent-model"), "parent-model");
-    }
-
     #[tokio::test]
     async fn explicit_inherit_is_resolved_once_and_remains_fixed() {
         let initial = SubagentRuntimeGeneration {
@@ -2951,7 +2978,13 @@ mod resolve_subagent_model_tests {
             thinking: None,
         };
         let authority = Arc::new(tokio::sync::RwLock::new(initial.clone()));
-        let binding = subagent_model_binding(Some("inherit"), None, &initial, &authority);
+        let binding = subagent_model_binding(
+            Some("inherit"),
+            None,
+            &AppConfig::default(),
+            &initial,
+            &authority,
+        );
         *authority.write().await = SubagentRuntimeGeneration {
             model: "parent-b".to_string(),
             token_limit: 65_536,
@@ -2979,7 +3012,9 @@ mod resolve_subagent_model_tests {
             )),
         };
         let authority = Arc::new(tokio::sync::RwLock::new(parent.clone()));
-        let binding = subagent_model_binding(Some("fast"), Some("low"), &parent, &authority);
+        let config = AppConfig::default();
+        let binding =
+            subagent_model_binding(Some("inherit"), Some("low"), &config, &parent, &authority);
         let fixed = binding.snapshot().await;
         assert_eq!(
             fixed.thinking,
@@ -2990,36 +3025,82 @@ mod resolve_subagent_model_tests {
 
         // Explicit model but NO thinking spec → the registration-time parent
         // thinking is copied (mirrors temperature/max_tokens).
-        let no_spec = subagent_model_binding(Some("fast"), None, &parent, &authority);
+        let no_spec = subagent_model_binding(Some("inherit"), None, &config, &parent, &authority);
         assert_eq!(no_spec.snapshot().await.thinking, parent.thinking);
 
         // No model spec → Inherit binding follows the parent generation's
         // thinking, so the published parent value flows into forks.
-        let inherit = subagent_model_binding(None, None, &parent, &authority);
+        let inherit = subagent_model_binding(None, None, &config, &parent, &authority);
         assert_eq!(inherit.snapshot().await.thinking, parent.thinking);
     }
 
     #[test]
-    fn fast_falls_back_to_parent_without_env() {
-        // Do not assert env-dependent path; only the no-env fallback.
-        let got = resolve_subagent_model(Some("fast"), "parent-model");
-        // If EKO_FAST_MODEL is set in the environment, honor it; otherwise parent.
-        if let Ok(fast) = std::env::var("EKO_FAST_MODEL") {
-            let trimmed = fast.trim();
-            if !trimmed.is_empty() {
-                assert_eq!(got, trimmed);
-                return;
-            }
-        }
-        assert_eq!(got, "parent-model");
+    fn configured_subagent_selector_resolves_the_complete_profile() -> Result<(), String> {
+        let mut config = AppConfig::default();
+        config.model_providers.insert(
+            "fast-provider".to_string(),
+            ModelProviderConfig {
+                base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+                ..Default::default()
+            },
+        );
+        config.configured_models.push(ConfiguredModel {
+            id: "fast-profile".to_string(),
+            display_name: "Fast profile".to_string(),
+            provider: "fast-provider".to_string(),
+            model: "fast-model".to_string(),
+            enabled: true,
+            context_window: Some(32_000),
+            ..Default::default()
+        });
+        let parent = SubagentRuntimeGeneration {
+            model: "parent-model".to_string(),
+            llm_config: None,
+            llm_client: None,
+            temperature: None,
+            max_tokens: None,
+            token_limit: 16_384,
+            thinking: None,
+        };
+
+        let fixed = resolve_fixed_subagent_generation(Some("fast-profile"), &config, &parent);
+        assert_eq!(fixed.model, "fast-model");
+        assert_eq!(fixed.token_limit, 32_000);
+        let llm_config = fixed
+            .llm_config
+            .ok_or_else(|| "configured profile did not produce LlmConfig".to_string())?;
+        assert_eq!(llm_config.model, "fast-model");
+        assert_eq!(
+            llm_config.base_url,
+            "http://127.0.0.1:11434/v1/chat/completions"
+        );
+        assert!(fixed.llm_client.is_some());
+        Ok(())
     }
 
     #[test]
-    fn concrete_model_passthrough() {
-        assert_eq!(
-            resolve_subagent_model(Some("claude-haiku"), "parent"),
-            "claude-haiku"
+    fn invalid_fixed_selector_falls_back_to_complete_parent_generation() {
+        let parent = SubagentRuntimeGeneration {
+            model: "parent-model".to_string(),
+            llm_config: None,
+            llm_client: None,
+            temperature: Some(0.4),
+            max_tokens: Some(2_048),
+            token_limit: 16_384,
+            thinking: Some(echo_agent::llm::ThinkingConfig::Level(
+                echo_agent::llm::ThinkingLevel::Medium,
+            )),
+        };
+        let fixed = resolve_fixed_subagent_generation(
+            Some("missing-profile"),
+            &AppConfig::default(),
+            &parent,
         );
+        assert_eq!(fixed.model, parent.model);
+        assert_eq!(fixed.temperature, parent.temperature);
+        assert_eq!(fixed.max_tokens, parent.max_tokens);
+        assert_eq!(fixed.token_limit, parent.token_limit);
+        assert_eq!(fixed.thinking, parent.thinking);
     }
 
     #[test]

@@ -262,6 +262,75 @@ describe('canonical chat event v4 contract', () => {
     );
   });
 
+  it('renders runtime cell truth from an Awaiter Ready fact after turn settlement', () => {
+    const base = fixture[0];
+    if (!base) throw new Error('contract fixture is incomplete');
+    const refs = context();
+    handleChatEventEnvelope(
+      {
+        ...base,
+        sequence: 2,
+        payload: { source: 'turn_status', event: { status: 'completed' } },
+      } as ChatEventEnvelope,
+      refs
+    );
+    const terminalCell = {
+      cell_id: 'cell-awaiter',
+      name: 'long test',
+      command_hash: 'sha256:test',
+      turn_id: base.turn_id,
+      execution_id: 'cell-execution',
+      call_id: 'call-awaiter',
+      phase: 'succeeded' as const,
+      terminal_cause: 'exited' as const,
+      terminal_message: null,
+      exit_code: 0,
+      artifact_status: 'below_threshold' as const,
+      artifact_message: null,
+      total_output_bytes: 8,
+      output_truncated: false,
+      output_excerpt: 'passed',
+      artifact_path: null,
+      artifact_sha256: null,
+      started_at: '2026-08-22T00:00:00Z',
+      finished_at: '2026-08-22T00:00:01Z',
+    };
+    handleChatEventEnvelope(
+      {
+        ...base,
+        sequence: 3,
+        payload: {
+          source: 'awaiter_result_ready',
+          event: {
+            result: {
+              receipt: {
+                execution_id: 'awaiter-execution',
+                control_task_id: 'awaiter:cell-awaiter:1',
+                attempt: 1,
+                watch_generation: 1,
+                cell_id: 'cell-awaiter',
+                workspace_id: base.workspace_id,
+                conversation_id: base.conversation_id ?? 'conversation',
+                run_id: null,
+                root_turn_id: base.root_turn_id,
+                state: 'settled',
+                started_at: '2026-08-22T00:00:00Z',
+                settled_at: '2026-08-22T00:00:01Z',
+              },
+              cell: terminalCell,
+              awaiter_status: 'completed',
+              awaiter_summary: 'prose incorrectly says failed',
+            },
+          },
+        },
+      } as ChatEventEnvelope,
+      refs
+    );
+    expect(useChatStore.getState().messages.at(-1)?.content).toContain(
+      'cell cell-awaiter succeeded'
+    );
+  });
+
   it('fails closed for an unknown run status', () => {
     const base = fixture[0];
     if (!base) throw new Error('contract fixture is incomplete');

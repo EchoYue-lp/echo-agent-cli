@@ -136,6 +136,10 @@ pub fn turn_prompt_context_registry() -> Arc<TurnPromptContextRegistry> {
 pub struct EkoContextProjector {
     task_runtime: TaskRuntimeContextProjector,
     turns: Arc<TurnPromptContextRegistry>,
+    awaiter: Option<(
+        Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
+        crate::workspace::WorkspaceExecutionScope,
+    )>,
 }
 
 impl EkoContextProjector {
@@ -146,7 +150,17 @@ impl EkoContextProjector {
         Self {
             task_runtime: TaskRuntimeContextProjector::new(task_runtime_registry),
             turns,
+            awaiter: None,
         }
+    }
+
+    pub fn with_awaiter_results(
+        mut self,
+        service: Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
+        execution_scope: crate::workspace::WorkspaceExecutionScope,
+    ) -> Self {
+        self.awaiter = Some((service, execution_scope));
+        self
     }
 }
 
@@ -164,6 +178,20 @@ impl PreModelContextProjector for EkoContextProjector {
             projections.push(ContextProjection {
                 marker: TURN_CONTRACT_MARKER.to_string(),
                 message: contract.map(render_turn_contract).map(Message::user),
+            });
+            let pending_awaiter = match (
+                self.awaiter.as_ref(),
+                context.conversation_id.as_deref(),
+                context.turn_id.as_deref(),
+            ) {
+                (Some((service, scope)), Some(conversation_id), Some(turn_id)) => service
+                    .project_pending_awaiter_results(scope.workspace_id(), conversation_id, turn_id)
+                    .map_err(echo_agent::error::ReactError::Other)?,
+                _ => None,
+            };
+            projections.push(ContextProjection {
+                marker: "[eko_pending_awaiter_results]".to_string(),
+                message: pending_awaiter.map(Message::user),
             });
             Ok(projections)
         })

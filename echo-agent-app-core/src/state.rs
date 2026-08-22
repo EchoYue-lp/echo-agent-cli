@@ -1570,6 +1570,7 @@ impl AppState {
         if let Some(store) = self.tasks.runtime.as_ref() {
             runtime.bind_store(store);
         }
+        runtime.bind_foreground_turns(self.session.foreground_turns.clone());
         self.command_cell_runtime = Some(runtime);
         self
     }

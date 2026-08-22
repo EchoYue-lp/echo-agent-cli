@@ -358,7 +358,42 @@ export type ChatDriverEvent =
       };
     }
   | { source: 'command_cell_started'; event: { cell: BackgroundCellState } }
-  | { source: 'command_cell_settled'; event: { cell: BackgroundCellState } };
+  | { source: 'command_cell_settled'; event: { cell: BackgroundCellState } }
+  | { source: 'awaiter_result_ready'; event: { result: AwaiterResult } }
+  | {
+      source: 'awaiter_result_acknowledged';
+      event: { acknowledgement: AwaiterResultAcknowledgement };
+    };
+
+export interface AwaiterWatchReceipt {
+  execution_id: string;
+  control_task_id: string;
+  attempt: number;
+  watch_generation: number;
+  cell_id: string;
+  workspace_id: string;
+  conversation_id: string;
+  run_id: string | null;
+  root_turn_id: string;
+  state: 'started' | 'settled' | 'cancelled' | 'failed';
+  started_at: string;
+  settled_at: string | null;
+}
+
+export interface AwaiterResult {
+  receipt: AwaiterWatchReceipt;
+  cell: BackgroundCellState;
+  awaiter_status: 'completed' | 'failed' | 'cancelled' | 'timed_out';
+  awaiter_summary: string | null;
+}
+
+export interface AwaiterResultAcknowledgement {
+  execution_id: string;
+  attempt: number;
+  watch_generation: number;
+  cell_id: string;
+  acknowledged_turn_id: string;
+}
 
 export interface ChatEventEnvelope {
   schema_version: number;

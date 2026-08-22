@@ -28,7 +28,9 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
     payload.source !== 'agent' &&
     payload.source !== 'turn_status' &&
     payload.source !== 'command_cell_started' &&
-    payload.source !== 'command_cell_settled'
+    payload.source !== 'command_cell_settled' &&
+    payload.source !== 'awaiter_result_ready' &&
+    payload.source !== 'awaiter_result_acknowledged'
   ) {
     return;
   }
@@ -99,6 +101,21 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       );
       break;
     }
+    case 'awaiter_result_ready': {
+      const result = payload.event.result;
+      handleChatEvent(
+        {
+          type: 'notice',
+          level: result.cell.phase === 'succeeded' ? 'info' : 'warning',
+          code: 'awaiter_result_ready',
+          message: `Awaiter ${result.receipt.execution_id}: cell ${result.cell.cell_id} ${result.cell.phase}`,
+        },
+        ctx
+      );
+      break;
+    }
+    case 'awaiter_result_acknowledged':
+      break;
     case 'execution':
       // The exact payload remains in the durable envelope. The dedicated
       // execution projection updates the TaskRuntime store.

@@ -343,6 +343,30 @@ impl ChatEventLog {
             self.initialize_stream(&selected_stream_id, &stream_dir, &mut state)?;
         }
 
+        if let Some(fact_key) = awaiter_fact_key(&event) {
+            for (start, path) in list_segments(&stream_dir)? {
+                let scan = scan_segment(&path, &selected_stream_id, false, start)?;
+                for existing in scan.events {
+                    if awaiter_fact_key(&existing.payload).as_deref() != Some(fact_key.as_str()) {
+                        continue;
+                    }
+                    let expected =
+                        echo_core::utils::canonical_json::canonical_json_bytes(&event)
+                            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+                    let actual =
+                        echo_core::utils::canonical_json::canonical_json_bytes(&existing.payload)
+                            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+                    return if expected == actual {
+                        Ok(existing)
+                    } else {
+                        Err(ChatEventLogError::InvalidEvent(format!(
+                            "conflicting Awaiter fact for {fact_key}"
+                        )))
+                    };
+                }
+            }
+        }
+
         let sequence =
             state
                 .last_sequence
@@ -356,7 +380,11 @@ impl ChatEventLog {
                 && state.last_sequence >= state.active_start);
         if rolled {
             self.sync_active_segment_before_roll(&stream_dir, &mut state)?;
-            self.prune_segments_to(&stream_dir, self.retention.max_segments)?;
+            self.prune_segments_to(
+                &selected_stream_id,
+                &stream_dir,
+                self.retention.max_segments,
+            )?;
             self.roll_segment(&stream_dir, &mut state, sequence)?;
         }
 
@@ -414,7 +442,11 @@ impl ChatEventLog {
         // per-stream retention cap.
         state.needs_prune = rolled || state.needs_prune;
         if matches!(durability, FileDurability::SyncData) && state.needs_prune {
-            match self.prune_segments_to(&stream_dir, self.retention.max_segments) {
+            match self.prune_segments_to(
+                &envelope.stream_id,
+                &stream_dir,
+                self.retention.max_segments,
+            ) {
                 Ok(()) => state.needs_prune = false,
                 Err(error) => {
                     // The envelope and every preceding delta are already
@@ -496,6 +528,74 @@ impl ChatEventLog {
             latest_cursor,
             truncated: retained_gap || capped,
         })
+    }
+
+    pub fn pending_awaiter_results(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        root_turn_id: &str,
+    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::AwaiterResult>, ChatEventLogError>
+    {
+        let selected_stream_id = stream_id(workspace_id, Some(conversation_id), root_turn_id)?;
+        let stream_dir = self.stream_dir(&selected_stream_id);
+        let stream_state = self.stream_state(&selected_stream_id);
+        let mut state = lock_stream_state(&stream_state);
+        if !ensure_real_directory(&self.root, false)? || !ensure_real_directory(&stream_dir, false)?
+        {
+            *state = StreamState::default();
+            return Ok(Vec::new());
+        }
+        self.initialize_stream(&selected_stream_id, &stream_dir, &mut state)?;
+        let mut pending = std::collections::BTreeMap::<
+            String,
+            crate::tasks::task_runtime::command_cells::AwaiterResult,
+        >::new();
+        for (start, path) in list_segments(&stream_dir)? {
+            let scan = scan_segment(&path, &selected_stream_id, false, start)?;
+            for event in scan.events {
+                match event.payload {
+                    ChatDriverEvent::AwaiterResultReady { result } => {
+                        pending.insert(awaiter_receipt_key(&result.receipt), *result);
+                    }
+                    ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
+                        pending.remove(&awaiter_ack_key(&acknowledgement));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(pending.into_values().collect())
+    }
+
+    pub fn pending_awaiter_results_for_conversation(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::AwaiterResult>, ChatEventLogError>
+    {
+        if !ensure_real_directory(&self.root, false)? {
+            return Ok(Vec::new());
+        }
+        let streams = self.conversation_streams(workspace_id, conversation_id)?;
+        let mut pending = Vec::new();
+        for (_, stream_dir) in streams {
+            let Some(first) = first_stream_envelope(&stream_dir)? else {
+                continue;
+            };
+            pending.extend(self.pending_awaiter_results(
+                workspace_id,
+                conversation_id,
+                &first.root_turn_id,
+            )?);
+        }
+        pending.sort_by(|left, right| {
+            left.receipt
+                .started_at
+                .cmp(&right.receipt.started_at)
+                .then_with(|| left.receipt.execution_id.cmp(&right.receipt.execution_id))
+        });
+        Ok(pending)
     }
 
     pub fn enqueue_chat_input(
@@ -799,16 +899,42 @@ impl ChatEventLog {
 
     fn prune_segments_to(
         &self,
+        stream_id: &str,
         stream_dir: &Path,
         retained_segments: usize,
     ) -> Result<(), ChatEventLogError> {
         let segments = list_segments(stream_dir)?;
-        let remove_count = segments.len().saturating_sub(retained_segments);
-        for (_, path) in segments.iter().take(remove_count) {
+        let mut pending_ready_segments = std::collections::HashMap::<String, u64>::new();
+        for (start, path) in &segments {
+            let scan = scan_segment(path, stream_id, false, *start)?;
+            for event in scan.events {
+                match &event.payload {
+                    ChatDriverEvent::AwaiterResultReady { result } => {
+                        pending_ready_segments.insert(awaiter_receipt_key(&result.receipt), *start);
+                    }
+                    ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
+                        pending_ready_segments.remove(&awaiter_ack_key(acknowledgement));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let pinned = pending_ready_segments
+            .into_values()
+            .collect::<std::collections::HashSet<_>>();
+        let mut remaining = segments.len();
+        for (start, path) in &segments {
+            if remaining <= retained_segments {
+                break;
+            }
+            if pinned.contains(start) {
+                break;
+            }
             fs::remove_file(path).map_err(|source| ChatEventLogError::Io {
                 path: path.clone(),
                 source,
             })?;
+            remaining = remaining.saturating_sub(1);
         }
         Ok(())
     }
@@ -868,6 +994,8 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         | ChatDriverEvent::Interrupt { .. }
         | ChatDriverEvent::CommandCellStarted { .. }
         | ChatDriverEvent::CommandCellSettled { .. }
+        | ChatDriverEvent::AwaiterResultReady { .. }
+        | ChatDriverEvent::AwaiterResultAcknowledged { .. }
         | ChatDriverEvent::InputQueued { .. }
         | ChatDriverEvent::InputRemoved { .. }
         | ChatDriverEvent::InputReordered { .. }
@@ -951,6 +1079,36 @@ fn event_identity(event: &ChatDriverEvent, root_turn_id: &str) -> (String, Strin
                 .unwrap_or_else(|| root_turn_id.to_string()),
         ),
         _ => (root_turn_id.to_string(), root_turn_id.to_string()),
+    }
+}
+
+fn awaiter_receipt_key(
+    receipt: &crate::tasks::task_runtime::command_cells::AwaiterWatchReceipt,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        receipt.execution_id, receipt.attempt, receipt.watch_generation
+    )
+}
+
+fn awaiter_ack_key(
+    acknowledgement: &crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        acknowledgement.execution_id, acknowledgement.attempt, acknowledgement.watch_generation
+    )
+}
+
+fn awaiter_fact_key(event: &ChatDriverEvent) -> Option<String> {
+    match event {
+        ChatDriverEvent::AwaiterResultReady { result } => {
+            Some(format!("ready:{}", awaiter_receipt_key(&result.receipt)))
+        }
+        ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
+            Some(format!("ack:{}", awaiter_ack_key(acknowledgement)))
+        }
+        _ => None,
     }
 }
 
@@ -1049,6 +1207,24 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
         {
             return Err(ChatEventLogError::InvalidEvent(
                 "command-cell terminal fact must have a settled typed state".to_string(),
+            ));
+        }
+        ChatDriverEvent::AwaiterResultReady { result }
+            if result.receipt.execution_id.trim().is_empty()
+                || result.receipt.cell_id != result.cell.cell_id
+                || result.cell.is_active() =>
+        {
+            return Err(ChatEventLogError::InvalidEvent(
+                "Awaiter Ready fact requires exact receipt identity and terminal cell truth"
+                    .to_string(),
+            ));
+        }
+        ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement }
+            if acknowledgement.execution_id.trim().is_empty()
+                || acknowledgement.acknowledged_turn_id.trim().is_empty() =>
+        {
+            return Err(ChatEventLogError::InvalidEvent(
+                "Awaiter acknowledgement identity is incomplete".to_string(),
             ));
         }
         _ => {}

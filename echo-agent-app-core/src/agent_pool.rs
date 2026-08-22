@@ -2045,6 +2045,12 @@ impl AgentPool {
 
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
+        if let (Some(runtime), Some(scope)) = (
+            self.shared.command_cell_runtime.as_ref(),
+            self.shared.execution_scope.as_ref(),
+        ) {
+            runtime.bind_agent(scope.workspace_id(), conversation_id, &handle);
+        }
 
         // Workspace pools own their ToolManagers, so complete the same task
         // tool suite used by the bootstrap primary. The execute tool captures

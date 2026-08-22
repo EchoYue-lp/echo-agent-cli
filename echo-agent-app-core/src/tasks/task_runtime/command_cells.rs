@@ -4,8 +4,8 @@
 //! remain authoritative in `BackgroundCommandManager`. This adapter only
 //! projects lifecycle facts into the owning TaskRuntime event stream.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock, Weak};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use echo_agent::sandbox::{SandboxExecutor, SandboxManager};
@@ -30,6 +30,8 @@ use super::types::{
 
 const OBSERVER_YIELD_MS: u64 = 30_000;
 const OUTPUT_EXCERPT_CHARS: usize = 1_000;
+const MAX_ACTIVE_AWAITERS: usize = 64;
+const SETTLED_AWAITER_RETENTION: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RunCellScope {
@@ -44,6 +46,86 @@ struct ChatCellScope {
     root_turn_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AwaiterWatchKey {
+    workspace_id: String,
+    conversation_id: String,
+    run_id: Option<String>,
+    root_turn_id: String,
+    cell_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaiterWatchState {
+    Started,
+    Settled,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AwaiterWatchReceipt {
+    pub execution_id: String,
+    pub control_task_id: String,
+    pub attempt: u32,
+    pub watch_generation: u64,
+    pub cell_id: String,
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub run_id: Option<String>,
+    pub root_turn_id: String,
+    pub state: AwaiterWatchState,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub settled_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaiterSummaryStatus {
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AwaiterResult {
+    pub receipt: AwaiterWatchReceipt,
+    pub cell: BackgroundCellState,
+    pub awaiter_status: AwaiterSummaryStatus,
+    pub awaiter_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AwaiterResultAcknowledgement {
+    pub execution_id: String,
+    pub attempt: u32,
+    pub watch_generation: u64,
+    pub cell_id: String,
+    pub acknowledged_turn_id: String,
+}
+
+struct ActiveAwaiterWatch {
+    receipt: AwaiterWatchReceipt,
+    executor: Arc<echo_agent::agent::subagent::SubagentExecutor>,
+    handle: Option<echo_agent::agent::subagent::BackgroundSubagentHandle>,
+    cancel: echo_agent::agent::CancellationToken,
+}
+
+#[derive(Default)]
+struct AwaiterRuntimeState {
+    active: HashMap<AwaiterWatchKey, ActiveAwaiterWatch>,
+    latest: HashMap<AwaiterWatchKey, AwaiterWatchReceipt>,
+    settled_order: VecDeque<(AwaiterWatchKey, u64)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AwaiterAgentKey {
+    workspace_id: String,
+    conversation_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandCellProjectionDiagnostic {
     pub cell_id: String,
@@ -54,12 +136,21 @@ pub struct CommandCellRuntimeService {
     inner: Arc<BackgroundCommandManager>,
     run_cells: RwLock<HashMap<RunCellScope, HashSet<String>>>,
     chat_cells: RwLock<HashMap<ChatCellScope, HashSet<String>>>,
+    cell_deadlines: RwLock<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     stores_by_workspace: RwLock<HashMap<String, Weak<TaskRuntimeStore>>>,
     projection_degraded: RwLock<HashMap<String, CommandCellProjectionDiagnostic>>,
     governor: Arc<super::executor::ProcessExecutionGovernor>,
     observers: TaskTracker,
     shutdown: CancellationToken,
     chat_events: Arc<crate::chat_event_log::ChatEventLog>,
+    awaiters: Mutex<AwaiterRuntimeState>,
+    awaiter_agents: RwLock<
+        HashMap<
+            AwaiterAgentKey,
+            std::sync::Weak<tokio::sync::RwLock<echo_agent::agent::ReactAgent>>,
+        >,
+    >,
+    foreground_turns: RwLock<Option<crate::foreground_turn::ForegroundTurnControl>>,
 }
 
 impl CommandCellRuntimeService {
@@ -75,17 +166,75 @@ impl CommandCellRuntimeService {
             )?),
             run_cells: RwLock::new(HashMap::new()),
             chat_cells: RwLock::new(HashMap::new()),
+            cell_deadlines: RwLock::new(HashMap::new()),
             stores_by_workspace: RwLock::new(HashMap::new()),
             projection_degraded: RwLock::new(HashMap::new()),
             governor: super::executor::process_execution_governor(),
             observers: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             chat_events,
+            awaiters: Mutex::new(AwaiterRuntimeState::default()),
+            awaiter_agents: RwLock::new(HashMap::new()),
+            foreground_turns: RwLock::new(None),
         }))
     }
 
     pub fn chat_events(&self) -> Arc<crate::chat_event_log::ChatEventLog> {
         self.chat_events.clone()
+    }
+
+    pub fn bind_agent(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        agent: &crate::agent_handle::AgentHandle,
+    ) {
+        if workspace_id.trim().is_empty() || conversation_id.trim().is_empty() {
+            return;
+        }
+        self.awaiter_agents
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                AwaiterAgentKey {
+                    workspace_id: workspace_id.to_string(),
+                    conversation_id: conversation_id.to_string(),
+                },
+                Arc::downgrade(agent.inner()),
+            );
+    }
+
+    pub fn bind_foreground_turns(
+        &self,
+        foreground_turns: crate::foreground_turn::ForegroundTurnControl,
+    ) {
+        *self
+            .foreground_turns
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(foreground_turns);
+    }
+
+    fn agent_for(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+    ) -> Option<crate::agent_handle::AgentHandle> {
+        let mut agents = self
+            .awaiter_agents
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let key = AwaiterAgentKey {
+            workspace_id: workspace_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+        };
+        let agent = agents
+            .get(&key)
+            .and_then(std::sync::Weak::upgrade)
+            .map(crate::agent_handle::AgentHandle::from_arc);
+        if agent.is_none() {
+            agents.remove(&key);
+        }
+        agent
     }
 
     pub fn projection_diagnostics(&self) -> Vec<CommandCellProjectionDiagnostic> {
@@ -161,13 +310,17 @@ impl CommandCellRuntimeService {
         }
     }
 
-    fn track(&self, scope: &RunCellScope, cell_id: &str) {
+    fn track(&self, scope: &RunCellScope, cell_id: &str, deadline: chrono::DateTime<chrono::Utc>) {
         self.run_cells
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .entry(scope.clone())
             .or_default()
             .insert(cell_id.to_string());
+        self.cell_deadlines
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(cell_id.to_string(), deadline);
     }
 
     fn forget(&self, scope: &RunCellScope, cell_id: &str) {
@@ -182,15 +335,28 @@ impl CommandCellRuntimeService {
         if remove_run {
             run_cells.remove(scope);
         }
+        self.cell_deadlines
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(cell_id);
     }
 
-    fn track_chat(&self, scope: &ChatCellScope, cell_id: &str) {
+    fn track_chat(
+        &self,
+        scope: &ChatCellScope,
+        cell_id: &str,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) {
         self.chat_cells
             .write()
             .unwrap_or_else(|error| error.into_inner())
             .entry(scope.clone())
             .or_default()
             .insert(cell_id.to_string());
+        self.cell_deadlines
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(cell_id.to_string(), deadline);
     }
 
     fn forget_chat(&self, scope: &ChatCellScope, cell_id: &str) {
@@ -205,6 +371,10 @@ impl CommandCellRuntimeService {
         if remove_scope {
             chat_cells.remove(scope);
         }
+        self.cell_deadlines
+            .write()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(cell_id);
     }
 
     fn append_chat_cell_fact(
@@ -272,6 +442,546 @@ impl CommandCellRuntimeService {
         }
     }
 
+    fn cell_state_for_watch(
+        &self,
+        key: &AwaiterWatchKey,
+    ) -> Result<BackgroundCellState, CommandCellError> {
+        if let Some(run_id) = key.run_id.as_deref() {
+            let store = self.store_for_workspace(&key.workspace_id).ok_or_else(|| {
+                CommandCellError::Validation {
+                    message: "Awaiter requires the exact TaskRuntimeStore".to_string(),
+                }
+            })?;
+            return store
+                .list_background_cells(run_id)
+                .map_err(|error| CommandCellError::Runtime {
+                    message: error.to_string(),
+                })?
+                .into_iter()
+                .find(|cell| cell.cell_id == key.cell_id)
+                .ok_or_else(|| CommandCellError::Validation {
+                    message: "cell does not belong to the exact TaskRun scope".to_string(),
+                });
+        }
+        let replay = self
+            .chat_events
+            .replay(
+                &key.workspace_id,
+                Some(&key.conversation_id),
+                &key.root_turn_id,
+                0,
+            )
+            .map_err(|error| CommandCellError::Runtime {
+                message: error.to_string(),
+            })?;
+        find_chat_cell_fact(&replay.events, &key.cell_id, false)
+            .or_else(|| find_chat_cell_fact(&replay.events, &key.cell_id, true))
+            .cloned()
+            .ok_or_else(|| CommandCellError::Validation {
+                message: "cell does not belong to the exact ordinary Chat scope".to_string(),
+            })
+    }
+
+    fn owns_active_cell(&self, key: &AwaiterWatchKey) -> bool {
+        match key.run_id.as_deref() {
+            Some(run_id) => self
+                .run_cells
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&RunCellScope {
+                    workspace_id: key.workspace_id.clone(),
+                    run_id: run_id.to_string(),
+                })
+                .is_some_and(|cells| cells.contains(&key.cell_id)),
+            None => self
+                .chat_cells
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&ChatCellScope {
+                    workspace_id: key.workspace_id.clone(),
+                    conversation_id: key.conversation_id.clone(),
+                    root_turn_id: key.root_turn_id.clone(),
+                })
+                .is_some_and(|cells| cells.contains(&key.cell_id)),
+        }
+    }
+
+    async fn watch_cell(
+        self: &Arc<Self>,
+        registry: Arc<dyn CommandCellRegistry>,
+        executor: Arc<echo_agent::agent::subagent::SubagentExecutor>,
+        execution_scope: &crate::workspace::WorkspaceExecutionScope,
+        context: &ToolContext,
+        cell_id: &str,
+        new_generation: bool,
+    ) -> Result<AwaiterWatchReceipt, CommandCellError> {
+        let conversation_id =
+            context
+                .conversation_id
+                .clone()
+                .ok_or_else(|| CommandCellError::Validation {
+                    message: "watch_cell requires conversation identity".to_string(),
+                })?;
+        let root_turn_id =
+            context
+                .message_id
+                .clone()
+                .ok_or_else(|| CommandCellError::Validation {
+                    message: "watch_cell requires root message identity".to_string(),
+                })?;
+        let key = AwaiterWatchKey {
+            workspace_id: execution_scope.workspace_id().to_string(),
+            conversation_id,
+            run_id: context.run_id.clone(),
+            root_turn_id,
+            cell_id: cell_id.to_string(),
+        };
+        if !self.owns_active_cell(&key) {
+            return Err(CommandCellError::Validation {
+                message: "watch_cell cannot cross its exact cell owner scope".to_string(),
+            });
+        }
+        let snapshot = registry.wait(cell_id, 0, 0).await?;
+        if snapshot.snapshot.phase.is_terminal() {
+            return Err(CommandCellError::Validation {
+                message: format!(
+                    "cell {cell_id} is already {}",
+                    snapshot.snapshot.phase.as_str()
+                ),
+            });
+        }
+        let base_cell = self.cell_state_for_watch(&key)?;
+        let observation = registry.observe(cell_id)?;
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|error| CommandCellError::Runtime {
+                message: format!("Tokio runtime is unavailable: {error}"),
+            })?;
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let receipt = {
+            let mut state = self
+                .awaiters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if let Some(active) = state.active.get(&key) {
+                return Ok(active.receipt.clone());
+            }
+            if !new_generation && let Some(latest) = state.latest.get(&key) {
+                return Ok(latest.clone());
+            }
+            if state.active.len() >= MAX_ACTIVE_AWAITERS {
+                return Err(CommandCellError::Runtime {
+                    message: "process Awaiter capacity is full".to_string(),
+                });
+            }
+            let watch_generation = state
+                .latest
+                .get(&key)
+                .map(|receipt| receipt.watch_generation.saturating_add(1))
+                .unwrap_or(1);
+            let control_task_id = format!("awaiter:{cell_id}:{watch_generation}");
+            let receipt = AwaiterWatchReceipt {
+                execution_id: format!("awaiter-{}", uuid::Uuid::new_v4()),
+                control_task_id,
+                attempt: 1,
+                watch_generation,
+                cell_id: cell_id.to_string(),
+                workspace_id: key.workspace_id.clone(),
+                conversation_id: key.conversation_id.clone(),
+                run_id: key.run_id.clone(),
+                root_turn_id: key.root_turn_id.clone(),
+                state: AwaiterWatchState::Started,
+                started_at: chrono::Utc::now(),
+                settled_at: None,
+            };
+            state.latest.insert(key.clone(), receipt.clone());
+            state.active.insert(
+                key.clone(),
+                ActiveAwaiterWatch {
+                    receipt: receipt.clone(),
+                    executor: executor.clone(),
+                    handle: None,
+                    cancel: cancel.clone(),
+                },
+            );
+            receipt
+        };
+
+        let deadline = self
+            .cell_deadlines
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(cell_id)
+            .copied()
+            .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::seconds(30));
+        let wait_duration = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+        let permit = tokio::select! {
+            _ = self.shutdown.cancelled() => Err(CommandCellError::Shutdown),
+            _ = cancel.cancelled() => Err(CommandCellError::Cancelled),
+            result = tokio::time::timeout(
+                wait_duration,
+                self.governor.subagent_semaphore().acquire_owned(),
+            ) => result
+                .map_err(|_| CommandCellError::CapacityDeadline)
+                .and_then(|permit| permit.map_err(|_| CommandCellError::Shutdown)),
+        };
+        let permit = match permit {
+            Ok(permit) => permit,
+            Err(error) => {
+                self.fail_awaiter_start(&key, &receipt, error.to_string());
+                return Err(error);
+            }
+        };
+        let identity = match echo_agent::agent::subagent::SubagentAttemptIdentity::new(
+            receipt.control_task_id.clone(),
+            receipt.execution_id.clone(),
+            receipt.attempt,
+        ) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.fail_awaiter_start(&key, &receipt, error.to_string());
+                return Err(CommandCellError::Runtime {
+                    message: error.to_string(),
+                });
+            }
+        };
+        let request = echo_agent::agent::subagent::DispatchRequest {
+            agent_name: "awaiter".to_string(),
+            task: format!(
+                "Watch command cell {cell_id} until it reaches a terminal state and all output is drained. Report only typed runtime fields."
+            ),
+            mode_override: None,
+            cancel: cancel.clone(),
+            parent_agent: "eko".to_string(),
+            parent_context: None,
+            delegation_policy: echo_agent::tasks::NestedDelegationPolicy {
+                can_spawn_subagents: false,
+                delegate_depth: 0,
+                max_delegate_depth: 0,
+            },
+            runtime_context: Some(echo_core::tools::ExternalRunContext {
+                conversation_id: Some(key.conversation_id.clone()),
+                run_id: key.run_id.clone(),
+                turn_id: context.turn_id.clone(),
+                execution_id: Some(receipt.execution_id.clone()),
+                isolation_id: None,
+                message_id: Some(key.root_turn_id.clone()),
+                cancel: Some(Arc::new(cancel.clone())),
+                trace_sink: context.trace_sink.clone(),
+                delegation_policy: Some(echo_agent::tasks::NestedDelegationPolicy {
+                    can_spawn_subagents: false,
+                    delegate_depth: 0,
+                    max_delegate_depth: 0,
+                }),
+            }),
+            message: None,
+            prompt_payload: None,
+            constraints: vec![
+                "Observe only the assigned command cell".to_string(),
+                "Do not create or mutate TaskRun state".to_string(),
+            ],
+            background: true,
+        };
+        let handle = match executor
+            .dispatch_background_attempt(request, identity)
+            .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.fail_awaiter_start(&key, &receipt, error.to_string());
+                return Err(CommandCellError::Runtime {
+                    message: error.to_string(),
+                });
+            }
+        };
+        let cancelled_while_starting = {
+            let mut state = self
+                .awaiters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match state.active.get_mut(&key) {
+                Some(active) if active.receipt.execution_id == receipt.execution_id => {
+                    active.handle = Some(handle.clone());
+                    active.cancel.is_cancelled()
+                }
+                _ => true,
+            }
+        };
+        if cancelled_while_starting {
+            handle.cancel();
+        }
+        let service = self.clone();
+        let observers = self.observers.clone();
+        let receipt_for_task = receipt.clone();
+        drop(observers.spawn_on(
+            async move {
+                let _observation = observation;
+                let join_result = handle.join().await;
+                drop(permit);
+                let settled_receipt =
+                    service.mark_awaiter_joined(&key, &receipt_for_task, &join_result);
+                let wait_for_terminal = matches!(
+                    &join_result,
+                    Ok(result)
+                        if result.outcome.status
+                            == echo_agent::agent::subagent::SubagentStatus::Completed
+                );
+                match observe_awaiter_cell_truth(
+                    registry,
+                    base_cell,
+                    wait_for_terminal,
+                    &service.shutdown,
+                )
+                .await
+                {
+                    Ok(Some(cell)) => {
+                        let (awaiter_status, awaiter_summary) = awaiter_summary(join_result);
+                        service
+                            .publish_awaiter_result(AwaiterResult {
+                                receipt: settled_receipt,
+                                cell,
+                                awaiter_status,
+                                awaiter_summary,
+                            })
+                            .await;
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(
+                            execution_id = settled_receipt.execution_id,
+                            %error,
+                            "Awaiter joined but runtime cell truth could not be observed"
+                        );
+                    }
+                }
+            },
+            &runtime,
+        ));
+        Ok(receipt)
+    }
+
+    fn fail_awaiter_start(
+        &self,
+        key: &AwaiterWatchKey,
+        receipt: &AwaiterWatchReceipt,
+        message: String,
+    ) {
+        let mut state = self
+            .awaiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active.remove(key);
+        let mut failed = receipt.clone();
+        failed.state = AwaiterWatchState::Failed;
+        failed.settled_at = Some(chrono::Utc::now());
+        state.latest.insert(key.clone(), failed);
+        tracing::warn!(execution_id = receipt.execution_id, %message, "Awaiter start failed");
+    }
+
+    fn mark_awaiter_joined(
+        &self,
+        key: &AwaiterWatchKey,
+        receipt: &AwaiterWatchReceipt,
+        result: &echo_agent::error::Result<echo_agent::agent::subagent::SubagentResult>,
+    ) -> AwaiterWatchReceipt {
+        let mut settled = receipt.clone();
+        settled.state = match result {
+            Ok(result) => match result.outcome.status {
+                echo_agent::agent::subagent::SubagentStatus::Completed => {
+                    AwaiterWatchState::Settled
+                }
+                echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                    AwaiterWatchState::Cancelled
+                }
+                echo_agent::agent::subagent::SubagentStatus::Failed
+                | echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                    AwaiterWatchState::Failed
+                }
+            },
+            Err(error) => match echo_agent::agent::subagent::subagent_status_from_error(error) {
+                echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                    AwaiterWatchState::Cancelled
+                }
+                _ => AwaiterWatchState::Failed,
+            },
+        };
+        settled.settled_at = Some(chrono::Utc::now());
+        let mut state = self
+            .awaiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.active.remove(key);
+        state.latest.insert(key.clone(), settled.clone());
+        state
+            .settled_order
+            .push_back((key.clone(), settled.watch_generation));
+        while state.settled_order.len() > SETTLED_AWAITER_RETENTION {
+            let Some((old_key, old_generation)) = state.settled_order.pop_front() else {
+                break;
+            };
+            let remove = state
+                .latest
+                .get(&old_key)
+                .is_some_and(|latest| latest.watch_generation == old_generation)
+                && !state.active.contains_key(&old_key);
+            if remove {
+                state.latest.remove(&old_key);
+            }
+        }
+        settled
+    }
+
+    async fn interrupt_awaiter(
+        &self,
+        execution_id: &str,
+        expected_attempt: u32,
+    ) -> Result<AwaiterWatchReceipt, String> {
+        let (executor, cancel, handle, receipt) = {
+            let state = self
+                .awaiters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let active = state
+                .active
+                .values()
+                .find(|active| active.receipt.execution_id == execution_id)
+                .ok_or_else(|| format!("Awaiter execution '{execution_id}' is not active"))?;
+            if active.receipt.attempt != expected_attempt {
+                return Err(format!(
+                    "Awaiter attempt mismatch: expected {expected_attempt}, active {}",
+                    active.receipt.attempt
+                ));
+            }
+            (
+                active.executor.clone(),
+                active.cancel.clone(),
+                active.handle.clone(),
+                active.receipt.clone(),
+            )
+        };
+        cancel.cancel();
+        if let Some(handle) = handle {
+            handle.cancel();
+            executor
+                .interrupt_subagent(execution_id, expected_attempt)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(receipt)
+    }
+
+    async fn publish_awaiter_result(self: &Arc<Self>, result: AwaiterResult) {
+        let mut delay = Duration::from_millis(50);
+        loop {
+            match self.chat_events.append(
+                &result.receipt.workspace_id,
+                Some(&result.receipt.conversation_id),
+                &result.receipt.root_turn_id,
+                crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+                    result: Box::new(result.clone()),
+                },
+            ) {
+                Ok(_) => break,
+                Err(error) => {
+                    tracing::warn!(
+                        execution_id = result.receipt.execution_id,
+                        %error,
+                        "retrying Awaiter Ready persistence"
+                    );
+                    if self.shutdown.is_cancelled() {
+                        return;
+                    }
+                    tokio::select! {
+                        _ = self.shutdown.cancelled() => return,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+                }
+            }
+        }
+
+        let instruction = render_awaiter_handoff(&result);
+        let foreground_turns = self
+            .foreground_turns
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let snapshots = foreground_turns
+            .as_ref()
+            .and_then(|turns| {
+                turns
+                    .snapshots_for_conversation_scoped(
+                        &result.receipt.workspace_id,
+                        &result.receipt.conversation_id,
+                    )
+                    .ok()
+            })
+            .unwrap_or_default();
+        let snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.root_turn_id == result.receipt.root_turn_id)
+            .or_else(|| snapshots.first());
+        if let (Some(snapshot), Some(agent)) = (
+            snapshot,
+            self.agent_for(
+                &result.receipt.workspace_id,
+                &result.receipt.conversation_id,
+            ),
+        ) && let Ok(acknowledged_turn_id) = agent
+            .steer_input(
+                Some(&snapshot.active_turn_id),
+                echo_agent::llm::types::Message::user(instruction),
+            )
+            .await
+        {
+            self.acknowledge_awaiter_result(&result, acknowledged_turn_id);
+        }
+    }
+
+    fn acknowledge_awaiter_result(&self, result: &AwaiterResult, acknowledged_turn_id: String) {
+        let acknowledgement = AwaiterResultAcknowledgement {
+            execution_id: result.receipt.execution_id.clone(),
+            attempt: result.receipt.attempt,
+            watch_generation: result.receipt.watch_generation,
+            cell_id: result.receipt.cell_id.clone(),
+            acknowledged_turn_id,
+        };
+        if let Err(error) = self.chat_events.append(
+            &result.receipt.workspace_id,
+            Some(&result.receipt.conversation_id),
+            &result.receipt.root_turn_id,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement },
+        ) {
+            tracing::warn!(
+                execution_id = result.receipt.execution_id,
+                %error,
+                "Awaiter handoff was accepted but acknowledgement persistence failed"
+            );
+        }
+    }
+
+    pub(crate) fn project_pending_awaiter_results(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        turn_id: &str,
+    ) -> Result<Option<String>, String> {
+        let pending = self
+            .chat_events
+            .pending_awaiter_results_for_conversation(workspace_id, conversation_id)
+            .map_err(|error| error.to_string())?;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let mut rendered = String::from("[pending_awaiter_results]\n");
+        for result in &pending {
+            rendered.push_str(&render_awaiter_handoff(result));
+            rendered.push('\n');
+            self.acknowledge_awaiter_result(result, turn_id.to_string());
+        }
+        rendered.push_str("[/pending_awaiter_results]");
+        Ok(Some(rendered))
+    }
+
     pub(crate) fn stop_run(&self, workspace_id: &str, run_id: &str) -> usize {
         let scope = RunCellScope {
             workspace_id: workspace_id.to_string(),
@@ -292,6 +1002,20 @@ impl CommandCellRuntimeService {
     pub async fn shutdown(&self) -> Result<(), String> {
         self.shutdown.cancel();
         self.observers.close();
+        let active_awaiters = self
+            .awaiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            .values()
+            .map(|active| (active.cancel.clone(), active.handle.clone()))
+            .collect::<Vec<_>>();
+        for (cancel, handle) in active_awaiters {
+            cancel.cancel();
+            if let Some(handle) = handle {
+                handle.cancel();
+            }
+        }
         let shutdown_result = self
             .inner
             .shutdown()
@@ -440,7 +1164,7 @@ impl ScopedCommandCellRegistry {
                 message: format!("ordinary Chat cell start could not be persisted: {error}"),
             });
         }
-        self.service.track_chat(&scope, &cell_id);
+        self.service.track_chat(&scope, &cell_id, receipt.deadline);
 
         let deadline = (receipt.deadline - chrono::Utc::now())
             .to_std()
@@ -473,22 +1197,29 @@ impl ScopedCommandCellRegistry {
     }
 }
 
-/// Install the Task/Auto-safe awaiter dispatch surface. It delegates to the
-/// already-registered `agent_tool` internally, so awaiter remains an ephemeral
-/// Subagent and never becomes a second TaskRuntime task relation.
+/// Install the Task/Auto-safe Awaiter control surface. Dispatch goes directly
+/// through the framework executor while EKO retains the exact attempt handle.
 pub(crate) fn install_watch_cell_tool(
     agent: &mut echo_agent::agent::ReactAgent,
     registry: Arc<dyn CommandCellRegistry>,
+    service: Arc<CommandCellRuntimeService>,
+    execution_scope: crate::workspace::WorkspaceExecutionScope,
 ) {
+    let executor = agent.subagent_executor().clone();
     agent.add_tool(Box::new(WatchCellTool {
         registry,
-        tool_manager: Arc::downgrade(agent.tool_manager()),
+        service: service.clone(),
+        executor,
+        execution_scope,
     }));
+    agent.add_tool(Box::new(InterruptAwaiterTool { service }));
 }
 
 struct WatchCellTool {
     registry: Arc<dyn CommandCellRegistry>,
-    tool_manager: std::sync::Weak<echo_agent::tools::ToolManager>,
+    service: Arc<CommandCellRuntimeService>,
+    executor: Arc<echo_agent::agent::subagent::SubagentExecutor>,
+    execution_scope: crate::workspace::WorkspaceExecutionScope,
 }
 
 impl Tool for WatchCellTool {
@@ -507,6 +1238,10 @@ impl Tool for WatchCellTool {
                 "cell_id": {
                     "type": "string",
                     "description": "Running cell ID returned by shell(background=true)"
+                },
+                "new_generation": {
+                    "type": "boolean",
+                    "description": "Start a new watch generation after the previous one settled"
                 }
             },
             "required": ["cell_id"]
@@ -519,7 +1254,9 @@ impl Tool for WatchCellTool {
         context: &'a ToolContext,
     ) -> BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         let registry = Arc::clone(&self.registry);
-        let manager = self.tool_manager.clone();
+        let service = self.service.clone();
+        let executor = self.executor.clone();
+        let execution_scope = self.execution_scope.clone();
         Box::pin(async move {
             let cell_id = parameters
                 .get("cell_id")
@@ -527,35 +1264,97 @@ impl Tool for WatchCellTool {
                 .ok_or_else(|| {
                     echo_agent::error::ToolError::MissingParameter("cell_id".to_string())
                 })?;
-            let snapshot = registry.wait(cell_id, 0, 0).await.map_err(|error| {
-                echo_agent::error::ToolError::ExecutionFailed {
-                    tool: "watch_cell".to_string(),
-                    message: error.to_string(),
-                }
-            })?;
-            if snapshot.snapshot.phase.is_terminal() {
-                return Ok(ToolResult::error(format!(
-                    "cell {cell_id} is already {}; use wait to read its terminal result",
-                    snapshot.snapshot.phase.as_str()
-                )));
-            }
-            let Some(manager) = manager.upgrade() else {
-                return Ok(ToolResult::error(
-                    "awaiter dispatch runtime is no longer available",
-                ));
-            };
-            let mut dispatch = ToolParameters::new();
-            dispatch.insert("agent_name".to_string(), json!("awaiter"));
-            dispatch.insert(
-                "task".to_string(),
-                json!(format!(
-                    "Watch command cell {cell_id} until it reaches a terminal state and all output is drained."
-                )),
-            );
-            dispatch.insert("background".to_string(), json!(true));
-            manager
-                .execute_tool_with_context("agent_tool", dispatch, context)
+            let new_generation = parameters
+                .get("new_generation")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            match service
+                .watch_cell(
+                    registry,
+                    executor,
+                    &execution_scope,
+                    context,
+                    cell_id,
+                    new_generation,
+                )
                 .await
+            {
+                Ok(receipt) => serde_json::to_string(&receipt)
+                    .map(ToolResult::success)
+                    .map_err(|error| {
+                        echo_agent::error::ToolError::ExecutionFailed {
+                            tool: "watch_cell".to_string(),
+                            message: error.to_string(),
+                        }
+                        .into()
+                    }),
+                Err(error) => Ok(ToolResult::error(error.to_string())),
+            }
+        })
+    }
+}
+
+struct InterruptAwaiterTool {
+    service: Arc<CommandCellRuntimeService>,
+}
+
+impl Tool for InterruptAwaiterTool {
+    fn name(&self) -> &str {
+        "interrupt_awaiter"
+    }
+
+    fn description(&self) -> &str {
+        "Interrupt one exact Awaiter attempt without stopping its command cell."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "execution_id": { "type": "string" },
+                "expected_attempt": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["execution_id", "expected_attempt"]
+        })
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        parameters: ToolParameters,
+        _context: &'a ToolContext,
+    ) -> BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        let service = self.service.clone();
+        Box::pin(async move {
+            let execution_id = parameters
+                .get("execution_id")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| {
+                    echo_agent::error::ToolError::MissingParameter("execution_id".to_string())
+                })?;
+            let expected_attempt = parameters
+                .get("expected_attempt")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|attempt| u32::try_from(attempt).ok())
+                .filter(|attempt| *attempt > 0)
+                .ok_or_else(|| echo_agent::error::ToolError::InvalidParameter {
+                    name: "expected_attempt".to_string(),
+                    message: "must be a positive u32".to_string(),
+                })?;
+            match service
+                .interrupt_awaiter(execution_id, expected_attempt)
+                .await
+            {
+                Ok(receipt) => serde_json::to_string(&receipt)
+                    .map(ToolResult::success)
+                    .map_err(|error| {
+                        echo_agent::error::ToolError::ExecutionFailed {
+                            tool: "interrupt_awaiter".to_string(),
+                            message: error.to_string(),
+                        }
+                        .into()
+                    }),
+                Err(error) => Ok(ToolResult::error(error)),
+            }
         })
     }
 }
@@ -620,12 +1419,12 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
             );
             match start_commit {
                 Ok(super::store::BackgroundCellStartCommit::Durable) => {
-                    self.service.track(&scope, &cell_id);
+                    self.service.track(&scope, &cell_id, receipt.deadline);
                 }
                 Ok(super::store::BackgroundCellStartCommit::CommittedProjectionDegraded {
                     detail,
                 }) => {
-                    self.service.track(&scope, &cell_id);
+                    self.service.track(&scope, &cell_id, receipt.deadline);
                     let _ = self.service.inner.abort_prepared(
                         reservation,
                         format!("Started projection degraded: {detail}"),
@@ -734,6 +1533,123 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
     fn shutdown(&self) -> BoxFuture<'_, Result<(), CommandCellError>> {
         Box::pin(async { Ok(()) })
     }
+}
+
+async fn observe_awaiter_cell_truth(
+    registry: Arc<dyn CommandCellRegistry>,
+    mut cell: BackgroundCellState,
+    wait_for_terminal: bool,
+    shutdown: &CancellationToken,
+) -> Result<Option<BackgroundCellState>, String> {
+    let mut cursor = 0_u64;
+    let mut excerpt = String::new();
+    loop {
+        let yield_ms = if wait_for_terminal {
+            OBSERVER_YIELD_MS
+        } else {
+            0
+        };
+        let delta = tokio::select! {
+            _ = shutdown.cancelled() => return Err("command-cell runtime is shutting down".to_string()),
+            delta = registry.wait(&cell.cell_id, cursor, yield_ms) => {
+                delta.map_err(|error| error.to_string())?
+            }
+        };
+        push_tail(&mut excerpt, &delta.new_output, OUTPUT_EXCERPT_CHARS);
+        cursor = delta.next_cursor;
+        if !delta.snapshot.phase.is_terminal() {
+            if wait_for_terminal {
+                continue;
+            }
+            return Ok(None);
+        }
+        if cursor < delta.snapshot.total_output_bytes {
+            continue;
+        }
+        cell.phase = project_phase(delta.snapshot.phase);
+        cell.terminal_cause = delta.snapshot.terminal_cause.map(project_terminal_cause);
+        cell.terminal_message = delta.snapshot.terminal_message;
+        cell.exit_code = delta.snapshot.exit_code;
+        cell.artifact_status = project_artifact_status(&delta.snapshot.artifact_status);
+        cell.artifact_message = delta.snapshot.artifact_message;
+        cell.total_output_bytes = delta.snapshot.total_output_bytes;
+        cell.output_truncated = delta.snapshot.output_truncated;
+        cell.output_excerpt = (!excerpt.is_empty()).then_some(excerpt);
+        cell.artifact_path = delta
+            .snapshot
+            .output_artifact
+            .as_ref()
+            .map(|artifact| artifact.path.display().to_string());
+        cell.artifact_sha256 = delta
+            .snapshot
+            .output_artifact
+            .map(|artifact| artifact.sha256);
+        cell.finished_at = Some(chrono::Utc::now());
+        return Ok(Some(cell));
+    }
+}
+
+fn awaiter_summary(
+    result: echo_agent::error::Result<echo_agent::agent::subagent::SubagentResult>,
+) -> (AwaiterSummaryStatus, Option<String>) {
+    match result {
+        Ok(result) => {
+            let status = match result.outcome.status {
+                echo_agent::agent::subagent::SubagentStatus::Completed => {
+                    AwaiterSummaryStatus::Completed
+                }
+                echo_agent::agent::subagent::SubagentStatus::Failed => AwaiterSummaryStatus::Failed,
+                echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                    AwaiterSummaryStatus::Cancelled
+                }
+                echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                    AwaiterSummaryStatus::TimedOut
+                }
+            };
+            let summary = (!result.outcome.summary.trim().is_empty())
+                .then(|| {
+                    result
+                        .outcome
+                        .summary
+                        .chars()
+                        .take(1_200)
+                        .collect::<String>()
+                })
+                .or_else(|| {
+                    (!result.output.trim().is_empty())
+                        .then(|| result.output.chars().take(1_200).collect::<String>())
+                });
+            (status, summary)
+        }
+        Err(error) => {
+            let status = match echo_agent::agent::subagent::subagent_status_from_error(&error) {
+                echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                    AwaiterSummaryStatus::Cancelled
+                }
+                echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                    AwaiterSummaryStatus::TimedOut
+                }
+                echo_agent::agent::subagent::SubagentStatus::Completed => {
+                    AwaiterSummaryStatus::Completed
+                }
+                echo_agent::agent::subagent::SubagentStatus::Failed => AwaiterSummaryStatus::Failed,
+            };
+            (status, Some(error.to_string().chars().take(500).collect()))
+        }
+    }
+}
+
+fn render_awaiter_handoff(result: &AwaiterResult) -> String {
+    let encoded = serde_json::to_string(result).unwrap_or_else(|error| {
+        format!(
+            "{{\"execution_id\":\"{}\",\"serialization_error\":\"{}\"}}",
+            result.receipt.execution_id,
+            error.to_string().chars().take(200).collect::<String>()
+        )
+    });
+    format!(
+        "[awaiter_result]\n{encoded}\n[/awaiter_result]\nUse the runtime cell fields as terminal truth. The Awaiter summary is diagnostic only."
+    )
 }
 
 async fn observe_terminal_cell(
@@ -1060,22 +1976,372 @@ mod tests {
     };
 
     fn test_service(root: &std::path::Path) -> Result<Arc<CommandCellRuntimeService>, String> {
-        let chat_events = crate::chat_event_log::ChatEventLog::open(
-            root.join("chat-events"),
-            crate::chat_event_log::ChatEventRetention::default(),
-        )
-        .map_err(|error| error.to_string())?;
+        test_service_with_retention(root, crate::chat_event_log::ChatEventRetention::default())
+    }
+
+    fn test_service_with_retention(
+        root: &std::path::Path,
+        retention: crate::chat_event_log::ChatEventRetention,
+    ) -> Result<Arc<CommandCellRuntimeService>, String> {
+        let chat_events =
+            crate::chat_event_log::ChatEventLog::open(root.join("chat-events"), retention)
+                .map_err(|error| error.to_string())?;
         Ok(Arc::new(CommandCellRuntimeService {
             inner: Arc::new(BackgroundCommandManager::default()),
             run_cells: RwLock::new(HashMap::new()),
             chat_cells: RwLock::new(HashMap::new()),
+            cell_deadlines: RwLock::new(HashMap::new()),
             stores_by_workspace: RwLock::new(HashMap::new()),
             projection_degraded: RwLock::new(HashMap::new()),
             governor: super::super::executor::process_execution_governor(),
             observers: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             chat_events: Arc::new(chat_events),
+            awaiters: Mutex::new(AwaiterRuntimeState::default()),
+            awaiter_agents: RwLock::new(HashMap::new()),
+            foreground_turns: RwLock::new(None),
         }))
+    }
+
+    fn terminal_cell(cell_id: &str) -> BackgroundCellState {
+        BackgroundCellState {
+            cell_id: cell_id.to_string(),
+            name: "test cell".to_string(),
+            command_hash: "sha256:test".to_string(),
+            turn_id: Some("turn".to_string()),
+            execution_id: Some("cell-execution".to_string()),
+            call_id: Some("call".to_string()),
+            phase: BackgroundCellPhase::Succeeded,
+            terminal_cause: Some(BackgroundCellTerminalCause::Exited),
+            terminal_message: None,
+            exit_code: Some(0),
+            artifact_status: BackgroundCellArtifactStatus::BelowThreshold,
+            artifact_message: None,
+            total_output_bytes: 2,
+            output_truncated: false,
+            output_excerpt: Some("ok".to_string()),
+            artifact_path: None,
+            artifact_sha256: None,
+            started_at: chrono::Utc::now(),
+            finished_at: Some(chrono::Utc::now()),
+        }
+    }
+
+    fn awaiter_result(execution_id: &str, cell_id: &str) -> AwaiterResult {
+        AwaiterResult {
+            receipt: AwaiterWatchReceipt {
+                execution_id: execution_id.to_string(),
+                control_task_id: format!("awaiter:{cell_id}:1"),
+                attempt: 1,
+                watch_generation: 1,
+                cell_id: cell_id.to_string(),
+                workspace_id: "global".to_string(),
+                conversation_id: "conversation".to_string(),
+                run_id: None,
+                root_turn_id: "root-message".to_string(),
+                state: AwaiterWatchState::Settled,
+                started_at: chrono::Utc::now(),
+                settled_at: Some(chrono::Utc::now()),
+            },
+            cell: terminal_cell(cell_id),
+            awaiter_status: AwaiterSummaryStatus::Completed,
+            awaiter_summary: Some("prose says failed but runtime truth succeeded".to_string()),
+        }
+    }
+
+    #[test]
+    fn awaiter_ready_is_idempotent_and_acknowledgement_clears_pending() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let result = awaiter_result("awaiter-execution", "cell-ready");
+        let event = || crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+            result: Box::new(result.clone()),
+        };
+        let first = service
+            .chat_events
+            .append("global", Some("conversation"), "root-message", event())
+            .map_err(|error| error.to_string())?;
+        let duplicate = service
+            .chat_events
+            .append("global", Some("conversation"), "root-message", event())
+            .map_err(|error| error.to_string())?;
+        assert_eq!(first.event_id, duplicate.event_id);
+        let pending = service
+            .chat_events
+            .pending_awaiter_results("global", "conversation", "root-message")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(pending, vec![result.clone()]);
+        assert_eq!(
+            pending.first().map(|result| result.cell.phase),
+            Some(BackgroundCellPhase::Succeeded)
+        );
+
+        service.acknowledge_awaiter_result(&result, "next-turn".to_string());
+        let pending = service
+            .chat_events
+            .pending_awaiter_results("global", "conversation", "root-message")
+            .map_err(|error| error.to_string())?;
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn unacknowledged_awaiter_ready_pins_its_retained_segment() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service_with_retention(
+            temp.path(),
+            crate::chat_event_log::ChatEventRetention {
+                segment_rollover_bytes: 1,
+                max_segments: 2,
+                max_replay_events: 128,
+            },
+        )?;
+        let result = awaiter_result("awaiter-pinned", "cell-pinned");
+        service
+            .chat_events
+            .append(
+                "global",
+                Some("conversation"),
+                "root-message",
+                crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+                    result: Box::new(result.clone()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        for index in 0..12 {
+            service
+                .chat_events
+                .append(
+                    "global",
+                    Some("conversation"),
+                    "root-message",
+                    crate::chat_driver::ChatDriverEvent::ExecutionPath {
+                        requested_mode: "chat".to_string(),
+                        observed_path: format!("chat-{index}"),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+        }
+        let pending = service
+            .chat_events
+            .pending_awaiter_results("global", "conversation", "root-message")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(pending, vec![result]);
+        Ok(())
+    }
+
+    #[test]
+    fn next_turn_projection_delivers_and_acknowledges_pending_results() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let result = awaiter_result("awaiter-next-turn", "cell-next-turn");
+        service
+            .chat_events
+            .append(
+                "global",
+                Some("conversation"),
+                "root-message",
+                crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+                    result: Box::new(result.clone()),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        let projection = service
+            .project_pending_awaiter_results("global", "conversation", "next-turn")?
+            .ok_or_else(|| "pending Awaiter result was not projected".to_string())?;
+        assert!(projection.contains("awaiter-next-turn"));
+        assert!(projection.contains("\"phase\":\"succeeded\""));
+        let pending = service
+            .chat_events
+            .pending_awaiter_results_for_conversation("global", "conversation")
+            .map_err(|error| error.to_string())?;
+        assert!(pending.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exact_awaiter_interrupt_does_not_stop_its_cell() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let registry = service.scoped(
+            crate::workspace::WorkspaceExecutionScope::global(temp.path()),
+            None,
+        );
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "sleep 30".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        let key = AwaiterWatchKey {
+            workspace_id: "global".to_string(),
+            conversation_id: "conversation".to_string(),
+            run_id: None,
+            root_turn_id: "root-message".to_string(),
+            cell_id: cell_id.clone(),
+        };
+        let receipt = AwaiterWatchReceipt {
+            execution_id: "awaiter-interrupt".to_string(),
+            control_task_id: format!("awaiter:{cell_id}:1"),
+            attempt: 1,
+            watch_generation: 1,
+            cell_id: cell_id.clone(),
+            workspace_id: "global".to_string(),
+            conversation_id: "conversation".to_string(),
+            run_id: None,
+            root_turn_id: "root-message".to_string(),
+            state: AwaiterWatchState::Started,
+            started_at: chrono::Utc::now(),
+            settled_at: None,
+        };
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let executor = Arc::new(echo_agent::agent::subagent::SubagentExecutor::new(
+            Arc::new(echo_agent::agent::subagent::SubagentRegistry::new()),
+            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+        ));
+        service
+            .awaiters
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .active
+            .insert(
+                key,
+                ActiveAwaiterWatch {
+                    receipt: receipt.clone(),
+                    executor,
+                    handle: None,
+                    cancel: cancel.clone(),
+                },
+            );
+
+        assert!(
+            service
+                .interrupt_awaiter(&receipt.execution_id, 2)
+                .await
+                .is_err()
+        );
+        assert!(!cancel.is_cancelled());
+        service.interrupt_awaiter(&receipt.execution_id, 1).await?;
+        assert!(cancel.is_cancelled());
+        let cell = registry
+            .wait(&cell_id, 0, 0)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(!cell.snapshot.phase.is_terminal());
+        registry.stop(&cell_id);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_awaiter_dispatch_returns_receipt_and_retains_join_until_ready()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
+        let registry = service.scoped(scope.clone(), None);
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "sleep 1; printf owned-awaiter-result".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        let mut parent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("test-model")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let definition = echo_agent::agent::subagent::SubagentBuilder::new("awaiter")
+            .description("test Awaiter")
+            .background()
+            .build();
+        parent.register_subagent_with_definition(
+            definition,
+            Box::new(
+                echo_agent::testing::MockAgent::new("awaiter")
+                    .with_response("diagnostic summary only"),
+            ),
+        );
+        let executor = parent.subagent_executor().clone();
+        let context = ToolContext {
+            conversation_id: Some("conversation".to_string()),
+            message_id: Some("root-message".to_string()),
+            turn_id: Some("turn".to_string()),
+            ..ToolContext::default()
+        };
+        let started = std::time::Instant::now();
+        let receipt = service
+            .watch_cell(
+                registry.clone(),
+                executor,
+                &scope,
+                &context,
+                &cell_id,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(receipt.state, AwaiterWatchState::Started);
+        let duplicate = service
+            .watch_cell(
+                registry.clone(),
+                parent.subagent_executor().clone(),
+                &scope,
+                &context,
+                &cell_id,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(duplicate.execution_id, receipt.execution_id);
+        assert_eq!(duplicate.watch_generation, receipt.watch_generation);
+
+        let pending = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pending = service
+                    .chat_events
+                    .pending_awaiter_results("global", "conversation", "root-message")
+                    .map_err(|error| error.to_string())?;
+                if let Some(result) = pending.into_iter().next() {
+                    return Ok::<AwaiterResult, String>(result);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "owned Awaiter did not publish Ready".to_string())??;
+        assert_eq!(pending.receipt.execution_id, receipt.execution_id);
+        assert_eq!(pending.cell.phase, BackgroundCellPhase::Succeeded);
+        assert_eq!(pending.awaiter_status, AwaiterSummaryStatus::Completed);
+        assert!(
+            pending
+                .awaiter_summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("diagnostic summary only"))
+        );
+        assert!(
+            service
+                .awaiters
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .active
+                .is_empty()
+        );
+        Ok(())
     }
 
     #[tokio::test]

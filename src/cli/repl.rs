@@ -875,6 +875,15 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
                     cell.cell_id, cell.phase
                 ))
             }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultReady { result } => {
+                self.output.emit(format!(
+                    "Awaiter {} ready: cell {} {}",
+                    result.receipt.execution_id, result.cell.cell_id, result.cell.phase
+                ))
+            }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+                ..
+            } => true,
             echo_agent_app_core::chat_driver::ChatDriverEvent::ContextCompressed {
                 before_count,
                 after_count,
