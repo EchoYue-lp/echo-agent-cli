@@ -53,6 +53,9 @@ pub mod task_tools;
 pub mod types;
 pub mod worktree;
 
+#[cfg(test)]
+mod long_horizon_contracts;
+
 pub use completion_gate::requirements_for_plan;
 pub use execution_target::TaskExecutionTargetResolver;
 pub(crate) use executor::drive_unattended_run;

@@ -68,9 +68,11 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 
 ## 尚在收口
 
-跨 workspace/conversation 的基础 host、消息 journal、Agent groups 和本地恢复已经存在，
-但端到端可靠性验收尚未完成。仍需收敛精确 IPC identity、durable ordinary-input FIFO、
-live delivery safe-point/reply、删除/eviction、boot recovery、全局资源上限和真实 soak。
+跨 workspace/conversation 的 host、精确 IPC/event identity、durable ordinary-input FIFO、
+消息 journal、Agent groups、live delivery settlement、删除/eviction、boot recovery 和
+TaskRuntime 进程级资源上限已接入生产路径并通过自动门禁。端到端可靠性仍未最终验收：
+真实 GUI 证据和两小时多 workspace soak 尚未记录；CommandCell/Awaiter 还需把同一进程级
+资源策略扩展到 cell/Awaiter 路径。
 
 这些未完成项由
 [`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)

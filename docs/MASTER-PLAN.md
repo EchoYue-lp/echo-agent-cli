@@ -1,6 +1,6 @@
 # EKO 当前项目状态
 
-Last updated: 2026-08-21
+Last updated: 2026-08-22
 
 本文是跨会话恢复工作的简短事实源，只记录当前权威路径、未完成工作和下一步。
 已完成里程碑不在这里保留实施日志；长期有效能力见 [功能总览](./features.md)。
@@ -58,23 +58,25 @@ Last updated: 2026-08-21
 5. 删除先 settle/shutdown/evict，进程级资源上限不会随 workspace 数量倍增。
 6. GUI/TUI/CLI/channel fault matrix 与 2 小时 soak 全绿后才标记 Complete。
 
-当前工作树已完成 M0-M7 和 M8 自动实现：workspace-scoped IPC/event、durable input
+应用提交 `5603958` 已完成 M0-M7 和 M8 自动实现：workspace-scoped IPC/event、durable input
 FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter settlement/backoff
 以及 process governor 均通过完整自动门禁。最终状态仍为 In progress，因为真实 GUI
 验收证据和规格要求的 2 小时多 workspace soak 尚未记录；完成这两项后才能改为 Complete。
 
 ### Long-Horizon Runtime Closure
 
-状态：Pending；framework CommandCell LH1 可独立启动，应用 LH2-LH4 依赖 P0 runtime
-resolver、address identity、event routing 和 boot reconciler 收敛。
+状态：Pending；2026-08-22 已按应用 `5603958` 和 framework `49db907` 重新校准。P0 的
+resolver、address identity、event routing 和 host recovery 已可直接复用，不再等待未来
+cutover；最终 LH6 仍依赖 P0 GUI/2h soak closeout。
 
 规格：[`design/specs/long-horizon-runtime-closure.md`](../design/specs/long-horizon-runtime-closure.md)
 
-2026-08-21 深度审查确认 M0-M5 的 Goal、RunTurn、provider retry、正式 PlanTask Subagent
-控制、Requirement/Evidence 和 checkpoint 内核真实存在，12 小时 deterministic ledger 也
-可验证；但普通 conversation boot resume、Awaiter 结果所有权/回传、cell terminal repair、
-typed terminal 投影和 hot `get_run_state` 尚未闭环。完成 LH0-LH6 与真实 Agent/Awaiter soak
-前，不再把长程产品级验收标为 Complete。
+最新审查确认 Goal、RunTurn、provider retry、正式 PlanTask Subagent 控制、
+Requirement/Evidence、checkpoint/suffix 投影和 12 小时 deterministic ledger 真实存在；
+同时冻结 LH-F01..LH-F13：普通 conversation boot resume、Awaiter owned receipt/回传、
+Started-before-side-effect、跨轮 drain retention、普通 Chat cell 精确地址、terminal repair、
+typed projection、process governor 覆盖、完整 Provider profile 和 hot `get_run_state` 尚未闭环。
+完成 LH0-LH6 与真实 Agent/Awaiter soak 前，不再把长程产品级验收标为 Complete。
 
 ### Surface Parity Cleanup
 
@@ -88,9 +90,11 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-先完成 P0 runtime reliability 的真实 GUI 验收和 2 小时并发 soak，记录 artifact、
-资源峰值与零串扰结果，再提交并把该里程碑改为 Complete；framework LH1 可并行推进。
-P0 与 long-horizon closure 验收后再执行 surface parity cleanup。
+Long-horizon 的下一实施切片是 LH0：为 LH-F01..LH-F13 建立失败合同、调用图、全扫描
+allowlist、资源/性能基线，不改生产行为；随后先合并 framework LH1，再进入 app LH2。
+P0 runtime reliability 的真实 GUI 验收和 2 小时并发 soak 可独立完成，但必须在 LH6 前
+记录 artifact、资源峰值与零串扰结果。P0 与 long-horizon closure 验收后再执行 surface
+parity cleanup。
 
 ## 文档生命周期
 
