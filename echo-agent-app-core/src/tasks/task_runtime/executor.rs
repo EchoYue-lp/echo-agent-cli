@@ -1490,7 +1490,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .ok_or_else(|| {
                 echo_agent::error::ReactError::Other(format!("run {run_id} has no plan"))
             })?;
-        let runtime_tasks = plan.tasks.iter().map(PlanTask::to_task).collect();
+        let runtime_tasks = plan
+            .tasks
+            .iter()
+            .map(PlanTask::to_task)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(echo_agent::error::ReactError::Other)?;
         let by_id = plan
             .tasks
             .into_iter()
@@ -3282,7 +3287,7 @@ fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_agent::t
 /// The registered writer Subagent carries the full write tool set and its
 /// definition selects worktree or data-workspace isolation. Coding writes land
 /// in an isolated checkout rather than the main workspace.
-/// If no WorktreeFactory is configured, dispatch **hard-fails** (Phase 2 Task 13)
+/// If EKO cannot establish the requested worktree, dispatch hard-fails.
 /// rather than silently sharing the main tree.
 /// Disjoint exact owners may run concurrently; the DAG scheduler separates
 /// overlapping and unknown ownership before dispatch.
@@ -3444,12 +3449,6 @@ fn file_access_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<(
         .map(|path| (write, path.to_string()))
 }
 
-fn push_unique_path(paths: &mut Vec<String>, path: String) {
-    if !path.is_empty() && !paths.iter().any(|existing| existing == &path) {
-        paths.push(path);
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
@@ -3554,9 +3553,8 @@ async fn run_main_agent_task(
                 let mut in_thinking = false;
                 let mut pending_verification = HashMap::<String, String>::new();
                 let mut pending_file_access = HashMap::<String, (bool, String)>::new();
-                let mut observed_verification = Vec::new();
+                let mut observed_evidence = Vec::new();
                 let mut observed_artifacts = Vec::new();
-                let mut touched_files = echo_agent::agent::subagent::SubagentTouchedFiles::default();
                 let started = std::time::Instant::now();
                 let mut usage = TaskExecutionUsage::default();
 
@@ -3751,27 +3749,35 @@ async fn run_main_agent_task(
                                     .unwrap_or_else(|| result.output.clone())
                             };
                             if let Some(check) = pending_verification.remove(&call_id) {
-                                observed_verification.push(
-                                    echo_agent::agent::subagent::SubagentVerification {
-                                        check,
-                                        status: if result.success {
-                                            echo_agent::agent::subagent::SubagentVerificationStatus::Passed
+                                observed_evidence.push(
+                                    echo_agent::agent::subagent::SubagentEvidence {
+                                        kind: "verification".to_string(),
+                                        subject: check,
+                                        outcome: Some(if result.success {
+                                            "passed".to_string()
                                         } else {
-                                            echo_agent::agent::subagent::SubagentVerificationStatus::Failed
-                                        },
+                                            "failed".to_string()
+                                        }),
                                         details: result_text.chars().take(500).collect(),
-                                        source: echo_agent::agent::subagent::SubagentVerificationSource::Observed,
+                                        source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                                        attributes: serde_json::Value::Null,
                                     },
                                 );
                             }
                             if result.success
                                 && let Some((write, path)) = pending_file_access.remove(&call_id)
                             {
-                                if write {
-                                    push_unique_path(&mut touched_files.written, path);
-                                } else {
-                                    push_unique_path(&mut touched_files.read, path);
-                                }
+                                observed_evidence.push(
+                                    echo_agent::agent::subagent::SubagentEvidence {
+                                        kind: if write { "file_write" } else { "file_read" }
+                                            .to_string(),
+                                        subject: path,
+                                        outcome: Some("succeeded".to_string()),
+                                        details: String::new(),
+                                        source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                                        attributes: serde_json::Value::Null,
+                                    },
+                                );
                             } else {
                                 pending_file_access.remove(&call_id);
                             }
@@ -3900,8 +3906,7 @@ async fn run_main_agent_task(
                 );
                 echo_agent::agent::subagent::merge_observed_evidence(
                     &mut outcome,
-                    observed_verification,
-                    touched_files,
+                    observed_evidence,
                     observed_artifacts,
                 );
                 let duration_ms =
@@ -5654,6 +5659,7 @@ Read the runtime path and found one missing branch.
             status: SubagentRunStatus::Completed,
             summary: summary.to_string(),
             artifacts: Vec::new(),
+            evidence: Vec::new(),
             verification: Vec::new(),
             remaining_work: Vec::new(),
             touched_files: SubagentTouchedFiles::default(),
@@ -6867,6 +6873,7 @@ Read the runtime path and found one missing branch.
             status: SubagentRunStatus::Completed,
             summary: "Frontend uses React 19 + Zustand.".into(),
             artifacts: Vec::new(),
+            evidence: Vec::new(),
             verification: Vec::new(),
             remaining_work: Vec::new(),
             touched_files: SubagentTouchedFiles::default(),
@@ -6890,6 +6897,7 @@ Read the runtime path and found one missing branch.
             status: SubagentRunStatus::Completed,
             summary: "done".into(),
             artifacts: Vec::new(),
+            evidence: Vec::new(),
             verification: Vec::new(), // no observed pass for "cargo test"
             remaining_work: Vec::new(),
             touched_files: SubagentTouchedFiles::default(),
@@ -6934,6 +6942,7 @@ Read the runtime path and found one missing branch.
                 status: SubagentRunStatus::Completed,
                 summary: "Backend has 4 modules.".into(),
                 artifacts: Vec::new(),
+                evidence: Vec::new(),
                 verification: Vec::new(),
                 remaining_work: Vec::new(),
                 touched_files: SubagentTouchedFiles::default(),
@@ -6999,6 +7008,7 @@ Read the runtime path and found one missing branch.
                 status: SubagentRunStatus::Completed,
                 summary: "partial".into(),
                 artifacts: Vec::new(),
+                evidence: Vec::new(),
                 verification: Vec::new(),
                 remaining_work: vec!["not done".into()],
                 touched_files: SubagentTouchedFiles::default(),
@@ -7053,6 +7063,7 @@ Read the runtime path and found one missing branch.
                 status: SubagentRunStatus::Completed,
                 summary: "clean run".into(),
                 artifacts: Vec::new(),
+                evidence: Vec::new(),
                 verification: Vec::new(),
                 remaining_work: Vec::new(),
                 touched_files: SubagentTouchedFiles::default(),
@@ -7065,6 +7076,7 @@ Read the runtime path and found one missing branch.
                 status: SubagentRunStatus::Completed,
                 summary: "blocked run".into(),
                 artifacts: Vec::new(),
+                evidence: Vec::new(),
                 verification: Vec::new(), // execution_check has no observed pass
                 remaining_work: Vec::new(),
                 touched_files: SubagentTouchedFiles::default(),

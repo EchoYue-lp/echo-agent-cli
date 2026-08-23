@@ -24,7 +24,7 @@ use crate::subagent_loader::SubagentCatalogSnapshot;
 
 use super::executor::{ExecEvent, RunOutcome, RunPlanPolicy};
 use super::profiles::ProfileTemplate;
-use super::types::DomainProfile;
+use super::types::{DomainProfile, EkoTaskExtension};
 
 #[derive(Debug, Clone, Default)]
 pub struct TaskCapabilityCatalog {
@@ -50,7 +50,9 @@ impl TaskCapabilityCatalog {
         &self,
         task: &echo_agent::tasks::TaskSpec,
     ) -> std::result::Result<(), String> {
-        if !self.subagents.contains(&task.agent_role) {
+        let extension: EkoTaskExtension = serde_json::from_value(task.extension.clone())
+            .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", task.id))?;
+        if !self.subagents.contains(&extension.agent_role) {
             let mut available = self
                 .subagents
                 .names()
@@ -59,11 +61,11 @@ impl TaskCapabilityCatalog {
             available.sort();
             return Err(format!(
                 "unknown Subagent '{}'; available: {}",
-                task.agent_role,
+                extension.agent_role,
                 available.join(", ")
             ));
         }
-        for tool in &task.allowed_tools {
+        for tool in &extension.allowed_tools {
             if Self::TASK_CONTROL_TOOLS.contains(&tool.as_str()) {
                 return Err(format!(
                     "task '{}' cannot delegate task-control tool '{}' to a Subagent",

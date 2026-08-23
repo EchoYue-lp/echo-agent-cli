@@ -331,32 +331,6 @@ impl PlanTaskKind {
             _ => return None,
         })
     }
-
-    pub fn to_task_kind(self) -> echo_agent::tasks::TaskKind {
-        match self {
-            PlanTaskKind::ReadOnlyReview => echo_agent::tasks::TaskKind::ReadOnlyReview,
-            PlanTaskKind::Investigation => echo_agent::tasks::TaskKind::Investigation,
-            PlanTaskKind::TestPlan => echo_agent::tasks::TaskKind::TestPlan,
-            PlanTaskKind::Implementation => echo_agent::tasks::TaskKind::Implementation,
-            PlanTaskKind::Debugging => echo_agent::tasks::TaskKind::Debugging,
-            PlanTaskKind::Review => echo_agent::tasks::TaskKind::Review,
-            PlanTaskKind::Summary => echo_agent::tasks::TaskKind::Summary,
-            PlanTaskKind::Verification => echo_agent::tasks::TaskKind::Verification,
-        }
-    }
-
-    pub fn from_task_kind(kind: echo_agent::tasks::TaskKind) -> Self {
-        match kind {
-            echo_agent::tasks::TaskKind::ReadOnlyReview => Self::ReadOnlyReview,
-            echo_agent::tasks::TaskKind::Investigation => Self::Investigation,
-            echo_agent::tasks::TaskKind::TestPlan => Self::TestPlan,
-            echo_agent::tasks::TaskKind::Implementation => Self::Implementation,
-            echo_agent::tasks::TaskKind::Debugging => Self::Debugging,
-            echo_agent::tasks::TaskKind::Review => Self::Review,
-            echo_agent::tasks::TaskKind::Summary => Self::Summary,
-            echo_agent::tasks::TaskKind::Verification => Self::Verification,
-        }
-    }
 }
 
 // ── Todo status ─────────────────────────────────────────────────────────
@@ -1145,7 +1119,7 @@ impl TaskExecutionTarget {
 
 /// EKO file/UI projection of the immutable framework task specification.
 ///
-/// This DTO preserves EKO metadata for `plan.json` and generated TypeScript;
+/// This DTO preserves EKO product fields for `plan.json` and generated TypeScript;
 /// framework validation and DAG scheduling never consume it directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, rename = "TaskSpec")]
@@ -1172,27 +1146,50 @@ pub struct EkoTaskSpec {
 
 impl EkoTaskSpec {
     pub(crate) fn to_task_spec(&self) -> Result<echo_agent::tasks::TaskSpec, String> {
-        let metadata = serde_json::to_value(EkoTaskMetadata {
+        let extension = serde_json::to_value(EkoTaskExtension {
+            kind: self.kind,
+            agent_role: self.agent_role.clone(),
             domain_profile: self.domain_profile,
             parallel_group: self.parallel_group.clone(),
             execution_target: self.execution_target.clone(),
-            sort_order: self.sort_order,
-        })
-        .map_err(|error| format!("task '{}' has invalid EKO metadata: {error}", self.id))?;
-        Ok(echo_agent::tasks::TaskSpec {
-            id: self.id.clone(),
-            title: self.title.clone(),
-            description: self.description.clone(),
-            kind: self.kind.to_task_kind(),
-            agent_role: self.agent_role.clone(),
-            depends_on: self.depends_on.clone(),
             files: self.files.clone(),
             allowed_tools: self.allowed_tools.clone(),
             required_artifacts: self.required_artifacts.clone(),
             execution_checks: self.execution_checks.clone(),
             acceptance_criteria: self.acceptance_criteria.clone(),
+            sort_order: self.sort_order,
+        })
+        .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", self.id))?;
+        Ok(echo_agent::tasks::TaskSpec {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            depends_on: self.depends_on.clone(),
             max_retries: self.max_retries,
-            metadata,
+            extension,
+        })
+    }
+
+    pub(crate) fn from_task_spec(spec: echo_agent::tasks::TaskSpec) -> Result<Self, String> {
+        let extension: EkoTaskExtension = serde_json::from_value(spec.extension)
+            .map_err(|error| format!("task '{}' has invalid EKO extension: {error}", spec.id))?;
+        Ok(Self {
+            id: spec.id,
+            title: spec.title,
+            description: spec.description,
+            kind: extension.kind,
+            agent_role: extension.agent_role,
+            domain_profile: extension.domain_profile,
+            depends_on: spec.depends_on,
+            parallel_group: extension.parallel_group,
+            execution_target: extension.execution_target,
+            files: extension.files,
+            allowed_tools: extension.allowed_tools,
+            required_artifacts: extension.required_artifacts,
+            execution_checks: extension.execution_checks,
+            acceptance_criteria: extension.acceptance_criteria,
+            max_retries: spec.max_retries,
+            sort_order: extension.sort_order,
         })
     }
 }
@@ -1211,13 +1208,23 @@ pub struct EkoTaskExecution {
     pub claim: Option<echo_agent::tasks::TaskClaim>,
 }
 
-/// EKO-only metadata carried through the framework runtime extension point.
+/// Lossless EKO payload carried through the framework task extension point.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EkoTaskMetadata {
+pub struct EkoTaskExtension {
+    pub kind: PlanTaskKind,
+    pub agent_role: String,
     pub domain_profile: DomainProfile,
     pub parallel_group: Option<String>,
     #[serde(default)]
     pub execution_target: Option<TaskExecutionTarget>,
+    pub files: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    #[serde(default)]
+    pub required_artifacts: Vec<String>,
+    #[serde(default)]
+    pub execution_checks: Vec<String>,
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
     pub sort_order: i64,
 }
 
@@ -1831,44 +1838,9 @@ impl PlanTask {
     }
 
     /// Convert losslessly to the framework's canonical runtime task model.
-    pub fn to_task(&self) -> echo_agent::tasks::Task {
-        let metadata = serde_json::Value::Object(serde_json::Map::from_iter([
-            (
-                "domain_profile".to_string(),
-                serde_json::Value::String(self.domain_profile.as_str().to_string()),
-            ),
-            (
-                "parallel_group".to_string(),
-                self.parallel_group
-                    .clone()
-                    .map(serde_json::Value::String)
-                    .unwrap_or(serde_json::Value::Null),
-            ),
-            (
-                "execution_target".to_string(),
-                serde_json::to_value(&self.execution_target).unwrap_or(serde_json::Value::Null),
-            ),
-            (
-                "sort_order".to_string(),
-                serde_json::Value::Number(self.sort_order.into()),
-            ),
-        ]));
-        echo_agent::tasks::Task {
-            spec: echo_agent::tasks::TaskSpec {
-                id: self.id.clone(),
-                title: self.title.clone(),
-                description: self.description.clone(),
-                kind: self.kind.to_task_kind(),
-                agent_role: self.agent_role.clone(),
-                depends_on: self.depends_on.clone(),
-                files: self.files.clone(),
-                allowed_tools: self.allowed_tools.clone(),
-                required_artifacts: self.required_artifacts.clone(),
-                execution_checks: self.execution_checks.clone(),
-                acceptance_criteria: self.acceptance_criteria.clone(),
-                max_retries: self.max_retries,
-                metadata,
-            },
+    pub fn to_task(&self) -> Result<echo_agent::tasks::Task, String> {
+        Ok(echo_agent::tasks::Task {
+            spec: self.spec().to_task_spec()?,
             execution: echo_agent::tasks::TaskExecution {
                 task_id: self.id.clone(),
                 status: self.status.to_task_status(self.status_detail.as_deref()),
@@ -1876,7 +1848,7 @@ impl PlanTask {
                 failure_fingerprint: self.failure_fingerprint.clone(),
                 claim: self.claim.clone(),
             },
-        }
+        })
     }
 }
 
@@ -1891,8 +1863,7 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
                 spec.id, execution.task_id
             ));
         }
-        let metadata: EkoTaskMetadata = serde_json::from_value(spec.metadata)
-            .map_err(|error| format!("task '{}' has invalid EKO metadata: {error}", spec.id))?;
+        let spec = EkoTaskSpec::from_task_spec(spec)?;
         let status = TodoStatus::try_from_task_status(&execution.status)?;
         let status_detail = task_status_detail(&execution.status);
 
@@ -1900,12 +1871,12 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
             id: spec.id,
             title: spec.title,
             description: spec.description,
-            kind: PlanTaskKind::from_task_kind(spec.kind),
+            kind: spec.kind,
             agent_role: spec.agent_role,
-            domain_profile: metadata.domain_profile,
+            domain_profile: spec.domain_profile,
             depends_on: spec.depends_on,
-            parallel_group: metadata.parallel_group,
-            execution_target: metadata.execution_target,
+            parallel_group: spec.parallel_group,
+            execution_target: spec.execution_target,
             files: spec.files,
             allowed_tools: spec.allowed_tools,
             required_artifacts: spec.required_artifacts,
@@ -1917,7 +1888,7 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
             status,
             status_detail,
             claim: execution.claim,
-            sort_order: metadata.sort_order,
+            sort_order: spec.sort_order,
         })
     }
 }
@@ -1956,18 +1927,45 @@ pub struct TaskPatch {
 
 impl TaskPatch {
     pub(crate) fn to_task_spec_patch(&self) -> echo_agent::tasks::TaskSpecPatch {
+        let mut extension = serde_json::Map::new();
+        if let Some(kind) = self.kind {
+            extension.insert(
+                "kind".to_string(),
+                serde_json::Value::String(kind.as_str().to_string()),
+            );
+        }
+        if let Some(agent_role) = &self.agent_role {
+            extension.insert(
+                "agent_role".to_string(),
+                serde_json::Value::String(agent_role.clone()),
+            );
+        }
+        for (key, values) in [
+            ("files", self.files.as_ref()),
+            ("allowed_tools", self.allowed_tools.as_ref()),
+            ("required_artifacts", self.required_artifacts.as_ref()),
+            ("execution_checks", self.execution_checks.as_ref()),
+            ("acceptance_criteria", self.acceptance_criteria.as_ref()),
+        ] {
+            if let Some(values) = values {
+                extension.insert(
+                    key.to_string(),
+                    serde_json::Value::Array(
+                        values
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
+            }
+        }
         echo_agent::tasks::TaskSpecPatch {
             title: self.title.clone(),
             description: self.description.clone(),
-            kind: self.kind.map(PlanTaskKind::to_task_kind),
-            agent_role: self.agent_role.clone(),
             depends_on: self.depends_on.clone(),
-            files: self.files.clone(),
-            allowed_tools: self.allowed_tools.clone(),
-            required_artifacts: self.required_artifacts.clone(),
-            execution_checks: self.execution_checks.clone(),
-            acceptance_criteria: self.acceptance_criteria.clone(),
             max_retries: self.max_retries,
+            extension: (!extension.is_empty()).then_some(serde_json::Value::Object(extension)),
         }
     }
 }
@@ -2340,30 +2338,32 @@ pub struct SubagentVerificationResult {
     pub source: SubagentVerificationSource,
 }
 
-impl From<&echo_agent::agent::subagent::SubagentVerification> for SubagentVerificationResult {
-    fn from(verification: &echo_agent::agent::subagent::SubagentVerification) -> Self {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentEvidenceResult {
+    pub kind: String,
+    pub subject: String,
+    pub outcome: Option<String>,
+    pub details: String,
+    pub source: SubagentVerificationSource,
+    pub attributes: serde_json::Value,
+}
+
+impl From<&echo_agent::agent::subagent::SubagentEvidence> for SubagentEvidenceResult {
+    fn from(evidence: &echo_agent::agent::subagent::SubagentEvidence) -> Self {
         Self {
-            check: verification.check.clone(),
-            status: match verification.status {
-                echo_agent::agent::subagent::SubagentVerificationStatus::Passed => {
-                    SubagentVerificationStatus::Passed
-                }
-                echo_agent::agent::subagent::SubagentVerificationStatus::Failed => {
-                    SubagentVerificationStatus::Failed
-                }
-                echo_agent::agent::subagent::SubagentVerificationStatus::NotRun => {
-                    SubagentVerificationStatus::NotRun
-                }
-            },
-            details: verification.details.clone(),
-            source: match verification.source {
-                echo_agent::agent::subagent::SubagentVerificationSource::Observed => {
+            kind: evidence.kind.clone(),
+            subject: evidence.subject.clone(),
+            outcome: evidence.outcome.clone(),
+            details: evidence.details.clone(),
+            source: match evidence.source {
+                echo_agent::agent::subagent::SubagentEvidenceSource::Observed => {
                     SubagentVerificationSource::Observed
                 }
-                echo_agent::agent::subagent::SubagentVerificationSource::Reported => {
+                echo_agent::agent::subagent::SubagentEvidenceSource::Reported => {
                     SubagentVerificationSource::Reported
                 }
             },
+            attributes: evidence.attributes.clone(),
         }
     }
 }
@@ -2382,6 +2382,9 @@ pub struct SubagentTaskResult {
     pub status: SubagentRunStatus,
     pub summary: String,
     pub artifacts: Vec<SubagentArtifactResult>,
+    #[serde(default)]
+    #[ts(skip)]
+    pub evidence: Vec<SubagentEvidenceResult>,
     pub verification: Vec<SubagentVerificationResult>,
     pub remaining_work: Vec<String>,
     pub touched_files: SubagentTouchedFiles,
@@ -2393,17 +2396,42 @@ impl SubagentTaskResult {
     }
 
     pub fn from_framework_outcome(outcome: &echo_agent::agent::subagent::SubagentOutcome) -> Self {
+        let evidence: Vec<SubagentEvidenceResult> =
+            outcome.evidence.iter().map(Into::into).collect();
+        let verification = evidence
+            .iter()
+            .filter_map(project_verification_evidence)
+            .collect();
+        let mut touched_files = SubagentTouchedFiles::default();
+        for item in &evidence {
+            let access = match item.kind.as_str() {
+                "file_read" => Some((false, item.subject.clone())),
+                "file_write" => Some((true, item.subject.clone())),
+                "tool_result" if item.outcome.as_deref() == Some("succeeded") => {
+                    project_tool_file_access(item)
+                }
+                _ => None,
+            };
+            if let Some((write, path)) = access {
+                let target = if write {
+                    &mut touched_files.written
+                } else {
+                    &mut touched_files.read
+                };
+                if !target.iter().any(|existing| existing == &path) {
+                    target.push(path);
+                }
+            }
+        }
         Self {
             contract_version: outcome.contract_version,
             status: outcome.status.into(),
             summary: outcome.summary.clone(),
             artifacts: outcome.artifacts.iter().map(Into::into).collect(),
-            verification: outcome.verification.iter().map(Into::into).collect(),
+            evidence,
+            verification,
             remaining_work: outcome.remaining_work.clone(),
-            touched_files: SubagentTouchedFiles {
-                read: outcome.touched_files.read.clone(),
-                written: outcome.touched_files.written.clone(),
-            },
+            touched_files,
         }
     }
 
@@ -2420,15 +2448,79 @@ impl SubagentTaskResult {
             .take(64)
             .collect();
         Self {
-            contract_version: 1,
+            contract_version: 2,
             status,
             summary,
             artifacts: Vec::new(),
+            evidence: Vec::new(),
             verification: Vec::new(),
             remaining_work,
             touched_files: SubagentTouchedFiles::default(),
         }
     }
+}
+
+fn project_verification_evidence(
+    evidence: &SubagentEvidenceResult,
+) -> Option<SubagentVerificationResult> {
+    let check = if evidence.kind == "verification" {
+        Some(evidence.subject.clone())
+    } else if evidence.kind == "tool_result" {
+        evidence
+            .attributes
+            .get("args")
+            .and_then(|args| verification_check_from_tool(&evidence.subject, args))
+    } else {
+        None
+    }?;
+    Some(SubagentVerificationResult {
+        check,
+        status: match evidence.outcome.as_deref() {
+            Some("passed" | "succeeded") => SubagentVerificationStatus::Passed,
+            Some("failed") => SubagentVerificationStatus::Failed,
+            _ => SubagentVerificationStatus::NotRun,
+        },
+        details: evidence.details.clone(),
+        source: evidence.source,
+    })
+}
+
+fn verification_check_from_tool(name: &str, args: &serde_json::Value) -> Option<String> {
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    if !matches!(
+        normalized.as_str(),
+        "shell" | "bash" | "terminal" | "run_code" | "execute_command"
+    ) {
+        return None;
+    }
+    ["command", "cmd", "code", "script"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn project_tool_file_access(evidence: &SubagentEvidenceResult) -> Option<(bool, String)> {
+    let normalized = evidence.subject.to_ascii_lowercase().replace('-', "_");
+    let write = normalized.contains("write")
+        || normalized.contains("edit")
+        || normalized.contains("delete")
+        || normalized.contains("patch");
+    let read = normalized.contains("read")
+        || normalized.contains("search")
+        || normalized.contains("glob")
+        || normalized.contains("grep");
+    if !write && !read {
+        return None;
+    }
+    let args = evidence.attributes.get("args")?;
+    ["path", "file_path", "target", "directory"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|path| (write, path.to_string()))
 }
 
 /// Aggregate cost/usage for a single [`SubagentRun`].
@@ -2641,25 +2733,41 @@ impl SuggestedTask {
         echo_agent::tasks::SuggestedTask {
             title: self.title.clone(),
             description: self.description.clone(),
-            kind: self.kind.to_task_kind(),
-            agent_role: self.agent_role.clone(),
             dependencies: self.dependencies.clone(),
             why_needed: self.why_needed.clone(),
             risk: self.risk.clone(),
+            extension: serde_json::json!({
+                "kind": self.kind.as_str(),
+                "agent_role": self.agent_role,
+            }),
         }
     }
 
     /// Convert a framework suggestion into the EKO app type.
-    pub fn from_runtime_suggested_task(task: echo_agent::tasks::SuggestedTask) -> Self {
-        Self {
+    pub fn from_runtime_suggested_task(
+        task: echo_agent::tasks::SuggestedTask,
+    ) -> Result<Self, String> {
+        let kind = task
+            .extension
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .and_then(PlanTaskKind::from_str)
+            .ok_or_else(|| "suggested task extension has no valid kind".to_string())?;
+        let agent_role = task
+            .extension
+            .get("agent_role")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "suggested task extension has no Subagent role".to_string())?;
+        Ok(Self {
             title: task.title,
             description: task.description,
-            kind: PlanTaskKind::from_task_kind(task.kind),
-            agent_role: task.agent_role,
+            kind,
+            agent_role,
             dependencies: task.dependencies,
             why_needed: task.why_needed,
             risk: task.risk,
-        }
+        })
     }
 }
 
@@ -2769,36 +2877,33 @@ mod tests {
             sort_order: 10,
         };
 
-        let runtime = task.to_task();
+        let runtime = task.to_task()?;
 
         assert_eq!(runtime.spec.id, "t1");
-        assert_eq!(
-            runtime.spec.kind,
-            echo_agent::tasks::TaskKind::Investigation
-        );
         assert_eq!(
             runtime.execution.status,
             echo_agent::tasks::TaskStatus::Running
         );
         assert_eq!(runtime.spec.depends_on, vec!["t0".to_string()]);
-        assert_eq!(runtime.spec.required_artifacts, vec!["report.md"]);
-        assert_eq!(runtime.spec.execution_checks, vec!["cargo check"]);
-        assert_eq!(
-            runtime.spec.acceptance_criteria,
-            vec!["root cause is explained"]
-        );
         assert_eq!(runtime.spec.max_retries, 2);
         assert_eq!(runtime.execution.retry_count, 1);
         assert_eq!(
             runtime.execution.failure_fingerprint.as_deref(),
             Some("failure-1")
         );
-        let metadata: EkoTaskMetadata = serde_json::from_value(runtime.spec.metadata.clone())
+        let extension: EkoTaskExtension = serde_json::from_value(runtime.spec.extension.clone())
             .map_err(|error| error.to_string())?;
-        assert_eq!(metadata.domain_profile, DomainProfile::AiCoding);
-        assert_eq!(metadata.parallel_group.as_deref(), Some("g1"));
-        assert_eq!(metadata.execution_target, task.execution_target);
-        assert_eq!(metadata.sort_order, 10);
+        assert_eq!(extension.kind, PlanTaskKind::Investigation);
+        assert_eq!(extension.agent_role, "explorer");
+        assert_eq!(extension.domain_profile, DomainProfile::AiCoding);
+        assert_eq!(extension.parallel_group.as_deref(), Some("g1"));
+        assert_eq!(extension.execution_target, task.execution_target);
+        assert_eq!(extension.files, task.files);
+        assert_eq!(extension.allowed_tools, task.allowed_tools);
+        assert_eq!(extension.required_artifacts, task.required_artifacts);
+        assert_eq!(extension.execution_checks, task.execution_checks);
+        assert_eq!(extension.acceptance_criteria, task.acceptance_criteria);
+        assert_eq!(extension.sort_order, 10);
 
         let round_trip = PlanTask::try_from(runtime)?;
         assert_eq!(round_trip.id, task.id);
@@ -2815,7 +2920,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_task_status_projection_preserves_failure_detail() {
+    fn plan_task_status_projection_preserves_failure_detail() -> Result<(), String> {
         let task = PlanTask {
             id: "failed-task".to_string(),
             title: "Failed task".to_string(),
@@ -2840,7 +2945,7 @@ mod tests {
             sort_order: 0,
         };
 
-        let framework_task = task.to_task();
+        let framework_task = task.to_task()?;
 
         assert_eq!(
             framework_task.execution.status,
@@ -2854,6 +2959,7 @@ mod tests {
             TodoStatus::try_from_task_status(&framework_task.execution.status),
             Ok(TodoStatus::Failed)
         );
+        Ok(())
     }
 
     #[test]
@@ -2882,10 +2988,11 @@ mod tests {
             task_id: "t1".to_string(),
             subagent_name: "explorer".to_string(),
             result: SubagentTaskResult {
-                contract_version: 1,
+                contract_version: 2,
                 status: SubagentRunStatus::Completed,
                 summary: "Read runtime".to_string(),
                 artifacts: Vec::new(),
+                evidence: Vec::new(),
                 verification: Vec::new(),
                 remaining_work: Vec::new(),
                 touched_files: SubagentTouchedFiles {
@@ -2912,8 +3019,12 @@ mod tests {
         assert_eq!(runtime.task_id, "t1");
         assert_eq!(runtime.suggested_tasks.len(), 1);
         assert_eq!(
-            runtime.suggested_tasks.first().map(|task| task.kind),
-            Some(echo_agent::tasks::TaskKind::Implementation)
+            runtime
+                .suggested_tasks
+                .first()
+                .and_then(|task| task.extension.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("implementation")
         );
     }
 
@@ -2931,6 +3042,61 @@ mod tests {
                 .iter()
                 .all(|item| item.chars().count() == 500)
         );
+    }
+
+    #[test]
+    fn framework_evidence_round_trips_and_projects_product_fields() {
+        let outcome = echo_agent::agent::subagent::SubagentOutcome {
+            contract_version: 2,
+            status: echo_agent::agent::subagent::SubagentStatus::Completed,
+            summary: "done".to_string(),
+            artifacts: Vec::new(),
+            evidence: vec![
+                echo_agent::agent::subagent::SubagentEvidence {
+                    kind: "tool_result".to_string(),
+                    subject: "shell".to_string(),
+                    outcome: Some("succeeded".to_string()),
+                    details: "ok".to_string(),
+                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    attributes: serde_json::json!({ "args": { "command": "cargo test" } }),
+                },
+                echo_agent::agent::subagent::SubagentEvidence {
+                    kind: "tool_result".to_string(),
+                    subject: "write_file".to_string(),
+                    outcome: Some("succeeded".to_string()),
+                    details: String::new(),
+                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    attributes: serde_json::json!({ "args": { "path": "src/lib.rs" } }),
+                },
+                echo_agent::agent::subagent::SubagentEvidence {
+                    kind: "domain_fact".to_string(),
+                    subject: "schema".to_string(),
+                    outcome: Some("confirmed".to_string()),
+                    details: "field-level evidence".to_string(),
+                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Reported,
+                    attributes: serde_json::json!({ "confidence": "high" }),
+                },
+            ],
+            remaining_work: Vec::new(),
+        };
+
+        let projected = SubagentTaskResult::from_framework_outcome(&outcome);
+
+        assert_eq!(projected.evidence.len(), outcome.evidence.len());
+        assert_eq!(
+            projected.evidence.get(2).map(|item| item.kind.as_str()),
+            Some("domain_fact")
+        );
+        assert_eq!(
+            projected
+                .evidence
+                .get(2)
+                .and_then(|item| item.attributes.get("confidence"))
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        assert_eq!(projected.verification.len(), 1);
+        assert_eq!(projected.touched_files.written, vec!["src/lib.rs"]);
     }
 
     #[test]

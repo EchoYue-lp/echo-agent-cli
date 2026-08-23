@@ -853,6 +853,7 @@ mod tests {
                     producer_execution_id: Some("execution-1".to_string()),
                     available: true,
                 }],
+                evidence: Vec::new(),
                 verification: vec![SubagentVerificationResult {
                     check: "cargo   test -p sample".to_string(),
                     status: SubagentVerificationStatus::Passed,

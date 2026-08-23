@@ -7998,7 +7998,7 @@ mod tests {
             },
         );
         let terminal_result = echo_agent::agent::subagent::SubagentOutcome {
-            contract_version: 1,
+            contract_version: 2,
             status: echo_agent::agent::subagent::SubagentStatus::Completed,
             summary: "done".to_string(),
             artifacts: vec![echo_agent::agent::subagent::SubagentArtifact {
@@ -8009,17 +8009,33 @@ mod tests {
                 producer_execution_id: Some("task-1:1".to_string()),
                 available: true,
             }],
-            verification: vec![echo_agent::agent::subagent::SubagentVerification {
-                check: "cargo test".to_string(),
-                status: echo_agent::agent::subagent::SubagentVerificationStatus::Passed,
-                details: "ok".to_string(),
-                source: echo_agent::agent::subagent::SubagentVerificationSource::Observed,
-            }],
+            evidence: vec![
+                echo_agent::agent::subagent::SubagentEvidence {
+                    kind: "verification".to_string(),
+                    subject: "cargo test".to_string(),
+                    outcome: Some("passed".to_string()),
+                    details: "ok".to_string(),
+                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    attributes: serde_json::Value::Null,
+                },
+                echo_agent::agent::subagent::SubagentEvidence {
+                    kind: "file_read".to_string(),
+                    subject: "src/lib.rs".to_string(),
+                    outcome: Some("succeeded".to_string()),
+                    details: String::new(),
+                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    attributes: serde_json::Value::Null,
+                },
+                echo_agent::agent::subagent::SubagentEvidence {
+                    kind: "file_write".to_string(),
+                    subject: "report.json".to_string(),
+                    outcome: Some("succeeded".to_string()),
+                    details: String::new(),
+                    source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                    attributes: serde_json::Value::Null,
+                },
+            ],
             remaining_work: Vec::new(),
-            touched_files: echo_agent::agent::subagent::SubagentTouchedFiles {
-                read: vec!["src/lib.rs".to_string()],
-                written: vec!["report.json".to_string()],
-            },
         };
         update_subagent_runs(
             &mut app,

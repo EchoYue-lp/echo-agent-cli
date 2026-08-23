@@ -77,13 +77,13 @@ struct SubagentFrontmatter {
     readonly: bool,
     /// Sprint 8: request worktree isolation for this Fork-dispatched subagent
     /// (Claude Code `isolation: worktree` equivalent). Only meaningful for
-    /// writer subagents; requires a `WorktreeFactory` configured on the agent.
+    /// writer subagents; resolved by EKO's worktree isolation policy.
     #[serde(default)]
     worktree: bool,
     /// Sprint 10: request a per-subagent data workspace (tmpdir) for this
     /// Fork-dispatched data/research subagent — disjoint output dir, no git
     /// coupling. Mutually exclusive with `worktree` (worktree wins if both).
-    /// Requires a `DataWorkspaceFactory` configured on the agent.
+    /// Resolved by EKO's data-workspace isolation policy.
     #[serde(default)]
     workspace: bool,
     /// Optional tags; merged with the default readonly/parallel tags when

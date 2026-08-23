@@ -15,7 +15,7 @@ use super::profiles::default_subagent_for;
 use super::store::{InitialRunTriggerMetadata, StoreError, TaskRuntimeStore};
 use super::task_tools::{TaskCapabilityCatalog, current_run_id, formal_run_id_for_turn};
 use super::types::{
-    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskMetadata, PlanTaskKind,
+    AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskExtension, PlanTaskKind,
     TaskExecutionTarget, TaskRun, TaskUpdateRequest,
 };
 
@@ -124,7 +124,7 @@ fn store_error(error: StoreError) -> RevisionedTaskStoreError {
 }
 
 /// EKO product policy: run bootstrap, domain defaults, capability validation,
-/// and metadata round trips. It cannot alter generic task fields.
+/// and extension round trips. It cannot alter generic task fields.
 pub struct EkoTaskToolPolicy {
     store: Arc<TaskRuntimeStore>,
     capabilities: Arc<TaskCapabilityCatalog>,
@@ -170,6 +170,41 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
     fn task_input_schema_extensions(&self) -> serde_json::Map<String, serde_json::Value> {
         serde_json::Map::from_iter([
             (
+                "kind".to_string(),
+                serde_json::json!({
+                    "type": "string",
+                    "enum": ["implementation", "debugging", "verification", "review", "investigation", "test_plan", "summary", "read_only_review"]
+                }),
+            ),
+            (
+                "subagent".to_string(),
+                serde_json::json!({ "type": "string", "description": "Registered Subagent role; omit for the domain default" }),
+            ),
+            (
+                "agent_role".to_string(),
+                serde_json::json!({ "type": "string", "description": "Replacement Subagent role in task_update patches" }),
+            ),
+            (
+                "files".to_string(),
+                serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+            ),
+            (
+                "allowed_tools".to_string(),
+                serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+            ),
+            (
+                "required_artifacts".to_string(),
+                serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+            ),
+            (
+                "execution_checks".to_string(),
+                serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+            ),
+            (
+                "acceptance_criteria".to_string(),
+                serde_json::json!({ "type": "array", "items": { "type": "string" } }),
+            ),
+            (
                 "parallel_group".to_string(),
                 serde_json::json!({ "type": "string" }),
             ),
@@ -196,6 +231,10 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
                 }),
             ),
         ])
+    }
+
+    fn required_task_input_extensions(&self) -> Vec<String> {
+        vec!["kind".to_string()]
     }
 
     async fn resolve_scope(&self, context: &ToolContext) -> Result<String, TaskPolicyError> {
@@ -303,19 +342,32 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         position: usize,
     ) -> Result<PreparedTaskPolicy, TaskPolicyError> {
         let run = self.run(scope_id)?;
+        let kind = draft
+            .extension
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .and_then(PlanTaskKind::from_str)
+            .ok_or_else(|| TaskPolicyError::Rejected {
+                message: format!("task '{}' has no valid kind", draft.id),
+            })?;
         let parallel_group = draft
-            .extensions
+            .extension
             .get("parallel_group")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let agent_role = draft.subagent.clone().unwrap_or_else(|| {
-            default_subagent_for(run.domain_profile, PlanTaskKind::from_task_kind(draft.kind))
-                .to_string()
-        });
+        let agent_role = draft
+            .extension
+            .get("subagent")
+            .or_else(|| draft.extension.get("agent_role"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| default_subagent_for(run.domain_profile, kind).to_string());
         let execution_target = draft
-            .extensions
+            .extension
             .get("execution_target")
             .cloned()
             .map(serde_json::from_value::<TaskExecutionTarget>)
@@ -338,19 +390,23 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
                 });
             }
         }
-        let metadata = serde_json::to_value(EkoTaskMetadata {
+        let extension = serde_json::to_value(EkoTaskExtension {
+            kind,
+            agent_role,
             domain_profile: run.domain_profile,
             parallel_group,
             execution_target,
+            files: string_array_extension(&draft.extension, "files"),
+            allowed_tools: string_array_extension(&draft.extension, "allowed_tools"),
+            required_artifacts: string_array_extension(&draft.extension, "required_artifacts"),
+            execution_checks: string_array_extension(&draft.extension, "execution_checks"),
+            acceptance_criteria: string_array_extension(&draft.extension, "acceptance_criteria"),
             sort_order: i64::try_from(position).unwrap_or(i64::MAX),
         })
         .map_err(|error| TaskPolicyError::Backend {
-            message: format!("Failed to encode EKO task metadata: {error}"),
+            message: format!("Failed to encode EKO task extension: {error}"),
         })?;
-        Ok(PreparedTaskPolicy {
-            agent_role,
-            metadata,
-        })
+        Ok(PreparedTaskPolicy { extension })
     }
 
     async fn prepare_initial_context(
@@ -377,20 +433,25 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         })
     }
 
-    async fn finalize_task_metadata(
+    async fn finalize_task_extension(
         &self,
         _scope_id: &str,
         task_id: &str,
         position: usize,
-        metadata: serde_json::Value,
+        mut extension: serde_json::Value,
     ) -> Result<serde_json::Value, TaskPolicyError> {
-        let mut metadata: EkoTaskMetadata =
-            serde_json::from_value(metadata).map_err(|error| TaskPolicyError::Rejected {
-                message: format!("task '{task_id}' has invalid EKO metadata: {error}"),
+        if let Some(fields) = extension.as_object_mut()
+            && let Some(subagent) = fields.remove("subagent")
+        {
+            fields.insert("agent_role".to_string(), subagent);
+        }
+        let mut extension: EkoTaskExtension =
+            serde_json::from_value(extension).map_err(|error| TaskPolicyError::Rejected {
+                message: format!("task '{task_id}' has invalid EKO extension: {error}"),
             })?;
-        metadata.sort_order = i64::try_from(position).unwrap_or(i64::MAX);
-        serde_json::to_value(metadata).map_err(|error| TaskPolicyError::Backend {
-            message: format!("Failed to encode EKO task metadata: {error}"),
+        extension.sort_order = i64::try_from(position).unwrap_or(i64::MAX);
+        serde_json::to_value(extension).map_err(|error| TaskPolicyError::Backend {
+            message: format!("Failed to encode EKO task extension: {error}"),
         })
     }
 
@@ -416,6 +477,19 @@ fn task_goal(title: &str, description: &str) -> String {
     } else {
         "Agent task plan".to_string()
     }
+}
+
+fn string_array_extension(extension: &serde_json::Value, key: &str) -> Vec<String> {
+    extension
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Build the one revision service used by EKO's framework tools.
@@ -564,7 +638,8 @@ fn plan_graph_input(
         .tasks
         .iter()
         .map(super::types::PlanTask::to_task)
-        .collect();
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| TaskRevisionError::InvalidInput { message })?;
     Ok((run_id, context, tasks))
 }
 
@@ -583,7 +658,7 @@ fn load_committed_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use echo_agent::tasks::{TaskGraphExecutionMode, TaskKind};
+    use echo_agent::tasks::TaskGraphExecutionMode;
 
     fn test_capabilities() -> Arc<TaskCapabilityCatalog> {
         let definitions = crate::subagent_loader::discover_subagents(None, None);
@@ -611,16 +686,14 @@ mod tests {
                 id: "task-1".to_string(),
                 title: "Inspect runtime".to_string(),
                 description: "Inspect the current runtime state".to_string(),
-                kind: TaskKind::Investigation,
-                subagent: Some(subagent.to_string()),
                 depends_on: Vec::new(),
-                files: Vec::new(),
-                allowed_tools: Vec::new(),
-                required_artifacts: Vec::new(),
-                execution_checks: vec!["facts captured".to_string()],
-                acceptance_criteria: vec!["summary is grounded".to_string()],
                 max_retries: 1,
-                extensions: serde_json::Value::Null,
+                extension: serde_json::json!({
+                    "kind": "investigation",
+                    "subagent": subagent,
+                    "execution_checks": ["facts captured"],
+                    "acceptance_criteria": ["summary is grounded"],
+                }),
             }],
             base_revision: None,
             reason: None,

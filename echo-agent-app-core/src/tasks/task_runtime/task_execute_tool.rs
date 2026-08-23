@@ -961,6 +961,7 @@ mod tests {
                     status: SubagentRunStatus::Completed,
                     summary: "梳理 runtime、agent_pool、task_runtime 的职责".to_string(),
                     artifacts: Vec::new(),
+                    evidence: Vec::new(),
                     verification: Vec::new(),
                     remaining_work: Vec::new(),
                     touched_files: SubagentTouchedFiles {

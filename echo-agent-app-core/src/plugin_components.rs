@@ -773,8 +773,13 @@ fn framework_definition(
         can_delegate: definition.can_delegate,
         tags: definition.tags.clone(),
         lightweight: false,
-        isolate_worktree: definition.isolate_worktree,
-        isolate_workspace: definition.isolate_workspace,
+        isolation: if definition.isolate_worktree {
+            Some("worktree".to_string())
+        } else if definition.isolate_workspace {
+            Some("workspace".to_string())
+        } else {
+            None
+        },
         team: definition.team.clone(),
         is_background: definition.is_background,
     }

@@ -713,6 +713,7 @@ mod tests {
                     status: SubagentRunStatus::Completed,
                     summary: "确认 force_compress 不携带 TaskRuntime 状态".to_string(),
                     artifacts: Vec::new(),
+                    evidence: Vec::new(),
                     verification: Vec::new(),
                     remaining_work: Vec::new(),
                     touched_files: SubagentTouchedFiles {

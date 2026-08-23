@@ -308,25 +308,8 @@ fn prepare_revisioned_graph_commit(
                 task.spec.id, task.execution.task_id
             )));
         }
-        let metadata: EkoTaskMetadata = serde_json::from_value(task.spec.metadata.clone())?;
-        specifications.push(EkoTaskSpec {
-            id: task.spec.id.clone(),
-            title: task.spec.title.clone(),
-            description: task.spec.description.clone(),
-            kind: PlanTaskKind::from_task_kind(task.spec.kind),
-            agent_role: task.spec.agent_role.clone(),
-            domain_profile: metadata.domain_profile,
-            depends_on: task.spec.depends_on.clone(),
-            parallel_group: metadata.parallel_group,
-            execution_target: metadata.execution_target,
-            files: task.spec.files.clone(),
-            allowed_tools: task.spec.allowed_tools.clone(),
-            required_artifacts: task.spec.required_artifacts.clone(),
-            execution_checks: task.spec.execution_checks.clone(),
-            acceptance_criteria: task.spec.acceptance_criteria.clone(),
-            max_retries: task.spec.max_retries,
-            sort_order: metadata.sort_order,
-        });
+        specifications
+            .push(EkoTaskSpec::from_task_spec(task.spec.clone()).map_err(StoreError::InvalidPlan)?);
     }
     if expected_revision.is_none()
         && next.snapshot.tasks.iter().any(|task| {
@@ -1059,7 +1042,11 @@ impl RunCancellationRegistration {
 
 #[cfg(test)]
 fn validate_runtime_plan(tasks: &[PlanTask]) -> Result<(), StoreError> {
-    let runtime_tasks = tasks.iter().map(PlanTask::to_task).collect::<Vec<_>>();
+    let runtime_tasks = tasks
+        .iter()
+        .map(PlanTask::to_task)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(StoreError::InvalidPlan)?;
     echo_agent::tasks::PlanValidator::default()
         .validate_task_snapshot(&runtime_tasks)
         .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))
@@ -3532,28 +3519,9 @@ impl TaskRuntimeStore {
             let execution = executions
                 .remove(&spec.id)
                 .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
-            let metadata = serde_json::to_value(EkoTaskMetadata {
-                domain_profile: spec.domain_profile,
-                parallel_group: spec.parallel_group,
-                execution_target: spec.execution_target,
-                sort_order: spec.sort_order,
-            })?;
+            let framework_spec = spec.to_task_spec().map_err(StoreError::InvalidPlan)?;
             tasks.push(echo_agent::tasks::Task {
-                spec: echo_agent::tasks::TaskSpec {
-                    id: spec.id,
-                    title: spec.title,
-                    description: spec.description,
-                    kind: spec.kind.to_task_kind(),
-                    agent_role: spec.agent_role,
-                    depends_on: spec.depends_on,
-                    files: spec.files,
-                    allowed_tools: spec.allowed_tools,
-                    required_artifacts: spec.required_artifacts,
-                    execution_checks: spec.execution_checks,
-                    acceptance_criteria: spec.acceptance_criteria,
-                    max_retries: spec.max_retries,
-                    metadata,
-                },
+                spec: framework_spec,
                 execution: echo_agent::tasks::TaskExecution {
                     task_id: execution.task_id,
                     status: execution.status,
@@ -3591,7 +3559,7 @@ impl TaskRuntimeStore {
 
     /// Persist one framework-computed graph candidate with optimistic
     /// concurrency. Patch semantics and DAG validation have already run in
-    /// `TaskRevisionService`; this adapter only validates EKO metadata and
+    /// `TaskRevisionService`; this adapter only validates the EKO extension and
     /// commits the file event/projections atomically.
     pub(crate) fn compare_and_commit_revisioned_task_graph(
         &self,
@@ -3893,7 +3861,7 @@ impl TaskRuntimeStore {
             else {
                 return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
             };
-            let current = task.to_task();
+            let current = task.to_task().map_err(StoreError::InvalidPlan)?;
             if task.status != TodoStatus::Pending || current.spec != expected_task.spec {
                 return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
             }
@@ -7985,6 +7953,7 @@ mod tests {
                 status: SubagentRunStatus::Completed,
                 summary: "read chat.rs".into(),
                 artifacts: Vec::new(),
+                evidence: Vec::new(),
                 verification: vec![SubagentVerificationResult {
                     check: "cargo check".into(),
                     status: SubagentVerificationStatus::Passed,
@@ -9576,7 +9545,8 @@ mod tests {
             .get_plan("r1")?
             .and_then(|plan| plan.tasks.into_iter().next())
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        let claim = match store.claim_task("r1", &task.to_task(), 1)? {
+        let runtime_task = task.to_task().map_err(StoreError::InvalidPlan)?;
+        let claim = match store.claim_task("r1", &runtime_task, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(
@@ -9639,7 +9609,8 @@ mod tests {
             .first()
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
-        let claim = match store.claim_task("r1", &task.to_task(), 1)? {
+        let runtime_task = task.to_task().map_err(StoreError::InvalidPlan)?;
+        let claim = match store.claim_task("r1", &runtime_task, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(
@@ -9967,7 +9938,8 @@ mod tests {
             .tasks
             .first()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
-            .to_task();
+            .to_task()
+            .map_err(StoreError::InvalidPlan)?;
         store.apply_task_patch_for_test(
             "r1",
             &TaskUpdateRequest {
@@ -10007,7 +9979,8 @@ mod tests {
             .tasks
             .first()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
-            .to_task();
+            .to_task()
+            .map_err(StoreError::InvalidPlan)?;
         let claim = match store.claim_task("r1", &expected, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
@@ -10056,11 +10029,11 @@ mod tests {
             .first()
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let original_runtime = original.to_task().map_err(StoreError::InvalidPlan)?;
         let old_claim = echo_agent::tasks::TaskClaim::new(
             1,
             1,
-            original
-                .to_task()
+            original_runtime
                 .spec
                 .stable_hash()
                 .map_err(StoreError::InvalidPlan)?,
@@ -10123,7 +10096,8 @@ mod tests {
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(patched_task.retry_count, 0);
-        let new_claim = match store.claim_task("r1", &patched_task.to_task(), patched.revision)? {
+        let patched_runtime = patched_task.to_task().map_err(StoreError::InvalidPlan)?;
+        let new_claim = match store.claim_task("r1", &patched_runtime, patched.revision)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(

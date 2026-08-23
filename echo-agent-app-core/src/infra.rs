@@ -657,40 +657,17 @@ pub async fn create_agent_with_diagnostics(
     // Sprint 8: the same project root also seeds the worktree factory below.
     // (subagent_project_root / subagent_user_home computed before builder)
 
-    // Sprint 8: inject a worktree-isolation factory so Fork-dispatched writer
-    // subagents (those declaring `isolate_worktree: true`) can run in isolated
-    // git worktrees. Resolve the git repo root best-effort from the project
-    // root; if it's not a git repo, no factory is injected (subagents declaring
-    // isolation log a warning and run unisolated — the framework's default).
-    // No new permission gate: worktree is a user-driven isolation tool
-    // (AGENTS.md local-assistant positioning); factory failure still hard-fails
-    // the dispatch (data-loss guard, not a permission check).
-    let worktree_factory = subagent_project_root.as_ref().and_then(|root| {
-        crate::tasks::task_runtime::worktree::git_repo_root(root)
-            .ok()
-            .map(crate::tasks::task_runtime::worktree::EkoWorktreeFactory::new)
-            .map(|f| {
-                let arc: std::sync::Arc<
-                    dyn echo_agent::agent::subagent::worktree::WorktreeFactory,
-                > = std::sync::Arc::new(f);
-                arc
-            })
-    });
-    let builder = if let Some(factory) = worktree_factory {
-        builder.subagent_worktree_factory(factory)
-    } else {
-        builder
-    };
-
-    // Sprint 10: always inject a data-workspace factory (no git dependency —
-    // unlike worktree, tmpdir works anywhere). Fork-dispatched data/research
-    // subagents declaring `isolate_workspace: true` get a per-subagent tmpdir so
-    // parallel runs emit disjoint output files. Optional base_dir keeps them
-    // debuggable under a known parent; fall back to OS temp.
-    let data_workspace_factory: std::sync::Arc<
-        dyn echo_agent::agent::subagent::workspace::DataWorkspaceFactory,
-    > = std::sync::Arc::new(crate::tasks::task_runtime::worktree::EkoDataWorkspaceFactory::new());
-    let builder = builder.subagent_data_workspace_factory(data_workspace_factory);
+    // EKO owns the concrete worktree/workspace policies behind one framework
+    // isolation boundary. A requested kind that cannot be established fails
+    // rather than silently sharing the primary workspace.
+    let repo_root = subagent_project_root
+        .as_ref()
+        .and_then(|root| crate::tasks::task_runtime::worktree::git_repo_root(root).ok());
+    let isolation_provider: std::sync::Arc<dyn echo_agent::agent::subagent::IsolationProvider> =
+        std::sync::Arc::new(
+            crate::tasks::task_runtime::worktree::EkoIsolationProvider::new(repo_root),
+        );
+    let builder = builder.subagent_isolation_provider(isolation_provider);
 
     // Reuse one canonical checkpoint store for ReAct and compiled team task
     // graphs. A caller-provided store is authoritative; otherwise EKO installs
@@ -1012,13 +989,13 @@ async fn register_default_subagents(
                 // framework's dispatch_fork create an isolated worktree for the
                 // writer (eko-fork-<label> branch).
                 if subagent_def.isolate_worktree {
-                    builder = builder.isolate_worktree();
+                    builder = builder.isolation("worktree");
                 }
                 // Sprint 10: honor the frontmatter `workspace: true` flag for
                 // data/research subagents (per-subagent tmpdir, disjoint outputs).
                 // Loader clears it when worktree is active (mutually exclusive).
                 if subagent_def.isolate_workspace {
-                    builder = builder.isolate_workspace();
+                    builder = builder.isolation("workspace");
                 }
                 // Sprint 11: if this .md declares a team (team_strategy +
                 // manager + subagent team members), override execution_mode to Team and
