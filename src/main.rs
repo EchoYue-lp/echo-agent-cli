@@ -26,30 +26,15 @@ use clap::Parser;
 
 /// Build a `TaskRuntimeStore` for headless (non-GUI) entry points (TUI / channels).
 ///
-/// Opens the on-disk store, falling back to an
-/// in-memory store if the file-backed store is unavailable. Returned as `Option<Arc<...>>`
-/// because `drive_chat` takes `Option<&TaskRuntimeStore>` (normal-only callers
-/// pass `None`). Headless modes support complex tasks (TUI/GUI parity,
-/// AGENTS.md), so they always provide a store.
+/// Headless modes support complex tasks (TUI/GUI parity), so root authority
+/// and cross-process lease failures abort bootstrap instead of silently
+/// switching persistence semantics.
 #[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 fn build_task_runtime_store_for_headless()
--> Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>> {
-    let store = match echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new() {
-        Ok(store) => store,
-        Err(e) => {
-            tracing::warn!("Failed to open TaskRuntime store: {e}; in-memory fallback");
-            match echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory() {
-                Ok(store) => store,
-                Err(memory_error) => {
-                    tracing::error!(
-                        "Failed to initialize in-memory task_runtime store: {memory_error}"
-                    );
-                    return None;
-                }
-            }
-        }
-    };
-    Some(std::sync::Arc::new(store))
+-> anyhow::Result<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>> {
+    Ok(std::sync::Arc::new(
+        echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new()?,
+    ))
 }
 
 #[tokio::main]
@@ -199,14 +184,13 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     // Every headless surface is a full Agent surface. Build one TaskRuntime
     // store, register the same task tools on the primary agent, and inject the
     // store into the shared pool before any pooled agent is created.
-    let task_runtime_store = build_task_runtime_store_for_headless();
-    if let Some(store) = task_runtime_store.clone() {
-        echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
-            &agent_handle,
-            store,
-        )
-        .await;
-    }
+    let task_runtime_store = build_task_runtime_store_for_headless()?;
+    echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
+        &agent_handle,
+        task_runtime_store.clone(),
+    )
+    .await;
+    let task_runtime_store = Some(task_runtime_store);
     let pool = {
         let pool = echo_agent_app_core::agent_pool::AgentPool::from_runtime(
             &runtime,

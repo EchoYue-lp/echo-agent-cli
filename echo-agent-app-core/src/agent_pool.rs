@@ -3372,6 +3372,9 @@ mod tests {
             )
             .map_err(|error| error.to_string())?,
         );
+        let canonical_root = std::fs::canonicalize(temp.path())
+            .map_err(|error| error.to_string())?
+            .join("tasks");
         store
             .create_run(
                 "permanent-terminal-debt",
@@ -3451,7 +3454,7 @@ mod tests {
             .driver_token
             .ok_or_else(|| "abandoned settlement driver token is missing".to_string())?;
         assert_eq!(diagnostic.run_id, "permanent-terminal-debt");
-        assert_eq!(diagnostic.root, temp.path().join("tasks"));
+        assert_eq!(diagnostic.root, canonical_root);
         assert!(!diagnostic.error.is_empty());
         let shutdown_text = shutdown_error.to_string();
         assert!(shutdown_text.contains("run=permanent-terminal-debt"));

@@ -880,6 +880,7 @@ impl TaskRuntimeWorkspaceTransition<'_> {
         statuses: &[TaskRunStatus],
     ) -> Result<Vec<TaskRun>, StoreError> {
         super::file_store::FileTaskStore::from_root(self.store.shadow.root())
+            .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))?
             .list_runs_in(statuses)
             .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))
     }
@@ -890,7 +891,7 @@ impl TaskRuntimeWorkspaceTransition<'_> {
         workspace_id: impl Into<String>,
     ) -> Result<(), StoreError> {
         let root = root.into();
-        std::fs::create_dir_all(&root)
+        echo_agent::utils::fs::create_dir_all_durable(&root)
             .map_err(|error| super::file_shadow::ShadowError::Io(error.to_string()))?;
         let mut generation = self
             .store
@@ -902,7 +903,7 @@ impl TaskRuntimeWorkspaceTransition<'_> {
                 "task runtime workspace transition lost exclusive admission".to_string(),
             ));
         }
-        self.store.shadow.rebind_root(root);
+        self.store.shadow.rebind_root(root)?;
         let previous_workspace_id = generation.workspace_id.clone();
         let workspace_id = workspace_id.into();
         generation.workspace_id = workspace_id.clone();
@@ -1125,8 +1126,8 @@ impl TaskRuntimeStore {
     /// Create the store at the default location.
     ///
     /// task/plan data lives under the file shadow root (`~/.eko/tasks/`);
-    /// No database is opened, so this
-    /// does not fail in practice — the `Result` is kept for call-site compat.
+    /// No database is opened. Root authority, durable directory creation, and
+    /// cross-process lease failures are propagated to bootstrap.
     pub fn new() -> anyhow::Result<Self> {
         Self::open()
     }
@@ -1135,9 +1136,9 @@ impl TaskRuntimeStore {
     /// root is the real storage location. Kept as `open()` with no args for
     /// call-site compatibility with the old `open(path)` constructor.
     pub fn open() -> anyhow::Result<Self> {
-        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(
+        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::try_new(
             super::file_shadow::FileTaskShadow::default_root(),
-        ));
+        )?);
         Ok(Self::with_shadow(shadow, "global"))
     }
 
@@ -1150,7 +1151,7 @@ impl TaskRuntimeStore {
         shadow_root: impl Into<PathBuf>,
         workspace_id: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
+        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::try_new(shadow_root)?);
         Ok(Self::with_shadow(shadow, workspace_id.into()))
     }
 
@@ -1216,7 +1217,7 @@ impl TaskRuntimeStore {
     /// `events.jsonl` / projection files back directly and so runs are isolated
     /// under a known directory. Replaces the old `attach_shadow` test hook.
     pub fn new_in_memory_with_shadow_root(shadow_root: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
+        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::try_new(shadow_root)?);
         Ok(Self::with_shadow(shadow, "test"))
     }
 
@@ -2863,7 +2864,8 @@ impl TaskRuntimeStore {
         })
     }
 
-    /// Atomically transition a run to `next` and append `RunStatusChanged`.
+    /// Serialize a run transition and durably append `RunStatusChanged`.
+    /// Projection refresh is self-healing, not I/O failure-atomic with append.
     /// Rejects illegal transitions (see [`TaskRunStatus::can_transition_to`]).
     pub fn transition_run(&self, run_id: &str, next: TaskRunStatus) -> Result<TaskRun, StoreError> {
         // F3-3/F3-4: 串行化"读→验证→写", 防并发 transition 丢更新 + 崩溃中态。
@@ -3386,8 +3388,8 @@ impl TaskRuntimeStore {
         self.request_pause_with_reason(run_id, RunPauseReason::User, None)
     }
 
-    /// Pause an active driver while atomically persisting the structured reason
-    /// with the Paused transition. Background command cells intentionally keep
+    /// Pause an active driver while persisting the structured reason in the
+    /// same durable transition event. Background command cells intentionally keep
     /// running; explicit cancellation is the only path that stops them.
     pub fn request_pause_with_reason(
         &self,
@@ -3560,7 +3562,9 @@ impl TaskRuntimeStore {
     /// Persist one framework-computed graph candidate with optimistic
     /// concurrency. Patch semantics and DAG validation have already run in
     /// `TaskRevisionService`; this adapter only validates the EKO extension and
-    /// commits the file event/projections atomically.
+    /// serializes the optimistic commit and durably appends each event. A
+    /// failure in a later revalidation event leaves an observable committed
+    /// prefix; projections self-heal from that prefix on retry.
     pub(crate) fn compare_and_commit_revisioned_task_graph(
         &self,
         run_id: &str,
@@ -3664,13 +3668,12 @@ impl TaskRuntimeStore {
             let prepared = prepare_revisioned_graph_commit(&run.run_id, run, None, commit)?;
             let timestamp = Utc::now();
             let mut events = vec![
-                RuntimeTaskEvent {
-                    seq: 1,
-                    run_id: run.run_id.clone(),
-                    task_id: None,
-                    step_id: None,
-                    event_type: RuntimeEventKind::RunCreated,
-                    payload: serde_json::json!({
+                super::run_authority::RuntimeJournalEvent::new(
+                    run.run_id.clone(),
+                    None,
+                    None,
+                    RuntimeEventKind::RunCreated,
+                    serde_json::json!({
                         "goal": run.goal,
                         "goal_revision": run.goal_revision,
                         "goal_sha256": run.goal_sha256,
@@ -3684,44 +3687,37 @@ impl TaskRuntimeStore {
                         "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
                     }),
                     timestamp,
-                },
-                RuntimeTaskEvent {
-                    seq: 2,
-                    run_id: run.run_id.clone(),
-                    task_id: None,
-                    step_id: None,
-                    event_type: RuntimeEventKind::PlanRevisionCommitted,
-                    payload: prepared.payload,
+                ),
+                super::run_authority::RuntimeJournalEvent::new(
+                    run.run_id.clone(),
+                    None,
+                    None,
+                    RuntimeEventKind::PlanRevisionCommitted,
+                    prepared.payload,
                     timestamp,
-                },
+                ),
             ];
             if let Some((enabled, auto_resume, token_budget, time_budget_seconds)) = continuation {
-                events.push(RuntimeTaskEvent {
-                    seq: 3,
-                    run_id: run.run_id.clone(),
-                    task_id: None,
-                    step_id: None,
-                    event_type: RuntimeEventKind::RunContinuationConfigured,
-                    payload: serde_json::json!({
+                events.push(super::run_authority::RuntimeJournalEvent::new(
+                    run.run_id.clone(),
+                    None,
+                    None,
+                    RuntimeEventKind::RunContinuationConfigured,
+                    serde_json::json!({
                         "enabled": enabled,
                         "auto_resume_after_restart": auto_resume,
                         "token_budget": token_budget,
                         "time_budget_seconds": time_budget_seconds,
                     }),
                     timestamp,
-                });
+                ));
             }
-            let trigger_seq = i64::try_from(events.len())
-                .ok()
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| StoreError::InvalidPlan("initial event sequence overflow".into()))?;
-            events.push(RuntimeTaskEvent {
-                seq: trigger_seq,
-                run_id: run.run_id.clone(),
-                task_id: None,
-                step_id: None,
-                event_type: RuntimeEventKind::Note,
-                payload: serde_json::json!({
+            events.push(super::run_authority::RuntimeJournalEvent::new(
+                run.run_id.clone(),
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
                     "kind": "trigger_metadata",
                     "source": trigger.source,
                     "task_kind": trigger.kind,
@@ -3730,9 +3726,9 @@ impl TaskRuntimeStore {
                     "dependencies": trigger.dependencies,
                 }),
                 timestamp,
-            });
+            ));
             self.shadow
-                .publish_initial_event_batch(&run.run_id, &events)?;
+                .publish_initial_event_batch(&run.run_id, events)?;
             Ok(prepared.next)
         })
     }
@@ -4536,10 +4532,22 @@ impl TaskRuntimeStore {
         for run_id in &run_ids {
             self.stop_owned_command_cells(run_id)?;
         }
-        self.shadow.remove_runs(&run_ids)?;
+        let removal = self.shadow.remove_runs(&run_ids);
+        let committed_degraded = matches!(
+            &removal,
+            Err(super::file_shadow::ShadowError::CommittedDeletionDegraded { .. })
+        );
+        if removal.is_err() && !committed_degraded {
+            return removal.map_err(Into::into);
+        }
         for run_id in &run_ids {
             super::continuation::clear_launcher(self, run_id);
             self.plan_locks.remove(run_id);
+        }
+        if let Ok(mut tokens) = self.run_cancel_tokens.lock() {
+            for run_id in &run_ids {
+                tokens.remove(run_id);
+            }
         }
         if let Ok(mut tokens) = self.task_cancel_tokens.lock() {
             tokens.retain(|key, _| {
@@ -4548,7 +4556,11 @@ impl TaskRuntimeStore {
                     .any(|run_id| key.starts_with(&format!("{run_id}::")))
             });
         }
-        Ok(())
+        if let Ok(mut controls) = self.active_subagent_controls.lock() {
+            controls
+                .retain(|_, target| !run_ids.iter().any(|run_id| target.belongs_to_run(run_id)));
+        }
+        removal.map_err(Into::into)
     }
 
     pub(crate) fn active_subagent_boundaries(
@@ -4832,6 +4844,18 @@ impl TaskRuntimeStore {
         self.file_store()?
             .get_run_state(run_id)
             .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))
+    }
+
+    /// Rebuild one diagnostic projection from the complete journal with an
+    /// empty in-memory checkpoint. The production authority remains unchanged.
+    pub fn diagnose_full_journal_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunStateSnapshot>, StoreError> {
+        let _operation = self.shadow_operation()?;
+        self.shadow
+            .diagnostic_full_replay(run_id)
+            .map_err(|error| StoreError::InvalidPlan(format!("journal diagnostic: {error}")))
     }
 
     /// Configure long-horizon execution without introducing a second Goal store.
@@ -6232,7 +6256,6 @@ fn validate_plan_goal_binding(run: &TaskRun, plan: &TaskPlan) -> Result<(), Stor
 #[allow(clippy::items_after_test_module)] // usage-record impls below are production code kept here for locality with their tests; reordering is pure churn
 mod tests {
     use super::*;
-    use std::io::Write;
 
     struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -6280,13 +6303,7 @@ mod tests {
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
             .map_err(|error| error.to_string())?;
         let run_id = format!("public-state-{event_count}");
-        let run_dir = root.join(&run_id);
-        std::fs::create_dir_all(&run_dir).map_err(|error| error.to_string())?;
-        let file = std::fs::File::create(run_dir.join("events.jsonl"))
-            .map_err(|error| error.to_string())?;
-        let mut writer = std::io::BufWriter::new(file);
         for index in 0..event_count {
-            let seq = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1);
             let (task_id, step_id, event_type, payload) = match index {
                 0 => (
                     None,
@@ -6462,21 +6479,17 @@ mod tests {
                     }),
                 ),
             };
-            let event = RuntimeTaskEvent {
-                seq,
-                run_id: run_id.clone(),
-                task_id,
-                step_id,
-                event_type,
-                payload,
-                timestamp: chrono::Utc::now(),
-            };
-            serde_json::to_writer(&mut writer, &event).map_err(|error| error.to_string())?;
-            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+            store
+                .shadow
+                .append_event_line(
+                    &run_id,
+                    task_id.as_deref(),
+                    step_id.as_deref(),
+                    event_type,
+                    payload,
+                )
+                .map_err(|error| error.to_string())?;
         }
-        writer.flush().map_err(|error| error.to_string())?;
-        let file = writer.into_inner().map_err(|error| error.to_string())?;
-        file.sync_all().map_err(|error| error.to_string())?;
         store
             .shadow
             .rewrite_plan(&run_id)
@@ -6863,6 +6876,9 @@ mod tests {
             TaskRuntimeStore::new_in_memory_with_shadow_root(root.clone())
                 .map_err(|error| error.to_string())?,
         );
+        let canonical_root = std::fs::canonicalize(temp.path())
+            .map_err(|error| error.to_string())?
+            .join("tasks");
         store
             .create_run(
                 "parked-prepare",
@@ -6985,7 +7001,7 @@ mod tests {
             .ok_or_else(|| "prepared driver abandonment is missing".to_string())?;
         assert_eq!(abandoned.run_id, "parked-prepare");
         assert_eq!(abandoned.target, TaskRunStatus::Cancelled);
-        assert_eq!(abandoned.root, root);
+        assert_eq!(abandoned.root, canonical_root);
         assert!(abandoned.driver_token.is_some());
         assert!(!abandoned.error.is_empty());
         assert_eq!(store.active_run_driver_count()?, 0);
@@ -8566,7 +8582,7 @@ mod tests {
         }
 
         let events = store.list_events("r1", 0)?;
-        let replayed = super::super::event_rebuild::rebuild_plan_from_events(&events)
+        let replayed = super::super::event_rebuild::fold_fixture_for_test(&events)
             .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
             .run_state()
             .continuation
@@ -8627,7 +8643,7 @@ mod tests {
         }
 
         let events = store.list_events("r1", 0)?;
-        let replayed = super::super::event_rebuild::rebuild_plan_from_events(&events)
+        let replayed = super::super::event_rebuild::fold_fixture_for_test(&events)
             .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
             .run_state()
             .continuation
@@ -10574,6 +10590,60 @@ mod tests {
     }
 
     #[test]
+    fn degraded_conversation_delete_clears_local_state_before_same_id_recreate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))?;
+        store.create_run(
+            "degraded-delete",
+            "workspace",
+            "conversation-delete",
+            "message",
+            DomainProfile::General,
+            "degraded delete",
+            "chat",
+            AttendedMode::Attended,
+        )?;
+        store
+            .task_cancel_tokens
+            .lock()
+            .map_err(|_| "task token lock poisoned")?
+            .insert(
+                "degraded-delete::task".to_string(),
+                echo_agent::agent::CancellationToken::new(),
+            );
+        assert!(store.plan_locks.contains_key("degraded-delete"));
+        store.shadow.fail_root_sync_on_call_for_test(2);
+        assert!(matches!(
+            store.remove_conversation("conversation-delete"),
+            Err(StoreError::Shadow(
+                super::super::file_shadow::ShadowError::CommittedDeletionDegraded { .. }
+            ))
+        ));
+        assert!(!store.plan_locks.contains_key("degraded-delete"));
+        assert!(
+            !store
+                .task_cancel_tokens
+                .lock()
+                .map_err(|_| "task token lock poisoned")?
+                .contains_key("degraded-delete::task")
+        );
+        assert!(store.get_run("degraded-delete")?.is_none());
+        let recreated = store.create_run(
+            "degraded-delete",
+            "workspace",
+            "conversation-new",
+            "message-new",
+            DomainProfile::General,
+            "recreated",
+            "chat",
+            AttendedMode::Attended,
+        )?;
+        assert_eq!(recreated.conversation_id, "conversation-new");
+        Ok(())
+    }
+
+    #[test]
     fn conversation_removal_fails_closed_while_a_driver_is_active()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -10613,7 +10683,7 @@ mod tests {
         let events = store
             .list_events(&run_id, 0)
             .map_err(|error| error.to_string())?;
-        let full = super::super::event_rebuild::rebuild_plan_from_events(&events)
+        let full = super::super::event_rebuild::fold_fixture_for_test(&events)
             .map_err(|error| error.to_string())?
             .run_state();
         let warm = store
@@ -10633,20 +10703,23 @@ mod tests {
             .join("checkpoint.json");
         std::fs::write(&checkpoint_path, b"{corrupt checkpoint")
             .map_err(|error| error.to_string())?;
-        let repaired = store
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        let repaired = reopened
             .get_run_state(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "repaired state is missing".to_string())?;
         let repaired_bytes = echo_agent::utils::canonical_json::canonical_json_bytes(&repaired)
             .map_err(|error| error.to_string())?;
         assert_eq!(repaired_bytes, full_bytes);
-        let checkpoint = std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?;
-        let decoded =
-            serde_json::from_slice::<super::super::checkpoint::RuntimeCheckpoint>(&checkpoint)
-                .map_err(|error| error.to_string())?;
-        decoded
-            .validate(&run_id)
-            .map_err(|error| error.to_string())?;
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+        let decoded = FileCheckpointStore::<serde_json::Value>::open(&checkpoint_path)
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "repaired checkpoint is missing".to_string())?;
+        assert_eq!(decoded.sequence, 256);
+        assert!(decoded.state.is_object());
         Ok(())
     }
 
@@ -10709,8 +10782,12 @@ mod tests {
             .join("tasks")
             .join(&hundred_run)
             .join("events.jsonl");
+        drop(hundred_store);
         std::fs::write(&checkpoint_path, b"{corrupt checkpoint")
             .map_err(|error| error.to_string())?;
+        let hundred_store =
+            TaskRuntimeStore::new_in_memory_with_shadow_root(hundred_temp.path().join("tasks"))
+                .map_err(|error| error.to_string())?;
         let rebuild_started = std::time::Instant::now();
         assert!(
             hundred_store

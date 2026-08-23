@@ -538,8 +538,8 @@ pub struct TaskState {
     pub cancel_token: CancellationToken,
     /// TaskRuntime canonical file-backed store for complex-task runs, plans,
     /// todos, events, artifacts, reviews, and execution summaries.
-    /// Backs TaskRuntime query commands. `None` only if both the
-    /// on-disk open and the in-memory fallback failed (extreme OOM).
+    /// Backs TaskRuntime query commands. Bootstrap propagates authority errors;
+    /// `None` is retained only for explicit embedding/test construction.
     pub runtime: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     /// Manual interaction mode override (Chat/Task/Auto). `Auto` chooses
     /// between direct work and a formal run; `Chat` disables formal task tools
@@ -1021,7 +1021,7 @@ impl AppState {
         runtime_state_store: Option<Arc<dyn RuntimeStateStore>>,
         app_config: crate::config::EkoConfig,
         mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let config = agent
             .try_write(|guard| WebConfig {
                 model: guard.model_name().to_string(),
@@ -1063,7 +1063,7 @@ impl AppState {
         };
         let conversation_binding = Arc::new(RwLock::new(global_conversation.clone()));
 
-        Self {
+        Ok(Self {
             connection: ConnectionState {
                 agent,
                 model_consumers,
@@ -1140,15 +1140,9 @@ impl AppState {
             tasks: TaskState {
                 service: None,
                 cancel_token: CancellationToken::new(),
-                runtime: {
-                    let store = crate::tasks::task_runtime::TaskRuntimeStore::new().or_else(|e| {
-                        tracing::warn!(
-                            "Failed to open file-backed TaskRuntime store: {e}; falling back to in-memory"
-                        );
-                        crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
-                    });
-                    store.ok().map(Arc::new)
-                },
+                runtime: Some(Arc::new(
+                    crate::tasks::task_runtime::TaskRuntimeStore::new()?,
+                )),
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
             },
             webhook: WebhookState {
@@ -1189,7 +1183,7 @@ impl AppState {
             terminal: crate::terminal::TerminalService::new(),
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
             agent_deliveries: Arc::new(crate::agent_router::AgentDeliverySupervisor::default()),
-        }
+        })
     }
 
     /// Record the non-persistent model generation selected during bootstrap.
@@ -4135,6 +4129,7 @@ mod model_mutation_tests {
             config,
             mcp_runtime,
         )
+        .map_err(|error| error.to_string())?
         .with_active_model_id(active_runtime.id)
         .with_config_path(config_path.clone());
         state.set_pool(pool.clone());
@@ -5205,6 +5200,7 @@ mod workspace_transition_tests {
             Default::default(),
             mcp,
         )
+        .map_err(|error| error.to_string())?
         .with_agent_router(Arc::new(crate::agent_router::AgentRouter::new(
             temp.path().join("router"),
         )));
@@ -5361,6 +5357,7 @@ mod workspace_transition_tests {
             Default::default(),
             mcp,
         )
+        .map_err(|error| error.to_string())?
         .with_agent_router(Arc::new(crate::agent_router::AgentRouter::new(
             temp.path().join("router"),
         )));
@@ -5962,7 +5959,8 @@ mod workspace_transition_tests {
             None,
             Default::default(),
             mcp_runtime,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         state.tasks.runtime = Some(Arc::new(
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
@@ -6215,7 +6213,8 @@ mod service_bootstrap_tests {
             None,
             Default::default(),
             mcp_runtime,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let runtime_store = Arc::new(
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
@@ -6254,7 +6253,8 @@ mod service_bootstrap_tests {
             None,
             Default::default(),
             mcp_runtime,
-        );
+        )
+        .map_err(|error| error.to_string())?;
         let global = Arc::new(
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,

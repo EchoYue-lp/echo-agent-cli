@@ -29,7 +29,6 @@
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
 pub mod boot_reconciler;
-mod checkpoint;
 pub mod command_cells;
 pub mod compact_context;
 pub mod completion_gate;
@@ -47,6 +46,8 @@ pub mod profiles;
 pub mod register;
 pub mod review;
 pub mod revisioned_adapter;
+mod root_authority;
+mod run_authority;
 pub mod store;
 pub mod subagent_control;
 pub mod task_execute_tool;

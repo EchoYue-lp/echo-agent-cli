@@ -2844,20 +2844,21 @@ done
         } else {
             format!("{plugin_name}-fixture")
         };
-        let mut languages = serde_json::Map::new();
-        languages.insert(
-            language.clone(),
-            serde_json::json!({
-                "language": language,
-                "command": server,
-                "args": [],
-                "extensions": [".fixture"],
-                "env": {},
-                "max_restarts": 0
-            }),
-        );
-        let lsp = serde_yaml::to_string(&serde_json::json!({ "languages": languages }))
-            .map_err(|error| error.to_string())?;
+        let lsp = serde_yaml::to_string(&echo_agent::lsp::LspConfigFile {
+            languages: HashMap::from([(
+                language.clone(),
+                echo_agent::lsp::LspServerConfig {
+                    language,
+                    command: server.display().to_string(),
+                    args: Vec::new(),
+                    extensions: vec![".fixture".to_string()],
+                    env: HashMap::new(),
+                    initialization_options: None,
+                    max_restarts: 0,
+                },
+            )]),
+        })
+        .map_err(|error| error.to_string())?;
         std::fs::write(plugin.join("lsp.yaml"), lsp).map_err(|error| error.to_string())
     }
 

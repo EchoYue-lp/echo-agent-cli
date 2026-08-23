@@ -13,6 +13,10 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde::Serialize;
 
+use echo_agent::state::journal::{EventReducer, JournalRecord};
+
+use super::run_authority::RuntimeJournalEvent;
+
 use super::types::{
     ActiveSubagentBoundary, ActiveToolBoundary, AttendedMode, BackgroundCellArtifactStatus,
     BackgroundCellPhase, BackgroundCellState, BackgroundCellTerminalCause, BlockerAudit,
@@ -97,31 +101,46 @@ pub(crate) struct EventFoldState {
     #[serde(default)]
     recovery_blockers: std::collections::BTreeMap<String, RecoveryBlocker>,
     #[serde(default)]
-    last_seq: i64,
-}
-
-/// Fold a run's events (in seq order) into a snapshot.
-///
-/// Returns `Err` if the event stream is malformed (e.g. no `RunCreated`, or a
-/// task-mutating event references a task that was never inserted). A partial
-/// rebuild (missing optional fields) fills defaults and is not an error — the
-/// `RebuiltPlan` is the best-effort projection of the event log.
-pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPlan, RebuildError> {
-    let mut state = EventFoldState::default();
-    state.apply_events(events);
-    state.rebuilt_plan()
+    seen_run_ids: std::collections::BTreeSet<String>,
+    #[serde(skip)]
+    last_projected_event: Option<std::sync::Arc<RuntimeTaskEvent>>,
+    #[serde(skip)]
+    sequence_overflow: Option<u64>,
+    #[serde(skip)]
+    missing_record_sequence: bool,
 }
 
 impl EventFoldState {
-    pub(crate) fn last_seq(&self) -> i64 {
-        self.last_seq
+    pub(crate) fn has_committed_plan(&self) -> bool {
+        self.plan.is_some()
     }
 
-    pub(crate) fn run_id(&self) -> Option<&str> {
-        self.run.as_ref().map(|run| run.run_id.as_str())
+    pub(crate) fn seen_run_ids(&self) -> &std::collections::BTreeSet<String> {
+        &self.seen_run_ids
     }
 
-    pub(crate) fn apply_events(&mut self, events: &[RuntimeTaskEvent]) {
+    pub(crate) fn last_projected_event(&self) -> Option<std::sync::Arc<RuntimeTaskEvent>> {
+        self.last_projected_event
+            .as_ref()
+            .map(std::sync::Arc::clone)
+    }
+
+    pub(crate) fn sequence_overflow(&self) -> Option<u64> {
+        self.sequence_overflow
+    }
+
+    pub(crate) fn missing_record_sequence(&self) -> bool {
+        self.missing_record_sequence
+    }
+
+    fn apply_projected_event(&mut self, event: RuntimeTaskEvent) {
+        self.apply_runtime_event(&event);
+        self.last_projected_event = Some(std::sync::Arc::new(event));
+        self.sequence_overflow = None;
+        self.missing_record_sequence = false;
+    }
+
+    fn apply_runtime_event(&mut self, event: &RuntimeTaskEvent) {
         let Self {
             run,
             plan,
@@ -136,11 +155,14 @@ impl EventFoldState {
             active_subagents,
             active_tools,
             recovery_blockers,
-            last_seq,
+            seen_run_ids,
+            last_projected_event: _,
+            sequence_overflow: _,
+            missing_record_sequence: _,
         } = self;
         use RuntimeEventKind as K;
-        for ev in events {
-            *last_seq = ev.seq;
+        for ev in std::slice::from_ref(event) {
+            seen_run_ids.insert(ev.run_id.clone());
             match ev.event_type {
                 K::RunCreated => {
                     let p = &ev.payload;
@@ -926,6 +948,25 @@ impl EventFoldState {
     }
 }
 
+impl EventReducer for EventFoldState {
+    type Event = RuntimeJournalEvent;
+
+    fn apply(&mut self, _event: &Self::Event) {
+        // RuntimeJournalEvent has no caller-assigned sequence by design. The
+        // framework CheckpointedReducer always invokes apply_record; treating
+        // payload-only apply as degraded avoids reintroducing a second EKO
+        // sequence allocator.
+        self.missing_record_sequence = true;
+    }
+
+    fn apply_record(&mut self, record: &JournalRecord<Self::Event>) {
+        match record.event.project(record.sequence) {
+            Ok(event) => self.apply_projected_event(event),
+            Err(sequence) => self.sequence_overflow = Some(sequence),
+        }
+    }
+}
+
 fn tool_boundary_key(task_id: &str, call_id: &str) -> String {
     format!("{task_id}\0{call_id}")
 }
@@ -1092,6 +1133,17 @@ fn empty_plan_for(run: &TaskRun) -> TaskPlan {
 }
 
 #[cfg(test)]
+pub(crate) fn fold_fixture_for_test(
+    events: &[RuntimeTaskEvent],
+) -> Result<RebuiltPlan, RebuildError> {
+    let mut state = EventFoldState::default();
+    for event in events {
+        state.apply_runtime_event(event);
+    }
+    state.rebuilt_plan()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::{
@@ -1183,7 +1235,7 @@ mod tests {
         let events = s.list_events("r1", 0).unwrap();
 
         // 6. Rebuild from events.
-        let rebuilt = rebuild_plan_from_events(&events).unwrap();
+        let rebuilt = fold_fixture_for_test(&events).unwrap();
 
         // 7. Assert run header parity.
         assert_eq!(rebuilt.run.run_id, sql_run.run_id);
@@ -1281,7 +1333,7 @@ mod tests {
         .unwrap();
 
         let events = s.list_events("r1", 0).unwrap();
-        let rebuilt = rebuild_plan_from_events(&events).unwrap();
+        let rebuilt = fold_fixture_for_test(&events).unwrap();
         let t = rebuilt.tasks.iter().find(|t| t.id == "t1").unwrap();
         assert_eq!(t.title, "renamed");
         assert_eq!(t.description, "new desc");
@@ -1360,7 +1412,7 @@ mod tests {
             .cloned()
             .collect::<Vec<_>>();
         events.extend(duplicates);
-        let continuation = rebuild_plan_from_events(&events)
+        let continuation = fold_fixture_for_test(&events)
             .map_err(|error| error.to_string())?
             .continuation
             .ok_or_else(|| "continuation projection missing".to_string())?;
@@ -1383,7 +1435,7 @@ mod tests {
     fn rebuild_without_run_created_is_error() {
         let events: Vec<RuntimeTaskEvent> = Vec::new();
         assert!(matches!(
-            rebuild_plan_from_events(&events),
+            fold_fixture_for_test(&events),
             Err(RebuildError::NoRunCreated)
         ));
     }

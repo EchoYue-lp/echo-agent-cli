@@ -41,8 +41,8 @@ impl FileTaskStore {
         Self { shadow }
     }
 
-    pub fn from_root(root: impl Into<std::path::PathBuf>) -> Self {
-        Self::new(FileTaskShadow::new(root))
+    pub fn from_root(root: impl Into<std::path::PathBuf>) -> Result<Self, FileReadError> {
+        Ok(Self::new(FileTaskShadow::try_new(root)?))
     }
 
     fn read_run_state_resilient(
@@ -105,10 +105,10 @@ impl FileTaskStore {
     /// `created_at` descending (matching SQL `list_runs_in` ordering). Replaces
     /// `SELECT ... FROM tr_runs ORDER BY created_at DESC`.
     ///
-    /// Reads only `plan.json` (the run header lives there) — does NOT read
-    /// `events.jsonl` or rebuild, so this is O(runs) not O(events). The
-    /// collection-query methods (`latest_run_for_conversation` etc.) build on
-    /// this and stay cheap even with many long runs.
+    /// Each candidate must own a valid event authority; its checkpoint is
+    /// recovered and only a missing journal tail is replayed. Cost is
+    /// O(runs + missing tails), while the shadow LRU bounds retained journal
+    /// handles and fold state after the scan.
     pub fn scan_runs(&self) -> Result<TaskRunScan, FileReadError> {
         let mut runs = Vec::new();
         let mut issues = Vec::new();
@@ -278,11 +278,10 @@ impl FileTaskStore {
         run_id: &str,
         since_seq: i64,
     ) -> Result<Vec<RuntimeTaskEvent>, FileReadError> {
-        let events = self
-            .shadow
-            .read_events(run_id)
-            .map_err(FileReadError::Shadow)?;
-        Ok(events.into_iter().filter(|e| e.seq > since_seq).collect())
+        let after_sequence = u64::try_from(since_seq).unwrap_or_default();
+        self.shadow
+            .read_events_after(run_id, after_sequence)
+            .map_err(FileReadError::Shadow)
     }
 
     /// Artifacts: derive from `ArtifactProduced` events. (0c audit may revise.)
@@ -560,7 +559,7 @@ mod tests {
                 tasks: vec![task("rebuild-task", PlanTaskKind::Summary)],
             })
             .map_err(|error| error.to_string())?;
-        let file = FileTaskStore::from_root(tmp.path());
+        let file = FileTaskStore::from_root(tmp.path()).map_err(|error| error.to_string())?;
 
         std::fs::remove_file(tmp.path().join("rebuild-run/run-state.json"))
             .map_err(|error| error.to_string())?;
@@ -579,7 +578,7 @@ mod tests {
         assert_eq!(plan.plan_id, "rebuild-plan");
         assert_eq!(plan.tasks.len(), 1);
 
-        let shadow = FileTaskShadow::new(tmp.path());
+        let shadow = FileTaskShadow::new(tmp.path()).map_err(|error| error.to_string())?;
         shadow
             .append_event_line(
                 "rebuild-run",
@@ -600,9 +599,9 @@ mod tests {
     /// FileTaskStore read API must match SQL read after a full lifecycle,
     /// including the TodoItem runtime fields derived from events.
     #[test]
-    fn file_store_reads_match_sql() {
+    fn file_store_reads_match_sql() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
@@ -685,13 +684,14 @@ mod tests {
         let sql_ev = store.list_events("r1", 0).unwrap();
         let file_ev = file.list_events("r1", 0).unwrap();
         assert_eq!(sql_ev.len(), file_ev.len());
+        Ok(())
     }
 
     #[test]
     fn task_update_status_overrides_earlier_task_events() -> Result<(), Box<dyn std::error::Error>>
     {
         let tmp = tempfile::tempdir()?;
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
         store.create_run(
             "r1",
@@ -748,9 +748,9 @@ mod tests {
     /// headers, ordered by created_at descending (matching SQL `list_runs_in`
     /// ordering). Drives a store with two runs and asserts both surface.
     #[test]
-    fn list_runs_enumerates_all_runs_desc_by_created() {
+    fn list_runs_enumerates_all_runs_desc_by_created() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
             .create_run(
@@ -783,15 +783,16 @@ mod tests {
         let ids: Vec<_> = runs.iter().map(|r| r.run_id.as_str()).collect();
         assert!(ids.contains(&"r1"));
         assert!(ids.contains(&"r2"));
+        Ok(())
     }
 
     /// `latest_run_for_conversation` returns the most recent run for a
     /// conversation; `find_in_progress_run_by_conversation` returns one only
     /// if it is Running/Paused.
     #[test]
-    fn conversation_queries_filter_and_order() {
+    fn conversation_queries_filter_and_order() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
             .create_run(
@@ -827,13 +828,14 @@ mod tests {
         assert_eq!(in_prog.as_ref().map(|r| r.run_id.as_str()), Some("r1"));
         // Different conversation → none.
         assert!(file.latest_run_for_conversation("other").unwrap().is_none());
+        Ok(())
     }
 
     /// `list_runs_in` filters by status set.
     #[test]
-    fn list_runs_in_filters_by_status() {
+    fn list_runs_in_filters_by_status() -> Result<(), Box<dyn std::error::Error>> {
         let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path())?);
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
             .create_run(
@@ -872,6 +874,7 @@ mod tests {
         let pending = file.list_runs_in(&[TaskRunStatus::Pending]).unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].run_id, "r2");
+        Ok(())
     }
 
     #[test]
@@ -893,7 +896,7 @@ mod tests {
         std::fs::create_dir_all(&broken)?;
         std::fs::write(broken.join("events.jsonl"), b"{not-json}\n")?;
 
-        let scan = FileTaskStore::from_root(tmp.path()).scan_runs()?;
+        let scan = FileTaskStore::from_root(tmp.path())?.scan_runs()?;
         assert!(scan.runs.iter().any(|run| run.run_id == "healthy"));
         assert!(scan.issues.iter().any(|issue| issue.run_id == "broken"));
         Ok(())

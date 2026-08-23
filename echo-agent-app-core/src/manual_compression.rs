@@ -213,7 +213,7 @@ mod tests {
             None,
             Default::default(),
             mcp,
-        );
+        )?;
         state.storage.chat_events = Arc::new(ChatEventLog::open(
             temp.path().join("chat-events"),
             ChatEventRetention::default(),

@@ -1,227 +1,427 @@
-//! File-based authoritative store (U1c phase-0/0bc).
+//! EKO's TaskRuntime file layout and product projection adapter.
 //!
-//! The file system (`events.jsonl` + `plan.json`) is the read/write authority
-//! for all task data. SQL was retired in 0bc step 5.
-//!
-//! Layout: `{root}/{run_id}/events.jsonl` (append-only authority), `plan.json`
-//! and `run-state.json` (snapshots), plus discardable `checkpoint.json`.
-//! `root` defaults to `~/.eko/tasks/` (global, spec §2 path A).
+//! `events.jsonl` is the sole fact source. Sequencing, replay, crash-tail
+//! repair, the process lease, and checkpoint recovery are delegated to the
+//! framework journal through one canonical [`RunAuthority`] per run.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
-use fs2::FileExt;
-
-use super::checkpoint::RuntimeCheckpoint;
-use super::event_rebuild::EventFoldState;
+use super::root_authority::RootTransactionAuthority;
+use super::run_authority::{RunAuthority, RuntimeJournalEvent};
 use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
 
-/// Shadow writer for one root directory. Cheap to clone (wraps a root path; the
-/// append lock is per-run via the `events.jsonl` file handle being held briefly).
+const MAX_CACHED_RUN_AUTHORITIES: usize = 128;
+
+#[cfg(test)]
+type TestPause = Arc<(std::sync::Barrier, std::sync::Barrier)>;
+
+struct CachedRunAuthority {
+    authority: Arc<RunAuthority>,
+    last_used: u64,
+}
+
+struct ShadowGenerationState {
+    root: PathBuf,
+    generation: u64,
+    transitioning: bool,
+    root_authority: Option<RootTransactionAuthority>,
+    authorities: HashMap<String, CachedRunAuthority>,
+    access_clock: u64,
+}
+
+/// EKO product storage rooted at one workspace's TaskRuntime directory.
 #[derive(Clone)]
 pub struct FileTaskShadow {
-    root: std::sync::Arc<std::sync::RwLock<PathBuf>>,
-    /// Per-run write locks shared by event append and snapshot rewrite.
-    /// `append_event_line` holds the lock across seq allocation and append;
-    /// `rewrite_plan` acquires it again after append returns.
-    /// This prevents duplicate seq allocation and stale plan.json renames.
-    /// Different runs still run in parallel; only same-run writes serialize.
-    run_write_locks: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
-    >,
-    /// Optional synchronous event hook invoked after each event is successfully
-    /// appended. The hook receives the fully-formed `RuntimeTaskEvent`. Used by
-    /// the application-layer HookEventDispatcher to translate RuntimeEventKind
-    /// into framework HookEvents (TaskCreated/Started/Completed(status),
-    /// SubagentStop(status)) without polluting the sync store with async logic.
-    /// The callback must be cheap (spawn-and-detach); it runs under the per-run
-    /// write lock, so blocking here blocks all same-run writes.
-    ///
-    /// `OnceLock` so it can be attached once, post-construction: the store is
-    /// built early in bootstrap (before bridges exist), then the dispatcher is
-    /// attached once the agent + bridges are ready. Shared via Arc across clones.
+    state: Arc<Mutex<ShadowGenerationState>>,
     #[allow(clippy::type_complexity)]
-    // Arc<OnceLock<Arc<dyn Fn>>> — structural, mirrors run_write_locks above
-    event_hook: std::sync::Arc<
-        std::sync::OnceLock<std::sync::Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>>,
-    >,
+    event_hook: Arc<OnceLock<Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>>>,
     #[cfg(test)]
-    fail_initial_publish_before_rename: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    fail_initial_publish_before_rename: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    deletion_pause: Arc<Mutex<Option<TestPause>>>,
+    #[cfg(test)]
+    rebind_pause: Arc<Mutex<Option<TestPause>>>,
+    #[cfg(test)]
+    fail_root_sync_on_call: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FileTaskShadow {
-    /// Create a shadow rooted at `root`. The directory is created lazily on first write.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
+    pub fn try_new(root: impl Into<PathBuf>) -> Result<Self, ShadowError> {
+        let root = root.into();
+        let root_authority = RootTransactionAuthority::open(&root)?;
+        let root = root_authority.root().to_path_buf();
         let shadow = Self {
-            root: std::sync::Arc::new(std::sync::RwLock::new(root.into())),
-            run_write_locks: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            event_hook: std::sync::Arc::new(std::sync::OnceLock::new()),
+            state: Arc::new(Mutex::new(ShadowGenerationState {
+                root,
+                generation: 0,
+                transitioning: false,
+                root_authority: Some(root_authority),
+                authorities: HashMap::new(),
+                access_clock: 0,
+            })),
+            event_hook: Arc::new(OnceLock::new()),
             #[cfg(test)]
-            fail_initial_publish_before_rename: std::sync::Arc::new(
-                std::sync::atomic::AtomicBool::new(false),
-            ),
+            fail_initial_publish_before_rename: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            deletion_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            rebind_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            fail_root_sync_on_call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
-        shadow.recover_interrupted_transactions();
-        shadow
+        shadow.with_root_write(cleanup_transactions)?;
+        Ok(shadow)
     }
 
-    /// Attach a synchronous event hook fired after each successful append.
-    ///
-    /// Idempotent: the first call wins; subsequent calls are ignored (returns
-    /// false). This lets bootstrap attach the dispatcher once bridges exist
-    /// without racing. The hook receives the persisted `RuntimeTaskEvent` and
-    /// MUST be cheap (spawn-and-detach) because it runs under the per-run
-    /// write lock. This is the single injection point that lets the application
-    /// translate the event-sourced RuntimeEventKind stream into framework
-    /// HookEvents without making the store async.
+    pub fn new(root: impl Into<PathBuf>) -> Result<Self, ShadowError> {
+        Self::try_new(root)
+    }
+
+    #[cfg(test)]
+    fn new_unbound_for_test(root: impl Into<PathBuf>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ShadowGenerationState {
+                root: root.into(),
+                generation: 0,
+                transitioning: false,
+                root_authority: None,
+                authorities: HashMap::new(),
+                access_clock: 0,
+            })),
+            event_hook: Arc::new(OnceLock::new()),
+            fail_initial_publish_before_rename: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deletion_pause: Arc::new(Mutex::new(None)),
+            rebind_pause: Arc::new(Mutex::new(None)),
+            fail_root_sync_on_call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
     pub fn try_attach_event_hook(
         &self,
-        hook: std::sync::Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>,
+        hook: Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>,
     ) -> bool {
         self.event_hook.set(hook).is_ok()
     }
 
-    /// Default shadow root: `~/.eko/tasks/`.
     pub fn default_root() -> PathBuf {
         crate::data_root::user_data_path("tasks")
     }
 
     pub(crate) fn root(&self) -> PathBuf {
-        self.root
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .root
             .clone()
     }
 
-    pub(crate) fn rebind_root(&self, root: PathBuf) {
-        *self
-            .root
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = root;
-        self.run_write_locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        self.recover_interrupted_transactions();
+    pub(crate) fn rebind_root(&self, root: PathBuf) -> Result<(), ShadowError> {
+        let old_authority = self.root_authority()?;
+        let new_authority = RootTransactionAuthority::open(&root)?;
+        let (old_root, generation) = {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if state.transitioning {
+                return Err(ShadowError::RootTransition);
+            }
+            state.transitioning = true;
+            (state.root.clone(), state.generation)
+        };
+        let result = (|| {
+            let mut roots = vec![old_authority.clone(), new_authority.clone()];
+            roots.sort_by(|left, right| left.root().cmp(right.root()));
+            roots.dedup_by(|left, right| left.same_authority(right));
+            let root_guards = roots
+                .iter()
+                .map(|authority| authority.write_operation())
+                .collect::<Vec<_>>();
+            #[cfg(test)]
+            if let Some(pause) = self
+                .rebind_pause
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                pause.0.wait();
+                pause.1.wait();
+            }
+            let invalidation = if old_root.exists() {
+                Some(RunAuthority::begin_invalidate_root(&old_root)?)
+            } else {
+                None
+            };
+            cleanup_transactions(new_authority.root())?;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            if !state.transitioning || state.generation != generation {
+                return Err(ShadowError::RootTransition);
+            }
+            state.authorities.clear();
+            state.root = new_authority.root().to_path_buf();
+            state.root_authority = Some(new_authority);
+            state.generation = state.generation.saturating_add(1);
+            state.transitioning = false;
+            drop(state);
+            drop(invalidation);
+            drop(root_guards);
+            Ok(())
+        })();
+        if result.is_err() {
+            self.state
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .transitioning = false;
+        }
+        result
     }
 
+    #[cfg(test)]
     fn run_dir(&self, run_id: &str) -> PathBuf {
         self.root().join(run_id)
     }
 
+    #[cfg(test)]
     fn events_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("events.jsonl")
     }
 
-    fn plan_path(&self, run_id: &str) -> PathBuf {
-        self.run_dir(run_id).join("plan.json")
+    fn root_authority(&self) -> Result<RootTransactionAuthority, ShadowError> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.transitioning {
+            return Err(ShadowError::RootTransition);
+        }
+        if let Some(authority) = state.root_authority.as_ref() {
+            return Ok(authority.clone());
+        }
+        let authority = RootTransactionAuthority::open(&state.root)?;
+        state.root = authority.root().to_path_buf();
+        state.root_authority = Some(authority.clone());
+        state.generation = state.generation.saturating_add(1);
+        Ok(authority)
     }
 
-    fn run_state_path(&self, run_id: &str) -> PathBuf {
-        self.run_dir(run_id).join("run-state.json")
+    fn with_root_read<T>(
+        &self,
+        operation: impl FnOnce(&Path) -> Result<T, ShadowError>,
+    ) -> Result<T, ShadowError> {
+        let authority = self.root_authority()?;
+        let generation = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .generation;
+        let _guard = authority.read_operation();
+        self.validate_root_snapshot(&authority, generation)?;
+        operation(authority.root())
     }
 
-    fn checkpoint_path(&self, run_id: &str) -> PathBuf {
-        self.run_dir(run_id).join("checkpoint.json")
+    fn with_root_write<T>(
+        &self,
+        operation: impl FnOnce(&Path) -> Result<T, ShadowError>,
+    ) -> Result<T, ShadowError> {
+        let authority = self.root_authority()?;
+        let generation = self
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .generation;
+        let _guard = authority.write_operation();
+        self.validate_root_snapshot(&authority, generation)?;
+        operation(authority.root())
     }
 
-    /// Settle hidden task-publication and deletion directories left by a process
-    /// that ended inside a file transaction. Product run enumeration never
-    /// treats these directories as TaskRuns.
-    fn recover_interrupted_transactions(&self) {
-        let root = self.root();
-        let entries = match std::fs::read_dir(&root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-            Err(error) => {
-                tracing::warn!(%error, path = %root.display(), "failed to inspect task publication transactions");
-                return;
-            }
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    tracing::warn!(%error, path = %root.display(), "failed to inspect task publication transaction entry");
-                    continue;
-                }
-            };
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) => {
-                    tracing::warn!(%error, path = %entry.path().display(), "failed to inspect task publication transaction type");
-                    continue;
-                }
-            };
-            if file_type.is_dir()
-                && (name.starts_with(".preparing-") || name.starts_with(".deleting-"))
-                && let Err(error) = std::fs::remove_dir_all(entry.path())
-            {
-                tracing::warn!(%error, path = %entry.path().display(), "failed to remove stale task file transaction");
-            }
+    fn validate_root_snapshot(
+        &self,
+        authority: &RootTransactionAuthority,
+        generation: u64,
+    ) -> Result<(), ShadowError> {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let current = !state.transitioning
+            && state.generation == generation
+            && state
+                .root_authority
+                .as_ref()
+                .is_some_and(|candidate| candidate.same_authority(authority))
+            && state.root == authority.root();
+        if current {
+            Ok(())
+        } else {
+            Err(ShadowError::RootTransition)
         }
     }
 
-    /// Publish a TaskRun's complete first generation with one directory rename.
-    /// The supplied event batch is already framework-validated; both derived
-    /// projections are rebuilt before the run becomes enumerable.
+    fn sync_root(&self, root: &Path) -> Result<(), std::io::Error> {
+        #[cfg(test)]
+        {
+            let remaining = self
+                .fail_root_sync_on_call
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if remaining > 0 {
+                let previous = self
+                    .fail_root_sync_on_call
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if previous == 1 {
+                    return Err(std::io::Error::other("injected root sync failure"));
+                }
+            }
+        }
+        sync_directory(root)
+    }
+
+    fn authority(
+        &self,
+        run_id: &str,
+        create: bool,
+    ) -> Result<Option<Arc<RunAuthority>>, ShadowError> {
+        for _attempt in 0..2 {
+            let root_authority = self.root_authority()?;
+            let _root_guard = root_authority.read_operation();
+            let (generation, access) = {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                let same_root = state
+                    .root_authority
+                    .as_ref()
+                    .is_some_and(|current| current.same_authority(&root_authority))
+                    && state.root == root_authority.root();
+                if state.transitioning || !same_root {
+                    continue;
+                }
+                state.access_clock = state.access_clock.saturating_add(1);
+                let access = state.access_clock;
+                if let Some(cached) = state.authorities.get_mut(run_id)
+                    && cached.authority.is_open()
+                {
+                    cached.last_used = access;
+                    return Ok(Some(Arc::clone(&cached.authority)));
+                }
+                state.authorities.remove(run_id);
+                (state.generation, access)
+            };
+            let event_path = root_authority.root().join(run_id).join("events.jsonl");
+            if !create && !event_path.exists() {
+                return Ok(None);
+            }
+            let checkpoint_path = root_authority.root().join(run_id).join("checkpoint.json");
+            let authority = RunAuthority::open(&event_path, &checkpoint_path, run_id)?;
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let same_generation = !state.transitioning
+                && state.generation == generation
+                && state
+                    .root_authority
+                    .as_ref()
+                    .is_some_and(|current| current.same_authority(&root_authority))
+                && state.root == root_authority.root();
+            if !same_generation {
+                continue;
+            }
+            if let Some(cached) = state.authorities.get_mut(run_id)
+                && cached.authority.is_open()
+            {
+                cached.last_used = access;
+                return Ok(Some(Arc::clone(&cached.authority)));
+            }
+            state.authorities.insert(
+                run_id.to_string(),
+                CachedRunAuthority {
+                    authority: Arc::clone(&authority),
+                    last_used: access,
+                },
+            );
+            evict_idle_authorities(&mut state, Some(run_id));
+            return Ok(Some(authority));
+        }
+        Err(ShadowError::RootTransition)
+    }
+
+    fn clear_cached_authority(&self, run_id: &str, authority: &Arc<RunAuthority>) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state
+            .authorities
+            .get(run_id)
+            .is_some_and(|cached| Arc::ptr_eq(&cached.authority, authority))
+        {
+            state.authorities.remove(run_id);
+        }
+    }
+}
+
+fn cleanup_transactions(root: &Path) -> Result<(), ShadowError> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(ShadowError::Io(error.to_string())),
+    };
+    let mut removed = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                return Err(ShadowError::Io(error.to_string()));
+            }
+        };
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_hidden_transaction =
+            name.starts_with(".preparing-") || name.starts_with(".deleting-");
+        if is_hidden_transaction && entry.file_type().is_ok_and(|file_type| file_type.is_dir()) {
+            std::fs::remove_dir_all(entry.path())
+                .map_err(|error| ShadowError::Io(error.to_string()))?;
+            removed = true;
+        }
+    }
+    if removed {
+        sync_directory(root).map_err(|error| ShadowError::Io(error.to_string()))?;
+    }
+    Ok(())
+}
+
+fn evict_idle_authorities(state: &mut ShadowGenerationState, protected: Option<&str>) {
+    while state.authorities.len() > MAX_CACHED_RUN_AUTHORITIES {
+        let candidate = state
+            .authorities
+            .iter()
+            .filter(|(run_id, cached)| {
+                protected != Some(run_id.as_str()) && cached.authority.cache_evictable()
+            })
+            .min_by_key(|(_, cached)| cached.last_used)
+            .map(|(run_id, _)| run_id.clone());
+        let Some(candidate) = candidate else {
+            break;
+        };
+        state.authorities.remove(&candidate);
+    }
+}
+
+impl FileTaskShadow {
+    /// Publish a complete first TaskRun generation with one visible rename.
     pub(crate) fn publish_initial_event_batch(
         &self,
         run_id: &str,
-        events: &[RuntimeTaskEvent],
+        events: Vec<RuntimeJournalEvent>,
     ) -> Result<(), ShadowError> {
-        if events.is_empty() {
-            return Err(ShadowError::Encode(
-                "initial task publication requires at least one event".to_string(),
-            ));
-        }
-        for (index, event) in events.iter().enumerate() {
-            let expected_seq = i64::try_from(index)
-                .ok()
-                .and_then(|value| value.checked_add(1))
-                .ok_or_else(|| {
-                    ShadowError::Encode("initial event sequence overflow".to_string())
-                })?;
-            if event.run_id != run_id || event.seq != expected_seq {
-                return Err(ShadowError::Encode(format!(
-                    "invalid initial event at position {expected_seq}: run '{}', seq {}",
-                    event.run_id, event.seq
-                )));
-            }
-        }
-        if events.first().map(|event| event.event_type) != Some(RuntimeEventKind::RunCreated)
+        if events.is_empty()
+            || events.first().map(RuntimeJournalEvent::event_type)
+                != Some(RuntimeEventKind::RunCreated)
             || !events
                 .iter()
-                .any(|event| event.event_type == RuntimeEventKind::PlanRevisionCommitted)
+                .any(|event| event.event_type() == RuntimeEventKind::PlanRevisionCommitted)
         {
             return Err(ShadowError::Encode(
                 "initial task publication requires RunCreated and PlanRevisionCommitted"
                     .to_string(),
             ));
         }
-
-        let rebuilt = super::event_rebuild::rebuild_plan_from_events(events)
-            .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
-        let mut events_jsonl = Vec::new();
-        for event in events {
-            serde_json::to_writer(&mut events_jsonl, event)
-                .map_err(|error| ShadowError::Encode(error.to_string()))?;
-            events_jsonl.push(b'\n');
+        if events.iter().any(|event| event.run_id() != run_id) {
+            return Err(ShadowError::Encode(
+                "initial task publication contains an event for another run".to_string(),
+            ));
         }
-        let plan_json = serde_json::to_vec_pretty(&rebuilt.plan_revision())
-            .map_err(|error| ShadowError::Encode(error.to_string()))?;
-        let state_json = serde_json::to_vec_pretty(&rebuilt.run_state())
-            .map_err(|error| ShadowError::Encode(error.to_string()))?;
 
-        let lock = self.run_write_lock(run_id);
-        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-        let root = self.root();
-        std::fs::create_dir_all(&root).map_err(|error| ShadowError::Io(error.to_string()))?;
-        let final_directory = self.run_dir(run_id);
+        self.with_root_write(|root| {
+        echo_agent::utils::fs::create_dir_all_durable(root)
+            .map_err(|error| ShadowError::Io(error.to_string()))?;
+        let final_directory = root.join(run_id);
         if final_directory.exists() {
             return Err(ShadowError::Io(format!(
                 "task run already exists: {run_id}"
@@ -230,21 +430,28 @@ impl FileTaskShadow {
         let staging_directory = root.join(format!(".preparing-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&staging_directory)
             .map_err(|error| ShadowError::Io(error.to_string()))?;
+
         #[cfg(test)]
         let simulate_crash = self
             .fail_initial_publish_before_rename
             .swap(false, std::sync::atomic::Ordering::SeqCst);
         #[cfg(not(test))]
         let simulate_crash = false;
-        let stage_result = (|| -> Result<(), ShadowError> {
-            write_synced(&staging_directory.join("events.jsonl"), &events_jsonl)
-                .map_err(|error| ShadowError::Io(error.to_string()))?;
-            write_synced(&staging_directory.join("plan.json"), &plan_json)
-                .map_err(|error| ShadowError::Io(error.to_string()))?;
-            write_synced(&staging_directory.join("run-state.json"), &state_json)
-                .map_err(|error| ShadowError::Io(error.to_string()))?;
+
+        let mut committed = Vec::with_capacity(events.len());
+        let stage_result = (|| -> Result<Option<ShadowError>, ShadowError> {
+            let authority = RunAuthority::open(
+                &staging_directory.join("events.jsonl"),
+                &staging_directory.join("checkpoint.json"),
+                run_id,
+            )?;
+            for event in events {
+                committed.push(authority.append(event)?.0);
+            }
+            authority.refresh_projections(false)?;
             sync_directory(&staging_directory)
                 .map_err(|error| ShadowError::Io(error.to_string()))?;
+            drop(authority);
             if simulate_crash {
                 return Err(ShadowError::Io(
                     "injected crash before initial run publication".to_string(),
@@ -252,24 +459,32 @@ impl FileTaskShadow {
             }
             std::fs::rename(&staging_directory, &final_directory)
                 .map_err(|error| ShadowError::Io(error.to_string()))?;
-            if let Err(error) = sync_directory(&root) {
-                tracing::warn!(%error, path = %root.display(), "task publication is visible but parent directory sync failed");
-            }
-            Ok(())
+            let degradation = self.sync_root(root).err().map(|error| {
+                ShadowError::CommittedPublicationDegraded {
+                    run_id: run_id.to_string(),
+                    detail: error.to_string(),
+                }
+            });
+            Ok(degradation)
         })();
-        if stage_result.is_err() {
-            if !simulate_crash && let Err(error) = std::fs::remove_dir_all(&staging_directory) {
-                tracing::warn!(%error, path = %staging_directory.display(), "failed to remove aborted task publication transaction");
+        let degradation = match stage_result {
+            Ok(degradation) => degradation,
+            Err(error) => {
+                if !simulate_crash
+                    && let Err(cleanup) = std::fs::remove_dir_all(&staging_directory)
+                {
+                    tracing::warn!(%cleanup, path = %staging_directory.display(), "failed to remove aborted task publication");
+                }
+                return Err(error);
             }
-            return stage_result;
-        }
-
+        };
         if let Some(hook) = self.event_hook.get() {
-            for event in events {
+            for event in &committed {
                 hook(event);
             }
         }
-        Ok(())
+        degradation.map_or(Ok(()), Err)
+        })
     }
 
     #[cfg(test)]
@@ -278,146 +493,85 @@ impl FileTaskShadow {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    // ── 0bc step-2: file-authority write path (replaces SQL INSERT + flush) ──
+    #[cfg(test)]
+    fn pause_next_deletion_for_test(&self) -> TestPause {
+        let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *self
+            .deletion_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&pause));
+        pause
+    }
 
-    /// Append one enriched event to `events.jsonl` for `run_id`, assigning it
-    /// the next seq (1-based). Returns the fully
-    /// formed `RuntimeTaskEvent` (with seq + timestamp) that was written.
-    ///
-    /// This is the file-authority write primitive: store write methods call
-    /// this instead of a database insert, then call [`rewrite_plan`] to
-    /// incrementally refresh the snapshots. seq is per-run (each run has its own
-    /// `events.jsonl`), so appending to run B does not advance run A's seq.
-    ///
-    /// Atomicity: the append is serialized by both the in-process per-run mutex
-    /// and an OS advisory lock. The latter is required because independent
-    /// stores and processes can point at the same local data root. A crash
-    /// mid-append can at worst leave the last partial line; the next append
-    /// repairs that torn tail before allocating its sequence.
+    #[cfg(test)]
+    fn pause_next_rebind_for_test(&self) -> TestPause {
+        let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        *self
+            .rebind_pause
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(Arc::clone(&pause));
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_root_sync_on_call_for_test(&self, call: usize) {
+        self.fail_root_sync_on_call
+            .store(call, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn cached_authority_count_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .authorities
+            .len()
+    }
+
+    #[cfg(test)]
+    fn has_cached_authority_for_test(&self, run_id: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .authorities
+            .contains_key(run_id)
+    }
+
     pub fn append_event_line(
         &self,
         run_id: &str,
         task_id: Option<&str>,
         step_id: Option<&str>,
-        event_type: super::types::RuntimeEventKind,
+        event_type: RuntimeEventKind,
         payload: serde_json::Value,
-    ) -> Result<RuntimeTaskEvent, ShadowError> {
-        // Hold the per-run write lock across seq allocation and durable append.
-        // This closes the duplicate-seq race that arose when callers entered
-        // `next_seq` concurrently and each observed the same cached value
-        // before any append landed (observed in production events.jsonl as
-        // repeated seq 8/9/30/57/63-66). Different runs still run in
-        // parallel; only same-run writes serialize.
-        let lock = self.run_write_lock(run_id);
-        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-
-        let dir = self.run_dir(run_id);
-        std::fs::create_dir_all(&dir).map_err(|e| ShadowError::Io(e.to_string()))?;
-        let _file_guard = self.lock_run_file(run_id)?;
-        repair_torn_tail(&self.events_path(run_id))?;
-        self.validate_event_stream_for_append(run_id)?;
-
-        // seq = durable last assigned + 1 (1-based). The file lock makes the
-        // read/allocate/append sequence atomic across processes.
-        let next_seq = self.next_seq(run_id)?;
-
-        let event = RuntimeTaskEvent {
-            seq: next_seq,
-            run_id: run_id.to_string(),
-            task_id: task_id.map(str::to_string),
-            step_id: step_id.map(str::to_string),
-            event_type,
-            payload,
-            timestamp: chrono::Utc::now(),
-        };
-
-        // Append one JSON line. Ensure a trailing newline so the file is a
-        // well-formed JSONL stream (each event on its own line).
-        let mut line =
-            serde_json::to_string(&event).map_err(|e| ShadowError::Encode(e.to_string()))?;
-        line.push('\n');
-        append_line(&self.events_path(run_id), line.as_bytes())
-            .map_err(|e| ShadowError::Io(e.to_string()))?;
-
-        // Fire the event hook after the durable append, while still under the
-        // per-run write lock. The bounded HookEventDispatcher normally makes this a
-        // cheap enqueue; when saturated it deliberately applies backpressure
-        // instead of dropping lifecycle events. This is the single point
-        // the HookEventDispatcher observes every RuntimeEventKind transition
-        // (plan revision commit, task status change, subagent assigned/
-        // released, run status change) and translates it into framework
-        // HookEvents. Run while `event` is still owned so the borrow is short.
-        if let Some(hook) = self.event_hook.get() {
-            hook(&event);
-        }
-        Ok(event)
-    }
-
-    /// Get-or-create the per-run write lock Arc. The map itself is guarded by
-    /// a short-lived Mutex so callers never see a torn HashMap. Entries are
-    /// never removed on Drop (no remove-on-drop race); they live as long as
-    /// the FileTaskShadow, which is fine because the keyspace is run_ids and
-    /// the map is bounded by total runs ever written.
-    fn run_write_lock(&self, run_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
-        // Mutex::lock only fails on poison; recover the inner guard rather than
-        // panicking and losing the local serialization authority.
-        let mut map = self
-            .run_write_locks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        map.entry(run_id.to_string())
-            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
-            .clone()
-    }
-
-    fn lock_run_file(&self, run_id: &str) -> Result<std::fs::File, ShadowError> {
-        use sha2::Digest;
-
-        let root = self.root();
-        let lock_root = root
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
-            .join(".task-runtime-locks");
-        std::fs::create_dir_all(&lock_root).map_err(|error| ShadowError::Io(error.to_string()))?;
-        let mut identity = root.to_string_lossy().as_bytes().to_vec();
-        identity.push(0);
-        identity.extend_from_slice(run_id.as_bytes());
-        let digest = sha2::Sha256::digest(&identity);
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(lock_root.join(hex::encode(digest)))
-            .map_err(|error| ShadowError::Io(error.to_string()))?;
-        lock.lock_exclusive()
-            .map_err(|error| ShadowError::Io(error.to_string()))?;
-        Ok(lock)
-    }
-
-    fn validate_event_stream_for_append(&self, run_id: &str) -> Result<(), ShadowError> {
-        match self.load_checkpoint_suffix(run_id) {
-            Some(Ok(_)) => Ok(()),
-            Some(Err(_)) | None => {
-                let events = self.read_events(run_id)?;
-                validate_event_suffix(run_id, 0, &events)
+    ) -> Result<Arc<RuntimeTaskEvent>, ShadowError> {
+        let authority = self
+            .authority(run_id, true)?
+            .ok_or_else(|| ShadowError::Io("TaskRuntime authority unavailable".to_string()))?;
+        let event = RuntimeJournalEvent::for_append(run_id, task_id, step_id, event_type, payload);
+        let hook = self.event_hook.get().cloned();
+        let persisted = match authority.append_with_observer(event, |persisted| {
+            if let Some(hook) = hook.as_ref() {
+                hook(persisted);
             }
-        }
+        }) {
+            Ok((event, _receipt)) => event,
+            Err(error) => {
+                self.clear_cached_authority(run_id, &authority);
+                return Err(error);
+            }
+        };
+        Ok(persisted)
     }
 
-    /// Refresh the projections affected by the latest event.
-    ///
-    /// The method keeps its historical name while callers migrate, but
-    /// `plan.json` now contains only the plan specification and
-    /// `run-state.json` contains mutable execution state. Events that affect
-    /// neither projection (tool traces, reviews, artifacts) perform no rewrite.
-    ///
-    /// If the event stream has no `RunCreated` yet (e.g. an orphan review
-    /// written before the run was created — SQL tolerated this), there is no
-    /// plan to snapshot, so this is a no-op rather than an error. The events
-    /// themselves are still durably appended to `events.jsonl`.
     pub fn rewrite_plan(&self, run_id: &str) -> Result<(), ShadowError> {
-        self.refresh_projections(run_id, false).map(|_| ())
+        if self.root().is_file() {
+            return Ok(());
+        }
+        if let Some(authority) = self.authority(run_id, false)? {
+            authority.refresh_projections(false)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -425,208 +579,54 @@ impl FileTaskShadow {
         &self,
         run_id: &str,
     ) -> Result<ProjectionRefreshStats, ShadowError> {
-        self.refresh_projections(run_id, false)
+        self.authority(run_id, false)?
+            .map(|authority| authority.refresh_projections(false))
+            .transpose()
+            .map(Option::unwrap_or_default)
     }
 
-    /// Ensure snapshots include the complete durable event tail.
-    ///
-    /// A valid checkpoint with no suffix proves that snapshots written before
-    /// it reached the same event seq, so the common read path performs no
-    /// projection writes. A missing/invalid checkpoint or non-empty suffix is
-    /// repaired from `events.jsonl` before the caller reads a snapshot.
     pub(crate) fn ensure_projections_current(&self, run_id: &str) -> Result<(), ShadowError> {
-        self.refresh_projections(run_id, true).map(|_| ())
+        // A generation owner may temporarily make the root unavailable while
+        // retaining a terminal-settlement debt. Preserve the previous read
+        // contract: absence is reported by the projection read, while the
+        // cached authority remains available for a later explicit retry.
+        if self.root().is_file() {
+            return Ok(());
+        }
+        if let Some(authority) = self.authority(run_id, false)? {
+            authority.refresh_projections(true)?;
+        }
+        Ok(())
     }
 
-    fn refresh_projections(
-        &self,
-        run_id: &str,
-        skip_write_when_checkpoint_is_current: bool,
-    ) -> Result<ProjectionRefreshStats, ShadowError> {
-        // `append_event_line` releases its guard before returning, so this is
-        // not a re-entrant lock acquisition. Wait for any same-run append or
-        // rewrite to finish; proceeding after `try_lock` returns WouldBlock
-        // would rebuild and rename plan.json without serialization.
-        let lock = self.run_write_lock(run_id);
-        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
-        let _file_guard = self.lock_run_file(run_id)?;
-
-        let (mut state, events, used_checkpoint) = match self.load_checkpoint_suffix(run_id) {
-            Some(Ok((checkpoint, suffix))) => (checkpoint.state, suffix, true),
-            Some(Err(error)) => {
-                tracing::warn!(run_id, %error, "discarding invalid TaskRuntime checkpoint");
-                (EventFoldState::default(), self.read_events(run_id)?, false)
-            }
-            None => (EventFoldState::default(), self.read_events(run_id)?, false),
-        };
-        if events.is_empty() && !used_checkpoint {
-            return Ok(ProjectionRefreshStats {
-                used_checkpoint,
-                folded_events: 0,
-                seq: state.last_seq(),
-            });
-        }
-        if skip_write_when_checkpoint_is_current && used_checkpoint && events.is_empty() {
-            return Ok(ProjectionRefreshStats {
-                used_checkpoint,
-                folded_events: 0,
-                seq: state.last_seq(),
-            });
-        }
-        if !used_checkpoint {
-            validate_event_suffix(run_id, 0, &events)?;
-        }
-        let affects_plan = events.iter().any(event_affects_plan)
-            || (events.is_empty()
-                && state
-                    .rebuilt_plan()
-                    .is_ok_and(|plan| plan.plan.revision > 0));
-        let affects_run_state = events.iter().any(event_affects_run_state)
-            || (events.is_empty() && state.run_id().is_some());
-        state.apply_events(&events);
-        let rebuilt = match state.rebuilt_plan() {
-            Ok(r) => r,
-            Err(super::event_rebuild::RebuildError::NoRunCreated) => {
-                // No RunCreated in the stream. On the live file path every
-                // write that reaches here has either just appended RunCreated
-                // (create_run) or operates on an existing run — so hitting this
-                // branch means an orphan write (e.g. add_review before
-                // create_run, which SQL tolerated) or a corrupted/partial
-                // events.jsonl. Events are still authoritative on disk; we skip
-                // the plan.json snapshot but log so this stays diagnosable
-                // rather than a silent no-op.
-                tracing::warn!(
-                    run_id = %run_id,
-                    event_count = events.len(),
-                    "rewrite_plan: no RunCreated in event stream, skipping plan.json snapshot \
-                     (orphan write or corrupted events.jsonl)"
-                );
-                return Ok(ProjectionRefreshStats {
-                    used_checkpoint,
-                    folded_events: events.len(),
-                    seq: state.last_seq(),
+    pub fn list_run_ids(&self) -> Result<Vec<String>, ShadowError> {
+        self.with_root_read(|root| {
+            let entries = match std::fs::read_dir(root) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(error) => return Err(ShadowError::Io(error.to_string())),
+            };
+            let mut ids = Vec::new();
+            for entry in entries {
+                let entry = entry.map_err(|error| ShadowError::Io(error.to_string()))?;
+                let path = entry.path();
+                let hidden = entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with(".preparing-") || name.starts_with(".deleting-")
                 });
+                if hidden || !path.is_dir() {
+                    continue;
+                }
+                if !path.join("events.jsonl").is_file() {
+                    continue;
+                }
+                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                    ids.push(name.to_string());
+                }
             }
-        };
-        std::fs::create_dir_all(self.run_dir(run_id))
-            .map_err(|error| projection_degraded(state.last_seq(), error))?;
-        if affects_plan {
-            let plan_json = serde_json::to_string_pretty(&rebuilt.plan_revision())
-                .map_err(|error| projection_degraded(state.last_seq(), error))?;
-            atomic_write(&self.plan_path(run_id), plan_json.as_bytes())
-                .map_err(|error| projection_degraded(state.last_seq(), error))?;
-        }
-        if affects_run_state {
-            let state_json = serde_json::to_string_pretty(&rebuilt.run_state())
-                .map_err(|error| projection_degraded(state.last_seq(), error))?;
-            atomic_write(&self.run_state_path(run_id), state_json.as_bytes())
-                .map_err(|error| projection_degraded(state.last_seq(), error))?;
-        }
-        let event_byte_offset = std::fs::metadata(self.events_path(run_id))
-            .map_err(|error| projection_degraded(state.last_seq(), error))?
-            .len();
-        let checkpoint_seq = state.last_seq();
-        let checkpoint = RuntimeCheckpoint::new(run_id, event_byte_offset, state)
-            .map_err(|error| projection_degraded(checkpoint_seq, error))?;
-        let checkpoint_json = serde_json::to_vec(&checkpoint)
-            .map_err(|error| projection_degraded(checkpoint.seq, error))?;
-        atomic_write(&self.checkpoint_path(run_id), &checkpoint_json)
-            .map_err(|error| projection_degraded(checkpoint.seq, error))?;
-        Ok(ProjectionRefreshStats {
-            used_checkpoint,
-            folded_events: events.len(),
-            seq: checkpoint.seq,
+            Ok(ids)
         })
     }
 
-    fn load_checkpoint_suffix(
-        &self,
-        run_id: &str,
-    ) -> Option<Result<(RuntimeCheckpoint, Vec<RuntimeTaskEvent>), ShadowError>> {
-        let path = self.checkpoint_path(run_id);
-        if !path.exists() {
-            return None;
-        }
-        Some((|| {
-            let bytes = std::fs::read(&path).map_err(|error| {
-                ShadowError::Rebuild(format!("checkpoint read failed: {error}"))
-            })?;
-            let checkpoint =
-                serde_json::from_slice::<RuntimeCheckpoint>(&bytes).map_err(|error| {
-                    ShadowError::Rebuild(format!("checkpoint decode failed: {error}"))
-                })?;
-            checkpoint.validate(run_id).map_err(|error| {
-                ShadowError::Rebuild(format!("checkpoint validation failed: {error}"))
-            })?;
-            let suffix = self.read_events_from_offset(run_id, checkpoint.event_byte_offset)?;
-            validate_event_suffix(run_id, checkpoint.seq, &suffix)?;
-            Ok((checkpoint, suffix))
-        })())
-    }
-
-    /// Compute the next seq for `run_id`: durable last assigned + 1 (1-based).
-    /// The caller must hold the run's advisory file lock.
-    fn next_seq(&self, run_id: &str) -> Result<i64, ShadowError> {
-        // Event lines may be large, so the bounded backwards scan continues by
-        // block until it finds the preceding newline without assuming a maximum
-        // line size.
-        let last = read_last_event(&self.events_path(run_id))?;
-        match last {
-            Some(event) if event.run_id != run_id => Err(ShadowError::Rebuild(format!(
-                "last event belongs to run {}, expected {run_id}",
-                event.run_id
-            ))),
-            Some(event) => event
-                .seq
-                .checked_add(1)
-                .ok_or_else(|| ShadowError::Rebuild("event seq overflow".to_string())),
-            None => Ok(1),
-        }
-    }
-
-    /// Enumerate every run_id known to the file store: the directory names
-    /// under `root` that contain an `events.jsonl` (or `plan.json`). Used by
-    /// the collection-query read API (`list_runs` / `list_runs_in` / etc.) that
-    /// replaces SQL `SELECT ... FROM tr_runs WHERE ...`.
-    pub fn list_run_ids(&self) -> Result<Vec<String>, ShadowError> {
-        let mut ids = Vec::new();
-        let root = self.root();
-        let read_dir = match std::fs::read_dir(&root) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(ShadowError::Io(e.to_string())),
-        };
-        for entry in read_dir {
-            let entry = entry.map_err(|e| ShadowError::Io(e.to_string()))?;
-            let path = entry.path();
-            if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(".preparing-"))
-            {
-                continue;
-            }
-            if !path.is_dir() {
-                continue;
-            }
-            // A run dir is one that has events.jsonl or plan.json.
-            let has_events = path.join("events.jsonl").exists();
-            let has_plan = path.join("plan.json").exists();
-            let has_run_state = path.join("run-state.json").exists();
-            if !has_events && !has_plan && !has_run_state {
-                continue;
-            }
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                ids.push(name.to_string());
-            }
-        }
-        Ok(ids)
-    }
-
-    /// Hide a settled set of TaskRuns before removing their files. The durable
-    /// conversation deletion transaction owns cross-store retries; this method
-    /// keeps ordinary rename failures from exposing only part of this store's
-    /// participant set.
     pub(crate) fn remove_runs(&self, run_ids: &[String]) -> Result<(), ShadowError> {
         let mut run_ids = run_ids.to_vec();
         run_ids.sort();
@@ -645,388 +645,135 @@ impl FileTaskShadow {
             }
         }
 
-        let locks = run_ids
-            .iter()
-            .map(|run_id| self.run_write_lock(run_id))
-            .collect::<Vec<_>>();
-        let guards = locks
-            .iter()
-            .map(|lock| lock.lock().unwrap_or_else(|error| error.into_inner()))
-            .collect::<Vec<_>>();
-        let root = self.root();
-        std::fs::create_dir_all(&root).map_err(|error| ShadowError::Io(error.to_string()))?;
-        let tombstone = root.join(format!(".deleting-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir(&tombstone).map_err(|error| ShadowError::Io(error.to_string()))?;
-
-        let mut moved = Vec::<(PathBuf, PathBuf)>::new();
-        for run_id in &run_ids {
-            let source = self.run_dir(run_id);
-            if !source.exists() {
-                continue;
-            }
-            let target = tombstone.join(run_id);
-            if let Err(error) = std::fs::rename(&source, &target) {
-                let mut rollback_errors = Vec::new();
-                for (original, staged) in moved.iter().rev() {
-                    if let Err(rollback_error) = std::fs::rename(staged, original) {
-                        rollback_errors.push(rollback_error.to_string());
-                    }
+        self.with_root_write(|root| {
+            echo_agent::utils::fs::create_dir_all_durable(root)
+                .map_err(|error| ShadowError::Io(error.to_string()))?;
+            let mut invalidations = Vec::new();
+            for run_id in &run_ids {
+                let event_path = root.join(run_id).join("events.jsonl");
+                if event_path.exists() {
+                    invalidations.push(RunAuthority::begin_invalidate(&event_path)?);
                 }
-                if let Err(cleanup_error) = std::fs::remove_dir(&tombstone) {
-                    rollback_errors.push(cleanup_error.to_string());
-                }
-                return Err(ShadowError::Io(format!(
-                    "failed to stage run {run_id} for deletion: {error}; rollback errors: {}",
-                    rollback_errors.join("; ")
-                )));
             }
-            moved.push((source, target));
-        }
-        drop(guards);
-
-        for run_id in &run_ids {
-            self.run_write_locks
+            #[cfg(test)]
+            if let Some(pause) = self
+                .deletion_pause
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .remove(run_id);
-        }
-        if let Err(error) = std::fs::remove_dir_all(&tombstone) {
-            tracing::warn!(path = %tombstone.display(), %error, "TaskRun deletion tombstone remains for startup cleanup");
-        }
-        Ok(())
+                .take()
+            {
+                pause.0.wait();
+                pause.1.wait();
+            }
+            let tombstone = root.join(format!(".deleting-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&tombstone).map_err(|error| ShadowError::Io(error.to_string()))?;
+            if let Err(error) = self.sync_root(root) {
+                let _cleanup = std::fs::remove_dir(&tombstone);
+                return Err(ShadowError::Io(error.to_string()));
+            }
+            let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+            for run_id in &run_ids {
+                let source = root.join(run_id);
+                if !source.exists() {
+                    continue;
+                }
+                let target = tombstone.join(run_id);
+                if let Err(error) = std::fs::rename(&source, &target) {
+                    let mut rollback_errors = Vec::new();
+                    for (original, staged) in moved.iter().rev() {
+                        if let Err(rollback) = std::fs::rename(staged, original) {
+                            rollback_errors.push(rollback.to_string());
+                        }
+                    }
+                    if let Err(cleanup) = std::fs::remove_dir(&tombstone) {
+                        rollback_errors.push(cleanup.to_string());
+                    }
+                    return Err(ShadowError::Io(format!(
+                        "failed to stage run {run_id} for deletion: {error}; rollback errors: {}",
+                        rollback_errors.join("; ")
+                    )));
+                }
+                moved.push((source, target));
+            }
+            if !moved.is_empty() {
+                sync_directory(&tombstone).map_err(|error| {
+                    ShadowError::CommittedDeletionDegraded {
+                        tombstone: tombstone.display().to_string(),
+                        detail: error.to_string(),
+                    }
+                })?;
+                self.sync_root(root)
+                    .map_err(|error| ShadowError::CommittedDeletionDegraded {
+                        tombstone: tombstone.display().to_string(),
+                        detail: error.to_string(),
+                    })?;
+            }
+            {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                for run_id in &run_ids {
+                    state.authorities.remove(run_id);
+                }
+            }
+            std::fs::remove_dir_all(&tombstone).map_err(|error| {
+                ShadowError::CommittedDeletionDegraded {
+                    tombstone: tombstone.display().to_string(),
+                    detail: error.to_string(),
+                }
+            })?;
+            self.sync_root(root)
+                .map_err(|error| ShadowError::CommittedDeletionDegraded {
+                    tombstone: tombstone.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            drop(invalidations);
+            Ok(())
+        })
     }
 
-    /// Read the shadow plan.json for parity comparison. Returns None if not yet written.
     pub fn read_plan(&self, run_id: &str) -> Result<Option<PlanRevision>, ShadowError> {
-        let path = self.plan_path(run_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| ShadowError::Io(e.to_string()))?;
-        let plan: PlanRevision =
-            serde_json::from_str(&text).map_err(|e| ShadowError::Decode(e.to_string()))?;
-        Ok(Some(plan))
+        self.authority(run_id, false)?
+            .map(|authority| authority.read_plan_projection())
+            .transpose()
+            .map(Option::flatten)
     }
 
     pub fn read_run_state(&self, run_id: &str) -> Result<Option<RunStateSnapshot>, ShadowError> {
-        let path = self.run_state_path(run_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| ShadowError::Io(e.to_string()))?;
-        let state: RunStateSnapshot =
-            serde_json::from_str(&text).map_err(|e| ShadowError::Decode(e.to_string()))?;
-        Ok(Some(state))
+        self.authority(run_id, false)?
+            .map(|authority| authority.read_run_state_projection())
+            .transpose()
+            .map(Option::flatten)
     }
 
-    /// Read the shadow events.jsonl for parity comparison.
     pub fn read_events(&self, run_id: &str) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
-        let path = self.events_path(run_id);
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| ShadowError::Io(e.to_string()))?;
-        decode_event_text(&text)
+        self.read_events_after(run_id, 0)
     }
 
-    fn read_events_from_offset(
+    pub(crate) fn read_events_after(
         &self,
         run_id: &str,
-        offset: u64,
+        after_sequence: u64,
     ) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
-        use std::io::{Read, Seek, SeekFrom};
+        self.authority(run_id, false)?
+            .map(|authority| authority.replay_after(after_sequence))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
 
-        let path = self.events_path(run_id);
-        let mut file = std::fs::File::open(&path).map_err(|error| {
-            ShadowError::Rebuild(format!("checkpoint event read failed: {error}"))
-        })?;
-        let file_len = file
-            .metadata()
-            .map_err(|error| ShadowError::Rebuild(error.to_string()))?
-            .len();
-        if offset > file_len {
-            return Err(ShadowError::Rebuild(format!(
-                "checkpoint offset {offset} exceeds event length {file_len}"
-            )));
-        }
-        if offset > 0 {
-            file.seek(SeekFrom::Start(offset.saturating_sub(1)))
-                .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
-            let mut boundary = [0_u8; 1];
-            file.read_exact(&mut boundary)
-                .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
-            if boundary.first().copied() != Some(b'\n') {
-                return Err(ShadowError::Rebuild(
-                    "checkpoint offset is not an event boundary".to_string(),
-                ));
-            }
-        }
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
-        let mut text = String::new();
-        file.read_to_string(&mut text)
-            .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
-        decode_event_text(&text)
+    pub(crate) fn diagnostic_full_replay(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunStateSnapshot>, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.diagnostic_full_replay())
+            .transpose()
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ProjectionRefreshStats {
     pub(crate) used_checkpoint: bool,
     pub(crate) folded_events: usize,
     pub(crate) seq: i64,
-}
-
-fn event_affects_plan(event: &RuntimeTaskEvent) -> bool {
-    matches!(
-        event.event_type,
-        RuntimeEventKind::PlanRevisionCommitted | RuntimeEventKind::RequirementEvidenceRevalidated
-    )
-}
-
-fn event_affects_run_state(event: &RuntimeTaskEvent) -> bool {
-    let note_kind = event
-        .payload
-        .get("kind")
-        .and_then(serde_json::Value::as_str);
-    matches!(
-        event.event_type,
-        RuntimeEventKind::RunCreated
-            | RuntimeEventKind::RunGoalUpdated
-            | RuntimeEventKind::RequirementEvidenceInvalidated
-            | RuntimeEventKind::RequirementEvidenceRevalidated
-            | RuntimeEventKind::RequirementSkipped
-            | RuntimeEventKind::RunStatusChanged
-            | RuntimeEventKind::RunAttachmentsUpdated
-            | RuntimeEventKind::RunCancelled
-            | RuntimeEventKind::PlanRevisionCommitted
-            | RuntimeEventKind::TaskStarted
-            | RuntimeEventKind::TaskCompleted
-            | RuntimeEventKind::TaskFailed
-            | RuntimeEventKind::TaskCancelled
-            | RuntimeEventKind::TaskTimedOut
-            | RuntimeEventKind::TaskSkipped
-            | RuntimeEventKind::TaskBlocked
-            | RuntimeEventKind::TodoUpdated
-            | RuntimeEventKind::SubagentAssigned
-            | RuntimeEventKind::SubagentReleased
-            | RuntimeEventKind::ToolStarted
-            | RuntimeEventKind::ToolCompleted
-            | RuntimeEventKind::ToolFailed
-            | RuntimeEventKind::RecoveryBlocked
-            | RuntimeEventKind::RecoveryResolved
-            | RuntimeEventKind::BackgroundCellStarted
-            | RuntimeEventKind::BackgroundCellFinished
-            | RuntimeEventKind::RunContinuationConfigured
-            | RuntimeEventKind::RunTurnStarted
-            | RuntimeEventKind::RunTurnUsageAccounted
-            | RuntimeEventKind::RunTurnCompacted
-            | RuntimeEventKind::RunTurnFinished
-            | RuntimeEventKind::RunProviderRetryScheduled
-            | RuntimeEventKind::RunContinuationDeferred
-            | RuntimeEventKind::RunContinuationResumed
-            | RuntimeEventKind::RunPauseReasonChanged
-    ) || (event.event_type == RuntimeEventKind::Note
-        && matches!(note_kind, Some("summary_persisted")))
-}
-
-fn validate_event_suffix(
-    run_id: &str,
-    checkpoint_seq: i64,
-    events: &[RuntimeTaskEvent],
-) -> Result<(), ShadowError> {
-    let mut expected = checkpoint_seq
-        .checked_add(1)
-        .ok_or_else(|| ShadowError::Rebuild("checkpoint seq overflow".to_string()))?;
-    for event in events {
-        if event.run_id != run_id {
-            return Err(ShadowError::Rebuild(format!(
-                "event {} belongs to run {}, expected {run_id}",
-                event.seq, event.run_id
-            )));
-        }
-        if event.seq != expected {
-            return Err(ShadowError::Rebuild(format!(
-                "event suffix is not contiguous: expected {expected}, got {}",
-                event.seq
-            )));
-        }
-        expected = expected
-            .checked_add(1)
-            .ok_or_else(|| ShadowError::Rebuild("event seq overflow".to_string()))?;
-    }
-    Ok(())
-}
-
-fn decode_event_text(text: &str) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
-    let mut events = Vec::new();
-    let has_terminal_newline = text.ends_with('\n');
-    let lines = text.split('\n').collect::<Vec<_>>();
-    let line_count = lines.len();
-    for (index, line) in lines.into_iter().enumerate() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let event = match serde_json::from_str(line) {
-            Ok(event) => event,
-            Err(_) if !has_terminal_newline && index.saturating_add(1) == line_count => break,
-            Err(error) => {
-                return Err(ShadowError::Decode(format!(
-                    "line {}: {}",
-                    index.saturating_add(1),
-                    error
-                )));
-            }
-        };
-        events.push(event);
-    }
-    Ok(events)
-}
-
-fn projection_degraded(seq: i64, error: impl std::fmt::Display) -> ShadowError {
-    ShadowError::CommittedProjectionDegraded {
-        seq,
-        detail: error.to_string(),
-    }
-}
-
-fn read_last_event(path: &Path) -> Result<Option<RuntimeTaskEvent>, ShadowError> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(ShadowError::Io(error.to_string())),
-    };
-    let file_len = file
-        .metadata()
-        .map_err(|error| ShadowError::Io(error.to_string()))?
-        .len();
-    if file_len == 0 {
-        return Ok(None);
-    }
-    file.seek(SeekFrom::Start(file_len.saturating_sub(1)))
-        .map_err(|error| ShadowError::Io(error.to_string()))?;
-    let mut final_byte = [0_u8; 1];
-    file.read_exact(&mut final_byte)
-        .map_err(|error| ShadowError::Io(error.to_string()))?;
-    let line_end = if final_byte.first().copied() == Some(b'\n') {
-        file_len.saturating_sub(1)
-    } else {
-        file_len
-    };
-    if line_end == 0 {
-        return Ok(None);
-    }
-    let (_, line) = read_line_ending_at(&mut file, line_end)?;
-    serde_json::from_slice(&line)
-        .map(Some)
-        .map_err(|error| ShadowError::Decode(format!("last event: {error}")))
-}
-
-fn read_line_ending_at(
-    file: &mut std::fs::File,
-    line_end: u64,
-) -> Result<(u64, Vec<u8>), ShadowError> {
-    use std::io::{Read, Seek, SeekFrom};
-
-    const BLOCK_BYTES: u64 = 8 * 1024;
-    let mut search_end = line_end;
-    let line_start = loop {
-        let block_start = search_end.saturating_sub(BLOCK_BYTES);
-        let block_len = search_end.saturating_sub(block_start);
-        let block_len =
-            usize::try_from(block_len).map_err(|error| ShadowError::Read(error.to_string()))?;
-        let mut block = vec![0_u8; block_len];
-        file.seek(SeekFrom::Start(block_start))
-            .map_err(|error| ShadowError::Io(error.to_string()))?;
-        file.read_exact(&mut block)
-            .map_err(|error| ShadowError::Io(error.to_string()))?;
-        if let Some(position) = block.iter().rposition(|byte| *byte == b'\n') {
-            let position =
-                u64::try_from(position).map_err(|error| ShadowError::Read(error.to_string()))?;
-            break block_start.saturating_add(position).saturating_add(1);
-        }
-        if block_start == 0 {
-            break 0;
-        }
-        search_end = block_start;
-    };
-    let line_len = line_end.saturating_sub(line_start);
-    let line_len =
-        usize::try_from(line_len).map_err(|error| ShadowError::Read(error.to_string()))?;
-    let mut line = vec![0_u8; line_len];
-    file.seek(SeekFrom::Start(line_start))
-        .map_err(|error| ShadowError::Io(error.to_string()))?;
-    file.read_exact(&mut line)
-        .map_err(|error| ShadowError::Io(error.to_string()))?;
-    Ok((line_start, line))
-}
-
-fn repair_torn_tail(path: &Path) -> Result<(), ShadowError> {
-    use std::io::{Read, Seek, SeekFrom, Write};
-
-    let mut file = match std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(ShadowError::Io(error.to_string())),
-    };
-    let file_len = file
-        .metadata()
-        .map_err(|error| ShadowError::Io(error.to_string()))?
-        .len();
-    if file_len == 0 {
-        return Ok(());
-    }
-    file.seek(SeekFrom::Start(file_len.saturating_sub(1)))
-        .map_err(|error| ShadowError::Io(error.to_string()))?;
-    let mut final_byte = [0_u8; 1];
-    file.read_exact(&mut final_byte)
-        .map_err(|error| ShadowError::Io(error.to_string()))?;
-    if final_byte.first().copied() == Some(b'\n') {
-        return Ok(());
-    }
-    let (tail_start, tail) = read_line_ending_at(&mut file, file_len)?;
-    if serde_json::from_slice::<RuntimeTaskEvent>(&tail).is_ok() {
-        file.seek(SeekFrom::End(0))
-            .map_err(|error| ShadowError::Io(error.to_string()))?;
-        file.write_all(b"\n")
-            .map_err(|error| ShadowError::Io(error.to_string()))?;
-    } else {
-        file.set_len(tail_start)
-            .map_err(|error| ShadowError::Io(error.to_string()))?;
-    }
-    file.sync_all()
-        .map_err(|error| ShadowError::Io(error.to_string()))?;
-    sync_parent(path).map_err(|error| ShadowError::Io(error.to_string()))
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ShadowError {
-    #[error("shadow read failed: {0}")]
-    Read(String),
-    #[error("shadow io: {0}")]
-    Io(String),
-    #[error("shadow encode: {0}")]
-    Encode(String),
-    #[error("shadow decode: {0}")]
-    Decode(String),
-    #[error("shadow rebuild: {0}")]
-    Rebuild(String),
-    #[error("event seq {seq} committed but projection refresh degraded: {detail}")]
-    CommittedProjectionDegraded { seq: i64, detail: String },
-}
-
-fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()
 }
 
 #[cfg(unix)]
@@ -1039,83 +786,54 @@ fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Write `bytes` to `path` atomically: write to a unique tmp file, fsync,
-/// rename over `path`.
-///
-/// The tmp file name must be **unique per call** (not a fixed `.tmp` suffix):
-/// `TaskRuntimeStore` does not serialize `rewrite_plan` across concurrent
-/// tasks, so two concurrent `atomic_write`s on the same `plan.json` would race
-/// on a shared `plan.json.tmp` — one rename would move the other's tmp away,
-/// making the second `rename` fail with "No such file or directory". A unique
-/// tmp name (pid + counter + nanos) eliminates the collision.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let uniq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    let tmp = path.with_extension(format!("tmp.{}.{}.{}", std::process::id(), ts, uniq));
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(error);
-    }
-    sync_parent(path)
-}
-
-/// Append `bytes` (one JSONL line, including trailing newline) to `path`.
-/// Creates the file if it does not exist. Uses `O_APPEND` so concurrent
-/// appends (if any) do not interleave within a single write(2) call.
-fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    sync_parent(path)
-}
-
-fn sync_parent(path: &Path) -> std::io::Result<()> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    std::fs::File::open(parent)?.sync_all()
+#[derive(Debug, thiserror::Error)]
+pub enum ShadowError {
+    #[error("shadow I/O: {0}")]
+    Io(String),
+    #[error("shadow encode: {0}")]
+    Encode(String),
+    #[error("shadow decode: {0}")]
+    Decode(String),
+    #[error("shadow rebuild: {0}")]
+    Rebuild(String),
+    #[error("event {seq} committed but projection refresh degraded: {detail}")]
+    CommittedProjectionDegraded { seq: i64, detail: String },
+    #[error("TaskRun {run_id} is visible but root publication durability degraded: {detail}")]
+    CommittedPublicationDegraded { run_id: String, detail: String },
+    #[error("TaskRun deletion is staged at {tombstone} but durability degraded: {detail}")]
+    CommittedDeletionDegraded { tombstone: String, detail: String },
+    #[error("TaskRuntime root generation is transitioning")]
+    RootTransition,
+    #[error("TaskRuntime authority is closed: {0}")]
+    AuthorityClosed(String),
+    #[error("next journal sequence {next_sequence} exceeds the EKO i64 cursor domain")]
+    SequenceCapacityExceeded { next_sequence: u64 },
+    #[error("journal sequence {sequence} exceeds the EKO i64 cursor domain")]
+    SequenceOutOfRange { sequence: u64 },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tasks::task_runtime::event_rebuild::rebuild_plan_from_events;
-    use crate::tasks::task_runtime::file_store::FileTaskStore;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
         AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, PlanTaskKind,
-        RuntimeEventKind, TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation,
-        TaskUpdateRequest, TodoStatus,
+        TaskPatch, TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest, TodoStatus,
     };
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn task(id: &str, kind: PlanTaskKind) -> PlanTask {
+    fn task(id: &str) -> PlanTask {
         PlanTask {
             id: id.to_string(),
             title: format!("task {id}"),
             description: format!("do {id}"),
-            kind,
-            agent_role: "code_reviewer".to_string(),
-            domain_profile: DomainProfile::AiCoding,
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".to_string(),
+            domain_profile: DomainProfile::General,
             depends_on: Vec::new(),
             parallel_group: None,
             execution_target: None,
-            files: vec!["src/a.rs".to_string()],
+            files: Vec::new(),
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: Vec::new(),
             execution_checks: Vec::new(),
@@ -1130,108 +848,48 @@ mod tests {
         }
     }
 
-    fn append_run_created(shadow: &FileTaskShadow, run_id: &str) -> Result<(), String> {
-        shadow
-            .append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({
-                    "goal": "checkpoint goal",
-                    "goal_revision": 1,
-                    "goal_sha256": crate::tasks::task_runtime::task_goal_sha256("checkpoint goal"),
-                    "domain_profile": "general",
-                    "workspace_id": "ws",
-                    "conversation_id": "conversation",
-                    "root_message_id": "message",
-                    "route": "complex_runtime",
-                    "attended_mode": "unattended",
-                    "created_at": "2026-08-17T00:00:00Z",
-                }),
-            )
-            .map(|_| ())
-            .map_err(|error| error.to_string())
+    fn run_created(
+        shadow: &FileTaskShadow,
+        run_id: &str,
+    ) -> Result<Arc<RuntimeTaskEvent>, ShadowError> {
+        shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunCreated,
+            serde_json::json!({
+                "goal": "journal authority",
+                "goal_revision": 1,
+                "goal_sha256": crate::tasks::task_runtime::task_goal_sha256("journal authority"),
+                "domain_profile": "general",
+                "workspace_id": "workspace",
+                "conversation_id": "conversation",
+                "root_message_id": "root",
+                "route": "complex",
+                "attended_mode": "attended",
+                "created_at": echo_agent::utils::time::to_local(chrono::Utc::now()).to_rfc3339(),
+            }),
+        )
     }
 
     #[test]
-    fn checkpoint_warm_suffix_matches_full_rebuild() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
-        append_run_created(&shadow, "checkpoint-run")?;
-
-        let cold = shadow
-            .rewrite_plan_with_stats("checkpoint-run")
-            .map_err(|error| error.to_string())?;
-        assert!(!cold.used_checkpoint);
-        assert_eq!(cold.folded_events, 1);
-        assert_eq!(cold.seq, 1);
-
-        shadow
-            .append_event_line(
-                "checkpoint-run",
-                None,
-                None,
-                RuntimeEventKind::RunContinuationConfigured,
-                serde_json::json!({
-                    "enabled": true,
-                    "token_budget": 500,
-                    "time_budget_seconds": 60,
-                }),
-            )
-            .map_err(|error| error.to_string())?;
-        let warm = shadow
-            .rewrite_plan_with_stats("checkpoint-run")
-            .map_err(|error| error.to_string())?;
-        assert!(warm.used_checkpoint);
-        assert_eq!(warm.folded_events, 1);
-        assert_eq!(warm.seq, 2);
-        let warm_state = shadow
-            .read_run_state("checkpoint-run")
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "warm run-state projection missing".to_string())?;
-
-        std::fs::remove_file(shadow.checkpoint_path("checkpoint-run"))
-            .map_err(|error| error.to_string())?;
-        let cold_again = shadow
-            .rewrite_plan_with_stats("checkpoint-run")
-            .map_err(|error| error.to_string())?;
-        assert!(!cold_again.used_checkpoint);
-        assert_eq!(cold_again.folded_events, 2);
-        let rebuilt_state = shadow
-            .read_run_state("checkpoint-run")
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "rebuilt run-state projection missing".to_string())?;
-        assert_eq!(
-            serde_json::to_value(warm_state).map_err(|error| error.to_string())?,
-            serde_json::to_value(rebuilt_state).map_err(|error| error.to_string())?
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn checkpoint_retains_usage_and_compaction_deduplication() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
-        append_run_created(&shadow, "dedupe-run")?;
+    fn checkpoint_warm_suffix_preserves_usage_and_compaction_deduplication() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "dedupe").map_err(|error| error.to_string())?;
         for (kind, payload) in [
             (
                 RuntimeEventKind::RunTurnStarted,
                 serde_json::json!({
-                    "turn_id": "turn-1",
-                    "ordinal": 0,
-                    "origin": "continuation",
-                    "transcript_visibility": "internal",
+                    "turn_id": "turn-1", "ordinal": 0, "origin": "continuation",
+                    "transcript_visibility": "internal"
                 }),
             ),
             (
                 RuntimeEventKind::RunTurnUsageAccounted,
                 serde_json::json!({
-                    "event_id": "usage-1",
-                    "turn_id": "turn-1",
-                    "input_tokens": 2,
-                    "output_tokens": 3,
-                    "elapsed_seconds": 0,
+                    "event_id": "usage-1", "turn_id": "turn-1",
+                    "input_tokens": 2, "output_tokens": 3, "elapsed_seconds": 0
                 }),
             ),
             (
@@ -1240,22 +898,20 @@ mod tests {
             ),
         ] {
             shadow
-                .append_event_line("dedupe-run", None, None, kind, payload)
+                .append_event_line("dedupe", None, None, kind, payload)
                 .map_err(|error| error.to_string())?;
         }
-        shadow
-            .rewrite_plan("dedupe-run")
+        let cold = shadow
+            .rewrite_plan_with_stats("dedupe")
             .map_err(|error| error.to_string())?;
-
+        assert!(!cold.used_checkpoint);
+        assert_eq!(cold.folded_events, 4);
         for (kind, payload) in [
             (
                 RuntimeEventKind::RunTurnUsageAccounted,
                 serde_json::json!({
-                    "event_id": "usage-1",
-                    "turn_id": "turn-1",
-                    "input_tokens": 2,
-                    "output_tokens": 3,
-                    "elapsed_seconds": 0,
+                    "event_id": "usage-1", "turn_id": "turn-1",
+                    "input_tokens": 2, "output_tokens": 3, "elapsed_seconds": 0
                 }),
             ),
             (
@@ -1264,16 +920,16 @@ mod tests {
             ),
         ] {
             shadow
-                .append_event_line("dedupe-run", None, None, kind, payload)
+                .append_event_line("dedupe", None, None, kind, payload)
                 .map_err(|error| error.to_string())?;
         }
         let warm = shadow
-            .rewrite_plan_with_stats("dedupe-run")
+            .rewrite_plan_with_stats("dedupe")
             .map_err(|error| error.to_string())?;
         assert!(warm.used_checkpoint);
         assert_eq!(warm.folded_events, 2);
         let continuation = shadow
-            .read_run_state("dedupe-run")
+            .read_run_state("dedupe")
             .map_err(|error| error.to_string())?
             .and_then(|state| state.continuation)
             .ok_or_else(|| "continuation projection missing".to_string())?;
@@ -1283,92 +939,15 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_checkpoint_is_discarded_and_rebuilt_from_events() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
-        append_run_created(&shadow, "corrupt-checkpoint")?;
-        shadow
-            .rewrite_plan("corrupt-checkpoint")
-            .map_err(|error| error.to_string())?;
-        std::fs::write(
-            shadow.checkpoint_path("corrupt-checkpoint"),
-            b"{\"schema_version\":1,\"state_hash\":",
-        )
-        .map_err(|error| error.to_string())?;
-        shadow
-            .append_event_line(
-                "corrupt-checkpoint",
-                None,
-                None,
-                RuntimeEventKind::RunStatusChanged,
-                serde_json::json!({"from": "pending", "to": "running"}),
-            )
-            .map_err(|error| error.to_string())?;
-
-        let rebuilt = shadow
-            .rewrite_plan_with_stats("corrupt-checkpoint")
-            .map_err(|error| error.to_string())?;
-        assert!(!rebuilt.used_checkpoint);
-        assert_eq!(rebuilt.folded_events, 2);
-        let run = shadow
-            .read_run_state("corrupt-checkpoint")
-            .map_err(|error| error.to_string())?
-            .map(|state| state.run)
-            .ok_or_else(|| "rebuilt run missing".to_string())?;
-        assert_eq!(run.status, TaskRunStatus::Running);
-        let bytes = std::fs::read(shadow.checkpoint_path("corrupt-checkpoint"))
-            .map_err(|error| error.to_string())?;
-        let checkpoint = serde_json::from_slice::<RuntimeCheckpoint>(&bytes)
-            .map_err(|error| error.to_string())?;
-        checkpoint
-            .validate("corrupt-checkpoint")
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    #[test]
-    fn checkpoint_schema_hash_and_offset_mismatches_fall_back() -> Result<(), String> {
-        for case in ["schema", "hash", "offset"] {
-            let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-            let shadow = FileTaskShadow::new(tmp.path());
-            let run_id = format!("invalid-{case}");
-            append_run_created(&shadow, &run_id)?;
+    fn corrupt_ahead_and_behind_checkpoints_recover_from_journal() -> Result<(), String> {
+        for case in ["corrupt", "tampered", "ahead", "behind"] {
+            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let run_id = format!("checkpoint-{case}");
+            let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            run_created(&shadow, &run_id).map_err(|error| error.to_string())?;
             shadow
                 .rewrite_plan(&run_id)
                 .map_err(|error| error.to_string())?;
-            let path = shadow.checkpoint_path(&run_id);
-            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-            let mut value = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .map_err(|error| error.to_string())?;
-            match case {
-                "schema" => {
-                    let field = value
-                        .get_mut("schema_version")
-                        .ok_or_else(|| "schema field missing".to_string())?;
-                    *field = serde_json::json!(999);
-                }
-                "hash" => {
-                    let field = value
-                        .get_mut("state_hash")
-                        .ok_or_else(|| "state_hash field missing".to_string())?;
-                    *field = serde_json::json!("invalid");
-                }
-                "offset" => {
-                    let field = value
-                        .get_mut("event_byte_offset")
-                        .ok_or_else(|| "offset field missing".to_string())?;
-                    let offset = field
-                        .as_u64()
-                        .ok_or_else(|| "offset was not a u64".to_string())?;
-                    *field = serde_json::json!(offset.saturating_add(1));
-                }
-                _ => return Err(format!("unsupported checkpoint case: {case}")),
-            }
-            std::fs::write(
-                &path,
-                serde_json::to_vec_pretty(&value).map_err(|error| error.to_string())?,
-            )
-            .map_err(|error| error.to_string())?;
             shadow
                 .append_event_line(
                     &run_id,
@@ -1378,68 +957,99 @@ mod tests {
                     serde_json::json!({"from": "pending", "to": "running"}),
                 )
                 .map_err(|error| error.to_string())?;
-            let rebuilt = shadow
+            if case != "behind" {
+                shadow
+                    .rewrite_plan(&run_id)
+                    .map_err(|error| error.to_string())?;
+            }
+            let checkpoint_path = temp.path().join(&run_id).join("checkpoint.json");
+            drop(shadow);
+            match case {
+                "corrupt" => std::fs::write(&checkpoint_path, b"{corrupt")
+                    .map_err(|error| error.to_string())?,
+                "tampered" => {
+                    let mut value: serde_json::Value = serde_json::from_slice(
+                        &std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    value["state"]["run"] = serde_json::Value::Null;
+                    std::fs::write(
+                        &checkpoint_path,
+                        serde_json::to_vec(&value).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?;
+                }
+                "ahead" => {
+                    use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+                    let store = FileCheckpointStore::<serde_json::Value>::open(&checkpoint_path);
+                    let frame = store
+                        .load()
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| "checkpoint missing".to_string())?;
+                    store
+                        .save(&frame.state, 999)
+                        .map_err(|error| error.to_string())?;
+                }
+                "behind" => {}
+                _ => return Err("unknown checkpoint case".to_string()),
+            }
+            let reopened = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            let stats = reopened
                 .rewrite_plan_with_stats(&run_id)
                 .map_err(|error| error.to_string())?;
-            assert!(!rebuilt.used_checkpoint, "case {case}");
-            assert_eq!(rebuilt.folded_events, 2, "case {case}");
-            let repaired = std::fs::read(&path).map_err(|error| error.to_string())?;
-            serde_json::from_slice::<RuntimeCheckpoint>(&repaired)
-                .map_err(|error| error.to_string())?
-                .validate(&run_id)
-                .map_err(|error| error.to_string())?;
+            assert_eq!(stats.folded_events, if case == "behind" { 1 } else { 2 });
+            assert_eq!(stats.used_checkpoint, case == "behind");
+            assert_eq!(
+                reopened
+                    .read_run_state(&run_id)
+                    .map_err(|error| error.to_string())?
+                    .map(|state| state.run.status),
+                Some(TaskRunStatus::Running)
+            );
         }
         Ok(())
     }
 
     #[test]
-    fn durable_event_reports_typed_projection_degradation() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
-        append_run_created(&shadow, "degraded-run")?;
+    fn committed_projection_failure_self_heals_without_duplicate_replay() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "degraded").map_err(|error| error.to_string())?;
         shadow
-            .rewrite_plan("degraded-run")
+            .rewrite_plan("degraded")
             .map_err(|error| error.to_string())?;
-        std::fs::remove_file(shadow.checkpoint_path("degraded-run"))
-            .map_err(|error| error.to_string())?;
-        std::fs::create_dir(shadow.checkpoint_path("degraded-run"))
-            .map_err(|error| error.to_string())?;
+        let checkpoint = temp.path().join("degraded/checkpoint.json");
+        std::fs::remove_file(&checkpoint).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&checkpoint).map_err(|error| error.to_string())?;
         let committed = shadow
             .append_event_line(
-                "degraded-run",
+                "degraded",
                 None,
                 None,
                 RuntimeEventKind::RunStatusChanged,
                 serde_json::json!({"from": "pending", "to": "running"}),
             )
             .map_err(|error| error.to_string())?;
-        let error = match shadow.rewrite_plan("degraded-run") {
-            Ok(()) => {
-                return Err("checkpoint directory unexpectedly accepted replacement".to_string());
-            }
-            Err(error) => error,
-        };
         assert!(matches!(
-            error,
-            ShadowError::CommittedProjectionDegraded { seq, .. } if seq == committed.seq
+            shadow.rewrite_plan("degraded"),
+            Err(ShadowError::CommittedProjectionDegraded { seq, .. }) if seq == committed.seq
         ));
         assert_eq!(
             shadow
-                .read_events("degraded-run")
+                .read_events("degraded")
                 .map_err(|error| error.to_string())?
-                .last()
-                .map(|event| event.seq),
-            Some(committed.seq)
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunStatusChanged)
+                .count(),
+            1
         );
-
-        std::fs::remove_dir(shadow.checkpoint_path("degraded-run"))
-            .map_err(|error| error.to_string())?;
+        std::fs::remove_dir(&checkpoint).map_err(|error| error.to_string())?;
         shadow
-            .rewrite_plan("degraded-run")
+            .rewrite_plan("degraded")
             .map_err(|error| error.to_string())?;
         assert_eq!(
             shadow
-                .read_run_state("degraded-run")
+                .read_run_state("degraded")
                 .map_err(|error| error.to_string())?
                 .map(|state| state.run.status),
             Some(TaskRunStatus::Running)
@@ -1448,703 +1058,1204 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "M5 performance fixture; run explicitly with --ignored --nocapture"]
-    fn benchmark_checkpoint_1k_turns_10k_events_100_compactions() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
-        let run_id = "benchmark-run";
-        std::fs::create_dir_all(shadow.run_dir(run_id)).map_err(|error| error.to_string())?;
-        let mut events = Vec::with_capacity(10_000);
-        {
-            let mut push = |event_type: RuntimeEventKind, payload: serde_json::Value| {
-                let next = i64::try_from(events.len())
-                    .unwrap_or(i64::MAX)
-                    .saturating_add(1);
-                events.push(RuntimeTaskEvent {
-                    seq: next,
-                    run_id: run_id.to_string(),
-                    task_id: None,
-                    step_id: None,
-                    event_type,
-                    payload,
-                    timestamp: chrono::Utc::now(),
-                });
-            };
-            push(
-                RuntimeEventKind::RunCreated,
+    fn incremental_sequence_rewinds_plan_from_the_reducer_projection() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let first = run_created(&shadow, "plan").map_err(|error| error.to_string())?;
+        let second = shadow
+            .append_event_line(
+                "plan",
+                None,
+                None,
+                RuntimeEventKind::PlanRevisionCommitted,
                 serde_json::json!({
-                    "goal": "benchmark checkpoint",
-                    "goal_revision": 1,
-                    "goal_sha256": crate::tasks::task_runtime::task_goal_sha256("benchmark checkpoint"),
-                    "domain_profile": "general",
-                    "workspace_id": "ws",
-                    "conversation_id": "benchmark",
-                    "root_message_id": "message",
-                    "route": "complex_runtime",
-                    "attended_mode": "unattended",
+                    "reason": "initial",
+                    "base_revision": 0,
+                    "skipped_task_ids": [],
+                    "plan": PlanRevision {
+                        plan_id: "plan-1".to_string(),
+                        run_id: "plan".to_string(),
+                        revision: 1,
+                        domain_profile: DomainProfile::General,
+                        goal_revision: 1,
+                        goal_sha256: crate::tasks::task_runtime::task_goal_sha256("journal authority"),
+                        assumptions: Vec::new(),
+                        risks: Vec::new(),
+                        execution_mode: ExecutionMode::Parallel,
+                        tasks: vec![task("task-1").spec()],
+                    }
                 }),
-            );
-            push(
-                RuntimeEventKind::RunContinuationConfigured,
-                serde_json::json!({"enabled": true}),
-            );
-            for ordinal in 0_u64..1_000 {
-                let turn_id = format!("turn-{ordinal}");
-                push(
-                    RuntimeEventKind::RunTurnStarted,
-                    serde_json::json!({
-                        "turn_id": turn_id.clone(),
-                        "ordinal": ordinal,
-                        "origin": "continuation",
-                        "transcript_visibility": "internal",
-                    }),
-                );
-                push(
-                    RuntimeEventKind::RunTurnUsageAccounted,
-                    serde_json::json!({
-                        "event_id": format!("usage-{ordinal}"),
-                        "turn_id": turn_id.clone(),
-                        "input_tokens": 1,
-                        "output_tokens": 1,
-                        "elapsed_seconds": 0,
-                    }),
-                );
-                if ordinal < 100 {
-                    push(
-                        RuntimeEventKind::RunTurnCompacted,
-                        serde_json::json!({
-                            "event_id": format!("compact-{ordinal}"),
-                            "turn_id": turn_id.clone(),
-                        }),
-                    );
-                }
-                push(
-                    RuntimeEventKind::RunTurnFinished,
-                    serde_json::json!({
-                        "turn_id": turn_id,
-                        "status": "ended",
-                        "elapsed_seconds": 0,
-                        "made_progress": true,
-                    }),
-                );
-            }
-        }
-        while events.len() < 10_000 {
-            let next = i64::try_from(events.len())
-                .unwrap_or(i64::MAX)
-                .saturating_add(1);
-            events.push(RuntimeTaskEvent {
-                seq: next,
-                run_id: run_id.to_string(),
-                task_id: None,
-                step_id: None,
-                event_type: RuntimeEventKind::Note,
-                payload: serde_json::json!({
-                    "kind": "benchmark_runtime_diagnostic",
-                    "detail": "representative persisted tool and runtime diagnostic payload used to avoid benchmarking an unrealistically empty event tail; the content is fixed so consecutive samples exercise identical JSON decoding and event-fold work",
-                }),
-                timestamp: chrono::Utc::now(),
-            });
-        }
-        let mut jsonl = Vec::new();
-        for event in &events {
-            serde_json::to_writer(&mut jsonl, event).map_err(|error| error.to_string())?;
-            jsonl.push(b'\n');
-        }
-        std::fs::write(shadow.events_path(run_id), &jsonl).map_err(|error| error.to_string())?;
-
+            )
+            .map_err(|error| error.to_string())?;
+        let third = shadow
+            .append_event_line(
+                "plan",
+                Some("task-1"),
+                None,
+                RuntimeEventKind::TaskStarted,
+                serde_json::json!({"status": "running", "owner_agent": "explorer"}),
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!([first.seq, second.seq, third.seq], [1, 2, 3]);
         shadow
-            .rewrite_plan_with_stats(run_id)
+            .rewrite_plan("plan")
             .map_err(|error| error.to_string())?;
-        let full_started = std::time::Instant::now();
-        let full_events = shadow
-            .read_events(run_id)
-            .map_err(|error| error.to_string())?;
-        let full_rebuilt =
-            rebuild_plan_from_events(&full_events).map_err(|error| error.to_string())?;
-        let full_elapsed = full_started.elapsed();
-        assert_eq!(full_events.len(), 10_000);
-        assert_eq!(full_rebuilt.run.run_id, run_id);
-        let state = shadow
-            .read_run_state(run_id)
+        let plan = shadow
+            .read_plan("plan")
             .map_err(|error| error.to_string())?
-            .ok_or_else(|| "benchmark run-state missing".to_string())?;
-        let continuation = state
-            .continuation
-            .ok_or_else(|| "benchmark continuation missing".to_string())?;
-        assert_eq!(continuation.compaction_count, 100);
-        assert_eq!(continuation.next_turn_ordinal, 1_000);
+            .ok_or_else(|| "plan projection missing".to_string())?;
+        let state = shadow
+            .read_run_state("plan")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run-state projection missing".to_string())?;
+        assert_eq!(plan.plan_id, "plan-1");
+        assert_eq!(
+            state.tasks.first().map(|task| task.status.clone()),
+            Some(echo_agent::tasks::TaskStatus::Running)
+        );
+        Ok(())
+    }
 
-        let warm_rebuild_started = std::time::Instant::now();
-        let checkpoint_result = shadow
-            .load_checkpoint_suffix(run_id)
-            .ok_or_else(|| "benchmark checkpoint missing".to_string())?
+    #[test]
+    fn lifecycle_reorder_skip_status_and_multiple_runs_keep_projection_parity() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path())
             .map_err(|error| error.to_string())?;
-        let (checkpoint, suffix) = checkpoint_result;
-        assert!(suffix.is_empty());
-        let mut checkpoint_state = checkpoint.state;
-        checkpoint_state.apply_events(&suffix);
-        let warm_rebuilt = checkpoint_state
-            .rebuilt_plan()
+        let reader = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        for run_id in ["first", "second"] {
+            let goal = format!("goal {run_id}");
+            store
+                .create_run(
+                    run_id,
+                    "workspace",
+                    run_id,
+                    "message",
+                    DomainProfile::General,
+                    &goal,
+                    "complex",
+                    AttendedMode::Attended,
+                )
+                .map_err(|error| error.to_string())?;
+            store
+                .attach_plan_for_test(&TaskPlan {
+                    plan_id: format!("plan-{run_id}"),
+                    run_id: run_id.to_string(),
+                    revision: 1,
+                    domain_profile: DomainProfile::General,
+                    goal_revision: 1,
+                    goal_sha256: crate::tasks::task_runtime::task_goal_sha256(&goal),
+                    assumptions: Vec::new(),
+                    risks: Vec::new(),
+                    execution_mode: ExecutionMode::Parallel,
+                    tasks: vec![task(&format!("{run_id}-a")), task(&format!("{run_id}-b"))],
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        store
+            .apply_task_patch_for_test(
+                "first",
+                &TaskUpdateRequest {
+                    base_revision: 1,
+                    reason: "reorder then skip".to_string(),
+                    operations: vec![
+                        TaskUpdateOperation::Reorder {
+                            task_ids: vec!["first-b".to_string(), "first-a".to_string()],
+                        },
+                        TaskUpdateOperation::Update {
+                            task_id: "first-a".to_string(),
+                            patch: TaskPatch {
+                                title: Some("renamed first task".to_string()),
+                                ..Default::default()
+                            },
+                        },
+                    ],
+                },
+            )
             .map_err(|error| error.to_string())?;
-        let warm_rebuild_elapsed = warm_rebuild_started.elapsed();
-        assert_eq!(warm_rebuilt.run.run_id, run_id);
+        store
+            .apply_task_patch_for_test(
+                "first",
+                &TaskUpdateRequest {
+                    base_revision: 2,
+                    reason: "no longer required".to_string(),
+                    operations: vec![TaskUpdateOperation::Skip {
+                        task_id: "first-b".to_string(),
+                    }],
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .set_task_status(
+                "first",
+                "first-a",
+                TodoStatus::Running,
+                Some("explorer"),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("first", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("first", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
 
-        let append_fold_started = std::time::Instant::now();
+        for run_id in ["first", "second"] {
+            let public_events = store
+                .list_events(run_id, 0)
+                .map_err(|error| error.to_string())?;
+            let authority_events = reader
+                .read_events(run_id)
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                serde_json::to_value(public_events).map_err(|error| error.to_string())?,
+                serde_json::to_value(authority_events).map_err(|error| error.to_string())?
+            );
+        }
+        let plan = reader
+            .read_plan("first")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "first plan missing".to_string())?;
+        assert_eq!(
+            plan.tasks.first().map(|task| task.id.as_str()),
+            Some("first-b")
+        );
+        assert_eq!(
+            plan.tasks.get(1).map(|task| task.title.as_str()),
+            Some("renamed first task")
+        );
+        let state = reader
+            .read_run_state("first")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "first state missing".to_string())?;
+        assert_eq!(state.run.status, TaskRunStatus::Paused);
+        assert_eq!(
+            state
+                .tasks
+                .iter()
+                .find(|task| task.task_id == "first-b")
+                .map(|task| task.status.clone()),
+            Some(echo_agent::tasks::TaskStatus::Skipped)
+        );
+        assert!(
+            reader
+                .read_plan("second")
+                .map_err(|error| error.to_string())?
+                .is_some_and(|plan| plan.tasks.iter().all(|task| task.id.starts_with("second-")))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn same_run_projection_waits_for_authority_append_boundary() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "locked").map_err(|error| error.to_string())?;
+        let authority = shadow
+            .authority("locked", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "authority missing".to_string())?;
+        let guard = authority.lock_operation_for_test();
+        let writer = shadow.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = writer
+                .rewrite_plan("locked")
+                .map_err(|error| error.to_string());
+            let _delivered = sender.send(result);
+        });
+        assert!(matches!(
+            receiver.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(guard);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| error.to_string())??;
+        handle
+            .join()
+            .map_err(|_| "projection thread panicked".to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "TaskRuntime journal performance characterization; run explicitly"]
+    fn benchmark_1k_turns_10k_events_100_compactions() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let run_id = "benchmark";
+        run_created(&shadow, run_id).map_err(|error| error.to_string())?;
         shadow
             .append_event_line(
                 run_id,
                 None,
                 None,
-                RuntimeEventKind::RunContinuationDeferred,
-                serde_json::json!({"reason": "benchmark"}),
+                RuntimeEventKind::RunContinuationConfigured,
+                serde_json::json!({"enabled": true}),
             )
             .map_err(|error| error.to_string())?;
-        let warm = shadow
-            .rewrite_plan_with_stats(run_id)
-            .map_err(|error| error.to_string())?;
-        let append_fold_elapsed = append_fold_started.elapsed();
-        assert!(warm.used_checkpoint);
-        assert_eq!(warm.folded_events, 1);
-
-        let snapshot_started = std::time::Instant::now();
-        let run = FileTaskStore::new(shadow.clone())
-            .get_run(run_id)
-            .map_err(|error| error.to_string())?;
-        let snapshot_elapsed = snapshot_started.elapsed();
-        assert!(run.is_some());
-        let checkpoint_bytes = std::fs::metadata(shadow.checkpoint_path(run_id))
-            .map_err(|error| error.to_string())?
-            .len();
-        let event_bytes = std::fs::metadata(shadow.events_path(run_id))
-            .map_err(|error| error.to_string())?
-            .len();
-        println!(
-            "{}",
-            serde_json::json!({
-                "events": 10_001,
-                "run_turns": 1_000,
-                "compactions": 100,
-                "full_rebuild_ms": full_elapsed.as_secs_f64() * 1_000.0,
-                "warm_rebuild_ms": warm_rebuild_elapsed.as_secs_f64() * 1_000.0,
-                "warm_append_fold_ms": append_fold_elapsed.as_secs_f64() * 1_000.0,
-                "snapshot_read_ms": snapshot_elapsed.as_secs_f64() * 1_000.0,
-                "checkpoint_bytes": checkpoint_bytes,
-                "event_bytes": event_bytes,
-                "warm_folded_events": warm.folded_events,
-            })
-        );
-        assert!(checkpoint_bytes < event_bytes);
-        assert!(full_elapsed < std::time::Duration::from_millis(150));
-        assert!(warm_rebuild_elapsed < std::time::Duration::from_millis(10));
-        assert!(append_fold_elapsed < std::time::Duration::from_millis(50));
-        assert!(snapshot_elapsed < std::time::Duration::from_millis(2));
-        assert!(
-            full_elapsed.as_nanos() > warm_rebuild_elapsed.as_nanos().saturating_mul(5),
-            "warm checkpoint rebuild must be at least five times faster"
-        );
-        assert!(checkpoint_bytes <= 128 * 1024);
-        assert!(checkpoint_bytes.saturating_mul(10) < event_bytes);
-        Ok(())
-    }
-
-    /// Parity: after attaching a shadow and driving a full lifecycle, the file
-    /// mirror (events.jsonl + plan.json) must agree with the SQL store on events
-    /// and on the rebuilt plan. This is the 0a acceptance gate for the shadow.
-    #[test]
-    fn shadow_parity_after_full_lifecycle() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).expect("store");
-
-        // Drive a lifecycle.
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::AiCoding,
-                "review runtime",
-                "complex_runtime",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        let plan = TaskPlan {
-            plan_id: "p1".to_string(),
-            run_id: "r1".to_string(),
-            revision: 1,
-            domain_profile: DomainProfile::AiCoding,
-            goal_revision: 1,
-            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("review runtime"),
-            assumptions: vec!["small repo".to_string()],
-            risks: vec!["flaky tests".to_string()],
-            execution_mode: ExecutionMode::Parallel,
-            tasks: vec![
-                task("t1", PlanTaskKind::ReadOnlyReview),
-                task("t2", PlanTaskKind::Investigation),
-            ],
-        };
-        store.attach_plan_for_test(&plan).unwrap();
-        store
-            .apply_task_patch_for_test(
-                "r1",
-                &TaskUpdateRequest {
-                    base_revision: 1,
-                    reason: "rename task".to_string(),
-                    operations: vec![TaskUpdateOperation::Update {
-                        task_id: "t1".to_string(),
-                        patch: TaskPatch {
-                            title: Some("renamed t1".to_string()),
-                            ..Default::default()
-                        },
-                    }],
-                },
-            )
-            .unwrap();
-        store
-            .set_task_status("r1", "t1", TodoStatus::Running, Some("explorer"), None)
-            .unwrap();
-
-        // Parity 1: event count matches.
-        let sql_events = store.list_events("r1", 0).unwrap();
-        let file_events = shadow.read_events("r1").unwrap();
-        assert_eq!(
-            sql_events.len(),
-            file_events.len(),
-            "event count parity: sql={} file={}",
-            sql_events.len(),
-            file_events.len()
-        );
-        // Parity 2: event seqs + kinds match (payloads are enriched identically).
-        for (s, f) in sql_events.iter().zip(file_events.iter()) {
-            assert_eq!(s.seq, f.seq, "seq parity");
-            assert_eq!(s.event_type, f.event_type, "kind parity at seq {}", s.seq);
+        for ordinal in 0_u64..1_000 {
+            let turn_id = format!("turn-{ordinal}");
+            for (kind, payload) in [
+                (
+                    RuntimeEventKind::RunTurnStarted,
+                    serde_json::json!({
+                        "turn_id": turn_id, "ordinal": ordinal, "origin": "continuation",
+                        "transcript_visibility": "internal"
+                    }),
+                ),
+                (
+                    RuntimeEventKind::RunTurnUsageAccounted,
+                    serde_json::json!({
+                        "event_id": format!("usage-{ordinal}"), "turn_id": turn_id,
+                        "input_tokens": 1, "output_tokens": 1, "elapsed_seconds": 0
+                    }),
+                ),
+                (
+                    RuntimeEventKind::RunTurnFinished,
+                    serde_json::json!({
+                        "turn_id": turn_id, "status": "ended", "elapsed_seconds": 0,
+                        "made_progress": true
+                    }),
+                ),
+            ] {
+                shadow
+                    .append_event_line(run_id, None, None, kind, payload)
+                    .map_err(|error| error.to_string())?;
+            }
+            if ordinal < 100 {
+                shadow
+                    .append_event_line(
+                        run_id,
+                        None,
+                        None,
+                        RuntimeEventKind::RunTurnCompacted,
+                        serde_json::json!({
+                            "event_id": format!("compact-{ordinal}"), "turn_id": turn_id
+                        }),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
         }
-
-        // Parity 3: file plan.json matches SQL-rebuilt plan (via the shadow's own rebuild).
-        let file_plan = shadow.read_plan("r1").unwrap().expect("plan.json written");
-        let file_state = shadow
-            .read_run_state("r1")
-            .unwrap()
-            .expect("run-state.json written");
-        let rebuilt = rebuild_plan_from_events(&sql_events).unwrap();
-        assert_eq!(file_state.run.run_id, rebuilt.run.run_id);
-        assert_eq!(file_state.run.goal, rebuilt.run.goal);
-        assert_eq!(file_state.run.route, rebuilt.run.route);
-        assert_eq!(file_plan.plan_id, rebuilt.plan.plan_id);
-        assert_eq!(file_plan.execution_mode, rebuilt.plan.execution_mode);
-        assert_eq!(file_plan.tasks.len(), rebuilt.tasks.len());
-        let ft1 = file_plan.tasks.iter().find(|t| t.id == "t1").unwrap();
-        let rt1 = rebuilt.tasks.iter().find(|t| t.id == "t1").unwrap();
-        assert_eq!(ft1.title, rt1.title);
-        assert_eq!(ft1.title, "renamed t1");
-        let state_t1 = file_state
-            .tasks
-            .iter()
-            .find(|task| task.task_id == "t1")
-            .unwrap();
-        assert_eq!(state_t1.status, rt1.execution().status);
-    }
-
-    /// Helper: assert file shadow plan matches SQL-rebuilt plan on the fields the
-    /// rebuilder tracks (run header, plan envelope, task count + per-task identity).
-    fn assert_parity(store: &TaskRuntimeStore, shadow: &FileTaskShadow, run_id: &str) {
-        let sql_events = store.list_events(run_id, 0).unwrap();
-        let file_events = shadow.read_events(run_id).unwrap();
-        assert_eq!(
-            sql_events.len(),
-            file_events.len(),
-            "[{run_id}] event count parity: sql={} file={}",
-            sql_events.len(),
-            file_events.len()
-        );
-        for (s, f) in sql_events.iter().zip(file_events.iter()) {
-            assert_eq!(s.seq, f.seq, "[{run_id}] seq parity");
-            assert_eq!(
-                s.event_type, f.event_type,
-                "[{run_id}] kind parity at seq {}",
-                s.seq
-            );
-        }
-        let file_plan = shadow.read_plan(run_id).unwrap();
-        let file_state = shadow.read_run_state(run_id).unwrap();
-        let rebuilt = rebuild_plan_from_events(&sql_events).unwrap();
-        let file_state = file_state.expect("run-state.json written");
-        assert_eq!(
-            file_state.run.run_id, rebuilt.run.run_id,
-            "[{run_id}] run_id"
-        );
-        assert_eq!(file_state.run.goal, rebuilt.run.goal, "[{run_id}] goal");
-        assert_eq!(file_state.run.route, rebuilt.run.route, "[{run_id}] route");
-        assert_eq!(
-            file_state.run.status, rebuilt.run.status,
-            "[{run_id}] run status"
-        );
-        if rebuilt.plan.revision == 0 {
-            assert!(file_plan.is_none(), "[{run_id}] no plan revision committed");
-            return;
-        }
-        let file_plan = file_plan.expect("plan.json written");
-        assert_eq!(
-            file_plan.plan_id, rebuilt.plan.plan_id,
-            "[{run_id}] plan_id"
-        );
-        assert_eq!(
-            file_plan.tasks.len(),
-            rebuilt.tasks.len(),
-            "[{run_id}] task count"
-        );
-        for (ft, rt) in file_plan.tasks.iter().zip(rebuilt.tasks.iter()) {
-            assert_eq!(ft.id, rt.id, "[{run_id}] task id");
-            assert_eq!(ft.title, rt.title, "[{run_id}] task {} title", ft.id);
-            assert_eq!(ft.kind, rt.kind, "[{run_id}] task {} kind", ft.id);
-            let execution = file_state
-                .tasks
-                .iter()
-                .find(|task| task.task_id == ft.id)
-                .expect("task execution written");
-            assert_eq!(
-                execution.status,
-                rt.execution().status,
-                "[{run_id}] task {} status",
-                ft.id
-            );
-            assert_eq!(
-                ft.sort_order, rt.sort_order,
-                "[{run_id}] task {} sort_order",
-                ft.id
-            );
-        }
-    }
-
-    /// Parity across reorder + remove: ordering changes and deletions must be
-    /// reflected identically in the file shadow and the SQL rebuild.
-    #[test]
-    fn shadow_parity_reorder_and_remove() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
-
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::General,
-                "g",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        let plan = TaskPlan {
-            plan_id: "p1".to_string(),
-            run_id: "r1".to_string(),
-            revision: 1,
-            domain_profile: DomainProfile::General,
-            goal_revision: 1,
-            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("g"),
-            assumptions: Vec::new(),
-            risks: Vec::new(),
-            execution_mode: ExecutionMode::Parallel,
-            tasks: vec![
-                task("t1", PlanTaskKind::Investigation),
-                task("t2", PlanTaskKind::Investigation),
-                task("t3", PlanTaskKind::Investigation),
-            ],
-        };
-        store.attach_plan_for_test(&plan).unwrap();
-        // Reorder: move t3 to front.
-        store
-            .apply_task_patch_for_test(
-                "r1",
-                &TaskUpdateRequest {
-                    base_revision: 1,
-                    reason: "prioritize t3".to_string(),
-                    operations: vec![TaskUpdateOperation::Reorder {
-                        task_ids: vec!["t3".to_string(), "t1".to_string(), "t2".to_string()],
-                    }],
-                },
-            )
-            .unwrap();
-        assert_parity(&store, &shadow, "r1");
-        store
-            .apply_task_patch_for_test(
-                "r1",
-                &TaskUpdateRequest {
-                    base_revision: 2,
-                    reason: "t2 is no longer required".to_string(),
-                    operations: vec![TaskUpdateOperation::Skip {
-                        task_id: "t2".to_string(),
-                    }],
-                },
-            )
-            .unwrap();
-        assert_parity(&store, &shadow, "r1");
-        let file_plan = shadow.read_plan("r1").unwrap().unwrap();
-        assert_eq!(file_plan.tasks.len(), 3, "soft delete keeps the task");
-        let _t2 = file_plan
-            .tasks
-            .iter()
-            .find(|t| t.id == "t2")
-            .expect("t2 still present after soft delete");
-        let state = shadow.read_run_state("r1").unwrap().unwrap();
-        let t2 = state
-            .tasks
-            .iter()
-            .find(|task| task.task_id == "t2")
-            .unwrap();
-        assert_eq!(t2.status, echo_agent::tasks::TaskStatus::Skipped);
-    }
-
-    /// Parity across multiple runs: events and plans must not cross-contaminate.
-    #[test]
-    fn shadow_parity_multiple_runs_isolated() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
-
-        for rid in ["r1", "r2"] {
-            store
-                .create_run(
-                    rid,
-                    "ws",
-                    rid,
-                    "m",
-                    DomainProfile::AiCoding,
-                    &format!("goal {rid}"),
-                    "complex",
-                    AttendedMode::Attended,
+        let mut count = 3_102_usize;
+        while count < 10_000 {
+            shadow
+                .append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"kind": "benchmark", "ordinal": count}),
                 )
-                .unwrap();
-            let plan = TaskPlan {
-                plan_id: format!("p_{rid}"),
-                run_id: rid.to_string(),
-                revision: 1,
-                domain_profile: DomainProfile::AiCoding,
-                goal_revision: 1,
-                goal_sha256: crate::tasks::task_runtime::task_goal_sha256(&format!("goal {rid}")),
-                assumptions: Vec::new(),
-                risks: Vec::new(),
-                execution_mode: ExecutionMode::Parallel,
-                tasks: vec![task(&format!("{rid}_t1"), PlanTaskKind::Summary)],
-            };
-            store.attach_plan_for_test(&plan).unwrap();
+                .map_err(|error| error.to_string())?;
+            count = count.saturating_add(1);
         }
-        assert_parity(&store, &shadow, "r1");
-        assert_parity(&store, &shadow, "r2");
-        // r1's file plan must not contain r2's task.
-        let p1 = shadow.read_plan("r1").unwrap().unwrap();
-        assert!(p1.tasks.iter().all(|t| t.id == "r1_t1"));
-    }
-
-    /// Parity across run status transitions (Pending → Running → Paused → Completed).
-    #[test]
-    fn shadow_parity_run_status_transitions() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
-
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::General,
-                "g",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        store.transition_run("r1", TaskRunStatus::Running).unwrap();
-        assert_parity(&store, &shadow, "r1");
-        store.transition_run("r1", TaskRunStatus::Paused).unwrap();
-        assert_parity(&store, &shadow, "r1");
-        store.transition_run("r1", TaskRunStatus::Running).unwrap();
-        store
-            .transition_run("r1", TaskRunStatus::Completed)
-            .unwrap();
-        assert_parity(&store, &shadow, "r1");
-        // Final status in file plan must be Completed.
-        let state = shadow.read_run_state("r1").unwrap().unwrap();
-        assert_eq!(state.run.status, TaskRunStatus::Completed);
-    }
-
-    // ── 0bc step-2: incremental append API (file becomes write authority) ──
-
-    /// `append_event` writes one event line to events.jsonl with a seq derived
-    /// from the current line count (1-based, monotonically increasing), and
-    /// `rewrite_plan` rebuilds plan.json from the full event stream. This is
-    /// the file-authority path that replaces SQL INSERT + flush_shadow.
-    #[test]
-    fn append_event_assigns_incremental_seq_and_rewinds_plan() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shadow = FileTaskShadow::new(tmp.path());
-
-        // No RunCreated yet — append three events and check seq + plan rebuild.
-        let e1 = shadow
-            .append_event_line(
-                "r1",
-                None,
-                None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({
-                    "goal": "g", "domain_profile": "general",
-                    "workspace_id": "ws", "conversation_id": "c1",
-                    "root_message_id": "m1", "route": "", "created_at": "2026-06-25T00:00:00Z",
-                }),
-            )
-            .unwrap();
-        let e2 = shadow
-            .append_event_line(
-                "r1",
-                None,
-                None,
-                RuntimeEventKind::PlanRevisionCommitted,
-                serde_json::json!({
-                    "reason": "initial plan",
-                    "base_revision": 0,
-                    "skipped_task_ids": [],
-                    "plan": PlanRevision {
-                        plan_id: "p1".to_string(),
-                        run_id: "r1".to_string(),
-                        revision: 1,
-                        domain_profile: DomainProfile::General,
-                        goal_revision: 1,
-                        goal_sha256: crate::tasks::task_runtime::task_goal_sha256("g"),
-                        assumptions: Vec::new(),
-                        risks: Vec::new(),
-                        execution_mode: ExecutionMode::Parallel,
-                        tasks: Vec::new(),
-                    },
-                }),
-            )
-            .unwrap();
-        shadow.rewrite_plan("r1").unwrap();
-        let e3 = shadow
-            .append_event_line(
-                "r1",
-                Some("t1"),
-                None,
-                RuntimeEventKind::TaskStarted,
-                serde_json::json!({ "status": "running", "owner_agent": "explorer" }),
-            )
-            .unwrap();
-
-        // seq is 1-based, monotonically increasing per run.
-        assert_eq!(e1.seq, 1);
-        assert_eq!(e2.seq, 2);
-        assert_eq!(e3.seq, 3);
-
-        // read_events returns all three in seq order.
-        let read_back = shadow.read_events("r1").unwrap();
-        assert_eq!(read_back.len(), 3);
-        assert_eq!(read_back[0].seq, 1);
-        assert_eq!(read_back[2].event_type, RuntimeEventKind::TaskStarted);
-
-        // rewrite_plan produces a plan.json reflecting the event stream.
-        shadow.rewrite_plan("r1").unwrap();
-        let plan = shadow.read_plan("r1").unwrap().unwrap();
-        let state = shadow.read_run_state("r1").unwrap().unwrap();
-        assert_eq!(state.run.run_id, "r1");
-        assert_eq!(state.run.goal, "g");
-        assert_eq!(plan.plan_id, "p1");
-    }
-
-    #[test]
-    fn rewrite_plan_waits_for_same_run_write_lock() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
+        let started = std::time::Instant::now();
         shadow
-            .append_event_line(
-                "locked-run",
-                None,
-                None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({
-                    "goal": "g",
-                    "domain_profile": "general",
-                    "workspace_id": "ws",
-                    "conversation_id": "c1",
-                    "root_message_id": "m1",
-                    "route": "",
-                    "created_at": "2026-06-25T00:00:00Z",
-                }),
-            )
+            .rewrite_plan(run_id)
             .map_err(|error| error.to_string())?;
-
-        let run_lock = shadow.run_write_lock("locked-run");
-        let guard = run_lock.lock().unwrap_or_else(|error| error.into_inner());
-        let writer = shadow.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let result = writer
-                .rewrite_plan("locked-run")
-                .map_err(|error| error.to_string());
-            let _ = tx.send(result);
-        });
-
-        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Ok(_) => return Err("rewrite_plan proceeded without the same-run lock".to_string()),
-            Err(error) => return Err(format!("rewrite result channel failed: {error}")),
-        }
-
-        drop(guard);
-        rx.recv_timeout(std::time::Duration::from_secs(1))
-            .map_err(|error| format!("rewrite_plan did not resume after unlock: {error}"))??;
-        handle
-            .join()
-            .map_err(|_| "rewrite thread panicked".to_string())?;
+        let elapsed = started.elapsed();
+        let events = shadow
+            .read_events(run_id)
+            .map_err(|error| error.to_string())?;
+        let continuation = shadow
+            .read_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| "benchmark continuation missing".to_string())?;
+        assert_eq!(events.len(), 10_000);
+        assert_eq!(continuation.tokens_used, 2_000);
+        assert_eq!(continuation.compaction_count, 100);
+        println!("TaskRuntime 10k projection: {elapsed:?}");
         Ok(())
     }
 
     #[test]
-    fn torn_tail_is_ignored_then_repaired_before_append() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
-        shadow
-            .append_event_line(
-                "torn-run",
-                None,
-                None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({
-                    "goal": "g",
-                    "domain_profile": "general",
-                    "workspace_id": "ws",
-                    "conversation_id": "c1",
-                    "root_message_id": "m1",
-                    "route": "",
-                    "created_at": "2026-08-14T00:00:00Z",
-                }),
-            )
+    fn same_run_concurrent_appends_use_one_framework_sequence_authority() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = Arc::new(FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?);
+        run_created(&shadow, "run").map_err(|error| error.to_string())?;
+        let mut threads = Vec::new();
+        for index in 0..64 {
+            let shadow = Arc::clone(&shadow);
+            threads.push(std::thread::spawn(move || {
+                shadow.append_event_line(
+                    "run",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"index": index}),
+                )
+            }));
+        }
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| "append thread panicked".to_string())?
+                .map_err(|error| error.to_string())?;
+        }
+        let events = shadow
+            .read_events("run")
             .map_err(|error| error.to_string())?;
-        let path = shadow.events_path("torn-run");
-        append_line(&path, b"{\"seq\":2").map_err(|error| error.to_string())?;
+        assert_eq!(events.len(), 65);
+        assert_eq!(
+            events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            (1_i64..=65).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
 
+    #[test]
+    fn same_path_first_open_converges_while_different_paths_open_in_parallel() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let first =
+            FileTaskShadow::new(temp.path().join("first")).map_err(|error| error.to_string())?;
+        let alias =
+            FileTaskShadow::new(temp.path().join("first")).map_err(|error| error.to_string())?;
+        let other =
+            FileTaskShadow::new(temp.path().join("other")).map_err(|error| error.to_string())?;
+        let path = temp.path().join("first/shared/events.jsonl");
+        let pause =
+            RunAuthority::pause_next_open_for_test(&path).map_err(|error| error.to_string())?;
+        let opening = first.clone();
+        let first_handle = std::thread::spawn(move || run_created(&opening, "shared"));
+        pause.0.wait();
+        let other_open = other.clone();
+        let (other_tx, other_rx) = std::sync::mpsc::channel();
+        let other_handle = std::thread::spawn(move || {
+            let result = run_created(&other_open, "independent");
+            let _sent = other_tx.send(result);
+        });
+        assert_eq!(
+            other_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?
+                .seq,
+            1
+        );
+        let alias_open = alias.clone();
+        let (alias_tx, alias_rx) = std::sync::mpsc::channel();
+        let alias_handle = std::thread::spawn(move || {
+            let result = alias_open.append_event_line(
+                "shared",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"alias": true}),
+            );
+            let _sent = alias_tx.send(result);
+        });
+        assert!(matches!(
+            alias_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        pause.1.wait();
+        let first_sequence = first_handle
+            .join()
+            .map_err(|_| "first open panicked".to_string())?
+            .map_err(|error| error.to_string())?
+            .seq;
+        let alias_sequence = alias_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?
+            .seq;
+        let mut sequences = [first_sequence, alias_sequence];
+        sequences.sort_unstable();
+        assert_eq!(sequences, [1, 2]);
+        alias_handle
+            .join()
+            .map_err(|_| "alias open panicked".to_string())?;
+        other_handle
+            .join()
+            .map_err(|_| "other open panicked".to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_held_slots_survive_amortized_registry_prune() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("root");
+        assert!(
+            RootTransactionAuthority::held_lookup_survives_prune_for_test(&root)
+                .map_err(|error| error.to_string())?
+        );
+        let run_dir = root.join("run");
+        std::fs::create_dir_all(&run_dir).map_err(|error| error.to_string())?;
+        assert!(
+            RunAuthority::held_lookup_survives_prune_for_test(
+                &run_dir.join("events.jsonl"),
+                &run_dir.join("checkpoint.json"),
+                "run",
+            )
+            .map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn root_last_handle_closing_blocks_immediate_reopen_until_lease_release() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("closing");
+        std::fs::create_dir(&root).map_err(|error| error.to_string())?;
+        let authority = RootTransactionAuthority::open(&root).map_err(|error| error.to_string())?;
+        let pause = RootTransactionAuthority::pause_next_drop_for_test(&root)
+            .map_err(|error| error.to_string())?;
+        let drop_handle = std::thread::spawn(move || drop(authority));
+        pause.0.wait();
+        let open_root = root.clone();
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        let open_handle = std::thread::spawn(move || {
+            let result = RootTransactionAuthority::open(&open_root);
+            let _sent = open_tx.send(result);
+        });
+        assert!(matches!(
+            open_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        pause.1.wait();
+        drop_handle
+            .join()
+            .map_err(|_| "root drop panicked".to_string())?;
+        let reopened = open_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            reopened.root(),
+            std::fs::canonicalize(&root).map_err(|error| error.to_string())?
+        );
+        open_handle
+            .join()
+            .map_err(|_| "root reopen panicked".to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    fn different_runs_append_in_parallel_and_poll_uses_string_safe_sequence() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = Arc::new(FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?);
+        let mut threads = Vec::new();
+        for run_id in ["a", "b"] {
+            let shadow = Arc::clone(&shadow);
+            threads.push(std::thread::spawn(move || -> Result<(), ShadowError> {
+                run_created(&shadow, run_id)?;
+                for index in 0..16 {
+                    shadow.append_event_line(
+                        run_id,
+                        None,
+                        None,
+                        RuntimeEventKind::Note,
+                        serde_json::json!({"index": index}),
+                    )?;
+                }
+                Ok(())
+            }));
+        }
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| "append thread panicked".to_string())?
+                .map_err(|error| error.to_string())?;
+        }
+        for run_id in ["a", "b"] {
+            let tail = shadow
+                .read_events_after(run_id, 12)
+                .map_err(|error| error.to_string())?;
+            assert_eq!(tail.first().map(|event| event.seq), Some(13));
+            let encoded = serde_json::to_value(&tail).map_err(|error| error.to_string())?;
+            assert!(
+                encoded
+                    .get(0)
+                    .and_then(|event| event.get("seq"))
+                    .is_some_and(serde_json::Value::is_string)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn hooks_fire_once_after_durable_append() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let hook_calls = Arc::clone(&calls);
+        let hook_observed = Arc::clone(&observed);
+        assert!(shadow.try_attach_event_hook(Arc::new(move |event| {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            hook_observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.seq);
+        })));
+        run_created(&shadow, "run").map_err(|error| error.to_string())?;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[1]
+        );
         assert_eq!(
             shadow
-                .read_events("torn-run")
+                .read_events("run")
                 .map_err(|error| error.to_string())?
                 .len(),
             1
         );
-        let appended = shadow
+        Ok(())
+    }
+
+    #[test]
+    fn torn_tail_is_repaired_before_the_next_authoritative_append() -> Result<(), String> {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "torn").map_err(|error| error.to_string())?;
+        let event_path = shadow.events_path("torn");
+        drop(shadow);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&event_path)
+            .map_err(|error| error.to_string())?;
+        file.write_all(b"{\"sequence\":2")
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        drop(file);
+
+        let reopened = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        assert_eq!(
+            reopened
+                .read_events("torn")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        let next = reopened
             .append_event_line(
-                "torn-run",
-                Some("t1"),
+                "torn",
                 None,
-                RuntimeEventKind::TaskStarted,
-                serde_json::json!({"status": "running"}),
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"after": "repair"}),
             )
             .map_err(|error| error.to_string())?;
-        assert_eq!(appended.seq, 2);
-        assert_eq!(
+        assert_eq!(next.seq, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mid_file_corruption_and_sequence_gap_fail_closed() -> Result<(), String> {
+        for case in ["corrupt", "gap"] {
+            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            run_created(&shadow, case).map_err(|error| error.to_string())?;
             shadow
-                .read_events("torn-run")
+                .append_event_line(
+                    case,
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"case": case}),
+                )
+                .map_err(|error| error.to_string())?;
+            let path = shadow.events_path(case);
+            drop(shadow);
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            let mut lines = bytes
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(Vec::from)
+                .collect::<Vec<_>>();
+            if case == "corrupt" {
+                let first = lines
+                    .first_mut()
+                    .ok_or_else(|| "first journal line missing".to_string())?;
+                *first = b"not-json".to_vec();
+            } else {
+                let second = lines
+                    .get_mut(1)
+                    .ok_or_else(|| "second journal line missing".to_string())?;
+                let mut value: serde_json::Value =
+                    serde_json::from_slice(second).map_err(|error| error.to_string())?;
+                value["sequence"] = serde_json::json!(3_u64);
+                *second = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+            }
+            let mut damaged = Vec::new();
+            for line in lines {
+                damaged.extend_from_slice(&line);
+                damaged.push(b'\n');
+            }
+            std::fs::write(&path, damaged).map_err(|error| error.to_string())?;
+            let reopened = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            assert!(matches!(
+                reopened.read_events(case),
+                Err(ShadowError::Rebuild(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn independent_shadow_handles_share_the_canonical_run_authority() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let first = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let second = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&first, "shared").map_err(|error| error.to_string())?;
+        let handles = [first.clone(), second]
+            .into_iter()
+            .map(|shadow| {
+                std::thread::spawn(move || -> Result<Vec<i64>, ShadowError> {
+                    let mut sequences = Vec::new();
+                    for index in 0..24 {
+                        sequences.push(
+                            shadow
+                                .append_event_line(
+                                    "shared",
+                                    None,
+                                    None,
+                                    RuntimeEventKind::Note,
+                                    serde_json::json!({"index": index}),
+                                )?
+                                .seq,
+                        );
+                    }
+                    Ok(sequences)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut sequences = Vec::new();
+        for handle in handles {
+            sequences.extend(
+                handle
+                    .join()
+                    .map_err(|_| "append thread panicked".to_string())?
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        sequences.sort_unstable();
+        assert_eq!(sequences, (2_i64..=49).collect::<Vec<_>>());
+        assert_eq!(
+            first
+                .read_events("shared")
+                .map_err(|error| error.to_string())?
+                .len(),
+            49
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_hooks_follow_durable_sequence_order() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "hook-order").map_err(|error| error.to_string())?;
+        let entered = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let hook_entered = Arc::clone(&entered);
+        let hook_observed = Arc::clone(&observed);
+        assert!(shadow.try_attach_event_hook(Arc::new(move |event| {
+            hook_observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.seq);
+            if event.seq == 2 {
+                hook_entered.0.wait();
+                hook_entered.1.wait();
+            }
+        })));
+        let first = shadow.clone();
+        let first_handle = std::thread::spawn(move || {
+            first.append_event_line(
+                "hook-order",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"ordinal": 1}),
+            )
+        });
+        entered.0.wait();
+        let second = shadow.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let second_handle = std::thread::spawn(move || {
+            let result = second.append_event_line(
+                "hook-order",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"ordinal": 2}),
+            );
+            let _sent = done_tx.send(result);
+        });
+        assert!(matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        entered.1.wait();
+        first_handle
+            .join()
+            .map_err(|_| "first hook append panicked".to_string())?
+            .map_err(|error| error.to_string())?;
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        second_handle
+            .join()
+            .map_err(|_| "second hook append panicked".to_string())?;
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[2, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn delete_closes_other_shadow_then_same_id_recreates_at_sequence_one() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let deleting = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let other = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&deleting, "deleted").map_err(|error| error.to_string())?;
+        let stale = other
+            .authority("deleted", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "stale authority missing".to_string())?;
+        let pause = deleting.pause_next_deletion_for_test();
+        let deleting_thread = deleting.clone();
+        let handle =
+            std::thread::spawn(move || deleting_thread.remove_runs(&["deleted".to_string()]));
+        pause.0.wait();
+        let appending = other.clone();
+        let (append_tx, append_rx) = std::sync::mpsc::channel();
+        let append_handle = std::thread::spawn(move || {
+            let result = appending.append_event_line(
+                "deleted",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({"goal": "recreated"}),
+            );
+            let _sent = append_tx.send(result);
+        });
+        assert!(matches!(
+            append_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        pause.1.wait();
+        handle
+            .join()
+            .map_err(|_| "delete thread panicked".to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            stale.append(RuntimeJournalEvent::for_append(
+                "deleted",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"stale": true}),
+            )),
+            Err(ShadowError::AuthorityClosed(_))
+        ));
+        let recreated = append_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        append_handle
+            .join()
+            .map_err(|_| "append thread panicked".to_string())?;
+        assert_eq!(recreated.seq, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn authority_open_serializes_with_rebind_and_stale_handle_closes() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let old_root = temp.path().join("old");
+        let new_root = temp.path().join("new");
+        let moving = FileTaskShadow::new(&old_root).map_err(|error| error.to_string())?;
+        let old_reader = FileTaskShadow::new(&old_root).map_err(|error| error.to_string())?;
+        run_created(&moving, "known").map_err(|error| error.to_string())?;
+        let stale = old_reader
+            .authority("known", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "old authority missing".to_string())?;
+        let pause = moving.pause_next_rebind_for_test();
+        let rebinding = moving.clone();
+        let new_root_for_thread = new_root.clone();
+        let rebind_handle = std::thread::spawn(move || rebinding.rebind_root(new_root_for_thread));
+        pause.0.wait();
+        let opening = old_reader.clone();
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        let open_handle = std::thread::spawn(move || {
+            let result = opening.append_event_line(
+                "unseen",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({"goal": "old unseen"}),
+            );
+            let _sent = open_tx.send(result);
+        });
+        assert!(matches!(
+            open_rx.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        pause.1.wait();
+        rebind_handle
+            .join()
+            .map_err(|_| "rebind thread panicked".to_string())?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            open_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?
+                .seq,
+            1
+        );
+        open_handle
+            .join()
+            .map_err(|_| "authority open panicked".to_string())?;
+        assert!(matches!(
+            stale.append(RuntimeJournalEvent::for_append(
+                "known",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"stale": true}),
+            )),
+            Err(ShadowError::AuthorityClosed(_))
+        ));
+        assert_eq!(
+            old_reader
+                .append_event_line(
+                    "known",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"old": "reopened"}),
+                )
+                .map_err(|error| error.to_string())?
+                .seq,
+            2
+        );
+        assert_eq!(
+            moving
+                .append_event_line(
+                    "known",
+                    None,
+                    None,
+                    RuntimeEventKind::RunCreated,
+                    serde_json::json!({"goal": "new"}),
+                )
+                .map_err(|error| error.to_string())?
+                .seq,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn constructors_do_not_clean_live_root_transactions() -> Result<(), String> {
+        for prefix in [".preparing-live", ".deleting-live"] {
+            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let first = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            let authority = first.root_authority().map_err(|error| error.to_string())?;
+            let guard = authority.write_operation();
+            let live = temp.path().join(prefix);
+            std::fs::create_dir_all(&live).map_err(|error| error.to_string())?;
+            let root = temp.path().to_path_buf();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                let shadow = FileTaskShadow::new(root);
+                let _sent = done_tx.send(shadow);
+            });
+            assert!(matches!(
+                done_rx.recv_timeout(std::time::Duration::from_millis(50)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert!(live.exists());
+            std::fs::remove_dir_all(&live).map_err(|error| error.to_string())?;
+            drop(guard);
+            let _shadow = done_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .map_err(|error| error.to_string())?;
+            handle
+                .join()
+                .map_err(|_| "constructor thread panicked".to_string())?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn competing_process_cannot_clean_a_live_root_transaction() -> Result<(), String> {
+        const ROOT_ENV: &str = "EKO_TASK_RUNTIME_ROOT_LEASE_CHILD";
+        if let Some(root) = std::env::var_os(ROOT_ENV) {
+            let shadow = FileTaskShadow::new_unbound_for_test(PathBuf::from(&root));
+            assert!(shadow.root_authority().is_err());
+            assert!(PathBuf::from(root).join(".preparing-live").exists());
+            return Ok(());
+        }
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let _owner = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        std::fs::create_dir(temp.path().join(".preparing-live"))
+            .map_err(|error| error.to_string())?;
+        let output = std::process::Command::new(
+            std::env::current_exe().map_err(|error| error.to_string())?,
+        )
+        .arg("tasks::task_runtime::file_shadow::tests::competing_process_cannot_clean_a_live_root_transaction")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(ROOT_ENV, temp.path())
+        .output()
+        .map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(format!(
+                "root lease child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        assert!(temp.path().join(".preparing-live").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn shadow_retries_root_lease_after_competing_process_exits() -> Result<(), String> {
+        const ROOT_ENV: &str = "EKO_TASK_RUNTIME_ROOT_RETRY_CHILD";
+        const READY_ENV: &str = "EKO_TASK_RUNTIME_ROOT_RETRY_READY";
+        const RELEASE_ENV: &str = "EKO_TASK_RUNTIME_ROOT_RETRY_RELEASE";
+        if let (Some(root), Some(ready), Some(release)) = (
+            std::env::var_os(ROOT_ENV),
+            std::env::var_os(READY_ENV),
+            std::env::var_os(RELEASE_ENV),
+        ) {
+            let shadow =
+                FileTaskShadow::new(PathBuf::from(root)).map_err(|error| error.to_string())?;
+            shadow.root_authority().map_err(|error| error.to_string())?;
+            std::fs::write(&ready, b"ready").map_err(|error| error.to_string())?;
+            let release = PathBuf::from(release);
+            for _ in 0..500 {
+                if release.exists() {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            return Err("root lease child release timed out".to_string());
+        }
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("leased-root");
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
+        let mut child = std::process::Command::new(
+            std::env::current_exe().map_err(|error| error.to_string())?,
+        )
+        .arg("tasks::task_runtime::file_shadow::tests::shadow_retries_root_lease_after_competing_process_exits")
+        .arg("--exact")
+        .env(ROOT_ENV, &root)
+        .env(READY_ENV, &ready)
+        .env(RELEASE_ENV, &release)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+        for _ in 0..500 {
+            if ready.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !ready.exists() {
+            let _killed = child.kill();
+            return Err("root lease child did not become ready".to_string());
+        }
+        let retrying = FileTaskShadow::new_unbound_for_test(&root);
+        assert!(retrying.root_authority().is_err());
+        std::fs::write(&release, b"release").map_err(|error| error.to_string())?;
+        let status = child.wait().map_err(|error| error.to_string())?;
+        assert!(status.success());
+        retrying
+            .root_authority()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            retrying
+                .append_event_line(
+                    "retry",
+                    None,
+                    None,
+                    RuntimeEventKind::RunCreated,
+                    serde_json::json!({"goal": "retry lease"}),
+                )
+                .map_err(|error| error.to_string())?
+                .seq,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_nested_root_is_durably_created_before_first_publication() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("nested/one/two/tasks");
+        let shadow = FileTaskShadow::new(&root).map_err(|error| error.to_string())?;
+        run_created(&shadow, "fresh").map_err(|error| error.to_string())?;
+        assert!(root.is_dir());
+        assert!(root.join("fresh/events.jsonl").is_file());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn final_root_symlink_is_rejected_without_a_second_authority() -> Result<(), String> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let real = temp.path().join("real");
+        std::fs::create_dir(&real).map_err(|error| error.to_string())?;
+        let owner = FileTaskShadow::new(&real).map_err(|error| error.to_string())?;
+        let owner_authority = owner.root_authority().map_err(|error| error.to_string())?;
+        let alias = temp.path().join("alias");
+        symlink(&real, &alias).map_err(|error| error.to_string())?;
+        let aliased = FileTaskShadow::new_unbound_for_test(&alias);
+        assert!(aliased.root_authority().is_err());
+        assert_eq!(
+            owner_authority.root(),
+            std::fs::canonicalize(&real)
+                .map_err(|error| error.to_string())?
+                .as_path()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn deletion_barrier_failure_leaves_cold_cleanup_tombstone() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "barrier-delete").map_err(|error| error.to_string())?;
+        shadow.fail_root_sync_on_call_for_test(2);
+        let error = shadow
+            .remove_runs(&["barrier-delete".to_string()])
+            .err()
+            .ok_or_else(|| "injected deletion barrier unexpectedly succeeded".to_string())?;
+        assert!(matches!(
+            error,
+            ShadowError::CommittedDeletionDegraded { .. }
+        ));
+        assert!(!temp.path().join("barrier-delete").exists());
+        assert!(
+            std::fs::read_dir(temp.path())
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".deleting-"))
+        );
+        drop(shadow);
+        let cold = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        assert!(
+            !cold
+                .list_run_ids()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|run_id| run_id == "barrier-delete")
+        );
+        assert!(
+            !std::fs::read_dir(temp.path())
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".deleting-"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_initial_publication_still_dispatches_committed_hooks_in_order() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let hook_observed = Arc::clone(&observed);
+        assert!(shadow.try_attach_event_hook(Arc::new(move |event| {
+            hook_observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.seq);
+        })));
+        let timestamp = chrono::Utc::now();
+        let events = vec![
+            RuntimeJournalEvent::new(
+                "publish-degraded",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": "publish degraded",
+                    "goal_revision": 1,
+                    "goal_sha256": crate::tasks::task_runtime::task_goal_sha256("publish degraded"),
+                    "domain_profile": "general",
+                    "workspace_id": "workspace",
+                    "conversation_id": "conversation",
+                    "root_message_id": "message",
+                    "route": "complex",
+                    "attended_mode": "attended",
+                }),
+                timestamp,
+            ),
+            RuntimeJournalEvent::new(
+                "publish-degraded",
+                None,
+                None,
+                RuntimeEventKind::PlanRevisionCommitted,
+                serde_json::json!({
+                    "reason": "initial",
+                    "base_revision": 0,
+                    "skipped_task_ids": [],
+                    "plan": PlanRevision {
+                        plan_id: "plan".to_string(),
+                        run_id: "publish-degraded".to_string(),
+                        revision: 1,
+                        domain_profile: DomainProfile::General,
+                        goal_revision: 1,
+                        goal_sha256: crate::tasks::task_runtime::task_goal_sha256("publish degraded"),
+                        assumptions: Vec::new(),
+                        risks: Vec::new(),
+                        execution_mode: ExecutionMode::Sequential,
+                        tasks: Vec::new(),
+                    },
+                }),
+                timestamp,
+            ),
+        ];
+        shadow.fail_root_sync_on_call_for_test(1);
+        assert!(matches!(
+            shadow.publish_initial_event_batch("publish-degraded", events),
+            Err(ShadowError::CommittedPublicationDegraded { .. })
+        ));
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[1, 2]
+        );
+        assert!(temp.path().join("publish-degraded/events.jsonl").is_file());
+        drop(shadow);
+        assert_eq!(
+            FileTaskShadow::new(temp.path())
+                .map_err(|error| error.to_string())?
+                .read_events("publish-degraded")
                 .map_err(|error| error.to_string())?
                 .len(),
             2
@@ -2153,234 +2264,210 @@ mod tests {
     }
 
     #[test]
-    fn corruption_before_the_tail_still_fails_closed() -> Result<(), String> {
-        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
-        let shadow = FileTaskShadow::new(tmp.path());
-        let path = shadow.events_path("corrupt-run");
-        let parent = path.parent().ok_or_else(|| "missing parent".to_string())?;
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        std::fs::write(&path, b"not-json\n{\"seq\":2").map_err(|error| error.to_string())?;
-
-        assert!(matches!(
-            shadow.read_events("corrupt-run"),
-            Err(ShadowError::Decode(_))
-        ));
+    fn append_failure_closes_all_aliases_and_reopen_reuses_sequence() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let first = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let second = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&first, "poison").map_err(|error| error.to_string())?;
+        let first_alias = first
+            .authority("poison", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "first alias missing".to_string())?;
+        let second_alias = second
+            .authority("poison", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "second alias missing".to_string())?;
+        let path = temp.path().join("poison/events.jsonl");
+        let backup = temp.path().join("poison/events.backup");
+        std::fs::rename(&path, &backup).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&path).map_err(|error| error.to_string())?;
+        assert!(
+            first
+                .append_event_line(
+                    "poison",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"fails": true}),
+                )
+                .is_err()
+        );
+        for alias in [first_alias, second_alias] {
+            assert!(matches!(
+                alias.append(RuntimeJournalEvent::for_append(
+                    "poison",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"stale": true}),
+                )),
+                Err(ShadowError::AuthorityClosed(_))
+            ));
+        }
+        std::fs::remove_dir(&path).map_err(|error| error.to_string())?;
+        std::fs::rename(&backup, &path).map_err(|error| error.to_string())?;
+        assert_eq!(
+            second
+                .append_event_line(
+                    "poison",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"reopened": true}),
+                )
+                .map_err(|error| error.to_string())?
+                .seq,
+            2
+        );
         Ok(())
     }
 
-    /// A second run's events must not perturb the first run's seq or plan —
-    /// seq is per-run (each run has its own events.jsonl).
     #[test]
-    fn append_event_seq_is_per_run() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shadow = FileTaskShadow::new(tmp.path());
-
-        let a1 = shadow
-            .append_event_line(
-                "rA",
-                None,
-                None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({}),
-            )
-            .unwrap();
-        let b1 = shadow
-            .append_event_line(
-                "rB",
-                None,
-                None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({}),
-            )
-            .unwrap();
-        let a2 = shadow
-            .append_event_line(
-                "rA",
-                None,
-                None,
-                RuntimeEventKind::RunStatusChanged,
-                serde_json::json!({}),
-            )
-            .unwrap();
-
-        assert_eq!(a1.seq, 1);
-        assert_eq!(a2.seq, 2); // rA's second event, not affected by rB
-        assert_eq!(b1.seq, 1); // rB starts at 1
-    }
-
-    /// Regression: concurrent `atomic_write`s on the same path must not collide
-    /// on a shared tmp file name. Before the fix, `atomic_write` used a fixed
-    /// `plan.json.tmp`; two concurrent writers raced on it — one `rename` moved
-    /// the other's tmp away, so the second `rename` failed with
-    /// "No such file or directory". This reproduced as the
-    /// `failed to mark task running ... file shadow: shadow io: No such file`
-    /// WARN spam during parallel readonly delegation (the executor fans out N tasks,
-    /// each `set_task_status` → `rewrite_plan` → `atomic_write` concurrently).
-    ///
-    /// With per-call unique tmp names (pid + counter + nanos), renames never
-    /// collide, so all concurrent writes succeed.
-    #[test]
-    fn concurrent_atomic_write_no_tmp_collision() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let tmpdir = tempfile::tempdir().expect("tempdir");
-        let target = tmpdir.path().join("plan.json");
-
-        // 8 threads × 50 iterations hammering atomic_write on the same path.
-        // Before the fix this reliably produced "No such file" on a multicore
-        // machine; after the fix every write succeeds.
-        const THREADS: usize = 8;
-        const ITERS: usize = 50;
-        let target = Arc::new(target);
-        let errors: Vec<std::io::Error> = (0..THREADS)
-            .map(|t| {
-                let target = target.clone();
-                thread::spawn(move || {
-                    let mut errs = Vec::new();
-                    for i in 0..ITERS {
-                        let payload = format!("t{t}-i{i}");
-                        if let Err(e) = atomic_write(&target, payload.as_bytes()) {
-                            errs.push(e);
-                        }
-                    }
-                    errs
-                })
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|h| h.join().expect("thread"))
-            .collect();
-
-        assert!(
-            errors.is_empty(),
-            "concurrent atomic_write produced {} errors (expected 0); first: {:?}",
-            errors.len(),
-            errors.first()
-        );
-
-        // Final content is one of the writers' payloads (last rename wins) and
-        // no stray tmp files are left behind.
-        let leftovers: Vec<_> = std::fs::read_dir(tmpdir.path())
-            .expect("read_dir")
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+    fn lru_bounds_idle_authorities_and_pins_active_or_degraded_entries() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "active").map_err(|error| error.to_string())?;
+        run_created(&shadow, "debt").map_err(|error| error.to_string())?;
+        let active = shadow
+            .authority("active", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "active authority missing".to_string())?;
+        let active_guard = active.lock_operation_for_test();
+        let debt = shadow
+            .authority("debt", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "debt authority missing".to_string())?;
+        debt.mark_durability_debt_for_test();
+        drop(debt);
+        for index in 0..(MAX_CACHED_RUN_AUTHORITIES + 24) {
+            run_created(&shadow, &format!("historical-{index}"))
+                .map_err(|error| error.to_string())?;
+        }
+        assert!(shadow.cached_authority_count_for_test() <= MAX_CACHED_RUN_AUTHORITIES + 1);
+        assert!(shadow.has_cached_authority_for_test("active"));
+        assert!(shadow.has_cached_authority_for_test("debt"));
         assert_eq!(
-            leftovers,
-            vec!["plan.json".to_string()],
-            "only plan.json should remain; got {leftovers:?}"
+            shadow
+                .read_events("historical-0")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
         );
-    }
-
-    /// Regression: concurrent append_event_line callers for the same run_id
-    /// must observe strictly unique, monotonically increasing seq values.
-    /// Before the per-run write lock was added, two callers could both read
-    /// the cached seq before either append landed, producing duplicate seq
-    /// numbers in events.jsonl (observed in production as repeated seq
-    /// 8/9/30/57/63-66). This test fires 100 concurrent appends and asserts
-    /// the resulting seq set is exactly 1..=100.
-    #[test]
-    fn concurrent_append_produces_unique_strictly_increasing_seq() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let shadow = FileTaskShadow::new(tmp.path().to_path_buf());
-        // Use a single shared run_id (the race only happens within one run).
-        let run_id = "r-concurrent";
+        drop(active_guard);
+        drop(active);
         shadow
             .append_event_line(
-                run_id,
+                "debt",
                 None,
                 None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({"goal": "x"}),
+                RuntimeEventKind::Note,
+                serde_json::json!({"barrier": "cleared"}),
             )
-            .expect("seed RunCreated");
-
-        let threads = 8;
-        let per_thread = 12; // 8 * 12 = 96, plus RunCreated → 97 total events
-        let shadow = std::sync::Arc::new(shadow);
-        let handles: Vec<_> = (0..threads)
-            .map(|_| {
-                let s = shadow.clone();
-                std::thread::spawn(move || {
-                    let mut local = Vec::new();
-                    for i in 0..per_thread {
-                        let ev = s
-                            .append_event_line(
-                                run_id,
-                                Some(&format!("t{i}")),
-                                None,
-                                RuntimeEventKind::Note,
-                                serde_json::json!({"i": i}),
-                            )
-                            .expect("append");
-                        local.push(ev.seq);
-                    }
-                    local
-                })
-            })
-            .collect();
-        let mut all_seqs: Vec<i64> = handles
-            .into_iter()
-            .flat_map(|h| h.join().expect("thread"))
-            .collect();
-        all_seqs.sort();
-
-        // Each seq must appear exactly once.
-        let mut seen = std::collections::HashSet::new();
-        for &s in &all_seqs {
-            assert!(seen.insert(s), "duplicate seq {s} observed");
+            .map_err(|error| error.to_string())?;
+        for index in 0..8 {
+            run_created(&shadow, &format!("later-{index}")).map_err(|error| error.to_string())?;
         }
-        // Seqs are 2..=(97), because RunCreated took seq=1.
-        let expected: Vec<i64> = (2..=(1 + threads * per_thread) as i64).collect();
-        assert_eq!(all_seqs, expected, "seq must be strictly contiguous");
+        assert!(shadow.cached_authority_count_for_test() <= MAX_CACHED_RUN_AUTHORITIES);
+        let second = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        for index in 0..(MAX_CACHED_RUN_AUTHORITIES + 24) {
+            second
+                .read_events(&format!("historical-{index}"))
+                .map_err(|error| error.to_string())?;
+        }
+        assert!(second.cached_authority_count_for_test() <= MAX_CACHED_RUN_AUTHORITIES);
+        Ok(())
     }
 
     #[test]
-    fn independent_shadows_share_durable_sequence_lock() -> Result<(), Box<dyn std::error::Error>> {
-        let tmp = tempfile::tempdir()?;
-        let first = FileTaskShadow::new(tmp.path().to_path_buf());
-        let second = FileTaskShadow::new(tmp.path().to_path_buf());
-        let run_id = "r-independent";
-        first.append_event_line(
-            run_id,
-            None,
-            None,
-            RuntimeEventKind::RunCreated,
-            serde_json::json!({"goal": "x"}),
-        )?;
+    fn projection_only_orphan_is_not_a_task_run() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let orphan = temp.path().join("orphan");
+        std::fs::create_dir_all(&orphan).map_err(|error| error.to_string())?;
+        std::fs::write(orphan.join("plan.json"), b"{}").map_err(|error| error.to_string())?;
+        std::fs::write(orphan.join("run-state.json"), b"{}").map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        assert!(
+            !shadow
+                .list_run_ids()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .any(|run_id| run_id == "orphan")
+        );
+        assert!(
+            shadow
+                .read_plan("orphan")
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            shadow
+                .read_run_state("orphan")
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        Ok(())
+    }
 
-        let handles = [first.clone(), second]
-            .into_iter()
-            .map(|shadow| {
-                std::thread::spawn(move || -> Result<Vec<i64>, ShadowError> {
-                    let mut sequences = Vec::new();
-                    for index in 0..24 {
-                        let event = shadow.append_event_line(
-                            run_id,
-                            None,
-                            None,
-                            RuntimeEventKind::Note,
-                            serde_json::json!({"index": index}),
-                        )?;
-                        sequences.push(event.seq);
-                    }
-                    Ok(sequences)
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut sequences = Vec::new();
-        for handle in handles {
-            let joined = handle
-                .join()
-                .map_err(|_| std::io::Error::other("append thread panicked"))?;
-            sequences.extend(joined?);
+    #[test]
+    fn multi_event_failure_exposes_exact_committed_prefix_without_retry() -> Result<(), String> {
+        for first_kind in [
+            RuntimeEventKind::RunGoalUpdated,
+            RuntimeEventKind::RunCancelled,
+        ] {
+            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+            let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            run_created(&shadow, "prefix").map_err(|error| error.to_string())?;
+            let event_path = temp.path().join("prefix/events.jsonl");
+            let backup = temp.path().join("prefix/events.backup");
+            let sabotage_path = event_path.clone();
+            let sabotage_backup = backup.clone();
+            assert!(shadow.try_attach_event_hook(Arc::new(move |event| {
+                if event.event_type == first_kind {
+                    let _renamed = std::fs::rename(&sabotage_path, &sabotage_backup);
+                    let _created = std::fs::create_dir(&sabotage_path);
+                }
+            })));
+            shadow
+                .append_event_line(
+                    "prefix",
+                    None,
+                    None,
+                    first_kind,
+                    serde_json::json!({"operation": "prefix"}),
+                )
+                .map_err(|error| error.to_string())?;
+            assert!(
+                shadow
+                    .append_event_line(
+                        "prefix",
+                        None,
+                        None,
+                        RuntimeEventKind::Note,
+                        serde_json::json!({"operation": "suffix"}),
+                    )
+                    .is_err()
+            );
+            std::fs::remove_dir(&event_path).map_err(|error| error.to_string())?;
+            std::fs::rename(&backup, &event_path).map_err(|error| error.to_string())?;
+            let cold = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+            let events = cold
+                .read_events("prefix")
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == first_kind)
+                    .count(),
+                1
+            );
+            assert!(!events.iter().any(|event| {
+                event
+                    .payload
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("suffix")
+            }));
         }
-        sequences.sort_unstable();
-        assert_eq!(sequences, (2_i64..=49).collect::<Vec<_>>());
-        let events = first.read_events(run_id)?;
-        assert_eq!(events.len(), 49);
-        validate_event_suffix(run_id, 0, &events)?;
         Ok(())
     }
 }

@@ -204,7 +204,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         runtime.state_store.clone(),
         app_config.clone(),
         runtime.mcp_config_runtime.clone(),
-    );
+    )?;
     if let Some(active_model) = runtime.active_runtime_model.as_ref() {
         state_inner = state_inner.with_active_model_id(active_model.id.clone());
     }

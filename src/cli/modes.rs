@@ -447,7 +447,7 @@ pub async fn start_headless_services(
         resources.runtime_state_store,
         app_config.clone(),
         resources.mcp_config_runtime,
-    )
+    )?
     .with_active_model_id(resources.active_model_id)
     .with_review_integration(resources.review_integration)
     .with_plugin_runtime(Some(resources.plugin_runtime))

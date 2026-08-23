@@ -24,6 +24,12 @@ pub(super) struct ActiveSubagentControlTarget {
     executor: Arc<SubagentExecutor>,
 }
 
+impl ActiveSubagentControlTarget {
+    pub(super) fn belongs_to_run(&self, run_id: &str) -> bool {
+        self.identity.run_id == run_id
+    }
+}
+
 /// Removes only the exact route registered for this physical execution.
 pub(crate) struct SubagentControlTargetGuard {
     store: Arc<TaskRuntimeStore>,

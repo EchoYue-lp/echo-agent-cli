@@ -49,7 +49,7 @@ async fn isolated_app_state() -> anyhow::Result<Fixture> {
         None,
         Default::default(),
         mcp,
-    );
+    )?;
     state.workspace.registry = registry;
     state.agent_router = Arc::new(crate::agent_router::AgentRouter::new(
         temp.path().join("agent-router"),

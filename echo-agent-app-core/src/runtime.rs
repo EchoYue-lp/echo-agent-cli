@@ -388,7 +388,7 @@ impl AgentRuntime {
     pub fn into_app_state(
         self,
         conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
-    ) -> AppState {
+    ) -> anyhow::Result<AppState> {
         let mut state = AppState::from_shared(
             self.agent_handle.clone(),
             Some(self.model_consumers.clone()),
@@ -397,7 +397,7 @@ impl AgentRuntime {
             self.state_store.clone(),
             self.app_config.clone(),
             self.mcp_config_runtime.clone(),
-        );
+        )?;
         if let Some(runtime) = self.active_runtime_model.as_ref() {
             state = state.with_active_model_id(runtime.id.clone());
         }
@@ -408,7 +408,7 @@ impl AgentRuntime {
             .with_command_cell_runtime(self.command_cell_runtime.clone());
         // Note: task_service and scheduler are started separately by the caller
         // because they need a Store which may be created differently per entry.
-        state
+        Ok(state)
     }
 
     /// Initialize an `AgentPool` from this runtime for multi-conversation

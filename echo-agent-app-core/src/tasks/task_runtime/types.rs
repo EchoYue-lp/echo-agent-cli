@@ -2118,18 +2118,33 @@ fn serialize_seq_as_string<S: serde::Serializer>(seq: &i64, s: S) -> Result<S::O
 }
 
 fn deserialize_seq_from_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
-    use serde::Deserialize;
-    // Accept either a string ("123") or a number (123) for robustness.
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Num {
-        Str(String),
-        Num(i64),
+    struct SequenceVisitor;
+
+    impl serde::de::Visitor<'_> for SequenceVisitor {
+        type Value = i64;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an i64 event sequence as a decimal string or integer")
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(value)
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            i64::try_from(value).map_err(E::custom)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            value.parse::<i64>().map_err(E::custom)
+        }
+
+        fn visit_string<E: serde::de::Error>(self, value: String) -> Result<Self::Value, E> {
+            self.visit_str(&value)
+        }
     }
-    match Num::deserialize(d)? {
-        Num::Str(s) => s.parse().map_err(serde::de::Error::custom),
-        Num::Num(n) => Ok(n),
-    }
+
+    d.deserialize_any(SequenceVisitor)
 }
 
 /// A concrete output produced by a task (file, report, chart, trace, …).
@@ -2774,6 +2789,37 @@ impl SuggestedTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Deserialize)]
+    struct SequenceProbe {
+        #[serde(deserialize_with = "deserialize_seq_from_string")]
+        seq: i64,
+    }
+
+    #[test]
+    fn event_sequence_accepts_string_and_lossless_integer_forms() -> Result<(), String> {
+        for (encoded, expected) in [
+            (r#"{"seq":42}"#, 42_i64),
+            (r#"{"seq":9007199254740993}"#, 9_007_199_254_740_993_i64),
+            (r#"{"seq":"9007199254740993"}"#, 9_007_199_254_740_993_i64),
+        ] {
+            let decoded: SequenceProbe =
+                serde_json::from_str(encoded).map_err(|error| error.to_string())?;
+            assert_eq!(decoded.seq, expected);
+        }
+        for invalid in [
+            r#"{"seq":9223372036854775808}"#,
+            r#"{"seq":1.5}"#,
+            r#"{"seq":"not-a-sequence"}"#,
+        ] {
+            if serde_json::from_str::<SequenceProbe>(invalid).is_ok() {
+                return Err(format!(
+                    "invalid event sequence decoded successfully: {invalid}"
+                ));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn interaction_mode_prompt_contracts_are_distinct_and_actionable() {

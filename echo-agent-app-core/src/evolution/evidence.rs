@@ -213,11 +213,25 @@ pub struct EvidenceCandidateDraft {
     pub confidence: f32,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 enum EvidenceLogRecord {
     Candidate(Box<EvidenceCandidate>),
     Interaction(EvidenceInteractionEvent),
+}
+
+fn decode_log_record(line: &str) -> Result<EvidenceLogRecord, String> {
+    let value: serde_json::Value = serde_json::from_str(line).map_err(|error| error.to_string())?;
+    match value.get("record_type") {
+        None => serde_json::from_value::<EvidenceCandidate>(value)
+            .map(|candidate| EvidenceLogRecord::Candidate(Box::new(candidate)))
+            .map_err(|error| error.to_string()),
+        Some(serde_json::Value::String(record_type)) if record_type == "interaction" => {
+            serde_json::from_value::<EvidenceInteractionEvent>(value)
+                .map(EvidenceLogRecord::Interaction)
+                .map_err(|error| error.to_string())
+        }
+        Some(record_type) => Err(format!("unknown evidence record_type: {record_type}")),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -938,7 +952,7 @@ fn read_latest_from(file: File) -> Result<HashMap<String, EvidenceCandidate>, St
         if line.trim().is_empty() {
             continue;
         }
-        let record: EvidenceLogRecord = serde_json::from_str(&line).map_err(|error| {
+        let record = decode_log_record(&line).map_err(|error| {
             format!(
                 "invalid evidence JSONL record at line {}: {error}",
                 index.saturating_add(1)
@@ -959,7 +973,7 @@ fn read_interactions_from(file: File) -> Result<Vec<EvidenceInteractionEvent>, S
         if line.trim().is_empty() {
             continue;
         }
-        let record: EvidenceLogRecord = serde_json::from_str(&line).map_err(|error| {
+        let record = decode_log_record(&line).map_err(|error| {
             format!(
                 "invalid evidence JSONL record at line {}: {error}",
                 index.saturating_add(1)
@@ -1126,6 +1140,57 @@ mod tests {
         assert_eq!(first.candidate_id, second.candidate_id);
         assert_eq!(second.evidence.len(), 2);
         assert_eq!(store.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_snapshot_round_trips_through_log_record() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let candidate = store.upsert(draft("Round trip candidate", "source"))?;
+        let encoded = serde_json::to_string(&candidate).map_err(|error| error.to_string())?;
+        match decode_log_record(&encoded)? {
+            EvidenceLogRecord::Candidate(decoded) => {
+                assert_eq!(decoded.candidate_id, candidate.candidate_id);
+                Ok(())
+            }
+            EvidenceLogRecord::Interaction(_) => {
+                Err("candidate decoded as an interaction event".to_string())
+            }
+        }
+    }
+
+    #[test]
+    fn interaction_snapshot_round_trips_and_unknown_record_types_fail_closed() -> Result<(), String>
+    {
+        let interaction = EvidenceInteractionEvent {
+            schema_version: SCHEMA_VERSION,
+            record_type: "interaction".to_string(),
+            event_id: "interaction-round-trip".to_string(),
+            candidate_id: "candidate-round-trip".to_string(),
+            action: EvidenceInteractionAction::Rejected,
+            timestamp: Utc::now(),
+        };
+        let encoded = serde_json::to_string(&interaction).map_err(|error| error.to_string())?;
+        match decode_log_record(&encoded)? {
+            EvidenceLogRecord::Interaction(decoded) => {
+                assert_eq!(decoded.event_id, interaction.event_id);
+            }
+            EvidenceLogRecord::Candidate(_) => {
+                return Err("interaction decoded as a candidate".to_string());
+            }
+        }
+        for invalid in [
+            r#"{"record_type":"candidate"}"#,
+            r#"{"record_type":{"interaction":true}}"#,
+            r#"{"record_type":"interaction","candidate_id":"missing-fields"}"#,
+        ] {
+            if decode_log_record(invalid).is_ok() {
+                return Err(format!(
+                    "invalid evidence record decoded successfully: {invalid}"
+                ));
+            }
+        }
         Ok(())
     }
 

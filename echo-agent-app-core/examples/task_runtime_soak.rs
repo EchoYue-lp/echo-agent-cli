@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use chrono::Utc;
 use clap::Parser;
-use echo_agent_app_core::tasks::task_runtime::event_rebuild::rebuild_plan_from_events;
+use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
 use echo_agent_app_core::tasks::task_runtime::store::{RunTurnClaimOutcome, RunTurnCompletion};
 use echo_agent_app_core::tasks::task_runtime::{
     Artifact, ArtifactKind, AttendedMode, BootAutoResumeOutcome, DomainProfile, ExecutionMode,
@@ -595,12 +595,12 @@ fn validate_runtime(
             && plan.goal_sha256 == snapshot.run.goal_sha256,
         "Goal/Plan binding drifted"
     );
-    let rebuilt = rebuild_plan_from_events(&events)
-        .map_err(|error| anyhow!("full event rebuild failed: {error}"))?
-        .run_state();
+    let replayed = store
+        .diagnose_full_journal_projection(run_id)?
+        .ok_or_else(|| anyhow!("full journal diagnostic projection missing"))?;
     ensure!(
-        serde_json::to_value(&snapshot)? == serde_json::to_value(&rebuilt)?,
-        "checkpoint-backed snapshot differs from full event rebuild"
+        serde_json::to_value(&snapshot)? == serde_json::to_value(&replayed)?,
+        "checkpoint-backed snapshot differs from full journal projection"
     );
     let continuation = snapshot
         .continuation
@@ -665,13 +665,24 @@ fn final_evidence(
         "successful soak did not end Paused"
     );
     let event_bytes = std::fs::read(task_root.join(run_id).join("events.jsonl"))?;
-    let checkpoint_bytes = std::fs::read(task_root.join(run_id).join("checkpoint.json"))?;
-    let checkpoint = serde_json::from_slice::<serde_json::Value>(&checkpoint_bytes)?;
-    let checkpoint_state_hash = checkpoint
-        .get("state_hash")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| anyhow!("final checkpoint state hash missing"))?
-        .to_string();
+    let checkpoint = FileCheckpointStore::<serde_json::Value>::open(
+        task_root.join(run_id).join("checkpoint.json"),
+    )
+    .load()?
+    .ok_or_else(|| anyhow!("final checkpoint missing"))?;
+    let event_tail = store
+        .list_events(run_id, 0)?
+        .last()
+        .map(|event| u64::try_from(event.seq))
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(
+        checkpoint.sequence == event_tail,
+        "final checkpoint does not cover the journal tail"
+    );
+    let checkpoint_state_bytes =
+        echo_agent::utils::canonical_json::canonical_json_bytes(&checkpoint.state)?;
+    let checkpoint_state_hash = hex::encode(Sha256::digest(checkpoint_state_bytes));
     let run_state_bytes = serde_json::to_vec(&snapshot)?;
     Ok(FinalEvidence {
         run_status: snapshot.run.status.as_str().to_string(),
