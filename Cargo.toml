@@ -47,8 +47,7 @@ required-features = ["gui"]
 
 [dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core" }
-echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", default-features = false, features = ["mcp", "lsp", "human-loop", "subagent", "tasks"] }
-echo-core = { version = "0.2", package = "echo_core", path = "../echo-agent/echo-core" }
+echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", default-features = false, features = ["mcp", "lsp", "human-loop", "subagent"] }
 # async_trait: needed for `impl MessageHandler for AppChannelMessageHandler` (channels feature).
 async-trait = "0.1"
 # async-stream: needed for `aggregate_by_sentence` (AppChannel stream aggregation, channels feature).

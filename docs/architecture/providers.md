@@ -70,7 +70,7 @@ Provider 的 `default_api_protocol` 只用于新建模型表单的初始值，�
 GUI / TUI / CLI
        |
        v
-AppState linearized mutation -> AppConfig file
+AppState linearized mutation -> EkoConfig file
        |
        v
 ModelRuntimeConfig (provider root + model protocol + modalities)

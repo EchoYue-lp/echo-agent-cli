@@ -154,7 +154,7 @@ async fn cmd_model(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 input_modalities.push(echo_agent::llm::ModelInputModality::Video);
             }
             let mutation = echo_agent_app_core::state::ConfiguredModelMutation {
-                model: echo_agent::config::ConfiguredModel {
+                model: echo_agent_app_core::config::ConfiguredModel {
                     provider: (*provider).to_string(),
                     model: (*model).to_string(),
                     api_protocol: protocol,
@@ -230,7 +230,7 @@ async fn cmd_provider(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let requires_api_key = args.get(5).is_some_and(|value| *value == "requires-key");
             let mutation = echo_agent_app_core::state::ModelProviderMutation {
                 id: (*id).to_string(),
-                provider: echo_agent::config::ModelProviderConfig {
+                provider: echo_agent_app_core::config::ModelProviderConfig {
                     name: (*id).to_string(),
                     api_key_env,
                     base_url: Some((*base_url).to_string()),

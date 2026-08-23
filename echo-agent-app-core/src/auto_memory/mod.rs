@@ -1,14 +1,15 @@
 //! Auto-memory product integration.
 //!
-//! Generic observation extraction lives in `echo_agent::evolution::auto_memory`.
-//! EKO routes extracted observations into the workspace evidence inbox instead
-//! of writing inferred content directly into durable memory.
+//! Coding-oriented observation extraction and inbox routing are EKO product
+//! policy. The framework owns only generic memory contracts and stores.
+
+mod policy;
 
 use crate::evolution::{
     EvidenceCandidate, EvidenceCandidateDraft, EvidenceKind, EvidenceRef, EvidenceSource,
     EvidenceStore,
 };
-pub use echo_agent::evolution::auto_memory::{
+pub use policy::{
     AutoMemoryConfig, Observation, ObservationCategory, extract_observations,
     format_observations_for_memory,
 };

@@ -7,7 +7,7 @@ use anyhow::Result;
 
 use crate::agent_handle::AgentHandle;
 use crate::cli::args::{Args, JsonlApprovalPolicy, JsonlInteractionMode, JsonlPermissionMode};
-use echo_agent::config::AppConfig;
+use echo_agent_app_core::config::EkoConfig;
 
 type CliShutdownFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
 
@@ -125,7 +125,7 @@ async fn drain_cli_shutdown(
 fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
     crate::cli::ReplConfig {
         prompt: "echo".to_string(),
-        history_file: echo_agent::paths::user_data_path("history.txt")
+        history_file: echo_agent_app_core::data_root::user_data_path("history.txt")
             .to_string_lossy()
             .into_owned(),
         mode: "general".to_string(),
@@ -240,8 +240,11 @@ pub async fn run_jsonl_mode(
         Some(conversation_id.clone()),
         turn_id.clone(),
     );
+    let permission_mode =
+        echo_agent_app_core::permission::parse_permission_mode(options.permission_mode.as_str())
+            .map_err(anyhow::Error::msg)?;
     agent
-        .write(|agent| agent.set_permission_mode(options.permission_mode.as_str()))
+        .write(|agent| agent.set_permission_mode(permission_mode))
         .await;
 
     let workspace_root = scoped_runtime.execution_scope().root().to_path_buf();
@@ -422,11 +425,11 @@ pub async fn run_jsonl_mode(
 pub async fn start_headless_services(
     agent: AgentHandle,
     hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
-    app_config: &AppConfig,
+    app_config: &EkoConfig,
     resources: HeadlessServiceResources,
 ) -> Result<HeadlessServices> {
     let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
-        let file_path = echo_agent::paths::user_data_path("scheduler_store");
+        let file_path = echo_agent_app_core::data_root::user_data_path("scheduler_store");
         match echo_agent::memory::FileStore::new(&file_path) {
             Ok(store) => std::sync::Arc::new(store),
             Err(error) => {
@@ -705,7 +708,7 @@ pub async fn shutdown_headless_services(
 pub struct ChannelsModeArgs {
     pub app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
     pub pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
-    pub app_config: AppConfig,
+    pub app_config: EkoConfig,
     pub task_runtime_store:
         Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     pub review_integration:
@@ -995,7 +998,7 @@ mod tests {
         async fn handle(
             &self,
             message: echo_agent::channels::InboundMessage,
-        ) -> echo_core::error::Result<echo_agent::channels::OutboundMessage> {
+        ) -> echo_agent::error::Result<echo_agent::channels::OutboundMessage> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(echo_agent::channels::OutboundMessage::new(
                 message.channel_id,
@@ -1008,7 +1011,7 @@ mod tests {
         async fn reply(
             &self,
             _message: echo_agent::channels::OutboundMessage,
-        ) -> echo_core::error::Result<()> {
+        ) -> echo_agent::error::Result<()> {
             Ok(())
         }
     }
@@ -1055,8 +1058,8 @@ mod tests {
     }
 
     #[cfg(feature = "channels")]
-    fn channel_test_error(message: impl Into<String>) -> echo_core::error::ReactError {
-        echo_core::error::ReactError::Channel(Box::new(echo_core::error::ChannelError::Other(
+    fn channel_test_error(message: impl Into<String>) -> echo_agent::error::ReactError {
+        echo_agent::error::ReactError::Channel(Box::new(echo_agent::error::ChannelError::Other(
             message.into(),
         )))
     }
@@ -1083,7 +1086,7 @@ mod tests {
         async fn start(
             &mut self,
             _handler: Arc<dyn echo_agent::channels::MessageHandler>,
-        ) -> echo_core::error::Result<()> {
+        ) -> echo_agent::error::Result<()> {
             if self.fail_start {
                 Err(channel_test_error(format!("{} start failure", self.id)))
             } else {
@@ -1091,7 +1094,7 @@ mod tests {
             }
         }
 
-        async fn stop(&mut self) -> echo_core::error::Result<()> {
+        async fn stop(&mut self) -> echo_agent::error::Result<()> {
             self.stops.fetch_add(1, Ordering::SeqCst);
             if self.fail_stop {
                 Err(channel_test_error(format!("{} stop failure", self.id)))
@@ -1103,7 +1106,7 @@ mod tests {
         async fn send(
             &self,
             _message: echo_agent::channels::OutboundMessage,
-        ) -> echo_core::error::Result<()> {
+        ) -> echo_agent::error::Result<()> {
             Ok(())
         }
     }

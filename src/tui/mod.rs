@@ -1998,7 +1998,7 @@ async fn settle_tui_foreground_on_exit(
 #[allow(clippy::too_many_arguments)] // startup entry: agent + services + config + pool + store + review_integration all wired here
 pub async fn run_tui(
     agent: AgentHandle,
-    tui_config: &echo_agent::config::TuiConfig,
+    tui_config: &echo_agent_app_core::config::TuiConfig,
     mode_display: &str,
     tui_pending: echo_agent_app_core::hitl::PendingApprovalQueue,
     tui_provider: std::sync::Arc<echo_agent_app_core::hitl::TuiHumanLoopProvider>,
@@ -2062,7 +2062,10 @@ pub async fn run_tui(
     app.context_snapshot.context_window_size = app.context_window_size;
     app.tool_count = agent.read(|value| value.tool_names().len()).await;
     app.permission_mode = agent
-        .read(|value| value.get_permission_mode().to_string())
+        .read(|value| {
+            echo_agent_app_core::permission::permission_mode_id(value.get_permission_mode())
+                .to_string()
+        })
         .await;
     app.max_display_chars = tui_config.max_display_chars;
     app.pending_approval = Some(tui_pending);

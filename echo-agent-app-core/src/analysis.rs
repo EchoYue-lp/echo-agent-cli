@@ -14,8 +14,8 @@ use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use echo_agent::agent::AgentHandle;
+use echo_agent::tools::{ToolContext, ToolResultKind};
 use echo_agent::tools::{ToolFailureCategory, ToolManager, ToolParameters};
-use echo_core::tools::{ToolContext, ToolResultKind};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -297,7 +297,7 @@ pub fn create_analysis(
         updated_at: now,
     };
 
-    echo_core::utils::fs::atomic_write(
+    echo_agent::utils::fs::atomic_write(
         &analysis_dir.join(language.script_name()),
         language.starter_script().as_bytes(),
     )?;
@@ -367,7 +367,7 @@ pub fn save_analysis(
     let analysis_dir = analysis_dir(workspace_root, analysis_id)?;
     let script_path = safe_existing_relative_file(&analysis_dir, &document.manifest.script_path)?;
 
-    echo_core::utils::fs::atomic_write(&script_path, request.script.as_bytes())?;
+    echo_agent::utils::fs::atomic_write(&script_path, request.script.as_bytes())?;
     document.manifest.title = title.to_string();
     document.manifest.input_paths = input_paths;
     document.manifest.parameters = request.parameters;
@@ -1027,7 +1027,7 @@ fn read_optional_json<T: for<'de> Deserialize<'de>>(path: &Path) -> AnalysisResu
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> AnalysisResult<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    echo_core::utils::fs::atomic_write(path, &bytes)?;
+    echo_agent::utils::fs::atomic_write(path, &bytes)?;
     Ok(())
 }
 
@@ -1317,7 +1317,7 @@ mod tests {
             seen_profile: seen_profile.clone(),
         }));
         let prepared = crate::analysis_runtime::PreparedAnalyticsRuntime {
-            profile: Arc::new(echo_core::tools::ScriptExecutionProfile::new(
+            profile: Arc::new(echo_agent::tools::ScriptExecutionProfile::new(
                 "eko-analytics:test-lock",
                 "python",
                 "/tmp/eko-analytics/.venv/bin/python",

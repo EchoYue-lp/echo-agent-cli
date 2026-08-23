@@ -16,7 +16,7 @@
 //! that OpenAI, DeepSeek, and Anthropic can cache automatically.
 
 use super::context::ProjectContext;
-use echo_core::tokenizer::{HeuristicTokenizer, Tokenizer};
+use echo_agent::tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 

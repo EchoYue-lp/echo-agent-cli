@@ -635,10 +635,16 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if mode.is_empty() {
         // Show current permission mode
         let current = match ctx.app_state.as_ref() {
-            Some(state) => state.config.permission_mode.read().await.clone(),
+            Some(state) => echo_agent_app_core::permission::permission_mode_id(
+                *state.config.permission_mode.read().await,
+            ),
             None => {
                 ctx.agent
-                    .read(|a| a.get_permission_mode().to_string())
+                    .read(|agent| {
+                        echo_agent_app_core::permission::permission_mode_id(
+                            agent.get_permission_mode(),
+                        )
+                    })
                     .await
             }
         };
@@ -656,28 +662,25 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         return CommandOutcome::Continue;
     }
 
-    // Validate the mode
-    let normalized = match mode {
-        "default" => "default",
-        "auto-edit" | "autoedit" | "accept-edits" => "auto-edit",
-        "full-auto" | "fullauto" | "bypass" => "full-auto",
-        "auto" | "plan" => "default",
-        "strict" | "strict-confirm" | "strict-confirmation" => "strict",
-        _ => {
-            println!("Unknown permission mode: '{}'", mode);
-            println!("Valid modes: default, auto-edit, full-auto, strict");
+    let framework_mode = match echo_agent_app_core::permission::parse_permission_mode(mode) {
+        Ok(mode) => mode,
+        Err(error) => {
+            println!("{error}");
             return CommandOutcome::Continue;
         }
     };
+    let normalized = echo_agent_app_core::permission::permission_mode_id(framework_mode);
 
     match ctx.app_state.as_ref() {
         Some(state) => {
-            *state.config.permission_mode.write().await = normalized.to_string();
-            state
-                .apply_permission_mode_to_agents(normalized.to_string())
-                .await;
+            *state.config.permission_mode.write().await = framework_mode;
+            state.apply_permission_mode_to_agents(framework_mode).await;
         }
-        None => ctx.agent.write(|a| a.set_permission_mode(normalized)).await,
+        None => {
+            ctx.agent
+                .write(|agent| agent.set_permission_mode(framework_mode))
+                .await
+        }
     }
 
     match normalized {

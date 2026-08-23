@@ -28,7 +28,7 @@ GUI 用户在“设置 -> 模型 Provider”中：
 3. 为每个模型明确选择 `chat_completions`、`responses` 或 `anthropic`。
 4. 选择输入能力并设为默认模型。
 
-TUI/CLI 用户可以准备 `./echo-agent.yaml` 或 `~/.eko/config.yaml`。最小示例：
+TUI/CLI 用户可以准备 `./eko.yaml` 或 `~/.eko/config.yaml`。最小示例：
 
 ```yaml
 model:

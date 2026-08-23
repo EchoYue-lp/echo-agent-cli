@@ -10646,9 +10646,9 @@ mod tests {
             .get_run_state(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "checkpoint-backed state is missing".to_string())?;
-        let full_bytes = echo_core::utils::canonical_json::canonical_json_bytes(&full)
+        let full_bytes = echo_agent::utils::canonical_json::canonical_json_bytes(&full)
             .map_err(|error| error.to_string())?;
-        let warm_bytes = echo_core::utils::canonical_json::canonical_json_bytes(&warm)
+        let warm_bytes = echo_agent::utils::canonical_json::canonical_json_bytes(&warm)
             .map_err(|error| error.to_string())?;
         assert_eq!(warm_bytes, full_bytes);
 
@@ -10663,7 +10663,7 @@ mod tests {
             .get_run_state(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "repaired state is missing".to_string())?;
-        let repaired_bytes = echo_core::utils::canonical_json::canonical_json_bytes(&repaired)
+        let repaired_bytes = echo_agent::utils::canonical_json::canonical_json_bytes(&repaired)
             .map_err(|error| error.to_string())?;
         assert_eq!(repaired_bytes, full_bytes);
         let checkpoint = std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?;

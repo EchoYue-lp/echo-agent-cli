@@ -4,12 +4,12 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use echo_agent::agent::ReactAgent;
+use echo_agent::tools::ToolContext;
 use echo_agent::tools::research::{
     CrossrefClient, EuropePmcClient, OpenAlexClient, ScholarlySearchPage, ScholarlyWork,
     ZoteroClient, ZoteroLibraryKind, scholarly_work_from_zotero, scholarly_work_to_zotero,
 };
 use echo_agent::tools::{Tool, ToolFailureCategory, ToolParameters, ToolResult, ToolRiskLevel};
-use echo_core::tools::ToolContext;
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

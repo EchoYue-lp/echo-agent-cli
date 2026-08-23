@@ -100,7 +100,7 @@ impl std::fmt::Display for AuditDecision {
 /// CLI permission rule — simplified serializable form for the REST API.
 ///
 /// This serves as an adapter over the framework's richer [`PermissionRule`]
-/// type (in `echo_core::tools::permission`). The `matcher` field is a string
+/// type (in `echo_agent::tools::permission`). The `matcher` field is a string
 /// that maps to `RuleMatcher` variants (`tool:<name>`, `pattern:<glob>`,
 /// `permission:<flag>`, or `*` for catch-all). The `behavior` field maps to
 /// `RuleBehavior` (see [`PermissionBehavior`]).
@@ -113,7 +113,7 @@ pub struct PermissionRuleConfig {
     pub source: String,
 }
 
-/// Permission behavior — mirrors `echo_core::tools::permission::RuleBehavior`.
+/// Permission behavior — mirrors `echo_agent::tools::permission::RuleBehavior`.
 ///
 /// | Variant | Framework `RuleBehavior` equivalent |
 /// |---------|-------------------------------------|
@@ -376,7 +376,7 @@ impl ConnectionState {
 
 /// 配置状态：应用 / Web / 沙箱 / 权限
 pub struct ConfigState {
-    pub app_config: RwLock<echo_agent::config::AppConfig>,
+    pub app_config: RwLock<crate::config::EkoConfig>,
     /// Runtime model currently published to primary and pooled agents. This
     /// remains distinct from the durable default when startup used `--model`.
     active_model_id: RwLock<String>,
@@ -384,7 +384,7 @@ pub struct ConfigState {
     pub config_path: std::path::PathBuf,
     pub web_config: RwLock<WebConfig>,
     pub sandbox_config: RwLock<SandboxConfigData>,
-    pub permission_mode: RwLock<String>,
+    pub permission_mode: RwLock<echo_agent::tools::permission::PermissionMode>,
     pub permission_rules: RwLock<Vec<PermissionRuleConfig>>,
     model_mutations: Mutex<ModelMutationOwnerState>,
 }
@@ -412,14 +412,14 @@ impl Default for ModelMutationOwnerState {
 
 #[derive(Debug, Clone)]
 pub struct ConfiguredModelMutation {
-    pub model: echo_agent::config::ConfiguredModel,
+    pub model: crate::config::ConfiguredModel,
     pub set_default: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct ModelProviderMutation {
     pub id: String,
-    pub provider: echo_agent::config::ModelProviderConfig,
+    pub provider: crate::config::ModelProviderConfig,
     pub preserve_auth_token: bool,
 }
 
@@ -427,7 +427,7 @@ pub struct ModelProviderMutation {
 /// publication have completed for an active-model mutation.
 #[derive(Clone)]
 pub struct ModelMutationReceipt {
-    pub config: echo_agent::config::AppConfig,
+    pub config: crate::config::EkoConfig,
     pub model_id: String,
     pub runtime: Option<crate::model_config::ModelRuntimeConfig>,
     pub activated: bool,
@@ -449,7 +449,7 @@ pub enum ModelMutationError {
 }
 
 type OwnedConfigUpdate =
-    Box<dyn FnOnce(&mut echo_agent::config::AppConfig) -> Result<(), String> + Send + 'static>;
+    Box<dyn FnOnce(&mut crate::config::EkoConfig) -> Result<(), String> + Send + 'static>;
 
 enum ModelMutationRequest {
     UpsertModel(ConfiguredModelMutation),
@@ -466,7 +466,7 @@ enum ModelMutationRequest {
 }
 
 struct PreparedModelMutation {
-    config: echo_agent::config::AppConfig,
+    config: crate::config::EkoConfig,
     model_id: String,
     runtime: Option<crate::model_config::ModelRuntimeConfig>,
     prepared: Option<crate::infra::PreparedRuntimeLlm>,
@@ -1019,7 +1019,7 @@ impl AppState {
         hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
         conversation_store: Option<Arc<dyn ConversationStore>>,
         runtime_state_store: Option<Arc<dyn RuntimeStateStore>>,
-        app_config: echo_agent::config::AppConfig,
+        app_config: crate::config::EkoConfig,
         mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
     ) -> Self {
         let config = agent
@@ -1077,7 +1077,9 @@ impl AppState {
                 config_path: crate::config_watcher::resolve_config_save_path(None),
                 web_config: RwLock::new(config),
                 sandbox_config: RwLock::new(SandboxConfigData::default()),
-                permission_mode: RwLock::new("default".to_string()),
+                permission_mode: RwLock::new(
+                    echo_agent::tools::permission::PermissionMode::Default,
+                ),
                 permission_rules: RwLock::new(Vec::new()),
                 model_mutations: Mutex::new(ModelMutationOwnerState::default()),
             },
@@ -1205,9 +1207,9 @@ impl AppState {
     /// Persist one complete config snapshot to the immutable bootstrap source.
     fn save_app_config(
         &self,
-        config: &echo_agent::config::AppConfig,
+        config: &crate::config::EkoConfig,
     ) -> std::result::Result<(), String> {
-        echo_agent::config::save_config_file(&self.config.config_path, config)
+        crate::config::save_config_file(&self.config.config_path, config)
     }
 
     /// Upsert one configured model through the sole application-owned config
@@ -1259,7 +1261,7 @@ impl AppState {
             .await
     }
 
-    /// Serialize a broader AppConfig edit with model mutations so a stale
+    /// Serialize a broader EkoConfig edit with model mutations so a stale
     /// whole-config snapshot cannot overwrite an accepted model publication.
     /// When model runtime fields change, the active model is preflighted and
     /// republished within the same owned settlement.
@@ -1267,9 +1269,9 @@ impl AppState {
         self: &Arc<Self>,
         reapply_active_model: bool,
         update: Update,
-    ) -> Result<echo_agent::config::AppConfig, ModelMutationError>
+    ) -> Result<crate::config::EkoConfig, ModelMutationError>
     where
-        Update: FnOnce(&mut echo_agent::config::AppConfig) -> Result<(), String> + Send + 'static,
+        Update: FnOnce(&mut crate::config::EkoConfig) -> Result<(), String> + Send + 'static,
     {
         self.run_owned_model_mutation(ModelMutationRequest::UpdateConfig {
             update: Box::new(update),
@@ -2272,18 +2274,21 @@ impl AppState {
         Ok(())
     }
 
-    pub async fn apply_permission_mode_to_agents(&self, mode: String) {
+    pub async fn apply_permission_mode_to_agents(
+        &self,
+        mode: echo_agent::tools::permission::PermissionMode,
+    ) {
         match self.connection.pool.as_ref() {
-            Some(pool) => pool.apply_permission_mode(mode.clone()).await,
+            Some(pool) => pool.apply_permission_mode(mode).await,
             None => {
                 self.connection
                     .primary_agent()
-                    .write(|agent| agent.set_permission_mode(&mode))
+                    .write(|agent| agent.set_permission_mode(mode))
                     .await;
             }
         }
         for (_, runtime) in self.workspace.runtimes.loaded_execution_runtimes().await {
-            runtime.pool().apply_permission_mode(mode.clone()).await;
+            runtime.pool().apply_permission_mode(mode).await;
         }
     }
 
@@ -3661,7 +3666,7 @@ async fn reload_plugin_runtime_followers(
 }
 
 fn prepare_model_mutation(
-    current: &echo_agent::config::AppConfig,
+    current: &crate::config::EkoConfig,
     active_model_id: &str,
     request: ModelMutationRequest,
 ) -> Result<PreparedModelMutation, ModelMutationError> {
@@ -3891,7 +3896,7 @@ fn prepare_model_mutation(
 }
 
 fn resolve_active_model_runtime(
-    config: &echo_agent::config::AppConfig,
+    config: &crate::config::EkoConfig,
     active_model_id: &str,
 ) -> Result<Option<crate::model_config::ModelRuntimeConfig>, ModelMutationError> {
     if !config.configured_models.iter().any(|model| model.enabled) {
@@ -3917,7 +3922,7 @@ mod reliability_contracts;
 #[cfg(test)]
 mod model_mutation_tests {
     use super::*;
-    use echo_agent::config::{ConfiguredModel, ModelProviderConfig};
+    use crate::config::{ConfiguredModel, ModelProviderConfig};
     use echo_agent::llm::LlmApiProtocol;
 
     const MODEL_A: &str = "model-a";
@@ -3931,7 +3936,7 @@ mod model_mutation_tests {
 
     #[test]
     fn first_configured_model_becomes_the_active_generation() -> Result<(), String> {
-        let mut config = echo_agent::config::AppConfig::default();
+        let mut config = crate::config::EkoConfig::default();
         config.model_providers.insert(
             "local".to_string(),
             ModelProviderConfig {
@@ -4006,8 +4011,8 @@ mod model_mutation_tests {
         }
     }
 
-    fn valid_config() -> Result<echo_agent::config::AppConfig, String> {
-        let mut config = echo_agent::config::AppConfig::default();
+    fn valid_config() -> Result<crate::config::EkoConfig, String> {
+        let mut config = crate::config::EkoConfig::default();
         config.model_providers.insert(
             "local-a".to_string(),
             ModelProviderConfig {
@@ -4032,7 +4037,7 @@ mod model_mutation_tests {
         Ok(config)
     }
 
-    fn invalid_successor_config() -> Result<echo_agent::config::AppConfig, String> {
+    fn invalid_successor_config() -> Result<crate::config::EkoConfig, String> {
         let mut config = valid_config()?;
         let invalid = config
             .configured_models
@@ -4052,8 +4057,8 @@ mod model_mutation_tests {
         Ok(config)
     }
 
-    fn shared_provider_config() -> Result<echo_agent::config::AppConfig, String> {
-        let mut config = echo_agent::config::AppConfig::default();
+    fn shared_provider_config() -> Result<crate::config::EkoConfig, String> {
+        let mut config = crate::config::EkoConfig::default();
         config.model_providers.insert(
             "local-shared".to_string(),
             ModelProviderConfig {
@@ -4071,14 +4076,14 @@ mod model_mutation_tests {
     }
 
     async fn fixture(
-        config: echo_agent::config::AppConfig,
+        config: crate::config::EkoConfig,
         persistence_fails: bool,
     ) -> Result<ModelMutationFixture, String> {
         fixture_with_active(config, persistence_fails, MODEL_A).await
     }
 
     async fn fixture_with_active(
-        config: echo_agent::config::AppConfig,
+        config: crate::config::EkoConfig,
         persistence_fails: bool,
         active_model_id: &str,
     ) -> Result<ModelMutationFixture, String> {
@@ -4088,8 +4093,8 @@ mod model_mutation_tests {
             std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
             path
         } else {
-            let path = temp.path().join("echo-agent.yaml");
-            echo_agent::config::save_config_file(&path, &config)?;
+            let path = temp.path().join("eko.yaml");
+            crate::config::save_config_file(&path, &config)?;
             path
         };
         let created = crate::infra::create_agent_with_diagnostics(
@@ -4289,7 +4294,7 @@ mod model_mutation_tests {
         endpoint: &str,
         context_window: usize,
     ) -> Result<(), String> {
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.model.default_model_id.as_deref(), Some(model_id));
         assert_live_generation(fixture, model_id, runtime_model, endpoint, context_window).await
     }
@@ -4466,7 +4471,7 @@ mod model_mutation_tests {
         let result = fixture.state.delete_configured_model_owned(MODEL_A).await;
 
         assert!(matches!(result, Err(ModelMutationError::Validation(_))));
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.configured_models.len(), 2);
         assert!(
             persisted
@@ -4496,7 +4501,7 @@ mod model_mutation_tests {
                 .iter()
                 .all(|model| model.id != MODEL_A)
         );
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert!(
             persisted
                 .configured_models
@@ -4608,7 +4613,7 @@ mod model_mutation_tests {
         assert!(receipt.deleted);
         assert!(!receipt.activated);
         assert!(receipt.runtime.is_none());
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert!(persisted.configured_models.is_empty());
         assert!(persisted.model.default_model_id.is_none());
         assert_no_live_generation(&fixture).await
@@ -4628,7 +4633,7 @@ mod model_mutation_tests {
         assert!(receipt.deleted);
         assert!(!receipt.activated);
         assert!(receipt.config.model_providers.is_empty());
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert!(persisted.model_providers.is_empty());
         assert_no_live_generation(&fixture).await
     }
@@ -4738,7 +4743,7 @@ mod model_mutation_tests {
         let result = fixture.state.set_default_model_owned(MODEL_B).await;
 
         assert!(matches!(result, Err(ModelMutationError::Publication(_))));
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
         assert_eq!(
             agent_projection(&failing).await?,
@@ -4768,7 +4773,7 @@ mod model_mutation_tests {
         let result = fixture.state.set_default_model_owned(MODEL_B).await;
 
         assert!(matches!(result, Err(ModelMutationError::Publication(_))));
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
         assert_eq!(
             agent_projection(&inherited).await?,
@@ -4815,7 +4820,7 @@ mod model_mutation_tests {
             receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
             Some(MODEL_A)
         );
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
         assert_eq!(
             persisted
@@ -4866,7 +4871,7 @@ mod model_mutation_tests {
             receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
             Some(MODEL_B)
         );
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
         assert_session_generation(
             &fixture,
@@ -4895,7 +4900,7 @@ mod model_mutation_tests {
             receipt.runtime.as_ref().map(|runtime| runtime.id.as_str()),
             Some(MODEL_A)
         );
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
         assert!(
             persisted
@@ -4923,7 +4928,7 @@ mod model_mutation_tests {
         let result = fixture.state.upsert_model_provider_owned(mutation).await;
 
         assert!(matches!(result, Err(ModelMutationError::Validation(_))));
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(
             persisted
                 .model_providers
@@ -4969,7 +4974,7 @@ mod model_mutation_tests {
             .map_err(|error| error.to_string())?;
 
         assert!(!receipt.activated);
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert_eq!(persisted.model.default_model_id.as_deref(), Some(MODEL_A));
         assert_eq!(
             persisted
@@ -5018,7 +5023,7 @@ mod model_mutation_tests {
         assert!(receipt.deleted);
         assert!(!receipt.activated);
         assert!(receipt.runtime.is_none());
-        let persisted = echo_agent::config::load_config_file(&fixture.config_path)?;
+        let persisted = crate::config::load_config_file(&fixture.config_path)?;
         assert!(
             persisted
                 .configured_models

@@ -18,7 +18,7 @@ use echo_agent::agent::{
     Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity, envelope_event_stream,
 };
 use echo_agent::prelude::Message;
-use echo_core::tools::TraceSinkFn;
+use echo_agent::tools::TraceSinkFn;
 use futures::StreamExt;
 
 use crate::tasks::task_runtime::executor::ExecEvent;
@@ -1478,9 +1478,9 @@ async fn drive_chat_inner(
             active_run_id.clone(),
         )
         .map_err(|error| error.to_string())?;
-        let invocation = echo_core::agent::AgentInvocationContext {
+        let invocation = echo_agent::agent::AgentInvocationContext {
             history: None,
-            runtime: Some(echo_core::tools::ExternalRunContext {
+            runtime: Some(echo_agent::tools::ExternalRunContext {
                 conversation_id,
                 // A real pre-created Task-mode run is value-carried across
                 // framework spawns. Chat/Auto task tools derive their prospective
@@ -2007,7 +2007,7 @@ mod tests {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl echo_core::tools::Tool for CountingTool {
+    impl echo_agent::tools::Tool for CountingTool {
         fn name(&self) -> &str {
             "web_fetch"
         }
@@ -2022,12 +2022,12 @@ mod tests {
 
         fn execute<'a>(
             &'a self,
-            _parameters: echo_core::tools::ToolParameters,
-        ) -> futures::future::BoxFuture<'a, echo_core::error::Result<echo_core::tools::ToolResult>>
+            _parameters: echo_agent::tools::ToolParameters,
+        ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<echo_agent::tools::ToolResult>>
         {
             Box::pin(async move {
                 self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Ok(echo_core::tools::ToolResult::success("created"))
+                Ok(echo_agent::tools::ToolResult::success("created"))
             })
         }
     }
@@ -2036,7 +2036,7 @@ mod tests {
         observed: std::sync::Arc<std::sync::Mutex<Option<std::path::PathBuf>>>,
     }
 
-    impl echo_core::tools::Tool for WorkingDirProbeTool {
+    impl echo_agent::tools::Tool for WorkingDirProbeTool {
         fn name(&self) -> &str {
             "web_fetch"
         }
@@ -2051,16 +2051,16 @@ mod tests {
 
         fn execute_with_context<'a>(
             &'a self,
-            _parameters: echo_core::tools::ToolParameters,
-            context: &'a echo_core::tools::ToolContext,
-        ) -> futures::future::BoxFuture<'a, echo_core::error::Result<echo_core::tools::ToolResult>>
+            _parameters: echo_agent::tools::ToolParameters,
+            context: &'a echo_agent::tools::ToolContext,
+        ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<echo_agent::tools::ToolResult>>
         {
             Box::pin(async move {
                 *self
                     .observed
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner()) = context.working_dir.clone();
-                Ok(echo_core::tools::ToolResult::success("recorded"))
+                Ok(echo_agent::tools::ToolResult::success("recorded"))
             })
         }
     }
@@ -3841,7 +3841,7 @@ mod tests {
     async fn drive_chat_keeps_user_text_raw_and_projects_mode_contract() -> Result<(), String> {
         use echo_agent::agent::CancellationToken;
         use echo_agent::compression::is_context_projection_message;
-        use echo_core::llm::types::Role;
+        use echo_agent::llm::types::Role;
         use std::sync::Arc;
 
         let mock = Arc::new(

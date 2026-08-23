@@ -25,7 +25,7 @@ pub(crate) fn rollout_for_mode(_interaction_mode: InteractionMode) -> ToolOptimi
 
 pub(crate) fn record_mode_schema_budget(
     interaction_mode: InteractionMode,
-    definitions: &[echo_core::llm::types::ToolDefinition],
+    definitions: &[echo_agent::llm::types::ToolDefinition],
     visible: &HashSet<String>,
 ) {
     let rollout = rollout_for_mode(interaction_mode);

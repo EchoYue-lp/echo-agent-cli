@@ -8,12 +8,11 @@ description = "Shared state and infrastructure for EKO"
 
 [dependencies]
 echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", default-features = false, features = [
-    "mcp", "lsp", "human-loop", "subagent", "git", "tasks",
+    "mcp", "lsp", "human-loop", "subagent", "git",
     "shell", "files", "web",
     "chart", "research", "media",
-    "rag",
+    "rag", "project-rules",
 ] }
-echo-core = { version = "0.2", package = "echo_core", path = "../../echo-agent/echo-core" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

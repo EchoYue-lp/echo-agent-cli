@@ -40,12 +40,13 @@ use echo_agent::agent::AgentHandle;
 use echo_agent::agent::CancellationToken;
 use tokio::sync::{Notify, RwLock};
 
+use crate::config::EkoConfig;
 use crate::infra;
 use crate::model_config::ModelRuntimeConfig;
 use crate::plugin_components::{PreparedPluginAgent, register_plugin_agents};
 use crate::workspace::WorkspaceKind;
-use echo_agent::config::AppConfig;
 use echo_agent::mcp::McpConfigFile;
+use echo_agent::tools::permission::PermissionMode;
 
 const PROCESS_AGENT_EXECUTION_LIMIT: usize = 10;
 static PROCESS_AGENT_EXECUTION: std::sync::LazyLock<Arc<AgentExecutionGovernor>> =
@@ -513,10 +514,10 @@ pub struct AgentPool {
     admission: Arc<AgentPoolAdmission>,
     process_agent_execution: Arc<AgentExecutionGovernor>,
     config: PoolConfig,
-    app_config: RwLock<AppConfig>,
+    app_config: RwLock<EkoConfig>,
     /// Working directory applied to existing and future pooled agents.
     working_dir: RwLock<Option<std::path::PathBuf>>,
-    permission_mode: RwLock<String>,
+    permission_mode: RwLock<PermissionMode>,
     /// Exact plugin generation projected into existing and future agents.
     agent_generation: RwLock<AgentPluginGeneration>,
     /// Cancellation token for the cleanup monitor task.
@@ -562,7 +563,7 @@ pub(crate) struct PreparedAgentPoolModelPublication<'a> {
     _transition: AgentPoolWorkspaceTransition<'a>,
     _agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
     publications: Vec<infra::PreparedAgentModelPublication>,
-    app_config: AppConfig,
+    app_config: EkoConfig,
     runtime: ModelRuntimeConfig,
 }
 
@@ -571,7 +572,7 @@ pub(crate) struct PreparedAgentPoolModelDeactivation<'a> {
     _transition: AgentPoolWorkspaceTransition<'a>,
     _agents: tokio::sync::RwLockWriteGuard<'a, HashMap<String, PooledAgent>>,
     publications: Vec<infra::PreparedAgentModelDeactivation>,
-    app_config: AppConfig,
+    app_config: EkoConfig,
 }
 
 /// Pool-wide plugin publication. The existing workspace-transition admission
@@ -860,7 +861,7 @@ impl AgentPool {
             config,
             app_config: RwLock::new(runtime.session_app_config.clone()),
             working_dir: RwLock::new(working_dir),
-            permission_mode: RwLock::new("default".to_string()),
+            permission_mode: RwLock::new(PermissionMode::Default),
             agent_generation: RwLock::new(AgentPluginGeneration::new(
                 0,
                 skill_descriptors,
@@ -960,7 +961,7 @@ impl AgentPool {
             config: self.config.clone(),
             app_config: RwLock::new(self.app_config.read().await.clone()),
             working_dir: RwLock::new(Some(root.clone())),
-            permission_mode: RwLock::new(self.permission_mode.read().await.clone()),
+            permission_mode: RwLock::new(*self.permission_mode.read().await),
             agent_generation: RwLock::new(self.agent_generation.read().await.clone()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
@@ -1053,7 +1054,7 @@ impl AgentPool {
     #[cfg(test)]
     pub(crate) async fn for_model_mutation_test(
         primary: &AgentHandle,
-        app_config: AppConfig,
+        app_config: EkoConfig,
     ) -> Self {
         Self::new_for_test_with_config(primary, None, None, 8, false, app_config).await
     }
@@ -1066,7 +1067,7 @@ impl AgentPool {
         max_agents: usize,
         enable_background_agent: bool,
     ) -> Self {
-        let mut app_config = AppConfig::default();
+        let mut app_config = EkoConfig::default();
         app_config.model.provider = "test".to_string();
         app_config.model.name = "test-model".to_string();
         app_config.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());
@@ -1088,7 +1089,7 @@ impl AgentPool {
         store: Option<Arc<dyn echo_agent::memory::Store>>,
         max_agents: usize,
         enable_background_agent: bool,
-        app_config: AppConfig,
+        app_config: EkoConfig,
     ) -> Self {
         let mut shared = SharedResources::extract_from(agent, review_integration).await;
         if let Some(store) = store {
@@ -1113,7 +1114,7 @@ impl AgentPool {
             },
             app_config: RwLock::new(app_config),
             working_dir: RwLock::new(None),
-            permission_mode: RwLock::new("default".to_string()),
+            permission_mode: RwLock::new(PermissionMode::Default),
             agent_generation: RwLock::new(AgentPluginGeneration::default()),
             cleanup_cancel: CancellationToken::new(),
             cleanup_handle: Mutex::new(None),
@@ -1181,10 +1182,10 @@ impl AgentPool {
         // Fast path: reuse existing agent
         if let Some(existing) = agents.get_mut(conversation_id) {
             existing.last_used = Instant::now();
-            let permission_mode = self.permission_mode.read().await.clone();
+            let permission_mode = *self.permission_mode.read().await;
             let _updated = existing.handle.try_write(|agent| {
                 if agent.get_permission_mode() != permission_mode {
-                    agent.set_permission_mode(&permission_mode);
+                    agent.set_permission_mode(permission_mode);
                 }
             });
             let handle = existing.handle.clone();
@@ -1339,7 +1340,7 @@ impl AgentPool {
     }
 
     /// Update the pool's app config snapshot used for future agents.
-    pub async fn update_app_config(&self, app_config: AppConfig) {
+    pub async fn update_app_config(&self, app_config: EkoConfig) {
         let _agents = self.agents.write().await;
         *self.app_config.write().await = app_config;
     }
@@ -1367,7 +1368,7 @@ impl AgentPool {
     /// Admit every existing and future pool consumer before persistence.
     pub(crate) async fn prepare_model_publication(
         &self,
-        app_config: AppConfig,
+        app_config: EkoConfig,
         runtime: ModelRuntimeConfig,
         prepared: infra::PreparedRuntimeLlm,
     ) -> Result<PreparedAgentPoolModelPublication<'_>, String> {
@@ -1423,7 +1424,7 @@ impl AgentPool {
     /// Admit every pooled agent before removing the final active model.
     pub(crate) async fn prepare_model_deactivation(
         &self,
-        app_config: AppConfig,
+        app_config: EkoConfig,
     ) -> Result<PreparedAgentPoolModelDeactivation<'_>, String> {
         let transition = self
             .preflight_model_mutation()
@@ -1465,21 +1466,11 @@ impl AgentPool {
     /// The shared permission service is the authority used by tool execution,
     /// so it is updated first. Idle agents mirror the mode immediately; a busy
     /// agent refreshes its informational config on its next pool acquisition.
-    pub async fn apply_permission_mode(&self, mode: String) {
-        *self.permission_mode.write().await = mode.clone();
+    pub async fn apply_permission_mode(&self, mode: PermissionMode) {
+        *self.permission_mode.write().await = mode;
 
         if let Some(service) = &self.shared.permission_service {
-            use echo_agent::tools::permission::PermissionMode;
-
-            let framework_mode = match mode.as_str() {
-                "full-auto" => PermissionMode::BypassPermissions,
-                "auto-edit" | "accept-edits" => PermissionMode::AcceptEdits,
-                "strict" | "strict-confirm" | "strict-confirmation" => {
-                    PermissionMode::StrictConfirm
-                }
-                _ => PermissionMode::Default,
-            };
-            service.set_mode(framework_mode).await;
+            service.set_mode(mode).await;
             service.clear_cache();
         }
 
@@ -1493,11 +1484,10 @@ impl AgentPool {
 
         let mut updated_agents = 0usize;
         for handle in agents {
-            let mode = mode.clone();
             if handle
                 .try_write(|agent| {
                     if agent.get_permission_mode() != mode {
-                        agent.set_permission_mode(&mode);
+                        agent.set_permission_mode(mode);
                     }
                 })
                 .is_some()
@@ -2139,8 +2129,8 @@ impl AgentPool {
         if let Some(ref ps) = self.shared.permission_service {
             agent.set_permission_service(ps.clone());
         }
-        let permission_mode = self.permission_mode.read().await.clone();
-        agent.set_permission_mode(&permission_mode);
+        let permission_mode = *self.permission_mode.read().await;
+        agent.set_permission_mode(permission_mode);
 
         // 3. Install the exact plugin generation committed by PluginRuntime.
         let agent_generation = self.agent_generation.read().await.clone();
@@ -2830,14 +2820,14 @@ mod tests {
         let mut candidate = pool.app_config.read().await.clone();
         candidate.model_providers.insert(
             runtime.provider.clone(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 base_url: runtime.base_url.clone(),
                 ..Default::default()
             },
         );
         candidate
             .configured_models
-            .push(echo_agent::config::ConfiguredModel {
+            .push(crate::config::ConfiguredModel {
                 id: runtime.id.clone(),
                 display_name: runtime.display_name.clone(),
                 provider: runtime.provider.clone(),
@@ -2872,31 +2862,31 @@ mod tests {
         use echo_agent::agent::Agent;
 
         let agent = create_test_agent_handle()?;
-        let mut config = AppConfig {
+        let mut config = EkoConfig {
             configured_models: vec![
-                echo_agent::config::ConfiguredModel {
+                crate::config::ConfiguredModel {
                     id: "local:a".to_string(),
                     display_name: "A".to_string(),
                     provider: "local".to_string(),
                     model: "a".to_string(),
                     context_window: Some(100_000),
-                    ..echo_agent::config::ConfiguredModel::default()
+                    ..crate::config::ConfiguredModel::default()
                 },
-                echo_agent::config::ConfiguredModel {
+                crate::config::ConfiguredModel {
                     id: "local:b".to_string(),
                     display_name: "B".to_string(),
                     provider: "local".to_string(),
                     model: "b".to_string(),
                     context_window: Some(200_000),
-                    ..echo_agent::config::ConfiguredModel::default()
+                    ..crate::config::ConfiguredModel::default()
                 },
             ],
-            ..AppConfig::default()
+            ..EkoConfig::default()
         };
         config.model.default_model_id = Some("local:a".to_string());
         config.model_providers.insert(
             "local".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
                 ..Default::default()
@@ -3183,13 +3173,14 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
 
-        pool.apply_permission_mode("full-auto".to_string()).await;
+        pool.apply_permission_mode(PermissionMode::BypassPermissions)
+            .await;
 
         let first_mode = first
             .agent()
-            .read(|agent| agent.get_permission_mode().to_string())
+            .read(|agent| agent.get_permission_mode())
             .await;
-        assert_eq!(first_mode, "full-auto");
+        assert_eq!(first_mode, PermissionMode::BypassPermissions);
 
         let second = pool
             .acquire("conv-b")
@@ -3197,9 +3188,9 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let second_mode = second
             .agent()
-            .read(|agent| agent.get_permission_mode().to_string())
+            .read(|agent| agent.get_permission_mode())
             .await;
-        assert_eq!(second_mode, "full-auto");
+        assert_eq!(second_mode, PermissionMode::BypassPermissions);
         Ok(())
     }
 
@@ -3251,7 +3242,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(1),
-            pool.apply_permission_mode("full-auto".to_string()),
+            pool.apply_permission_mode(PermissionMode::BypassPermissions),
         )
         .await
         .map_err(|_| "permission update waited for a busy agent".to_string())?;
@@ -3263,9 +3254,9 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let refreshed_mode = refreshed
             .agent()
-            .read(|agent| agent.get_permission_mode().to_string())
+            .read(|agent| agent.get_permission_mode())
             .await;
-        assert_eq!(refreshed_mode, "full-auto");
+        assert_eq!(refreshed_mode, PermissionMode::BypassPermissions);
         Ok(())
     }
 

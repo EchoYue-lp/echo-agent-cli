@@ -140,7 +140,7 @@ impl Drop for ConversationLockRegistration<'_> {
 
 impl ConversationDeletionService {
     pub fn at_default_root() -> Self {
-        Self::new(echo_agent::paths::user_data_path("conversation-deletions"))
+        Self::new(crate::data_root::user_data_path("conversation-deletions"))
     }
 
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -528,7 +528,7 @@ impl ConversationDeletionService {
 
     fn read_tombstone(&self, path: &Path) -> Result<DeletionTombstone, ConversationDeletionError> {
         self.ensure_tombstone_root()?;
-        let bytes = echo_core::utils::fs::read_existing(path).map_err(|source| {
+        let bytes = echo_agent::utils::fs::read_existing(path).map_err(|source| {
             ConversationDeletionError::Io {
                 path: path.to_path_buf(),
                 source,
@@ -571,7 +571,7 @@ impl ConversationDeletionService {
                 message: error.to_string(),
             }
         })?;
-        echo_core::utils::fs::atomic_write(path, &bytes).map_err(|source| {
+        echo_agent::utils::fs::atomic_write(path, &bytes).map_err(|source| {
             ConversationDeletionError::Io {
                 path: path.to_path_buf(),
                 source,

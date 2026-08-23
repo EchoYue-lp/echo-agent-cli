@@ -84,7 +84,7 @@ impl FileTaskShadow {
 
     /// Default shadow root: `~/.eko/tasks/`.
     pub fn default_root() -> PathBuf {
-        echo_agent::paths::user_data_path("tasks")
+        crate::data_root::user_data_path("tasks")
     }
 
     pub(crate) fn root(&self) -> PathBuf {

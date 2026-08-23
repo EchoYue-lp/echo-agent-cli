@@ -99,7 +99,7 @@ impl SkillsHub {
 
     /// 默认技能目录
     pub fn default_skills_dir() -> PathBuf {
-        echo_agent::paths::user_data_path("skills")
+        crate::data_root::user_data_path("skills")
     }
 
     /// 重新扫描目录

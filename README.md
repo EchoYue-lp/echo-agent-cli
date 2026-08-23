@@ -34,7 +34,7 @@ EKO 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供
 echo-agent-cli/
 ├── Cargo.toml              # Rust 工作区配置（v1.0.0, edition 2024）
 ├── init.sh                 # 初始化脚本
-├── config/                 # 配置文件（echo-agent.yaml, mcp.json）
+├── config/                 # 配置文件（eko.yaml, mcp.json）
 ├── docs/                   # 项目文档（架构、配置、入门指南）
 ├── src/                    # 应用入口
 │   ├── main.rs             # TUI 主入口
@@ -92,7 +92,7 @@ cd web-frontend && npm install && cd ..
 
 GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_model_id`。用户可以创建多个 Provider，并在每个 Provider 下创建多个模型；每个模型明确选择 Chat Completions、Responses 或 Anthropic 协议，纯文本能力默认启用，并可追加图像、音频、视频能力。用户填写的 API Key 优先级高于 Provider 配置的环境变量。
 
-也可以通过 `echo-agent.yaml` 设置模型。完整配置参考：
+也可以通过 `eko.yaml` 设置模型。完整配置参考：
 
 - [配置指南](docs/configuration.md)
 
@@ -101,8 +101,8 @@ GUI、TUI 和 CLI 共享 `model_providers`、`configured_models` 和 `default_mo
 EKO 按以下优先级查找配置文件：
 
 1. 命令行参数: `--config <path>`
-2. 环境变量: `ECHO_AGENT_CONFIG`
-3. 当前目录: `./echo-agent.yaml`
+2. 环境变量: `EKO_CONFIG`
+3. 当前目录: `./eko.yaml`
 4. 用户目录: `~/.eko/config.yaml`
 
 MCP 配置优先级：`--mcp-config` → YAML `mcp.config_path` →

@@ -719,7 +719,7 @@ impl CommandCellRuntimeService {
                 delegate_depth: 0,
                 max_delegate_depth: 0,
             },
-            runtime_context: Some(echo_core::tools::ExternalRunContext {
+            runtime_context: Some(echo_agent::tools::ExternalRunContext {
                 conversation_id: Some(key.conversation_id.clone()),
                 run_id: key.run_id.clone(),
                 turn_id: context.turn_id.clone(),

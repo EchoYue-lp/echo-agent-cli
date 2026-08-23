@@ -119,7 +119,7 @@ impl UnifiedMemory {
     /// Get the file path for a given instruction tier.
     fn instruction_path(&self, tier: InstructionTier) -> Result<PathBuf, String> {
         match tier {
-            InstructionTier::User => Ok(echo_agent::paths::user_data_path("user.md")),
+            InstructionTier::User => Ok(crate::data_root::user_data_path("user.md")),
             InstructionTier::Project => {
                 let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
                 let root =

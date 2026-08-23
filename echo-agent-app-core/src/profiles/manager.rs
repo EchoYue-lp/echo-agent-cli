@@ -22,7 +22,7 @@ impl ProfileManager {
 
     /// 存储基础路径
     pub fn base_dir() -> PathBuf {
-        echo_agent::paths::user_data_path("profiles")
+        crate::data_root::user_data_path("profiles")
     }
 
     // ── CRUD 操作 ────────────────────────────────────────

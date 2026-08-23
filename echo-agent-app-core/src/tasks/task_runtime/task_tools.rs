@@ -180,7 +180,7 @@ pub(crate) fn formal_run_id_for_turn(turn_id: &str) -> String {
 }
 
 pub(crate) fn trace_sink_from_tool_context(
-    ctx: &echo_core::tools::ToolContext,
+    ctx: &echo_agent::tools::ToolContext,
 ) -> Option<TraceSink> {
     ctx.trace_sink.as_ref().map(|sink| {
         let sink = sink.clone();
@@ -204,7 +204,7 @@ pub(crate) fn trace_sink_from_tool_context(
 /// ToolContext 的值(跨 spawn 安全)。`ctx.trace_sink` 是框架 Value 形式,
 /// 这里反序列化回 `ExecEvent` 包装成 `TraceSink` 注入 task_local。
 pub(crate) async fn scoped_with_ctx_run_id<F, Fut, R>(
-    ctx: &echo_core::tools::ToolContext,
+    ctx: &echo_agent::tools::ToolContext,
     f: F,
 ) -> R
 where
@@ -279,7 +279,7 @@ mod tests {
     async fn tool_context_scopes_run_and_cancellation_together() -> std::result::Result<(), String>
     {
         let parent_cancel = tokio_util::sync::CancellationToken::new();
-        let ctx = echo_core::tools::ToolContext {
+        let ctx = echo_agent::tools::ToolContext {
             run_id: Some("run-context".to_string()),
             cancel: Some(Arc::new(parent_cancel.clone())),
             ..Default::default()
@@ -537,7 +537,7 @@ mod task_create_tests {
             "description": "由多个 Subagent 分析当前项目",
             "kind": "read_only_review"
         }));
-        let ctx = echo_core::tools::ToolContext {
+        let ctx = echo_agent::tools::ToolContext {
             conversation_id: Some("conversation-identity".to_string()),
             run_id: Some(run_id.to_string()),
             turn_id: Some("turn-identity".to_string()),
@@ -832,7 +832,7 @@ impl Tool for CreateComplexTaskTool {
     fn execute_with_context<'a>(
         &'a self,
         params: ToolParameters,
-        _ctx: &'a echo_core::tools::ToolContext,
+        _ctx: &'a echo_agent::tools::ToolContext,
     ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move { self.do_create(params).await })
     }
@@ -1125,7 +1125,7 @@ impl Tool for CheckRunStatusTool {
     fn execute_with_context<'a>(
         &'a self,
         params: ToolParameters,
-        _ctx: &'a echo_core::tools::ToolContext,
+        _ctx: &'a echo_agent::tools::ToolContext,
     ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move { Self::do_check(params).await })
     }
@@ -1186,7 +1186,7 @@ impl Tool for CancelRunTool {
     fn execute_with_context<'a>(
         &'a self,
         params: ToolParameters,
-        _ctx: &'a echo_core::tools::ToolContext,
+        _ctx: &'a echo_agent::tools::ToolContext,
     ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move { Self::do_cancel(params).await })
     }

@@ -1080,7 +1080,7 @@ pub struct ReplConfig {
     pub task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     /// Persisted conversation identity for the shared chat driver.
     pub conversation_id: String,
-    /// Shared webhook emitter (built from `AppConfig.webhooks` at bootstrap).
+    /// Shared webhook emitter (built from `EkoConfig.webhooks` at bootstrap).
     /// `None` means no endpoints configured — emit calls are skipped cheaply.
     pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
     /// Authoritative application state used by workspace and other stateful commands.
@@ -1091,7 +1091,7 @@ impl Default for ReplConfig {
     fn default() -> Self {
         Self {
             prompt: "echo".to_string(),
-            history_file: echo_agent::paths::user_data_path("history.txt")
+            history_file: echo_agent_app_core::data_root::user_data_path("history.txt")
                 .to_string_lossy()
                 .into_owned(),
             mode: "general".to_string(),

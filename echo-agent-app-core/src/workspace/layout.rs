@@ -19,7 +19,7 @@ impl WorkspaceLayout {
     /// 工作区基础目录：`~/.eko/workspaces/`
     ///
     pub fn base_dir() -> PathBuf {
-        echo_agent::paths::user_data_path("workspaces")
+        crate::data_root::user_data_path("workspaces")
     }
 
     /// 工作区根目录：`~/.eko/workspaces/{id}/`

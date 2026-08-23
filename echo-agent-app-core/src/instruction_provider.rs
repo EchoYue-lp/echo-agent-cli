@@ -97,7 +97,7 @@ impl InstructionProvider {
                 .map(|root| root.join(".eko").join("project.md"))
                 .as_deref(),
         )?;
-        let user_path = echo_agent::paths::user_data_path("user.md");
+        let user_path = crate::data_root::user_data_path("user.md");
         let user_level = strict_optional_text(Some(&user_path))?;
         let repository_level =
             strict_repository_instructions(working_dir, project_root.as_deref())?;
@@ -111,7 +111,7 @@ impl InstructionProvider {
         let project_memory = project_root
             .as_deref()
             .map(|root| root.join(".eko").join("MEMORY.md"));
-        let global_memory = echo_agent::paths::user_data_path("MEMORY.md");
+        let global_memory = crate::data_root::user_data_path("MEMORY.md");
         let hot_memory = match project_memory.as_deref() {
             Some(path) if path.try_exists()? => strict_optional_text(Some(path))?,
             _ => strict_optional_text(Some(&global_memory))?,
@@ -230,7 +230,7 @@ impl InstructionProvider {
 
     /// Load user-level instructions from `~/.eko/user.md`.
     fn load_user_instructions() -> Option<String> {
-        Some(echo_agent::paths::user_data_path("user.md"))
+        Some(crate::data_root::user_data_path("user.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
@@ -245,7 +245,7 @@ impl InstructionProvider {
     ) -> Option<String> {
         let working_dir = working_dir?;
         let resolver =
-            echo_core::project_rules::InstructionResolver::new(working_dir).agents_files_only();
+            echo_agent::project_rules::InstructionResolver::new(working_dir).agents_files_only();
         let resolved = match project_root {
             Some(root) => resolver.project_root(root).resolve(),
             None => resolver.resolve(),
@@ -289,7 +289,7 @@ impl InstructionProvider {
 
     /// Path to the user-level instructions file.
     fn user_instructions_path() -> PathBuf {
-        echo_agent::paths::user_data_path("user.md")
+        crate::data_root::user_data_path("user.md")
     }
 
     /// Load hot-layer memory content from `.eko/MEMORY.md`.
@@ -299,7 +299,7 @@ impl InstructionProvider {
         let project_path = project_root.map(|root| root.join(".eko").join("MEMORY.md"));
         let path = project_path
             .filter(|path| path.exists())
-            .unwrap_or_else(|| echo_agent::paths::user_data_path("MEMORY.md"));
+            .unwrap_or_else(|| crate::data_root::user_data_path("MEMORY.md"));
         let raw = std::fs::read_to_string(path).ok()?;
 
         Some(crate::utils::strip_yaml_frontmatter(&raw))
@@ -351,7 +351,7 @@ impl InstructionProvider {
 
     /// Save auto-promoted rules to one previously resolved authority path.
     pub fn save_agents_instructions_at(path: &Path, content: &str) -> std::io::Result<()> {
-        echo_core::utils::fs::atomic_write(path, content.as_bytes())
+        echo_agent::utils::fs::atomic_write(path, content.as_bytes())
     }
 }
 

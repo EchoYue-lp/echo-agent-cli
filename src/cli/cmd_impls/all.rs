@@ -258,7 +258,7 @@ async fn cmd_memory(_: &CommandContext, args: &[&str]) -> CommandOutcome {
             println!("\n📝 Project Memory\n");
 
             // User-level: ~/.eko/user.md
-            let user_path = echo_agent::paths::user_data_path("user.md");
+            let user_path = echo_agent_app_core::data_root::user_data_path("user.md");
             print_memory_tier("User", &user_path);
 
             // Project-level: <project-root>/.eko/project.md

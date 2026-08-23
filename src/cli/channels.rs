@@ -72,7 +72,7 @@ fn channel_render_event_stream(
     mut prompt_rx: tokio::sync::broadcast::Receiver<String>,
     mut terminal_rx: tokio::sync::oneshot::Receiver<echo_agent_app_core::chat_driver::TurnOutcome>,
     stream_drop_guard: ChannelStreamDropGuard,
-) -> futures::stream::BoxStream<'static, echo_core::error::Result<ChannelRenderEvent>> {
+) -> futures::stream::BoxStream<'static, echo_agent::error::Result<ChannelRenderEvent>> {
     use futures::StreamExt;
 
     async_stream::stream! {
@@ -832,7 +832,7 @@ impl Drop for AppChannelMessageHandler {
 fn immediate_channel_response<'a>(
     msg: &echo_agent::channels::InboundMessage,
     message: impl Into<String>,
-) -> futures::stream::BoxStream<'a, echo_core::error::Result<echo_agent::channels::OutboundMessage>>
+) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
 {
     use futures::StreamExt;
 
@@ -982,7 +982,7 @@ fn channel_terminal_stream(
     terminal_id: String,
 ) -> futures::stream::BoxStream<
     'static,
-    echo_core::error::Result<echo_agent::channels::OutboundMessage>,
+    echo_agent::error::Result<echo_agent::channels::OutboundMessage>,
 > {
     use futures::StreamExt;
 
@@ -1047,7 +1047,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     async fn handle(
         &self,
         msg: echo_agent::channels::InboundMessage,
-    ) -> echo_core::error::Result<echo_agent::channels::OutboundMessage> {
+    ) -> echo_agent::error::Result<echo_agent::channels::OutboundMessage> {
         use futures::StreamExt;
 
         let channel_id = msg.channel_id.clone();
@@ -1070,10 +1070,10 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     async fn handle_stream<'a>(
         &'a self,
         msg: echo_agent::channels::InboundMessage,
-    ) -> echo_core::error::Result<
+    ) -> echo_agent::error::Result<
         futures::stream::BoxStream<
             'a,
-            echo_core::error::Result<echo_agent::channels::OutboundMessage>,
+            echo_agent::error::Result<echo_agent::channels::OutboundMessage>,
         >,
     > {
         let developer_command = match parse_developer_command(&msg.text) {
@@ -1503,7 +1503,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     async fn reply(
         &self,
         _msg: echo_agent::channels::OutboundMessage,
-    ) -> echo_core::error::Result<()> {
+    ) -> echo_agent::error::Result<()> {
         // 实际发送由插件 wrapper（QqMessageHandler / FeishuMessageHandler）的 reply 承担
         //（wrapper 拦截 reply -> send_tx -> IM API）。inner reply 保持 no-op，
         // 与原 AgentChannelHandler::reply 一致。
@@ -1742,15 +1742,15 @@ fn is_sentence_end(c: char) -> bool {
 /// (AGENTS.md §1);无 unwrap/expect(§2)。
 #[cfg(feature = "channels")]
 async fn aggregate_by_sentence<'a>(
-    mut events: futures::stream::BoxStream<'a, echo_core::error::Result<ChannelRenderEvent>>,
+    mut events: futures::stream::BoxStream<'a, echo_agent::error::Result<ChannelRenderEvent>>,
     channel_id: String,
     to: String,
     chat_type: echo_agent::channels::ChatType,
-) -> futures::stream::BoxStream<'a, echo_core::error::Result<echo_agent::channels::OutboundMessage>>
+) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
 {
+    use echo_agent::agent::AgentEvent;
     use echo_agent::channels::OutboundMessage;
     use echo_agent_app_core::chat_driver::ChatDriverEvent;
-    use echo_core::agent::AgentEvent;
     use futures::StreamExt;
 
     let s = async_stream::try_stream! {
@@ -2318,9 +2318,9 @@ mod tests {
     #[cfg(feature = "channels")]
     mod aggregate {
         use super::super::{ChannelRenderEvent, FLUSH_THRESHOLD, aggregate_by_sentence};
+        use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
         use echo_agent::channels::{ChatType, OutboundMessage};
-        use echo_core::agent::{AgentEvent, EventEnvelope, EventIdentity};
-        use echo_core::error::Result;
+        use echo_agent::error::Result;
         use futures::stream::{BoxStream, StreamExt};
         fn events_to_stream(
             events: Vec<Result<AgentEvent>>,

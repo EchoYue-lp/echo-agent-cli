@@ -20,7 +20,7 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         println!("\n--- Registered Hooks ({}) ---", sources.len());
                         if sources.is_empty() {
                             println!("  No hooks registered.");
-                            println!("  Configure hooks in ~/.eko/hooks.yaml or echo-agent.yaml");
+                            println!("  Configure hooks in ~/.eko/hooks.yaml or eko.yaml");
                         } else {
                             for (name, count) in &sources {
                                 println!("  * {} ({} rules)", name, count);
@@ -31,10 +31,10 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 .await;
         }
         "reload" => {
-            // P0-1: 从磁盘重读**所有** user hook 来源(echo-agent.yaml 内嵌
+            // P0-1: 从磁盘重读**所有** user hook 来源(eko.yaml 内嵌
             // + ~/.eko/hooks.yaml + .eko/hooks.yaml),合并成单个 definition
             // 后一次性 register。旧实现只 reload 文件 hooks、不重读
-            // echo-agent.yaml,导致 reload 后内嵌 hooks 永久丢失。
+            // eko.yaml,导致 reload 后内嵌 hooks 永久丢失。
             let load_result =
                 echo_agent_app_core::hook_config_loader::HookConfigLoader::load_merged_from_disk();
             if !load_result.errors.is_empty() {
@@ -60,10 +60,10 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 .await;
             if is_empty {
                 println!("No hooks found in config sources.");
-                println!("  Checked: echo-agent.yaml, ~/.eko/hooks.yaml, .eko/hooks.yaml");
+                println!("  Checked: eko.yaml, ~/.eko/hooks.yaml, .eko/hooks.yaml");
             } else {
                 println!("Loaded {} rules from:", rule_count);
-                println!("  - echo-agent.yaml (inline)");
+                println!("  - eko.yaml (inline)");
                 for path in &load_result.loaded_from {
                     println!("  - {}", path.display());
                 }

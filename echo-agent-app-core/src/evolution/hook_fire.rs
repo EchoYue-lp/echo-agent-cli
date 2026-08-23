@@ -10,7 +10,7 @@
 
 use echo_agent::agent::AgentHandle;
 use echo_agent::evolution::{EvolutionObserver, HookEvolutionObserver};
-use echo_core::hooks::{HookContext, HookEvent};
+use echo_agent::hooks::{HookContext, HookEvent};
 use std::sync::Arc;
 
 /// Build the framework adapter for this agent's shared HookRegistry.

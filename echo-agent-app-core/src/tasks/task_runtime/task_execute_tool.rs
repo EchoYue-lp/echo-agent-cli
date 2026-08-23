@@ -540,7 +540,7 @@ impl Tool for ExecuteTaskTool {
     fn execute_with_context<'a>(
         &'a self,
         params: echo_agent::tools::ToolParameters,
-        ctx: &'a echo_core::tools::ToolContext,
+        ctx: &'a echo_agent::tools::ToolContext,
     ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
             let conversation_id = ctx.conversation_id.clone();
@@ -558,7 +558,7 @@ impl Tool for ExecuteTaskTool {
 }
 
 fn compact_completed_task_result(
-    ctx: &echo_core::tools::ToolContext,
+    ctx: &echo_agent::tools::ToolContext,
     mut result: ToolResult,
 ) -> echo_agent::error::Result<ToolResult> {
     if !result.success || !result.output.contains("各 subagent 的产出如下") {
@@ -569,9 +569,9 @@ fn compact_completed_task_result(
     };
     config.threshold_bytes = 1;
     let full_output = result.output.clone();
-    let artifact = match echo_core::tools::artifact::persist_tool_output(
+    let artifact = match echo_agent::tools::artifact::persist_tool_output(
         config,
-        echo_core::tools::artifact::ToolOutputArtifactIdentity::from_context(ctx, "task_execute"),
+        echo_agent::tools::artifact::ToolOutputArtifactIdentity::from_context(ctx, "task_execute"),
         &full_output,
     ) {
         Ok(artifact) => artifact,

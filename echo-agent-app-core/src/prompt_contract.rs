@@ -1,6 +1,6 @@
 //! Static prompt contract auditing for EKO-owned prompt surfaces.
 
-use echo_core::tokenizer::{HeuristicTokenizer, Tokenizer};
+use echo_agent::tokenizer::{HeuristicTokenizer, Tokenizer};
 
 pub const DEMO_PHRASES: &[&str] = &[
     "you are a helpful assistant",

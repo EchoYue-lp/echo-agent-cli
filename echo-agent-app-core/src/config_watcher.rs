@@ -125,7 +125,7 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
     if let Some(p) = explicit {
         return Some(anchor_to_current_dir(PathBuf::from(p)));
     }
-    echo_agent::config::config_search_paths()
+    crate::config::config_search_paths()
         .into_iter()
         .find(|path| path.exists())
         .map(anchor_to_current_dir)
@@ -136,10 +136,10 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
 /// working directory.
 pub fn resolve_config_save_path(explicit: Option<&str>) -> PathBuf {
     let selected = resolve_config_path(explicit).unwrap_or_else(|| {
-        echo_agent::config::config_search_paths()
+        crate::config::config_search_paths()
             .into_iter()
             .nth(1)
-            .unwrap_or_else(|| echo_agent::paths::user_data_path("config.yaml"))
+            .unwrap_or_else(|| crate::data_root::user_data_path("config.yaml"))
     });
     anchor_to_current_dir(selected)
 }
@@ -459,7 +459,7 @@ fn config_watch_targets<'a>(
     if let Some(path) = config_path {
         targets.push(path.to_path_buf());
     }
-    targets.push(echo_agent::paths::user_data_path("hooks.yaml"));
+    targets.push(crate::data_root::user_data_path("hooks.yaml"));
     targets.extend(
         workspace_roots
             .into_iter()
@@ -523,8 +523,8 @@ async fn handle_config_change(
     if let Some(emitter) = webhook_emitter {
         let new_config = config_path
             .and_then(Path::to_str)
-            .map(|path| echo_agent::config::load_config(Some(path)))
-            .unwrap_or_else(|| echo_agent::config::load_config(None));
+            .map(|path| crate::config::load_config(Some(path)))
+            .unwrap_or_else(|| crate::config::load_config(None));
         emitter.reload_from_config(&new_config).await;
     }
 }
@@ -597,7 +597,7 @@ mod tests {
         let targets = config_watch_targets(Some(&app), [current.as_path()]);
 
         assert!(targets.contains(&app));
-        assert!(targets.contains(&echo_agent::paths::user_data_path("hooks.yaml")));
+        assert!(targets.contains(&crate::data_root::user_data_path("hooks.yaml")));
         assert!(targets.contains(&current.join(".eko/hooks.yaml")));
         Ok(())
     }

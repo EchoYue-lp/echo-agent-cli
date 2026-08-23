@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use echo_agent::config::AppConfig;
+use crate::config::EkoConfig;
 use echo_agent::mcp::{McpConfigFile, McpServerEntry};
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -55,7 +55,7 @@ pub enum McpConfigRuntimeError {
 /// Precedence is CLI override, application YAML, environment, then EKO's
 /// user-data `mcp.json`. The default path is returned even before the file
 /// exists so the first GUI mutation has an unambiguous durable destination.
-pub fn resolve_mcp_config_path(cli_override: Option<&str>, app_config: &AppConfig) -> PathBuf {
+pub fn resolve_mcp_config_path(cli_override: Option<&str>, app_config: &EkoConfig) -> PathBuf {
     let env_override = std::env::var("MCP_CONFIG_PATH").ok();
     resolve_mcp_config_path_sources(
         cli_override,
@@ -73,7 +73,7 @@ fn resolve_mcp_config_path_sources(
         .map(PathBuf::from)
         .or_else(|| yaml_config.map(PathBuf::from))
         .or_else(|| env_override.map(PathBuf::from))
-        .unwrap_or_else(|| echo_agent::paths::user_data_path("mcp.json"))
+        .unwrap_or_else(|| crate::data_root::user_data_path("mcp.json"))
 }
 
 /// Parse one configuration snapshot. A missing file is an empty initial
@@ -645,7 +645,7 @@ impl McpConfigRuntime {
                     )
                 })?;
             }
-            echo_core::utils::fs::atomic_write(&write_path, &bytes)
+            echo_agent::utils::fs::atomic_write(&write_path, &bytes)
         })
         .await
         .map_err(|error| McpConfigRuntimeError::WriterTask(error.to_string()))?
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn cli_override_selects_the_canonical_path() {
-        let mut app_config = AppConfig::default();
+        let mut app_config = EkoConfig::default();
         app_config.mcp.config_path = Some("from-yaml.json".to_string());
         assert_eq!(
             resolve_mcp_config_path(Some("from-cli.json"), &app_config),

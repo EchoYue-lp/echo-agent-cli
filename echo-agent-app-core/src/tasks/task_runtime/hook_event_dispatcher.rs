@@ -33,8 +33,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use echo_agent::hooks::{SubagentStopStatus, TaskTerminalStatus};
 use echo_agent::hooks_bridge::{HookCorrelation, SubagentHookBridge, TaskHookBridge};
-use echo_core::hooks::{SubagentStopStatus, TaskTerminalStatus};
 use serde_json::Value;
 
 use super::types::{RuntimeEventKind, RuntimeTaskEvent};

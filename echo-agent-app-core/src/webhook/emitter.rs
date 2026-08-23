@@ -6,7 +6,7 @@
 //!
 //! 没有 global singleton。`WebhookEmitter` 通过 `AppState.webhook.emitter`
 //! (GUI/TUI/channel) 或 `ReplConfig.webhook_emitter` (CLI) 注入。一个进程
-//! 内可以有多个独立 emitter，但通常只有一个，从 `AppConfig.webhooks` 构建。
+//! 内可以有多个独立 emitter，但通常只有一个，从 `EkoConfig.webhooks` 构建。
 //! 之前的 `init_global` / `emit_global` / `global_emitter` 被移除，因为
 //! `init_global` 从未被调用 → 全局 emitter 永远没有 endpoints → 之前的
 //! `emit_global(...)` 调用全是 no-op，掩盖了"webhook 实际上没生效"的真实状态。
@@ -64,7 +64,7 @@ impl WebhookEmitter {
     }
 
     /// Build the product emitter from the canonical application config.
-    pub fn from_config(config: &echo_agent::config::AppConfig) -> Self {
+    pub fn from_config(config: &crate::config::EkoConfig) -> Self {
         Self::with_endpoints(
             config
                 .webhooks
@@ -85,7 +85,7 @@ impl WebhookEmitter {
     }
 
     /// Reload endpoint configuration from the canonical application config.
-    pub async fn reload_from_config(&self, config: &echo_agent::config::AppConfig) {
+    pub async fn reload_from_config(&self, config: &crate::config::EkoConfig) {
         let replacement = config
             .webhooks
             .endpoints
@@ -141,7 +141,7 @@ impl WebhookEmitter {
                 data: event,
             };
             let body = match serde_json::to_value(&payload).and_then(|mut value| {
-                echo_core::utils::retention::ContentRetentionPolicy {
+                echo_agent::utils::retention::ContentRetentionPolicy {
                     max_string_chars: 4_096,
                     max_array_items: 256,
                 }
@@ -234,7 +234,7 @@ mod tests {
             },
         };
         let mut value = serde_json::to_value(payload).map_err(|error| error.to_string())?;
-        echo_core::utils::retention::ContentRetentionPolicy {
+        echo_agent::utils::retention::ContentRetentionPolicy {
             max_string_chars: 4_096,
             max_array_items: 256,
         }

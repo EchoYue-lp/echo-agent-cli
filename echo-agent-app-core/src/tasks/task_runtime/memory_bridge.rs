@@ -423,8 +423,8 @@ mod tests {
     #[tokio::test]
     async fn completed_run_memory_is_recallable_after_settlement() -> Result<(), String> {
         use echo_agent::evolution::{MemoryRecaller, ReviewConfig};
+        use echo_agent::memory::store::Store;
         use echo_agent::workspace::state::memory::store::InMemoryStore;
-        use echo_core::memory::store::Store;
 
         // Real backing store; keep a clone for direct recall.
         let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());

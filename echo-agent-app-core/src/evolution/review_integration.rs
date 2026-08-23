@@ -683,7 +683,7 @@ impl ReviewIntegration {
             })?;
         super::fire_evolution_hook(
             &primary,
-            echo_core::hooks::HookEvent::RulePromoted,
+            echo_agent::hooks::HookEvent::RulePromoted,
             &receipt.memory_key,
         )
         .await;
@@ -1054,8 +1054,7 @@ impl ReviewIntegration {
 
         // ── Skill candidate detection ──────────────────────────────
         if self.config.detect_skill_candidates {
-            let mut detector =
-                SkillCandidateDetector::new().with_curator(workspace_curator(&echo_agent_dir));
+            let mut detector = SkillCandidateDetector::new(workspace_curator(&echo_agent_dir));
             if let Some(observer) = self.current_evolution_observer() {
                 detector = detector.with_evolution_observer(observer);
             }

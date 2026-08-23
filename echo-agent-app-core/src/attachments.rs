@@ -65,7 +65,7 @@ pub fn resolve_uploads_dir(workspace_root: Option<&Path>) -> PathBuf {
     if let Some(root) = workspace_root {
         crate::workspace::layout::WorkspaceLayout::uploads(root)
     } else {
-        echo_agent::paths::user_data_path("uploads")
+        crate::data_root::user_data_path("uploads")
     }
 }
 
@@ -170,10 +170,12 @@ pub fn save_attachment(att: &AttachmentData, uploads_dir: &Path) -> Result<PathB
 
     let file_name = format!("{}_{}", uuid::Uuid::new_v4(), base);
     let path = uploads_dir.join(file_name);
-    echo_core::utils::fs::atomic_write(&path, &bytes).map_err(|source| AttachmentError::Write {
-        name: att.name.clone(),
-        path: path.clone(),
-        source,
+    echo_agent::utils::fs::atomic_write(&path, &bytes).map_err(|source| {
+        AttachmentError::Write {
+            name: att.name.clone(),
+            path: path.clone(),
+            source,
+        }
     })?;
     Ok(path)
 }
@@ -385,8 +387,9 @@ fn restore_retired_staging(
                 "staging path reappeared before restoration",
             )),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                std::fs::read(&item.scoped_path)
-                    .and_then(|bytes| echo_core::utils::fs::atomic_write(&item.staged_path, &bytes))
+                std::fs::read(&item.scoped_path).and_then(|bytes| {
+                    echo_agent::utils::fs::atomic_write(&item.staged_path, &bytes)
+                })
             }
             Err(error) => Err(error),
         };
@@ -611,7 +614,7 @@ mod tests {
             .collect();
         let msg = build_message_from_refs("look", &refs).map_err(|error| error.to_string())?;
         // Multimodal message: 1 text + 1 image part.
-        let echo_core::llm::types::MessageContent::Parts(parts) = &msg.content else {
+        let echo_agent::llm::types::MessageContent::Parts(parts) = &msg.content else {
             return Err(format!("expected Parts, got {:?}", msg.content));
         };
         assert_eq!(parts.len(), 2);
@@ -631,7 +634,7 @@ mod tests {
             .map(|(p, a)| AttachmentRef::from_saved(p.clone(), a))
             .collect();
         let msg = build_message_from_refs("see notes", &refs).map_err(|error| error.to_string())?;
-        let echo_core::llm::types::MessageContent::Parts(parts) = &msg.content else {
+        let echo_agent::llm::types::MessageContent::Parts(parts) = &msg.content else {
             return Err(format!("expected Parts, got {:?}", msg.content));
         };
         assert_eq!(parts.len(), 2);

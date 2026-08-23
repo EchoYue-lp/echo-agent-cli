@@ -108,7 +108,7 @@ pub fn resolve_user_input_spill_dir(workspace_root: Option<&Path>) -> PathBuf {
     if let Some(root) = workspace_root {
         crate::workspace::layout::WorkspaceLayout::user_input_artifacts(root)
     } else {
-        echo_agent::paths::user_data_path("artifacts").join("user-input")
+        crate::data_root::user_data_path("artifacts").join("user-input")
     }
 }
 
@@ -678,7 +678,7 @@ fn persist_inline_resource(
     let nonce = uuid::Uuid::new_v4();
     let safe_name = path_component(&attachment.name);
     let final_path = directory.join(format!("{nonce}-{safe_name}"));
-    echo_core::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
+    echo_agent::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
         PreparedTurnError::Write {
             path: final_path.clone(),
             source,
@@ -727,7 +727,7 @@ fn spill_to_artifact(
     })?;
 
     let bytes = text.as_bytes();
-    echo_core::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
+    echo_agent::utils::fs::atomic_write(&final_path, bytes).map_err(|source| {
         PreparedTurnError::Write {
             path: final_path.clone(),
             source,

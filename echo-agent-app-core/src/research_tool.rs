@@ -2,10 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
+use echo_agent::error::Result;
+use echo_agent::tools::permission::ToolPermission;
 use echo_agent::tools::research::ZoteroLibraryKind;
-use echo_core::error::Result;
-use echo_core::tools::permission::ToolPermission;
-use echo_core::tools::{Tool, ToolParameters, ToolResult, ToolRiskLevel};
+use echo_agent::tools::{Tool, ToolParameters, ToolResult, ToolRiskLevel};
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,7 +73,7 @@ impl Tool for ResearchLibraryTool {
     fn execute_with_context<'a>(
         &'a self,
         parameters: ToolParameters,
-        context: &'a echo_core::tools::ToolContext,
+        context: &'a echo_agent::tools::ToolContext,
     ) -> BoxFuture<'a, Result<ToolResult>> {
         Box::pin(async move {
             let action = match parameters.get("action").and_then(Value::as_str) {
@@ -232,7 +232,7 @@ fn parse_export_format(value: &str) -> crate::research::ResearchResult<ReviewExp
     }
 }
 
-fn workspace_root(context: &echo_core::tools::ToolContext) -> PathBuf {
+fn workspace_root(context: &echo_agent::tools::ToolContext) -> PathBuf {
     context
         .working_dir
         .as_ref()

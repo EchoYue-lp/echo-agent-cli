@@ -1,4 +1,4 @@
-use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
+use crate::config::{ConfiguredModel, EkoConfig, ModelProviderConfig};
 use echo_agent::llm::core::capabilities::{
     ThinkingProfile, infer_context_window, resolve_thinking_profile,
 };
@@ -159,7 +159,7 @@ pub fn find_env_api_key(provider: &ModelProviderConfig) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-pub fn configured_provider_views(config: &AppConfig) -> Vec<ModelProviderView> {
+pub fn configured_provider_views(config: &EkoConfig) -> Vec<ModelProviderView> {
     config
         .model_providers
         .iter()
@@ -203,7 +203,7 @@ pub fn configured_provider_views(config: &AppConfig) -> Vec<ModelProviderView> {
         .collect()
 }
 
-pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
+pub fn configured_model_views(config: &EkoConfig) -> Vec<ConfiguredModelView> {
     if config.configured_models.is_empty() {
         return Vec::new();
     }
@@ -272,7 +272,7 @@ fn effective_context_window(model: &ConfiguredModel) -> u32 {
 }
 
 pub fn upsert_model_provider(
-    config: &mut AppConfig,
+    config: &mut EkoConfig,
     provider_id: &str,
     mut provider: ModelProviderConfig,
 ) -> Result<String, String> {
@@ -308,7 +308,7 @@ pub fn upsert_model_provider(
     Ok(provider_id)
 }
 
-pub fn delete_model_provider(config: &mut AppConfig, provider_id: &str) -> Result<usize, String> {
+pub fn delete_model_provider(config: &mut EkoConfig, provider_id: &str) -> Result<usize, String> {
     if !config.model_providers.contains_key(provider_id) {
         return Err(format!("Provider '{provider_id}' is not configured"));
     }
@@ -347,7 +347,7 @@ pub fn delete_model_provider(config: &mut AppConfig, provider_id: &str) -> Resul
 }
 
 pub fn upsert_configured_model(
-    config: &mut AppConfig,
+    config: &mut EkoConfig,
     mut model: ConfiguredModel,
 ) -> Result<String, String> {
     model.provider = slug(&model.provider);
@@ -386,7 +386,7 @@ pub fn upsert_configured_model(
 }
 
 pub fn set_default_model(
-    config: &mut AppConfig,
+    config: &mut EkoConfig,
     model_id: &str,
 ) -> Result<ModelRuntimeConfig, String> {
     let model = config
@@ -414,9 +414,9 @@ pub fn set_default_model(
 /// current process. A startup selector changes only this session view; durable
 /// configuration remains owned by the model-mutation transaction.
 pub fn session_config_for_runtime(
-    config: &AppConfig,
+    config: &EkoConfig,
     runtime: &ModelRuntimeConfig,
-) -> Result<AppConfig, String> {
+) -> Result<EkoConfig, String> {
     let mut session = config.clone();
     if session
         .configured_models
@@ -436,7 +436,7 @@ pub enum DeleteConfiguredModelOutcome {
 }
 
 pub fn delete_configured_model(
-    config: &mut AppConfig,
+    config: &mut EkoConfig,
     model_id: &str,
 ) -> Result<DeleteConfiguredModelOutcome, String> {
     let deleting_default = config.model.default_model_id.as_deref() == Some(model_id);
@@ -469,7 +469,7 @@ pub fn delete_configured_model(
     Ok(DeleteConfiguredModelOutcome::RemovedNonDefault)
 }
 
-pub(crate) fn clear_selected_model(config: &mut AppConfig) {
+pub(crate) fn clear_selected_model(config: &mut EkoConfig) {
     config.model.default_model_id = None;
     config.model.provider.clear();
     config.model.name.clear();
@@ -481,7 +481,7 @@ pub(crate) fn clear_selected_model(config: &mut AppConfig) {
     config.model.context_window = None;
 }
 
-pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> ModelRuntimeConfig {
+pub fn resolve_runtime_model(config: &EkoConfig, model_id: Option<&str>) -> ModelRuntimeConfig {
     let selected = model_id
         .and_then(|id| config.configured_models.iter().find(|model| model.id == id))
         .or_else(|| {
@@ -598,7 +598,7 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
 /// Resolve a CLI/TUI model selector without splitting model identity from its
 /// provider credentials, endpoint, and protocol.
 pub fn resolve_runtime_model_selector(
-    config: &AppConfig,
+    config: &EkoConfig,
     selector: Option<&str>,
 ) -> Result<ModelRuntimeConfig, ModelSelectionError> {
     let Some(selector) = selector.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn session_runtime_selection_does_not_mutate_the_persisted_default() -> Result<(), String> {
-        let mut config = AppConfig {
+        let mut config = EkoConfig {
             configured_models: vec![
                 ConfiguredModel {
                     id: "local:a".to_string(),
@@ -791,7 +791,7 @@ mod tests {
                     ..ConfiguredModel::default()
                 },
             ],
-            ..AppConfig::default()
+            ..EkoConfig::default()
         };
         config.model.default_model_id = Some("local:a".to_string());
         let selected = resolve_runtime_model_selector(&config, Some("local:b"))
@@ -809,7 +809,7 @@ mod tests {
 
     #[test]
     fn explicit_zero_context_window_is_rejected_by_runtime_preflight() -> Result<(), String> {
-        let mut config = AppConfig {
+        let mut config = EkoConfig {
             configured_models: vec![ConfiguredModel {
                 id: "local:zero".to_string(),
                 display_name: "Zero".to_string(),
@@ -818,11 +818,11 @@ mod tests {
                 context_window: Some(0),
                 ..ConfiguredModel::default()
             }],
-            ..AppConfig::default()
+            ..EkoConfig::default()
         };
         config.model_providers.insert(
             "local".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
                 ..Default::default()
@@ -841,7 +841,7 @@ mod tests {
     #[test]
     fn model_capabilities_keep_text_default_and_preserve_friendly_modalities() -> Result<(), String>
     {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         upsert_model_provider(
             &mut config,
             "gateway",
@@ -879,7 +879,7 @@ mod tests {
 
     #[test]
     fn deleting_default_selects_an_enabled_successor_before_removal() -> Result<(), String> {
-        let mut config = AppConfig {
+        let mut config = EkoConfig {
             configured_models: vec![
                 ConfiguredModel {
                     id: "local:a".to_string(),
@@ -904,7 +904,7 @@ mod tests {
                     ..ConfiguredModel::default()
                 },
             ],
-            ..AppConfig::default()
+            ..EkoConfig::default()
         };
         set_default_model(&mut config, "local:a")?;
 
@@ -927,7 +927,7 @@ mod tests {
 
     #[test]
     fn deleting_last_default_clears_the_selected_model() -> Result<(), String> {
-        let mut config = AppConfig {
+        let mut config = EkoConfig {
             configured_models: vec![ConfiguredModel {
                 id: "local:a".to_string(),
                 display_name: "A".to_string(),
@@ -935,7 +935,7 @@ mod tests {
                 model: "a".to_string(),
                 ..ConfiguredModel::default()
             }],
-            ..AppConfig::default()
+            ..EkoConfig::default()
         };
         set_default_model(&mut config, "local:a")?;
 
@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn deleting_provider_cascades_models_and_selects_an_external_successor() -> Result<(), String> {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "first".to_string(),
             ModelProviderConfig {
@@ -1004,7 +1004,7 @@ mod tests {
 
     #[test]
     fn deleting_last_provider_clears_the_selected_model() -> Result<(), String> {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config
             .model_providers
             .insert("local".to_string(), ModelProviderConfig::default());
@@ -1028,7 +1028,7 @@ mod tests {
 
     #[test]
     fn successor_without_provider_config_clears_legacy_credentials() -> Result<(), String> {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model.auth_token = Some("old-provider-token".to_string());
         config.model.base_url = Some("https://old.example/v1/responses".to_string());
         config.configured_models = vec![
@@ -1061,7 +1061,7 @@ mod tests {
 
     #[test]
     fn api_key_requirement_is_explicit_not_assumed() {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "gateway".to_string(),
             ModelProviderConfig {
@@ -1075,7 +1075,7 @@ mod tests {
 
     #[test]
     fn provider_key_policy_is_applied_without_provider_name_inference() {
-        let mut config = AppConfig {
+        let mut config = EkoConfig {
             configured_models: vec![ConfiguredModel {
                 id: "gateway:model".to_string(),
                 provider: "gateway".to_string(),
@@ -1083,11 +1083,11 @@ mod tests {
                 enabled: true,
                 ..ConfiguredModel::default()
             }],
-            ..AppConfig::default()
+            ..EkoConfig::default()
         };
         config.model_providers.insert(
             "gateway".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("http://127.0.0.1:11434/v1/responses".to_string()),
                 requires_api_key: true,
@@ -1100,7 +1100,7 @@ mod tests {
 
     #[test]
     fn configured_provider_views_project_user_protocol_defaults() -> Result<(), String> {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         upsert_model_provider(
             &mut config,
             "my-gateway",
@@ -1126,7 +1126,7 @@ mod tests {
     #[test]
     fn model_protocol_is_explicit_and_independent_of_provider_name() {
         for provider in ["openai", "anthropic", "custom"] {
-            let mut config = AppConfig::default();
+            let mut config = EkoConfig::default();
             let model_id = stable_model_id(provider, "model");
             config.configured_models = vec![ConfiguredModel {
                 id: model_id.clone(),
@@ -1146,10 +1146,10 @@ mod tests {
 
     #[test]
     fn one_provider_root_supports_models_with_different_protocols() -> Result<(), String> {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "custom".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("https://gateway.example/v1/responses".to_string()),
                 ..Default::default()
@@ -1180,10 +1180,10 @@ mod tests {
 
     #[test]
     fn provider_root_accepts_explicit_responses_protocol() {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("https://gateway.example/v1".to_string()),
                 ..Default::default()
@@ -1213,10 +1213,10 @@ mod tests {
 
     #[test]
     fn complete_endpoint_is_rewritten_for_each_explicit_protocol() {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: None,
                 base_url: Some("https://gateway.example/v1/chat/completions".to_string()),
                 ..Default::default()
@@ -1245,10 +1245,10 @@ mod tests {
 
     #[test]
     fn selector_resolves_one_identity_and_types_unknown_disabled_and_ambiguous_errors() {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: Some("openai-key".to_string()),
                 base_url: Some("https://api.openai.com/v1/responses".to_string()),
                 ..Default::default()
@@ -1256,7 +1256,7 @@ mod tests {
         );
         config.model_providers.insert(
             "anthropic".to_string(),
-            echo_agent::config::ModelProviderConfig {
+            crate::config::ModelProviderConfig {
                 auth_token: Some("anthropic-key".to_string()),
                 base_url: Some("https://api.anthropic.com/v1/messages".to_string()),
                 ..Default::default()
@@ -1319,7 +1319,7 @@ mod tests {
 
     #[test]
     fn yaml_protocol_defaults_to_chat_and_honors_explicit_override() -> Result<(), String> {
-        let config: AppConfig = serde_yaml::from_str(
+        let config: EkoConfig = serde_yaml::from_str(
             r#"
 model_providers:
   custom:
@@ -1356,7 +1356,7 @@ configured_models:
 
     #[test]
     fn empty_configuration_has_no_synthetic_model() {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model.provider = "ignored-legacy-provider".to_string();
         config.model.name = "ignored-legacy-model".to_string();
 
@@ -1370,7 +1370,7 @@ configured_models:
 
     #[test]
     fn model_views_expose_only_effective_thinking_levels() -> Result<(), String> {
-        let mut config = AppConfig {
+        let mut config = EkoConfig {
             configured_models: vec![ConfiguredModel {
                 id: "openai:gpt-5.6-sol".to_string(),
                 display_name: "GPT-5.6 Sol".to_string(),
@@ -1379,7 +1379,7 @@ configured_models:
                 api_protocol: LlmApiProtocol::Responses,
                 ..ConfiguredModel::default()
             }],
-            ..AppConfig::default()
+            ..EkoConfig::default()
         };
         config.model.default_model_id = Some("openai:gpt-5.6-sol".to_string());
 

@@ -13,7 +13,7 @@
 //! ```
 
 #[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
-use echo_agent::config;
+use echo_agent_app_core::config;
 #[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
 use echo_agent_cli::cli;
 #[cfg(any(feature = "tui", feature = "gui", feature = "channels"))]
@@ -96,13 +96,13 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let mut app_config = config::load_config(args.config.as_deref());
     let configured_mcp_path = app_config.mcp.config_path.clone();
     // Resolve MCP before the generic environment overlay copies
-    // MCP_CONFIG_PATH into AppConfig. This preserves CLI > YAML > env.
+    // MCP_CONFIG_PATH into EkoConfig. This preserves CLI > YAML > env.
     let mcp_config_path = echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(
         args.mcp_config.as_deref(),
         &app_config,
     );
     config::apply_env_overrides(&mut app_config);
-    // Keep AppConfig as the file-backed configuration; the resolved runtime
+    // Keep EkoConfig as the file-backed configuration; the resolved runtime
     // source above owns environment and CLI overrides.
     app_config.mcp.config_path = configured_mcp_path;
 
@@ -640,8 +640,8 @@ fn process_args_request_jsonl(args: impl IntoIterator<Item = std::ffi::OsString>
 #[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
-    use echo_agent::config;
     use echo_agent::prelude::*;
+    use echo_agent_app_core::config;
 
     #[test]
     fn test_create_agent_config() {
@@ -682,7 +682,7 @@ mod tests {
             command_cell_runtime: None,
             execution_scope: None,
         };
-        let mut app_config = config::AppConfig::default();
+        let mut app_config = config::EkoConfig::default();
         app_config.model.provider = "local-test".to_string();
         app_config.model.name = "test-model".to_string();
         app_config.model.base_url = Some("http://127.0.0.1:11434/v1/chat/completions".to_string());

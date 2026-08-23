@@ -265,7 +265,7 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
 
 fn compile_direct_invocation(
     input: &SubagentPromptInput<'_>,
-    history: Vec<echo_core::llm::types::Message>,
+    history: Vec<echo_agent::llm::types::Message>,
 ) -> CompiledSubagentInvocation {
     let mut diagnostics = PromptDiagnostics::default();
     let mut sections = Vec::new();
@@ -305,7 +305,7 @@ fn compile_direct_invocation(
 
 fn compile_planned_invocation(
     task: PlannedTaskPrompt,
-    history: Vec<echo_core::llm::types::Message>,
+    history: Vec<echo_agent::llm::types::Message>,
 ) -> CompiledSubagentInvocation {
     let mut diagnostics = PromptDiagnostics::default();
     let mut sections = Vec::new();
@@ -446,7 +446,7 @@ fn render_task_boundary(boundary: &TaskBoundaryPrompt) -> String {
 mod tests {
     use super::*;
     use echo_agent::agent::subagent::{ExecutionMode, SubagentContext};
-    use echo_core::llm::types::Message;
+    use echo_agent::llm::types::Message;
 
     fn parent_context() -> SubagentContext {
         let mut context = SubagentContext::empty();

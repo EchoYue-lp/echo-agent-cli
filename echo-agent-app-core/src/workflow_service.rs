@@ -75,7 +75,7 @@ pub struct WorkflowService {
 
 impl WorkflowService {
     pub fn default_path() -> PathBuf {
-        echo_agent::paths::user_data_path("workflows.json")
+        crate::data_root::user_data_path("workflows.json")
     }
 
     pub fn at_default_path() -> Self {
@@ -95,7 +95,7 @@ impl WorkflowService {
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, WorkflowServiceError> {
         let path = path.into();
-        let catalog = match echo_core::utils::fs::read_existing(&path) {
+        let catalog = match echo_agent::utils::fs::read_existing(&path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|error| WorkflowServiceError::Serialization(error.to_string()))?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -389,7 +389,7 @@ fn write_catalog(
 fn persist_catalog(path: &Path, catalog: &WorkflowCatalog) -> Result<(), WorkflowServiceError> {
     let encoded = serde_json::to_vec_pretty(catalog)
         .map_err(|error| WorkflowServiceError::Serialization(error.to_string()))?;
-    echo_core::utils::fs::atomic_write(path, &encoded).map_err(|source| WorkflowServiceError::Io {
+    echo_agent::utils::fs::atomic_write(path, &encoded).map_err(|source| WorkflowServiceError::Io {
         path: path.to_path_buf(),
         source,
     })

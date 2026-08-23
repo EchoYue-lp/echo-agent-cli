@@ -19,11 +19,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent_handle::AgentHandle;
+use crate::config::EkoConfig;
 use crate::evolution::ReviewIntegration;
 use crate::hitl::HitlDispatcher;
 use crate::infra::{self, AgentCreateParams};
 use crate::state::AppState;
-use echo_agent::config::AppConfig;
 use echo_agent::evolution::ReviewConfig;
 use echo_agent::intent::{
     KeywordClassifier, LlmIntentClassifier, SkillDescription, TriggerSupervisor,
@@ -36,14 +36,14 @@ pub struct AgentRuntime {
     pub agent_handle: AgentHandle,
     pub model_consumers: crate::infra::AgentModelConsumers,
     pub hitl_dispatcher: Arc<HitlDispatcher>,
-    pub app_config: AppConfig,
+    pub app_config: EkoConfig,
     /// Exact model generation selected for this process. This may differ from
     /// the durable default when startup used `--model`.
     pub active_runtime_model: Option<crate::model_config::ModelRuntimeConfig>,
     /// Non-persistent session view used when creating future pooled agents.
     /// A CLI/TUI `--model` selector updates this view without changing the
     /// durable application default consumed by configuration mutations.
-    pub session_app_config: AppConfig,
+    pub session_app_config: EkoConfig,
     pub keyword_classifier: KeywordClassifier,
     /// Shared `RuntimeStateStore` produced during bootstrap. Surfaced on the
     /// runtime so `init_pool` (and any future product paths) can inject the
@@ -87,7 +87,7 @@ impl AgentRuntime {
     /// 11. Register LSP tools
     /// 12. Fire startup hook
     pub async fn bootstrap(
-        app_config: &AppConfig,
+        app_config: &EkoConfig,
         mut params: AgentCreateParams,
         mcp_config_path: PathBuf,
     ) -> anyhow::Result<Self> {
@@ -233,7 +233,7 @@ impl AgentRuntime {
         // verification / planning) directly into the system prompt so they
         // are always active without requiring explicit activate_skill calls.
         {
-            let enabled_config_path = echo_agent::paths::user_data_path("enabled-skills.json");
+            let enabled_config_path = crate::data_root::user_data_path("enabled-skills.json");
             let enabled_config = crate::skills_hub::EnabledSkillsConfig::load(&enabled_config_path)
                 .unwrap_or_default();
             // 收集 baseline 名为 owned Vec<String>,move 进 async 闭包(闭包要 'static,
@@ -271,12 +271,12 @@ impl AgentRuntime {
         }
 
         // ── 6. User hooks ──
-        // Single merged load: echo-agent.yaml inline + ~/.eko/hooks.yaml +
+        // Single merged load: eko.yaml inline + ~/.eko/hooks.yaml +
         // .eko/hooks.yaml are merged into one HooksDefinition by
         // HookConfigLoader (P0-1), then registered once. The previous code
         // loaded inline and file sources separately, each calling
         // clear_user_hooks(), so the second load wiped the first — a silent
-        // bug where echo-agent.yaml inline hooks disappeared whenever any
+        // bug where eko.yaml inline hooks disappeared whenever any
         // hooks.yaml file existed.
         infra::load_user_hooks(&agent_handle, app_config).await;
 
@@ -602,7 +602,7 @@ pub(crate) async fn register_lsp_tools(
 
     // Global preferences override discovery defaults.
     {
-        let global_lsp = echo_agent::paths::user_data_path(".lsp.yaml");
+        let global_lsp = crate::data_root::user_data_path(".lsp.yaml");
         if global_lsp.is_file() {
             match LspConfig::from_file(&global_lsp) {
                 Ok(global) => config.merge(global),

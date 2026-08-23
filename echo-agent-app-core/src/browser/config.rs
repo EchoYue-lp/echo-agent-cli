@@ -105,7 +105,7 @@ impl BrowserConfig {
 
 impl Default for BrowserConfig {
     fn default() -> Self {
-        let base_dir = echo_agent::paths::user_data_path("browser");
+        let base_dir = crate::data_root::user_data_path("browser");
         Self {
             enabled: true,
             node_command: "node".to_string(),

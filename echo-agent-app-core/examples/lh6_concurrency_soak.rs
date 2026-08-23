@@ -111,7 +111,7 @@ impl Drop for LedgerFailureGuard {
         ledger.status = "failed".to_string();
         ledger.completed_at = Some(chrono::Utc::now().to_rfc3339());
         if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
-            let _ = echo_core::utils::fs::atomic_write(&self.path, &bytes);
+            let _ = echo_agent::utils::fs::atomic_write(&self.path, &bytes);
         }
     }
 }
@@ -389,7 +389,7 @@ async fn run_cycle(
 
 fn write_ledger(path: &Path, ledger: &Ledger) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(ledger)?;
-    echo_core::utils::fs::atomic_write(path, &bytes).map_err(anyhow::Error::from)
+    echo_agent::utils::fs::atomic_write(path, &bytes).map_err(anyhow::Error::from)
 }
 
 fn hash_tree(root: &Path) -> Result<String> {

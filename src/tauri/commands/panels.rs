@@ -68,8 +68,10 @@ fn map_structured_extraction_error(error: StructuredExtractionError) -> IpcError
 pub async fn get_permissions_mode(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let mode = state.app_state.config.permission_mode.read().await;
-    Ok(serde_json::json!({ "mode": mode.clone() }))
+    let mode = *state.app_state.config.permission_mode.read().await;
+    Ok(serde_json::json!({
+        "mode": echo_agent_app_core::permission::permission_mode_id(mode)
+    }))
 }
 
 #[tauri::command]
@@ -77,29 +79,16 @@ pub async fn set_permissions_mode(
     state: tauri::State<'_, TauriState>,
     mode: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let normalized = match mode.as_str() {
-        "default" => "default",
-        "auto-edit" | "autoedit" | "accept-edits" | "auto-approve" => "auto-edit",
-        "full-auto" | "fullauto" | "bypass" => "full-auto",
-        // Legacy config/UI alias from before interaction mode was separated
-        // from approval mode. Auto routing is controlled by InteractionMode;
-        // approval mode has only the four user-facing variants below.
-        "auto" | "plan" => "default",
-        "strict" | "strict-confirm" | "strict-confirmation" => "strict",
-        _ => {
-            return Err(IpcError::Validation(format!(
-                "Invalid permission mode '{}'. Valid: default, auto-edit, full-auto, strict",
-                mode
-            )));
-        }
-    };
+    let framework_mode = echo_agent_app_core::permission::parse_permission_mode(&mode)
+        .map_err(IpcError::Validation)?;
+    let normalized = echo_agent_app_core::permission::permission_mode_id(framework_mode);
     let mut mode_lock = state.app_state.config.permission_mode.write().await;
-    *mode_lock = normalized.to_string();
+    *mode_lock = framework_mode;
     drop(mode_lock);
 
     state
         .app_state
-        .apply_permission_mode_to_agents(normalized.to_string())
+        .apply_permission_mode_to_agents(framework_mode)
         .await;
 
     Ok(serde_json::json!({"success": true, "mode": normalized}))
@@ -457,7 +446,9 @@ fn hub_skill_json(entry: &echo_agent_app_core::skills_hub::SkillHubEntry) -> ser
 /// ~/.eko/enabled-skills.json 路径(B3:enable/disable 同步写此文件,
 /// 消除"SkillsHub 内存 / enabled-skills.json / is_baseline 硬编码"三套状态不同步)。
 fn enabled_skills_json_path() -> Option<std::path::PathBuf> {
-    Some(echo_agent::paths::user_data_path("enabled-skills.json"))
+    Some(echo_agent_app_core::data_root::user_data_path(
+        "enabled-skills.json",
+    ))
 }
 
 /// 同步 enabled-skills.json:确保 skill entry 存在(带 category),设置 enabled。
@@ -1679,7 +1670,7 @@ pub async fn generate_skill_draft(
 
     echo_agent_app_core::evolution::fire_evolution_hook(
         &agent,
-        echo_core::hooks::HookEvent::SkillLifecycleTransition,
+        echo_agent::hooks::HookEvent::SkillLifecycleTransition,
         &result.name,
     )
     .await;
@@ -1751,7 +1742,7 @@ pub async fn activate_skill_draft(
 
     echo_agent_app_core::evolution::fire_evolution_hook(
         &agent,
-        echo_core::hooks::HookEvent::SkillLifecycleTransition,
+        echo_agent::hooks::HookEvent::SkillLifecycleTransition,
         &name,
     )
     .await;

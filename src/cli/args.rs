@@ -121,7 +121,7 @@ pub struct Args {
     #[arg(long)]
     pub mcp_config: Option<String>,
 
-    /// 配置文件路径 (echo-agent.yaml)
+    /// 配置文件路径 (eko.yaml)
     #[arg(long)]
     pub config: Option<String>,
 

@@ -11,29 +11,23 @@ pub fn configure_data_root() -> anyhow::Result<()> {
         if !root.is_absolute() {
             anyhow::bail!("EKO_DATA_DIR must be an absolute path: {}", root.display());
         }
-        echo_agent::paths::set_user_data_dir(root.clone()).map_err(|current| {
+        echo_agent_app_core::data_root::configure(root.clone()).map_err(|current| {
             anyhow::anyhow!(
                 "EKO data root was already initialized at {}",
                 current.display()
             )
         })?;
-        echo_agent::plugin::set_plugin_data_base_dir(root).map_err(|current| {
-            anyhow::anyhow!(
-                "EKO plugin data root was already initialized at {}",
-                current.display()
-            )
-        })?;
         return Ok(());
     }
-    echo_agent::paths::set_user_data_dir_name(".eko").map_err(|current| {
+    echo_agent_app_core::data_root::configure(
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".eko"),
+    )
+    .map_err(|current| {
         anyhow::anyhow!(
             "EKO data root was already initialized at {}",
-            current.display()
-        )
-    })?;
-    echo_agent::plugin::set_plugin_data_base_dir_name(".eko").map_err(|current| {
-        anyhow::anyhow!(
-            "EKO plugin data root was already initialized at {}",
             current.display()
         )
     })?;

@@ -2,9 +2,9 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::config::{ConfiguredModel, ModelProviderConfig};
 use echo_agent::llm::{LlmApiProtocol, ModelInputModality};
 use echo_agent_app_core::AppState;
+use echo_agent_app_core::config::{ConfiguredModel, ModelProviderConfig};
 use echo_agent_app_core::infra::test_runtime_llm_connection;
 use echo_agent_app_core::model_config::{self, ModelRuntimeConfig};
 use echo_agent_app_core::state::{
@@ -113,7 +113,7 @@ fn model_mutation_ipc_error(error: ModelMutationError) -> IpcError {
 }
 
 fn resolve_connection_probe(
-    app_config: &echo_agent::config::AppConfig,
+    app_config: &echo_agent_app_core::config::EkoConfig,
     provider: String,
     model: String,
     api_key: Option<String>,
@@ -397,13 +397,13 @@ async fn test_connection_inner(
 #[cfg(test)]
 mod tests {
     use super::resolve_connection_probe;
-    use echo_agent::config::{AppConfig, ModelProviderConfig};
     use echo_agent::llm::LlmApiProtocol;
+    use echo_agent_app_core::config::{EkoConfig, ModelProviderConfig};
     use echo_agent_app_core::infra::prepare_runtime_llm;
 
     #[test]
     fn connection_probe_uses_real_client_preflight() -> Result<(), String> {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "openai".to_string(),
             ModelProviderConfig {

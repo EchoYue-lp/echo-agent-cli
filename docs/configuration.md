@@ -2,23 +2,24 @@
 
 ## 配置位置与优先级
 
-EKO 启动时把 framework 用户数据根设置为 `~/.eko`。`EKO_DATA_DIR` 可以覆盖整个
-数据根，适合测试或隔离实例。
+EKO 在 app-core 中拥有 `EkoConfig` 与 `~/.eko` 数据根。framework 只接收转换后的
+`FrameworkConfig`、typed `PermissionMode` 和显式路径；它不发现 EKO 配置文件。
+`EKO_DATA_DIR` 可以覆盖整个产品数据根，适合测试或隔离实例。
 
 主配置查找顺序：
 
 1. `--config <path>`
-2. `ECHO_AGENT_CONFIG`
-3. `./echo-agent.yaml`
+2. `EKO_CONFIG`
+3. `./eko.yaml`
 4. `~/.eko/config.yaml`
 
-GUI、TUI、CLI/JSONL 和 channel 读取同一份配置。GUI 变更通过统一 AppState mutation
+GUI、TUI、CLI/JSONL 和 channel 读取同一份 `EkoConfig`。GUI 变更通过统一 AppState mutation
 原子保存；包含密钥的配置在 Unix 上写成 `0600`。
 
 ## 推荐配置
 
 GUI 用户优先在“设置 -> 模型 Provider”中管理 Provider 和模型。手写 YAML 时可从
-`config/echo-agent.example.yaml` 开始，核心结构如下：
+`config/eko.example.yaml` 开始，核心结构如下：
 
 ```yaml
 model:
@@ -196,7 +197,7 @@ EKO_BROWSER_EXTENSION_TOKEN=replace-with-extension-token
 
 Hook 合并顺序从低到高：
 
-1. `echo-agent.yaml` 内嵌 `hooks`
+1. `eko.yaml` 内嵌 `hooks`
 2. `~/.eko/hooks.yaml`
 3. `<project>/.eko/hooks.yaml`
 
@@ -257,7 +258,7 @@ FEISHU_APP_SECRET=...
 | 变量                         | 用途                               |
 | ---------------------------- | ---------------------------------- |
 | `EKO_DATA_DIR`               | 覆盖 `~/.eko` 数据根               |
-| `ECHO_AGENT_CONFIG`          | 主配置文件                         |
+| `EKO_CONFIG`          | 主配置文件                         |
 | `MODEL_NAME`                 | CLI `--model` 默认值               |
 | `MCP_CONFIG_PATH`            | MCP 配置文件                       |
 | `EKO_UV_PATH`                | analytics runtime 使用的 `uv` 路径 |

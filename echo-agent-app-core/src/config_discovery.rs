@@ -9,7 +9,7 @@
 //!
 //! | File | Location | Purpose |
 //! |------|----------|---------|
-//! | `echo-agent.yaml` | Project root or `~/.eko/` | Agent configuration |
+//! | `eko.yaml` | Project root or `~/.eko/` | Agent configuration |
 //! | `.mcp.json` | Project root or `~/.eko/` | MCP server configuration |
 //! | `hooks.yaml` | Project `.eko/` or `~/.eko/` | Hook definitions |
 //! | `user.md` | `~/.eko/` | User-level instructions |
@@ -167,7 +167,7 @@ pub struct ConfigDiscovery {
 impl ConfigDiscovery {
     /// Create a new discovery service.
     pub fn new() -> Self {
-        let data_root = echo_agent::paths::user_data_dir();
+        let data_root = crate::data_root::user_data_dir();
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -217,21 +217,21 @@ impl ConfigDiscovery {
     // ── Discovery methods ────────────────────────────────────────────
 
     fn discover_agent_configs(&self, inv: &mut ConfigInventory) {
-        // Global: ~/.eko/echo-agent.yaml
-        let global = self.data_root.join("echo-agent.yaml");
+        // Global: ~/.eko/eko.yaml
+        let global = self.data_root.join("eko.yaml");
         inv.agent_configs.push(ConfigFile {
-            name: "echo-agent.yaml (global)".into(),
+            name: "eko.yaml (global)".into(),
             path: global.clone(),
             scope: ConfigScope::Global,
             category: ConfigCategory::Agent,
             accessible: global.exists(),
         });
 
-        // Project: <root>/echo-agent.yaml
+        // Project: <root>/eko.yaml
         if let Some(ref root) = self.project_root {
-            let project = root.join("echo-agent.yaml");
+            let project = root.join("eko.yaml");
             inv.agent_configs.push(ConfigFile {
-                name: "echo-agent.yaml (project)".into(),
+                name: "eko.yaml (project)".into(),
                 path: project.clone(),
                 scope: ConfigScope::Project,
                 category: ConfigCategory::Agent,

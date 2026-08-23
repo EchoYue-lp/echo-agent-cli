@@ -459,8 +459,8 @@ fn run_status_name(status: RunStatus) -> &'static str {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use echo_agent::llm::cache::PromptCacheFingerprint;
     use echo_agent::trace::{InMemoryRunStore, LlmContextBreakdown, RunTimings, TokenUsage};
-    use echo_core::llm::cache::PromptCacheFingerprint;
 
     fn run_with_calls(id: &str, events: Vec<RunEvent>) -> Run {
         let mut run = Run {

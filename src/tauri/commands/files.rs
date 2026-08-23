@@ -196,7 +196,7 @@ fn write_workspace_file(
     }
 
     let replaced =
-        echo_core::utils::fs::atomic_compare_and_swap(&target, content.as_bytes(), |current| {
+        echo_agent::utils::fs::atomic_compare_and_swap(&target, content.as_bytes(), |current| {
             file_revision(current) == expected_revision
         })
         .map_err(|error| IpcError::Internal(error.to_string()))?;

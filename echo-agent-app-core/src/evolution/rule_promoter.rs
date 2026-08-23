@@ -901,7 +901,7 @@ fn write_receipt(path: &Path, receipt: &RulePromotionReceipt) -> Result<(), Rule
             path: path.to_path_buf(),
             reason: error.to_string(),
         })?;
-    echo_core::utils::fs::atomic_write(path, &bytes).map_err(|error| RulePromotionError::Io {
+    echo_agent::utils::fs::atomic_write(path, &bytes).map_err(|error| RulePromotionError::Io {
         operation: "write",
         path: path.to_path_buf(),
         reason: error.to_string(),

@@ -19,7 +19,7 @@ use echo_agent::prelude::{
     Tool, ToolFailure, ToolFailureCategory, ToolParameters, ToolResult, ToolRiskLevel,
     ToolSideEffect,
 };
-use echo_core::tools::{ToolContext, ToolResultContent, ToolResultKind};
+use echo_agent::tools::{ToolContext, ToolResultContent, ToolResultKind};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};

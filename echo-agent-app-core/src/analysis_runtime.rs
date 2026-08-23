@@ -10,7 +10,7 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 
-use echo_core::tools::ScriptExecutionProfile;
+use echo_agent::tools::ScriptExecutionProfile;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -90,7 +90,7 @@ impl Default for AnalyticsRuntime {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("uv"));
         Self {
-            cache_root: echo_agent::paths::user_data_path("runtimes").join("analytics"),
+            cache_root: crate::data_root::user_data_path("runtimes").join("analytics"),
             uv_program,
         }
     }
@@ -202,7 +202,7 @@ impl AnalyticsRuntime {
     }
 }
 
-impl echo_core::tools::ScriptExecutionProfileResolver for AnalyticsRuntime {
+impl echo_agent::tools::ScriptExecutionProfileResolver for AnalyticsRuntime {
     fn resolve<'a>(
         &'a self,
         language: &'a str,
@@ -256,7 +256,7 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if fs::read(path).ok().as_deref() == Some(bytes) {
         return Ok(());
     }
-    echo_core::utils::fs::atomic_write(path, bytes)
+    echo_agent::utils::fs::atomic_write(path, bytes)
 }
 
 fn load_ready_marker(
@@ -378,7 +378,7 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> AnalyticsRuntimeResult<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
-    echo_core::utils::fs::atomic_write(path, &bytes)?;
+    echo_agent::utils::fs::atomic_write(path, &bytes)?;
     Ok(())
 }
 

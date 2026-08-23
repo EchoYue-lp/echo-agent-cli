@@ -11,7 +11,7 @@ use crate::tool_execution::ToolExecutionRepository;
 use crate::tool_execution_projection::ToolExecutionProjector;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use echo_core::utils::fs::FileDurability;
+use echo_agent::utils::fs::FileDurability;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -298,7 +298,7 @@ impl crate::chat_driver::ChatSink for JournaledChatSink {
 
 impl ChatEventLog {
     pub fn default_root() -> PathBuf {
-        echo_agent::paths::user_data_path("chat-events")
+        crate::data_root::user_data_path("chat-events")
     }
 
     /// Create the process-wide authority without performing fallible I/O.
@@ -309,7 +309,7 @@ impl ChatEventLog {
             root: Self::default_root(),
             retention: ChatEventRetention::default(),
             streams: DashMap::new(),
-            append_file: Arc::new(echo_core::utils::fs::append_existing),
+            append_file: Arc::new(echo_agent::utils::fs::append_existing),
         }
     }
 
@@ -331,7 +331,7 @@ impl ChatEventLog {
             root,
             retention,
             streams: DashMap::new(),
-            append_file: Arc::new(echo_core::utils::fs::append_existing),
+            append_file: Arc::new(echo_agent::utils::fs::append_existing),
         })
     }
 
@@ -377,11 +377,10 @@ impl ChatEventLog {
                     if awaiter_fact_key(&existing.payload).as_deref() != Some(fact_key.as_str()) {
                         continue;
                     }
-                    let expected =
-                        echo_core::utils::canonical_json::canonical_json_bytes(&event)
-                            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+                    let expected = echo_agent::utils::canonical_json::canonical_json_bytes(&event)
+                        .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
                     let actual =
-                        echo_core::utils::canonical_json::canonical_json_bytes(&existing.payload)
+                        echo_agent::utils::canonical_json::canonical_json_bytes(&existing.payload)
                             .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
                     return if expected == actual {
                         Ok(existing)
@@ -948,7 +947,7 @@ impl ChatEventLog {
         next_sequence: u64,
     ) -> Result<(), ChatEventLogError> {
         let next_path = segment_path(stream_dir, next_sequence);
-        echo_core::utils::fs::atomic_write(&next_path, b"").map_err(|source| {
+        echo_agent::utils::fs::atomic_write(&next_path, b"").map_err(|source| {
             ChatEventLogError::Io {
                 path: next_path,
                 source,
@@ -1362,7 +1361,7 @@ struct EnvelopeIntegrity<'a> {
 fn envelope_content_hash(integrity: EnvelopeIntegrity<'_>) -> Result<String, ChatEventLogError> {
     // Integrity must validate after restart, not only in-process. The shared
     // encoder recursively sorts nested maps such as ToolResult metadata.
-    let encoded = echo_core::utils::canonical_json::canonical_json_bytes(&integrity)
+    let encoded = echo_agent::utils::canonical_json::canonical_json_bytes(&integrity)
         .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
     Ok(digest(&encoded))
 }
@@ -1421,7 +1420,7 @@ fn first_stream_envelope(
         return Ok(None);
     };
     let bytes =
-        echo_core::utils::fs::read_existing(&path).map_err(|source| ChatEventLogError::Io {
+        echo_agent::utils::fs::read_existing(&path).map_err(|source| ChatEventLogError::Io {
             path: path.clone(),
             source,
         })?;
@@ -1466,7 +1465,7 @@ fn scan_segment(
     expected_start: u64,
 ) -> Result<SegmentScan, ChatEventLogError> {
     let bytes =
-        echo_core::utils::fs::read_existing(path).map_err(|source| ChatEventLogError::Io {
+        echo_agent::utils::fs::read_existing(path).map_err(|source| ChatEventLogError::Io {
             path: path.to_path_buf(),
             source,
         })?;
@@ -1496,7 +1495,7 @@ fn scan_segment(
         let raw = match serde_json::from_slice::<serde_json::Value>(line) {
             Ok(raw) => raw,
             Err(error) if repair_torn_tail && !terminated => {
-                echo_core::utils::fs::truncate_existing(
+                echo_agent::utils::fs::truncate_existing(
                     path,
                     u64::try_from(valid_bytes).unwrap_or(u64::MAX),
                     FileDurability::SyncData,
@@ -1538,7 +1537,7 @@ fn scan_segment(
         events.push(event);
         valid_bytes = valid_bytes.saturating_add(chunk.len());
         if !terminated && repair_torn_tail {
-            echo_core::utils::fs::append_existing(path, b"\n", FileDurability::SyncData).map_err(
+            echo_agent::utils::fs::append_existing(path, b"\n", FileDurability::SyncData).map_err(
                 |source| ChatEventLogError::Io {
                     path: path.to_path_buf(),
                     source,
@@ -1992,7 +1991,7 @@ mod tests {
             if matches!(durability, FileDurability::SyncData) {
                 observed_sync_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            echo_core::utils::fs::append_existing(path, bytes, durability)
+            echo_agent::utils::fs::append_existing(path, bytes, durability)
         });
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?
@@ -2050,7 +2049,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(format!("{durability_name}:{record_name}"));
-            echo_core::utils::fs::append_existing(path, bytes, durability)
+            echo_agent::utils::fs::append_existing(path, bytes, durability)
         });
         let log = ChatEventLog::open(
             temp.path(),
@@ -2110,7 +2109,7 @@ mod tests {
             if matches!(durability, FileDurability::SyncData) {
                 observed_sync_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
-            echo_core::utils::fs::append_existing(path, bytes, durability)
+            echo_agent::utils::fs::append_existing(path, bytes, durability)
         });
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?
@@ -2169,10 +2168,10 @@ mod tests {
                 let partial = bytes.get(..midpoint).ok_or_else(|| {
                     std::io::Error::other("failed to select partial chat event bytes")
                 })?;
-                echo_core::utils::fs::append_existing(path, partial, FileDurability::Flush)?;
+                echo_agent::utils::fs::append_existing(path, partial, FileDurability::Flush)?;
                 return Err(std::io::Error::other("injected append failure"));
             }
-            echo_core::utils::fs::append_existing(path, bytes, durability)
+            echo_agent::utils::fs::append_existing(path, bytes, durability)
         });
         let log = ChatEventLog::open(temp.path(), ChatEventRetention::default())
             .map_err(|error| error.to_string())?
@@ -2220,10 +2219,10 @@ mod tests {
                 let partial = bytes.get(..midpoint).ok_or_else(|| {
                     std::io::Error::other("failed to select rollover partial bytes")
                 })?;
-                echo_core::utils::fs::append_existing(path, partial, FileDurability::Flush)?;
+                echo_agent::utils::fs::append_existing(path, partial, FileDurability::Flush)?;
                 return Err(std::io::Error::other("injected rollover append failure"));
             }
-            echo_core::utils::fs::append_existing(path, bytes, durability)
+            echo_agent::utils::fs::append_existing(path, bytes, durability)
         });
         let log = ChatEventLog::open(
             temp.path(),
@@ -2729,7 +2728,7 @@ mod tests {
         let replaced_for_append = Arc::clone(&replaced_segment);
         let external_for_append = external.clone();
         let append_file: Arc<AppendFile> = Arc::new(move |path, bytes, durability| {
-            echo_core::utils::fs::append_existing(path, bytes, durability)?;
+            echo_agent::utils::fs::append_existing(path, bytes, durability)?;
             if !bytes.is_empty()
                 && matches!(durability, FileDurability::SyncData)
                 && sabotage_for_append.swap(false, Ordering::AcqRel)
@@ -3048,7 +3047,7 @@ mod tests {
                     .recv_timeout(std::time::Duration::from_secs(2))
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
             }
-            echo_core::utils::fs::append_existing(path, bytes, durability)
+            echo_agent::utils::fs::append_existing(path, bytes, durability)
         });
         let log = Arc::new(
             ChatEventLog::open(temp.path(), ChatEventRetention::default())

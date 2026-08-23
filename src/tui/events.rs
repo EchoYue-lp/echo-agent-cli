@@ -3127,7 +3127,7 @@ fn push_tui_system_message(app: &mut TuiApp, content: impl Into<String>) {
     });
 }
 
-fn refresh_tui_models(app: &mut TuiApp, config: &echo_agent::config::AppConfig) {
+fn refresh_tui_models(app: &mut TuiApp, config: &echo_agent_app_core::config::EkoConfig) {
     app.configured_models = echo_agent_app_core::model_config::configured_model_views(config)
         .into_iter()
         .map(|view| {
@@ -3243,7 +3243,7 @@ async fn handle_tui_model_command(app: &mut TuiApp, args: &str) {
                 input_modalities.push(echo_agent::llm::ModelInputModality::Video);
             }
             let mutation = echo_agent_app_core::state::ConfiguredModelMutation {
-                model: echo_agent::config::ConfiguredModel {
+                model: echo_agent_app_core::config::ConfiguredModel {
                     provider: (*provider).to_string(),
                     model: (*model).to_string(),
                     api_protocol: protocol,
@@ -3337,7 +3337,7 @@ async fn handle_tui_provider_command(app: &mut TuiApp, args: &str) {
             let requires_api_key = parts.get(5).is_some_and(|value| *value == "requires-key");
             let mutation = echo_agent_app_core::state::ModelProviderMutation {
                 id: (*id).to_string(),
-                provider: echo_agent::config::ModelProviderConfig {
+                provider: echo_agent_app_core::config::ModelProviderConfig {
                     name: (*id).to_string(),
                     api_key_env,
                     base_url: Some((*base_url).to_string()),
@@ -4278,7 +4278,7 @@ async fn handle_slash_command(
                         .await
                 }
                 "reload" => {
-                    // P0-1: 从磁盘重读所有 user hook 来源(含 echo-agent.yaml
+                    // P0-1: 从磁盘重读所有 user hook 来源(含 eko.yaml
                     // 内嵌),合并成单个 definition 后一次性 register。
                     let loaded = echo_agent_app_core::hook_config_loader::HookConfigLoader::load_merged_from_disk();
                     if !loaded.errors.is_empty() {
@@ -4362,28 +4362,30 @@ async fn handle_slash_command(
                     content: format!("Permission mode: {}", app.permission_mode),
                 });
             } else {
-                let normalized = match args.trim().to_ascii_lowercase().as_str() {
-                    "ask" | "default" => "default",
-                    "auto" | "auto-edit" => "auto-edit",
-                    "full-auto" => "full-auto",
-                    "deny" | "strict" => "strict",
-                    _ => {
+                let framework_mode = match echo_agent_app_core::permission::parse_permission_mode(
+                    args.trim(),
+                ) {
+                    Ok(mode) => mode,
+                    Err(_) => {
                         app.messages.push(ChatMessage {
-                            role: MessageRole::System,
-                            content: "Unknown permission mode; use default, auto-edit, full-auto, or strict".to_string(),
-                        });
+                                role: MessageRole::System,
+                                content: "Unknown permission mode; use default, plan, auto-edit, full-auto, auto, bubble, dont-ask, or strict".to_string(),
+                            });
                         return;
                     }
                 };
+                let normalized =
+                    echo_agent_app_core::permission::permission_mode_id(framework_mode);
                 if let Some(state) = app.app_state.as_ref() {
-                    *state.config.permission_mode.write().await = normalized.to_string();
-                    state
-                        .apply_permission_mode_to_agents(normalized.to_string())
-                        .await;
+                    *state.config.permission_mode.write().await = framework_mode;
+                    state.apply_permission_mode_to_agents(framework_mode).await;
                 } else {
                     agent
-                        .write(|value| value.set_permission_mode(normalized))
+                        .write(|value| value.set_permission_mode(framework_mode))
                         .await;
+                    if let Some(pool) = &app.pool {
+                        pool.apply_permission_mode(framework_mode).await;
+                    }
                 }
                 app.permission_mode = normalized.to_string();
                 app.messages.push(ChatMessage {

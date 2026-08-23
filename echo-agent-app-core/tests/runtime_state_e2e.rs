@@ -15,12 +15,12 @@
 use std::sync::Arc;
 
 use echo_agent::agent::Agent;
-use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
 use echo_agent::state::{FileRuntimeStateStore, RuntimeStateStore};
+use echo_agent_app_core::config::{ConfiguredModel, EkoConfig, ModelProviderConfig};
 use echo_agent_app_core::infra::{self, AgentCreateParams};
 
-fn make_app_config() -> AppConfig {
-    let mut c = AppConfig::default();
+fn make_app_config() -> EkoConfig {
+    let mut c = EkoConfig::default();
     c.agent.name = "rt-test-agent".to_string();
     c.agent.system_prompt = "You are a test runtime agent.".to_string();
     c.agent.max_iterations = 1;

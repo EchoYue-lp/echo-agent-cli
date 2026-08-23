@@ -868,12 +868,12 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         let data_dir = temp.path().join("data");
-        let variables = PluginVariables::new("configured", temp.path().into(), temp.path().into())
-            .with_plugin_data(data_dir.clone())
-            .with_user_config(HashMap::from([(
-                "accent".to_string(),
-                "#123456".to_string(),
-            )]));
+        let variables =
+            PluginVariables::new(temp.path().into(), data_dir.clone(), temp.path().into())
+                .with_user_config(HashMap::from([(
+                    "accent".to_string(),
+                    "#123456".to_string(),
+                )]));
 
         let theme = read_theme_with_variables("configured", &theme_path, Some(&variables))?;
         let style = read_output_style_with_variables("configured", &style_path, Some(&variables))?;

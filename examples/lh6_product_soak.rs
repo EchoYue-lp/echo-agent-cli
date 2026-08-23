@@ -6,7 +6,6 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
 use echo_agent::agent::AgentEvent;
-use echo_agent::config;
 use echo_agent::human_loop::{
     HumanLoopKind, HumanLoopProvider, HumanLoopRequest, HumanLoopResponse,
 };
@@ -16,6 +15,7 @@ use echo_agent_app_core::agent_pool::{AgentPool, PoolConfig, agent_execution_res
 use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome};
 use echo_agent_app_core::chat_event_log::{ChatEventEnvelope, ChatSurface, bind_surface_chat_sink};
 use echo_agent_app_core::chat_resources::ChatResources;
+use echo_agent_app_core::config;
 use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
 use echo_agent_app_core::prepared_turn::{PreparedUserTurn, UserTurnInput};
 use echo_agent_app_core::runtime::AgentRuntime;
@@ -168,7 +168,7 @@ impl Drop for LedgerFailureGuard {
         ledger.status = "failed".to_string();
         ledger.completed_at = Some(chrono::Utc::now().to_rfc3339());
         if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
-            let _ = echo_core::utils::fs::atomic_write(&self.path, &bytes);
+            let _ = echo_agent::utils::fs::atomic_write(&self.path, &bytes);
         }
     }
 }
@@ -448,7 +448,7 @@ async fn main() -> Result<()> {
     ensure!(ledger.subagent_controls >= 1);
     ensure!(ledger.peak_resources.agent_active > 0);
     ledger.active_elapsed_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let data_root = echo_agent::paths::user_data_path("");
+    let data_root = echo_agent_app_core::data_root::user_data_path("");
     ledger.journal_sha256 = Some(hash_tree(&data_root.join("chat-events"))?);
     ledger.task_events_sha256 = Some(hash_matching_files(&args.output_dir, "events.jsonl")?);
     ledger.status = if args.probe {
@@ -465,7 +465,7 @@ async fn main() -> Result<()> {
 
 async fn bootstrap(
     args: &Args,
-    app_config: &echo_agent::config::AppConfig,
+    app_config: &echo_agent_app_core::config::EkoConfig,
     hitl: Arc<AutoHitlProvider>,
 ) -> Result<ProductContext> {
     let conversation_store = echo_agent_app_core::infra::create_conversation_store();
@@ -499,7 +499,8 @@ async fn bootstrap(
     .await;
     let pool = AgentPool::from_runtime(&runtime, PoolConfig::default(), Some(task_runtime.clone()))
         .await?;
-    pool.apply_permission_mode("full-auto".to_string()).await;
+    pool.apply_permission_mode(echo_agent::tools::permission::PermissionMode::BypassPermissions)
+        .await;
     echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
         &runtime.agent_handle,
         task_runtime.clone(),
@@ -1000,7 +1001,7 @@ async fn inject_control_events(
 }
 
 fn write_ledger(path: &Path, ledger: &Ledger) -> Result<()> {
-    echo_core::utils::fs::atomic_write(path, &serde_json::to_vec_pretty(ledger)?)
+    echo_agent::utils::fs::atomic_write(path, &serde_json::to_vec_pretty(ledger)?)
         .map_err(anyhow::Error::from)
 }
 

@@ -39,6 +39,13 @@ Last updated: 2026-08-23
 - dynamic Provider/model/protocol/thinking profile。
 - workspace-qualified session/checkpoint/task/browser/control surface，JSONL mode/policy/attachment/HITL。
 - Workflow GUI 与统一 structured extraction 的 GUI/TUI/CLI/channel 生产入口。
+- Public framework boundary：EKO 配置已由 app-core `EkoConfig` 独立拥有，permission mode 在
+  app state/pool/framework 间全程 typed 且 DTO 八变体无损 round-trip；CLI/app-core 直接
+  `echo_core` 依赖与源码引用均为 0。产品 data root、Theme/Monitor/OutputStyle、coding
+  auto-memory policy 留在应用层，framework 只接收显式路径、tool capability 与 command policy。
+
+Task 2 集成检查点已基于 framework `437cb63` 完成全量门禁。该分支暂不合入 CLI `main`；
+Task 1 review 修复进入 framework `main` 后，必须合并最新 framework/CLI 基线并重跑受影响门禁。
 
 这些条目完成后的 design/plan/audit/soak 文档已经删除；需要理解当前行为时以代码、测试、
 [架构说明](./architecture.md) 和 [功能总览](./features.md) 为准。

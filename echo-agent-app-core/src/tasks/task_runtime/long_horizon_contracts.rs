@@ -349,7 +349,7 @@ fn lh_f11_fast_model_resolves_one_complete_configured_profile() -> Result<(), St
     )?;
     require(
         APP_INFRA,
-        "ShellTool::new_permissive()",
+        "with_command_policy(Arc::new(crate::permission::EkoCommandPolicy))",
         "LH6 repair regressed: EKO still applies a fixed shell whitelist after PermissionService",
     )
 }

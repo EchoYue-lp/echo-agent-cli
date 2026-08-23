@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
 use chrono::{DateTime, Utc};
-use echo_core::retry::RetryPolicy;
+use echo_agent::retry::RetryPolicy;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -521,7 +521,7 @@ impl AgentDeliverySupervisor {
 
 impl AgentRouter {
     pub fn at_default_root() -> Arc<Self> {
-        Arc::new(Self::new(echo_agent::paths::user_data_path("agent-router")))
+        Arc::new(Self::new(crate::data_root::user_data_path("agent-router")))
     }
 
     pub fn new(root: PathBuf) -> Self {
@@ -1119,7 +1119,7 @@ fn write_groups(path: &Path, groups: &[AgentGroup]) -> Result<(), AgentRouterErr
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    echo_core::utils::fs::atomic_write(path, &encoded).map_err(|source| AgentRouterError::Io {
+    echo_agent::utils::fs::atomic_write(path, &encoded).map_err(|source| AgentRouterError::Io {
         path: path.to_path_buf(),
         source,
     })
@@ -1404,7 +1404,7 @@ fn write_events(path: &Path, events: &[AgentInboxEvent]) -> Result<(), AgentRout
         })?;
         encoded.push(b'\n');
     }
-    echo_core::utils::fs::atomic_write(path, &encoded).map_err(|source| AgentRouterError::Io {
+    echo_agent::utils::fs::atomic_write(path, &encoded).map_err(|source| AgentRouterError::Io {
         path: path.to_path_buf(),
         source,
     })

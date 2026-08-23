@@ -9,7 +9,7 @@ use echo_agent::tasks::{
     RevisionedTaskStoreError, TaskCreateInput, TaskDraft, TaskGraphCommit, TaskGraphContext,
     TaskPolicyError, TaskRevisionError, TaskRevisionService, TaskToolPolicy,
 };
-use echo_core::tools::ToolContext;
+use echo_agent::tools::ToolContext;
 
 use super::profiles::default_subagent_for;
 use super::store::{InitialRunTriggerMetadata, StoreError, TaskRuntimeStore};

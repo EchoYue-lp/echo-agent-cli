@@ -57,7 +57,7 @@ impl PluginLspRuntime {
     /// Build the non-plugin LSP configuration for one workspace generation.
     pub fn config_for_workspace(project_root: &Path) -> LspConfig {
         let mut config = LspConfig::discover(project_root);
-        let global_lsp = echo_agent::paths::user_data_path(".lsp.yaml");
+        let global_lsp = crate::data_root::user_data_path(".lsp.yaml");
         if global_lsp.is_file() {
             match LspConfig::from_file(&global_lsp) {
                 Ok(global) => config.merge(global),
@@ -158,19 +158,65 @@ pub struct PluginValidationReport {
     pub errors: Vec<String>,
 }
 
-/// Capabilities visible to EKO, combining framework and application-owned
-/// components from the same fixed package layout.
-pub fn plugin_capabilities(entry: &PluginEntry) -> Vec<echo_agent::plugin::PluginCapability> {
-    let mut capabilities = entry.inferred_capabilities();
+/// EKO projection of portable framework components plus product-only UI and
+/// background-service components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EkoPluginCapability {
+    Skill,
+    Hook,
+    McpServer,
+    LspServer,
+    Agent,
+    Tool,
+    Monitor,
+    Theme,
+    OutputStyle,
+}
+
+impl EkoPluginCapability {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Skill => "Skills",
+            Self::Hook => "Hooks",
+            Self::McpServer => "MCP Servers",
+            Self::LspServer => "LSP Servers",
+            Self::Agent => "Agents",
+            Self::Tool => "Tools",
+            Self::Monitor => "Monitors",
+            Self::Theme => "Themes",
+            Self::OutputStyle => "Output Styles",
+        }
+    }
+}
+
+impl From<echo_agent::plugin::PluginCapability> for EkoPluginCapability {
+    fn from(capability: echo_agent::plugin::PluginCapability) -> Self {
+        match capability {
+            echo_agent::plugin::PluginCapability::Skill => Self::Skill,
+            echo_agent::plugin::PluginCapability::Hook => Self::Hook,
+            echo_agent::plugin::PluginCapability::McpServer => Self::McpServer,
+            echo_agent::plugin::PluginCapability::LspServer => Self::LspServer,
+            echo_agent::plugin::PluginCapability::Agent => Self::Agent,
+            echo_agent::plugin::PluginCapability::Tool => Self::Tool,
+        }
+    }
+}
+
+pub fn plugin_capabilities(entry: &PluginEntry) -> Vec<EkoPluginCapability> {
+    let mut capabilities = entry
+        .inferred_capabilities()
+        .into_iter()
+        .map(EkoPluginCapability::from)
+        .collect::<Vec<_>>();
     if let Ok(eko) = crate::plugin_components::resolve_eko_components(&entry.root) {
         if eko.monitors_file.is_some() {
-            capabilities.push(echo_agent::plugin::PluginCapability::Monitor);
+            capabilities.push(EkoPluginCapability::Monitor);
         }
         if !eko.theme_files.is_empty() {
-            capabilities.push(echo_agent::plugin::PluginCapability::Theme);
+            capabilities.push(EkoPluginCapability::Theme);
         }
         if !eko.output_style_files.is_empty() {
-            capabilities.push(echo_agent::plugin::PluginCapability::OutputStyle);
+            capabilities.push(EkoPluginCapability::OutputStyle);
         }
     }
     capabilities
@@ -263,7 +309,7 @@ impl PluginRuntimeService {
         registry_source: RegistrySource,
     ) -> Arc<Self> {
         let preferences_file = match &registry_source {
-            RegistrySource::Default => echo_agent::plugin::plugin_data_base_dir()
+            RegistrySource::Default => crate::data_root::user_data_dir()
                 .join("plugins")
                 .join("preferences.json"),
             #[cfg(test)]
@@ -280,7 +326,7 @@ impl PluginRuntimeService {
             registry_source,
             preferences_file,
             state: Mutex::new(PluginRuntimeState {
-                registry: PluginRegistry::new(None),
+                registry: PluginRegistry::new(crate::data_root::user_data_dir(), None),
                 framework_components: HashMap::new(),
                 mcp_ownership: HashMap::new(),
                 prepared: PreparedApplicationComponents::default(),
@@ -1433,11 +1479,10 @@ impl PluginRuntimeService {
                 let project_dir =
                     std::env::current_dir().unwrap_or_else(|_| directory.to_path_buf());
                 let variables = echo_agent::plugin::PluginVariables::new(
-                    &manifest.name,
                     directory.to_path_buf(),
+                    std::env::temp_dir(),
                     project_dir,
                 )
-                .with_plugin_data(std::env::temp_dir())
                 .with_json_user_config(&defaults);
                 let errors = validate_application_component_files(
                     &manifest.name,
@@ -2087,7 +2132,9 @@ impl PluginRuntimeService {
 
     fn registry_for(&self, project_root: PathBuf) -> PluginRegistry {
         match &self.registry_source {
-            RegistrySource::Default => PluginRegistry::new(Some(project_root)),
+            RegistrySource::Default => {
+                PluginRegistry::new(crate::data_root::user_data_dir(), Some(project_root))
+            }
             #[cfg(test)]
             RegistrySource::Custom {
                 state_file,
@@ -3531,7 +3578,7 @@ done
             ));
         }
         let child_base = child_base.ok_or_else(|| "missing child plugin base".to_string())?;
-        echo_agent::plugin::set_plugin_data_base_dir(child_base.clone()).map_err(|current| {
+        crate::data_root::configure(child_base.clone()).map_err(|current| {
             format!(
                 "plugin base was initialized before isolated test: {}",
                 current.display()
@@ -3625,7 +3672,7 @@ done
             ));
         }
         let child_base = child_base.ok_or_else(|| "missing child plugin base".to_string())?;
-        echo_agent::plugin::set_plugin_data_base_dir(child_base.clone()).map_err(|current| {
+        crate::data_root::configure(child_base.clone()).map_err(|current| {
             format!(
                 "plugin base was initialized before isolated test: {}",
                 current.display()

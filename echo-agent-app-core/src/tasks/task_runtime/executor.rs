@@ -3218,7 +3218,7 @@ async fn run_readonly_subagent(
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
             let attempt_identity = attempt_identity.clone();
             Box::pin(async move {
-                let runtime_context = Some(echo_core::tools::ExternalRunContext {
+                let runtime_context = Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: None,
                     run_id: Some(run_id.clone()),
                     turn_id: message_id.clone(),
@@ -3250,7 +3250,7 @@ async fn run_readonly_subagent(
         .await
 }
 
-fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_core::tools::TraceSinkFn> {
+fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_agent::tools::TraceSinkFn> {
     // Wrap an app-layer `ExecSink` into the framework's `TraceSinkFn`
     // (Value-based) so it can be carried across `tokio::spawn` boundaries via
     // `ExternalRunContext.trace_sink`. The app's `scoped_with_ctx_run_id`
@@ -3267,7 +3267,7 @@ fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_core::to
             if let Ok(ev) = serde_json::from_value::<ExecEvent>(value) {
                 sink(ev);
             }
-        }) as echo_core::tools::TraceSinkFn
+        }) as echo_agent::tools::TraceSinkFn
     })
 }
 
@@ -3308,7 +3308,7 @@ async fn run_writer_subagent(
     let run_record = store.get_run(run_id).ok().flatten();
     let root_message_id = run_record.as_ref().map(|r| r.root_message_id.clone());
     let conversation_id = run_record.as_ref().map(|r| r.conversation_id.clone());
-    let run_message: Option<echo_core::llm::types::Message> = run_record.as_ref().and_then(|r| {
+    let run_message: Option<echo_agent::llm::types::Message> = run_record.as_ref().and_then(|r| {
         if r.attachments.is_empty() {
             None
         } else {
@@ -3328,7 +3328,7 @@ async fn run_writer_subagent(
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
             let attempt_identity = attempt_identity.clone();
             Box::pin(async move {
-                let runtime_context = Some(echo_core::tools::ExternalRunContext {
+                let runtime_context = Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: conversation_id.clone(),
                     run_id: Some(run_id.clone()),
                     turn_id: root_message_id.clone(),
@@ -3477,7 +3477,7 @@ async fn run_main_agent_task(
     let workspace_id = run_record.workspace_id.clone();
     let conversation_id = run_record.conversation_id.clone();
     let root_message_id = Some(run_record.root_message_id.clone());
-    let run_message: Option<echo_core::llm::types::Message> = {
+    let run_message: Option<echo_agent::llm::types::Message> = {
         let r = &run_record;
         if r.attachments.is_empty() {
             None
@@ -3503,9 +3503,9 @@ async fn run_main_agent_task(
                     &visible_tools,
                 );
                 let visible_tools = Some(visible_tools);
-                let invocation = echo_core::agent::AgentInvocationContext {
+                let invocation = echo_agent::agent::AgentInvocationContext {
                     history: None,
-                    runtime: Some(echo_core::tools::ExternalRunContext {
+                    runtime: Some(echo_agent::tools::ExternalRunContext {
                         conversation_id: Some(conversation_id.clone()),
                         run_id: Some(run_id.clone()),
                         turn_id: root_message_id.clone(),
@@ -3524,7 +3524,7 @@ async fn run_main_agent_task(
                     visible_tools,
                     run_budget: None,
                 };
-                let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation)
+                let event_identity = echo_agent::agent::EventIdentity::from_invocation(&invocation)
                     .map_err(|error| ExecutionFailure::from_react(error, "invalid task event identity"))?;
                 // Multimodal path when the run has attachments; plain text otherwise.
                 let raw_stream = if let Some(msg) = run_message {
@@ -3546,7 +3546,7 @@ async fn run_main_agent_task(
                             ExecutionFailure::from_react(error, "main agent stream failed")
                         })?
                 };
-                let mut stream = echo_core::agent::envelope_event_stream(
+                let mut stream = echo_agent::agent::envelope_event_stream(
                     raw_stream,
                     event_identity,
                 );
@@ -3776,7 +3776,7 @@ async fn run_main_agent_task(
                                 pending_file_access.remove(&call_id);
                             }
                             if let Some(artifact) =
-                                echo_core::tools::artifact::ToolOutputArtifactRef::from_metadata(
+                                echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(
                                     &result.metadata,
                                 )
                             {
@@ -4161,9 +4161,9 @@ pub async fn drive_agent_run(
                 &visible_tools,
             );
             let visible_tools = Some(visible_tools);
-            let invocation = echo_core::agent::AgentInvocationContext {
+            let invocation = echo_agent::agent::AgentInvocationContext {
                 history: None,
-                runtime: Some(echo_core::tools::ExternalRunContext {
+                runtime: Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: conversation_id_for_scope.clone(),
                     run_id: Some(run_id_for_scope.clone()),
                     turn_id: message_id_for_scope.clone(),
@@ -4180,22 +4180,22 @@ pub async fn drive_agent_run(
                 visible_tools,
                 run_budget: None,
             };
-            let event_identity = match echo_core::agent::EventIdentity::from_invocation(&invocation)
-            {
-                Ok(identity) => identity,
-                Err(error) => {
-                    tracing::error!(
-                        source_id = %source_id,
-                        run_id = %run_id_for_scope,
-                        error = %error,
-                        "Run agent event identity is invalid"
-                    );
-                    return AgentDriveStreamResult {
-                        failure: Some(error.to_string()),
-                        final_answer: None,
-                    };
-                }
-            };
+            let event_identity =
+                match echo_agent::agent::EventIdentity::from_invocation(&invocation) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        tracing::error!(
+                            source_id = %source_id,
+                            run_id = %run_id_for_scope,
+                            error = %error,
+                            "Run agent event identity is invalid"
+                        );
+                        return AgentDriveStreamResult {
+                            failure: Some(error.to_string()),
+                            final_answer: None,
+                        };
+                    }
+                };
 
             // Execute the prompt. The agent's ReAct loop will call
             // task_create + task_execute, which runs the plan through
@@ -4210,7 +4210,7 @@ pub async fn drive_agent_run(
             {
                 Ok(raw_stream) => {
                     let mut stream =
-                        echo_core::agent::envelope_event_stream(raw_stream, event_identity);
+                        echo_agent::agent::envelope_event_stream(raw_stream, event_identity);
                     let mut final_answer = None;
                     // Drain the stream to completion. Interactive callers may
                     // receive events through the invocation trace sink; every

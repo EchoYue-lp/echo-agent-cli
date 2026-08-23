@@ -6,9 +6,9 @@
 //! 调用 `HookRegistry::clear_user_hooks()` + `register_user_hooks()`,
 //! 而框架的 `HookSource::UserConfig` 只有一个槽位 —— 后装的 clear 会
 //! 把先装的清掉,导致:
-//! 1. `echo-agent.yaml` 内嵌 hooks 在 bootstrap 第 6 步被 hooks.yaml
+//! 1. `eko.yaml` 内嵌 hooks 在 bootstrap 第 6 步被 hooks.yaml
 //!    文件加载覆盖丢失;
-//! 2. `/hooks reload` 只重读文件 hooks、不重读 echo-agent.yaml,reload
+//! 2. `/hooks reload` 只重读文件 hooks、不重读 eko.yaml,reload
 //!    后内嵌 hooks 永久丢失。
 //!
 //! ## 修复
@@ -23,11 +23,11 @@
 //!
 //! ## 合并顺序(后者覆盖前者同名 event 的 rules,additive merge)
 //!
-//! 1. `echo-agent.yaml` 内嵌 `hooks:` 字段(最低优先级)
+//! 1. `eko.yaml` 内嵌 `hooks:` 字段(最低优先级)
 //! 2. `~/.eko/hooks.yaml`(全局用户 hooks)
 //! 3. `.eko/hooks.yaml`(项目级 hooks,最高优先级)
 
-use echo_agent::config::AppConfig;
+use crate::config::EkoConfig;
 use echo_agent::skills::hooks::HooksDefinition;
 use std::path::{Path, PathBuf};
 
@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 pub struct HooksLoadResult {
     /// 合并后的 hooks 定义(空表示无任何 user hook)。
     pub definition: HooksDefinition,
-    /// 实际加载成功的文件路径列表(内嵌 echo-agent.yaml 不算文件,
+    /// 实际加载成功的文件路径列表(内嵌 eko.yaml 不算文件,
     /// 不进入此列表;只含 `~/.eko/hooks.yaml` 与 `.eko/hooks.yaml`)。
     pub loaded_from: Vec<PathBuf>,
     /// Read/parse errors. Reload callers must keep the existing live hook set
@@ -53,7 +53,7 @@ pub struct HooksLoadResult {
 /// 单一槽位 —— 本 enum 只在 loader 内部用于追踪合并顺序和日志。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookConfigSource {
-    /// `echo-agent.yaml` 内嵌 `hooks:` 字段(最低优先级)。
+    /// `eko.yaml` 内嵌 `hooks:` 字段(最低优先级)。
     InlineConfig,
     /// `~/.eko/hooks.yaml`(全局)。
     GlobalFile,
@@ -65,7 +65,7 @@ impl HookConfigSource {
     /// 可读名称(日志用)。
     fn label(self) -> &'static str {
         match self {
-            HookConfigSource::InlineConfig => "echo-agent.yaml (inline)",
+            HookConfigSource::InlineConfig => "eko.yaml (inline)",
             HookConfigSource::GlobalFile => "~/.eko/hooks.yaml (global)",
             HookConfigSource::ProjectFile => ".eko/hooks.yaml (project)",
         }
@@ -74,20 +74,20 @@ impl HookConfigSource {
 
 /// 唯一的 hook 配置加载器。
 ///
-/// 无状态:所有方法都是关联函数,直接从磁盘/`AppConfig` 读取并合并。
-/// 提供 `load_merged`(已知 `AppConfig`)与 `load_merged_from_disk`
-/// (`/hooks reload` 无法访问 `AppConfig` 时从磁盘重读)两个统一入口。
+/// 无状态:所有方法都是关联函数,直接从磁盘/`EkoConfig` 读取并合并。
+/// 提供 `load_merged`(已知 `EkoConfig`)与 `load_merged_from_disk`
+/// (`/hooks reload` 无法访问 `EkoConfig` 时从磁盘重读)两个统一入口。
 pub struct HookConfigLoader;
 
 impl HookConfigLoader {
     /// 加载并合并所有 user hook 来源(内嵌 + 全局文件 + 项目文件)。
     ///
-    /// 这是 bootstrap 路径应使用的入口:它接收已加载的 `AppConfig`,
+    /// 这是 bootstrap 路径应使用的入口:它接收已加载的 `EkoConfig`,
     /// 取其 `hooks` 字段,再叠加两个 hooks.yaml 文件,合并返回单个
     /// `HooksDefinition`。调用方拿到结果后应**一次性**
     /// `clear_user_hooks()` + `register_user_hooks(merged)`,不要
     /// 再单独 register 内嵌或文件 hooks(那是旧 bug 的根源)。
-    pub fn load_merged(app_config: &AppConfig) -> HooksLoadResult {
+    pub fn load_merged(app_config: &EkoConfig) -> HooksLoadResult {
         let project_root = std::env::current_dir().ok();
         Self::load_merged_for_workspace(app_config, project_root.as_deref())
     }
@@ -97,14 +97,14 @@ impl HookConfigLoader {
     /// Passing the workspace root explicitly avoids consulting process cwd
     /// while a workspace switch is in flight.
     pub fn load_merged_for_workspace(
-        app_config: &AppConfig,
+        app_config: &EkoConfig,
         project_root: Option<&Path>,
     ) -> HooksLoadResult {
         let mut definition = HooksDefinition::default();
         let mut loaded_from = Vec::new();
         let mut errors = Vec::new();
 
-        // 1. echo-agent.yaml 内嵌(最低优先级)
+        // 1. eko.yaml 内嵌(最低优先级)
         let inline = app_config.hooks.clone();
         let inline_rule_count: usize = inline.rules.values().map(Vec::len).sum();
         if inline_rule_count > 0 {
@@ -112,7 +112,7 @@ impl HookConfigLoader {
             tracing::info!(
                 source = HookConfigSource::InlineConfig.label(),
                 count = inline_rule_count,
-                "Loaded inline user hooks from echo-agent.yaml"
+                "Loaded inline user hooks from eko.yaml"
             );
         }
 
@@ -128,8 +128,8 @@ impl HookConfigLoader {
 
     /// 从磁盘重新加载并合并所有 user hook 来源。
     ///
-    /// 用于 `/hooks reload`:无法访问 `AppConfig` 时,用框架的
-    /// `load_config(None)` 重新从标准路径读取 `echo-agent.yaml`,
+    /// 用于 `/hooks reload`:无法访问 `EkoConfig` 时,用框架的
+    /// `load_config(None)` 重新从标准路径读取 `eko.yaml`,
     /// 再叠加两个 hooks.yaml 文件。语义与 `load_merged` 完全一致,
     /// 只是内嵌来源从磁盘重读而非从内存取。
     pub fn load_merged_from_disk() -> HooksLoadResult {
@@ -148,15 +148,15 @@ impl HookConfigLoader {
         project_root: Option<&Path>,
     ) -> HooksLoadResult {
         let mut config_errors = Vec::new();
-        let mut app_config = AppConfig::default();
+        let mut app_config = EkoConfig::default();
         let search_paths = config_path
             .map(|path| vec![path.to_path_buf()])
-            .unwrap_or_else(echo_agent::config::config_search_paths);
+            .unwrap_or_else(crate::config::config_search_paths);
         for path in search_paths {
             if !path.exists() {
                 continue;
             }
-            match echo_agent::config::load_config_file(&path) {
+            match crate::config::load_config_file(&path) {
                 Ok(config) => {
                     app_config = config;
                     break;
@@ -186,7 +186,7 @@ impl HookConfigLoader {
         project_root: Option<&Path>,
     ) {
         // 2. 全局 hooks: ~/.eko/hooks.yaml
-        let global_path = echo_agent::paths::user_data_path("hooks.yaml");
+        let global_path = crate::data_root::user_data_path("hooks.yaml");
         match try_load_yaml(&global_path) {
             Ok(Some(def)) => {
                 let count: usize = def.rules.values().map(Vec::len).sum();
@@ -262,16 +262,16 @@ mod tests {
         HooksDefinition { rules }
     }
 
-    /// 空的 AppConfig(无内嵌 hooks)。
-    fn empty_app_config() -> AppConfig {
-        AppConfig::default()
+    /// 空的 EkoConfig(无内嵌 hooks)。
+    fn empty_app_config() -> EkoConfig {
+        EkoConfig::default()
     }
 
-    /// 把 inline hooks 塞进 AppConfig 的 `hooks` 字段。
-    fn app_config_with_inline(def: HooksDefinition) -> AppConfig {
-        AppConfig {
+    /// 把 inline hooks 塞进 EkoConfig 的 `hooks` 字段。
+    fn app_config_with_inline(def: HooksDefinition) -> EkoConfig {
+        EkoConfig {
             hooks: def,
-            ..AppConfig::default()
+            ..EkoConfig::default()
         }
     }
 
@@ -316,7 +316,7 @@ mod tests {
 
     #[test]
     fn test_load_merged_empty_app_config_no_hooks() {
-        // 空 AppConfig + (测试环境下很可能不存在的)文件 → 空结果。
+        // 空 EkoConfig + (测试环境下很可能不存在的)文件 → 空结果。
         let cfg = empty_app_config();
         let result = HookConfigLoader::load_merged(&cfg);
         // loaded_from 可能有项目文件(取决于测试运行目录),但 definition
@@ -342,7 +342,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
 
         let result = HookConfigLoader::load_merged_for_workspace(
-            &AppConfig::default(),
+            &EkoConfig::default(),
             Some(workspace.path()),
         );
         assert!(result.errors.is_empty());

@@ -240,7 +240,7 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         println!("  {name}: {from:?} → {to:?}");
                         echo_agent_app_core::evolution::fire_evolution_hook(
                             &ctx.agent,
-                            echo_core::hooks::HookEvent::SkillLifecycleTransition,
+                            echo_agent::hooks::HookEvent::SkillLifecycleTransition,
                             name,
                         )
                         .await;
@@ -1189,7 +1189,7 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                         // are notified of the skill merge.
                         echo_agent_app_core::evolution::fire_evolution_hook(
                             &ctx.agent,
-                            echo_core::hooks::HookEvent::SkillMergeApplied,
+                            echo_agent::hooks::HookEvent::SkillMergeApplied,
                             &proposal.primary_skill,
                         )
                         .await;
@@ -1514,7 +1514,7 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 // Fire SkillPatchApplied hook.
                 echo_agent_app_core::evolution::fire_evolution_hook(
                     &ctx.agent,
-                    echo_core::hooks::HookEvent::SkillPatchApplied,
+                    echo_agent::hooks::HookEvent::SkillPatchApplied,
                     skill_name,
                 )
                 .await;

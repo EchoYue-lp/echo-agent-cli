@@ -15,9 +15,9 @@ use echo_agent::state::RuntimeStateStore;
 use futures::future::BoxFuture;
 
 use crate::agent_handle::AgentHandle;
+use crate::config::EkoConfig;
 use crate::model_config;
 use crate::project::prompt::PromptAssembler;
-use echo_agent::config::AppConfig;
 
 type Result<T, E = echo_agent::error::ReactError> = std::result::Result<T, E>;
 
@@ -72,7 +72,7 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
 /// Product priority is explicit agent override, selected model context window,
 /// then EKO's documented fallback.
 pub fn effective_token_limit(
-    app_config: &AppConfig,
+    app_config: &EkoConfig,
     runtime: Option<&model_config::ModelRuntimeConfig>,
 ) -> usize {
     if app_config.agent.token_limit > 0 {
@@ -144,7 +144,7 @@ fn subagent_build_thinking(
 fn subagent_model_binding(
     spec: Option<&str>,
     thinking_spec: Option<&str>,
-    app_config: &AppConfig,
+    app_config: &EkoConfig,
     parent_generation: &SubagentRuntimeGeneration,
     inherited_generation: &Arc<tokio::sync::RwLock<SubagentRuntimeGeneration>>,
 ) -> SubagentModelBinding {
@@ -163,7 +163,7 @@ fn subagent_model_binding(
 
 fn resolve_fixed_subagent_generation(
     spec: Option<&str>,
-    app_config: &AppConfig,
+    app_config: &EkoConfig,
     parent_generation: &SubagentRuntimeGeneration,
 ) -> SubagentRuntimeGeneration {
     let selector = match spec.map(str::trim).filter(|value| !value.is_empty()) {
@@ -299,7 +299,7 @@ pub fn tool_output_artifact_config(
     // without teaching the generic framework an EKO-specific sibling path.
     let root_dir = working_dir
         .map(crate::workspace::layout::WorkspaceLayout::artifacts)
-        .unwrap_or_else(|| echo_agent::paths::user_data_path("artifacts"));
+        .unwrap_or_else(|| crate::data_root::user_data_path("artifacts"));
     echo_agent::tools::artifact::ToolOutputArtifactConfig::new(root_dir, "conversation_or_30d")
         .threshold_bytes(TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES)
         .max_age_secs(Some(TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS))
@@ -393,7 +393,7 @@ pub fn default_primary_conversation_id() -> String {
 /// This id is shared by the primary agent and built-in subagents so repeated
 /// project prompts land in the same provider cache partition across sessions.
 pub fn load_or_create_cache_user_id() -> String {
-    let path = echo_agent::paths::user_data_path("cache_user_id");
+    let path = crate::data_root::user_data_path("cache_user_id");
 
     if let Ok(existing) = std::fs::read_to_string(&path)
         && !existing.trim().is_empty()
@@ -423,7 +423,7 @@ pub struct CreatedAgent {
 /// Create an Agent instance without retaining build diagnostics.
 pub async fn create_agent(
     params: &AgentCreateParams,
-    app_config: &AppConfig,
+    app_config: &EkoConfig,
 ) -> std::result::Result<ReactAgent, String> {
     create_agent_with_diagnostics(params, app_config)
         .await
@@ -433,7 +433,7 @@ pub async fn create_agent(
 /// Create an agent and retain the application-owned prompt assembly report.
 pub async fn create_agent_with_diagnostics(
     params: &AgentCreateParams,
-    app_config: &AppConfig,
+    app_config: &EkoConfig,
 ) -> std::result::Result<CreatedAgent, String> {
     // EKO can boot before the user configures a provider. An explicit selector
     // must still resolve, while an absent selector leaves the Agent detached
@@ -504,7 +504,7 @@ pub async fn create_agent_with_diagnostics(
     let prompt_assembly = assembler.assemble_with_report();
     let system_prompt = prompt_assembly.prompt.clone();
 
-    // Determine config values from AppConfig
+    // Determine config values from EkoConfig
     let token_limit = effective_token_limit(app_config, runtime_model.as_ref());
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
@@ -640,7 +640,7 @@ pub async fn create_agent_with_diagnostics(
 
     // Initialize JSONL run store for trace persistence (before build)
     {
-        let run_dir = echo_agent::paths::user_data_path("runs");
+        let run_dir = crate::data_root::user_data_path("runs");
         match JsonlRunStore::new(&run_dir) {
             Ok(store) => {
                 builder = builder.with_run_store(Arc::new(store));
@@ -872,7 +872,7 @@ fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
 #[allow(clippy::too_many_arguments)]
 async fn register_default_subagents(
     agent: &mut ReactAgent,
-    app_config: &AppConfig,
+    app_config: &EkoConfig,
     parent_generation: SubagentRuntimeGeneration,
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
@@ -1348,7 +1348,8 @@ fn install_eko_shell_policy(
     // strict for other embedders, while EKO still keeps the shell tool's
     // dangerous blocklist and explicit-approval classifications.
     agent.replace_tool(Box::new(
-        echo_agent::tools::shell::ShellTool::new_permissive()
+        echo_agent::tools::shell::ShellTool::new()
+            .with_command_policy(Arc::new(crate::permission::EkoCommandPolicy))
             .with_sandbox(sandbox_manager)
             .with_cell_launcher(command_cells),
     ));
@@ -1599,7 +1600,7 @@ async fn run_dreaming_pass(
 
 /// 创建对话持久化 Store（文件），失败时返回 None（禁用持久化）
 pub fn create_conversation_store() -> Option<Arc<dyn ConversationStore>> {
-    let base = echo_agent::paths::user_data_dir();
+    let base = crate::data_root::user_data_dir();
 
     match echo_agent::memory::FileConversationStore::new(&base) {
         Ok(store) => {
@@ -1630,7 +1631,7 @@ pub fn inject_conversation_store(agent: &AgentHandle, store: &Option<Arc<dyn Con
 /// Distinct from [`create_conversation_store`], which only stores user-visible
 /// transcript projections.
 pub fn create_runtime_state_store() -> Option<Arc<dyn RuntimeStateStore>> {
-    create_runtime_state_store_in(echo_agent::paths::user_data_dir())
+    create_runtime_state_store_in(crate::data_root::user_data_dir())
 }
 
 /// 创建指定 base dir 下的运行时状态 Store（U1c：文件后端，无 SQLite）。
@@ -1658,7 +1659,7 @@ pub fn create_runtime_state_store_in(
 /// 与历史行为一致——框架默认就是这里。返回 (store_path, echo_agent_dir)：
 /// `echo_agent_dir` 是 hot 层 MEMORY.md 的落点（`.eko/`），与 store 同根。
 pub fn global_memory_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let echo_agent_dir = echo_agent::paths::user_data_dir();
+    let echo_agent_dir = crate::data_root::user_data_dir();
     let store_path = echo_agent_dir.join("store.json");
     (store_path, echo_agent_dir)
 }
@@ -1964,7 +1965,7 @@ pub enum LogTarget {
 ///
 /// Only imports known API key variables to avoid polluting the environment
 /// with unrelated shell state.
-pub fn load_shell_env(app_config: &AppConfig) {
+pub fn load_shell_env(app_config: &EkoConfig) {
     #[cfg(target_os = "macos")]
     {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
@@ -2192,7 +2193,7 @@ fn tui_log_path() -> std::path::PathBuf {
         }
     }
 
-    let dir = echo_agent::paths::user_data_path("logs");
+    let dir = crate::data_root::user_data_path("logs");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("tui.log")
 }
@@ -2205,7 +2206,7 @@ fn tui_log_path() -> std::path::PathBuf {
 /// restarts; rotate/truncate manually if it grows too large.
 #[cfg(not(feature = "telemetry"))]
 fn app_log_file() -> Option<std::fs::File> {
-    let dir = echo_agent::paths::user_data_path("logs");
+    let dir = crate::data_root::user_data_path("logs");
     let _ = std::fs::create_dir_all(&dir);
     std::fs::OpenOptions::new()
         .create(true)
@@ -2231,8 +2232,8 @@ pub enum DoctorConnectivity {
 /// Send a minimal chat request to verify the model is reachable and responding.
 async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> {
     use echo_agent::error::ReactError;
-    let mut app_config = echo_agent::config::load_config(None);
-    echo_agent::config::apply_env_overrides(&mut app_config);
+    let mut app_config = crate::config::load_config(None);
+    crate::config::apply_env_overrides(&mut app_config);
     let runtime = model_config::resolve_runtime_model_selector(&app_config, Some(model))
         .map_err(|error| ReactError::Other(error.to_string()))?;
     let prepared = prepare_runtime_llm(&runtime).map_err(ReactError::Other)?;
@@ -2261,8 +2262,8 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
 
 /// 执行基础环境诊断（API Key、配置文件、数据目录等）
 pub fn run_base_doctor() -> DoctorResult {
-    let mut config = echo_agent::config::load_config(None);
-    echo_agent::config::apply_env_overrides(&mut config);
+    let mut config = crate::config::load_config(None);
+    crate::config::apply_env_overrides(&mut config);
     run_base_doctor_for_model(&config.model.get_model_name())
 }
 
@@ -2279,7 +2280,7 @@ pub fn run_base_doctor_for_model_with_connectivity(
     let mut issues: Vec<String> = Vec::new();
     let mut checks: Vec<String> = Vec::new();
 
-    let base = echo_agent::paths::user_data_dir();
+    let base = crate::data_root::user_data_dir();
     let base_display = base.display();
 
     checks.push(format!("ℹ️  当前模型: {model}"));
@@ -2372,7 +2373,7 @@ pub fn run_base_doctor_for_model_with_connectivity(
 ///
 /// 这是 P0-1 修复后的**唯一** user hook 注册入口(bootstrap 路径)。
 /// 它通过 [`crate::hook_config_loader::HookConfigLoader::load_merged`] 把
-/// 三个来源(echo-agent.yaml 内嵌 + ~/.eko/hooks.yaml + .eko/hooks.yaml)
+/// 三个来源(eko.yaml 内嵌 + ~/.eko/hooks.yaml + .eko/hooks.yaml)
 /// 按固定顺序合并成单个 `HooksDefinition`,然后**一次性**
 /// `clear_user_hooks()` + `register_user_hooks(merged)`。
 ///
@@ -2382,7 +2383,7 @@ pub fn run_base_doctor_for_model_with_connectivity(
 /// 旧的实现只 register `app_config.hooks`(内嵌),把文件来源留给
 /// `runtime.rs::bootstrap` 单独 register —— 但 `register_user_hooks`
 /// 内部会覆盖 `UserConfig` 单槽位,导致文件来源 clear 掉内嵌来源。
-pub async fn load_user_hooks(agent: &AgentHandle, app_config: &AppConfig) {
+pub async fn load_user_hooks(agent: &AgentHandle, app_config: &EkoConfig) {
     let load_result = crate::hook_config_loader::HookConfigLoader::load_merged(app_config);
     for error in &load_result.errors {
         tracing::warn!(%error, "User hook source was not loaded");
@@ -2407,7 +2408,7 @@ pub async fn load_user_hooks(agent: &AgentHandle, app_config: &AppConfig) {
     tracing::info!(
         count = rule_count,
         files = ?load_result.loaded_from,
-        "User hooks loaded (merged: inline echo-agent.yaml + hooks.yaml files)"
+        "User hooks loaded (merged: inline eko.yaml + hooks.yaml files)"
     );
 }
 
@@ -2456,11 +2457,11 @@ pub fn print_doctor_result(result: &DoctorResult) {
     println!();
 }
 
-/// Build an [`LlmConfig`] from the AppConfig's model section.
+/// Build an [`LlmConfig`] from the EkoConfig's model section.
 ///
 /// Maps the provider string to the appropriate factory method and optionally
 /// overrides the base URL. This enables auth_token / base_url from
-/// `echo-agent.yaml` to flow through to the agent's LLM client without
+/// `eko.yaml` to flow through to the agent's LLM client without
 /// requiring `echo-agent-models.yaml` or provider-specific env vars.
 pub fn build_llm_config(
     provider: &str,
@@ -2706,9 +2707,9 @@ mod llm_config_tests {
         AgentCreateParams, build_llm_config, build_runtime_llm_config,
         create_agent_with_diagnostics, prepare_runtime_llm, test_runtime_llm_connection,
     };
+    use crate::config::{ConfiguredModel, EkoConfig, ModelProviderConfig};
     use crate::model_config::ModelRuntimeConfig;
     use echo_agent::agent::Agent;
-    use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
     use echo_agent::llm::LlmApiProtocol;
 
     #[tokio::test]
@@ -2718,7 +2719,7 @@ mod llm_config_tests {
                 system_prompt: Some("deferred model setup test".to_string()),
                 ..Default::default()
             },
-            &AppConfig::default(),
+            &EkoConfig::default(),
         )
         .await?;
 
@@ -2828,8 +2829,8 @@ mod llm_config_tests {
         assert!(error.contains("requires an API key"));
     }
 
-    fn selectable_model_config(agent_token_limit: usize) -> Result<AppConfig, String> {
-        let mut config = AppConfig::default();
+    fn selectable_model_config(agent_token_limit: usize) -> Result<EkoConfig, String> {
+        let mut config = EkoConfig::default();
         config.agent.token_limit = agent_token_limit;
         config.model_providers.insert(
             "local".to_string(),
@@ -2937,9 +2938,9 @@ mod resolve_subagent_model_tests {
         eko_visibility_horizon, resolve_fixed_subagent_generation, resolved_max_tool_output_tokens,
         subagent_model_binding, tool_output_artifact_config,
     };
+    use crate::config::{ConfiguredModel, EkoConfig, ModelProviderConfig};
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::agent::subagent::{SubagentPromptCompiler, SubagentRegistry};
-    use echo_agent::config::{AppConfig, ConfiguredModel, ModelProviderConfig};
     use echo_agent::sandbox::SandboxManager;
     use std::sync::Arc;
 
@@ -3007,7 +3008,7 @@ mod resolve_subagent_model_tests {
         let binding = subagent_model_binding(
             Some("inherit"),
             None,
-            &AppConfig::default(),
+            &EkoConfig::default(),
             &initial,
             &authority,
         );
@@ -3038,7 +3039,7 @@ mod resolve_subagent_model_tests {
             )),
         };
         let authority = Arc::new(tokio::sync::RwLock::new(parent.clone()));
-        let config = AppConfig::default();
+        let config = EkoConfig::default();
         let binding =
             subagent_model_binding(Some("inherit"), Some("low"), &config, &parent, &authority);
         let fixed = binding.snapshot().await;
@@ -3062,7 +3063,7 @@ mod resolve_subagent_model_tests {
 
     #[test]
     fn configured_subagent_selector_resolves_the_complete_profile() -> Result<(), String> {
-        let mut config = AppConfig::default();
+        let mut config = EkoConfig::default();
         config.model_providers.insert(
             "fast-provider".to_string(),
             ModelProviderConfig {
@@ -3119,7 +3120,7 @@ mod resolve_subagent_model_tests {
         };
         let fixed = resolve_fixed_subagent_generation(
             Some("missing-profile"),
-            &AppConfig::default(),
+            &EkoConfig::default(),
             &parent,
         );
         assert_eq!(fixed.model, parent.model);

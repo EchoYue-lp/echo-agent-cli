@@ -5,14 +5,14 @@
 
 use crate::{cli, config_watcher, infra, state::AppState};
 use clap::Parser;
-use echo_agent::config;
+use echo_agent_app_core::config;
 use std::ffi::OsString;
 use std::sync::Arc;
 
 /// Crash log path — written to when the app panics before Tauri starts.
 /// This is the only way to debug silent crashes on macOS (no terminal attached).
 fn crash_log_path() -> std::path::PathBuf {
-    echo_agent::paths::user_data_path("crash.log")
+    echo_agent_app_core::data_root::user_data_path("crash.log")
 }
 
 /// Install a panic hook that writes the panic message to a crash log file.
@@ -132,13 +132,13 @@ async fn run_desktop() -> anyhow::Result<()> {
     infra::load_shell_env(&app_config);
     let configured_mcp_path = app_config.mcp.config_path.clone();
     // Resolve MCP before the generic environment overlay copies
-    // MCP_CONFIG_PATH into AppConfig. This preserves CLI > YAML > env.
+    // MCP_CONFIG_PATH into EkoConfig. This preserves CLI > YAML > env.
     let mcp_config_path = echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(
         args.mcp_config.as_deref(),
         &app_config,
     );
     config::apply_env_overrides(&mut app_config);
-    // Keep AppConfig as the file-backed configuration; the resolved runtime
+    // Keep EkoConfig as the file-backed configuration; the resolved runtime
     // source above owns environment and CLI overrides.
     app_config.mcp.config_path = configured_mcp_path;
     let webhook_emitter = Arc::new(echo_agent_app_core::webhook::WebhookEmitter::from_config(
@@ -185,7 +185,7 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Cron definitions are independent of TaskRun lifecycle state.
     let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
-        let file_path = echo_agent::paths::user_data_path("scheduler_store");
+        let file_path = echo_agent_app_core::data_root::user_data_path("scheduler_store");
         match echo_agent::memory::FileStore::new(&file_path) {
             Ok(store) => Arc::new(store),
             Err(_) => Arc::new(echo_agent::memory::InMemoryStore::new()),

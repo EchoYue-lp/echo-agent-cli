@@ -116,7 +116,7 @@ pub async fn test_hook(
 ///
 /// This reuses the shared `HookConfigLoader::load_merged_from_disk` path that
 /// the CLI `/hooks reload` uses, so both surfaces apply the exact same merge
-/// semantics (echo-agent.yaml inline + ~/.eko/hooks.yaml + .eko/hooks.yaml).
+/// semantics (eko.yaml inline + ~/.eko/hooks.yaml + .eko/hooks.yaml).
 /// Only user-config hooks are replaced (`clear_user_hooks` +
 /// `register_user_hooks`); skill/plugin-sourced hooks are left intact.
 #[tauri::command]

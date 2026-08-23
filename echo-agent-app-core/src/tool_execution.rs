@@ -227,7 +227,7 @@ impl ToolExecutionRepository {
     }
 
     pub fn default_root() -> PathBuf {
-        echo_agent::paths::user_data_path("tool-executions")
+        crate::data_root::user_data_path("tool-executions")
     }
 
     pub fn register_artifact_config(
@@ -1108,12 +1108,12 @@ fn reject_symlink(path: &Path) -> ToolExecutionResult<()> {
 
 fn write_manifest(path: &Path, manifest: &StoredManifest) -> ToolExecutionResult<()> {
     let bytes = serde_json::to_vec(manifest)?;
-    echo_core::utils::fs::atomic_write(path, &bytes)?;
+    echo_agent::utils::fs::atomic_write(path, &bytes)?;
     Ok(())
 }
 
 fn read_manifest_path(path: &Path) -> ToolExecutionResult<StoredManifest> {
-    let bytes = echo_core::utils::fs::read_existing(path)?;
+    let bytes = echo_agent::utils::fs::read_existing(path)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
@@ -1184,7 +1184,7 @@ mod tests {
     use super::*;
     use echo_agent::agent::ToolInvocationRewrite;
     use echo_agent::tools::ToolFailure;
-    use echo_core::tools::ToolResultKind;
+    use echo_agent::tools::ToolResultKind;
 
     fn chat_owner() -> ToolExecutionOwner {
         ToolExecutionOwner::Chat {
