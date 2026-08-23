@@ -1626,13 +1626,15 @@ pub(crate) async fn run_auto_memory_on_exit(
     }
 
     let Some(integration) = review_integration.as_ref() else {
-        println!("  Auto-memory: Review integration is not configured.");
+        eprintln!("  Auto-memory: Review integration is not configured.");
         return;
     };
     let evidence_lease = match integration.lease_generation() {
         Ok(lease) => lease,
         Err(error) => {
-            println!("  Auto-memory: workspace is switching; candidates were not queued ({error})");
+            eprintln!(
+                "  Auto-memory: workspace is switching; candidates were not queued ({error})"
+            );
             return;
         }
     };
@@ -1669,11 +1671,11 @@ pub(crate) async fn run_auto_memory_on_exit(
 
     let store = evidence_lease.evidence_store();
     match queue_observations(&store, &observations, &messages) {
-        Ok(candidates) => println!(
+        Ok(candidates) => eprintln!(
             "  Auto-memory: queued {} observation candidate(s) for review.",
             candidates.len()
         ),
-        Err(error) => println!("  Auto-memory: failed to queue candidates ({error})"),
+        Err(error) => eprintln!("  Auto-memory: failed to queue candidates ({error})"),
     }
 }
 
