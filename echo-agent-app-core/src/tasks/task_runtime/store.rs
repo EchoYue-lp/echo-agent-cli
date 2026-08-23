@@ -536,6 +536,8 @@ pub struct TaskRuntimeStore {
     #[cfg(test)]
     fail_next_cell_started: std::sync::atomic::AtomicBool,
     #[cfg(test)]
+    fail_next_cell_started_projection: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
     fail_cell_terminal_remaining: std::sync::atomic::AtomicUsize,
     /// File-backed event authority and deterministic projections.
     pub(super) shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
@@ -1197,6 +1199,8 @@ impl TaskRuntimeStore {
             #[cfg(test)]
             fail_next_cell_started: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            fail_next_cell_started_projection: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             fail_cell_terminal_remaining: std::sync::atomic::AtomicUsize::new(0),
             shadow,
             shadow_generation: std::sync::Mutex::new(ShadowGeneration {
@@ -1660,6 +1664,12 @@ impl TaskRuntimeStore {
     #[cfg(test)]
     pub(crate) fn fail_next_cell_started_for_test(&self) {
         self.fail_next_cell_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_cell_started_projection_for_test(&self) {
+        self.fail_next_cell_started_projection
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -5699,6 +5709,15 @@ impl TaskRuntimeStore {
                     RuntimeEventKind::BackgroundCellStarted,
                     payload,
                 )?;
+            }
+            #[cfg(test)]
+            if self
+                .fail_next_cell_started_projection
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(BackgroundCellStartCommit::CommittedProjectionDegraded {
+                    detail: "injected BackgroundCellStarted projection failure".to_string(),
+                });
             }
             match self.shadow.rewrite_plan(run_id) {
                 Ok(()) => Ok(BackgroundCellStartCommit::Durable),

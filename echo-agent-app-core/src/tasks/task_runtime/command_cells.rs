@@ -780,19 +780,7 @@ impl CommandCellRuntimeService {
                 drop(permit);
                 let settled_receipt =
                     service.mark_awaiter_joined(&key, &receipt_for_task, &join_result);
-                let wait_for_terminal = matches!(
-                    &join_result,
-                    Ok(result)
-                        if result.outcome.status
-                            == echo_agent::agent::subagent::SubagentStatus::Completed
-                );
-                match observe_awaiter_cell_truth(
-                    registry,
-                    base_cell,
-                    wait_for_terminal,
-                    &service.shutdown,
-                )
-                .await
+                match observe_awaiter_cell_truth(registry, base_cell, true, &service.shutdown).await
                 {
                     Ok(Some(cell)) => {
                         let (awaiter_status, awaiter_summary) = awaiter_summary(join_result);
@@ -2442,6 +2430,80 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn awaiter_provider_failure_preserves_cell_truth() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
+        let registry = service.scoped(scope.clone(), None);
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "sleep 0.2; printf cell-still-succeeded".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        let mut parent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("test-model")
+            .build()
+            .map_err(|error| error.to_string())?;
+        parent.register_subagent_with_definition(
+            echo_agent::agent::subagent::SubagentBuilder::new("awaiter")
+                .description("failing test Awaiter")
+                .background()
+                .build(),
+            Box::new(
+                echo_agent::testing::FailingMockAgent::new("awaiter", "provider unavailable")
+                    .with_failure(echo_agent::testing::MockAgentFailure::Subagent),
+            ),
+        );
+        let context = ToolContext {
+            conversation_id: Some("conversation".to_string()),
+            message_id: Some("root-message".to_string()),
+            turn_id: Some("turn".to_string()),
+            ..ToolContext::default()
+        };
+        let receipt = service
+            .watch_cell(
+                registry,
+                parent.subagent_executor().clone(),
+                &scope,
+                &context,
+                &cell_id,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let pending = service
+                    .chat_events
+                    .pending_awaiter_results("global", "conversation", "root-message")
+                    .map_err(|error| error.to_string())?;
+                if let Some(result) = pending.into_iter().next() {
+                    return Ok::<AwaiterResult, String>(result);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .map_err(|_| "failed Awaiter did not publish its result".to_string())??;
+        assert_eq!(result.receipt.execution_id, receipt.execution_id);
+        assert_eq!(result.awaiter_status, AwaiterSummaryStatus::Failed);
+        assert_eq!(result.cell.phase, BackgroundCellPhase::Succeeded);
+        assert_eq!(
+            result.cell.terminal_cause,
+            Some(BackgroundCellTerminalCause::Exited)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn task_runtime_store_fallback_records_one_start_and_one_finish() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let store = Arc::new(
@@ -2775,6 +2837,90 @@ mod tests {
                 .list_background_cells("start-failure")
                 .map_err(|error| error.to_string())?
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn committed_start_with_degraded_projection_aborts_and_repairs_terminal()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "workspace")
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "projection-failure",
+                "workspace",
+                "conversation",
+                "root-message",
+                DomainProfile::AiCoding,
+                "repair committed start projection",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("projection-failure", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store.fail_next_cell_started_projection_for_test();
+        let service = test_service(temp.path())?;
+        let workspace_id = crate::workspace::WorkspaceId::from_name("workspace");
+        let registry = service.scoped(
+            crate::workspace::WorkspaceExecutionScope::workspace(&workspace_id, temp.path()),
+            Some(store.clone()),
+        );
+        let side_effect = temp.path().join("must-not-exist-after-degraded-projection");
+        let result = registry
+            .launch(CommandCellRequest {
+                command: format!("touch {}", side_effect.display()),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    run_id: Some("projection-failure".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await;
+        assert!(matches!(result, Err(CommandCellError::Runtime { .. })));
+
+        let cell = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let cells = store
+                    .list_background_cells("projection-failure")
+                    .map_err(|error| error.to_string())?;
+                if let Some(cell) = cells.into_iter().find(|cell| !cell.is_active()) {
+                    return Ok::<BackgroundCellState, String>(cell);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| "committed start did not repair to terminal".to_string())??;
+        assert!(!side_effect.exists());
+        assert_eq!(cell.phase, BackgroundCellPhase::LaunchFailed);
+        assert_eq!(
+            cell.terminal_cause,
+            Some(BackgroundCellTerminalCause::LaunchFailed)
+        );
+        let events = store
+            .list_events("projection-failure", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::BackgroundCellStarted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::BackgroundCellFinished)
+                .count(),
+            1
         );
         Ok(())
     }

@@ -74,6 +74,28 @@ impl ProcessExecutionGovernor {
     pub(crate) fn subagent_semaphore(&self) -> Arc<Semaphore> {
         self.subagent.clone()
     }
+
+    fn snapshot(&self) -> ProcessExecutionResourceSnapshot {
+        let limits = EkoExecutionLimits::default();
+        ProcessExecutionResourceSnapshot {
+            subagent_active: limits
+                .max_concurrent_subagents
+                .saturating_sub(self.subagent.available_permits()),
+            subagent_limit: limits.max_concurrent_subagents,
+            write_active: limits
+                .max_concurrent_writes
+                .saturating_sub(self.write.available_permits()),
+            write_limit: limits.max_concurrent_writes,
+            shell_active: limits
+                .max_concurrent_shells
+                .saturating_sub(self.shell.available_permits()),
+            shell_limit: limits.max_concurrent_shells,
+            llm_active: limits
+                .max_parallel_llm_calls
+                .saturating_sub(self.llm.available_permits()),
+            llm_limit: limits.max_parallel_llm_calls,
+        }
+    }
 }
 
 use super::completion_gate::{artifact_matches, verification_matches};
@@ -99,6 +121,32 @@ impl Default for EkoExecutionLimits {
             max_parallel_llm_calls: 4,
         }
     }
+}
+
+/// Content-free process resource counters for diagnostics and soak evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProcessExecutionResourceSnapshot {
+    pub subagent_active: usize,
+    pub subagent_limit: usize,
+    pub write_active: usize,
+    pub write_limit: usize,
+    pub shell_active: usize,
+    pub shell_limit: usize,
+    pub llm_active: usize,
+    pub llm_limit: usize,
+}
+
+impl ProcessExecutionResourceSnapshot {
+    pub fn within_limits(self) -> bool {
+        self.subagent_active <= self.subagent_limit
+            && self.write_active <= self.write_limit
+            && self.shell_active <= self.shell_limit
+            && self.llm_active <= self.llm_limit
+    }
+}
+
+pub fn process_execution_resource_snapshot() -> ProcessExecutionResourceSnapshot {
+    PROCESS_EXECUTION_GOVERNOR.snapshot()
 }
 
 /// Scope of an execution-flow event on the unified frontend channel.

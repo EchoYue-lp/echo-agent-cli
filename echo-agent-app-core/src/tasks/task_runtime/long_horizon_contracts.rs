@@ -5,6 +5,8 @@
 //! reachability assertion for the corrected authority.
 
 const APP_COMMAND_CELLS: &str = include_str!("command_cells.rs");
+const APP_AGENT_POOL: &str = include_str!("../../agent_pool.rs");
+const APP_CHAT_DRIVER: &str = include_str!("../../chat_driver.rs");
 const APP_EXECUTOR: &str = include_str!("executor.rs");
 const APP_FILE_STORE: &str = include_str!("file_store.rs");
 const APP_COMPLETION_GATE: &str = include_str!("completion_gate.rs");
@@ -19,6 +21,10 @@ const FRAMEWORK_CELL_CONTRACT: &str =
 const FRAMEWORK_CELL_RUNTIME: &str =
     include_str!("../../../../../echo-agent/echo-orchestration/src/tasks/command_cell.rs");
 const STORE_SOAK: &str = include_str!("../../../examples/task_runtime_soak.rs");
+const LH6_CONCURRENCY_SOAK: &str = include_str!("../../../examples/lh6_concurrency_soak.rs");
+const LH6_PRODUCT_SOAK: &str = include_str!("../../../../examples/lh6_product_soak.rs");
+const FRONTEND_CHAT_CONTRACT: &str =
+    include_str!("../../../../web-frontend/src/hooks/chatEventHandler.contract.test.ts");
 
 fn require(source: &str, needle: &str, failure: &str) -> Result<(), String> {
     if source.contains(needle) {
@@ -340,6 +346,11 @@ fn lh_f11_fast_model_resolves_one_complete_configured_profile() -> Result<(), St
         APP_INFRA,
         "prepare_runtime_llm(&runtime)",
         "LH-F11 repair regressed: resolved Provider profile is not prepared as one generation",
+    )?;
+    require(
+        APP_INFRA,
+        "ShellTool::new_permissive()",
+        "LH6 repair regressed: EKO still applies a fixed shell whitelist after PermissionService",
     )
 }
 
@@ -389,5 +400,159 @@ fn lh_f13_owner_identity_routes_ordinary_chat_to_its_exact_journal() -> Result<(
         APP_COMMAND_CELLS,
         "append_chat_cell_fact",
         "LH-F13 repair regressed: ordinary Chat cell is not durably journaled",
+    )
+}
+
+#[test]
+fn lh6_fault_matrix_has_automated_evidence_for_every_row() -> Result<(), String> {
+    let cases = [
+        (
+            "publication race",
+            FRAMEWORK_CELL_RUNTIME,
+            "launch_publishes_handle_before_fast_terminal_settlement",
+        ),
+        (
+            "Started append failure",
+            APP_COMMAND_CELLS,
+            "started_append_failure_executes_no_process_and_leaves_no_active_cell",
+        ),
+        (
+            "Started projection failure",
+            APP_COMMAND_CELLS,
+            "committed_start_with_degraded_projection_aborts_and_repairs_terminal",
+        ),
+        (
+            "tracked capacity",
+            FRAMEWORK_CELL_RUNTIME,
+            "total_tracked_capacity_backpressures_prepared_launches",
+        ),
+        (
+            "UTF-8 pipe split",
+            FRAMEWORK_CELL_RUNTIME,
+            "artifact_decoder_preserves_utf8_split_across_pipe_reads",
+        ),
+        (
+            "artifact writer failure",
+            FRAMEWORK_CELL_RUNTIME,
+            "artifact_write_failure_has_typed_status",
+        ),
+        (
+            "artifact finalizer deadline",
+            FRAMEWORK_CELL_RUNTIME,
+            "shutdown_aborts_blocking_artifact_finalizer_at_deadline",
+        ),
+        (
+            "terminal append retry",
+            APP_COMMAND_CELLS,
+            "terminal_persistence_failure_retains_owner_until_retry_succeeds",
+        ),
+        (
+            "receiver lag replay",
+            FRONTEND_CHAT_CONTRACT,
+            "renders runtime cell truth from an Awaiter Ready fact after turn settlement",
+        ),
+        (
+            "Awaiter Provider failure",
+            APP_COMMAND_CELLS,
+            "awaiter_provider_failure_preserves_cell_truth",
+        ),
+        (
+            "complete fast Provider profile",
+            APP_INFRA,
+            "configured_subagent_selector_resolves_the_complete_profile",
+        ),
+        (
+            "three-workspace shared governor",
+            LH6_CONCURRENCY_SOAK,
+            "const WORKSPACE_COUNT: usize = 3",
+        ),
+        (
+            "main turn before Awaiter",
+            FRONTEND_CHAT_CONTRACT,
+            "after its foreground turn is terminal",
+        ),
+        (
+            "process restart cell closure",
+            APP_STORE,
+            "boot_recovery_closes_orphan_cell_without_replaying_it",
+        ),
+        (
+            "Provider retry",
+            APP_CHAT_DRIVER,
+            "typed_retryable_llm_failure_schedules_without_persisting_provider_message",
+        ),
+        (
+            "checkpoint corruption",
+            APP_STORE,
+            "checkpoint_state_is_canonical_byte_equivalent_to_full_replay_and_repairs_corruption",
+        ),
+        (
+            "workspace corruption isolation",
+            APP_STATE,
+            "corrupt_workspace_does_not_block_healthy_global_boot_recovery",
+        ),
+        (
+            "committed projection degradation",
+            APP_COMMAND_CELLS,
+            "cell start committed but projection degraded",
+        ),
+    ];
+    if cases.len() != 18 {
+        return Err(format!(
+            "LH6 fault matrix expected 18 rows, found {}",
+            cases.len()
+        ));
+    }
+    for (name, source, evidence) in cases {
+        require(
+            source,
+            evidence,
+            &format!("LH6 fault matrix lost automated evidence for {name}"),
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn lh6_soaks_use_real_product_authorities_and_self_retire() -> Result<(), String> {
+    for (source, name) in [
+        (LH6_CONCURRENCY_SOAK, "concurrency"),
+        (LH6_PRODUCT_SOAK, "real-product"),
+    ] {
+        require(
+            source,
+            "\"passed\".to_string()",
+            &format!("LH6 {name} soak does not self-retire as passed"),
+        )?;
+        require_absent(
+            source,
+            "loop { std::process::Command",
+            &format!("LH6 {name} soak contains a binary restart loop"),
+        )?;
+    }
+    require(
+        LH6_PRODUCT_SOAK,
+        "drive_foreground_chat(",
+        "LH6 product soak bypasses the real foreground Agent driver",
+    )?;
+    require(
+        LH6_PRODUCT_SOAK,
+        "ChatSurface::Gui",
+        "LH6 product soak omits the GUI surface",
+    )?;
+    require(
+        LH6_PRODUCT_SOAK,
+        "HumanLoopRequest::input",
+        "LH6 product soak omits HITL",
+    )?;
+    require(
+        LH6_PRODUCT_SOAK,
+        "watch_cell",
+        "LH6 product soak omits Awaiter dispatch",
+    )?;
+    require(
+        APP_AGENT_POOL,
+        "PROCESS_AGENT_EXECUTION",
+        "LH6 product soak cannot enforce a process Agent execution bound",
     )
 }

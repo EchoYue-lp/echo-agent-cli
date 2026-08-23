@@ -710,6 +710,7 @@ pub async fn create_agent_with_diagnostics(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    install_eko_shell_policy(&mut agent, sandbox_manager.clone(), command_cells.clone());
     agent
         .tool_manager()
         .apply_script_execution_profile_resolver(script_execution_profile_resolver.clone());
@@ -1269,10 +1270,10 @@ fn build_writer_subagent_agent(
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         })
-        .sandbox_manager(sandbox_manager)
+        .sandbox_manager(sandbox_manager.clone())
         // 与主智能体共享同一进程级 registry；cell 自身通过同一个 sandbox
         // executor 执行，不会从前台策略静默降级为宿主机直连。
-        .command_cells(command_cells);
+        .command_cells(command_cells.clone());
 
     if max_iterations > 0 {
         builder = builder.max_iterations(max_iterations);
@@ -1303,6 +1304,7 @@ fn build_writer_subagent_agent(
     }
 
     let mut subagent = builder.build()?;
+    install_eko_shell_policy(&mut subagent, sandbox_manager, command_cells);
     subagent
         .tool_manager()
         .apply_script_execution_profile_resolver(script_execution_profile_resolver);
@@ -1326,6 +1328,24 @@ fn build_writer_subagent_agent(
     );
     subagent.config_mut().set_cache_user_id(cache_user_id);
     Ok(subagent)
+}
+
+fn install_eko_shell_policy(
+    agent: &mut ReactAgent,
+    sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    command_cells: Arc<dyn echo_agent::tools::cell::CommandCellRegistry>,
+) {
+    // EKO is a local personal assistant. The application PermissionService is
+    // the authority for automatic tool policy; retaining the framework's
+    // generic fixed whitelist here would reject harmless full-auto commands
+    // after permission had already been granted. The framework default stays
+    // strict for other embedders, while EKO still keeps the shell tool's
+    // dangerous blocklist and explicit-approval classifications.
+    agent.replace_tool(Box::new(
+        echo_agent::tools::shell::ShellTool::new_permissive()
+            .with_sandbox(sandbox_manager)
+            .with_cell_launcher(command_cells),
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3159,6 +3179,46 @@ mod resolve_subagent_model_tests {
                 .iter()
                 .any(|name| name == "agent_tool")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eko_writer_shell_defers_unknown_commands_to_permission_policy()
+    -> echo_agent::error::Result<()> {
+        let subagent = build_writer_subagent_agent(
+            "writer",
+            "exercise local shell policy",
+            "test-model",
+            None,
+            None,
+            None,
+            None,
+            8_192,
+            None,
+            30_000,
+            1_024,
+            "test-cache-user",
+            1,
+            false,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
+            Arc::new(SubagentRegistry::new()),
+            None,
+            Arc::new(SandboxManager::local_sandbox()),
+            test_command_cells()?,
+            Arc::new(crate::analysis_runtime::AnalyticsRuntime::default()),
+            true,
+        )?;
+        let result = subagent
+            .tool_manager()
+            .execute_tool(
+                "shell",
+                echo_agent::tools::ToolParameters::from([(
+                    "command".to_string(),
+                    serde_json::json!("sleep 0"),
+                )]),
+            )
+            .await?;
+        assert!(result.success, "{}", result.error.unwrap_or(result.output));
         Ok(())
     }
 

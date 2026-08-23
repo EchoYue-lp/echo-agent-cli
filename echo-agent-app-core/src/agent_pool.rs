@@ -47,6 +47,45 @@ use crate::workspace::WorkspaceKind;
 use echo_agent::config::AppConfig;
 use echo_agent::mcp::McpConfigFile;
 
+const PROCESS_AGENT_EXECUTION_LIMIT: usize = 10;
+static PROCESS_AGENT_EXECUTION: std::sync::LazyLock<Arc<AgentExecutionGovernor>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(AgentExecutionGovernor::new(PROCESS_AGENT_EXECUTION_LIMIT))
+    });
+
+struct AgentExecutionGovernor {
+    limit: usize,
+    semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+impl AgentExecutionGovernor {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(limit.max(1))),
+        }
+    }
+
+    fn snapshot(&self) -> AgentExecutionResourceSnapshot {
+        AgentExecutionResourceSnapshot {
+            active: self
+                .limit
+                .saturating_sub(self.semaphore.available_permits()),
+            limit: self.limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentExecutionResourceSnapshot {
+    pub active: usize,
+    pub limit: usize,
+}
+
+pub fn agent_execution_resource_snapshot() -> AgentExecutionResourceSnapshot {
+    PROCESS_AGENT_EXECUTION.snapshot()
+}
+
 /// Immutable EKO projection of the plugin catalog installed into primary,
 /// existing pooled, and future pooled agents as one generation.
 #[derive(Clone, Default)]
@@ -253,6 +292,7 @@ struct AgentPoolAdmission {
 struct AgentPoolAdmissionState {
     total: usize,
     by_key: HashMap<String, usize>,
+    process_permits: HashMap<String, tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl AgentPoolAdmission {
@@ -260,6 +300,7 @@ impl AgentPoolAdmission {
         self: &Arc<Self>,
         key: &str,
         agent: AgentHandle,
+        process_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<AgentPoolExecutionLease, PoolError> {
         let mut active = self
             .active
@@ -276,6 +317,10 @@ impl AgentPoolAdmission {
             .unwrap_or_default()
             .checked_add(1)
             .ok_or(PoolError::ExecutionLeaseCapacity)?;
+        if key_count == 1 {
+            let permit = process_permit.ok_or(PoolError::ExecutionLeaseCapacity)?;
+            active.process_permits.insert(key.to_string(), permit);
+        }
         active.total = total;
         active.by_key.insert(key.to_string(), key_count);
         drop(active);
@@ -283,6 +328,32 @@ impl AgentPoolAdmission {
             agent,
             admission: Some((Arc::clone(self), key.to_string())),
         })
+    }
+
+    fn issue_process_scoped(
+        self: &Arc<Self>,
+        key: &str,
+        agent: AgentHandle,
+        governor: &Arc<AgentExecutionGovernor>,
+    ) -> Result<AgentPoolExecutionLease, PoolError> {
+        if self.is_active(key) {
+            match self.issue(key, agent.clone(), None) {
+                Ok(lease) => return Ok(lease),
+                Err(PoolError::ExecutionLeaseCapacity) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let permit = match governor.semaphore.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) if self.is_active(key) => {
+                return self.issue(key, agent, None);
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                return Err(PoolError::ExecutionLeaseCapacity);
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => return Err(PoolError::ShuttingDown),
+        };
+        self.issue(key, agent, Some(permit))
     }
 
     fn is_active(&self, key: &str) -> bool {
@@ -353,14 +424,20 @@ impl Drop for AgentPoolExecutionLease {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         active.total = active.total.saturating_sub(1);
+        let mut release_process_permit = false;
         if let Some(count) = active.by_key.get_mut(&key) {
             *count = count.saturating_sub(1);
             if *count == 0 {
                 active.by_key.remove(&key);
+                release_process_permit = true;
             }
         }
+        let process_permit = release_process_permit
+            .then(|| active.process_permits.remove(&key))
+            .flatten();
         let released_last = active.total == 0;
         drop(active);
+        drop(process_permit);
         if released_last {
             admission.idle.notify_waiters();
         }
@@ -434,6 +511,7 @@ pub struct AgentPool {
     workspace_transitioning: AtomicBool,
     shutting_down: AtomicBool,
     admission: Arc<AgentPoolAdmission>,
+    process_agent_execution: Arc<AgentExecutionGovernor>,
     config: PoolConfig,
     app_config: RwLock<AppConfig>,
     /// Working directory applied to existing and future pooled agents.
@@ -778,6 +856,7 @@ impl AgentPool {
             workspace_transitioning: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(AgentPoolAdmission::default()),
+            process_agent_execution: PROCESS_AGENT_EXECUTION.clone(),
             config,
             app_config: RwLock::new(runtime.session_app_config.clone()),
             working_dir: RwLock::new(working_dir),
@@ -877,6 +956,7 @@ impl AgentPool {
             workspace_transitioning: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(AgentPoolAdmission::default()),
+            process_agent_execution: self.process_agent_execution.clone(),
             config: self.config.clone(),
             app_config: RwLock::new(self.app_config.read().await.clone()),
             working_dir: RwLock::new(Some(root.clone())),
@@ -1023,6 +1103,9 @@ impl AgentPool {
             workspace_transitioning: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             admission: Arc::new(AgentPoolAdmission::default()),
+            process_agent_execution: Arc::new(AgentExecutionGovernor::new(
+                PROCESS_AGENT_EXECUTION_LIMIT,
+            )),
             config: PoolConfig {
                 max_agents,
                 idle_timeout: Duration::from_secs(1800),
@@ -1104,9 +1187,13 @@ impl AgentPool {
                     agent.set_permission_mode(&permission_mode);
                 }
             });
-            return self
-                .admission
-                .issue(conversation_id, existing.handle.clone());
+            let handle = existing.handle.clone();
+            drop(agents);
+            return self.admission.issue_process_scoped(
+                conversation_id,
+                handle,
+                &self.process_agent_execution,
+            );
         }
 
         // Enforce the requested class limit and evict only from that class.
@@ -1172,8 +1259,9 @@ impl AgentPool {
             pool_size = agents.len(),
             "AgentPool: new agent created"
         );
-
-        self.admission.issue(conversation_id, handle)
+        drop(agents);
+        self.admission
+            .issue_process_scoped(conversation_id, handle, &self.process_agent_execution)
     }
 
     /// Lease an existing agent without creating a new one.
@@ -1190,10 +1278,17 @@ impl AgentPool {
         if self.workspace_transitioning.load(Ordering::Acquire) {
             return Err(PoolError::WorkspaceTransition);
         }
-        agents
+        let handle = agents
             .get(conversation_id)
-            .map(|pooled| self.admission.issue(conversation_id, pooled.handle.clone()))
-            .transpose()
+            .map(|pooled| pooled.handle.clone());
+        drop(agents);
+        match handle {
+            Some(handle) => self
+                .admission
+                .issue_process_scoped(conversation_id, handle, &self.process_agent_execution)
+                .map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Retire one cached agent using the exact execution receipt that owns it.
@@ -2290,6 +2385,53 @@ mod tests {
         let _h3 = pool.acquire("conv-3").await.map_err(|e| e.to_string())?;
 
         assert_eq!(pool.pool_size().await, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn process_agent_execution_is_bounded_across_workspace_pools() -> TestResult {
+        let governor = Arc::new(AgentExecutionGovernor::new(PROCESS_AGENT_EXECUTION_LIMIT));
+        let mut pools = Vec::new();
+        for _ in 0..3 {
+            let mut pool = create_test_pool(10, false).await?;
+            pool.process_agent_execution = governor.clone();
+            pools.push(Arc::new(pool));
+        }
+        let mut leases = Vec::new();
+        for index in 0..PROCESS_AGENT_EXECUTION_LIMIT {
+            let pool = pools
+                .get(index % pools.len())
+                .ok_or_else(|| "workspace pool is missing".to_string())?;
+            leases.push(
+                pool.acquire(&format!("workspace-conversation-{index}"))
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        assert_eq!(
+            governor.snapshot(),
+            AgentExecutionResourceSnapshot {
+                active: PROCESS_AGENT_EXECUTION_LIMIT,
+                limit: PROCESS_AGENT_EXECUTION_LIMIT,
+            }
+        );
+
+        let waiting_pool = pools
+            .first()
+            .cloned()
+            .ok_or_else(|| "waiting workspace pool is missing".to_string())?;
+        assert!(matches!(
+            waiting_pool.acquire("workspace-conversation-waiting").await,
+            Err(PoolError::ExecutionLeaseCapacity)
+        ));
+        leases.pop();
+        let admitted = waiting_pool
+            .acquire("workspace-conversation-waiting")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(admitted);
+        drop(leases);
+        assert!(governor.snapshot().active <= governor.snapshot().limit);
         Ok(())
     }
 
