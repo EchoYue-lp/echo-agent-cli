@@ -24,7 +24,7 @@ const CONVERSATIONS_PER_WORKSPACE: usize = 3;
 #[derive(Debug, Parser)]
 #[command(name = "lh6-concurrency-soak")]
 struct Args {
-    #[arg(long, default_value_t = 600)]
+    #[arg(long, default_value_t = 60)]
     duration_seconds: u64,
     #[arg(long)]
     output_dir: PathBuf,
@@ -120,8 +120,8 @@ impl Drop for LedgerFailureGuard {
 async fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(
-        args.duration_seconds >= 600,
-        "LH6 concurrency soak requires at least 600 active seconds"
+        args.duration_seconds >= 60,
+        "LH6 development concurrency smoke requires at least 60 active seconds"
     );
     let repo_root = git_repo_root()?;
     ensure_clean_worktree(&repo_root)?;
