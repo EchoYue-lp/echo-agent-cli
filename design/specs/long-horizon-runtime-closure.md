@@ -1,8 +1,7 @@
 # EKO Long-Horizon Runtime Closure
 
-> Date: 2026-08-23 (recalibrated through framework `3711e90` and application `6ab4fca`)
-> Status: LH0-LH5 Complete (`4ab7407`, framework `3711e90`, application
-> `fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`/`6ab4fca`); LH6 Pending
+> Date: 2026-08-23 (recalibrated through framework `afdf3b1` and application `0782a8c`)
+> Status: LH0-LH5 Complete; LH6 implementation Complete and acceptance In progress
 > Priority: P0; identity cutover is complete, while final LH6 acceptance still depends on the
 > runtime-reliability GUI/soak closeout
 > Scope: CommandCell, Awaiter, continuation boot recovery, terminal evidence, hot-state performance,
@@ -1114,62 +1113,82 @@ Two gates are required.
 Failure requires repair and a fresh run. Historical deterministic store soaks cannot replace this
 gate because they exercise a different path.
 
+### 13.9 LH6 running acceptance record
+
+Automated repair commits are framework `afdf3b1` and application `b125d9d`/`0782a8c`. The
+real-provider probe passed with 3 workspaces x 3 conversations, 36 Provider turns, 3 Awaiter
+results, 9 direct cells, 3 HITL responses, 2 controlled runtime restarts, all four surface
+identities, one Provider retry, one compaction, and one Subagent control receipt. Failure counters
+were zero.
+
+Formal release gates run detached through one-shot `launchctl submit` services and do not restart:
+
+| Gate | launchd label | Ledger/log root | Status at documentation commit |
+| ---- | ------------- | --------------- | ------------------------------ |
+| 10-minute concurrency | `com.eko.lh6-concurrency-0782a8c` | `.eko/soak/lh6-concurrency-0782a8c/` | running |
+| 2-hour real product | `com.eko.lh6-real-0782a8c` | `.eko/soak/lh6-real-0782a8c/` | running; first 9 turns and Awaiter passed |
+
+Both ledgers identify application commit `0782a8c16810cd1eb20c1b3f4e23d36310d7704c`. A prior
+`b125d9d` attempt is retained as failed/interrupted evidence after it exposed and led to repair of
+the durable terminal observer race. Do not mark LH6 Complete until both current ledgers are
+`passed` and the remaining real GUI acceptance is recorded.
+
 ## 14. Repair Completion Standard
 
 ### 14.1 Awaiter
 
-- [ ] remains configured Subagent role, not special model/runtime state;
-- [ ] fast profile resolves Provider/protocol/auth/model/thinking as one generation;
-- [ ] `watch_cell` returns owned idempotent receipt with generation and attempt;
-- [ ] app-core retains and joins background handle;
-- [ ] process-wide Subagent permit is retained through settlement;
-- [ ] exact message/interrupt works for active Awaiter attempt;
-- [ ] runtime terminal fields override conflicting prose;
-- [ ] result projects once and remains deliverable until safe-point acknowledgement after remount/lag;
-- [ ] stopping Awaiter and cell are distinct.
+- [x] remains configured Subagent role, not special model/runtime state;
+- [x] fast profile resolves Provider/protocol/auth/model/thinking as one generation;
+- [x] `watch_cell` returns owned idempotent receipt with generation and attempt;
+- [x] app-core retains and joins background handle;
+- [x] process-wide Subagent permit is retained through settlement;
+- [x] exact message/interrupt works for active Awaiter attempt;
+- [x] runtime terminal fields override conflicting prose;
+- [x] result projects once and remains deliverable until safe-point acknowledgement after remount/lag;
+- [x] stopping Awaiter and cell are distinct.
 
 ### 14.2 CommandCell
 
-- [ ] queue + running + drain + retained history is bounded;
-- [ ] handle publication precedes settlement;
-- [ ] durable Started precedes process/sandbox side effects for EKO cells;
-- [ ] queue time is included in deadline;
-- [ ] pipe drain and artifact finalization cannot outlive the absolute deadline;
-- [ ] typed cause/artifact state round-trips framework -> EKO -> surface;
-- [ ] terminal persistence never gives up while process lives;
-- [ ] shutdown leaves no cell or detached observer.
+- [x] queue + running + drain + retained history is bounded;
+- [x] handle publication precedes settlement;
+- [x] durable Started precedes process/sandbox side effects for EKO cells;
+- [x] queue time is included in deadline;
+- [x] pipe drain and artifact finalization cannot outlive the absolute deadline;
+- [x] typed cause/artifact state round-trips framework -> EKO -> surface;
+- [x] terminal persistence never gives up while process lives;
+- [x] shutdown leaves no cell or detached observer.
 
 ### 14.3 Continuation and recovery
 
-- [ ] all eligible unattended TaskRuns auto-resume, not only `background:` runs;
-- [ ] attended runs require interactive owner;
-- [ ] exact workspace/conversation/run survives restart;
-- [ ] process commands are never blindly replayed;
-- [ ] provider/budget/Goal/HITL/blockers recheck atomically;
-- [ ] one boot claim starts one driver.
+- [x] all eligible unattended TaskRuns auto-resume, not only `background:` runs;
+- [x] attended runs require interactive owner;
+- [x] exact workspace/conversation/run survives restart;
+- [x] process commands are never blindly replayed;
+- [x] provider/budget/Goal/HITL/blockers recheck atomically;
+- [x] one boot claim starts one driver.
 
 ### 14.4 Completion and evidence
 
-- [ ] active cell/Awaiter facts block only when semantically required;
-- [ ] failed/timed-out/cancelled cell is explicit evidence, never hidden success;
-- [ ] artifact write failure cannot satisfy required artifact;
-- [ ] Awaiter output alone cannot complete Requirement;
-- [ ] full replay and live completion report agree.
+- [x] active cell/Awaiter facts block only when semantically required;
+- [x] failed/timed-out/cancelled cell is explicit evidence, never hidden success;
+- [x] artifact write failure cannot satisfy required artifact;
+- [x] Awaiter output alone cannot complete Requirement;
+- [x] full replay and live completion report agree.
 
 ### 14.5 Performance and operations
 
 - [x] production `get_run_state` passes 10k/100k gates;
-- [ ] no retry/Awaiter wait tight-loop;
-- [ ] resource peaks stay within shared governor;
+- [x] no retry/Awaiter wait tight-loop;
+- [x] resource peaks stay within shared governor;
 - [ ] concurrency soak and real-product soak pass;
-- [ ] soak launcher self-retires and does not restart completed binary;
-- [ ] ledgers retain truthful passed/failed/waived status and hashes.
+- [x] soak launcher self-retires and does not restart completed binary;
+- [x] ledgers retain truthful passed/failed/waived status and hashes.
 
 ### 14.6 Surface parity
 
-- [ ] GUI, TUI, CLI/JSONL, channel use same app-core services;
-- [ ] all expose same typed terminal/control outcomes;
-- [ ] no surface-local Awaiter owner/result queue/recovery logic remains.
+- [x] GUI, TUI, CLI/JSONL, channel use same app-core services;
+- [x] all expose same typed terminal/control outcomes;
+- [x] no surface-local Awaiter owner/result queue/recovery logic remains.
 
 Only after every applicable item, LH0-LH6 gate, and repository submission gate passes may this file
 and `MASTER-PLAN` mark long-horizon product acceptance Complete.
@@ -1240,7 +1259,7 @@ logic; no two authorities remain active.
 | LH3   | Complete | N/A              | `09b9fc5`          | 11 runtime + 13 contracts; all app gates     | N/A                          |
 | LH4   | Complete | N/A              | `57be5c5`          | 5 boot/parity tests; all app gates           | N/A                          |
 | LH5   | Complete | N/A              | `6ab4fca`          | 14 contracts; 5 release samples; full gate  | N/A                          |
-| LH6   | Pending  | N/A              | N/A                | pending                                      | fault matrix + real soak     |
+| LH6   | In progress | `afdf3b1`     | `b125d9d`/`0782a8c` | 18-row matrix; full gates; real probe passed | background soak + GUI record |
 
 Allowed status: `Pending`, `In progress`, `Blocked`, `Complete`. Complete requires the stage gate and
 all applicable repository gates.

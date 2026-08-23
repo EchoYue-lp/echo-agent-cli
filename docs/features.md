@@ -74,7 +74,8 @@ TaskRuntime 进程级资源上限已接入生产路径并通过自动门禁。�
 真实 GUI 证据和两小时多 workspace soak 尚未记录；CommandCell/Awaiter 已共享进程资源
 governor并拥有 typed terminal receipt，普通 conversation boot resume、dedicated Awaiter
 surface projector、checkpoint-backed hot state 和 10k/100k 性能门已收口；剩余验收是 LH6
-故障矩阵、跨 surface 集成门、并发 soak 和两小时真实 Provider soak。
+后台 ledger 与真实 GUI 记录。LH6 的 18 行故障矩阵、跨 surface real-provider harness、进程级
+Agent/Subagent/shell/write/LLM governor 和 truthful self-retiring soak runner 已完成并通过自动门禁。
 
 这些未完成项由
 [`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)

@@ -1,7 +1,7 @@
 # EKO 多项目与多会话运行时可靠性修复规格
 
 > 日期：2026-08-21  
-> 状态：M0-M7 Complete；M8 automated implementation Complete；最终 GUI/2h soak acceptance pending
+> 状态：M0-M7 Complete；M8 automated implementation Complete；正式 2h soak 运行中，GUI acceptance pending
 > 优先级：P0 可靠性修复  
 > 整合范围：workspace/conversation runtime、foreground input/interrupt、本地恢复、
 > AgentRouter live/cold delivery 与 groups
@@ -1008,7 +1008,7 @@ npm run build
 | M5   | Complete    | TaskRuntime boot recovery + orphan chat/HITL durable terminal repair | Pending | N/A | boot recovery suite、GUI orphan reconciliation、HITL exact identity green | 无 live lease 的 stream 不再假恢复 | N/A |
 | M6   | Complete    | scoped aggregate deletion + idle-proof host shutdown/evict | Pending | N/A | busy reject/idle evict、same-id workspace isolation green | 删除前先 settle owners | N/A |
 | M7   | Complete    | AgentRouter Claimed/Injected/Delivered + persisted retry/reply | Pending | N/A | live cancel、cold reply、restart、three-inbox tests green | Delivered 延后到 transcript/reply safe point | N/A |
-| M8   | In progress | process governor + shared surface identity/projection | Pending | N/A | Clippy/full Rust/GUI/frontend automated gates green | 自动实现已完成 | 真实 GUI 证据与 2h soak |
+| M8   | In progress | process governor + shared surface identity/projection | `b125d9d`/`0782a8c` | `afdf3b1` | full Rust/GUI/frontend gates；real probe 3x3/36 turns green | 修复 Agent 全局许可、artifact finalize、Awaiter failure journal | `.eko/soak/lh6-real-0782a8c` + 真实 GUI 记录 |
 
 状态只能是 `Pending`、`In progress`、`Blocked`、`Complete`。只有本阶段验收和所有适用
 门禁全绿才能标 Complete。框架无改动必须明确写 `N/A`，不能把应用 commit 误记为框架

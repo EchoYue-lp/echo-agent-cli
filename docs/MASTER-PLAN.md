@@ -65,8 +65,8 @@ FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter sett
 
 ### Long-Horizon Runtime Closure
 
-状态：In progress；LH0-LH5 已完成，framework `3711e90`、application
-`4ab7407`/`fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`/`6ab4fca`；LH6 Pending。P0 的 resolver、address
+状态：In progress；LH0-LH5 已完成，LH6 自动修复已由 framework `afdf3b1`、application
+`b125d9d`/`0782a8c` 完成；正式 10 分钟/2 小时验收后台运行中。P0 的 resolver、address
 identity、event routing 和 host recovery 已可直接复用，不再等待未来 cutover；最终 LH6 仍依赖
 P0 GUI/2h soak closeout。
 
@@ -93,12 +93,13 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-Long-horizon 的 LH5 已完成：`TaskRuntimeStore::get_run_state` 复用既有 checkpoint/suffix read
-authority，RunTurn、Subagent、tool、recovery 与 CommandCell 的 operational/idempotency 状态由同一个
-`EventFoldState` 投影；生产全历史扫描从 18 处收敛到 7 处显式审计 allowlist。最终五次 release
-样本中 10k/100k hot read 的最坏中位数为 0.189/0.165 ms，append + read 最坏 20.84 ms，corrupt
-checkpoint rebuild 最坏 194.66 ms，repaired warm read 最坏 0.456 ms。下一实施阶段执行 LH6：完成
-自动故障注入矩阵、跨 surface 集成门、并发 soak 和两小时真实 Provider soak。
+Long-horizon 的 LH6 代码修复已完成：18 行故障矩阵、可取消 artifact finalize、Started projection
+crash window、Awaiter Provider failure durable result、EKO permission-owned shell policy、跨 workspace
+Agent execution governor、四 surface real-provider harness 与 truthful ledger 都已进入生产/测试路径。
+真实探针完成 3x3、36 Provider turns、3 Awaiter、3 HITL、2 restart，零失败。正式 acceptance 由
+`com.eko.lh6-concurrency-0782a8c` 和 `com.eko.lh6-real-0782a8c` 后台执行，证据分别写入
+`.eko/soak/lh6-concurrency-0782a8c/` 与 `.eko/soak/lh6-real-0782a8c/`。下一步只读取 ledger，两个
+状态都为 `passed` 且补齐真实 GUI 记录后关闭 M8/LH6；不得重新实现或重启已通过任务。
 
 ## 文档生命周期
 
