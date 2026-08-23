@@ -82,6 +82,40 @@ struct Ledger {
     journal_sha256: Option<String>,
 }
 
+struct LedgerFailureGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl LedgerFailureGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LedgerFailureGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(bytes) = std::fs::read(&self.path) else {
+            return;
+        };
+        let Ok(mut ledger) = serde_json::from_slice::<Ledger>(&bytes) else {
+            return;
+        };
+        ledger.status = "failed".to_string();
+        ledger.completed_at = Some(chrono::Utc::now().to_rfc3339());
+        if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
+            let _ = echo_core::utils::fs::atomic_write(&self.path, &bytes);
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -130,6 +164,7 @@ async fn main() -> Result<()> {
         journal_sha256: None,
     };
     write_ledger(&ledger_path, &ledger)?;
+    let mut failure_guard = LedgerFailureGuard::new(ledger_path.clone());
 
     while u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) < required_active_millis
     {
@@ -167,6 +202,7 @@ async fn main() -> Result<()> {
     ledger.status = "passed".to_string();
     ledger.completed_at = Some(chrono::Utc::now().to_rfc3339());
     write_ledger(&ledger_path, &ledger)?;
+    failure_guard.disarm();
     println!("{}", serde_json::to_string_pretty(&ledger)?);
     Ok(())
 }
@@ -277,14 +313,35 @@ async fn run_cycle(
             }
             other => return Err(anyhow!("unexpected cell phase {other:?}")),
         }
-        let replay = chat_events
-            .replay(
-                &item.address.workspace_id,
-                Some(&item.address.conversation_id),
-                &item.root_turn_id,
-                0,
-            )
-            .map_err(|error| anyhow!(error.to_string()))?;
+        let replay = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let replay = chat_events
+                    .replay(
+                        &item.address.workspace_id,
+                        Some(&item.address.conversation_id),
+                        &item.root_turn_id,
+                        0,
+                    )
+                    .map_err(|error| anyhow!(error.to_string()))?;
+                let settled = replay
+                    .events
+                    .iter()
+                    .filter(|event| {
+                        matches!(
+                            &event.payload,
+                            ChatDriverEvent::CommandCellSettled { cell }
+                                if cell.cell_id == item.cell_id
+                        )
+                    })
+                    .count();
+                if settled > 0 {
+                    return Ok::<_, anyhow::Error>(replay);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow!("cell terminal did not reach its durable journal"))??;
         let started = replay
             .events
             .iter()
