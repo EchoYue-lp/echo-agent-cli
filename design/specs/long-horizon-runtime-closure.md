@@ -230,7 +230,8 @@ Historical soak evidence remains scoped truthfully. `.eko/soak/m5-12h/ledger.jso
 turns, 143 compactions, 11 recoveries, and zero failed turns/fingerprints. Its event-log SHA-256 is
 `6963144f5714bb164fe4a9e2c9dd9250981d37f6c60a6c1e324ed78835e89ee1`. The 24h/48h ledgers were
 still `running` at calibration time and are not accepted as passed evidence. None exercises the
-real Agent/Awaiter/surface path, so LH-F08 remains open.
+real Agent/Awaiter/surface path, so LH-F08 was still open at the LH0 calibration point. It is
+closed by the current LH6 evidence in Section 13.9.
 
 ## 4. Implementation Gate: Layering And Duplicate Search
 
@@ -1142,6 +1143,18 @@ counters with Agent peak 9/10. A longer run was intentionally stopped at 26.6 mi
 project policy change after 234 cells and zero failures; its ledger is `interrupted_by_policy`, not
 accepted or failed evidence. The fresh 2-hour run is deferred to the project Final Integration
 Gate.
+
+Current closure status for the second half of the original fault baseline:
+
+| Fault | Status | Production authority | Regression evidence |
+| ----- | ------ | -------------------- | ------------------- |
+| LH-F07 | Complete | framework publish-before-supervise `prepare_launch/start_prepared` | `launch_publishes_handle_before_fast_terminal_settlement` |
+| LH-F08 | Complete | real `drive_foreground_chat`/cell/Awaiter/HITL/surface harness | `lh6_soaks_use_real_product_authorities_and_self_retire`; 36-turn probe |
+| LH-F09 | Complete | EKO `record_background_cell_started` before `start_prepared` | `started_append_failure_executes_no_process_and_leaves_no_active_cell`; projection-degraded repair test |
+| LH-F10 | Complete | shared EKO process Subagent/shell governor | `lh_f10_command_cells_share_the_process_shell_governor`; 3x3 resource probe |
+| LH-F11 | Complete | complete configured model generation resolver | `configured_subagent_selector_resolves_the_complete_profile`; `lh_f11_fast_model_resolves_one_complete_configured_profile` |
+| LH-F12 | Complete | framework `CommandCellObservationLease` across drain rounds | `observation_lease_retains_terminal_across_multiple_drain_rounds` |
+| LH-F13 | Complete | exact ordinary-Chat `workspace/conversation/root` journal scope | `ordinary_chat_cell_uses_exact_conversation_and_root_message_journal` |
 
 ## 14. Repair Completion Standard
 
