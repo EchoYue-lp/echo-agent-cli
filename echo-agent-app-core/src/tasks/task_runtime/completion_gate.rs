@@ -112,6 +112,8 @@ impl TaskRuntimeStore {
                 )],
             });
         };
+        // Audit allowlist: completion reviews all Requirement/Evidence and
+        // artifact history; the hot runtime snapshot intentionally omits it.
         let events = self.list_events(run_id, 0)?;
         let requirements = requirements_for_plan(&plan);
         let mut blockers = Vec::new();

@@ -191,12 +191,9 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }) {
                 Ok(updated) => {
                     println!("\n  TaskRun {} budgets updated.", snapshot.run.run_id);
-                    print_task_run_status(
-                        &echo_agent_app_core::tasks::task_runtime::RunStateSnapshot {
-                            continuation: Some(updated),
-                            ..snapshot
-                        },
-                    );
+                    let mut updated_snapshot = snapshot;
+                    updated_snapshot.continuation = Some(updated);
+                    print_task_run_status(&updated_snapshot);
                 }
                 Err(error) => println!("\n  Unable to update TaskRun budgets: {error}"),
             }

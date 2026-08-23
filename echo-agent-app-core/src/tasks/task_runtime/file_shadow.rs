@@ -808,6 +808,13 @@ fn event_affects_run_state(event: &RuntimeTaskEvent) -> bool {
             | RuntimeEventKind::TaskSkipped
             | RuntimeEventKind::TaskBlocked
             | RuntimeEventKind::TodoUpdated
+            | RuntimeEventKind::SubagentAssigned
+            | RuntimeEventKind::SubagentReleased
+            | RuntimeEventKind::ToolStarted
+            | RuntimeEventKind::ToolCompleted
+            | RuntimeEventKind::ToolFailed
+            | RuntimeEventKind::RecoveryBlocked
+            | RuntimeEventKind::RecoveryResolved
             | RuntimeEventKind::BackgroundCellStarted
             | RuntimeEventKind::BackgroundCellFinished
             | RuntimeEventKind::RunContinuationConfigured

@@ -14,9 +14,10 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::types::{
-    AttendedMode, BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
-    BackgroundCellTerminalCause, BlockerAudit, DomainProfile, EkoTaskExecution, ExecutionMode,
-    PlanRevision, PlanTask, ProviderRetryState, RunContinuationState, RunPause, RunPauseReason,
+    ActiveSubagentBoundary, ActiveToolBoundary, AttendedMode, BackgroundCellArtifactStatus,
+    BackgroundCellPhase, BackgroundCellState, BackgroundCellTerminalCause, BlockerAudit,
+    DomainProfile, EkoTaskExecution, ExecutionMode, PlanRevision, PlanTask, ProviderRetryState,
+    RecoveryBlocker, RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex,
     RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
     RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus, TurnVisibility,
 };
@@ -31,6 +32,8 @@ pub struct RebuiltPlan {
     pub background_cells: Vec<BackgroundCellState>,
     #[serde(default)]
     pub continuation: Option<RunContinuationState>,
+    #[serde(default)]
+    pub(crate) event_index: RunStateEventIndex,
 }
 
 impl RebuiltPlan {
@@ -55,6 +58,7 @@ impl RebuiltPlan {
             tasks: self.tasks.iter().map(PlanTask::execution).collect(),
             continuation: self.continuation.clone(),
             background_cells: self.background_cells.clone(),
+            event_index: self.event_index.clone(),
         }
     }
 }
@@ -84,6 +88,14 @@ pub(crate) struct EventFoldState {
     accounted_compactions: std::collections::BTreeSet<String>,
     #[serde(default)]
     finished_turns: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    assigned_subagents: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    active_subagents: std::collections::BTreeMap<String, ActiveSubagentBoundary>,
+    #[serde(default)]
+    active_tools: std::collections::BTreeMap<String, ActiveToolBoundary>,
+    #[serde(default)]
+    recovery_blockers: std::collections::BTreeMap<String, RecoveryBlocker>,
     #[serde(default)]
     last_seq: i64,
 }
@@ -120,6 +132,10 @@ impl EventFoldState {
             accounted_usage,
             accounted_compactions,
             finished_turns,
+            assigned_subagents,
+            active_subagents,
+            active_tools,
+            recovery_blockers,
             last_seq,
         } = self;
         use RuntimeEventKind as K;
@@ -226,6 +242,63 @@ impl EventFoldState {
                             continuation,
                             finished_turns,
                         );
+                        if let Some(recovery) = ev.payload.get("recovery") {
+                            if let Some(subagents) = recovery
+                                .get("subagents")
+                                .and_then(serde_json::Value::as_array)
+                            {
+                                for recovered in subagents {
+                                    if let Some(execution_id) =
+                                        json_string(recovered, "execution_id")
+                                    {
+                                        active_subagents.remove(&execution_id);
+                                    }
+                                }
+                            }
+                            if let Some(tools) =
+                                recovery.get("tools").and_then(serde_json::Value::as_array)
+                            {
+                                for recovered in tools {
+                                    if let (Some(task_id), Some(call_id)) = (
+                                        json_string(recovered, "task_id"),
+                                        json_string(recovered, "call_id"),
+                                    ) {
+                                        active_tools.remove(&tool_boundary_key(&task_id, &call_id));
+                                    }
+                                }
+                            }
+                            if let Some(recovered_tasks) =
+                                recovery.get("tasks").and_then(serde_json::Value::as_array)
+                            {
+                                for recovered in recovered_tasks {
+                                    let Some(task_id) = json_string(recovered, "task_id") else {
+                                        continue;
+                                    };
+                                    let Some(blocker) = recovered.get("blocker") else {
+                                        continue;
+                                    };
+                                    if blocker.is_null() {
+                                        continue;
+                                    }
+                                    recovery_blockers.insert(
+                                        task_id.clone(),
+                                        RecoveryBlocker {
+                                            run_id: ev.run_id.clone(),
+                                            task_id,
+                                            execution_id: json_string(blocker, "execution_id"),
+                                            call_id: json_string(blocker, "call_id"),
+                                            tool_name: json_string(blocker, "tool_name"),
+                                            reason: json_string(blocker, "reason").unwrap_or_else(
+                                                || {
+                                                    "mutating side effect is indeterminate"
+                                                        .to_string()
+                                                },
+                                            ),
+                                        },
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 K::RunAttachmentsUpdated => {
@@ -416,6 +489,8 @@ impl EventFoldState {
                             started_at: ev.timestamp,
                             finished_at: None,
                         });
+                    cell.name = json_string(&ev.payload, "name").unwrap_or_default();
+                    cell.call_id = json_string(&ev.payload, "call_id");
                     cell.phase =
                         json_enum(&ev.payload, "phase").unwrap_or(BackgroundCellPhase::Unknown);
                     cell.terminal_cause = json_enum(&ev.payload, "terminal_cause");
@@ -442,6 +517,89 @@ impl EventFoldState {
                     cell.artifact_path = json_string(&ev.payload, "artifact_path");
                     cell.artifact_sha256 = json_string(&ev.payload, "artifact_sha256");
                     cell.finished_at = Some(ev.timestamp);
+                }
+                K::SubagentAssigned => {
+                    let (Some(task_id), Some(execution_id)) =
+                        (ev.task_id.clone(), ev.step_id.clone())
+                    else {
+                        continue;
+                    };
+                    assigned_subagents.insert(execution_id.clone());
+                    active_subagents.insert(
+                        execution_id.clone(),
+                        ActiveSubagentBoundary {
+                            task_id,
+                            execution_id,
+                            replay_safe: ev
+                                .payload
+                                .get("replay_safe")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                        },
+                    );
+                }
+                K::SubagentReleased => {
+                    if let Some(execution_id) = ev.step_id.as_ref() {
+                        active_subagents.remove(execution_id);
+                    }
+                }
+                K::ToolStarted => {
+                    let Some(task_id) = ev.task_id.clone() else {
+                        continue;
+                    };
+                    let call_id = json_string(&ev.payload, "call_id")
+                        .or_else(|| ev.step_id.clone())
+                        .unwrap_or_default();
+                    if call_id.is_empty() {
+                        continue;
+                    }
+                    active_tools.insert(
+                        tool_boundary_key(&task_id, &call_id),
+                        ActiveToolBoundary {
+                            task_id,
+                            execution_id: json_string(&ev.payload, "execution_id"),
+                            call_id,
+                            tool_name: json_string(&ev.payload, "tool_name")
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            replay_safe: ev
+                                .payload
+                                .get("replay_safe")
+                                .and_then(serde_json::Value::as_bool)
+                                .unwrap_or(false),
+                        },
+                    );
+                }
+                K::ToolCompleted | K::ToolFailed => {
+                    let Some(task_id) = ev.task_id.as_ref() else {
+                        continue;
+                    };
+                    let call_id = json_string(&ev.payload, "call_id")
+                        .or_else(|| ev.step_id.clone())
+                        .unwrap_or_default();
+                    active_tools.remove(&tool_boundary_key(task_id, &call_id));
+                }
+                K::RecoveryBlocked => {
+                    let Some(task_id) = ev.task_id.clone() else {
+                        continue;
+                    };
+                    recovery_blockers.insert(
+                        task_id.clone(),
+                        RecoveryBlocker {
+                            run_id: ev.run_id.clone(),
+                            task_id,
+                            execution_id: json_string(&ev.payload, "execution_id"),
+                            call_id: json_string(&ev.payload, "call_id"),
+                            tool_name: json_string(&ev.payload, "tool_name"),
+                            reason: json_string(&ev.payload, "reason").unwrap_or_else(|| {
+                                "mutating side effect is indeterminate".to_string()
+                            }),
+                        },
+                    );
+                }
+                K::RecoveryResolved => {
+                    if let Some(task_id) = ev.task_id.as_ref() {
+                        recovery_blockers.remove(task_id);
+                    }
                 }
                 K::RunContinuationConfigured => {
                     let state = continuation.get_or_insert_with(RunContinuationState::default);
@@ -754,8 +912,22 @@ impl EventFoldState {
             tasks: self.tasks.clone(),
             background_cells: self.background_cells.values().cloned().collect(),
             continuation: self.continuation.clone(),
+            event_index: RunStateEventIndex {
+                started_turns: self.started_turns.clone(),
+                accounted_usage: self.accounted_usage.clone(),
+                accounted_compactions: self.accounted_compactions.clone(),
+                finished_turns: self.finished_turns.clone(),
+                assigned_subagents: self.assigned_subagents.clone(),
+                active_subagents: self.active_subagents.values().cloned().collect(),
+                active_tools: self.active_tools.values().cloned().collect(),
+                recovery_blockers: self.recovery_blockers.values().cloned().collect(),
+            },
         })
     }
+}
+
+fn tool_boundary_key(task_id: &str, call_id: &str) -> String {
+    format!("{task_id}\0{call_id}")
 }
 
 fn json_string(payload: &serde_json::Value, key: &str) -> Option<String> {

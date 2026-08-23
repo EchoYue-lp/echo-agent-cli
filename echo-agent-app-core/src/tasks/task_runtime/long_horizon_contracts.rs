@@ -7,9 +7,11 @@
 const APP_COMMAND_CELLS: &str = include_str!("command_cells.rs");
 const APP_EXECUTOR: &str = include_str!("executor.rs");
 const APP_FILE_STORE: &str = include_str!("file_store.rs");
+const APP_COMPLETION_GATE: &str = include_str!("completion_gate.rs");
 const APP_INFRA: &str = include_str!("../../infra.rs");
 const APP_STATE: &str = include_str!("../../state.rs");
 const APP_STORE: &str = include_str!("store.rs");
+const APP_SUBAGENT_CONTROL: &str = include_str!("subagent_control.rs");
 const APP_TYPES: &str = include_str!("types.rs");
 const APP_TAURI: &str = include_str!("../../../../src/tauri/mod.rs");
 const FRAMEWORK_CELL_CONTRACT: &str =
@@ -172,23 +174,79 @@ fn lh_f05_background_cell_projection_is_typed_and_complete() -> Result<(), Strin
 }
 
 #[test]
-fn lh_f06_hot_state_still_bypasses_existing_checkpoint_read() -> Result<(), String> {
+fn lh_f06_hot_state_uses_the_existing_checkpoint_read_authority() -> Result<(), String> {
     let hot_read = between(
         APP_STORE,
         "pub fn get_run_state",
         "pub fn configure_run_continuation",
         "LH-F06 get_run_state could not be isolated",
     )?;
-    require(
+    require_absent(
         hot_read,
         concat!("let events = self.", "list_", "events(run_id, 0)?;"),
-        "LH-F06 baseline changed: get_run_state no longer performs full replay",
+        "LH-F06 repair regressed: get_run_state performs full replay",
     )?;
     require(
         APP_FILE_STORE,
-        "fn read_run_state_resilient",
-        "LH-F06 duplicate-search authority disappeared: checkpoint-backed read is missing",
+        "pub fn get_run_state",
+        "LH-F06 repair regressed: FileTaskStore wrapper is missing",
+    )?;
+    require(
+        hot_read,
+        ".get_run_state(run_id)",
+        "LH-F06 repair regressed: TaskRuntimeStore bypasses FileTaskStore",
+    )?;
+    let cell_read = between(
+        APP_STORE,
+        "pub fn list_background_cells",
+        "pub fn record_background_cell_started",
+        "LH-F06 background cell read could not be isolated",
+    )?;
+    require_absent(
+        cell_read,
+        "list_events(run_id, 0)",
+        "LH-F06 repair regressed: background cells perform full replay",
     )
+}
+
+#[test]
+fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
+    let production_store = APP_STORE
+        .split("// The compile-time test that proves the transaction invariant:")
+        .next()
+        .ok_or_else(|| "store production section missing".to_string())?;
+    let production_control = APP_SUBAGENT_CONTROL
+        .split("#[cfg(test)]")
+        .next()
+        .ok_or_else(|| "Subagent control production section missing".to_string())?;
+    let production_completion = APP_COMPLETION_GATE
+        .split("#[cfg(test)]")
+        .next()
+        .ok_or_else(|| "completion production section missing".to_string())?;
+    let scans = production_store.matches("list_events(run_id, 0)").count()
+        + production_control
+            .matches("list_events(&target.run_id, 0)")
+            .count()
+        + production_control
+            .matches("list_events(&identity.run_id, 0)")
+            .count()
+        + production_completion
+            .matches("list_events(run_id, 0)")
+            .count();
+    if scans != 7 {
+        return Err(format!(
+            "LH5 full-scan allowlist changed without review: expected 7, found {scans}"
+        ));
+    }
+    let comments = production_store.matches("Audit allowlist:").count()
+        + production_control.matches("Audit allowlist:").count()
+        + production_completion.matches("Audit allowlist:").count();
+    if comments != scans {
+        return Err(format!(
+            "LH5 full-scan comments do not cover the allowlist: {comments}/{scans}"
+        ));
+    }
+    Ok(())
 }
 
 #[test]

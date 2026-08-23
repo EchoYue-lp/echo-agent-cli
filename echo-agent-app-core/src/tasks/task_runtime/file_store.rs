@@ -95,6 +95,12 @@ impl FileTaskStore {
             .map(|state| state.run))
     }
 
+    /// Read the checkpoint-backed runtime projection after validating and
+    /// repairing its event suffix through the one shadow authority.
+    pub fn get_run_state(&self, run_id: &str) -> Result<Option<RunStateSnapshot>, FileReadError> {
+        self.read_run_state_resilient(run_id)
+    }
+
     /// Enumerate every run under root, returning the run headers ordered by
     /// `created_at` descending (matching SQL `list_runs_in` ordering). Replaces
     /// `SELECT ... FROM tr_runs ORDER BY created_at DESC`.

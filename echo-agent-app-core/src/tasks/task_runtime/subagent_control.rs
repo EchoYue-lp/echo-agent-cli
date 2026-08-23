@@ -351,6 +351,8 @@ impl TaskRuntimeStore {
         executor: &SubagentExecutor,
     ) -> Result<usize, StoreError> {
         self.with_run_lock(&target.run_id, || {
+            // Audit allowlist: queued guidance transfer folds the complete
+            // durable command journal for one logical attempt.
             let events = self.list_events(&target.run_id, 0)?;
             let states = command_states(&events);
             let pending = events
@@ -558,6 +560,8 @@ fn existing_receipt(
     store: &TaskRuntimeStore,
     identity: &SubagentControlIdentity,
 ) -> Result<Option<SubagentControlReceipt>, StoreError> {
+    // Audit allowlist: command receipt replay must compare every event sharing
+    // the idempotency key and reject cross-identity reuse.
     let events = store.list_events(&identity.run_id, 0)?;
     let matches = events
         .iter()

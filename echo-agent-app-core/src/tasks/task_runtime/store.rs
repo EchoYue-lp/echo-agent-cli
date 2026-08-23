@@ -1063,26 +1063,10 @@ fn validate_runtime_plan(tasks: &[PlanTask]) -> Result<(), StoreError> {
         .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ActiveSubagentBoundary {
-    pub(crate) task_id: String,
-    pub(crate) execution_id: String,
-    replay_safe: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecoverableSubagentResult {
     pub(crate) result: SubagentTaskResult,
     pub(crate) full_output: String,
-}
-
-#[derive(Debug, Clone)]
-struct ActiveToolBoundary {
-    task_id: String,
-    execution_id: Option<String>,
-    call_id: String,
-    tool_name: String,
-    replay_safe: bool,
 }
 
 struct TaskStatusEvent<'a> {
@@ -2813,6 +2797,9 @@ impl TaskRuntimeStore {
                     ),
                 });
             }
+            // Audit allowlist: requirement acceptance is evidence history, not
+            // operational hot state; exact Goal/hash correlation needs the
+            // complete append-only evidence stream.
             let duplicate = self.list_events(run_id, 0)?.into_iter().any(|event| {
                 event.event_type == RuntimeEventKind::RequirementSkipped
                     && event
@@ -4423,6 +4410,8 @@ impl TaskRuntimeStore {
     /// available; usage events provide the live projection while it is running.
     pub fn list_subagent_runs(&self, run_id: &str) -> Result<Vec<SubagentRun>, StoreError> {
         let mut runs = std::collections::BTreeMap::<String, SubagentRun>::new();
+        // Audit allowlist: this public history API reconstructs every Subagent
+        // attempt, live usage, and terminal result, not just current boundaries.
         for event in self.list_events(run_id, 0)? {
             if let Some(recovery) = boot_recovery_payload(&event)
                 && let Some(subagents) = recovery
@@ -4588,92 +4577,17 @@ impl TaskRuntimeStore {
         &self,
         run_id: &str,
     ) -> Result<Vec<ActiveSubagentBoundary>, StoreError> {
-        let mut active = std::collections::HashMap::<String, ActiveSubagentBoundary>::new();
-        for event in self.list_events(run_id, 0)? {
-            if let Some(recovery) = boot_recovery_payload(&event)
-                && let Some(subagents) = recovery
-                    .get("subagents")
-                    .and_then(serde_json::Value::as_array)
-            {
-                for recovered in subagents {
-                    if let Some(execution_id) = json_string(recovered, "execution_id") {
-                        active.remove(&execution_id);
-                    }
-                }
-            }
-            let Some(execution_id) = event.step_id.clone() else {
-                continue;
-            };
-            match event.event_type {
-                RuntimeEventKind::SubagentAssigned => {
-                    let Some(task_id) = event.task_id.clone() else {
-                        continue;
-                    };
-                    active.insert(
-                        execution_id.clone(),
-                        ActiveSubagentBoundary {
-                            task_id,
-                            execution_id,
-                            replay_safe: json_bool(&event.payload, "replay_safe", false),
-                        },
-                    );
-                }
-                RuntimeEventKind::SubagentReleased => {
-                    active.remove(&execution_id);
-                }
-                _ => {}
-            }
-        }
-        Ok(active.into_values().collect())
+        Ok(self
+            .get_run_state(run_id)?
+            .map(|state| state.event_index.active_subagents)
+            .unwrap_or_default())
     }
 
     fn active_tool_boundaries(&self, run_id: &str) -> Result<Vec<ActiveToolBoundary>, StoreError> {
-        let mut active = std::collections::HashMap::<(String, String), ActiveToolBoundary>::new();
-        for event in self.list_events(run_id, 0)? {
-            if let Some(recovery) = boot_recovery_payload(&event)
-                && let Some(tools) = recovery.get("tools").and_then(serde_json::Value::as_array)
-            {
-                for recovered in tools {
-                    let Some(task_id) = json_string(recovered, "task_id") else {
-                        continue;
-                    };
-                    let Some(call_id) = json_string(recovered, "call_id") else {
-                        continue;
-                    };
-                    active.remove(&(task_id, call_id));
-                }
-            }
-            let Some(task_id) = event.task_id.clone() else {
-                continue;
-            };
-            let call_id = json_string(&event.payload, "call_id")
-                .or_else(|| event.step_id.clone())
-                .unwrap_or_default();
-            if call_id.is_empty() {
-                continue;
-            }
-            let key = (task_id.clone(), call_id.clone());
-            match event.event_type {
-                RuntimeEventKind::ToolStarted => {
-                    active.insert(
-                        key,
-                        ActiveToolBoundary {
-                            task_id,
-                            execution_id: json_string(&event.payload, "execution_id"),
-                            call_id,
-                            tool_name: json_string(&event.payload, "tool_name")
-                                .unwrap_or_else(|| "unknown".to_string()),
-                            replay_safe: json_bool(&event.payload, "replay_safe", false),
-                        },
-                    );
-                }
-                RuntimeEventKind::ToolCompleted | RuntimeEventKind::ToolFailed => {
-                    active.remove(&key);
-                }
-                _ => {}
-            }
-        }
-        Ok(active.into_values().collect())
+        Ok(self
+            .get_run_state(run_id)?
+            .map(|state| state.event_index.active_tools)
+            .unwrap_or_default())
     }
 
     #[cfg(test)]
@@ -4935,15 +4849,11 @@ impl TaskRuntimeStore {
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
-    /// Read the deterministic event-folded run-state projection.
+    /// Read the deterministic checkpoint-backed run-state projection.
     pub fn get_run_state(&self, run_id: &str) -> Result<Option<RunStateSnapshot>, StoreError> {
-        let events = self.list_events(run_id, 0)?;
-        if events.is_empty() {
-            return Ok(None);
-        }
-        super::event_rebuild::rebuild_plan_from_events(&events)
-            .map(|rebuilt| Some(rebuilt.run_state()))
-            .map_err(|error| StoreError::InvalidPlan(format!("run-state rebuild: {error}")))
+        self.file_store()?
+            .get_run_state(run_id)
+            .map_err(|error| StoreError::InvalidPlan(format!("file read: {error}")))
     }
 
     /// Configure long-horizon execution without introducing a second Goal store.
@@ -5270,14 +5180,10 @@ impl TaskRuntimeStore {
                     ContinuationNotSubmittedReason::AlreadyRunning,
                 ));
             }
-            if self.list_events(run_id, 0)?.iter().any(|event| {
-                event.event_type == RuntimeEventKind::RunTurnStarted
-                    && event
-                        .payload
-                        .get("turn_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(turn_id)
-            }) {
+            if self
+                .get_run_state(run_id)?
+                .is_some_and(|state| state.event_index.started_turns.contains(turn_id))
+            {
                 return Err(StoreError::InvalidPlan(format!(
                     "RunTurn id {turn_id} was already used by {run_id}"
                 )));
@@ -5353,20 +5259,14 @@ impl TaskRuntimeStore {
                     "usage event targets inactive RunTurn {turn_id} in {run_id}"
                 )));
             }
-            let events = self.list_events(run_id, 0)?;
             let event_id = format!("{run_id}:{turn_id}:usage:{provider_event_id}");
-            let already_recorded = events.iter().any(|event| {
-                event.event_type == RuntimeEventKind::RunTurnUsageAccounted
-                    && event
-                        .payload
-                        .get("event_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(event_id.as_str())
-            });
             let current = self
                 .get_run_state(run_id)?
                 .and_then(|snapshot| snapshot.continuation)
                 .unwrap_or_default();
+            let already_recorded = self
+                .get_run_state(run_id)?
+                .is_some_and(|state| state.event_index.accounted_usage.contains(&event_id));
             let added_tokens = input_tokens.saturating_add(output_tokens);
             let will_exhaust = !already_recorded
                 && current.token_budget.is_some_and(|budget| {
@@ -5435,11 +5335,10 @@ impl TaskRuntimeStore {
             else {
                 return Ok(false);
             };
-            let events = self.list_events(run_id, 0)?;
-            let assigned = events.iter().any(|event| {
-                event.event_type == RuntimeEventKind::SubagentAssigned
-                    && event.step_id.as_deref() == Some(execution_id)
-            });
+            let state = self.get_run_state(run_id)?;
+            let assigned = state
+                .as_ref()
+                .is_some_and(|state| state.event_index.assigned_subagents.contains(execution_id));
             if !assigned {
                 return Err(StoreError::InvalidPlan(format!(
                     "usage event targets unknown Subagent execution {execution_id} in {run_id}"
@@ -5447,14 +5346,9 @@ impl TaskRuntimeStore {
             }
             let event_id =
                 format!("{run_id}:subagent:{execution_id}:usage:{source_event_id}");
-            let already_recorded = events.iter().any(|event| {
-                event.event_type == RuntimeEventKind::RunTurnUsageAccounted
-                    && event
-                        .payload
-                        .get("event_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(event_id.as_str())
-            });
+            let already_recorded = state
+                .as_ref()
+                .is_some_and(|state| state.event_index.accounted_usage.contains(&event_id));
             let active_turn_id = current
                 .active_turn
                 .as_ref()
@@ -5545,14 +5439,9 @@ impl TaskRuntimeStore {
                 )));
             }
             let event_id = format!("{run_id}:{turn_id}:compact:{provider_event_id}");
-            let already_recorded = self.list_events(run_id, 0)?.iter().any(|event| {
-                event.event_type == RuntimeEventKind::RunTurnCompacted
-                    && event
-                        .payload
-                        .get("event_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(event_id.as_str())
-            });
+            let already_recorded = self
+                .get_run_state(run_id)?
+                .is_some_and(|state| state.event_index.accounted_compactions.contains(&event_id));
             if already_recorded {
                 return Ok(());
             }
@@ -5580,14 +5469,14 @@ impl TaskRuntimeStore {
         self.with_run_lock(run_id, || {
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            // Audit allowlist: the completion progress fingerprint summarizes
+            // task/result history beyond the operational RunStateSnapshot.
             let events = self.list_events(run_id, 0)?;
-            let already_recorded = events.iter().any(|event| {
-                event.event_type == RuntimeEventKind::RunTurnFinished
-                    && event
-                        .payload
-                        .get("turn_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(completion.turn_id)
+            let already_recorded = self.get_run_state(run_id)?.is_some_and(|state| {
+                state
+                    .event_index
+                    .finished_turns
+                    .contains(completion.turn_id)
             });
             if already_recorded {
                 return self
@@ -5742,10 +5631,10 @@ impl TaskRuntimeStore {
         &self,
         run_id: &str,
     ) -> Result<Vec<BackgroundCellState>, StoreError> {
-        let events = self.list_events(run_id, 0)?;
-        super::event_rebuild::rebuild_plan_from_events(&events)
-            .map(|rebuilt| rebuilt.background_cells)
-            .map_err(|error| StoreError::InvalidPlan(format!("cell event rebuild: {error}")))
+        Ok(self
+            .get_run_state(run_id)?
+            .map(|state| state.background_cells)
+            .unwrap_or_default())
     }
 
     /// Persist one cell launch exactly once. The framework registry remains
@@ -5787,16 +5676,17 @@ impl TaskRuntimeStore {
                 "phase": BackgroundCellPhase::Prepared,
                 "artifact_status": BackgroundCellArtifactStatus::NotRequested,
             });
-            let existing = self.list_events(run_id, 0)?.into_iter().find(|event| {
-                event.event_type == RuntimeEventKind::BackgroundCellStarted
-                    && event
-                        .payload
-                        .get("cell_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(cell_id)
-            });
+            let existing = self
+                .list_background_cells(run_id)?
+                .into_iter()
+                .find(|cell| cell.cell_id == cell_id);
             if let Some(existing) = existing {
-                if existing.payload != payload {
+                if existing.name != retention.sanitize_text(name)
+                    || existing.command_hash != command_hash
+                    || existing.turn_id.as_deref() != turn_id
+                    || existing.execution_id.as_deref() != execution_id
+                    || existing.call_id.as_deref() != call_id
+                {
                     return Err(StoreError::InvalidPlan(format!(
                         "conflicting BackgroundCellStarted fact for cell {cell_id}"
                     )));
@@ -5877,16 +5767,33 @@ impl TaskRuntimeStore {
                 "artifact_sha256": artifact_sha256,
                 "call_id": call_id,
             });
-            let existing = self.list_events(run_id, 0)?.into_iter().find(|event| {
-                event.event_type == RuntimeEventKind::BackgroundCellFinished
-                    && event
-                        .payload
-                        .get("cell_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(cell_id)
-            });
+            let existing = self
+                .list_background_cells(run_id)?
+                .into_iter()
+                .find(|cell| cell.cell_id == cell_id && !cell.is_active());
             if let Some(existing) = existing {
-                if existing.payload != payload {
+                if existing.phase != phase
+                    || existing.terminal_cause != terminal_cause
+                    || existing.terminal_message.as_deref()
+                        != terminal_message
+                            .map(|text| retention.sanitize_text(text))
+                            .as_deref()
+                    || existing.exit_code != exit_code
+                    || existing.artifact_status != artifact_status
+                    || existing.artifact_message.as_deref()
+                        != artifact_message
+                            .map(|text| retention.sanitize_text(text))
+                            .as_deref()
+                    || existing.total_output_bytes != total_output_bytes
+                    || existing.output_truncated != output_truncated
+                    || existing.output_excerpt.as_deref()
+                        != output_excerpt
+                            .map(|text| retention.sanitize_text(text))
+                            .as_deref()
+                    || existing.artifact_path.as_deref() != artifact_path
+                    || existing.artifact_sha256.as_deref() != artifact_sha256
+                    || existing.call_id.as_deref() != call_id
+                {
                     return Err(StoreError::InvalidPlan(format!(
                         "conflicting BackgroundCellFinished fact for cell {cell_id}"
                     )));
@@ -6165,6 +6072,8 @@ impl TaskRuntimeStore {
         attempt: u32,
     ) -> Result<Option<RecoverableSubagentResult>, StoreError> {
         let mut result = None;
+        // Audit allowlist: restart result reuse needs the full logical-attempt
+        // assignment/release sequence and its retained full output.
         for event in self.list_events(run_id, 0)? {
             let matches_attempt = event.task_id.as_deref() == Some(task_id)
                 && event
@@ -6211,67 +6120,17 @@ impl TaskRuntimeStore {
     /// Current unresolved recovery barriers, folded from append-only events.
     pub fn list_recovery_blockers(&self, run_id: &str) -> Result<Vec<RecoveryBlocker>, StoreError> {
         let _operation = self.shadow_operation()?;
-        let mut blockers = std::collections::BTreeMap::<String, RecoveryBlocker>::new();
-        for event in self.list_events(run_id, 0)? {
-            match event.event_type {
-                RuntimeEventKind::RunStatusChanged => {
-                    let Some(recovery) = boot_recovery_payload(&event) else {
-                        continue;
-                    };
-                    let Some(tasks) = recovery.get("tasks").and_then(serde_json::Value::as_array)
-                    else {
-                        continue;
-                    };
-                    for recovered in tasks {
-                        let Some(task_id) = json_string(recovered, "task_id") else {
-                            continue;
-                        };
-                        let Some(blocker) = recovered.get("blocker") else {
-                            continue;
-                        };
-                        if blocker.is_null() {
-                            continue;
-                        }
-                        blockers.insert(
-                            task_id.clone(),
-                            RecoveryBlocker {
-                                run_id: run_id.to_string(),
-                                task_id,
-                                execution_id: json_string(blocker, "execution_id"),
-                                call_id: json_string(blocker, "call_id"),
-                                tool_name: json_string(blocker, "tool_name"),
-                                reason: json_string(blocker, "reason").unwrap_or_else(|| {
-                                    "mutating side effect is indeterminate".to_string()
-                                }),
-                            },
-                        );
-                    }
-                }
-                RuntimeEventKind::RecoveryBlocked => {
-                    let Some(task_id) = event.task_id.clone() else {
-                        continue;
-                    };
-                    blockers.insert(
-                        task_id.clone(),
-                        RecoveryBlocker {
-                            run_id: run_id.to_string(),
-                            task_id,
-                            execution_id: json_string(&event.payload, "execution_id"),
-                            call_id: json_string(&event.payload, "call_id"),
-                            tool_name: json_string(&event.payload, "tool_name"),
-                            reason: json_string(&event.payload, "reason")
-                                .unwrap_or_else(|| "mutating side effect is indeterminate".into()),
-                        },
-                    );
-                }
-                RuntimeEventKind::RecoveryResolved => {
-                    if let Some(task_id) = event.task_id.as_ref() {
-                        blockers.remove(task_id);
-                    }
-                }
-                _ => {}
-            }
-        }
+        let mut blockers = self
+            .get_run_state(run_id)?
+            .map(|state| {
+                state
+                    .event_index
+                    .recovery_blockers
+                    .into_iter()
+                    .map(|blocker| (blocker.task_id.clone(), blocker))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
         // The blocked Todo projection is itself durable. If the dedicated
         // RecoveryBlocked append was interrupted after TaskBlocked landed,
         // synthesize the barrier so resume still fails closed.
@@ -6345,10 +6204,6 @@ impl TaskRuntimeStore {
     }
 }
 
-fn json_bool(value: &serde_json::Value, key: &str, default: bool) -> bool {
-    value.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
-}
-
 fn boot_recovery_payload(event: &RuntimeTaskEvent) -> Option<&serde_json::Value> {
     event.payload.get("recovery").filter(|recovery| {
         recovery.get("kind").and_then(serde_json::Value::as_str) == Some("boot_recovery")
@@ -6390,6 +6245,7 @@ fn validate_plan_goal_binding(run: &TaskRun, plan: &TaskPlan) -> Result<(), Stor
 #[allow(clippy::items_after_test_module)] // usage-record impls below are production code kept here for locality with their tests; reordering is pure churn
 mod tests {
     use super::*;
+    use std::io::Write;
 
     struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
@@ -6424,6 +6280,226 @@ mod tests {
 
     fn fresh() -> TaskRuntimeStore {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    }
+
+    fn seed_public_state_fixture(
+        event_count: usize,
+    ) -> Result<(tempfile::TempDir, TaskRuntimeStore, String), String> {
+        if event_count == 0 {
+            return Err("performance fixture requires at least one event".to_string());
+        }
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        let run_id = format!("public-state-{event_count}");
+        let run_dir = root.join(&run_id);
+        std::fs::create_dir_all(&run_dir).map_err(|error| error.to_string())?;
+        let file = std::fs::File::create(run_dir.join("events.jsonl"))
+            .map_err(|error| error.to_string())?;
+        let mut writer = std::io::BufWriter::new(file);
+        for index in 0..event_count {
+            let seq = i64::try_from(index).unwrap_or(i64::MAX).saturating_add(1);
+            let (task_id, step_id, event_type, payload) = match index {
+                0 => (
+                    None,
+                    None,
+                    RuntimeEventKind::RunCreated,
+                    serde_json::json!({
+                        "goal": "public state performance",
+                        "goal_revision": 1,
+                        "goal_sha256": task_goal_sha256("public state performance"),
+                        "domain_profile": "general",
+                        "workspace_id": "test",
+                        "conversation_id": "ordinary-conversation",
+                        "root_message_id": "root-message",
+                        "route": "task",
+                        "attended_mode": "unattended",
+                    }),
+                ),
+                1 => (
+                    None,
+                    None,
+                    RuntimeEventKind::RunContinuationConfigured,
+                    serde_json::json!({"enabled": true}),
+                ),
+                2 => (
+                    None,
+                    None,
+                    RuntimeEventKind::RunTurnStarted,
+                    serde_json::json!({
+                        "turn_id": "fixture-turn",
+                        "ordinal": 1,
+                        "origin": "continuation",
+                        "transcript_visibility": "internal",
+                    }),
+                ),
+                3 => (
+                    None,
+                    None,
+                    RuntimeEventKind::RunTurnUsageAccounted,
+                    serde_json::json!({
+                        "event_id": "fixture-usage",
+                        "turn_id": "fixture-turn",
+                        "input_tokens": 2,
+                        "output_tokens": 3,
+                        "elapsed_seconds": 1,
+                    }),
+                ),
+                4 => (
+                    None,
+                    None,
+                    RuntimeEventKind::RunTurnCompacted,
+                    serde_json::json!({
+                        "event_id": "fixture-compaction",
+                        "turn_id": "fixture-turn",
+                    }),
+                ),
+                5 => (
+                    None,
+                    None,
+                    RuntimeEventKind::RunTurnFinished,
+                    serde_json::json!({
+                        "turn_id": "fixture-turn",
+                        "status": "ended",
+                        "elapsed_seconds": 1,
+                        "made_progress": true,
+                    }),
+                ),
+                6 => (
+                    Some("fixture-task-a".to_string()),
+                    Some("fixture-execution-a".to_string()),
+                    RuntimeEventKind::SubagentAssigned,
+                    serde_json::json!({"replay_safe": false}),
+                ),
+                7 => (
+                    Some("fixture-task-a".to_string()),
+                    Some("fixture-call-a".to_string()),
+                    RuntimeEventKind::ToolStarted,
+                    serde_json::json!({
+                        "execution_id": "fixture-execution-a",
+                        "call_id": "fixture-call-a",
+                        "tool_name": "write_file",
+                        "replay_safe": false,
+                    }),
+                ),
+                8 => (
+                    Some("fixture-task-a".to_string()),
+                    None,
+                    RuntimeEventKind::RecoveryBlocked,
+                    serde_json::json!({
+                        "execution_id": "fixture-execution-a",
+                        "call_id": "fixture-call-a",
+                        "tool_name": "write_file",
+                        "reason": "fixture uncertain side effect",
+                    }),
+                ),
+                9 => (
+                    None,
+                    Some("fixture-call-a".to_string()),
+                    RuntimeEventKind::BackgroundCellStarted,
+                    serde_json::json!({
+                        "cell_id": "fixture-cell",
+                        "name": "fixture command",
+                        "command_hash": "fixture-hash",
+                        "phase": "running",
+                        "artifact_status": "not_requested",
+                    }),
+                ),
+                10 => (
+                    Some("fixture-task-a".to_string()),
+                    Some("fixture-call-a".to_string()),
+                    RuntimeEventKind::ToolCompleted,
+                    serde_json::json!({"call_id": "fixture-call-a"}),
+                ),
+                11 => (
+                    Some("fixture-task-a".to_string()),
+                    Some("fixture-execution-a".to_string()),
+                    RuntimeEventKind::SubagentReleased,
+                    serde_json::json!({}),
+                ),
+                12 => (
+                    Some("fixture-task-a".to_string()),
+                    None,
+                    RuntimeEventKind::RecoveryResolved,
+                    serde_json::json!({}),
+                ),
+                13 => (
+                    None,
+                    Some("fixture-call-a".to_string()),
+                    RuntimeEventKind::BackgroundCellFinished,
+                    serde_json::json!({
+                        "cell_id": "fixture-cell",
+                        "phase": "succeeded",
+                        "terminal_cause": "exited",
+                        "exit_code": 0,
+                        "artifact_status": "not_requested",
+                    }),
+                ),
+                14 => (
+                    Some("fixture-task-b".to_string()),
+                    Some("fixture-execution-b".to_string()),
+                    RuntimeEventKind::SubagentAssigned,
+                    serde_json::json!({"replay_safe": false}),
+                ),
+                15 => (
+                    Some("fixture-task-b".to_string()),
+                    Some("fixture-call-b".to_string()),
+                    RuntimeEventKind::ToolStarted,
+                    serde_json::json!({
+                        "execution_id": "fixture-execution-b",
+                        "call_id": "fixture-call-b",
+                        "tool_name": "shell",
+                        "replay_safe": false,
+                    }),
+                ),
+                16 => (
+                    Some("fixture-task-b".to_string()),
+                    None,
+                    RuntimeEventKind::RecoveryBlocked,
+                    serde_json::json!({
+                        "execution_id": "fixture-execution-b",
+                        "call_id": "fixture-call-b",
+                        "tool_name": "shell",
+                        "reason": "fixture active recovery blocker",
+                    }),
+                ),
+                _ => (
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({
+                        "kind": "performance_fixture",
+                        "ordinal": index,
+                        "detail": "fixed diagnostic payload for public checkpoint-backed state reads",
+                    }),
+                ),
+            };
+            let event = RuntimeTaskEvent {
+                seq,
+                run_id: run_id.clone(),
+                task_id,
+                step_id,
+                event_type,
+                payload,
+                timestamp: chrono::Utc::now(),
+            };
+            serde_json::to_writer(&mut writer, &event).map_err(|error| error.to_string())?;
+            writer.write_all(b"\n").map_err(|error| error.to_string())?;
+        }
+        writer.flush().map_err(|error| error.to_string())?;
+        let file = writer.into_inner().map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        store
+            .shadow
+            .rewrite_plan(&run_id)
+            .map_err(|error| error.to_string())?;
+        Ok((temp, store, run_id))
+    }
+
+    fn median_duration(samples: &mut [std::time::Duration]) -> Option<std::time::Duration> {
+        samples.sort_unstable();
+        samples.get(samples.len() / 2).copied()
     }
 
     fn boot_recovery_event_count(store: &TaskRuntimeStore) -> Result<usize, StoreError> {
@@ -8221,6 +8297,66 @@ mod tests {
             .and_then(|state| state.continuation)
             .ok_or_else(|| "continuation missing".to_string())?;
         assert!(!continuation.deferred);
+        Ok(())
+    }
+
+    #[test]
+    fn cell_terminal_retry_uses_the_exact_checkpointed_terminal_fact() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.record_background_cell_started(
+            "r1",
+            "cell-retry",
+            "prepared name",
+            "hash",
+            None,
+            None,
+            Some("start-call"),
+        )?;
+
+        for _ in 0..2 {
+            store.record_background_cell_finished(
+                "r1",
+                "cell-retry",
+                "terminal name",
+                BackgroundCellPhase::Succeeded,
+                Some(BackgroundCellTerminalCause::Exited),
+                None,
+                Some(0),
+                BackgroundCellArtifactStatus::NotRequested,
+                None,
+                2,
+                false,
+                Some("ok"),
+                None,
+                None,
+                None,
+            )?;
+        }
+
+        let cells = store.list_background_cells("r1")?;
+        let cell = cells
+            .iter()
+            .find(|cell| cell.cell_id == "cell-retry")
+            .ok_or_else(|| StoreError::InvalidPlan("terminal cell missing".to_string()))?;
+        assert_eq!(cell.name, "terminal name");
+        assert_eq!(cell.call_id, None);
+        assert_eq!(cell.phase, BackgroundCellPhase::Succeeded);
+        assert_eq!(
+            store
+                .list_events("r1", 0)?
+                .iter()
+                .filter(|event| {
+                    event.event_type == RuntimeEventKind::BackgroundCellFinished
+                        && event
+                            .payload
+                            .get("cell_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("cell-retry")
+                })
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -10474,6 +10610,159 @@ mod tests {
         drop(registration);
         store.remove_conversation("conversation-delete")?;
         assert!(store.get_run("active-delete-run")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn checkpoint_state_is_canonical_byte_equivalent_to_full_replay_and_repairs_corruption()
+    -> Result<(), String> {
+        let (temp, store, run_id) = seed_public_state_fixture(256)?;
+        let events = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?;
+        let full = super::super::event_rebuild::rebuild_plan_from_events(&events)
+            .map_err(|error| error.to_string())?
+            .run_state();
+        let warm = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "checkpoint-backed state is missing".to_string())?;
+        let full_bytes = echo_core::utils::canonical_json::canonical_json_bytes(&full)
+            .map_err(|error| error.to_string())?;
+        let warm_bytes = echo_core::utils::canonical_json::canonical_json_bytes(&warm)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(warm_bytes, full_bytes);
+
+        let checkpoint_path = temp
+            .path()
+            .join("tasks")
+            .join(&run_id)
+            .join("checkpoint.json");
+        std::fs::write(&checkpoint_path, b"{corrupt checkpoint")
+            .map_err(|error| error.to_string())?;
+        let repaired = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "repaired state is missing".to_string())?;
+        let repaired_bytes = echo_core::utils::canonical_json::canonical_json_bytes(&repaired)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(repaired_bytes, full_bytes);
+        let checkpoint = std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?;
+        let decoded =
+            serde_json::from_slice::<super::super::checkpoint::RuntimeCheckpoint>(&checkpoint)
+                .map_err(|error| error.to_string())?;
+        decoded
+            .validate(&run_id)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "LH5 release performance gate; run with --release --ignored --nocapture"]
+    fn performance_public_get_run_state_10k_100k_release_gate() -> Result<(), String> {
+        if cfg!(debug_assertions) {
+            return Err("LH5 performance gate must run with --release".to_string());
+        }
+        let (_ten_temp, ten_store, ten_run) = seed_public_state_fixture(10_000)?;
+        let (hundred_temp, hundred_store, hundred_run) = seed_public_state_fixture(100_000)?;
+
+        let mut ten_samples = Vec::with_capacity(5);
+        let mut hundred_samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            let started = std::time::Instant::now();
+            assert!(
+                ten_store
+                    .get_run_state(&ten_run)
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+            );
+            ten_samples.push(started.elapsed());
+
+            let started = std::time::Instant::now();
+            assert!(
+                hundred_store
+                    .get_run_state(&hundred_run)
+                    .map_err(|error| error.to_string())?
+                    .is_some()
+            );
+            hundred_samples.push(started.elapsed());
+        }
+        let ten_median = median_duration(&mut ten_samples)
+            .ok_or_else(|| "10k sample set is empty".to_string())?;
+        let hundred_median = median_duration(&mut hundred_samples)
+            .ok_or_else(|| "100k sample set is empty".to_string())?;
+        let ten_worst = ten_samples.iter().copied().max().unwrap_or_default();
+        let hundred_worst = hundred_samples.iter().copied().max().unwrap_or_default();
+
+        let append_started = std::time::Instant::now();
+        hundred_store
+            .note(&hundred_run, None, "one appended public state event")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            hundred_store
+                .get_run_state(&hundred_run)
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+        let append_read = append_started.elapsed();
+
+        let checkpoint_path = hundred_temp
+            .path()
+            .join("tasks")
+            .join(&hundred_run)
+            .join("checkpoint.json");
+        let events_path = hundred_temp
+            .path()
+            .join("tasks")
+            .join(&hundred_run)
+            .join("events.jsonl");
+        std::fs::write(&checkpoint_path, b"{corrupt checkpoint")
+            .map_err(|error| error.to_string())?;
+        let rebuild_started = std::time::Instant::now();
+        assert!(
+            hundred_store
+                .get_run_state(&hundred_run)
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+        let corrupt_rebuild = rebuild_started.elapsed();
+        let warm_started = std::time::Instant::now();
+        assert!(
+            hundred_store
+                .get_run_state(&hundred_run)
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+        let repaired_warm = warm_started.elapsed();
+        let checkpoint_bytes = std::fs::metadata(&checkpoint_path)
+            .map_err(|error| error.to_string())?
+            .len();
+        let event_bytes = std::fs::metadata(&events_path)
+            .map_err(|error| error.to_string())?
+            .len();
+
+        println!(
+            "{}",
+            serde_json::json!({
+                "ten_k_median_ms": ten_median.as_secs_f64() * 1_000.0,
+                "ten_k_worst_ms": ten_worst.as_secs_f64() * 1_000.0,
+                "hundred_k_median_ms": hundred_median.as_secs_f64() * 1_000.0,
+                "hundred_k_worst_ms": hundred_worst.as_secs_f64() * 1_000.0,
+                "append_read_ms": append_read.as_secs_f64() * 1_000.0,
+                "corrupt_rebuild_ms": corrupt_rebuild.as_secs_f64() * 1_000.0,
+                "repaired_warm_ms": repaired_warm.as_secs_f64() * 1_000.0,
+                "checkpoint_bytes": checkpoint_bytes,
+                "event_bytes": event_bytes,
+            })
+        );
+        assert!(ten_median <= std::time::Duration::from_millis(2));
+        assert!(hundred_median <= std::time::Duration::from_millis(2));
+        assert!(hundred_median.as_nanos() <= ten_median.as_nanos().saturating_mul(2).max(1));
+        assert!(append_read <= std::time::Duration::from_millis(50));
+        assert!(corrupt_rebuild <= std::time::Duration::from_secs(5));
+        assert!(repaired_warm <= std::time::Duration::from_millis(2));
+        assert!(checkpoint_bytes <= 256 * 1024);
+        assert!(checkpoint_bytes.saturating_mul(20) < event_bytes);
         Ok(())
     }
 

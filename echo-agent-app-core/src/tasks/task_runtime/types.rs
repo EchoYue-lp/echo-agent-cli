@@ -1271,6 +1271,46 @@ pub struct RunStateSnapshot {
     /// Event-folded background command cells owned by this run.
     #[serde(default)]
     pub background_cells: Vec<BackgroundCellState>,
+    /// Internal operational/idempotency index carried by the same checkpoint
+    /// fold. It is not a second authority and is intentionally not a UI wire.
+    #[serde(default)]
+    pub(crate) event_index: RunStateEventIndex,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct RunStateEventIndex {
+    #[serde(default)]
+    pub(crate) started_turns: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) accounted_usage: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) accounted_compactions: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) finished_turns: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) assigned_subagents: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub(crate) active_subagents: Vec<ActiveSubagentBoundary>,
+    #[serde(default)]
+    pub(crate) active_tools: Vec<ActiveToolBoundary>,
+    #[serde(default)]
+    pub(crate) recovery_blockers: Vec<RecoveryBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveSubagentBoundary {
+    pub(crate) task_id: String,
+    pub(crate) execution_id: String,
+    pub(crate) replay_safe: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveToolBoundary {
+    pub(crate) task_id: String,
+    pub(crate) execution_id: Option<String>,
+    pub(crate) call_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) replay_safe: bool,
 }
 
 /// Source of one finite primary-Agent turn within a long-horizon TaskRun.
