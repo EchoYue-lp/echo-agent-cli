@@ -50,6 +50,10 @@ async fn isolated_app_state() -> anyhow::Result<Fixture> {
         Default::default(),
         mcp,
     )?;
+    state.storage.chat_events = Arc::new(crate::chat_event_log::ChatEventLog::open(
+        temp.path().join("chat-events"),
+        crate::chat_event_log::ChatEventRetention::default(),
+    )?);
     state.workspace.registry = registry;
     state.agent_router = Arc::new(crate::agent_router::AgentRouter::new(
         temp.path().join("agent-router"),

@@ -1626,15 +1626,14 @@ pub(crate) async fn run_auto_memory_on_exit(
     }
 
     let Some(integration) = review_integration.as_ref() else {
-        tracing::debug!("session-end auto-memory skipped: ReviewIntegration is not configured");
+        eprintln!("  Auto-memory: Review integration is not configured.");
         return;
     };
     let evidence_lease = match integration.lease_generation() {
         Ok(lease) => lease,
         Err(error) => {
-            tracing::debug!(
-                error = %error,
-                "session-end auto-memory skipped while the workspace is switching"
+            eprintln!(
+                "  Auto-memory: workspace is switching; candidates were not queued ({error})"
             );
             return;
         }
@@ -1672,14 +1671,11 @@ pub(crate) async fn run_auto_memory_on_exit(
 
     let store = evidence_lease.evidence_store();
     match queue_observations(&store, &observations, &messages) {
-        Ok(candidates) => tracing::debug!(
-            candidate_count = candidates.len(),
-            "session-end auto-memory queued observation candidates"
+        Ok(candidates) => eprintln!(
+            "  Auto-memory: queued {} observation candidate(s) for review.",
+            candidates.len()
         ),
-        Err(error) => tracing::warn!(
-            error = %error,
-            "session-end auto-memory failed to queue candidates"
-        ),
+        Err(error) => eprintln!("  Auto-memory: failed to queue candidates ({error})"),
     }
 }
 
