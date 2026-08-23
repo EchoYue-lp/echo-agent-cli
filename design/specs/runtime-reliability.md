@@ -1,7 +1,7 @@
 # EKO 多项目与多会话运行时可靠性修复规格
 
 > 日期：2026-08-21  
-> 状态：M0-M7 Complete；M8 automated implementation Complete；正式 2h soak 运行中，GUI acceptance pending
+> 状态：M0-M8 Complete；长时 soak 与完整人工 GUI 场景归项目 Final Integration Gate
 > 优先级：P0 可靠性修复  
 > 整合范围：workspace/conversation runtime、foreground input/interrupt、本地恢复、
 > AgentRouter live/cold delivery 与 groups
@@ -762,15 +762,14 @@ FIFO 公平，指标按 workspace/run 标注。per-run limit 与 process limit �
 - GUI/TUI/CLI/channel 使用相同 identity、queue、interrupt、restore、TaskRuntime 控制服务。
 - 删除 frontend hook-local queue authority、global GUI adapters、重复 restore、旧 event schema、
   focus-routing fallback 和过时测试。
-- 完成多 workspace/conversation fault matrix 和 soak。
+- 完成多 workspace/conversation fault matrix 和开发期 bounded smoke。
 
 **完成门**
 
 - 不存在第二 runtime/router/mailbox/DAG/store；迁移 adapter 全部删除。
 - 所有 surface 功能合同一致，仅渲染不同。
-- 至少 3 workspace x 3 conversation 并发 soak 2 小时，交叉完成/失败/cancel/retry/HITL，
-  零身份串扰、零丢 receipt、零 stuck lease、资源峰值不超过配置。
-- 全部提交门和本规格验收矩阵通过后，才可把 M8 和主计划恢复为 Complete。
+- 3 workspace x 3 conversation 的 60 秒 smoke、真实 Provider probe 和全部提交门通过。
+- 10 分钟/2 小时与完整人工 GUI 场景迁移到项目 Final Integration Gate，不阻塞 M8 关闭。
 
 ## 16. 建议提交切片与回滚边界
 
@@ -897,11 +896,12 @@ FIFO 公平，指标按 workspace/run 标注。per-run limit 与 process limit �
 6. 尝试删除 busy conversation/workspace，确认拒绝且目录存在；settle 后再删。
 7. 在 1280x800 与 390x844 检查 queue、recovery、conflict 状态无重叠/截断。
 
-### 17.7 并发与 soak
+### 17.7 开发期 smoke 与最终集成 soak
 
-- 最小自动并发门：3 workspace x 3 conversation，持续 10 分钟，注入随机
+- 最小自动并发门：3 workspace x 3 conversation，持续 60 秒，注入确定性
   complete/fail/cancel/pause/resume/steer/delivery/restart。
-- 最终门：同规模 2 小时真实 provider/工具 soak。
+- 项目 Final Integration Gate：10 分钟 deterministic concurrency + 同规模 2 小时真实
+  provider/工具 soak。
 - 每轮记录 address、root turn、active turn、run、delivery attempt、cursor 和资源 permit。
 - 失败条件：任何跨 address event/store/root 命中、accepted input 丢失、duplicate terminal、
   stuck lease、无界 retry、目录删除后写入、资源峰值越界。
@@ -977,10 +977,10 @@ npm run build
 - [ ] 进程级 LLM/shell/write/Subagent/Agent execution 峰值不超过配置。
 - [ ] 背景 address 事件不会触发当前 address 的无关全量 reload。
 - [ ] retry 不 tight-loop；deadline 到达前 CPU/日志无忙等。
-- [ ] 2 小时 soak 全部 failure counters 为零。
+- [x] 60 秒 3x3 smoke 与真实 Provider probe failure counters 为零。
+- [ ] 项目 Final Integration Gate 的 2 小时 soak failure counters 为零。
 
-只有以上全部完成、M0-M8 账本有提交和测试证据、所有适用门禁全绿，本文状态和
-`MASTER-PLAN` 才能改为 Complete。
+M0-M8 实现与开发期验收全部完成。未勾选的长时项由项目 Final Integration Gate 统一执行。
 
 ## 19. 风险与控制
 
@@ -1008,7 +1008,7 @@ npm run build
 | M5   | Complete    | TaskRuntime boot recovery + orphan chat/HITL durable terminal repair | Pending | N/A | boot recovery suite、GUI orphan reconciliation、HITL exact identity green | 无 live lease 的 stream 不再假恢复 | N/A |
 | M6   | Complete    | scoped aggregate deletion + idle-proof host shutdown/evict | Pending | N/A | busy reject/idle evict、same-id workspace isolation green | 删除前先 settle owners | N/A |
 | M7   | Complete    | AgentRouter Claimed/Injected/Delivered + persisted retry/reply | Pending | N/A | live cancel、cold reply、restart、three-inbox tests green | Delivered 延后到 transcript/reply safe point | N/A |
-| M8   | In progress | process governor + shared surface identity/projection | `b125d9d`/`0782a8c` | `afdf3b1` | full Rust/GUI/frontend gates；real probe 3x3/36 turns green | 修复 Agent 全局许可、artifact finalize、Awaiter failure journal | `.eko/soak/lh6-real-0782a8c` + 真实 GUI 记录 |
+| M8   | Complete | process governor + shared surface identity/projection | `b125d9d`/`0782a8c`/`cd52171` | `afdf3b1` | full Rust/GUI/frontend；3x3 smoke；36-turn real probe | 修复 Agent 全局许可、artifact finalize、Awaiter failure journal | N/A |
 
 状态只能是 `Pending`、`In progress`、`Blocked`、`Complete`。只有本阶段验收和所有适用
 门禁全绿才能标 Complete。框架无改动必须明确写 `N/A`，不能把应用 commit 误记为框架

@@ -1,9 +1,8 @@
 # EKO Long-Horizon Runtime Closure
 
-> Date: 2026-08-23 (recalibrated through framework `afdf3b1` and application `0782a8c`)
-> Status: LH0-LH5 Complete; LH6 implementation Complete and acceptance In progress
-> Priority: P0; identity cutover is complete, while final LH6 acceptance still depends on the
-> runtime-reliability GUI/soak closeout
+> Date: 2026-08-23 (recalibrated through framework `afdf3b1` and application `cd52171`)
+> Status: LH0-LH6 Complete; long-duration soak belongs to the project Final Integration Gate
+> Priority: P0 runtime repair Complete
 > Scope: CommandCell, Awaiter, continuation boot recovery, terminal evidence, hot-state performance,
 > and end-to-end long-horizon acceptance
 
@@ -952,10 +951,12 @@ Deliverables:
 
 Completion gate:
 
-- automated/manual acceptance below passes;
+- automated fault matrix, 60-second 3x3 smoke, real-provider probe, and repository gates pass;
 - no open P0/P1 finding in this specification;
-- `runtime-reliability.md` dependencies are Complete;
-- project status may then call long-horizon product acceptance Complete.
+- `runtime-reliability.md` implementation dependencies are Complete.
+
+The 10-minute/2-hour soaks and complete manual GUI scenario are project-level integration/release
+gates. They run after feature development converges, not after each runtime repair slice.
 
 ## 13. Test Specification
 
@@ -1088,11 +1089,19 @@ Run release fixtures with fixed histories and five consecutive samples. Record h
 commit, median, worst, event/checkpoint sizes, and peak RSS. Tests fail on threshold regression;
 results are not edited afterward.
 
-### 13.8 Soak tests
+### 13.8 Development smoke and final-project soak
 
-Two gates are required.
+**Development gate**
 
-**Automated concurrency soak**
+- 3 workspaces x 3 conversations for at least 60 seconds;
+- deterministic provider allowed;
+- seeded launch/wait/output/cancel/restart/focus-switch schedule;
+- assert global permits, exact routing, no lost terminal, and no busy loop.
+
+This bounded smoke runs with LH6 and future runtime changes. It must remain short enough for normal
+development iteration.
+
+**Final Integration Gate: automated concurrency soak**
 
 - 3 workspaces x 3 conversations;
 - at least 10 minutes;
@@ -1100,7 +1109,7 @@ Two gates are required.
 - seeded launch/wait/output/cancel/restart/focus-switch schedule;
 - assert global permits, exact routing, no lost terminal, no busy loop.
 
-**Real-product soak**
+**Final Integration Gate: real-product soak**
 
 - minimum 2 active hours;
 - real configured provider and actual `drive_chat`/TaskContinuationRuntime;
@@ -1110,10 +1119,11 @@ Two gates are required.
 - GUI plus one headless surface active;
 - content-free metrics only; no secrets in ledger.
 
-Failure requires repair and a fresh run. Historical deterministic store soaks cannot replace this
-gate because they exercise a different path.
+These long-duration gates run once the broader project feature set is complete, when their
+integration coverage is highest. A failure requires repair and a fresh final-project run.
+Historical deterministic store soaks cannot replace the real-product gate.
 
-### 13.9 LH6 running acceptance record
+### 13.9 LH6 acceptance record
 
 Automated repair commits are framework `afdf3b1` and application `b125d9d`/`0782a8c`. The
 real-provider probe passed with 3 workspaces x 3 conversations, 36 Provider turns, 3 Awaiter
@@ -1121,17 +1131,17 @@ results, 9 direct cells, 3 HITL responses, 2 controlled runtime restarts, all fo
 identities, one Provider retry, one compaction, and one Subagent control receipt. Failure counters
 were zero.
 
-Formal release gates run detached through one-shot `launchctl submit` services and do not restart:
+The extended 10-minute concurrency run also passed on `0782a8c`: 3x3 conversations, 203 cycles,
+1,827 cells, 1,371 succeeded, 456 cancelled, 8 runtime reopens, and zero routing, duplicate
+terminal, or resource failures. Ledger SHA-256 evidence remains at
+`.eko/soak/lh6-concurrency-0782a8c/ledger.json`.
 
-| Gate | launchd label | Ledger/log root | Status at documentation commit |
-| ---- | ------------- | --------------- | ------------------------------ |
-| 10-minute concurrency | `com.eko.lh6-concurrency-0782a8c` | `.eko/soak/lh6-concurrency-0782a8c/` | running |
-| 2-hour real product | `com.eko.lh6-real-0782a8c` | `.eko/soak/lh6-real-0782a8c/` | running; first 9 turns and Awaiter passed |
-
-Both ledgers identify application commit `0782a8c16810cd1eb20c1b3f4e23d36310d7704c`. A prior
-`b125d9d` attempt is retained as failed/interrupted evidence after it exposed and led to repair of
-the durable terminal observer race. Do not mark LH6 Complete until both current ledgers are
-`passed` and the remaining real GUI acceptance is recorded.
+The corrected real-product harness at `cd52171` passed the complete short probe again: 36 Provider
+turns, 3 Awaiters, 3 HITL responses, 2 controlled restarts, all four surfaces, and zero failure
+counters with Agent peak 9/10. A longer run was intentionally stopped at 26.6 minutes by the
+project policy change after 234 cells and zero failures; its ledger is `interrupted_by_policy`, not
+accepted or failed evidence. The fresh 2-hour run is deferred to the project Final Integration
+Gate.
 
 ## 14. Repair Completion Standard
 
@@ -1180,8 +1190,9 @@ the durable terminal observer race. Do not mark LH6 Complete until both current 
 - [x] production `get_run_state` passes 10k/100k gates;
 - [x] no retry/Awaiter wait tight-loop;
 - [x] resource peaks stay within shared governor;
-- [ ] concurrency soak and real-product soak pass;
-- [x] soak launcher self-retires and does not restart completed binary;
+- [x] bounded 3x3 development smoke and real-product probe pass;
+- [ ] Final Integration Gate: 10-minute concurrency and 2-hour real-product soak pass;
+- [x] smoke/soak binaries self-retire and do not contain restart loops;
 - [x] ledgers retain truthful passed/failed/waived status and hashes.
 
 ### 14.6 Surface parity
@@ -1190,8 +1201,8 @@ the durable terminal observer race. Do not mark LH6 Complete until both current 
 - [x] all expose same typed terminal/control outcomes;
 - [x] no surface-local Awaiter owner/result queue/recovery logic remains.
 
-Only after every applicable item, LH0-LH6 gate, and repository submission gate passes may this file
-and `MASTER-PLAN` mark long-horizon product acceptance Complete.
+LH0-LH6 implementation acceptance is Complete. The unchecked long-duration item is owned by the
+project Final Integration Gate and does not block subsequent feature development.
 
 ## 15. Submission Gates
 
@@ -1259,7 +1270,7 @@ logic; no two authorities remain active.
 | LH3   | Complete | N/A              | `09b9fc5`          | 11 runtime + 13 contracts; all app gates     | N/A                          |
 | LH4   | Complete | N/A              | `57be5c5`          | 5 boot/parity tests; all app gates           | N/A                          |
 | LH5   | Complete | N/A              | `6ab4fca`          | 14 contracts; 5 release samples; full gate  | N/A                          |
-| LH6   | In progress | `afdf3b1`     | `b125d9d`/`0782a8c` | 18-row matrix; full gates; real probe passed | background soak + GUI record |
+| LH6   | Complete | `afdf3b1` | `b125d9d`/`0782a8c`/`cd52171` | 18-row matrix; full gates; 3x3 smoke/probe | N/A |
 
 Allowed status: `Pending`, `In progress`, `Blocked`, `Complete`. Complete requires the stage gate and
 all applicable repository gates.

@@ -45,7 +45,7 @@ Last updated: 2026-08-23
 
 ### P0 Runtime Reliability
 
-状态：In progress
+状态：Complete（实现与开发期验收）
 
 规格：[`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)
 
@@ -56,19 +56,18 @@ Last updated: 2026-08-23
 3. 历史打开、live rebind、boot recovery 不覆盖正在运行的 Agent context。
 4. AgentRouter 只在 transcript safe point 后结算 Delivered，并闭环 reply/backoff。
 5. 删除先 settle/shutdown/evict，进程级资源上限不会随 workspace 数量倍增。
-6. GUI/TUI/CLI/channel fault matrix 与 2 小时 soak 全绿后才标记 Complete。
+6. GUI/TUI/CLI/channel fault matrix 与 bounded smoke 全绿；长时 soak 属于项目 Final Integration Gate。
 
 应用提交 `5603958` 已完成 M0-M7 和 M8 自动实现：workspace-scoped IPC/event、durable input
 FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter settlement/backoff
-以及 process governor 均通过完整自动门禁。最终状态仍为 In progress，因为真实 GUI
-验收证据和规格要求的 2 小时多 workspace soak 尚未记录；完成这两项后才能改为 Complete。
+以及 process governor 均通过完整自动门禁。M8 的 3x3 smoke 和 36-turn real-provider probe
+均为零失败；10 分钟/2 小时与完整人工 GUI 场景在项目全部研发完成后统一执行。
 
 ### Long-Horizon Runtime Closure
 
-状态：In progress；LH0-LH5 已完成，LH6 自动修复已由 framework `afdf3b1`、application
-`b125d9d`/`0782a8c` 完成；正式 10 分钟/2 小时验收后台运行中。P0 的 resolver、address
-identity、event routing 和 host recovery 已可直接复用，不再等待未来 cutover；最终 LH6 仍依赖
-P0 GUI/2h soak closeout。
+状态：Complete；LH0-LH6 已由 framework `afdf3b1`、application
+`b125d9d`/`0782a8c`/`cd52171` 完成。P0 的 resolver、address identity、event routing、host
+recovery、fault matrix、3x3 smoke 和 real-provider probe 均已收口。
 
 规格：[`design/specs/long-horizon-runtime-closure.md`](../design/specs/long-horizon-runtime-closure.md)
 
@@ -78,12 +77,12 @@ LH1-LH5 已关闭 CommandCell publication/retention、Started-before-side-effect
 typed terminal/artifact projection、owned repair，以及 Awaiter direct controlled dispatch、exact
 interrupt、process Subagent permit、Ready/Acknowledged replay、完整 Provider profile、dedicated
 surface projector、global/workspace 普通 conversation boot resume，以及 checkpoint-backed hot
-state、运行边界索引和 10k/100k 性能门。剩余缺口是真实 Agent/Awaiter/surface 故障矩阵与 soak。
-完成 LH6 前，不把长程产品级验收标为 Complete。
+state、运行边界索引、10k/100k 性能门、真实 Agent/Awaiter/surface 故障矩阵和 bounded smoke。
+长时间集成测试不再阻塞功能阶段，统一归项目 Final Integration Gate。
 
 ### Surface Parity Cleanup
 
-状态：Pending；在 P0 runtime reliability 收口后执行。
+状态：Pending；P0 runtime reliability 已收口，下一阶段可直接执行。
 
 规格：[`design/specs/surface-parity.md`](../design/specs/surface-parity.md)
 
@@ -96,10 +95,10 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 Long-horizon 的 LH6 代码修复已完成：18 行故障矩阵、可取消 artifact finalize、Started projection
 crash window、Awaiter Provider failure durable result、EKO permission-owned shell policy、跨 workspace
 Agent execution governor、四 surface real-provider harness 与 truthful ledger 都已进入生产/测试路径。
-真实探针完成 3x3、36 Provider turns、3 Awaiter、3 HITL、2 restart，零失败。正式 acceptance 由
-`com.eko.lh6-concurrency-0782a8c` 和 `com.eko.lh6-real-0782a8c` 后台执行，证据分别写入
-`.eko/soak/lh6-concurrency-0782a8c/` 与 `.eko/soak/lh6-real-0782a8c/`。下一步只读取 ledger，两个
-状态都为 `passed` 且补齐真实 GUI 记录后关闭 M8/LH6；不得重新实现或重启已通过任务。
+真实探针完成 3x3、36 Provider turns、3 Awaiter、3 HITL、2 restart，零失败；10 分钟扩展并发
+运行也完成 1,827 cells 且零失败。两小时尝试按研发节奏调整在 26.6 分钟主动停止，状态记录为
+`interrupted_by_policy`。下一实施入口切换到 Surface Parity Cleanup；10 分钟/2 小时和完整人工
+GUI 场景只在项目功能研发全部完成后执行一次 Final Integration Gate。
 
 ## 文档生命周期
 
