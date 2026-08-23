@@ -6,7 +6,7 @@ import type { TaskExecutionTarget } from './TaskExecutionTarget';
 /**
  * EKO file/UI projection of the immutable framework task specification.
  *
- * This DTO preserves EKO metadata for `plan.json` and generated TypeScript;
+ * This DTO preserves EKO product fields for `plan.json` and generated TypeScript;
  * framework validation and DAG scheduling never consume it directly.
  */
 export type TaskSpec = {

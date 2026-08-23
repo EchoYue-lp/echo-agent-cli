@@ -178,11 +178,11 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
             ),
             (
                 "subagent".to_string(),
-                serde_json::json!({ "type": "string", "description": "Registered Subagent role; omit for the domain default" }),
+                serde_json::json!({ "type": "string" }),
             ),
             (
                 "agent_role".to_string(),
-                serde_json::json!({ "type": "string", "description": "Replacement Subagent role in task_update patches" }),
+                serde_json::json!({ "type": "string" }),
             ),
             (
                 "files".to_string(),
@@ -213,7 +213,7 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
                 serde_json::json!({
                     "type": "object",
                     "additionalProperties": false,
-                    "description": "Optional persistent Agent-group member that executes this PlanTask. Copy the exact group, role, and address returned by the Agent group service.",
+                    "description": "Exact group, role, and address from the Agent group service.",
                     "properties": {
                         "group_id": { "type": "string" },
                         "subagent_role": { "type": "string" },

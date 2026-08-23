@@ -753,6 +753,7 @@ pub fn build_tauri_app(
                                             execution_id,
                                             run_id,
                                         } => {
+                                            let projected_result = echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
                                             (
                                                 "completed",
                                                 execution_id.clone(),
@@ -766,10 +767,10 @@ pub fn build_tauri_app(
                                                     "terminal_status": result.status.as_str(),
                                                     "contract_version": result.contract_version,
                                                     "summary": result.summary.clone(),
-                                                    "artifacts": result.artifacts.clone(),
-                                                    "verification": result.verification.clone(),
-                                                    "remaining_work": result.remaining_work.clone(),
-                                                    "touched_files": result.touched_files.clone(),
+                                                    "artifacts": projected_result.artifacts,
+                                                    "verification": projected_result.verification,
+                                                    "remaining_work": projected_result.remaining_work,
+                                                    "touched_files": projected_result.touched_files,
                                                 }),
                                             )
                                         },
@@ -781,43 +782,49 @@ pub fn build_tauri_app(
                                             result,
                                             execution_id,
                                             run_id,
-                                        } => (
-                                            status.as_str(),
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "error": error.clone(),
-                                                "terminal_status": status.as_str(),
-                                                "contract_version": result.contract_version,
-                                                "summary": result.summary.clone(),
-                                                "artifacts": result.artifacts.clone(),
-                                                "verification": result.verification.clone(),
-                                                "remaining_work": result.remaining_work.clone(),
-                                                "touched_files": result.touched_files.clone(),
-                                            }),
-                                        ),
+                                        } => {
+                                            let projected_result = echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
+                                            (
+                                                status.as_str(),
+                                                execution_id.clone(),
+                                                run_id.clone(),
+                                                agent.clone(),
+                                                serde_json::json!({
+                                                    "error": error.clone(),
+                                                    "terminal_status": status.as_str(),
+                                                    "contract_version": result.contract_version,
+                                                    "summary": result.summary.clone(),
+                                                    "artifacts": projected_result.artifacts,
+                                                    "verification": projected_result.verification,
+                                                    "remaining_work": projected_result.remaining_work,
+                                                    "touched_files": projected_result.touched_files,
+                                                }),
+                                            )
+                                        },
                                         SubagentEvent::DispatchCancelled {
                                             parent: _,
                                             agent,
                                             result,
                                             execution_id,
                                             run_id,
-                                        } => (
-                                            "cancelled",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "terminal_status": result.status.as_str(),
-                                                "contract_version": result.contract_version,
-                                                "summary": result.summary.clone(),
-                                                "artifacts": result.artifacts.clone(),
-                                                "verification": result.verification.clone(),
-                                                "remaining_work": result.remaining_work.clone(),
-                                                "touched_files": result.touched_files.clone(),
-                                            }),
-                                        ),
+                                        } => {
+                                            let projected_result = echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(result);
+                                            (
+                                                "cancelled",
+                                                execution_id.clone(),
+                                                run_id.clone(),
+                                                agent.clone(),
+                                                serde_json::json!({
+                                                    "terminal_status": result.status.as_str(),
+                                                    "contract_version": result.contract_version,
+                                                    "summary": result.summary.clone(),
+                                                    "artifacts": projected_result.artifacts,
+                                                    "verification": projected_result.verification,
+                                                    "remaining_work": projected_result.remaining_work,
+                                                    "touched_files": projected_result.touched_files,
+                                                }),
+                                            )
+                                        },
                                         SubagentEvent::DispatchThinkingStarted { .. }
                                         | SubagentEvent::DispatchThinkingDelta { .. }
                                         | SubagentEvent::DispatchThinkingEnded { .. }

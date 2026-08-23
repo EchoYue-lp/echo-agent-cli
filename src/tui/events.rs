@@ -7143,7 +7143,11 @@ fn apply_subagent_result(
     run: &mut SubagentRuntimeView,
     result: &echo_agent::agent::subagent::SubagentOutcome,
 ) {
-    run.summary = result.summary.clone();
+    let result =
+        echo_agent_app_core::tasks::task_runtime::SubagentTaskResult::from_framework_outcome(
+            result,
+        );
+    run.summary = result.summary;
     run.artifacts = result
         .artifacts
         .iter()
@@ -7154,9 +7158,9 @@ fn apply_subagent_result(
         .iter()
         .map(|item| format!("{}: {:?}", item.check, item.status))
         .collect();
-    run.remaining_work = result.remaining_work.clone();
-    run.files_read = result.touched_files.read.clone();
-    run.files_written = result.touched_files.written.clone();
+    run.remaining_work = result.remaining_work;
+    run.files_read = result.touched_files.read;
+    run.files_written = result.touched_files.written;
 }
 
 fn subagent_event_id(execution_id: Option<&str>, agent: &str) -> String {
