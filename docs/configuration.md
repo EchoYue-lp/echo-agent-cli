@@ -16,6 +16,11 @@ EKO 在 app-core 中拥有 `EkoConfig` 与 `~/.eko` 数据根。framework 只接
 GUI、TUI、CLI/JSONL 和 channel 读取同一份 `EkoConfig`。GUI 变更通过统一 AppState mutation
 原子保存；包含密钥的配置在 Unix 上写成 `0600`。
 
+EKO channel 通过 `AgentPool` 复用与其它 surface 相同的 provider/model 解析和显式
+`LlmClient`，不调用 framework 的 `AgentChannelHandler` 便捷构造器。framework 独立复用方
+使用 `AgentChannelHandler::from_config` 时必须显式传入 `LlmConfig`，或使用
+`from_config_with_client` 传入已构造的共享 client；不存在默认 LLM 或环境变量回退。
+
 ## 推荐配置
 
 GUI 用户优先在“设置 -> 模型 Provider”中管理 Provider 和模型。手写 YAML 时可从

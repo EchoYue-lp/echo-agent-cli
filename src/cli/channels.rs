@@ -1,13 +1,15 @@
 //! 应用层 IM channel 消息处理器 —— 把 IM 消息桥接到 `AgentPool`。
 //!
-//! 与框架层 `AgentChannelHandler::standard`（裸建 `ReactAgent`，不经 bootstrap）不同，
-//! 此处 agent 从 `AgentPool::acquire` 取，经 `AgentRuntime::bootstrap` 全套接通
+//! 框架层 `AgentChannelHandler::from_config` 要求调用方显式传入 `LlmConfig`，而 EKO
+//! channel 不直接构造该 handler。此处 agent 从 `AgentPool::acquire` 取，经
+//! `AgentRuntime::bootstrap` 全套接通
 //! （state_store / store / compressor / MemoryLayerManager / permission_service /
 //! cache_user_id / conversation_id）。会话按平台 conversation 隔离，群聊不会按 sender
 //! 交叉复用上下文。
 //!
 //! 归属（spec §D1-6）：`AgentPool` 是 EKO 产品概念，handler 放应用层（bin crate），
-//! 不进框架 `channels.rs`。框架 `AgentChannelHandler::new` 保留供纯框架/测试用。
+//! 不进框架 `channels.rs`。框架复用方可按需使用要求显式 LLM 依赖的
+//! `AgentChannelHandler::from_config` / `from_config_with_client`。
 
 #[cfg(feature = "channels")]
 use std::sync::Arc;
