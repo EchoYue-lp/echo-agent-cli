@@ -4200,15 +4200,7 @@ async fn handle_slash_command(
             let target = parts.collect::<Vec<_>>().join(" ");
             let content = match sub {
                 "list" | "ls" => {
-                    let servers = agent
-                        .read(|value| {
-                            value
-                                .list_mcp_servers()
-                                .into_iter()
-                                .map(ToString::to_string)
-                                .collect::<Vec<_>>()
-                        })
-                        .await;
+                    let servers = agent.read(|value| value.list_mcp_servers()).await;
                     if servers.is_empty() {
                         "No MCP servers connected.".to_string()
                     } else {

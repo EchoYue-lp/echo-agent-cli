@@ -390,7 +390,9 @@ mod tests {
             let (minimum_tools, maximum_tools) = match mode {
                 InteractionMode::Chat => (13, 20),
                 InteractionMode::Task => (14, 24),
-                InteractionMode::Auto => (16, 27),
+                // `final_answer` is internal and intentionally omitted from
+                // Agent::tool_definitions; the public Auto baseline is 15.
+                InteractionMode::Auto => (15, 27),
             };
             assert!(
                 stats.tool_count >= minimum_tools && stats.tool_count <= maximum_tools,

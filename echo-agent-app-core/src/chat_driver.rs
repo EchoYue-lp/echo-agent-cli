@@ -14,12 +14,12 @@
 //! old `(&str, Option<&Message>)` pair has been replaced by the single
 //! `PreparedUserTurn`.
 
-use echo_agent::agent::{
-    Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity, envelope_event_stream,
-};
+use echo_agent::agent::{Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity};
 use echo_agent::prelude::Message;
+use echo_agent::runtime::{AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnRequest};
 use echo_agent::tools::TraceSinkFn;
-use futures::StreamExt;
+
+pub use echo_agent::runtime::TurnOutcome;
 
 use crate::tasks::task_runtime::executor::ExecEvent;
 use crate::tasks::task_runtime::types::{
@@ -108,42 +108,6 @@ pub enum ChatDriverEvent {
     AwaiterResultAcknowledged {
         acknowledgement: crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
     },
-}
-
-/// Runtime-owned terminal result for one interactive turn.
-///
-/// The framework event envelope guarantees exactly one terminal Agent event;
-/// this value carries that same fact back to the entry point so callers never
-/// infer success from "the stream returned Ok".
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TurnOutcome {
-    Completed,
-    Cancelled,
-    Failed(echo_agent::error::AgentFailure),
-}
-
-impl TurnOutcome {
-    pub fn status(&self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Cancelled => "cancelled",
-            Self::Failed(_) => "failed",
-        }
-    }
-
-    fn from_agent_event(event: &AgentEvent) -> Option<Self> {
-        match event {
-            AgentEvent::FinalAnswer(_) => Some(Self::Completed),
-            AgentEvent::Cancelled => Some(Self::Cancelled),
-            AgentEvent::Error { failure, .. }
-                if failure.terminal_kind == echo_agent::error::AgentTerminalKind::Cancelled =>
-            {
-                Some(Self::Cancelled)
-            }
-            AgentEvent::Error { failure, .. } => Some(Self::Failed(failure.clone())),
-            _ => None,
-        }
-    }
 }
 
 /// Bounded control-plane result for one finite Agent invocation.
@@ -1401,6 +1365,267 @@ struct ChatTurnModelScope {
     transcript_visibility: TurnVisibility,
 }
 
+struct EkoTurnEventSink {
+    state: std::sync::Arc<std::sync::Mutex<EkoTurnEventSinkState>>,
+    sender: tokio::sync::mpsc::Sender<EkoTurnProjectionRequest>,
+    _worker: tokio::task::JoinHandle<()>,
+}
+
+struct EkoTurnEventSinkState {
+    webhook_observer: Option<WebhookTurnObserver>,
+    expose_internal_synthesis: bool,
+    downstream_failure: Option<echo_agent::error::AgentFailure>,
+}
+
+enum EkoTurnProjectionRequest {
+    Event {
+        event: Box<EventEnvelope>,
+        acknowledgement: tokio::sync::oneshot::Sender<echo_agent::error::Result<SinkControl>>,
+    },
+    #[cfg(test)]
+    Stop {
+        acknowledgement: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
+impl EkoTurnEventSink {
+    fn new(
+        sink: std::sync::Arc<dyn ChatSink>,
+        webhook_observer: WebhookTurnObserver,
+        active_run_id: Option<String>,
+        runtime_store: Option<std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+        turn_id: String,
+        transcript_visibility: TurnVisibility,
+    ) -> Self {
+        let state = std::sync::Arc::new(std::sync::Mutex::new(EkoTurnEventSinkState {
+            webhook_observer: Some(webhook_observer),
+            expose_internal_synthesis: transcript_visibility == TurnVisibility::Visible,
+            downstream_failure: None,
+        }));
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
+        let worker_state = std::sync::Arc::clone(&state);
+        let worker = tokio::task::spawn_blocking(move || {
+            while let Some(request) = receiver.blocking_recv() {
+                match request {
+                    EkoTurnProjectionRequest::Event {
+                        event,
+                        acknowledgement,
+                    } => {
+                        let result = project_eko_turn_event(
+                            &sink,
+                            &worker_state,
+                            active_run_id.as_deref(),
+                            runtime_store.as_deref(),
+                            &turn_id,
+                            *event,
+                        );
+                        let _ = acknowledgement.send(result);
+                    }
+                    #[cfg(test)]
+                    EkoTurnProjectionRequest::Stop { acknowledgement } => {
+                        let _ = acknowledgement.send(());
+                        break;
+                    }
+                }
+            }
+        });
+        Self {
+            state,
+            sender,
+            _worker: worker,
+        }
+    }
+
+    fn finish(
+        &self,
+        turn_id: String,
+        framework_terminal: TurnOutcome,
+    ) -> Result<ChatTurnOutcome, String> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let terminal = state
+            .downstream_failure
+            .take()
+            .map(TurnOutcome::Failed)
+            .unwrap_or(framework_terminal);
+        let observer = state
+            .webhook_observer
+            .take()
+            .ok_or_else(|| "EKO turn sink was finalized more than once".to_string())?;
+        Ok(observer.finish(turn_id, terminal))
+    }
+
+    fn record_projector_failure(
+        &self,
+        code: &str,
+        message: impl Into<String>,
+    ) -> echo_agent::error::ReactError {
+        let message = message.into();
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .downstream_failure = Some(echo_agent::error::AgentFailure::message(
+            code,
+            message.clone(),
+        ));
+        echo_agent::error::ReactError::Other(format!("{code}: {message}"))
+    }
+
+    #[cfg(test)]
+    async fn stop_worker_for_test(&self) -> Result<(), String> {
+        let (acknowledgement, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(EkoTurnProjectionRequest::Stop { acknowledgement })
+            .await
+            .map_err(|_| "EKO turn projector was already closed".to_string())?;
+        receiver
+            .await
+            .map_err(|_| "EKO turn projector stop acknowledgement was lost".to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for EkoTurnEventSink {
+    async fn on_event(&self, event: EventEnvelope) -> echo_agent::error::Result<SinkControl> {
+        let (acknowledgement, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(EkoTurnProjectionRequest::Event {
+                event: Box::new(event),
+                acknowledgement,
+            })
+            .await
+            .map_err(|_| {
+                self.record_projector_failure(
+                    "sink_projector_closed",
+                    "EKO turn projector closed before accepting an envelope",
+                )
+            })?;
+        receiver.await.map_err(|_| {
+            self.record_projector_failure(
+                "sink_projector_closed",
+                "EKO turn projector closed before acknowledging an envelope",
+            )
+        })?
+    }
+}
+
+fn project_eko_turn_event(
+    sink: &std::sync::Arc<dyn ChatSink>,
+    state: &std::sync::Arc<std::sync::Mutex<EkoTurnEventSinkState>>,
+    active_run_id: Option<&str>,
+    runtime_store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    turn_id: &str,
+    event: EventEnvelope,
+) -> echo_agent::error::Result<SinkControl> {
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(run_id) = active_run_id {
+        match &event.payload {
+            AgentEvent::LlmUsage {
+                prompt_tokens,
+                completion_tokens,
+                ..
+            } => {
+                if let Some(store) = runtime_store {
+                    let input_tokens = u64::try_from(*prompt_tokens).unwrap_or(u64::MAX);
+                    let output_tokens = u64::try_from(*completion_tokens).unwrap_or(u64::MAX);
+                    match store.account_run_turn_usage(
+                        run_id,
+                        turn_id,
+                        event.event_id.as_str(),
+                        input_tokens,
+                        output_tokens,
+                    ) {
+                        Ok(true) => {
+                            if let Err(error) = store.request_pause_with_reason(
+                                run_id,
+                                crate::tasks::task_runtime::RunPauseReason::TokenBudget,
+                                Some(
+                                    "the configured token budget was reached at a provider usage boundary",
+                                ),
+                            ) {
+                                tracing::warn!(
+                                    %error,
+                                    run_id,
+                                    "failed to pause a token-budget-exhausted run"
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => tracing::warn!(
+                            %error,
+                            run_id,
+                            "failed to account RunTurn usage"
+                        ),
+                    }
+                }
+            }
+            AgentEvent::ContextCompressed { .. } => {
+                if let Some(store) = runtime_store
+                    && let Err(error) =
+                        store.record_run_turn_compaction(run_id, turn_id, event.event_id.as_str())
+                {
+                    tracing::warn!(
+                        %error,
+                        run_id,
+                        "failed to persist RunTurn compaction"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let observer = state.webhook_observer.as_mut().ok_or_else(|| {
+        echo_agent::error::ReactError::Other("EKO turn sink was already finalized".to_string())
+    })?;
+    observer.observe(&event);
+    if !state.expose_internal_synthesis
+        && matches!(
+            &event.payload,
+            AgentEvent::ToolResult { name, .. } if name == "task_execute"
+        )
+    {
+        state.expose_internal_synthesis = active_run_id
+            .zip(runtime_store)
+            .and_then(|(run_id, store)| store.get_run(run_id).ok().flatten())
+            .is_some_and(|run| run.status == crate::tasks::task_runtime::TaskRunStatus::Completed);
+    }
+    if !state.expose_internal_synthesis && matches!(&event.payload, AgentEvent::FinalAnswer(_)) {
+        state.expose_internal_synthesis = active_run_id
+            .zip(runtime_store)
+            .and_then(|(run_id, store)| store.get_run(run_id).ok().flatten())
+            .is_some_and(|run| run.status == crate::tasks::task_runtime::TaskRunStatus::Completed);
+    }
+    let suppress_internal_transcript = !state.expose_internal_synthesis
+        && matches!(
+            &event.payload,
+            AgentEvent::Token(_)
+                | AgentEvent::ThinkStart
+                | AgentEvent::ThinkEnd { .. }
+                | AgentEvent::FinalAnswer(_)
+        );
+    if suppress_internal_transcript {
+        return Ok(SinkControl::Continue);
+    }
+    if sink.on_event(ChatDriverEvent::Agent(Box::new(event))) {
+        Ok(SinkControl::Continue)
+    } else {
+        let failure = echo_agent::error::AgentFailure::message(
+            "downstream_disconnect",
+            "chat event consumer rejected an undelivered framework envelope",
+        );
+        state.downstream_failure = Some(failure);
+        Err(echo_agent::error::ReactError::Other(
+            "downstream_disconnect: chat event consumer rejected an undelivered framework envelope"
+                .to_string(),
+        ))
+    }
+}
+
 /// Inner ReAct-streaming body of [`drive_chat`], run inside the run_id scope.
 async fn drive_chat_inner(
     agent: &AgentHandle,
@@ -1449,7 +1674,7 @@ async fn drive_chat_inner(
         // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
         let guard = inner.read().await;
-        let mut webhook_observer =
+        let webhook_observer =
             WebhookTurnObserver::new(webhook_emitter, guard.model_name().to_string());
         // Tool visibility is invocation-scoped, so pooled agents keep one
         // registry while each interaction mode gets its own product surface.
@@ -1500,176 +1725,20 @@ async fn drive_chat_inner(
             visible_tools,
             run_budget: None,
         };
-        let stream_result = guard
-            .execute_stream_message_with_invocation_context(msg, cancel, invocation)
-            .await;
-        let raw_stream = match stream_result {
-            Ok(stream) => stream,
-            Err(e) => {
-                // F1-5: 此前只 return Err 字符串, 不经 sink 发 Error 事件 →
-                // 前端 assistant 消息卡在 streaming。发 Error 让前端终止流式状态。
-                tracing::warn!(error = %e, "agent stream setup failed during chat");
-                if let Some(emitter) = webhook_observer.emitter.as_ref() {
-                    emitter.emit(crate::webhook::WebhookEvent::AgentError {
-                        error: e.to_string(),
-                    });
-                }
-                let failure = echo_agent::error::AgentFailure::from_react_error(&e);
-                match EventEnvelope::new(
-                    &event_identity,
-                    1,
-                    None,
-                    AgentEvent::from_error("chat_driver", &e),
-                ) {
-                    Ok(event) => {
-                        let _ = sink.on_event(ChatDriverEvent::Agent(Box::new(event)));
-                    }
-                    Err(envelope_error) => {
-                        tracing::error!(
-                            error = %envelope_error,
-                            "failed to construct terminal chat event"
-                        );
-                    }
-                }
-                return Ok(ChatTurnOutcome::failed(turn_id.clone(), failure));
-            }
-        };
-        let mut stream = envelope_event_stream(raw_stream, event_identity);
-        async {
-            let mut terminal_outcome = None;
-            let mut expose_internal_synthesis = transcript_visibility == TurnVisibility::Visible;
-            while let Some(event_result) = stream.next().await {
-                match event_result {
-                    Ok(event) => {
-                        let event_outcome = TurnOutcome::from_agent_event(&event.payload);
-                        if event_outcome.is_some() {
-                            terminal_outcome = event_outcome;
-                        }
-                        if let Some(run_id) = active_run_id.as_deref() {
-                            match &event.payload {
-                                AgentEvent::LlmUsage {
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    ..
-                                } => {
-                                    if let Some(store) = runtime_store.as_ref() {
-                                        let input_tokens =
-                                            u64::try_from(*prompt_tokens).unwrap_or(u64::MAX);
-                                        let output_tokens =
-                                            u64::try_from(*completion_tokens).unwrap_or(u64::MAX);
-                                        match store.account_run_turn_usage(
-                                            run_id,
-                                            &turn_id,
-                                            event.event_id.as_str(),
-                                            input_tokens,
-                                            output_tokens,
-                                        ) {
-                                            Ok(true) => {
-                                                if let Err(error) = store.request_pause_with_reason(
-                                                    run_id,
-                                                    crate::tasks::task_runtime::RunPauseReason::TokenBudget,
-                                                    Some("the configured token budget was reached at a provider usage boundary"),
-                                                ) {
-                                                    tracing::warn!(
-                                                        %error,
-                                                        run_id,
-                                                        "failed to pause a token-budget-exhausted run"
-                                                    );
-                                                }
-                                            }
-                                            Ok(false) => {}
-                                            Err(error) => tracing::warn!(
-                                                %error,
-                                                run_id,
-                                                "failed to account RunTurn usage"
-                                            ),
-                                        }
-                                    }
-                                }
-                                AgentEvent::ContextCompressed { .. } => {
-                                    if let Some(store) = runtime_store.as_ref()
-                                        && let Err(error) = store.record_run_turn_compaction(
-                                            run_id,
-                                            &turn_id,
-                                            event.event_id.as_str(),
-                                        )
-                                    {
-                                        tracing::warn!(
-                                            %error,
-                                            run_id,
-                                            "failed to persist RunTurn compaction"
-                                        );
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        webhook_observer.observe(&event);
-                        if !expose_internal_synthesis
-                            && matches!(
-                                &event.payload,
-                                AgentEvent::ToolResult { name, .. } if name == "task_execute"
-                            )
-                        {
-                            expose_internal_synthesis = active_run_id
-                                .as_deref()
-                                .zip(runtime_store.as_deref())
-                                .and_then(|(run_id, store)| store.get_run(run_id).ok().flatten())
-                                .is_some_and(|run| {
-                                    run.status
-                                        == crate::tasks::task_runtime::TaskRunStatus::Completed
-                                });
-                        }
-                        if !expose_internal_synthesis
-                            && matches!(&event.payload, AgentEvent::FinalAnswer(_))
-                        {
-                            expose_internal_synthesis = active_run_id
-                                .as_deref()
-                                .zip(runtime_store.as_deref())
-                                .and_then(|(run_id, store)| store.get_run(run_id).ok().flatten())
-                                .is_some_and(|run| {
-                                    run.status
-                                        == crate::tasks::task_runtime::TaskRunStatus::Completed
-                                });
-                        }
-                        let suppress_internal_transcript = !expose_internal_synthesis
-                            && matches!(
-                                &event.payload,
-                                AgentEvent::Token(_)
-                                    | AgentEvent::ThinkStart
-                                    | AgentEvent::ThinkEnd { .. }
-                                    | AgentEvent::FinalAnswer(_)
-                            );
-                        if !suppress_internal_transcript
-                            && !sink.on_event(ChatDriverEvent::Agent(Box::new(event)))
-                        {
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        // The envelope adapter normalizes raw stream errors into
-                        // terminal payloads. This branch remains for future
-                        // transport adapters that can fail independently.
-                        tracing::warn!(error = %e, "agent stream error during chat");
-                        let error = e.to_string();
-                        if let Some(emitter) = webhook_observer.emitter.as_ref() {
-                            emitter.emit(crate::webhook::WebhookEvent::AgentError {
-                                error: error.clone(),
-                            });
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-            let terminal = terminal_outcome.unwrap_or_else(|| {
-                TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
-                    "chat_driver",
-                    "chat event consumer closed before the terminal event",
-                ))
-            });
-            Ok::<ChatTurnOutcome, String>(webhook_observer.finish(turn_id, terminal))
-        }
-        .await
+        let eko_sink = EkoTurnEventSink::new(
+            sink,
+            webhook_observer,
+            active_run_id,
+            runtime_store,
+            turn_id.clone(),
+            transcript_visibility,
+        );
+        let request = TurnRequest::from_message(event_identity, msg)
+            .mode(TurnMode::Execute)
+            .cancel(cancel)
+            .invocation(invocation);
+        let receipt = AgentTurnDriver.drive(&*guard, request, &eko_sink).await;
+        eko_sink.finish(turn_id, receipt.outcome)
     })
     .await
 }
@@ -2164,6 +2233,200 @@ mod tests {
                 .unwrap_or_else(|error| error.into_inner())
                 .clone()
         }
+    }
+
+    #[tokio::test]
+    async fn eko_turn_sink_preserves_product_receipt_fields() -> Result<(), String> {
+        let sink = std::sync::Arc::new(MockChatSink::default());
+        let adapter = EkoTurnEventSink::new(
+            sink.clone(),
+            WebhookTurnObserver::new(None, "test-model".to_string()),
+            None,
+            None,
+            "receipt-turn".to_string(),
+            TurnVisibility::Visible,
+        );
+        let identity = EventIdentity::for_chat(
+            Some("receipt-conversation".to_string()),
+            "receipt-turn",
+            "receipt-turn",
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let events = [
+            AgentEvent::LlmUsage {
+                model: "test-model".to_string(),
+                prompt_tokens: 11,
+                completion_tokens: 7,
+                total_tokens: 18,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
+                usage_reported: true,
+            },
+            AgentEvent::ContextCompressed {
+                before_count: 10,
+                after_count: 4,
+                before_tokens: 1_000,
+                after_tokens: 400,
+            },
+            AgentEvent::FinalAnswer("finished".to_string()),
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            let sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            let envelope = EventEnvelope::new(&identity, sequence, None, event)
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                adapter
+                    .on_event(envelope)
+                    .await
+                    .map_err(|error| error.to_string())?,
+                SinkControl::Continue
+            );
+        }
+
+        let outcome = adapter.finish("receipt-turn".to_string(), TurnOutcome::Completed)?;
+        assert_eq!(outcome.terminal, TurnOutcome::Completed);
+        assert_eq!(outcome.input_tokens, 11);
+        assert_eq!(outcome.output_tokens, 7);
+        assert_eq!(outcome.compaction_count, 1);
+        assert_eq!(outcome.final_answer.as_deref(), Some("finished"));
+        assert_eq!(outcome.final_message_id.as_deref(), Some("receipt-turn"));
+        assert_eq!(sink.event_count(), 3);
+        Ok(())
+    }
+
+    struct RejectingChatSink;
+
+    impl ChatSink for RejectingChatSink {
+        fn on_event(&self, _event: ChatDriverEvent) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_envelope_is_a_typed_downstream_failure() -> Result<(), String> {
+        let adapter = EkoTurnEventSink::new(
+            std::sync::Arc::new(RejectingChatSink),
+            WebhookTurnObserver::new(None, "test-model".to_string()),
+            None,
+            None,
+            "rejected-turn".to_string(),
+            TurnVisibility::Visible,
+        );
+        let identity = EventIdentity::new("rejected-stream", "rejected-turn")
+            .map_err(|error| error.to_string())?;
+        let envelope = EventEnvelope::new(
+            &identity,
+            1,
+            None,
+            AgentEvent::Token("undelivered".to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+        let error = adapter
+            .on_event(envelope)
+            .await
+            .expect_err("rejected envelope must fail delivery");
+        assert!(error.to_string().contains("downstream_disconnect"));
+
+        let outcome = adapter.finish("rejected-turn".to_string(), TurnOutcome::Cancelled)?;
+        assert!(matches!(
+            outcome.terminal,
+            TurnOutcome::Failed(ref failure) if failure.code == "downstream_disconnect"
+        ));
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct SlowOrderedChatSink {
+        sequences: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl ChatSink for SlowOrderedChatSink {
+        fn on_event(&self, event: ChatDriverEvent) -> bool {
+            let ChatDriverEvent::Agent(event) = event else {
+                return true;
+            };
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            self.sequences
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(event.sequence);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_projector_preserves_burst_order_and_ack_backpressure() -> Result<(), String> {
+        const EVENTS: u64 = 96;
+        let sink = std::sync::Arc::new(SlowOrderedChatSink::default());
+        let adapter = EkoTurnEventSink::new(
+            sink.clone(),
+            WebhookTurnObserver::new(None, "test-model".to_string()),
+            None,
+            None,
+            "burst-turn".to_string(),
+            TurnVisibility::Visible,
+        );
+        let identity =
+            EventIdentity::new("burst-stream", "burst-turn").map_err(|error| error.to_string())?;
+        let mut deliveries = Vec::new();
+        for sequence in 1..=EVENTS {
+            let envelope = EventEnvelope::new(
+                &identity,
+                sequence,
+                None,
+                AgentEvent::Token(format!("token-{sequence}")),
+            )
+            .map_err(|error| error.to_string())?;
+            deliveries.push(adapter.on_event(envelope));
+        }
+        let results = futures::future::join_all(deliveries).await;
+        assert!(
+            results
+                .into_iter()
+                .all(|result| matches!(result, Ok(SinkControl::Continue)))
+        );
+        assert_eq!(
+            *sink
+                .sequences
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            (1..=EVENTS).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn closed_projector_returns_typed_sink_error() -> Result<(), String> {
+        let adapter = EkoTurnEventSink::new(
+            std::sync::Arc::new(MockChatSink::default()),
+            WebhookTurnObserver::new(None, "test-model".to_string()),
+            None,
+            None,
+            "closed-worker-turn".to_string(),
+            TurnVisibility::Visible,
+        );
+        adapter.stop_worker_for_test().await?;
+        let identity = EventIdentity::new("closed-worker-stream", "closed-worker-turn")
+            .map_err(|error| error.to_string())?;
+        let envelope = EventEnvelope::new(
+            &identity,
+            1,
+            None,
+            AgentEvent::Token("undelivered".to_string()),
+        )
+        .map_err(|error| error.to_string())?;
+        let error = adapter
+            .on_event(envelope)
+            .await
+            .expect_err("closed worker must reject delivery");
+        assert!(error.to_string().contains("sink_projector_closed"));
+        let outcome = adapter.finish("closed-worker-turn".to_string(), TurnOutcome::Cancelled)?;
+        assert!(matches!(
+            outcome.terminal,
+            TurnOutcome::Failed(ref failure) if failure.code == "sink_projector_closed"
+        ));
+        Ok(())
     }
 
     async fn wait_for_run_status(
