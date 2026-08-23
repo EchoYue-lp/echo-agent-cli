@@ -1,8 +1,8 @@
 # EKO Long-Horizon Runtime Closure
 
-> Date: 2026-08-22 (recalibrated through framework `3711e90` and application `57be5c5`)
-> Status: LH0-LH4 Complete (`4ab7407`, framework `3711e90`, application
-> `fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`); LH5-LH6 Pending
+> Date: 2026-08-23 (recalibrated through framework `3711e90` and application `6ab4fca`)
+> Status: LH0-LH5 Complete (`4ab7407`, framework `3711e90`, application
+> `fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`/`6ab4fca`); LH6 Pending
 > Priority: P0; identity cutover is complete, while final LH6 acceptance still depends on the
 > runtime-reliability GUI/soak closeout
 > Scope: CommandCell, Awaiter, continuation boot recovery, terminal evidence, hot-state performance,
@@ -787,6 +787,10 @@ audit, export, or complete evidence-history APIs. LH0 records that allowlist and
 scan counts; a comment at each retained full scan states why a checkpoint projection is
 insufficient.
 
+LH5 reduced the production allowlist from 18 sites to 7: four complete-history reads in the main
+store, two durable command-journal reads in Subagent control, and one completion-evidence read.
+The source contract fixes that count and requires one `Audit allowlist:` explanation per site.
+
 ### 11.3 Performance gates
 
 Release fixtures must exercise public production APIs, not internal checkpoint helpers only.
@@ -802,6 +806,26 @@ Release fixtures must exercise public production APIs, not internal checkpoint h
 The existing ignored 10k checkpoint fixture already gates `snapshot_read_ms < 2`; LH0 must capture
 its actual release-mode value before code changes. Thresholds may be tightened. Widening requires a
 new measured baseline and explicit review.
+
+### 11.4 LH5 acceptance record
+
+Final code: application `6ab4fca`. Host: Apple M1 Pro, 16 GiB, macOS 26.5.2 arm64. Toolchain:
+`rustc 1.97.1 (8bab26f4f 2026-07-14)`. Each row is one consecutive release invocation of the public
+`TaskRuntimeStore::get_run_state` fixture; values are milliseconds.
+
+| Sample | 10k median | 100k median | append + read | corrupt rebuild | repaired warm |
+| ------ | ---------- | ----------- | ------------- | --------------- | ------------- |
+| 1      | 0.111375   | 0.106083    | 11.405500     | 104.548417      | 0.261375      |
+| 2      | 0.098708   | 0.099167    | 14.094417     | 108.517083      | 0.276625      |
+| 3      | 0.189291   | 0.165375    | 18.667542     | 130.779792      | 0.254625      |
+| 4      | 0.099625   | 0.096125    | 20.834417     | 194.658958      | 0.267167      |
+| 5      | 0.108458   | 0.098000    | 17.425542     | 114.115042      | 0.456000      |
+
+The worst individual 10k/100k empty-suffix reads inside those samples were 0.955208/0.281792 ms.
+The 100k checkpoint was 2,631 bytes against a 27,777,571-27,777,619 byte event log. A separate
+cached auxiliary invocation measured 178,946,048 bytes maximum resident set size and 154,141,440
+bytes peak memory footprint. Canonical-byte equivalence, corrupt-checkpoint repair, exact terminal
+cell retry, and the fixed seven-site full-scan allowlist are automated tests; all gates passed.
 
 ## 12. Implementation Milestones
 
@@ -1134,7 +1158,7 @@ gate because they exercise a different path.
 
 ### 14.5 Performance and operations
 
-- [ ] production `get_run_state` passes 10k/100k gates;
+- [x] production `get_run_state` passes 10k/100k gates;
 - [ ] no retry/Awaiter wait tight-loop;
 - [ ] resource peaks stay within shared governor;
 - [ ] concurrency soak and real-product soak pass;
@@ -1215,7 +1239,7 @@ logic; no two authorities remain active.
 | LH2   | Complete | N/A              | `ad951b5`          | 6 runtime + 13 contracts; all app gates      | N/A                          |
 | LH3   | Complete | N/A              | `09b9fc5`          | 11 runtime + 13 contracts; all app gates     | N/A                          |
 | LH4   | Complete | N/A              | `57be5c5`          | 5 boot/parity tests; all app gates           | N/A                          |
-| LH5   | Pending  | N/A              | N/A                | pending                                      | hot-state performance        |
+| LH5   | Complete | N/A              | `6ab4fca`          | 14 contracts; 5 release samples; full gate  | N/A                          |
 | LH6   | Pending  | N/A              | N/A                | pending                                      | fault matrix + real soak     |
 
 Allowed status: `Pending`, `In progress`, `Blocked`, `Complete`. Complete requires the stage gate and

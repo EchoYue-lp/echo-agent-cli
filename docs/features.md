@@ -21,7 +21,7 @@
 | ----------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
 | 统一任务关系      | `task_create/task_update/task_list/task_execute` 使用同一个 revisioned TaskRun graph | `echo-agent-app-core/src/tasks/task_runtime/register.rs`         |
 | 动态 DAG          | 原子 plan、revision patch、claim、重试、取消、safe-point reload                      | `echo-agent-app-core/src/tasks/task_runtime/store.rs`            |
-| 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint projection         | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
+| 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint-backed hot state    | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
 | Subagent 执行     | direct、planned、fork、teammate、team 共用 prompt compiler 和结果合同                | `echo-agent-app-core/src/subagent_prompt.rs`                     |
 | Subagent 控制     | message、follow-up、interrupt、attempt identity 与 durable result                    | `echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs` |
 | 后台 command cell | bounded async admission、typed cursor wait、owner cancel、boot orphan closure        | framework cell runtime + app-core `command_cells.rs`             |
@@ -72,8 +72,9 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 消息 journal、Agent groups、live delivery settlement、删除/eviction、boot recovery 和
 TaskRuntime 进程级资源上限已接入生产路径并通过自动门禁。端到端可靠性仍未最终验收：
 真实 GUI 证据和两小时多 workspace soak 尚未记录；CommandCell/Awaiter 已共享进程资源
-governor并拥有 typed terminal receipt，普通 conversation boot resume 与 dedicated Awaiter
-surface projector 已收口；hot-state checkpoint 性能仍由 LH5 跟踪。
+governor并拥有 typed terminal receipt，普通 conversation boot resume、dedicated Awaiter
+surface projector、checkpoint-backed hot state 和 10k/100k 性能门已收口；剩余验收是 LH6
+故障矩阵、跨 surface 集成门、并发 soak 和两小时真实 Provider soak。
 
 这些未完成项由
 [`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)

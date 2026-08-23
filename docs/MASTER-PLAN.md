@@ -1,6 +1,6 @@
 # EKO 当前项目状态
 
-Last updated: 2026-08-22
+Last updated: 2026-08-23
 
 本文是跨会话恢复工作的简短事实源，只记录当前权威路径、未完成工作和下一步。
 已完成里程碑不在这里保留实施日志；长期有效能力见 [功能总览](./features.md)。
@@ -65,8 +65,8 @@ FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter sett
 
 ### Long-Horizon Runtime Closure
 
-状态：In progress；LH0-LH4 已完成，framework `3711e90`、application
-`4ab7407`/`fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`；LH5-LH6 Pending。P0 的 resolver、address
+状态：In progress；LH0-LH5 已完成，framework `3711e90`、application
+`4ab7407`/`fff1267`/`ad951b5`/`09b9fc5`/`57be5c5`/`6ab4fca`；LH6 Pending。P0 的 resolver、address
 identity、event routing 和 host recovery 已可直接复用，不再等待未来 cutover；最终 LH6 仍依赖
 P0 GUI/2h soak closeout。
 
@@ -74,11 +74,12 @@ P0 GUI/2h soak closeout。
 
 最新审查确认 Goal、RunTurn、provider retry、正式 PlanTask Subagent 控制、
 Requirement/Evidence、checkpoint/suffix 投影和 12 小时 deterministic ledger 真实存在；
-LH1-LH4 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
+LH1-LH5 已关闭 CommandCell publication/retention、Started-before-side-effect、普通 Chat 精确地址、
 typed terminal/artifact projection、owned repair，以及 Awaiter direct controlled dispatch、exact
 interrupt、process Subagent permit、Ready/Acknowledged replay、完整 Provider profile、dedicated
-surface projector 与 global/workspace 普通 conversation boot resume。剩余缺口是 hot
-`get_run_state` 与真实 Agent/Awaiter soak。完成 LH5-LH6 前，不把长程产品级验收标为 Complete。
+surface projector、global/workspace 普通 conversation boot resume，以及 checkpoint-backed hot
+state、运行边界索引和 10k/100k 性能门。剩余缺口是真实 Agent/Awaiter/surface 故障矩阵与 soak。
+完成 LH6 前，不把长程产品级验收标为 Complete。
 
 ### Surface Parity Cleanup
 
@@ -92,13 +93,12 @@ app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产�
 
 ## 下一步
 
-Long-horizon 的 LH4 已完成：一个 store-scoped `TaskRunBootReconciler` 统一 recover-once、eligibility、
-provider deadline 与原子 resume；AppState 枚举 global/registered workspace 并隔离损坏 scope，workspace
-host 通过独立 TaskRuntime OnceCell 实现 lazy recovery。合格 unattended normal conversation 使用
-journal-only sink 与 exact conversation pool key 恢复；attended run 等待 owner。app-core dedicated
-Awaiter projector 被 CLI/TUI/channel 复用，GUI/JSONL 保留同一 typed journal envelope，generic Tauri
-bridge 无条件排除 Awaiter 和正式 TaskRuntime Subagent。下一实施阶段执行 LH5：让 hot
-`get_run_state` 收敛到 checkpoint-backed read authority，并完成 10k/100k 性能门。
+Long-horizon 的 LH5 已完成：`TaskRuntimeStore::get_run_state` 复用既有 checkpoint/suffix read
+authority，RunTurn、Subagent、tool、recovery 与 CommandCell 的 operational/idempotency 状态由同一个
+`EventFoldState` 投影；生产全历史扫描从 18 处收敛到 7 处显式审计 allowlist。最终五次 release
+样本中 10k/100k hot read 的最坏中位数为 0.189/0.165 ms，append + read 最坏 20.84 ms，corrupt
+checkpoint rebuild 最坏 194.66 ms，repaired warm read 最坏 0.456 ms。下一实施阶段执行 LH6：完成
+自动故障注入矩阵、跨 surface 集成门、并发 soak 和两小时真实 Provider soak。
 
 ## 文档生命周期
 
