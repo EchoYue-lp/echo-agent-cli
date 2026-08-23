@@ -7,8 +7,14 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent_app_core::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
+use echo_agent_app_core::structured_extraction::{
+    StructuredExtractionError, StructuredExtractionExample, StructuredExtractionOutcome,
+    StructuredExtractionRequest, StructuredExtractionValidation,
+};
 use echo_agent_app_core::tasks::task_runtime::compact_context::RUNTIME_RECOVERY_MARKER;
-use echo_agent_app_core::workflow_service::WorkflowServiceError;
+use echo_agent_app_core::workflow_service::{
+    StoredWorkflow, WorkflowExecution, WorkflowMutationReceipt, WorkflowServiceError,
+};
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -43,6 +49,14 @@ fn map_workflow_error(error: WorkflowServiceError) -> IpcError {
         }
         WorkflowServiceError::InvalidDefinition(message) => IpcError::Validation(message),
         other => IpcError::Internal(other.to_string()),
+    }
+}
+
+fn map_structured_extraction_error(error: StructuredExtractionError) -> IpcError {
+    if error.is_validation() {
+        IpcError::Validation(error.to_string())
+    } else {
+        IpcError::Internal(error.to_string())
     }
 }
 
@@ -83,22 +97,10 @@ pub async fn set_permissions_mode(
     *mode_lock = normalized.to_string();
     drop(mode_lock);
 
-    if let Some(pool) = &state.app_state.connection.pool {
-        pool.apply_permission_mode(normalized.to_string()).await;
-    }
-
-    let primary_updated = state
+    state
         .app_state
-        .connection
-        .primary_agent()
-        .try_write(|agent| agent.set_permission_mode(normalized))
-        .is_some();
-    if !primary_updated {
-        tracing::debug!(
-            mode = normalized,
-            "Primary agent is active; shared permission service already has the new mode"
-        );
-    }
+        .apply_permission_mode_to_agents(normalized.to_string())
+        .await;
 
     Ok(serde_json::json!({"success": true, "mode": normalized}))
 }
@@ -743,59 +745,54 @@ pub async fn upload_skill(
 #[tauri::command]
 pub async fn list_workflows(
     state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    let workflows = state
+) -> Result<Vec<StoredWorkflow>, IpcError> {
+    state
         .app_state
         .history
         .workflows
         .list()
-        .map_err(map_workflow_error)?;
-    serde_json::to_value(workflows)
-        .map_err(|error| IpcError::Internal(format!("Failed to serialize workflows: {error}")))
+        .map_err(map_workflow_error)
 }
 
 #[tauri::command]
 pub async fn get_workflow(
     state: tauri::State<'_, TauriState>,
     id: String,
-) -> Result<serde_json::Value, IpcError> {
-    let workflow = state
+) -> Result<StoredWorkflow, IpcError> {
+    state
         .app_state
         .history
         .workflows
         .get(&id)
-        .map_err(map_workflow_error)?;
-    serde_json::to_value(workflow)
-        .map_err(|error| IpcError::Internal(format!("Failed to serialize workflow: {error}")))
+        .map_err(map_workflow_error)
 }
 
 #[tauri::command]
 pub async fn create_workflow(
     state: tauri::State<'_, TauriState>,
-    name: String,
+    name: Option<String>,
     definition: String,
-) -> Result<serde_json::Value, IpcError> {
-    let workflow = state
+) -> Result<StoredWorkflow, IpcError> {
+    state
         .app_state
         .history
         .workflows
-        .create(name, definition)
-        .map_err(map_workflow_error)?;
-    Ok(serde_json::json!({"success": true, "id": workflow.id}))
+        .create(name.unwrap_or_default(), definition)
+        .map_err(map_workflow_error)
 }
 
 #[tauri::command]
 pub async fn delete_workflow(
     state: tauri::State<'_, TauriState>,
     id: String,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<WorkflowMutationReceipt, IpcError> {
     state
         .app_state
         .history
         .workflows
         .delete(&id)
         .map_err(map_workflow_error)?;
-    Ok(serde_json::json!({"success": true}))
+    Ok(WorkflowMutationReceipt { success: true })
 }
 
 #[tauri::command]
@@ -803,17 +800,14 @@ pub async fn execute_workflow(
     state: tauri::State<'_, TauriState>,
     id: String,
     input: Option<serde_json::Value>,
-) -> Result<serde_json::Value, IpcError> {
-    let result = state
+) -> Result<WorkflowExecution, IpcError> {
+    state
         .app_state
         .history
         .workflows
         .execute(&id, input)
         .await
-        .map_err(map_workflow_error)?;
-    serde_json::to_value(result).map_err(|error| {
-        IpcError::Internal(format!("Failed to serialize workflow execution: {error}"))
-    })
+        .map_err(map_workflow_error)
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1086,63 +1080,45 @@ pub async fn get_compression_stats(
 #[tauri::command]
 pub async fn extract_data(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
     input: String,
     schema: serde_json::Value,
     schema_name: Option<String>,
-) -> Result<serde_json::Value, IpcError> {
-    if !schema.is_object() {
-        return Err(IpcError::Validation("Schema must be a JSON object".into()));
-    }
-    let name = schema_name.unwrap_or_else(|| "extraction".to_string());
-    let format = echo_agent::llm::ResponseFormat::json_schema(name, schema);
-    let value = state
+) -> Result<StructuredExtractionOutcome, IpcError> {
+    state
         .app_state
-        .connection
-        .primary_agent()
-        .read_async(|agent| Box::pin(async move { agent.extract_json(&input, format).await }))
+        .extract_structured_for_scope(
+            &workspace_id,
+            &conversation_id,
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            StructuredExtractionRequest {
+                input,
+                schema,
+                schema_name,
+            },
+        )
         .await
-        .map_err(|e| IpcError::Internal(format!("Extraction failed: {e}")))?;
-    Ok(json!({
-        "success": true,
-        "data": value,
-    }))
+        .map_err(map_structured_extraction_error)
 }
 
 #[tauri::command]
 pub async fn validate_schema(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     schema: serde_json::Value,
-) -> Result<serde_json::Value, IpcError> {
-    let mut errors = Vec::new();
-    if !schema.is_object() {
-        errors.push("Schema must be a JSON object".to_string());
-    }
-    Ok(json!({
-        "valid": errors.is_empty(),
-        "errors": errors,
-    }))
+) -> Result<StructuredExtractionValidation, IpcError> {
+    Ok(state
+        .app_state
+        .history
+        .structured_extraction
+        .validate_schema(&schema))
 }
 
 #[tauri::command]
 pub async fn get_extract_examples(
-    _state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    Ok(json!([
-        {
-            "name": "person",
-            "input": "Zhang San, 28 years old, works as an engineer.",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "age": {"type": "integer"},
-                    "job": {"type": "string"}
-                },
-                "required": ["name", "age"],
-                "additionalProperties": false
-            }
-        }
-    ]))
+    state: tauri::State<'_, TauriState>,
+) -> Result<Vec<StructuredExtractionExample>, IpcError> {
+    Ok(state.app_state.history.structured_extraction.examples())
 }
 
 // ════════════════════════════════════════════════════════════════════════════

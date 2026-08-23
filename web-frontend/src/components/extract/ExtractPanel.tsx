@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { FileJson, Play, CheckCircle, AlertCircle } from 'lucide-react';
 import { extractApi } from '../../api/endpoints';
-import type { ExtractExample, ValidateSchemaResponse } from '../../types/api';
+import type { StructuredExtractionExample, StructuredExtractionValidation } from '../../generated';
+import { useConversationStore } from '../../stores/conversationStore';
 
 const DEFAULT_SCHEMA = JSON.stringify(
   {
@@ -21,13 +22,20 @@ export function ExtractPanel() {
   const [schema, setSchema] = useState(DEFAULT_SCHEMA);
   const [schemaName, setSchemaName] = useState('');
   const [result, setResult] = useState<unknown>(null);
-  const [validation, setValidation] = useState<ValidateSchemaResponse | null>(null);
-  const [examples, setExamples] = useState<ExtractExample[]>([]);
+  const [validation, setValidation] = useState<StructuredExtractionValidation | null>(null);
+  const [examples, setExamples] = useState<StructuredExtractionExample[]>([]);
   const [extracting, setExtracting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const workspaceId = useConversationStore((state) => state.workspaceId);
+  const conversationId = useConversationStore((state) => state.activeId);
 
   useEffect(() => {
-    extractApi.getExamples().then(setExamples).catch(console.error);
+    extractApi
+      .getExamples()
+      .then(setExamples)
+      .catch((cause) => {
+        setError(cause instanceof Error ? cause.message : '加载提取示例失败');
+      });
   }, []);
 
   const extract = async () => {
@@ -36,13 +44,21 @@ export function ExtractPanel() {
     setError(null);
     setResult(null);
     try {
+      if (!conversationId) throw new Error('请先创建或选择一个会话');
       const parsedSchema = JSON.parse(schema);
-      const res = await extractApi.extract(input, parsedSchema, schemaName || undefined);
+      const res = await extractApi.extract(
+        workspaceId,
+        conversationId,
+        input,
+        parsedSchema,
+        schemaName || undefined
+      );
       setResult(res.data);
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : '提取失败');
+    } finally {
+      setExtracting(false);
     }
-    setExtracting(false);
   };
 
   const validate = async () => {
@@ -55,10 +71,12 @@ export function ExtractPanel() {
     }
   };
 
-  const loadExample = (ex: ExtractExample) => {
+  const loadExample = (ex: StructuredExtractionExample) => {
     setSchema(JSON.stringify(ex.schema, null, 2));
-    setInput(ex.example_input);
+    setInput(ex.input);
     setSchemaName(ex.name);
+    setValidation(null);
+    setError(null);
   };
 
   return (
@@ -188,14 +206,17 @@ export function ExtractPanel() {
       {/* Extract button */}
       <button
         onClick={extract}
-        disabled={extracting || !input.trim() || !schema.trim()}
+        disabled={extracting || !conversationId || !input.trim() || !schema.trim()}
         className="flex w-full items-center justify-center gap-2 rounded-lg py-2.5 text-xs font-medium transition-colors"
         style={{
           background:
-            extracting || !input.trim() || !schema.trim()
+            extracting || !conversationId || !input.trim() || !schema.trim()
               ? 'var(--border-primary)'
               : 'var(--accent)',
-          color: extracting || !input.trim() || !schema.trim() ? 'var(--text-tertiary)' : 'white',
+          color:
+            extracting || !conversationId || !input.trim() || !schema.trim()
+              ? 'var(--text-tertiary)'
+              : 'white',
         }}
       >
         {extracting ? (

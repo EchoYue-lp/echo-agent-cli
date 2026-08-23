@@ -733,6 +733,12 @@ pub async fn create_agent_with_diagnostics(
     agent.config_mut().set_cache_user_id(&cache_user_id);
 
     if let Some(browser_runtime) = &params.browser_runtime {
+        browser_runtime
+            .register_workspace_root(
+                execution_scope.workspace_id().to_string(),
+                execution_scope.root().to_path_buf(),
+            )
+            .await;
         browser_runtime.install_tools(&mut agent);
     }
 

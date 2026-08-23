@@ -28,6 +28,7 @@ export function WelcomeScreen({
   onSuggestionClick: (text: string) => void;
 }) {
   const loadConversation = useConversationStore((s) => s.loadConversation);
+  const workspaceId = useConversationStore((s) => s.workspaceId);
 
   const [latestSession, setLatestSession] = useState<LatestSession | null>(null);
   const [resumeLoading, setResumeLoading] = useState(false);
@@ -38,7 +39,7 @@ export function WelcomeScreen({
 
     const checkLatest = async () => {
       try {
-        const res = await sessionApi.getLatest();
+        const res = await sessionApi.getLatest(workspaceId);
         if (!cancelled && res.found && res.id) {
           setLatestSession({
             id: res.id,
@@ -58,7 +59,7 @@ export function WelcomeScreen({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [workspaceId]);
 
   const handleResume = async () => {
     if (!latestSession) return;

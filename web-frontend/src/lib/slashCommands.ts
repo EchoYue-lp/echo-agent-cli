@@ -1,206 +1,127 @@
-export interface SlashCommandArg {
-  name: string;
-  description: string;
-  required: boolean;
-}
+export type GuiSlashTarget =
+  | 'clear'
+  | 'tasks'
+  | 'analysis'
+  | 'research'
+  | 'browser'
+  | 'files'
+  | 'workflows'
+  | 'extract';
 
 export interface SlashCommand {
   name: string;
   aliases: string[];
   description: string;
   category: string;
-  icon?: string;
-  args?: SlashCommandArg[];
-  action?: 'send' | 'api';
+  target: GuiSlashTarget;
 }
 
 export const SLASH_COMMANDS: SlashCommand[] = [
-  // Session
   {
     name: '/clear',
     aliases: ['/cls'],
     description: 'Clear current chat',
     category: 'Session',
-    action: 'api',
-  },
-  {
-    name: '/history',
-    aliases: [],
-    description: 'View conversation history',
-    category: 'Session',
-    action: 'send',
-  },
-  {
-    name: '/stats',
-    aliases: [],
-    description: 'Show session statistics',
-    category: 'Session',
-    action: 'send',
-  },
-
-  // Context
-  {
-    name: '/mode',
-    aliases: [],
-    description: 'Switch agent mode (general/coding/research/data/writing)',
-    category: 'Context',
-    action: 'send',
-  },
-  {
-    name: '/model',
-    aliases: [],
-    description: 'Switch LLM model',
-    category: 'Context',
-    action: 'send',
-  },
-  {
-    name: '/compress',
-    aliases: ['/compact'],
-    description: 'Compress context',
-    category: 'Context',
-    action: 'send',
-  },
-  {
-    name: '/memory',
-    aliases: [],
-    description: 'View/manage memory',
-    category: 'Context',
-    action: 'send',
-  },
-  {
-    name: '/remember',
-    aliases: [],
-    description: 'Save something to memory',
-    category: 'Context',
-    action: 'send',
-  },
-
-  // Security
-  {
-    name: '/permission',
-    aliases: ['/perm'],
-    description: 'Set permission mode (default/auto-edit/full-auto/strict)',
-    category: 'Security',
-    action: 'send',
-  },
-
-  // Coding
-  {
-    name: '/plan',
-    aliases: [],
-    description: 'Enter plan mode (read-only analysis)',
-    category: 'Coding',
-    action: 'send',
+    target: 'clear',
   },
   {
     name: '/tasks',
     aliases: [],
-    description: 'Manage background tasks',
-    category: 'Coding',
-    action: 'send',
+    description: 'Open task runtime',
+    category: 'Workspace',
+    target: 'tasks',
   },
-  { name: '/test', aliases: [], description: 'Run tests', category: 'Coding', action: 'send' },
   {
-    name: '/code-review',
+    name: '/analysis',
     aliases: [],
-    description: 'Review code changes',
-    category: 'Coding',
-    action: 'send',
+    description: 'Open data analysis',
+    category: 'Workspace',
+    target: 'analysis',
   },
   {
-    name: '/diff',
+    name: '/research',
+    aliases: ['/papers'],
+    description: 'Open research workbench',
+    category: 'Workspace',
+    target: 'research',
+  },
+  {
+    name: '/browser',
     aliases: [],
-    description: 'Show file diff or git diff',
-    category: 'Coding',
-    action: 'send',
+    description: 'Open browser workspace',
+    category: 'Workspace',
+    target: 'browser',
   },
-
-  // Git
   {
-    name: '/git',
+    name: '/files',
     aliases: [],
-    description: 'Git operations (status/log/diff/commit/blame)',
-    category: 'Git',
-    action: 'send',
+    description: 'Open workspace files',
+    category: 'Workspace',
+    target: 'files',
   },
-
-  // Pipeline
   {
-    name: '/pipeline',
+    name: '/workflow',
     aliases: [],
-    description: 'Run a pipeline (research/writing/data)',
-    category: 'Pipeline',
-    action: 'send',
+    description: 'Open workflow management',
+    category: 'Automation',
+    target: 'workflows',
   },
-
-  // Scheduling
   {
-    name: '/cron',
-    aliases: ['/schedule'],
-    description: 'Manage scheduled tasks',
-    category: 'Scheduling',
-    action: 'send',
-  },
-
-  // Info
-  {
-    name: '/tools',
+    name: '/extract',
     aliases: [],
-    description: 'List available tools',
-    category: 'Info',
-    action: 'send',
+    description: 'Open structured extraction',
+    category: 'Automation',
+    target: 'extract',
   },
-  { name: '/help', aliases: [], description: 'Show help', category: 'Info', action: 'send' },
 ];
 
-/** Category display order and icons */
-export const CATEGORY_META: Record<string, { icon: string; order: number }> = {
-  Session: { icon: '🔄', order: 0 },
-  Context: { icon: '🧠', order: 1 },
-  Security: { icon: '🔒', order: 2 },
-  Coding: { icon: '💻', order: 3 },
-  Git: { icon: '📦', order: 4 },
-  Pipeline: { icon: '⚙️', order: 5 },
-  Scheduling: { icon: '⏰', order: 6 },
-  Memory: { icon: '💾', order: 7 },
-  Info: { icon: 'ℹ️', order: 8 },
+export const CATEGORY_META: Record<string, { order: number }> = {
+  Session: { order: 0 },
+  Workspace: { order: 1 },
+  Automation: { order: 2 },
 };
 
-/**
- * Filter and sort slash commands based on user query.
- * query should include the leading `/`.
- */
+export type GuiSlashHandlers = Record<GuiSlashTarget, () => void | Promise<void>>;
+
+/** Dispatch an exact command exposed by the GUI palette. */
+export async function dispatchGuiSlashCommand(
+  input: string,
+  handlers: GuiSlashHandlers
+): Promise<boolean> {
+  const command = input.trim().toLowerCase();
+  const descriptor = SLASH_COMMANDS.find(
+    (candidate) => candidate.name === command || candidate.aliases.includes(command)
+  );
+  if (!descriptor) return false;
+  await handlers[descriptor.target]();
+  return true;
+}
+
+/** Filter and sort slash commands based on a leading-slash query. */
 export function filterCommands(query: string): SlashCommand[] {
-  const q = query.toLowerCase().trim();
-  if (!q.startsWith('/')) return [];
-
-  const searchTerm = q.slice(1); // remove leading /
-
-  return SLASH_COMMANDS.filter((cmd) => {
-    const nameWithoutSlash = cmd.name.slice(1);
-    if (nameWithoutSlash.startsWith(searchTerm)) return true;
-    if (cmd.aliases.some((a) => a.slice(1).startsWith(searchTerm))) return true;
-    return false;
-  }).sort((a, b) => {
-    // Sort by category order, then alphabetically
-    const catA = CATEGORY_META[a.category]?.order ?? 99;
-    const catB = CATEGORY_META[b.category]?.order ?? 99;
-    if (catA !== catB) return catA - catB;
-    return a.name.localeCompare(b.name);
+  const normalized = query.toLowerCase().trim();
+  if (!normalized.startsWith('/')) return [];
+  const searchTerm = normalized.slice(1);
+  return SLASH_COMMANDS.filter((command) => {
+    const name = command.name.slice(1);
+    if (name.startsWith(searchTerm)) return true;
+    return command.aliases.some((alias) => alias.slice(1).startsWith(searchTerm));
+  }).sort((left, right) => {
+    const leftOrder = CATEGORY_META[left.category]?.order ?? 99;
+    const rightOrder = CATEGORY_META[right.category]?.order ?? 99;
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+    return left.name.localeCompare(right.name);
   });
 }
 
-/**
- * Group commands by category for display.
- */
 export function groupByCategory(commands: SlashCommand[]): Map<string, SlashCommand[]> {
   const groups = new Map<string, SlashCommand[]>();
-  for (const cmd of commands) {
-    const existing = groups.get(cmd.category);
+  for (const command of commands) {
+    const existing = groups.get(command.category);
     if (existing) {
-      existing.push(cmd);
+      existing.push(command);
     } else {
-      groups.set(cmd.category, [cmd]);
+      groups.set(command.category, [command]);
     }
   }
   return groups;

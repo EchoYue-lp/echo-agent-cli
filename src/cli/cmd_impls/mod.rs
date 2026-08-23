@@ -13,6 +13,7 @@ pub mod cron;
 pub mod developer;
 pub mod diff_cmd;
 pub mod evolution;
+pub mod extract;
 pub mod git;
 pub mod hooks;
 pub mod info;

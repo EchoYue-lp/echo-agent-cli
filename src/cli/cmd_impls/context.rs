@@ -261,7 +261,18 @@ cmd!(
 
 async fn cmd_system(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if args.is_empty() {
-        ctx.agent
+        let pool_execution = match (ctx.app_state.as_ref(), ctx.conversation_id.as_deref()) {
+            (Some(state), Some(conversation_id)) => match state.current_chat_runtime().await {
+                Ok(runtime) => runtime.agent_for(conversation_id).await.ok(),
+                Err(_) => None,
+            },
+            _ => None,
+        };
+        let agent = pool_execution
+            .as_ref()
+            .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+            .unwrap_or_else(|| ctx.agent.clone());
+        agent
             .read_async(|a| {
                 Box::pin(async move {
                     let ctx = a.context().lock().await;
@@ -276,9 +287,14 @@ async fn cmd_system(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             .await;
     } else {
         let prompt = args.join(" ");
-        ctx.agent
-            .write_async(|a| Box::pin(async move { a.set_system_prompt(prompt).await }))
-            .await;
+        match ctx.app_state.as_ref() {
+            Some(state) => state.apply_system_prompt_to_agents(prompt).await,
+            None => {
+                ctx.agent
+                    .write_async(|a| Box::pin(async move { a.set_system_prompt(prompt).await }))
+                    .await;
+            }
+        }
         println!("System prompt updated.");
     }
     CommandOutcome::Continue

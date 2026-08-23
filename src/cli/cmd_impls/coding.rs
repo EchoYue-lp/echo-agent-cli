@@ -634,10 +634,14 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
     if mode.is_empty() {
         // Show current permission mode
-        let current = ctx
-            .agent
-            .read(|a| a.get_permission_mode().to_string())
-            .await;
+        let current = match ctx.app_state.as_ref() {
+            Some(state) => state.config.permission_mode.read().await.clone(),
+            None => {
+                ctx.agent
+                    .read(|a| a.get_permission_mode().to_string())
+                    .await
+            }
+        };
         println!("Current permission mode: {}", current);
         println!();
         println!("Available modes:");
@@ -666,7 +670,15 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
     };
 
-    ctx.agent.write(|a| a.set_permission_mode(normalized)).await;
+    match ctx.app_state.as_ref() {
+        Some(state) => {
+            *state.config.permission_mode.write().await = normalized.to_string();
+            state
+                .apply_permission_mode_to_agents(normalized.to_string())
+                .await;
+        }
+        None => ctx.agent.write(|a| a.set_permission_mode(normalized)).await,
+    }
 
     match normalized {
         "auto-edit" => {

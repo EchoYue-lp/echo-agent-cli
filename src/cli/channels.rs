@@ -1128,6 +1128,31 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         if let Some(message) = self.control_command_response(&msg.text, &conv).await {
             return Ok(immediate_channel_response(&msg, message));
         }
+        if msg.text.split_whitespace().next() == Some("/extract") {
+            let workspace_id = self
+                .app_state
+                .current_execution_scope()
+                .await
+                .workspace_id()
+                .to_string();
+            let command = msg
+                .text
+                .trim()
+                .strip_prefix("/extract")
+                .map(str::trim)
+                .unwrap_or_default();
+            let message = self
+                .app_state
+                .execute_structured_extraction_command_for_scope(
+                    &workspace_id,
+                    &conv,
+                    ForegroundTurnSurface::Channel,
+                    command,
+                )
+                .await
+                .unwrap_or_else(|error| format!("Structured extraction command failed: {error}"));
+            return Ok(immediate_channel_response(&msg, message));
+        }
         if self.hitl.has_pending().await {
             match self.hitl.resolve_message(&msg.text).await {
                 ChannelHumanLoopResolution::Resolved(message)
@@ -1836,7 +1861,8 @@ async fn aggregate_by_sentence<'a>(
                     }
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::TurnStatus { .. })
-                | ChannelRenderEvent::Driver(ChatDriverEvent::ExecutionPath { .. }) => {}
+                | ChannelRenderEvent::Driver(ChatDriverEvent::ExecutionPath { .. })
+                | ChannelRenderEvent::Driver(ChatDriverEvent::TurnConfiguration { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::Interrupt { run_id, goal, new_message }) => {
                     flush_all!();
                     yield OutboundMessage::new(

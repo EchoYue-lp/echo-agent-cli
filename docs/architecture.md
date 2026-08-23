@@ -46,6 +46,8 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
 - `PluginRuntimeService`：Plugin 发现、候选 staging、runtime rewire 和偏好持久化。
 - `McpConfigRuntime`：用户 `mcp.json` 的唯一写入与连接 reconciliation。
 - `BrowserRuntime`：托管 Chromium/Chrome backend 与 browser event projection。
+- `WorkflowService` / `StructuredExtractionService`：EKO catalog、显式 runtime address、
+  typed outcome 与 surface command adapter；Graph/`extract_json` 执行仍由 framework 拥有。
 
 ### Workspace runtime
 

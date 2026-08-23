@@ -4,10 +4,29 @@ use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use echo_agent::agent::Agent;
 use std::sync::Arc;
 
+async fn active_execution(
+    ctx: &CommandContext,
+) -> Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease> {
+    let state = ctx.app_state.as_ref()?;
+    let conversation_id = ctx.conversation_id.as_deref()?;
+    let runtime = state.current_chat_runtime().await.ok()?;
+    runtime.agent_for(conversation_id).await.ok()
+}
+
+fn active_agent(
+    execution: Option<&echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
+    fallback: &crate::agent_handle::AgentHandle,
+) -> crate::agent_handle::AgentHandle {
+    execution
+        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .unwrap_or_else(|| fallback.clone())
+}
+
 // ── ResetCommand ─────────────────────────────────────────────────────
 
 async fn cmd_reset(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent
+    let execution = active_execution(ctx).await;
+    active_agent(execution.as_ref(), &ctx.agent)
         .read_async(|a| {
             Box::pin(async move {
                 let system_prompt = a.system_prompt().to_string();
@@ -32,7 +51,8 @@ cmd!(
 // ── HistoryCommand ───────────────────────────────────────────────────
 
 async fn cmd_history(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent
+    let execution = active_execution(ctx).await;
+    active_agent(execution.as_ref(), &ctx.agent)
         .read_async(|a| {
             Box::pin(async move {
                 let ctx = a.context().lock().await;
@@ -65,7 +85,8 @@ cmd!(
 // ── StatsCommand ─────────────────────────────────────────────────────
 
 async fn cmd_stats(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent
+    let execution = active_execution(ctx).await;
+    active_agent(execution.as_ref(), &ctx.agent)
         .read_async(|a| {
             Box::pin(async move {
                 let ctx = a.context().lock().await;
@@ -108,7 +129,13 @@ async fn cmd_sessions(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("Conversation persistence is unavailable in this runtime.");
         return CommandOutcome::Continue;
     };
-    let store = app_state.conversation_store().await;
+    let store = match app_state.current_chat_runtime().await {
+        Ok(runtime) => runtime.conversation_store(),
+        Err(error) => {
+            println!("Conversation runtime is unavailable: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
     let Some(store) = store else {
         println!("Conversation persistence is unavailable in this runtime.");
         return CommandOutcome::Continue;
@@ -164,7 +191,8 @@ cmd!(
 async fn cmd_new(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     crate::cli::repl::reset_usage_stats();
     // N3 fix: actually reset the conversation, not just usage stats
-    ctx.agent
+    let execution = active_execution(ctx).await;
+    active_agent(execution.as_ref(), &ctx.agent)
         .read_async(|a| {
             Box::pin(async move {
                 a.reset().await;
@@ -186,7 +214,8 @@ cmd!(
 // ── UndoCommand ──────────────────────────────────────────────────────
 
 async fn cmd_undo(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent
+    let execution = active_execution(ctx).await;
+    active_agent(execution.as_ref(), &ctx.agent)
         .read_async(|a| {
             Box::pin(async move {
                 let mut messages = a.get_messages().await;

@@ -510,6 +510,7 @@ pub struct StorageState {
 pub struct HistoryState {
     pub audit_logs: RwLock<Vec<AuditLogEntry>>,
     pub workflows: Arc<crate::workflow_service::WorkflowService>,
+    pub structured_extraction: Arc<crate::structured_extraction::StructuredExtractionService>,
 }
 
 /// 调度器状态
@@ -1125,6 +1126,9 @@ impl AppState {
             history: HistoryState {
                 audit_logs: RwLock::new(Vec::new()),
                 workflows: Arc::new(crate::workflow_service::WorkflowService::at_default_path()),
+                structured_extraction: Arc::new(
+                    crate::structured_extraction::StructuredExtractionService,
+                ),
             },
             scheduler: SchedulerState {
                 runner: None,
@@ -2253,6 +2257,59 @@ impl AppState {
             .await
     }
 
+    /// Remove process-global secondary projections after the target workspace
+    /// has proven idle and its runtime generation has been evicted.
+    pub fn purge_workspace_projections_for_delete(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+    ) -> anyhow::Result<()> {
+        self.storage
+            .chat_events
+            .remove_workspace(workspace_id.as_str())?;
+        self.storage
+            .tool_executions
+            .remove_workspace(workspace_id.as_str())?;
+        Ok(())
+    }
+
+    pub async fn apply_permission_mode_to_agents(&self, mode: String) {
+        match self.connection.pool.as_ref() {
+            Some(pool) => pool.apply_permission_mode(mode.clone()).await,
+            None => {
+                self.connection
+                    .primary_agent()
+                    .write(|agent| agent.set_permission_mode(&mode))
+                    .await;
+            }
+        }
+        for (_, runtime) in self.workspace.runtimes.loaded_execution_runtimes().await {
+            runtime.pool().apply_permission_mode(mode.clone()).await;
+        }
+    }
+
+    pub async fn apply_system_prompt_to_agents(&self, system_prompt: String) {
+        match self.connection.pool.as_ref() {
+            Some(pool) => pool.apply_system_prompt(system_prompt.clone()).await,
+            None => {
+                let prompt = system_prompt.clone();
+                self.connection
+                    .primary_agent()
+                    .write_async(|agent| {
+                        Box::pin(async move {
+                            agent.set_system_prompt(prompt).await;
+                        })
+                    })
+                    .await;
+            }
+        }
+        for (_, runtime) in self.workspace.runtimes.loaded_execution_runtimes().await {
+            runtime
+                .pool()
+                .apply_system_prompt(system_prompt.clone())
+                .await;
+        }
+    }
+
     /// Discover persisted conversation addresses from the existing workspace
     /// registry and per-workspace ConversationStores.
     pub async fn discover_agent_endpoints(
@@ -3209,6 +3266,90 @@ impl AppState {
     pub async fn current_chat_runtime(&self) -> anyhow::Result<ScopedChatRuntime> {
         let _transition = self.workspace.transition.lock().await;
         self.current_chat_runtime_inner().await
+    }
+
+    /// Run one structured extraction against the pooled Agent resolved by the
+    /// explicit workspace and conversation address supplied by the surface.
+    pub async fn extract_structured_for_scope(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        surface: crate::foreground_turn::ForegroundTurnSurface,
+        request: crate::structured_extraction::StructuredExtractionRequest,
+    ) -> Result<
+        crate::structured_extraction::StructuredExtractionOutcome,
+        crate::structured_extraction::StructuredExtractionError,
+    > {
+        use crate::structured_extraction::StructuredExtractionError;
+
+        let runtime = self
+            .chat_runtime_for_scope(workspace_id)
+            .await
+            .map_err(|error| StructuredExtractionError::Runtime(error.to_string()))?;
+        let turn_id = format!("extract:{}", uuid::Uuid::new_v4());
+        let foreground = runtime
+            .begin_turn(
+                &self.session.foreground_turns,
+                surface,
+                conversation_id,
+                turn_id,
+            )
+            .await
+            .map_err(|error| StructuredExtractionError::Admission(error.to_string()))?;
+        let execution = match runtime.agent_for(conversation_id).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                let error = StructuredExtractionError::AgentPool(error.to_string());
+                foreground.settle(crate::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(error.code(), error.to_string()),
+                ));
+                return Err(error);
+            }
+        };
+        let result = self
+            .history
+            .structured_extraction
+            .extract(&execution.agent(), request)
+            .await;
+        drop(execution);
+        match &result {
+            Ok(_) => foreground.settle(crate::chat_driver::TurnOutcome::Completed),
+            Err(error) => foreground.settle(crate::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(error.code(), error.to_string()),
+            )),
+        };
+        result
+    }
+
+    /// Parse and execute the shared `/extract` contract for terminal and
+    /// channel surfaces while preserving the same typed app-core outcomes.
+    pub async fn execute_structured_extraction_command_for_scope(
+        &self,
+        workspace_id: &str,
+        conversation_id: &str,
+        surface: crate::foreground_turn::ForegroundTurnSurface,
+        command: &str,
+    ) -> Result<String, crate::structured_extraction::StructuredExtractionError> {
+        use crate::structured_extraction::{
+            PreparedStructuredExtractionCommand, StructuredExtractionError,
+        };
+
+        let prepared = self.history.structured_extraction.parse_command(command)?;
+        let value = match prepared {
+            PreparedStructuredExtractionCommand::Examples => {
+                serde_json::to_value(self.history.structured_extraction.examples())
+            }
+            PreparedStructuredExtractionCommand::Validate(schema) => {
+                serde_json::to_value(self.history.structured_extraction.validate_schema(&schema))
+            }
+            PreparedStructuredExtractionCommand::Extract(request) => serde_json::to_value(
+                self.extract_structured_for_scope(workspace_id, conversation_id, surface, request)
+                    .await?,
+            ),
+        }
+        .map_err(|error| StructuredExtractionError::Serialization(error.to_string()))?;
+        serde_json::to_string_pretty(&value)
+            .map_err(|error| StructuredExtractionError::Serialization(error.to_string()))
     }
 
     async fn current_chat_runtime_inner(&self) -> anyhow::Result<ScopedChatRuntime> {

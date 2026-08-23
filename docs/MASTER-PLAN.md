@@ -37,6 +37,8 @@ Last updated: 2026-08-23
 - 数据分析、学术/医学研究、Zotero/Europe PMC、review/export。
 - layered memory、Review Inbox、Curator、rule/Skill promotion。
 - dynamic Provider/model/protocol/thinking profile。
+- workspace-qualified session/checkpoint/task/browser/control surface，JSONL mode/policy/attachment/HITL。
+- Workflow GUI 与统一 structured extraction 的 GUI/TUI/CLI/channel 生产入口。
 
 这些条目完成后的 design/plan/audit/soak 文档已经删除；需要理解当前行为时以代码、测试、
 [架构说明](./architecture.md) 和 [功能总览](./features.md) 为准。
@@ -80,16 +82,6 @@ surface projector、global/workspace 普通 conversation boot resume，以及 ch
 state、运行边界索引、10k/100k 性能门、真实 Agent/Awaiter/surface 故障矩阵和 bounded smoke。
 长时间集成测试不再阻塞功能阶段，统一归项目 Final Integration Gate。
 
-### Surface Parity Cleanup
-
-状态：Pending；P0 runtime reliability 已收口，下一阶段可直接执行。
-
-规格：[`design/specs/surface-parity.md`](../design/specs/surface-parity.md)
-
-代码可达性审计确认 Workflow GUI 和通用结构化抽取仍是定义/IPC 已存在但生产 surface
-未闭环的功能。必须复用现有 workflow executor 与 framework `extract_json`，补齐统一
-app-core 服务和 GUI/TUI/CLI/channel reachability，或删除不再作为产品能力的孤立适配器。
-
 ## 下一步
 
 Long-horizon 的 LH6 代码修复已完成：18 行故障矩阵、可取消 artifact finalize、Started projection
@@ -97,8 +89,10 @@ crash window、Awaiter Provider failure durable result、EKO permission-owned sh
 Agent execution governor、四 surface real-provider harness 与 truthful ledger 都已进入生产/测试路径。
 真实探针完成 3x3、36 Provider turns、3 Awaiter、3 HITL、2 restart，零失败；10 分钟扩展并发
 运行也完成 1,827 cells 且零失败。两小时尝试按研发节奏调整在 26.6 分钟主动停止，状态记录为
-`interrupted_by_policy`。下一实施入口切换到 Surface Parity Cleanup；10 分钟/2 小时和完整人工
-GUI 场景只在项目功能研发全部完成后执行一次 Final Integration Gate。
+`interrupted_by_policy`。Task 2 EKO Control Plane 与 Surface 已在
+`refactor/eko-control-surface` 完成全自动门禁；按总集成顺序，先等待 Task 1 framework
+correctness 合并，再将 Task 2 merge 最新 `main`、恢复标准相对依赖并进入 Task 3/4/5 集成。
+10 分钟/2 小时和完整人工 GUI 场景只在项目功能研发全部完成后执行一次 Final Integration Gate。
 
 ## 文档生命周期
 

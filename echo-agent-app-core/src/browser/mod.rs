@@ -6,7 +6,8 @@ pub mod session;
 pub mod sidecar;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use base64::Engine;
@@ -29,10 +30,12 @@ pub use error::{BrowserError, BrowserResult};
 pub use event::{BrowserEvent, BrowserFrame};
 pub use risk::BrowserActionRisk;
 pub use session::{
-    BrowserBackend, BrowserObservation, BrowserSession, BrowserSessionManager,
-    BrowserSessionStatus, BrowserTab, MAIN_TAB_OWNER,
+    BrowserBackend, BrowserObservation, BrowserSession, BrowserSessionAddress,
+    BrowserSessionManager, BrowserSessionStatus, BrowserTab, MAIN_TAB_OWNER,
 };
 use sidecar::BrowserSidecar;
+
+pub type BrowserApprovalAddress = BrowserSessionAddress;
 
 #[derive(Clone)]
 pub struct BrowserRuntime {
@@ -49,9 +52,70 @@ struct BrowserRuntimeInner {
     extension_startup_error: RwLock<Option<String>>,
     locator_failures: Mutex<HashMap<String, u8>>,
     default_approval_provider: RwLock<Option<Arc<dyn HumanLoopProvider>>>,
-    conversation_approval_providers: RwLock<HashMap<String, Arc<dyn HumanLoopProvider>>>,
+    approval_providers:
+        RwLock<HashMap<BrowserApprovalAddress, BrowserApprovalProviderRegistration>>,
+    workspace_roots: RwLock<HashMap<PathBuf, String>>,
     shutdown: CancellationToken,
     prewarm: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+struct BrowserApprovalProviderRegistration {
+    registration_id: uuid::Uuid,
+    provider: Arc<dyn HumanLoopProvider>,
+}
+
+#[must_use = "the browser approval registration must be retained for the owning turn"]
+pub struct BrowserApprovalRegistration {
+    runtime: Weak<BrowserRuntimeInner>,
+    address: BrowserApprovalAddress,
+    registration_id: uuid::Uuid,
+    closed: bool,
+}
+
+impl BrowserApprovalRegistration {
+    pub async fn close(mut self) {
+        self.remove_if_current().await;
+        self.closed = true;
+    }
+
+    async fn remove_if_current(&self) {
+        let Some(runtime) = self.runtime.upgrade() else {
+            return;
+        };
+        let mut providers = runtime.approval_providers.write().await;
+        if providers
+            .get(&self.address)
+            .is_some_and(|registration| registration.registration_id == self.registration_id)
+        {
+            providers.remove(&self.address);
+        }
+    }
+}
+
+impl Drop for BrowserApprovalRegistration {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        let runtime = self.runtime.clone();
+        let address = self.address.clone();
+        let registration_id = self.registration_id;
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            let Some(runtime) = runtime.upgrade() else {
+                return;
+            };
+            let mut providers = runtime.approval_providers.write().await;
+            if providers
+                .get(&address)
+                .is_some_and(|registration| registration.registration_id == registration_id)
+            {
+                providers.remove(&address);
+            }
+        });
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -79,7 +143,8 @@ impl BrowserRuntime {
                 extension_startup_error: RwLock::new(None),
                 locator_failures: Mutex::new(HashMap::new()),
                 default_approval_provider: RwLock::new(None),
-                conversation_approval_providers: RwLock::new(HashMap::new()),
+                approval_providers: RwLock::new(HashMap::new()),
+                workspace_roots: RwLock::new(HashMap::new()),
                 shutdown: CancellationToken::new(),
                 prewarm: Mutex::new(None),
             }),
@@ -154,40 +219,75 @@ impl BrowserRuntime {
         *self.inner.default_approval_provider.write().await = Some(provider);
     }
 
-    pub async fn set_conversation_approval_provider(
+    pub async fn register_approval_provider(
         &self,
-        conversation_id: String,
+        address: BrowserApprovalAddress,
+        workspace_root: PathBuf,
         provider: Arc<dyn HumanLoopProvider>,
-    ) {
-        self.inner
-            .conversation_approval_providers
-            .write()
-            .await
-            .insert(conversation_id, provider);
-    }
-
-    pub async fn remove_conversation_approval_provider(&self, conversation_id: &str) {
-        self.inner
-            .conversation_approval_providers
-            .write()
-            .await
-            .remove(conversation_id);
+    ) -> BrowserApprovalRegistration {
+        let registration_id = uuid::Uuid::new_v4();
+        self.inner.approval_providers.write().await.insert(
+            address.clone(),
+            BrowserApprovalProviderRegistration {
+                registration_id,
+                provider,
+            },
+        );
+        self.register_workspace_root(address.workspace_id.clone(), workspace_root)
+            .await;
+        BrowserApprovalRegistration {
+            runtime: Arc::downgrade(&self.inner),
+            address,
+            registration_id,
+            closed: false,
+        }
     }
 
     pub async fn execute_main(
         &self,
+        workspace_id: String,
+        workspace_root: PathBuf,
         conversation_id: String,
         action: BrowserAction,
         params: ToolParameters,
         cancel: Option<Arc<CancellationToken>>,
     ) -> BrowserResult<ToolResult> {
+        self.register_workspace_root(workspace_id, workspace_root.clone())
+            .await;
         let context = ToolContext {
+            working_dir: Some(workspace_root),
             conversation_id: Some(conversation_id),
             cancel,
             ..ToolContext::default()
         };
         self.call(action, params, &context, BrowserActor::Main)
             .await
+    }
+
+    pub async fn register_workspace_root(
+        &self,
+        workspace_id: impl Into<String>,
+        workspace_root: PathBuf,
+    ) {
+        self.inner
+            .workspace_roots
+            .write()
+            .await
+            .insert(workspace_root, workspace_id.into());
+    }
+
+    pub async fn remove_workspace(&self, workspace_id: &str) {
+        self.inner
+            .approval_providers
+            .write()
+            .await
+            .retain(|address, _| address.workspace_id != workspace_id);
+        self.inner
+            .workspace_roots
+            .write()
+            .await
+            .retain(|_, candidate| candidate != workspace_id);
+        self.inner.sessions.remove_workspace(workspace_id).await;
     }
 
     pub async fn interrupt(&self) {
@@ -304,6 +404,7 @@ impl BrowserRuntime {
             .conversation_id
             .as_deref()
             .unwrap_or("browser-default");
+        let address = self.resolve_address(context, conversation_id).await;
         let navigation_url = match action {
             BrowserAction::Navigate => {
                 Some(params.get("url").and_then(Value::as_str).ok_or_else(|| {
@@ -351,7 +452,7 @@ impl BrowserRuntime {
             Some("new") => self
                 .inner
                 .sessions
-                .open_tab(conversation_id, &owner_id, context.run_id.as_deref())
+                .open_tab(&address, &owner_id, context.run_id.as_deref())
                 .await
                 .ok_or_else(|| {
                     BrowserError::Connection("failed to allocate browser tab".to_string())
@@ -363,7 +464,7 @@ impl BrowserRuntime {
                 })?;
                 self.inner
                     .sessions
-                    .select_tab(conversation_id, &owner_id, index)
+                    .select_tab(&address, &owner_id, index)
                     .await
                     .ok_or_else(|| BrowserError::Tool {
                         tool: action.name().to_string(),
@@ -373,7 +474,7 @@ impl BrowserRuntime {
             _ => {
                 self.inner
                     .sessions
-                    .lease_tab(conversation_id, &owner_id, context.run_id.as_deref())
+                    .lease_tab(&address, &owner_id, context.run_id.as_deref())
                     .await
             }
         };
@@ -402,7 +503,7 @@ impl BrowserRuntime {
                     let session = self
                         .inner
                         .sessions
-                        .switch_backend(conversation_id, BrowserBackend::Managed)
+                        .switch_backend(&address, BrowserBackend::Managed)
                         .await
                         .ok_or_else(|| {
                             BrowserError::Connection("browser session missing".to_string())
@@ -438,7 +539,7 @@ impl BrowserRuntime {
                     let session = self
                         .inner
                         .sessions
-                        .switch_backend(conversation_id, BrowserBackend::Chrome)
+                        .switch_backend(&address, BrowserBackend::Chrome)
                         .await
                         .ok_or_else(|| {
                             BrowserError::Connection("browser session missing".to_string())
@@ -458,9 +559,9 @@ impl BrowserRuntime {
             let completion_lease = self
                 .inner
                 .sessions
-                .lease_tab(conversation_id, &owner_id, context.run_id.as_deref())
+                .lease_tab(&address, &owner_id, context.run_id.as_deref())
                 .await;
-            let selected_backend = self.inner.sessions.backend(conversation_id).await;
+            let selected_backend = self.inner.sessions.backend(&address).await;
             self.inner.sessions.emit(BrowserEvent::BackendChanged {
                 session_id: completion_lease.session_id.clone(),
                 backend: selected_backend,
@@ -485,7 +586,7 @@ impl BrowserRuntime {
                 .to_string();
             self.inner
                 .sessions
-                .set_status(conversation_id, BrowserSessionStatus::WaitingConfirmation)
+                .set_status(&address, BrowserSessionStatus::WaitingConfirmation)
                 .await;
             self.inner
                 .sessions
@@ -496,7 +597,7 @@ impl BrowserRuntime {
                     summary,
                 });
             let approved = match self
-                .confirm_action(conversation_id, action, action_risk, &params)
+                .confirm_action(&address, action, action_risk, &params)
                 .await
             {
                 Ok(approved) => approved,
@@ -510,7 +611,7 @@ impl BrowserRuntime {
                         });
                     self.inner
                         .sessions
-                        .set_status(conversation_id, BrowserSessionStatus::Ready)
+                        .set_status(&address, BrowserSessionStatus::Ready)
                         .await;
                     return Err(error);
                 }
@@ -525,7 +626,7 @@ impl BrowserRuntime {
             if !approved {
                 self.inner
                     .sessions
-                    .set_status(conversation_id, BrowserSessionStatus::Ready)
+                    .set_status(&address, BrowserSessionStatus::Ready)
                     .await;
                 return Err(BrowserError::Tool {
                     tool: action_name,
@@ -551,7 +652,7 @@ impl BrowserRuntime {
             });
             self.inner
                 .sessions
-                .set_developer_mode(conversation_id, enabled)
+                .set_developer_mode(&address, enabled)
                 .await;
             self.inner.sessions.emit(BrowserEvent::ActionCompleted {
                 session_id: lease.session_id,
@@ -568,7 +669,7 @@ impl BrowserRuntime {
             }));
         }
         if action == BrowserAction::PerformanceTrace
-            && !self.inner.sessions.developer_mode(conversation_id).await
+            && !self.inner.sessions.developer_mode(&address).await
         {
             return Err(BrowserError::Tool {
                 tool: action_name,
@@ -576,7 +677,7 @@ impl BrowserRuntime {
                     .to_string(),
             });
         }
-        let backend = self.inner.sessions.backend(conversation_id).await;
+        let backend = self.inner.sessions.backend(&address).await;
         if backend == BrowserBackend::Chrome
             && tabs_command.as_deref() == Some("close")
             && requested_index.unwrap_or(lease.tab_index) == 0
@@ -661,12 +762,12 @@ impl BrowserRuntime {
             });
             self.inner
                 .sessions
-                .set_status(conversation_id, BrowserSessionStatus::Navigating)
+                .set_status(&address, BrowserSessionStatus::Navigating)
                 .await;
         } else {
             self.inner
                 .sessions
-                .set_status(conversation_id, BrowserSessionStatus::Acting)
+                .set_status(&address, BrowserSessionStatus::Acting)
                 .await;
         }
         self.inner.sessions.emit(BrowserEvent::ActionStarted {
@@ -725,7 +826,7 @@ impl BrowserRuntime {
                 self.inner
                     .sessions
                     .update_page_metadata(
-                        conversation_id,
+                        &address,
                         &lease.tab_id,
                         page_url.as_deref(),
                         page_title.as_deref(),
@@ -733,7 +834,7 @@ impl BrowserRuntime {
                     .await;
                 self.inner
                     .sessions
-                    .set_status(conversation_id, BrowserSessionStatus::Ready)
+                    .set_status(&address, BrowserSessionStatus::Ready)
                     .await;
                 if action == BrowserAction::Navigate {
                     let url = arguments
@@ -743,7 +844,7 @@ impl BrowserRuntime {
                     if page_url.is_none() {
                         self.inner
                             .sessions
-                            .update_url(conversation_id, &lease.tab_id, url)
+                            .update_url(&address, &lease.tab_id, url)
                             .await;
                     }
                     self.inner.sessions.emit(BrowserEvent::NavigationCompleted {
@@ -821,7 +922,7 @@ impl BrowserRuntime {
                 }
                 if tabs_command.as_deref() == Some("close") {
                     let index = requested_index.unwrap_or(lease.tab_index);
-                    self.inner.sessions.close_tab(conversation_id, index).await;
+                    self.inner.sessions.close_tab(&address, index).await;
                 }
                 if let Some(highlight) = highlight_arguments {
                     let _ = self
@@ -861,7 +962,7 @@ impl BrowserRuntime {
                 }
                 self.inner
                     .sessions
-                    .set_status(conversation_id, BrowserSessionStatus::Failed)
+                    .set_status(&address, BrowserSessionStatus::Failed)
                     .await;
                 self.inner.sessions.emit(BrowserEvent::ActionFailed {
                     session_id: lease.session_id,
@@ -983,20 +1084,20 @@ impl BrowserRuntime {
 
     async fn confirm_action(
         &self,
-        conversation_id: &str,
+        address: &BrowserSessionAddress,
         action: BrowserAction,
         risk: BrowserActionRisk,
         params: &ToolParameters,
     ) -> BrowserResult<bool> {
-        let conversation_provider = self
+        let registration = self
             .inner
-            .conversation_approval_providers
+            .approval_providers
             .read()
             .await
-            .get(conversation_id)
-            .cloned();
-        let provider = match conversation_provider {
-            Some(provider) => Some(provider),
+            .get(address)
+            .map(|registration| registration.provider.clone());
+        let provider = match registration.as_ref() {
+            Some(provider) => Some(provider.clone()),
             None => self.inner.default_approval_provider.read().await.clone(),
         }
         .ok_or_else(|| BrowserError::Tool {
@@ -1005,7 +1106,12 @@ impl BrowserRuntime {
         })?;
         let request = HumanLoopRequest {
             request_id: None,
-            session_id: Some(conversation_id.to_string()),
+            session_id: Some(
+                registration
+                    .as_ref()
+                    .map(|_| address.session_id())
+                    .unwrap_or_else(|| address.conversation_id.clone()),
+            ),
             agent_name: None,
             kind: HumanLoopKind::Approval,
             prompt: risk.prompt(params),
@@ -1033,6 +1139,50 @@ impl BrowserRuntime {
                 | HumanLoopResponse::ApprovedWithScope { .. }
                 | HumanLoopResponse::ModifiedArgs { .. }
         ))
+    }
+
+    async fn resolve_address(
+        &self,
+        context: &ToolContext,
+        conversation_id: &str,
+    ) -> BrowserSessionAddress {
+        let roots = self.inner.workspace_roots.read().await;
+        let mut candidates = roots
+            .iter()
+            .filter(|(root, _)| {
+                context
+                    .working_dir
+                    .as_deref()
+                    .is_some_and(|working_dir| working_dir.starts_with(root))
+            })
+            .map(|(root, workspace_id)| (root.components().count(), workspace_id.clone()))
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        let registered_address = if candidates.is_empty() {
+            let providers = self.inner.approval_providers.read().await;
+            let mut addresses = providers
+                .keys()
+                .filter(|address| address.conversation_id == conversation_id)
+                .cloned();
+            let first = addresses.next();
+            if addresses.next().is_none() {
+                first
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(address) = registered_address {
+            return address;
+        }
+        BrowserSessionAddress::new(
+            candidates
+                .first()
+                .map(|(_, workspace_id)| workspace_id.clone())
+                .unwrap_or_else(|| "global".to_string()),
+            conversation_id,
+        )
     }
 }
 
@@ -1816,6 +1966,68 @@ mod tests {
 
         assert!(navigate.is_err());
         assert!(new_tab.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn approval_registration_uses_full_address_and_owned_generation() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let runtime = BrowserRuntime::start(BrowserConfig {
+            enabled: false,
+            extension_enabled: false,
+            session_dir: temp.path().join("sessions"),
+            ..BrowserConfig::default()
+        })
+        .await;
+        let provider: Arc<dyn HumanLoopProvider> = Arc::new(crate::hitl::HitlDispatcher::new());
+        let address_a = BrowserApprovalAddress::new("workspace-a", "conversation-1");
+        let address_b = BrowserApprovalAddress::new("workspace-b", "conversation-1");
+        let receipt_a = runtime
+            .register_approval_provider(
+                address_a.clone(),
+                temp.path().join("workspace-a"),
+                provider.clone(),
+            )
+            .await;
+        let receipt_b = runtime
+            .register_approval_provider(
+                address_b.clone(),
+                temp.path().join("workspace-b"),
+                provider.clone(),
+            )
+            .await;
+        let resolved = runtime
+            .resolve_address(
+                &ToolContext {
+                    working_dir: Some(temp.path().join("workspace-b/worktree")),
+                    conversation_id: Some("conversation-1".to_string()),
+                    ..ToolContext::default()
+                },
+                "conversation-1",
+            )
+            .await;
+        assert_eq!(resolved, address_b);
+
+        let replacement = runtime
+            .register_approval_provider(
+                address_a.clone(),
+                temp.path().join("workspace-a"),
+                provider,
+            )
+            .await;
+        receipt_a.close().await;
+        assert!(
+            runtime
+                .inner
+                .approval_providers
+                .read()
+                .await
+                .contains_key(&address_a)
+        );
+
+        replacement.close().await;
+        receipt_b.close().await;
+        assert!(runtime.inner.approval_providers.read().await.is_empty());
         Ok(())
     }
 

@@ -491,6 +491,12 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             prompt,
             conversation_id.clone(),
             &headless_services,
+            cli::JsonlRunOptions {
+                interaction_mode: args.jsonl_mode,
+                permission_mode: args.jsonl_permission,
+                approval_policy: args.jsonl_approval,
+                attachment_paths: args.jsonl_attachment.clone(),
+            },
         )
         .await
         {
@@ -645,6 +651,10 @@ mod tests {
             tui: false,
             no_alt_screen: false,
             jsonl: None,
+            jsonl_mode: cli::args::JsonlInteractionMode::Auto,
+            jsonl_permission: cli::args::JsonlPermissionMode::Default,
+            jsonl_approval: cli::args::JsonlApprovalPolicy::Reject,
+            jsonl_attachment: Vec::new(),
             port: 3000,
             host: "127.0.0.1".to_string(),
             model: Some("test-model".to_string()),
@@ -721,8 +731,33 @@ mod tests {
 
     #[test]
     fn test_args_accept_jsonl_one_shot_prompt() {
-        let args = cli::Args::parse_from(["echo-agent-cli", "--jsonl", "inspect the project"]);
+        let args = cli::Args::parse_from([
+            "echo-agent-cli",
+            "--jsonl",
+            "inspect the project",
+            "--jsonl-mode",
+            "task",
+            "--jsonl-permission",
+            "full-auto",
+            "--jsonl-approval",
+            "auto-approve",
+            "--jsonl-attachment",
+            "/tmp/context.txt",
+        ]);
         assert_eq!(args.jsonl.as_deref(), Some("inspect the project"));
+        assert_eq!(args.jsonl_mode, cli::args::JsonlInteractionMode::Task);
+        assert_eq!(
+            args.jsonl_permission,
+            cli::args::JsonlPermissionMode::FullAuto
+        );
+        assert_eq!(
+            args.jsonl_approval,
+            cli::args::JsonlApprovalPolicy::AutoApprove
+        );
+        assert_eq!(
+            args.jsonl_attachment,
+            vec![std::path::PathBuf::from("/tmp/context.txt")]
+        );
         assert!(!args.cli);
         assert!(!args.channels);
     }

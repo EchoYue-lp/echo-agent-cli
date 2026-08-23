@@ -1582,6 +1582,7 @@ dependencies = [
  "hex",
  "hmac",
  "indicatif",
+ "jsonschema",
  "notify",
  "nu-ansi-term",
  "portable-pty",

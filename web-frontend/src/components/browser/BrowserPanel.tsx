@@ -9,14 +9,16 @@ import { BrowserTabs } from './BrowserTabs';
 import { BrowserToolbar } from './BrowserToolbar';
 import { BrowserViewport } from './BrowserViewport';
 import { ChromeSetupDialog } from './ChromeSetupDialog';
+import { viewAddress, viewAddressKey, workspaceIdForView } from '../../lib/viewAddress';
 
 export function BrowserPanel() {
   useBrowserEvents();
   const [chromeSetupOpen, setChromeSetupOpen] = useState(false);
   const conversationId = useConversationStore((state) => state.activeId);
-  const workspaceId = useWorkspaceStore((state) => state.current?.id);
-  const browserScopeId = conversationId ?? `ui-preview:${workspaceId ?? 'global'}`;
-  const view = useBrowserStore((state) => state.views[browserScopeId]);
+  const workspaceId = workspaceIdForView(useWorkspaceStore((state) => state.current?.id));
+  const browserConversationId = conversationId ?? `ui-preview:${workspaceId}`;
+  const browserAddressKey = viewAddressKey(viewAddress(workspaceId, browserConversationId));
+  const view = useBrowserStore((state) => state.views[browserAddressKey]);
   const store = useBrowserStore();
   const refreshChromeStatus = useBrowserStore((state) => state.refreshChromeStatus);
   const refreshFrame = useBrowserStore((state) => state.refreshFrame);
@@ -29,9 +31,12 @@ export function BrowserPanel() {
   }, [refreshChromeStatus]);
   useEffect(() => {
     if (viewStatus !== 'ready') return;
-    const timer = window.setInterval(() => void refreshFrame(browserScopeId), 1500);
+    const timer = window.setInterval(
+      () => void refreshFrame(workspaceId, browserConversationId),
+      1500
+    );
     return () => window.clearInterval(timer);
-  }, [browserScopeId, refreshFrame, viewStatus]);
+  }, [browserConversationId, refreshFrame, viewStatus, workspaceId]);
   const activeTab =
     view?.session.tabs.find((tab) => tab.id === view.activeTabId) ?? view?.session.tabs[0];
   const busy =
@@ -39,8 +44,8 @@ export function BrowserPanel() {
     view?.session.status === 'acting' ||
     view?.session.status === 'starting';
 
-  const call = (fn: (id: string) => Promise<void>) => {
-    void fn(browserScopeId);
+  const call = (fn: (workspaceId: string, conversationId: string) => Promise<void>) => {
+    void fn(workspaceId, browserConversationId);
   };
   return (
     <>
@@ -48,7 +53,7 @@ export function BrowserPanel() {
         <BrowserToolbar
           url={activeTab?.url ?? ''}
           busy={Boolean(busy)}
-          onNavigate={(url) => void store.navigate(browserScopeId, url)}
+          onNavigate={(url) => void store.navigate(workspaceId, browserConversationId, url)}
           onBack={() => call(store.back)}
           onReload={() => call(store.reload)}
           onStop={() => void store.stop()}
@@ -57,7 +62,7 @@ export function BrowserPanel() {
           backend={view?.session.backend ?? 'managed'}
           chromeConnected={store.chromeConnected}
           onBackendChange={(backend) => {
-            void store.setBackend(browserScopeId, backend).then((error) => {
+            void store.setBackend(workspaceId, browserConversationId, backend).then((error) => {
               if (error && backend === 'chrome') setChromeSetupOpen(true);
             });
           }}
@@ -66,27 +71,29 @@ export function BrowserPanel() {
         <BrowserTabs
           tabs={view?.session.tabs ?? []}
           activeTabId={view?.activeTabId ?? null}
-          onSelect={(index) => void store.selectTab(browserScopeId, index)}
-          onClose={(index) => void store.closeTab(browserScopeId, index)}
+          onSelect={(index) => void store.selectTab(workspaceId, browserConversationId, index)}
+          onClose={(index) => void store.closeTab(workspaceId, browserConversationId, index)}
         />
         <BrowserViewport
           frame={view?.frame}
           busy={Boolean(busy)}
           clickable={Boolean(view && view.session.backend !== 'chrome')}
           scrollable={Boolean(view)}
-          onClickAt={(x, y) => void store.clickAt(browserScopeId, x, y)}
-          onScroll={(deltaX, deltaY) => void store.scroll(browserScopeId, deltaX, deltaY)}
+          onClickAt={(x, y) => void store.clickAt(workspaceId, browserConversationId, x, y)}
+          onScroll={(deltaX, deltaY) =>
+            void store.scroll(workspaceId, browserConversationId, deltaX, deltaY)
+          }
         />
         {(busy ||
           view?.session.status === 'waiting_confirmation' ||
           view?.error ||
-          store.commandErrors[browserScopeId] ||
+          store.commandErrors[browserAddressKey] ||
           Boolean(view?.diagnostics.length) ||
           view?.session.backend === 'chrome') && (
           <footer className="flex h-7 shrink-0 items-center justify-between gap-3 border-t border-[var(--border-primary)] px-2.5">
             <BrowserStatus
               status={view?.session.status}
-              error={view?.error ?? store.commandErrors[browserScopeId]}
+              error={view?.error ?? store.commandErrors[browserAddressKey]}
             />
             <div className="flex min-w-0 items-center gap-2 text-[10px] text-[var(--text-tertiary)]">
               {Boolean(view?.diagnostics.length) && (
@@ -117,7 +124,7 @@ export function BrowserPanel() {
           onClose={() => setChromeSetupOpen(false)}
           onConnectionChange={handleChromeConnectionChange}
           onUseChrome={async () => {
-            const error = await store.setBackend(browserScopeId, 'chrome');
+            const error = await store.setBackend(workspaceId, browserConversationId, 'chrome');
             if (!error) setChromeSetupOpen(false);
             return error;
           }}

@@ -25,7 +25,7 @@ describe('rightWorkspaceWidthForViewport', () => {
 });
 
 describe('useRightWorkspaceStore', () => {
-  it('opens flat task, analysis, research, browser, and file views', () => {
+  it('opens flat task, analysis, research, browser, file, and automation views', () => {
     const store = useRightWorkspaceStore.getState();
 
     store.openBrowser();
@@ -42,6 +42,20 @@ describe('useRightWorkspaceStore', () => {
 
     store.openTasks();
     expect(useRightWorkspaceStore.getState()).toMatchObject({ open: true, activeTab: 'tasks' });
+
+    store.openWorkflows();
+    expect(useRightWorkspaceStore.getState()).toMatchObject({
+      open: true,
+      activeTab: 'automation',
+      automationView: 'workflows',
+    });
+
+    store.openExtract();
+    expect(useRightWorkspaceStore.getState()).toMatchObject({
+      open: true,
+      activeTab: 'automation',
+      automationView: 'extract',
+    });
 
     store.close();
   });

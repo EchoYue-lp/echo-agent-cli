@@ -521,14 +521,6 @@ export interface AuditLog {
   reason?: string;
 }
 
-export interface WorkflowInfo {
-  id: string;
-  name: string;
-  definition: string;
-  status: string;
-  created_at: string;
-}
-
 export interface ConfigInfo {
   model: string;
   system_prompt: string;
@@ -616,32 +608,6 @@ export interface CompressResponse {
   messages_after: number;
   tokens_saved: number;
   message: string;
-}
-
-// ── Extract types ──
-
-export interface ExtractRequest {
-  input: string;
-  schema: object;
-  schema_name?: string;
-}
-
-export interface ExtractResponse {
-  success: boolean;
-  data: unknown;
-  schema_name: string;
-}
-
-export interface ValidateSchemaResponse {
-  valid: boolean;
-  errors: string[];
-}
-
-export interface ExtractExample {
-  name: string;
-  description: string;
-  schema: object;
-  example_input: string;
 }
 
 // ── Conversation persistence types ──

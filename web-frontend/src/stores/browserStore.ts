@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { apiInvoke, errorMessage, isTauri } from '../lib/tauri-bridge';
+import { viewAddress, viewAddressKey } from '../lib/viewAddress';
 
 export type BrowserStatus =
   | 'starting'
@@ -20,6 +21,7 @@ export interface BrowserTab {
 
 export interface BrowserSession {
   id: string;
+  workspace_id: string;
   conversation_id: string;
   status: BrowserStatus;
   backend?: 'managed' | 'chrome';
@@ -77,18 +79,28 @@ interface BrowserStore {
   commandErrors: Record<string, string>;
   chromeConnected: boolean;
   ingest: (event: BrowserEvent) => void;
-  navigate: (conversationId: string, url: string) => Promise<void>;
-  back: (conversationId: string) => Promise<void>;
-  reload: (conversationId: string) => Promise<void>;
-  refreshFrame: (conversationId: string) => Promise<void>;
-  clickAt: (conversationId: string, x: number, y: number) => Promise<void>;
-  scroll: (conversationId: string, deltaX: number, deltaY: number) => Promise<void>;
+  navigate: (workspaceId: string, conversationId: string, url: string) => Promise<void>;
+  back: (workspaceId: string, conversationId: string) => Promise<void>;
+  reload: (workspaceId: string, conversationId: string) => Promise<void>;
+  refreshFrame: (workspaceId: string, conversationId: string) => Promise<void>;
+  clickAt: (workspaceId: string, conversationId: string, x: number, y: number) => Promise<void>;
+  scroll: (
+    workspaceId: string,
+    conversationId: string,
+    deltaX: number,
+    deltaY: number
+  ) => Promise<void>;
   stop: () => Promise<void>;
-  selectTab: (conversationId: string, index: number) => Promise<void>;
-  newTab: (conversationId: string) => Promise<void>;
-  closeTab: (conversationId: string, index: number) => Promise<void>;
-  setBackend: (conversationId: string, backend: 'managed' | 'chrome') => Promise<string | null>;
+  selectTab: (workspaceId: string, conversationId: string, index: number) => Promise<void>;
+  newTab: (workspaceId: string, conversationId: string) => Promise<void>;
+  closeTab: (workspaceId: string, conversationId: string, index: number) => Promise<void>;
+  setBackend: (
+    workspaceId: string,
+    conversationId: string,
+    backend: 'managed' | 'chrome'
+  ) => Promise<string | null>;
   refreshChromeStatus: () => Promise<void>;
+  clearWorkspace: (workspaceId: string) => void;
 }
 
 function updateSession(
@@ -98,8 +110,8 @@ function updateSession(
 ) {
   const entry = Object.entries(views).find(([, view]) => view.session.id === sessionId);
   if (!entry) return views;
-  const [conversationId, view] = entry;
-  return { ...views, [conversationId]: updater(view) };
+  const [addressKey, view] = entry;
+  return { ...views, [addressKey]: updater(view) };
 }
 
 async function invokeBrowser(command: string, args?: Record<string, unknown>) {
@@ -118,7 +130,9 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
         return {
           views: {
             ...state.views,
-            [event.session.conversation_id]: {
+            [viewAddressKey(
+              viewAddress(event.session.workspace_id, event.session.conversation_id)
+            )]: {
               session: event.session,
               activeTabId: firstTab?.id ?? null,
               frame: null,
@@ -229,96 +243,100 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
       });
       return { views };
     }),
-  navigate: async (conversationId, url) => {
+  navigate: async (workspaceId, conversationId, url) => {
+    const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
     set((state) => ({
-      commandErrors: { ...state.commandErrors, [conversationId]: '' },
+      commandErrors: { ...state.commandErrors, [addressKey]: '' },
     }));
     try {
-      await invokeBrowser('browser_navigate', { conversationId, url });
+      await invokeBrowser('browser_navigate', { workspaceId, conversationId, url });
     } catch (error) {
       set((state) => ({
-        views: updateSession(
-          state.views,
-          state.views[conversationId]?.session.id ?? '',
-          (view) => ({
-            ...view,
-            error: errorMessage(error),
-          })
-        ),
+        views: updateSession(state.views, state.views[addressKey]?.session.id ?? '', (view) => ({
+          ...view,
+          error: errorMessage(error),
+        })),
       }));
     }
   },
-  back: async (conversationId) => {
+  back: async (workspaceId, conversationId) => {
     try {
-      await invokeBrowser('browser_back', { conversationId });
+      await invokeBrowser('browser_back', { workspaceId, conversationId });
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
     }
   },
-  reload: async (conversationId) => {
+  reload: async (workspaceId, conversationId) => {
     try {
-      await invokeBrowser('browser_reload', { conversationId });
+      await invokeBrowser('browser_reload', { workspaceId, conversationId });
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
     }
   },
-  refreshFrame: async (conversationId) => {
+  refreshFrame: async (workspaceId, conversationId) => {
     try {
-      await invokeBrowser('browser_screenshot', { conversationId });
+      await invokeBrowser('browser_screenshot', { workspaceId, conversationId });
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
     }
   },
-  clickAt: async (conversationId, x, y) => {
+  clickAt: async (workspaceId, conversationId, x, y) => {
     try {
-      await invokeBrowser('browser_click_at', { conversationId, x, y });
+      await invokeBrowser('browser_click_at', { workspaceId, conversationId, x, y });
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
     }
   },
-  scroll: async (conversationId, deltaX, deltaY) => {
+  scroll: async (workspaceId, conversationId, deltaX, deltaY) => {
     try {
-      await invokeBrowser('browser_scroll', { conversationId, deltaX, deltaY });
+      await invokeBrowser('browser_scroll', { workspaceId, conversationId, deltaX, deltaY });
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
     }
   },
   stop: () => invokeBrowser('browser_stop'),
-  selectTab: async (conversationId, index) => {
-    try {
-      await invokeBrowser('browser_tabs', { conversationId, action: 'select', index });
-    } catch (error) {
-      setViewError(set, conversationId, error);
-    }
-  },
-  newTab: async (conversationId) => {
+  selectTab: async (workspaceId, conversationId, index) => {
     try {
       await invokeBrowser('browser_tabs', {
+        workspaceId,
+        conversationId,
+        action: 'select',
+        index,
+      });
+    } catch (error) {
+      setViewError(set, workspaceId, conversationId, error);
+    }
+  },
+  newTab: async (workspaceId, conversationId) => {
+    try {
+      await invokeBrowser('browser_tabs', {
+        workspaceId,
         conversationId,
         action: 'new',
         url: 'about:blank',
       });
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
     }
   },
-  closeTab: async (conversationId, index) => {
+  closeTab: async (workspaceId, conversationId, index) => {
     try {
-      await invokeBrowser('browser_tabs', { conversationId, action: 'close', index });
+      await invokeBrowser('browser_tabs', { workspaceId, conversationId, action: 'close', index });
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
     }
   },
-  setBackend: async (conversationId, backend) => {
+  setBackend: async (workspaceId, conversationId, backend) => {
+    const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
     try {
-      await invokeBrowser('browser_set_backend', { conversationId, backend });
+      await invokeBrowser('browser_set_backend', { workspaceId, conversationId, backend });
       set((state) => ({
-        commandErrors: { ...state.commandErrors, [conversationId]: '' },
+        commandErrors: { ...state.commandErrors, [addressKey]: '' },
         chromeConnected: backend === 'chrome' ? true : state.chromeConnected,
       }));
       return null;
     } catch (error) {
-      setViewError(set, conversationId, error);
+      setViewError(set, workspaceId, conversationId, error);
       return errorMessage(error);
     }
   },
@@ -331,19 +349,37 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
       set({ chromeConnected: false });
     }
   },
+  clearWorkspace: (workspaceId) =>
+    set((state) => ({
+      views: Object.fromEntries(
+        Object.entries(state.views).filter(([, view]) => view.session.workspace_id !== workspaceId)
+      ),
+      commandErrors: Object.fromEntries(
+        Object.entries(state.commandErrors).filter(([key]) => {
+          try {
+            const address = JSON.parse(key) as [string, string];
+            return address[0] !== workspaceId;
+          } catch {
+            return true;
+          }
+        })
+      ),
+    })),
 }));
 
 function setViewError(
   set: (partial: Partial<BrowserStore> | ((state: BrowserStore) => Partial<BrowserStore>)) => void,
+  workspaceId: string,
   conversationId: string,
   error: unknown
 ) {
+  const addressKey = viewAddressKey(viewAddress(workspaceId, conversationId));
   set((state) => ({
     commandErrors: {
       ...state.commandErrors,
-      [conversationId]: errorMessage(error),
+      [addressKey]: errorMessage(error),
     },
-    views: updateSession(state.views, state.views[conversationId]?.session.id ?? '', (view) => ({
+    views: updateSession(state.views, state.views[addressKey]?.session.id ?? '', (view) => ({
       ...view,
       error: errorMessage(error),
     })),

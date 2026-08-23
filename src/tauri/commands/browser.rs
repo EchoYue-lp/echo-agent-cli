@@ -8,13 +8,26 @@ use tauri::State;
 
 async fn execute(
     state: &TauriState,
+    workspace_id: String,
     conversation_id: String,
     action: BrowserAction,
     params: ToolParameters,
 ) -> Result<(), String> {
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| error.to_string())?;
     state
         .browser_runtime
-        .execute_main(conversation_id, action, params, None)
+        .execute_main(
+            workspace_id,
+            runtime.execution_scope().root().to_path_buf(),
+            conversation_id,
+            action,
+            params,
+            None,
+        )
         .await
         .map(|_| ())
         .map_err(|error| error.to_string())
@@ -23,11 +36,13 @@ async fn execute(
 #[tauri::command]
 pub async fn browser_navigate(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
     url: String,
 ) -> Result<(), String> {
     execute(
         &state,
+        workspace_id,
         conversation_id,
         BrowserAction::Navigate,
         HashMap::from([("url".to_string(), Value::String(url))]),
@@ -38,18 +53,28 @@ pub async fn browser_navigate(
 #[tauri::command]
 pub async fn browser_back(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
 ) -> Result<(), String> {
-    execute(&state, conversation_id, BrowserAction::Back, HashMap::new()).await
+    execute(
+        &state,
+        workspace_id,
+        conversation_id,
+        BrowserAction::Back,
+        HashMap::new(),
+    )
+    .await
 }
 
 #[tauri::command]
 pub async fn browser_reload(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
 ) -> Result<(), String> {
     execute(
         &state,
+        workspace_id,
         conversation_id,
         BrowserAction::Reload,
         HashMap::new(),
@@ -60,10 +85,12 @@ pub async fn browser_reload(
 #[tauri::command]
 pub async fn browser_screenshot(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
 ) -> Result<(), String> {
     execute(
         &state,
+        workspace_id,
         conversation_id,
         BrowserAction::Screenshot,
         HashMap::new(),
@@ -74,12 +101,14 @@ pub async fn browser_screenshot(
 #[tauri::command]
 pub async fn browser_click_at(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
     x: f64,
     y: f64,
 ) -> Result<(), String> {
     execute(
         &state,
+        workspace_id,
         conversation_id,
         BrowserAction::ClickAt,
         HashMap::from([
@@ -94,12 +123,14 @@ pub async fn browser_click_at(
 #[tauri::command]
 pub async fn browser_scroll(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
     delta_x: f64,
     delta_y: f64,
 ) -> Result<(), String> {
     execute(
         &state,
+        workspace_id,
         conversation_id,
         BrowserAction::Scroll,
         HashMap::from([
@@ -113,6 +144,7 @@ pub async fn browser_scroll(
 #[tauri::command]
 pub async fn browser_tabs(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
     action: String,
     index: Option<u64>,
@@ -125,7 +157,14 @@ pub async fn browser_tabs(
     if let Some(url) = url {
         params.insert("url".to_string(), Value::String(url));
     }
-    execute(&state, conversation_id, BrowserAction::Tabs, params).await
+    execute(
+        &state,
+        workspace_id,
+        conversation_id,
+        BrowserAction::Tabs,
+        params,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -149,11 +188,19 @@ pub fn chrome_open_extensions_page() -> Result<(), String> {
 #[tauri::command]
 pub async fn browser_set_backend(
     state: State<'_, TauriState>,
+    workspace_id: String,
     conversation_id: String,
     backend: String,
 ) -> Result<(), String> {
     let params = HashMap::from([("backend".to_string(), Value::String(backend))]);
-    execute(&state, conversation_id, BrowserAction::Backend, params).await
+    execute(
+        &state,
+        workspace_id,
+        conversation_id,
+        BrowserAction::Backend,
+        params,
+    )
+    .await
 }
 
 fn open_playwright_extension_page() -> Result<(), String> {

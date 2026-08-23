@@ -19,6 +19,7 @@ import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
 import { useToolExecutionStore } from '../../stores/toolExecutionStore';
+import { dispatchGuiSlashCommand } from '../../lib/slashCommands';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -163,10 +164,18 @@ export function ChatPanel() {
   };
 
   const handleSend = async (text: string, attachments?: Attachment[]) => {
-    const command = text.trim().toLowerCase();
-    if (!attachments?.length && (command === '/clear' || command === '/cls')) {
-      await clearCurrentChat();
-      return true;
+    if (!attachments?.length) {
+      const dispatched = await dispatchGuiSlashCommand(text, {
+        clear: clearCurrentChat,
+        tasks: rightWorkspace.openTasks,
+        analysis: rightWorkspace.openAnalysis,
+        research: rightWorkspace.openResearch,
+        browser: rightWorkspace.openBrowser,
+        files: rightWorkspace.openFiles,
+        workflows: rightWorkspace.openWorkflows,
+        extract: rightWorkspace.openExtract,
+      });
+      if (dispatched) return true;
     }
     return sendMessage(text, attachments);
   };

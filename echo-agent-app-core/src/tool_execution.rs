@@ -677,6 +677,62 @@ impl ToolExecutionRepository {
         Ok(())
     }
 
+    pub fn remove_workspace(&self, workspace_id: &str) -> ToolExecutionResult<()> {
+        validate_workspace_id(workspace_id)?;
+        {
+            let state = self.lock_state();
+            if state.summaries.values().any(|summary| {
+                summary.workspace_id == workspace_id
+                    && summary.status == ToolExecutionStatus::Running
+            }) {
+                return Err(ToolExecutionError::ActiveConversation(
+                    workspace_id.to_string(),
+                ));
+            }
+        }
+        let scope = self
+            .root
+            .join(echo_agent::tools::artifact::artifact_scope_component(
+                workspace_id,
+            ));
+        let tombstone = if scope.exists() {
+            let trash_root = self.root.join(".trash");
+            fs::create_dir_all(&trash_root)?;
+            let tombstone = trash_root.join(format!(
+                "workspace-{}-{}",
+                echo_agent::tools::artifact::artifact_scope_component(workspace_id),
+                uuid::Uuid::new_v4()
+            ));
+            fs::rename(&scope, &tombstone)?;
+            Some(tombstone)
+        } else {
+            None
+        };
+        {
+            let mut state = self.lock_state();
+            let removed_details = state
+                .summaries
+                .values()
+                .filter(|summary| summary.workspace_id == workspace_id)
+                .map(|summary| summary.detail_ref.clone())
+                .collect::<Vec<_>>();
+            state
+                .summaries
+                .retain(|_, summary| summary.workspace_id != workspace_id);
+            for detail_ref in removed_details {
+                state.details.remove(&detail_ref);
+            }
+        }
+        if let Some(tombstone) = tombstone {
+            std::thread::spawn(move || {
+                if let Err(error) = fs::remove_dir_all(&tombstone) {
+                    tracing::warn!(path = %tombstone.display(), %error, "workspace tool execution tombstone cleanup failed");
+                }
+            });
+        }
+        Ok(())
+    }
+
     fn rebuild_index_and_recover(&self) -> ToolExecutionResult<()> {
         for path in find_manifest_files(&self.root)? {
             let location = DetailLocation {
@@ -1493,6 +1549,44 @@ mod tests {
             ToolExecutionStatus::Interrupted,
         )?;
         repository.remove_conversation("workspace-a", "conversation-1")?;
+        assert!(
+            repository
+                .summaries_for_conversation("workspace-a", "conversation-1")
+                .is_empty()
+        );
+        assert_eq!(
+            repository
+                .summaries_for_conversation("workspace-b", "conversation-1")
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_removal_keeps_other_workspace_tool_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = ToolExecutionRepository::open(temp.path())?;
+        let owner = chat_owner();
+        let invocation = invocation("shell", serde_json::json!({"command": "true"}));
+        for workspace_id in ["workspace-a", "workspace-b"] {
+            repository.project_start(
+                workspace_id,
+                owner.clone(),
+                Some("conversation-1"),
+                Some("run-1"),
+                "call-1",
+                &invocation,
+            )?;
+            repository.terminate_orphan(
+                workspace_id,
+                &owner,
+                "call-1",
+                ToolExecutionStatus::Unknown,
+            )?;
+        }
+        repository.remove_workspace("workspace-a")?;
         assert!(
             repository
                 .summaries_for_conversation("workspace-a", "conversation-1")

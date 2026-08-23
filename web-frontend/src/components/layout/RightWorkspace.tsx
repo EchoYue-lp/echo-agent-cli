@@ -7,6 +7,7 @@ import {
   GripVertical,
   ListTodo,
   PanelRightClose,
+  Workflow,
 } from 'lucide-react';
 import {
   rightWorkspaceWidthForViewport,
@@ -17,6 +18,7 @@ import { BrowserPanel } from '../browser/BrowserPanel';
 import { FileBrowser } from '../file-browser/FileBrowser';
 import AnalysisPanel from '../analysis/AnalysisPanel';
 import { PaperPanel } from '../papers/PaperPanel';
+import { AutomationPanel } from '../automation/AutomationPanel';
 import { RightRail } from './RightRail';
 
 export function RightWorkspace() {
@@ -102,6 +104,12 @@ export function RightWorkspace() {
             label="文件"
             onClick={() => store.setActiveTab('files')}
           />
+          <WorkspaceTab
+            active={store.activeTab === 'automation'}
+            icon={<Workflow size={13} />}
+            label="自动化"
+            onClick={() => store.setActiveTab('automation')}
+          />
           <div className="flex-1" />
           <button
             type="button"
@@ -122,6 +130,8 @@ export function RightWorkspace() {
             <PaperPanel />
           ) : store.activeTab === 'browser' ? (
             <BrowserPanel />
+          ) : store.activeTab === 'automation' ? (
+            <AutomationPanel />
           ) : (
             <FileBrowser />
           )}

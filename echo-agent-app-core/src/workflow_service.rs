@@ -10,8 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
 #[serde(deny_unknown_fields)]
+#[ts(export, rename = "StoredWorkflow")]
 pub struct StoredWorkflow {
     pub id: String,
     pub name: String,
@@ -22,13 +23,22 @@ pub struct StoredWorkflow {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export, rename = "WorkflowExecution")]
 pub struct WorkflowExecution {
     pub success: bool,
     pub workflow_id: String,
     pub path: Vec<String>,
     pub steps: usize,
     pub state: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export, rename = "WorkflowMutationReceipt")]
+pub struct WorkflowMutationReceipt {
+    pub success: bool,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]

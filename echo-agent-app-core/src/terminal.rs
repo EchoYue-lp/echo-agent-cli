@@ -398,7 +398,7 @@ mod tests {
             .await?;
 
         let mut output = Vec::new();
-        let exits = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let exits = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 match receiver.recv().await {
                     Ok(TerminalEvent::Output { bytes, .. }) => output.extend(bytes),

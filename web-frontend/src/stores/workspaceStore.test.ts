@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   createAndSwitchWorkspace: vi.fn(),
   listWorkspaces: vi.fn(),
   currentWorkspace: vi.fn(),
+  deleteWorkspace: vi.fn(),
   resetSession: vi.fn(),
   clearMessages: vi.fn(),
   initConversations: vi.fn(),
@@ -13,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   loadTree: vi.fn(),
   loadChanges: vi.fn(),
   addToast: vi.fn(),
+  clearBrowserWorkspace: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
@@ -21,6 +23,7 @@ vi.mock('../api/endpoints', () => ({
     createAndSwitch: mocks.createAndSwitchWorkspace,
     list: mocks.listWorkspaces,
     current: mocks.currentWorkspace,
+    delete: mocks.deleteWorkspace,
   },
   sessionApi: {
     reset: mocks.resetSession,
@@ -51,6 +54,12 @@ vi.mock('./fileStore', () => ({
       loadTree: mocks.loadTree,
       loadChanges: mocks.loadChanges,
     }),
+  },
+}));
+
+vi.mock('./browserStore', () => ({
+  useBrowserStore: {
+    getState: () => ({ clearWorkspace: mocks.clearBrowserWorkspace }),
   },
 }));
 
@@ -106,6 +115,7 @@ describe('workspaceStore file identity integration', () => {
       active: true,
     });
     mocks.resetSession.mockResolvedValue(undefined);
+    mocks.deleteWorkspace.mockResolvedValue({ success: true });
     mocks.initConversations.mockResolvedValue(undefined);
     mocks.loadTree.mockResolvedValue(undefined);
     mocks.loadChanges.mockResolvedValue(undefined);
@@ -210,5 +220,23 @@ describe('workspaceStore file identity integration', () => {
     expect(useWorkspaceStore.getState().current?.id).toBe('workspace-b');
     expect(mocks.initConversations).toHaveBeenCalledTimes(1);
     expect(mocks.initConversations).toHaveBeenCalledWith('workspace-b');
+  });
+
+  it('deleting the focused workspace clears projections and rebinds global conversations', async () => {
+    useWorkspaceStore.setState({
+      current: { id: 'workspace-b', name: 'Workspace B' } as any,
+      workspaces: [{ id: 'workspace-b', name: 'Workspace B' } as any],
+      isLoading: false,
+    });
+    mocks.currentWorkspace.mockResolvedValueOnce({ workspace: null, active: false });
+    mocks.listWorkspaces.mockResolvedValueOnce({ workspaces: [], count: 0 });
+
+    await useWorkspaceStore.getState().delete('workspace-b');
+
+    expect(mocks.deleteWorkspace).toHaveBeenCalledWith('workspace-b');
+    expect(mocks.clearBrowserWorkspace).toHaveBeenCalledWith('workspace-b');
+    expect(mocks.detachConversations).toHaveBeenCalledWith('workspace-b');
+    expect(mocks.initConversations).toHaveBeenCalledWith('global');
+    expect(useWorkspaceStore.getState().current).toBeNull();
   });
 });

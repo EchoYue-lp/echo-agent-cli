@@ -38,6 +38,8 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 | 代码执行与分析 | `run_code` 使用 EKO 锁定的 Python analytics runtime                                      | `echo-agent-app-core/src/analysis_runtime.rs`          |
 | Terminal       | 用户交互 terminal session 和 Agent shell 路径分离                                        | `echo-agent-app-core/src/terminal.rs`                  |
 | Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 投影                    | `echo-agent-app-core/src/browser/`                     |
+| 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/TUI/CLI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
+| 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome          | `echo-agent-app-core/src/structured_extraction.rs`     |
 | MCP            | 一份用户 `mcp.json`、动态连接、plugin name ownership、resource tools                     | `echo-agent-app-core/src/mcp_config_runtime.rs`        |
 | LSP            | 自动发现、诊断、定义、引用、hover 与 repo map                                            | framework LSP tools + app bootstrap                    |
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
@@ -62,6 +64,10 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
   以及 text/image/audio/video 输入能力。详见 [Provider 架构](./architecture/providers.md)。
 - GUI、TUI 和 CLI 共享模型、thinking profile、permission mode、MCP、Plugin、Hook、
   Skill 和 TaskRuntime 权威。
+- JSONL one-shot 可显式选择 interaction mode、permission/approval policy 和附件；HITL 请求
+  进入 canonical event stream，不能回传的 input/selection 会明确拒绝而不静默挂起。
+- Browser session、approval receipt、普通 Subagent event 和 workspace 删除投影均使用
+  `(workspace, conversation)` 地址；同名 conversation 不会跨 workspace 混写或误删。
 - Trace、usage/cache、context budget、Tool/Subagent execution 与 TaskRuntime event 均有
   typed projection；长输出按需加载，不进入首屏完整状态。
 - 所有 EKO 数据以普通文件、JSON 或 JSONL 保存；应用不依赖 SQLite。
@@ -77,12 +83,5 @@ surface projector、checkpoint-backed hot state 和 10k/100k 性能门已收口�
 Agent/Subagent/shell/write/LLM governor 和 truthful self-retiring runner，现均已完成并通过。
 10 分钟/2 小时与完整人工 GUI 场景统一属于项目研发完成后的 Final Integration Gate。
 
-这些未完成项由
-[`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)
-跟踪。CommandCell/Awaiter、普通 conversation boot resume、terminal repair 和 hot-state
-performance 的详细修复由
-[`design/specs/long-horizon-runtime-closure.md`](../design/specs/long-horizon-runtime-closure.md)
-跟踪。另有两个非运行时 reachability 缺口：Workflow GUI 未挂载，结构化抽取没有统一
-多 surface 服务；它们记录在
-[`design/specs/surface-parity.md`](../design/specs/surface-parity.md)。`docs/` 不维护第二份
-实施计划。
+Workflow GUI 与结构化抽取的多 surface reachability 已收口；GUI palette 只展示有真实 handler
+的命令。后续未完成工作只在 [`MASTER-PLAN`](./MASTER-PLAN.md) 维护，不在功能总览复制实施计划。

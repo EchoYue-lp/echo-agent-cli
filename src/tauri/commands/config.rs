@@ -125,20 +125,12 @@ pub async fn update_config(
         }
     }
 
-    {
+    if let Some(system_prompt) = req.system_prompt.clone() {
         state
             .app_state
-            .connection
-            .agent
-            .write_async(|agent| {
-                Box::pin(async move {
-                    if let Some(ref system_prompt) = req.system_prompt {
-                        agent.set_system_prompt(system_prompt.clone()).await;
-                        tracing::info!("系统提示词已更新");
-                    }
-                })
-            })
+            .apply_system_prompt_to_agents(system_prompt)
             .await;
+        tracing::info!("系统提示词已更新");
     }
 
     let available_models = {
@@ -282,16 +274,9 @@ pub async fn update_full_config(
     let system_prompt = config.agent.system_prompt.clone();
     state
         .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            let system_prompt = system_prompt.clone();
-            Box::pin(async move {
-                agent.set_system_prompt(system_prompt.clone()).await;
-                tracing::info!("配置已同步到 Agent");
-            })
-        })
+        .apply_system_prompt_to_agents(system_prompt)
         .await;
+    tracing::info!("配置已同步到 Agent");
 
     Ok(full_config_response(&config))
 }

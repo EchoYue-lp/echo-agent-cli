@@ -7,6 +7,7 @@ import { useSubagentRunStore } from './subagentRunStore';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
 import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
+import { useBrowserStore } from './browserStore';
 import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
 
 let workspaceGeneration = 0;
@@ -16,6 +17,7 @@ function detachVisibleWorkspace(workspaceId: string): void {
   useTaskRuntimeStore.getState().reset();
   useToolExecutionStore.getState().clear();
   useSubagentRunStore.getState().clear();
+  useBrowserStore.getState().clearWorkspace(workspaceId);
   useConversationStore.getState().detachForWorkspace(workspaceId);
 }
 
@@ -81,7 +83,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     const generation = workspaceGeneration + 1;
     workspaceGeneration = generation;
     const previousWorkspaceId = get().current?.id ?? GLOBAL_WORKSPACE_ID;
-    detachVisibleWorkspace(id);
+    detachVisibleWorkspace(previousWorkspaceId);
     set({ isLoading: true });
     try {
       if (import.meta.env.DEV) console.debug('[workspaceStore] switchTo:', id);
@@ -151,15 +153,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     await workspaceApi.delete(id);
     const { current } = get();
     if (current?.id === id) {
+      detachVisibleWorkspace(id);
       set({ current: null });
+      useFileStore.getState().markWorkspaceChanged();
     }
     await get().init();
+    if (current?.id === id) {
+      await useConversationStore.getState().init(GLOBAL_WORKSPACE_ID);
+    }
   },
 
   exit: async () => {
     const generation = workspaceGeneration + 1;
     workspaceGeneration = generation;
-    detachVisibleWorkspace(GLOBAL_WORKSPACE_ID);
+    detachVisibleWorkspace(get().current?.id ?? GLOBAL_WORKSPACE_ID);
     const res = await workspaceApi.exit();
     if (generation !== workspaceGeneration) return;
     set({ current: null });

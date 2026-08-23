@@ -15,16 +15,12 @@ import type {
   ConfigInfo,
   PermissionRule,
   AuditLog,
-  WorkflowInfo,
   SandboxStatus,
   SandboxConfig,
   SandboxExecuteRequest,
   SandboxExecuteResult,
   CompressResponse,
   CompressionStats,
-  ExtractResponse,
-  ValidateSchemaResponse,
-  ExtractExample,
   ConversationListItem,
   ConversationRecord,
   SavedMessage,
@@ -59,6 +55,11 @@ import type {
   SubagentControlReceipt,
   CompletionGateReport,
   WorkspaceTransitionReceipt,
+  StoredWorkflow,
+  WorkflowExecution,
+  StructuredExtractionExample,
+  StructuredExtractionOutcome,
+  StructuredExtractionValidation,
   ConfiguredModelListResponse,
   LlmApiProtocol,
   ModelInputModality,
@@ -112,10 +113,15 @@ export interface AutoMemoryExtractResult extends AutoMemoryPreview {
 }
 
 export const sessionApi = {
-  get: () => (isTauri() ? apiInvoke<SessionInfo>('get_session') : get<SessionInfo>('/session')),
-  reset: () =>
-    isTauri() ? apiInvoke<SessionInfo>('reset_session') : post<SessionInfo>('/session/reset'),
-  getLatest: () =>
+  get: (workspaceId: string, conversationId: string) =>
+    isTauri()
+      ? apiInvoke<SessionInfo>('get_session', { workspaceId, conversationId })
+      : get<SessionInfo>('/session'),
+  reset: (workspaceId: string, conversationId: string) =>
+    isTauri()
+      ? apiInvoke<SessionInfo>('reset_session', { workspaceId, conversationId })
+      : post<SessionInfo>('/session/reset'),
+  getLatest: (workspaceId: string) =>
     isTauri()
       ? apiInvoke<{
           found: boolean;
@@ -124,7 +130,7 @@ export const sessionApi = {
           updated_at?: string;
           message_count?: number;
           error?: string;
-        }>('get_latest_session')
+        }>('get_latest_session', { workspaceId })
       : get<{
           found: boolean;
           id?: string;
@@ -134,17 +140,22 @@ export const sessionApi = {
           error?: string;
         }>('/session/latest'),
 
-  createCheckpoint: () =>
+  createCheckpoint: (workspaceId: string, conversationId: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; snapshot_id?: string }>('create_checkpoint')
+      ? apiInvoke<{ success: boolean; snapshot_id?: string }>('create_checkpoint', {
+          workspaceId,
+          conversationId,
+        })
       : post<{ success: boolean; snapshot_id?: string }>('/session/checkpoint'),
-  listCheckpoints: () =>
+  listCheckpoints: (workspaceId: string, conversationId: string) =>
     isTauri()
-      ? apiInvoke<SnapshotInfo[]>('list_checkpoints')
+      ? apiInvoke<SnapshotInfo[]>('list_checkpoints', { workspaceId, conversationId })
       : get<SnapshotInfo[]>('/session/checkpoints'),
-  restoreCheckpoint: (id: string) =>
+  restoreCheckpoint: (workspaceId: string, conversationId: string, id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; restored_to?: string }>('restore_checkpoint', {
+          workspaceId,
+          conversationId,
           snapshot_id: id,
         })
       : post<{ success: boolean; restored_to?: string }>(`/session/restore/${id}`),
@@ -356,23 +367,23 @@ export const auditApi = {
 
 export const workflowApi = {
   list: () =>
-    isTauri() ? apiInvoke<WorkflowInfo[]>('list_workflows') : get<WorkflowInfo[]>('/workflow'),
+    isTauri() ? apiInvoke<StoredWorkflow[]>('list_workflows') : get<StoredWorkflow[]>('/workflow'),
   get: (id: string) =>
     isTauri()
-      ? apiInvoke<WorkflowInfo>('get_workflow', { id })
-      : get<WorkflowInfo>(`/workflow/${id}`),
+      ? apiInvoke<StoredWorkflow>('get_workflow', { id })
+      : get<StoredWorkflow>(`/workflow/${id}`),
   create: (definition: string, name?: string) =>
     isTauri()
-      ? apiInvoke<WorkflowInfo>('create_workflow', { definition, name })
-      : post<WorkflowInfo>('/workflow', { definition, name }),
+      ? apiInvoke<StoredWorkflow>('create_workflow', { definition, name })
+      : post<StoredWorkflow>('/workflow', { definition, name }),
   delete: (id: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean }>('delete_workflow', { id })
       : del<{ success: boolean }>(`/workflow/${id}`),
   execute: (id: string, input?: unknown) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; result?: unknown }>('execute_workflow', { id, input })
-      : post<{ success: boolean; result?: unknown }>(`/workflow/${id}/execute`, { input }),
+      ? apiInvoke<WorkflowExecution>('execute_workflow', { id, input })
+      : post<WorkflowExecution>(`/workflow/${id}/execute`, { input }),
 };
 
 export const sandboxApi = {
@@ -412,18 +423,36 @@ export const compressApi = {
 };
 
 export const extractApi = {
-  extract: (input: string, schema: object, schema_name?: string) =>
+  extract: (
+    workspaceId: string,
+    conversationId: string,
+    input: string,
+    schema: object,
+    schema_name?: string
+  ) =>
     isTauri()
-      ? apiInvoke<ExtractResponse>('extract_data', { input, schema, schema_name })
-      : post<ExtractResponse>('/extract', { input, schema, schema_name }),
+      ? apiInvoke<StructuredExtractionOutcome>('extract_data', {
+          workspaceId,
+          conversationId,
+          input,
+          schema,
+          schema_name,
+        })
+      : post<StructuredExtractionOutcome>('/extract', {
+          workspace_id: workspaceId,
+          conversation_id: conversationId,
+          input,
+          schema,
+          schema_name,
+        }),
   validateSchema: (schema: object) =>
     isTauri()
-      ? apiInvoke<ValidateSchemaResponse>('validate_schema', { schema })
-      : post<ValidateSchemaResponse>('/extract/validate', { schema }),
+      ? apiInvoke<StructuredExtractionValidation>('validate_schema', { schema })
+      : post<StructuredExtractionValidation>('/extract/validate', { schema }),
   getExamples: () =>
     isTauri()
-      ? apiInvoke<ExtractExample[]>('get_extract_examples')
-      : get<ExtractExample[]>('/extract/examples'),
+      ? apiInvoke<StructuredExtractionExample[]>('get_extract_examples')
+      : get<StructuredExtractionExample[]>('/extract/examples'),
 };
 
 export const conversationApi = {

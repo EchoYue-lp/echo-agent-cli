@@ -2,7 +2,58 @@
 //!
 //! 使用 clap derive 模式定义 TUI/GUI 产品入口参数。
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum JsonlInteractionMode {
+    Auto,
+    Chat,
+    Task,
+}
+
+impl JsonlInteractionMode {
+    pub fn runtime(self) -> echo_agent_app_core::tasks::task_runtime::InteractionMode {
+        match self {
+            Self::Auto => echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
+            Self::Chat => echo_agent_app_core::tasks::task_runtime::InteractionMode::Chat,
+            Self::Task => echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum JsonlPermissionMode {
+    Default,
+    AutoEdit,
+    FullAuto,
+    Strict,
+}
+
+impl JsonlPermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AutoEdit => "auto-edit",
+            Self::FullAuto => "full-auto",
+            Self::Strict => "strict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum JsonlApprovalPolicy {
+    Reject,
+    AutoApprove,
+}
+
+impl JsonlApprovalPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reject => "reject",
+            Self::AutoApprove => "auto_approve",
+        }
+    }
+}
 
 /// EKO - TUI/GUI 通用 Agent
 #[derive(Parser, Debug)]
@@ -33,6 +84,22 @@ pub struct Args {
         conflicts_with_all = ["tui", "web", "cli", "channels"]
     )]
     pub jsonl: Option<String>,
+
+    /// Interaction mode used by the JSONL turn.
+    #[arg(long, value_enum, default_value = "auto", requires = "jsonl")]
+    pub jsonl_mode: JsonlInteractionMode,
+
+    /// Agent tool permission mode used by the JSONL turn.
+    #[arg(long, value_enum, default_value = "default", requires = "jsonl")]
+    pub jsonl_permission: JsonlPermissionMode,
+
+    /// Non-interactive policy for approval HITL requests in JSONL mode.
+    #[arg(long, value_enum, default_value = "reject", requires = "jsonl")]
+    pub jsonl_approval: JsonlApprovalPolicy,
+
+    /// Attach a local file to the JSONL turn. May be repeated.
+    #[arg(long, value_name = "PATH", action = clap::ArgAction::Append, requires = "jsonl")]
+    pub jsonl_attachment: Vec<std::path::PathBuf>,
 
     /// Web 服务端口（仅内部 Web/GUI 使用）
     #[arg(long, short = 'p', default_value = "3000", hide = true)]

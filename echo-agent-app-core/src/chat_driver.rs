@@ -28,6 +28,15 @@ use crate::tasks::task_runtime::types::{
 };
 
 /// Complete product event stream consumed by every interactive surface.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ts_rs::TS)]
+#[serde(deny_unknown_fields)]
+#[ts(export, rename = "ChatAttachmentDescriptor")]
+pub struct ChatAttachmentDescriptor {
+    pub name: String,
+    pub mime_type: String,
+    pub source: crate::types::AttachmentSource,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "source", content = "event", rename_all = "snake_case")]
 pub enum ChatDriverEvent {
@@ -39,6 +48,12 @@ pub enum ChatDriverEvent {
     ExecutionPath {
         requested_mode: String,
         observed_path: String,
+    },
+    TurnConfiguration {
+        interaction_mode: String,
+        permission_mode: String,
+        approval_policy: String,
+        attachments: Vec<ChatAttachmentDescriptor>,
     },
     Interrupt {
         run_id: String,
@@ -2083,6 +2098,7 @@ mod tests {
                     .push((requested_mode, observed_path)),
                 ChatDriverEvent::Execution(_)
                 | ChatDriverEvent::TurnStatus { .. }
+                | ChatDriverEvent::TurnConfiguration { .. }
                 | ChatDriverEvent::Interrupt { .. }
                 | ChatDriverEvent::InputQueued { .. }
                 | ChatDriverEvent::InputRemoved { .. }

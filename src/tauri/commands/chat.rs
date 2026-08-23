@@ -557,12 +557,17 @@ pub async fn send_chat_message(
             })
         })
         .await;
-    let browser_approval_key = conversation_id
-        .clone()
-        .unwrap_or_else(|| "browser-default".to_string());
-    state
+    let browser_approval_address = echo_agent_app_core::browser::BrowserApprovalAddress::new(
+        workspace_id.clone(),
+        active_turn_key.clone(),
+    );
+    let browser_approval_registration = state
         .browser_runtime
-        .set_conversation_approval_provider(browser_approval_key.clone(), hitl_handler.clone())
+        .register_approval_provider(
+            browser_approval_address,
+            scoped_runtime.execution_scope().root().to_path_buf(),
+            hitl_handler.clone(),
+        )
         .await;
 
     use echo_agent_app_core::tasks::task_runtime::InteractionMode;
@@ -669,6 +674,7 @@ pub async fn send_chat_message(
                 })
             })
             .await;
+        browser_approval_registration.close().await;
         drop(pool_execution);
         tracing::info!(
             elapsed_ms = start.elapsed().as_millis() as u64,

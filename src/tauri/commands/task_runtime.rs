@@ -469,7 +469,15 @@ pub async fn resume_task_run(
     {
         return resume_continuation_run(&state, app, runtime, store, run_id, run_state).await;
     }
-    let primary_agent = runtime.primary_agent();
+    let conversation_id = run_state
+        .as_ref()
+        .map(|snapshot| snapshot.run.conversation_id.clone())
+        .ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?;
+    let pool_execution = runtime
+        .agent_for(&conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let primary_agent = pool_execution.agent();
     let review_integration = runtime.review_integration();
     let cancel = echo_agent::agent::CancellationToken::new();
     let supervisor_cancel = cancel.clone();
@@ -516,6 +524,7 @@ pub async fn resume_task_run(
         }, move |(memory_generation, layer_manager)| {
             preparation_store.resume_task_run(&preparation_run_id)?;
             Ok(((), move |mut receipt_owner: echo_agent_app_core::tasks::task_runtime::RunDriverReceiptOwner| async move {
+                let _pool_execution = pool_execution;
                 if let Some(generation) = memory_generation.as_ref() {
                     receipt_owner.retain(generation.clone());
                 }
@@ -642,6 +651,15 @@ async fn resume_continuation_run(
         )
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let pool_execution = match runtime.agent_for(&conversation_id).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
+            ));
+            return Err(IpcError::Validation(error.to_string()));
+        }
+    };
     let sink = crate::tauri::commands::chat::tauri_chat_sink(
         app.clone(),
         runtime.execution_scope().workspace_id().to_string(),
@@ -683,10 +701,11 @@ async fn resume_continuation_run(
         origin: RunTurnOrigin::Resume,
         transcript_visibility: TurnVisibility::Internal,
     };
-    let agent = runtime.primary_agent();
+    let agent = pool_execution.agent();
     let spawned_run_id = run_id.clone();
     let status_store = store;
     tokio::spawn(async move {
+        let _pool_execution = pool_execution;
         let outcome = echo_agent_app_core::foreground_turn::drive_foreground_chat_turn(
             lease, &agent, &turn, resources, binding,
         )
@@ -738,8 +757,12 @@ pub async fn retry_blocked_task(
     run_id: String,
     task_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let (runtime, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    let primary_agent = runtime.primary_agent();
+    let (runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let pool_execution = runtime
+        .agent_for(&run.conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let primary_agent = pool_execution.agent();
     let review_integration = runtime.review_integration();
     let cancel = echo_agent::agent::CancellationToken::new();
     // The pinned retry facade selects recovery or acceptance and mutates the
@@ -755,6 +778,7 @@ pub async fn retry_blocked_task(
     let preparation = spawn_tauri_task_retry(
         store,
         primary_agent,
+        Some(pool_execution),
         review_integration,
         trace_sink,
         cancel,
@@ -784,9 +808,11 @@ pub async fn retry_blocked_task(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_tauri_task_retry(
     store: Arc<TaskRuntimeStore>,
     primary_agent: echo_agent_app_core::agent_handle::AgentHandle,
+    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink,
     cancel: echo_agent::agent::CancellationToken,
@@ -825,6 +851,7 @@ fn spawn_tauri_task_retry(
             Ok((memory_generation, layer_manager))
         },
         move |(memory_generation, layer_manager), mut receipt_owner| async move {
+            let _pool_execution = pool_execution;
             if let Some(generation) = memory_generation.as_ref() {
                 receipt_owner.retain(generation.clone());
             }
@@ -872,8 +899,12 @@ pub async fn update_tasks(
     run_id: String,
     request: TaskUpdateRequest,
 ) -> Result<TaskPlan, IpcError> {
-    let (runtime, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    let agent = runtime.primary_agent();
+    let (runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let execution = runtime
+        .agent_for(&run.conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let agent = execution.agent();
     let service = echo_agent_app_core::tasks::task_runtime::task_revision_service_for_agent(
         &agent,
         store.clone(),
@@ -1181,6 +1212,7 @@ mod tests {
                 store.clone(),
                 test_agent()?,
                 None,
+                None,
                 trace_sink(),
                 echo_agent::agent::CancellationToken::new(),
                 run_id.to_string(),
@@ -1211,6 +1243,7 @@ mod tests {
         let result = spawn_tauri_task_retry(
             store.clone(),
             test_agent()?,
+            None,
             None,
             trace_sink(),
             echo_agent::agent::CancellationToken::new(),
@@ -1244,6 +1277,7 @@ mod tests {
         let error = spawn_tauri_task_retry(
             store.clone(),
             test_agent()?,
+            None,
             None,
             trace_sink(),
             echo_agent::agent::CancellationToken::new(),

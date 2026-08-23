@@ -21,6 +21,7 @@ pub use args::Args;
 pub use modes::{ChannelsModeArgs, run_channels_mode};
 pub use modes::{
     CompanionModeShutdown, HeadlessDreamingOwner, HeadlessServiceResources, HeadlessServices,
-    run_cli_mode, run_jsonl_mode, shutdown_headless_services, start_headless_services,
+    JsonlRunOptions, run_cli_mode, run_jsonl_mode, shutdown_headless_services,
+    start_headless_services,
 };
 pub use repl::{ReplConfig, ReplHumanLoopSession, run_repl};

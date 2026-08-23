@@ -42,6 +42,7 @@ pub mod run_driver;
 pub mod scheduler;
 pub mod skills_hub;
 pub mod state;
+pub mod structured_extraction;
 pub mod subagent_loader;
 pub mod subagent_prompt;
 #[cfg(test)]

@@ -1517,6 +1517,36 @@ impl AgentPool {
         );
     }
 
+    /// Publish a product system prompt to the primary, every existing pooled
+    /// Agent, and the config template used for future pool admissions.
+    pub async fn apply_system_prompt(&self, system_prompt: String) {
+        self.app_config.write().await.agent.system_prompt = system_prompt.clone();
+        let mut handles = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect::<Vec<_>>();
+        if let Some(primary) = self.primary_agent.read().await.clone()
+            && !handles
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate.inner(), primary.inner()))
+        {
+            handles.push(primary);
+        }
+        for handle in handles {
+            let system_prompt = system_prompt.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent.set_system_prompt(system_prompt).await;
+                    })
+                })
+                .await;
+        }
+    }
+
     /// Propagate `working_dir` to all pooled agents.
     ///
     /// Called after a workspace switch so that background tasks and
@@ -2253,6 +2283,7 @@ impl Drop for AgentPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent::agent::Agent;
 
     type TestResult<T = ()> = Result<T, String>;
 
@@ -3169,6 +3200,42 @@ mod tests {
             .read(|agent| agent.get_permission_mode().to_string())
             .await;
         assert_eq!(second_mode, "full-auto");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn system_prompt_applies_to_primary_existing_and_future_pool_agents() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let first = pool
+            .acquire("conv-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        pool.apply_system_prompt("Shared EKO prompt".to_string())
+            .await;
+
+        assert!(
+            pool.primary_agent()
+                .await
+                .map_err(|error| error.to_string())?
+                .read(|agent| agent.system_prompt().starts_with("Shared EKO prompt"))
+                .await
+        );
+        assert!(
+            first
+                .agent()
+                .read(|agent| agent.system_prompt().starts_with("Shared EKO prompt"))
+                .await
+        );
+        let future = pool
+            .acquire("conv-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(
+            future
+                .agent()
+                .read(|agent| agent.system_prompt().starts_with("Shared EKO prompt"))
+                .await
+        );
         Ok(())
     }
 

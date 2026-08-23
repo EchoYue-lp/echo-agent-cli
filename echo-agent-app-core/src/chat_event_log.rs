@@ -785,6 +785,61 @@ impl ChatEventLog {
         Ok(())
     }
 
+    /// Remove every ordinary-chat and message-only stream owned by one workspace.
+    /// Workspace deletion holds application admission before calling this method,
+    /// so removed streams cannot be recreated during the sweep.
+    pub fn remove_workspace(&self, workspace_id: &str) -> Result<(), ChatEventLogError> {
+        if workspace_id.trim().is_empty() {
+            return Err(ChatEventLogError::InvalidIdentity(
+                "workspace_id must not be empty".to_string(),
+            ));
+        }
+        if !ensure_real_directory(&self.root, false)? {
+            return Ok(());
+        }
+        let entries = fs::read_dir(&self.root).map_err(|source| ChatEventLogError::Io {
+            path: self.root.clone(),
+            source,
+        })?;
+        let mut matches = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| ChatEventLogError::Io {
+                path: self.root.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|source| ChatEventLogError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(ChatEventLogError::Corrupt {
+                    path,
+                    message: "chat event stream must not be a symlink".to_string(),
+                });
+            }
+            if !metadata.is_dir() {
+                continue;
+            }
+            if let Some(envelope) = first_stream_envelope(&path)?
+                && envelope.workspace_id == workspace_id
+            {
+                matches.push((envelope.stream_id, path));
+            }
+        }
+        for (stream_id, stream_dir) in matches {
+            let stream_state = self.stream_state(&stream_id);
+            let mut state = lock_stream_state(&stream_state);
+            fs::remove_dir_all(&stream_dir).map_err(|source| ChatEventLogError::Io {
+                path: stream_dir,
+                source,
+            })?;
+            *state = StreamState::default();
+            self.streams.remove(&stream_id);
+        }
+        Ok(())
+    }
+
     fn conversation_streams(
         &self,
         workspace_id: &str,
@@ -1018,6 +1073,7 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         }
         ChatDriverEvent::Execution(_)
         | ChatDriverEvent::ExecutionPath { .. }
+        | ChatDriverEvent::TurnConfiguration { .. }
         | ChatDriverEvent::Interrupt { .. }
         | ChatDriverEvent::CommandCellStarted { .. }
         | ChatDriverEvent::CommandCellSettled { .. }
@@ -3262,6 +3318,40 @@ mod tests {
         assert_eq!(
             workspace_b.first().map(|input| input.input_id.as_str()),
             Some("input-other")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_removal_keeps_same_conversation_in_other_workspace() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let log = ChatEventLog::open(temp.path().join("events"), ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        for workspace_id in ["workspace-a", "workspace-b"] {
+            log.append(
+                workspace_id,
+                Some("conversation-1"),
+                "turn-1",
+                ChatDriverEvent::TurnStatus {
+                    status: "completed".to_string(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        log.remove_workspace("workspace-a")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            log.replay("workspace-a", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .is_empty()
+        );
+        assert_eq!(
+            log.replay("workspace-b", Some("conversation-1"), "turn-1", 0)
+                .map_err(|error| error.to_string())?
+                .events
+                .len(),
+            1
         );
         Ok(())
     }

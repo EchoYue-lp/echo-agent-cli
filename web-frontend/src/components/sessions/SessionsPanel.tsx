@@ -1,33 +1,41 @@
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Save, RotateCcw, Plus, Clock } from 'lucide-react';
 import { sessionApi } from '../../api/endpoints';
 import type { SnapshotInfo } from '../../types/api';
+import { useConversationStore } from '../../stores/conversationStore';
 
 export function SessionsPanel() {
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const workspaceId = useConversationStore((state) => state.workspaceId);
+  const conversationId = useConversationStore((state) => state.activeId);
 
-  const load = async () => {
+  const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await sessionApi.listCheckpoints();
-      setSnapshots(data);
+      if (!conversationId) {
+        setSnapshots([]);
+      } else {
+        const data = await sessionApi.listCheckpoints(workspaceId, conversationId);
+        setSnapshots(data);
+      }
     } catch (e) {
       console.error(e);
     }
     setLoading(false);
-  };
+  }, [conversationId, workspaceId]);
 
   useEffect(() => {
     load();
-  }, []);
+  }, [load]);
 
   const create = async () => {
     setLoading(true);
     setMsg(null);
     try {
-      const res = await sessionApi.createCheckpoint();
+      if (!conversationId) throw new Error('请先选择一个会话');
+      const res = await sessionApi.createCheckpoint(workspaceId, conversationId);
       setMsg(res.success ? `检查点已创建：${res.snapshot_id?.slice(0, 8)}...` : '失败');
       await load();
     } catch (e: unknown) {
@@ -40,7 +48,8 @@ export function SessionsPanel() {
     setLoading(true);
     setMsg(null);
     try {
-      const res = await sessionApi.restoreCheckpoint(id);
+      if (!conversationId) throw new Error('请先选择一个会话');
+      const res = await sessionApi.restoreCheckpoint(workspaceId, conversationId, id);
       setMsg(res.success ? `已恢复到 ${res.restored_to?.slice(0, 8)}...` : '恢复失败');
     } catch (e: unknown) {
       setMsg(`错误：${e instanceof Error ? e.message : '未知'}`);
@@ -61,7 +70,7 @@ export function SessionsPanel() {
         </h3>
         <button
           onClick={create}
-          disabled={loading}
+          disabled={loading || !conversationId}
           className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors"
           style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
         >

@@ -126,6 +126,7 @@ pub enum SlashCommand {
     // -- Pipeline --
     Pipeline,
     Workflow,
+    Extract,
 
     // -- Security --
     Permission,
@@ -219,6 +220,7 @@ impl SlashCommand {
 
             Self::Pipeline => "Manage pipelines",
             Self::Workflow => "Manage and execute durable Graph workflows",
+            Self::Extract => "Extract typed JSON through the current conversation Agent",
 
             Self::Permission => "Show/set permission mode",
 
@@ -301,7 +303,7 @@ impl SlashCommand {
             | Self::Terminal
             | Self::Lsp => Category::Coding,
             Self::Git | Self::Worktrees => Category::Git,
-            Self::Pipeline | Self::Workflow => Category::Pipeline,
+            Self::Pipeline | Self::Workflow | Self::Extract => Category::Pipeline,
             Self::Permission => Category::Security,
             Self::Cron
             | Self::AutoMemory
@@ -344,6 +346,9 @@ impl SlashCommand {
             Self::Pipeline => "[list|run <name>]",
             Self::Workflow => {
                 "[list|show <id>|create <name> <definition|@path>|delete <id>|run <id> [json-input]]"
+            }
+            Self::Extract => {
+                "[examples|validate <schema-json|@path>|run <schema-name> <schema-json|@path> -- <input>]"
             }
             Self::Permission => "[ask|auto|deny]",
             Self::Cron => "[list|create|delete|pause|resume|run|reload]",

@@ -247,6 +247,12 @@ pub async fn delete_workspace(
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
 
+    state.browser_runtime.remove_workspace(ws_id.as_str()).await;
+    state
+        .app_state
+        .purge_workspace_projections_for_delete(&ws_id)
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+
     match state.app_state.workspace.registry.delete(&ws_id) {
         Ok(()) => {
             tracing::info!(workspace = %id, "Deleted workspace via IPC");

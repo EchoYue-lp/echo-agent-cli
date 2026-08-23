@@ -831,6 +831,16 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
             } => self.output.emit(format!(
                 "Execution path: {requested_mode} -> {observed_path}"
             )),
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
+                interaction_mode,
+                permission_mode,
+                approval_policy,
+                attachments,
+            } => self.output.emit(format!(
+                "Turn configuration: mode={interaction_mode}, permission={permission_mode}, \
+                 approval={approval_policy}, attachments={}",
+                attachments.len()
+            )),
             echo_agent_app_core::chat_driver::ChatDriverEvent::Interrupt {
                 run_id,
                 goal,
@@ -1200,6 +1210,7 @@ async fn run_repl_inner(
     crate::cli::cmd_impls::pipeline::register_all(&mut registry);
     crate::cli::cmd_impls::workspace::register_all(&mut registry);
     crate::cli::cmd_impls::workflows::register_all(&mut registry);
+    crate::cli::cmd_impls::extract::register_all(&mut registry);
     crate::cli::cmd_impls::plugins::register_all(&mut registry);
     crate::cli::cmd_impls::cron::register_all(&mut registry);
     crate::cli::cmd_impls::all::register_all(&mut registry);

@@ -51,17 +51,50 @@ fn terminate_subagent_tools(
     subagent_run_id: Option<&str>,
     status: echo_agent_app_core::tool_execution::ToolExecutionStatus,
     agent: &str,
+    workspace_id: Option<&str>,
 ) {
-    let Some(subagent_run_id) = subagent_run_id else {
-        tracing::error!(%agent, "subagent terminal event is missing a stable execution id");
+    let (Some(subagent_run_id), Some(workspace_id)) = (subagent_run_id, workspace_id) else {
+        tracing::error!(%agent, "subagent terminal event is missing a stable execution id or workspace address");
         return;
     };
-    match projector.terminate_subagent("global", subagent_run_id, status, agent) {
+    match projector.terminate_subagent(workspace_id, subagent_run_id, status, agent) {
         Ok(updates) => emit_tool_projection_updates(app, &updates),
         Err(error) => {
             tracing::warn!(%error, %subagent_run_id, "failed to close orphaned subagent tools");
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OrdinarySubagentProjectionAddress {
+    workspace_id: String,
+    conversation_id: String,
+    message_id: String,
+}
+
+fn resolve_gui_subagent_projection_address(
+    foreground_turns: &echo_agent_app_core::foreground_turn::ForegroundTurnControl,
+    conversation_id: &str,
+    message_id: Option<&str>,
+) -> Option<OrdinarySubagentProjectionAddress> {
+    let snapshots = foreground_turns
+        .snapshots(echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui)
+        .ok()?;
+    let mut matches = snapshots.into_iter().filter(|snapshot| {
+        snapshot.conversation_id == conversation_id
+            && message_id.is_none_or(|message_id| {
+                snapshot.root_turn_id == message_id || snapshot.active_turn_id == message_id
+            })
+    });
+    let selected = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(OrdinarySubagentProjectionAddress {
+        workspace_id: selected.workspace_id,
+        conversation_id: selected.conversation_id,
+        message_id: message_id.unwrap_or(&selected.root_turn_id).to_string(),
+    })
 }
 
 fn framework_subagent_event_needs_app_projection(agent: &str, run_id: Option<&str>) -> bool {
@@ -442,6 +475,7 @@ pub fn build_tauri_app(
                         task_runtime_store.clone(),
                     ),
                 );
+                let foreground_turns = state.app_state.session.foreground_turns.clone();
                 let supervisor = state.bridge_supervisor.clone();
                 let cancel = supervisor.cancellation_token();
                 let bridge = tokio::spawn(async move {
@@ -454,8 +488,10 @@ pub fn build_tauri_app(
                     };
                     let mut usage_sequence_by_execution =
                         std::collections::HashMap::<String, u64>::new();
-                    let mut subagent_context_by_execution =
-                        std::collections::HashMap::<String, Option<String>>::new();
+                    let mut subagent_context_by_execution = std::collections::HashMap::<
+                        String,
+                        OrdinarySubagentProjectionAddress,
+                    >::new();
                     loop {
                         let event = tokio::select! {
                             _ = cancel.cancelled() => break,
@@ -467,13 +503,26 @@ pub fn build_tauri_app(
                                 if let SubagentEvent::DispatchStarted {
                                     execution_id: Some(execution_id),
                                     conversation_id,
+                                    message_id,
                                     ..
                                 } = event.as_ref()
+                                    && let Some(conversation_id) = conversation_id.as_deref()
                                 {
-                                    subagent_context_by_execution.insert(
-                                        execution_id.clone(),
-                                        conversation_id.clone(),
-                                    );
+                                    match resolve_gui_subagent_projection_address(
+                                        &foreground_turns,
+                                        conversation_id,
+                                        message_id.as_deref(),
+                                    ) {
+                                        Some(address) => {
+                                            subagent_context_by_execution
+                                                .insert(execution_id.clone(), address);
+                                        }
+                                        None => tracing::error!(
+                                            %execution_id,
+                                            %conversation_id,
+                                            "ordinary subagent event has no unique GUI workspace address"
+                                        ),
+                                    }
                                 }
 
                                 match event.as_ref() {
@@ -496,33 +545,17 @@ pub fn build_tauri_app(
                                             tracing::error!(%call_id, name = %invocation.name, "subagent tool start is missing a stable execution id");
                                             continue;
                                         };
-                                        let mut conversation_id = subagent_context_by_execution
+                                        let Some(address) = subagent_context_by_execution
                                             .get(subagent_run_id)
-                                            .cloned()
-                                            .flatten();
-                                        if conversation_id.is_none()
-                                            && let (Some(run_id), Some(store)) =
-                                                (run_id.as_deref(), task_runtime_store.as_ref())
-                                        {
-                                            match store.get_run(run_id) {
-                                                Ok(Some(run)) => {
-                                                    conversation_id = Some(run.conversation_id)
-                                                }
-                                                Ok(None) => {
-                                                    tracing::error!(%run_id, %call_id, "subagent tool start references a missing TaskRuntime run");
-                                                    continue;
-                                                }
-                                                Err(error) => {
-                                                    tracing::error!(%error, %run_id, %call_id, "failed to resolve subagent tool conversation");
-                                                    continue;
-                                                }
-                                            }
-                                        }
+                                        else {
+                                            tracing::error!(%subagent_run_id, %call_id, "subagent tool start has no workspace-qualified address");
+                                            continue;
+                                        };
                                         match tool_projector.project_subagent_started(
                                             echo_agent_app_core::tool_execution_projection::SubagentToolStart {
-                                                workspace_id: "global",
+                                                workspace_id: &address.workspace_id,
                                                 subagent_run_id,
-                                                conversation_id: conversation_id.as_deref(),
+                                                conversation_id: Some(&address.conversation_id),
                                                 run_id: run_id.as_deref(),
                                                 call_id,
                                                 invocation,
@@ -555,8 +588,14 @@ pub fn build_tauri_app(
                                             tracing::error!(%call_id, %name, "subagent tool result is missing a stable execution id");
                                             continue;
                                         };
+                                        let Some(address) = subagent_context_by_execution
+                                            .get(subagent_run_id)
+                                        else {
+                                            tracing::error!(%subagent_run_id, %call_id, "subagent tool result has no workspace-qualified address");
+                                            continue;
+                                        };
                                         match tool_projector.project_subagent_completed(
-                                            "global",
+                                            &address.workspace_id,
                                             subagent_run_id,
                                             call_id,
                                             name,
@@ -588,6 +627,10 @@ pub fn build_tauri_app(
                                             execution_id.as_deref(),
                                             echo_agent_app_core::tool_execution::ToolExecutionStatus::Unknown,
                                             agent,
+                                            execution_id
+                                                .as_deref()
+                                                .and_then(|execution_id| subagent_context_by_execution.get(execution_id))
+                                                .map(|address| address.workspace_id.as_str()),
                                         );
                                     }
                                     SubagentEvent::DispatchFailed {
@@ -618,6 +661,10 @@ pub fn build_tauri_app(
                                             execution_id.as_deref(),
                                             tool_status,
                                             agent,
+                                            execution_id
+                                                .as_deref()
+                                                .and_then(|execution_id| subagent_context_by_execution.get(execution_id))
+                                                .map(|address| address.workspace_id.as_str()),
                                         );
                                     }
                                     SubagentEvent::DispatchCancelled {
@@ -635,6 +682,10 @@ pub fn build_tauri_app(
                                             execution_id.as_deref(),
                                             echo_agent_app_core::tool_execution::ToolExecutionStatus::Cancelled,
                                             agent,
+                                            execution_id
+                                                .as_deref()
+                                                .and_then(|execution_id| subagent_context_by_execution.get(execution_id))
+                                                .map(|address| address.workspace_id.as_str()),
                                         );
                                     }
                                     _ => {}
@@ -837,6 +888,17 @@ pub fn build_tauri_app(
                                 let subagent_run_id_owned: String = execution_id
                                     .clone()
                                     .unwrap_or_else(|| format!("{agent_name}:unknown"));
+                                let ordinary_address = if run_id.is_none() {
+                                    match subagent_context_by_execution.get(&subagent_run_id_owned) {
+                                        Some(address) => Some(address),
+                                        None => {
+                                            tracing::error!(%subagent_run_id_owned, "ordinary subagent event has no workspace-qualified address");
+                                            continue;
+                                        }
+                                    }
+                                } else {
+                                    None
+                                };
                                 let task_id = task_id_owned.as_deref();
                                 if let Some(task_id) = task_id {
                                     payload.insert("task_id".into(), task_id.into());
@@ -861,6 +923,20 @@ pub fn build_tauri_app(
                                     }
                                 } else {
                                     payload.insert("run_id".into(), String::new().into());
+                                }
+                                if let Some(address) = ordinary_address {
+                                    payload.insert(
+                                        "workspace_id".into(),
+                                        address.workspace_id.clone().into(),
+                                    );
+                                    payload.insert(
+                                        "conversation_id".into(),
+                                        address.conversation_id.clone().into(),
+                                    );
+                                    payload.insert(
+                                        "message_id".into(),
+                                        address.message_id.clone().into(),
+                                    );
                                 }
                                 payload.insert("agent".into(), agent_name.into());
                                 payload.insert("event".into(), event_type.into());
@@ -896,7 +972,8 @@ pub fn build_tauri_app(
 #[cfg(test)]
 mod tests {
     use super::{
-        framework_subagent_event_needs_app_projection, task_id_from_subagent_execution_id,
+        framework_subagent_event_needs_app_projection, resolve_gui_subagent_projection_address,
+        task_id_from_subagent_execution_id,
     };
 
     #[test]
@@ -923,5 +1000,40 @@ mod tests {
         assert_eq!(execution_id, "run-1:phase:task-1:7:2");
         assert!(task_id_from_subagent_execution_id("phase:task-1", "run-1").is_none());
         assert!(task_id_from_subagent_execution_id("run-2:phase:task-1:7:2", "run-1").is_none());
+    }
+
+    #[test]
+    fn ordinary_subagent_address_is_resolved_from_exact_gui_turn() -> Result<(), String> {
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+
+        let control = ForegroundTurnControl::default();
+        let _workspace_a = control
+            .begin_scoped(
+                "workspace-a",
+                ForegroundTurnSurface::Gui,
+                "conversation-1",
+                "message-a",
+            )
+            .map_err(|error| error.to_string())?;
+        let _workspace_b = control
+            .begin_scoped(
+                "workspace-b",
+                ForegroundTurnSurface::Gui,
+                "conversation-1",
+                "message-b",
+            )
+            .map_err(|error| error.to_string())?;
+
+        assert!(
+            resolve_gui_subagent_projection_address(&control, "conversation-1", None).is_none(),
+            "conversation-only resolution must reject cross-workspace ambiguity"
+        );
+        let resolved =
+            resolve_gui_subagent_projection_address(&control, "conversation-1", Some("message-b"))
+                .ok_or_else(|| "exact GUI turn did not resolve a workspace address".to_string())?;
+        assert_eq!(resolved.workspace_id, "workspace-b");
+        assert_eq!(resolved.conversation_id, "conversation-1");
+        assert_eq!(resolved.message_id, "message-b");
+        Ok(())
     }
 }

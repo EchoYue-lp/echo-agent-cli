@@ -43,6 +43,8 @@ pub struct BrowserTab {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserSession {
     pub id: String,
+    #[serde(default = "global_workspace_id")]
+    pub workspace_id: String,
     pub conversation_id: String,
     pub status: BrowserSessionStatus,
     #[serde(default)]
@@ -52,6 +54,29 @@ pub struct BrowserSession {
     pub tabs: Vec<BrowserTab>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn global_workspace_id() -> String {
+    "global".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BrowserSessionAddress {
+    pub workspace_id: String,
+    pub conversation_id: String,
+}
+
+impl BrowserSessionAddress {
+    pub fn new(workspace_id: impl Into<String>, conversation_id: impl Into<String>) -> Self {
+        Self {
+            workspace_id: workspace_id.into(),
+            conversation_id: conversation_id.into(),
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> String {
+        format!("{}::{}", self.workspace_id, self.conversation_id)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,7 +105,7 @@ struct SessionState {
 
 #[derive(Clone)]
 pub struct BrowserSessionManager {
-    sessions: Arc<RwLock<HashMap<String, SessionState>>>,
+    sessions: Arc<RwLock<HashMap<BrowserSessionAddress, SessionState>>>,
     events: broadcast::Sender<BrowserEvent>,
     operation_lock: Arc<Mutex<()>>,
     observation_char_limit: usize,
@@ -146,7 +171,10 @@ impl BrowserSessionManager {
                 .unwrap_or(0)
                 .saturating_add(1);
             restored.insert(
-                session.conversation_id.clone(),
+                BrowserSessionAddress::new(
+                    session.workspace_id.clone(),
+                    session.conversation_id.clone(),
+                ),
                 SessionState {
                     session,
                     owner_tabs: HashMap::new(),
@@ -167,47 +195,46 @@ impl BrowserSessionManager {
 
     pub async fn lease_tab(
         &self,
-        conversation_id: &str,
+        address: &BrowserSessionAddress,
         owner_id: &str,
         owner_run_id: Option<&str>,
     ) -> BrowserLease {
         let mut sessions = self.sessions.write().await;
         if sessions
-            .get(conversation_id)
+            .get(address)
             .is_some_and(|state| state.session.status == BrowserSessionStatus::Closed)
         {
-            sessions.remove(conversation_id);
+            sessions.remove(address);
         }
-        let state = sessions
-            .entry(conversation_id.to_string())
-            .or_insert_with(|| {
-                let now = Utc::now();
-                let session_id = format!("browser-{}", uuid::Uuid::new_v4());
-                let main_tab = BrowserTab {
-                    id: format!("tab-{}", uuid::Uuid::new_v4()),
-                    index: 0,
-                    owner_run_id: None,
-                    url: None,
-                    title: None,
-                };
-                let session = BrowserSession {
-                    id: session_id,
-                    conversation_id: conversation_id.to_string(),
-                    status: BrowserSessionStatus::Starting,
-                    backend: BrowserBackend::Managed,
-                    developer_mode: false,
-                    tabs: vec![main_tab.clone()],
-                    created_at: now,
-                    updated_at: now,
-                };
-                let mut owner_tabs = HashMap::new();
-                owner_tabs.insert(MAIN_TAB_OWNER.to_string(), main_tab.id.clone());
-                SessionState {
-                    session,
-                    owner_tabs,
-                    next_tab_index: 1,
-                }
-            });
+        let state = sessions.entry(address.clone()).or_insert_with(|| {
+            let now = Utc::now();
+            let session_id = format!("browser-{}", uuid::Uuid::new_v4());
+            let main_tab = BrowserTab {
+                id: format!("tab-{}", uuid::Uuid::new_v4()),
+                index: 0,
+                owner_run_id: None,
+                url: None,
+                title: None,
+            };
+            let session = BrowserSession {
+                id: session_id,
+                workspace_id: address.workspace_id.clone(),
+                conversation_id: address.conversation_id.clone(),
+                status: BrowserSessionStatus::Starting,
+                backend: BrowserBackend::Managed,
+                developer_mode: false,
+                tabs: vec![main_tab.clone()],
+                created_at: now,
+                updated_at: now,
+            };
+            let mut owner_tabs = HashMap::new();
+            owner_tabs.insert(MAIN_TAB_OWNER.to_string(), main_tab.id.clone());
+            SessionState {
+                session,
+                owner_tabs,
+                next_tab_index: 1,
+            }
+        });
 
         if state.session.status == BrowserSessionStatus::Starting {
             state.session.status = BrowserSessionStatus::Ready;
@@ -263,13 +290,13 @@ impl BrowserSessionManager {
 
     pub async fn open_tab(
         &self,
-        conversation_id: &str,
+        address: &BrowserSessionAddress,
         owner_id: &str,
         owner_run_id: Option<&str>,
     ) -> Option<BrowserLease> {
-        let _ = self.lease_tab(conversation_id, MAIN_TAB_OWNER, None).await;
+        let _ = self.lease_tab(address, MAIN_TAB_OWNER, None).await;
         let mut sessions = self.sessions.write().await;
-        let state = sessions.get_mut(conversation_id)?;
+        let state = sessions.get_mut(address)?;
         let tab = BrowserTab {
             id: format!("tab-{}", uuid::Uuid::new_v4()),
             index: state.next_tab_index,
@@ -301,12 +328,12 @@ impl BrowserSessionManager {
 
     pub async fn select_tab(
         &self,
-        conversation_id: &str,
+        address: &BrowserSessionAddress,
         owner_id: &str,
         index: usize,
     ) -> Option<BrowserLease> {
         let mut sessions = self.sessions.write().await;
-        let state = sessions.get_mut(conversation_id)?;
+        let state = sessions.get_mut(address)?;
         let tab = state
             .session
             .tabs
@@ -329,9 +356,9 @@ impl BrowserSessionManager {
         Some(lease)
     }
 
-    pub async fn close_tab(&self, conversation_id: &str, index: usize) {
+    pub async fn close_tab(&self, address: &BrowserSessionAddress, index: usize) {
         let mut sessions = self.sessions.write().await;
-        let Some(state) = sessions.get_mut(conversation_id) else {
+        let Some(state) = sessions.get_mut(address) else {
             return;
         };
         let closed_id = state
@@ -357,8 +384,8 @@ impl BrowserSessionManager {
         self.persist(&session).await;
     }
 
-    pub async fn set_status(&self, conversation_id: &str, status: BrowserSessionStatus) {
-        let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
+    pub async fn set_status(&self, address: &BrowserSessionAddress, status: BrowserSessionStatus) {
+        let session = if let Some(state) = self.sessions.write().await.get_mut(address) {
             state.session.status = status;
             state.session.updated_at = Utc::now();
             Some(state.session.clone())
@@ -370,8 +397,8 @@ impl BrowserSessionManager {
         }
     }
 
-    pub async fn set_developer_mode(&self, conversation_id: &str, enabled: bool) {
-        let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
+    pub async fn set_developer_mode(&self, address: &BrowserSessionAddress, enabled: bool) {
+        let session = if let Some(state) = self.sessions.write().await.get_mut(address) {
             state.session.developer_mode = enabled;
             state.session.updated_at = Utc::now();
             Some(state.session.clone())
@@ -385,10 +412,10 @@ impl BrowserSessionManager {
 
     pub async fn switch_backend(
         &self,
-        conversation_id: &str,
+        address: &BrowserSessionAddress,
         backend: BrowserBackend,
     ) -> Option<BrowserSession> {
-        let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
+        let session = if let Some(state) = self.sessions.write().await.get_mut(address) {
             if state.session.backend == backend {
                 return Some(state.session.clone());
             }
@@ -418,36 +445,36 @@ impl BrowserSessionManager {
         None
     }
 
-    pub async fn backend(&self, conversation_id: &str) -> BrowserBackend {
+    pub async fn backend(&self, address: &BrowserSessionAddress) -> BrowserBackend {
         self.sessions
             .read()
             .await
-            .get(conversation_id)
+            .get(address)
             .map(|state| state.session.backend)
             .unwrap_or_default()
     }
 
-    pub async fn developer_mode(&self, conversation_id: &str) -> bool {
+    pub async fn developer_mode(&self, address: &BrowserSessionAddress) -> bool {
         self.sessions
             .read()
             .await
-            .get(conversation_id)
+            .get(address)
             .is_some_and(|state| state.session.developer_mode)
     }
 
-    pub async fn update_url(&self, conversation_id: &str, tab_id: &str, url: &str) {
-        self.update_page_metadata(conversation_id, tab_id, Some(url), None)
+    pub async fn update_url(&self, address: &BrowserSessionAddress, tab_id: &str, url: &str) {
+        self.update_page_metadata(address, tab_id, Some(url), None)
             .await;
     }
 
     pub async fn update_page_metadata(
         &self,
-        conversation_id: &str,
+        address: &BrowserSessionAddress,
         tab_id: &str,
         url: Option<&str>,
         title: Option<&str>,
     ) {
-        let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
+        let session = if let Some(state) = self.sessions.write().await.get_mut(address) {
             if let Some(tab) = state.session.tabs.iter_mut().find(|tab| tab.id == tab_id) {
                 if let Some(url) = url {
                     tab.url = Some(url.to_string());
@@ -501,6 +528,33 @@ impl BrowserSessionManager {
             .collect()
     }
 
+    pub async fn remove_workspace(&self, workspace_id: &str) {
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            let addresses = sessions
+                .keys()
+                .filter(|address| address.workspace_id == workspace_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            addresses
+                .into_iter()
+                .filter_map(|address| sessions.remove(&address))
+                .map(|state| state.session)
+                .collect::<Vec<_>>()
+        };
+        for session in removed {
+            let _ = self.events.send(BrowserEvent::SessionClosed {
+                session_id: session.id.clone(),
+            });
+            let path = self.metadata_dir.join(format!("{}.json", session.id));
+            if let Err(error) = tokio::fs::remove_file(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %path.display(), %error, "failed to remove browser session metadata");
+            }
+        }
+    }
+
     pub async fn close_all(&self) {
         let mut sessions = self.sessions.write().await;
         let mut changed = Vec::new();
@@ -543,14 +597,19 @@ impl BrowserSessionManager {
 mod tests {
     use super::*;
 
+    fn address(conversation_id: &str) -> BrowserSessionAddress {
+        BrowserSessionAddress::new("workspace-1", conversation_id)
+    }
+
     #[tokio::test]
     async fn conversation_reuses_session_and_run_gets_own_tab() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
-        let main = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        let main_again = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        let subagent = manager.lease_tab("conv-1", "exec-1", Some("run-1")).await;
-        let subagent_again = manager.lease_tab("conv-1", "exec-1", Some("run-1")).await;
+        let address = address("conv-1");
+        let main = manager.lease_tab(&address, MAIN_TAB_OWNER, None).await;
+        let main_again = manager.lease_tab(&address, MAIN_TAB_OWNER, None).await;
+        let subagent = manager.lease_tab(&address, "exec-1", Some("run-1")).await;
+        let subagent_again = manager.lease_tab(&address, "exec-1", Some("run-1")).await;
 
         assert_eq!(main.session_id, main_again.session_id);
         assert_eq!(main.tab_id, main_again.tab_id);
@@ -563,15 +622,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_conversation_isolated_by_workspace_and_removed_exactly() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
+        let first = BrowserSessionAddress::new("workspace-a", "conversation-1");
+        let second = BrowserSessionAddress::new("workspace-b", "conversation-1");
+        let first_lease = manager.lease_tab(&first, MAIN_TAB_OWNER, None).await;
+        let second_lease = manager.lease_tab(&second, MAIN_TAB_OWNER, None).await;
+        assert_ne!(first_lease.session_id, second_lease.session_id);
+
+        manager.remove_workspace("workspace-a").await;
+        let sessions = manager.sessions().await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions
+                .first()
+                .map(|session| session.workspace_id.as_str()),
+            Some("workspace-b")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn developer_mode_is_scoped_to_conversation() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
-        manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        manager.lease_tab("conv-2", MAIN_TAB_OWNER, None).await;
-        manager.set_developer_mode("conv-1", true).await;
+        let first = address("conv-1");
+        let second = address("conv-2");
+        manager.lease_tab(&first, MAIN_TAB_OWNER, None).await;
+        manager.lease_tab(&second, MAIN_TAB_OWNER, None).await;
+        manager.set_developer_mode(&first, true).await;
 
-        assert!(manager.developer_mode("conv-1").await);
-        assert!(!manager.developer_mode("conv-2").await);
+        assert!(manager.developer_mode(&first).await);
+        assert!(!manager.developer_mode(&second).await);
         Ok(())
     }
 
@@ -579,14 +662,14 @@ mod tests {
     async fn backend_is_conversation_scoped() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
-        manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        manager.lease_tab("conv-2", MAIN_TAB_OWNER, None).await;
-        manager
-            .switch_backend("conv-1", BrowserBackend::Chrome)
-            .await;
+        let first = address("conv-1");
+        let second = address("conv-2");
+        manager.lease_tab(&first, MAIN_TAB_OWNER, None).await;
+        manager.lease_tab(&second, MAIN_TAB_OWNER, None).await;
+        manager.switch_backend(&first, BrowserBackend::Chrome).await;
 
-        assert_eq!(manager.backend("conv-1").await, BrowserBackend::Chrome);
-        assert_eq!(manager.backend("conv-2").await, BrowserBackend::Managed);
+        assert_eq!(manager.backend(&first).await, BrowserBackend::Chrome);
+        assert_eq!(manager.backend(&second).await, BrowserBackend::Managed);
         Ok(())
     }
 
@@ -594,11 +677,12 @@ mod tests {
     async fn switching_backend_resets_tab_indices() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
-        manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        manager.open_tab("conv-1", "subagent", Some("run-1")).await;
+        let address = address("conv-1");
+        manager.lease_tab(&address, MAIN_TAB_OWNER, None).await;
+        manager.open_tab(&address, "subagent", Some("run-1")).await;
 
         let session = manager
-            .switch_backend("conv-1", BrowserBackend::Chrome)
+            .switch_backend(&address, BrowserBackend::Chrome)
             .await
             .ok_or_else(|| "session missing".to_string())?;
 
@@ -612,11 +696,12 @@ mod tests {
     async fn selecting_current_backend_preserves_tabs() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
-        let main = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        manager.open_tab("conv-1", "subagent", Some("run-1")).await;
+        let address = address("conv-1");
+        let main = manager.lease_tab(&address, MAIN_TAB_OWNER, None).await;
+        manager.open_tab(&address, "subagent", Some("run-1")).await;
 
         let session = manager
-            .switch_backend("conv-1", BrowserBackend::Managed)
+            .switch_backend(&address, BrowserBackend::Managed)
             .await
             .ok_or_else(|| "session missing".to_string())?;
 
@@ -645,12 +730,11 @@ mod tests {
     async fn page_metadata_updates_the_leased_tab() -> Result<(), String> {
         let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(dir.path().to_path_buf(), 100);
-        let lease = manager
-            .lease_tab("conversation", MAIN_TAB_OWNER, None)
-            .await;
+        let address = address("conversation");
+        let lease = manager.lease_tab(&address, MAIN_TAB_OWNER, None).await;
         manager
             .update_page_metadata(
-                "conversation",
+                &address,
                 &lease.tab_id,
                 Some("https://example.com"),
                 Some("Example"),
@@ -677,7 +761,9 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
         let mut events = manager.subscribe();
-        let lease = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        let lease = manager
+            .lease_tab(&address("conv-1"), MAIN_TAB_OWNER, None)
+            .await;
         manager.close_all().await;
 
         let sessions = manager.sessions().await;
@@ -705,7 +791,8 @@ mod tests {
     async fn restored_metadata_is_closed_and_new_use_starts_fresh_session() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let first = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
-        let old = first.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        let address = address("conv-1");
+        let old = first.lease_tab(&address, MAIN_TAB_OWNER, None).await;
         first.close_all().await;
 
         let restored = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
@@ -716,7 +803,7 @@ mod tests {
             Some(BrowserSessionStatus::Closed)
         );
 
-        let fresh = restored.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        let fresh = restored.lease_tab(&address, MAIN_TAB_OWNER, None).await;
         assert_ne!(fresh.session_id, old.session_id);
         Ok(())
     }
@@ -725,27 +812,28 @@ mod tests {
     async fn explicit_tab_changes_update_owner_lease() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
-        let main = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        let address = address("conv-1");
+        let main = manager.lease_tab(&address, MAIN_TAB_OWNER, None).await;
         let opened = manager
-            .open_tab("conv-1", MAIN_TAB_OWNER, None)
+            .open_tab(&address, MAIN_TAB_OWNER, None)
             .await
             .ok_or_else(|| "tab should open".to_string())?;
         assert_eq!(opened.tab_index, 1);
         assert_eq!(
             manager
-                .lease_tab("conv-1", MAIN_TAB_OWNER, None)
+                .lease_tab(&address, MAIN_TAB_OWNER, None)
                 .await
                 .tab_id,
             opened.tab_id
         );
 
         let selected = manager
-            .select_tab("conv-1", MAIN_TAB_OWNER, main.tab_index)
+            .select_tab(&address, MAIN_TAB_OWNER, main.tab_index)
             .await
             .ok_or_else(|| "main tab should still exist".to_string())?;
         assert_eq!(selected.tab_id, main.tab_id);
 
-        manager.close_tab("conv-1", opened.tab_index).await;
+        manager.close_tab(&address, opened.tab_index).await;
         assert_eq!(
             manager.sessions().await.first().map(|s| s.tabs.len()),
             Some(1)

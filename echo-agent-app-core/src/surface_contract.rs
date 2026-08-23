@@ -12,17 +12,25 @@ enum ProductSurface {
     Gui,
     Tui,
     Cli,
+    Jsonl,
     Channel,
     Cron,
 }
 
 impl ProductSurface {
-    const ALL: [Self; 5] = [Self::Gui, Self::Tui, Self::Cli, Self::Channel, Self::Cron];
+    const ALL: [Self; 6] = [
+        Self::Gui,
+        Self::Tui,
+        Self::Cli,
+        Self::Jsonl,
+        Self::Channel,
+        Self::Cron,
+    ];
 }
 
 struct CapabilityRow {
     capability: &'static str,
-    evidence: [&'static str; 5],
+    evidence: [&'static str; 6],
 }
 
 const CAPABILITY_MATRIX: &[CapabilityRow] = &[
@@ -32,6 +40,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "ChatInput mode selector",
             "/mode chat|task|auto",
             "/mode chat|task|auto",
+            "--jsonl-mode chat|task|auto",
             "/mode chat|task|auto",
             "N/A: scheduled Task trigger has no interactive selector",
         ],
@@ -42,6 +51,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "TaskRuntime plan controls",
             "plan and task slash commands",
             "task runtime slash commands",
+            "Task mode shared task tools and canonical events",
             "shared plan/task tools",
             "scheduled TaskRuntime plan",
         ],
@@ -52,6 +62,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "paused TaskRuntime Goal editor",
             "/task-goal",
             "/task-goal",
+            "N/A: JSONL is a finite one-shot turn without follow-up Goal editing",
             "/task-goal",
             "N/A: only an explicit interactive user may update a Goal",
         ],
@@ -62,6 +73,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "task and scheduler panels",
             "task and cron commands",
             "task and cron commands",
+            "shared background task tools and canonical event stream",
             "shared background tools",
             "SchedulerRunner to supervised TaskRuntime cron driver",
         ],
@@ -72,6 +84,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "execution event projection",
             "subagent runtime view",
             "structured terminal result",
+            "canonical Subagent execution events",
             "driver execution events",
             "durable structured run result",
         ],
@@ -82,6 +95,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "approval/input/selection dialogs",
             "pending HumanLoop card",
             "REPL HumanLoop provider",
+            "typed HITL request events with explicit one-shot approval policy",
             "next-message HumanLoop provider",
             "N/A: unattended run persists interaction-required failure",
         ],
@@ -92,6 +106,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "memory commands and panels",
             "/remember /forget /memory",
             "/remember /forget /memory",
+            "pooled agent layered memory tools",
             "layered memory tools",
             "pooled agent layered memory tools",
         ],
@@ -102,6 +117,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "settings and tool projection",
             "skills/MCP/Browser commands and tools",
             "skills/MCP/Browser commands and tools",
+            "pooled agent Skills/MCP/Browser tools",
             "pooled agent tool surface",
             "isolated pooled agent tool surface",
         ],
@@ -112,6 +128,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "attachment picker",
             "/attach",
             "/attach",
+            "repeatable --jsonl-attachment",
             "channel attachment adapter",
             "N/A: scheduled definitions have no interactive attachment source",
         ],
@@ -122,6 +139,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "tool cards",
             "tool execution messages",
             "terminal tool renderer",
+            "canonical journal stream and Ctrl+C cancellation",
             "driver event renderer",
             "durable tool/run events",
         ],
@@ -132,6 +150,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "open artifact action",
             "/open-artifact",
             "artifact path and metadata",
+            "durable artifact references in canonical events",
             "artifact reference text",
             "durable artifact reference",
         ],
@@ -142,6 +161,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "durable run inspector",
             "/trace",
             "/trace",
+            "usage and protected-context events",
             "/trace [run-id]",
             "durable run trace",
         ],
@@ -152,6 +172,7 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "Agent message dialog with durable receipts",
             "/agent-list /agent-send /agent-status",
             "/agent-list /agent-send /agent-status",
+            "pooled agent cross-workspace messaging tools",
             "/agent-list /agent-send /agent-status",
             "N/A: scheduled runs consume messages but do not originate interactive sends",
         ],
@@ -162,16 +183,61 @@ const CAPABILITY_MATRIX: &[CapabilityRow] = &[
             "Agent group editor and frozen PlanTask target",
             "/agent-group and shared TaskRuntime target adapter",
             "/agent-group and shared TaskRuntime target adapter",
+            "Task mode honors frozen Agent-group targets",
             "/agent-group and shared TaskRuntime target adapter",
             "scheduled TaskRuntime honors frozen Agent-group targets",
+        ],
+    },
+    CapabilityRow {
+        capability: "workflow",
+        evidence: [
+            "production Automation workspace panel",
+            "/workflow shared WorkflowService command",
+            "/workflow shared WorkflowService command",
+            "N/A: JSONL runs one finite Agent turn rather than product CRUD commands",
+            "/workflow shared WorkflowService command",
+            "scheduled workflow task uses the shared service and Graph executor",
+        ],
+    },
+    CapabilityRow {
+        capability: "structured_extraction",
+        evidence: [
+            "production Automation extraction panel",
+            "/extract shared app-core service",
+            "/extract shared app-core service",
+            "N/A: JSONL is itself the machine event transport, not an extraction command shell",
+            "/extract shared app-core service",
+            "N/A: scheduled runs do not accept an interactive extraction schema",
+        ],
+    },
+    CapabilityRow {
+        capability: "chart",
+        evidence: [
+            "ChartCard renders canonical chart specs",
+            "TUI AgentEvent chart renderer",
+            "CLI AgentEvent chart renderer",
+            "canonical AgentEvent chart envelope",
+            "driver AgentEvent chart renderer",
+            "durable chart artifact/event",
+        ],
+    },
+    CapabilityRow {
+        capability: "research_sandbox",
+        evidence: [
+            "production research workbench and sandbox settings",
+            "research/analysis commands plus shared run_code tools",
+            "research/analysis commands plus shared run_code tools",
+            "pooled agent research and sandbox tools",
+            "pooled agent research and sandbox tools",
+            "scheduled TaskRuntime research and sandbox tools",
         ],
     },
 ];
 
 #[test]
 fn capability_matrix_has_evidence_for_every_surface() {
-    assert_eq!(ProductSurface::ALL.len(), 5);
-    assert_eq!(CAPABILITY_MATRIX.len(), 14);
+    assert_eq!(ProductSurface::ALL.len(), 6);
+    assert_eq!(CAPABILITY_MATRIX.len(), 18);
     for row in CAPABILITY_MATRIX {
         assert!(!row.capability.trim().is_empty());
         assert_eq!(row.evidence.len(), ProductSurface::ALL.len());

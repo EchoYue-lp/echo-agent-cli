@@ -1,10 +1,12 @@
 //! Non-interactive JSONL transport over the shared chat driver.
 
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink};
 use echo_agent_app_core::chat_event_log::ChatEventEnvelope;
+
+use crate::cli::args::JsonlApprovalPolicy;
 
 /// Writes one canonical, already-journaled chat envelope per line.
 pub struct JsonlChatSink {
@@ -50,6 +52,85 @@ impl ChatSink for JsonlChatSink {
             return false;
         }
         true
+    }
+}
+
+/// Non-interactive HITL adapter for one-shot JSONL execution. Requests remain
+/// visible in the canonical event stream; the configured policy determines
+/// whether approval requests are accepted. Input and selection requests are
+/// rejected because this transport has no follow-up input channel.
+pub struct JsonlHumanLoopProvider {
+    sink: Arc<dyn ChatSink>,
+    approval_policy: JsonlApprovalPolicy,
+}
+
+impl JsonlHumanLoopProvider {
+    pub fn new(sink: Arc<dyn ChatSink>, approval_policy: JsonlApprovalPolicy) -> Self {
+        Self {
+            sink,
+            approval_policy,
+        }
+    }
+}
+
+impl echo_agent::human_loop::HumanLoopProvider for JsonlHumanLoopProvider {
+    fn request(
+        &self,
+        request: echo_agent::human_loop::HumanLoopRequest,
+    ) -> futures::future::BoxFuture<
+        '_,
+        echo_agent::error::Result<echo_agent::human_loop::HumanLoopResponse>,
+    > {
+        use echo_agent::human_loop::{HumanLoopKind, HumanLoopResponse};
+
+        let request_id = request
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let event = match &request.kind {
+            HumanLoopKind::Approval => ChatDriverEvent::ApprovalRequest {
+                request_id,
+                tool_name: request.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                args: request.args.unwrap_or(serde_json::Value::Null),
+                prompt: request.prompt,
+            },
+            HumanLoopKind::Input => ChatDriverEvent::InputRequest {
+                request_id,
+                prompt: request.prompt,
+            },
+            HumanLoopKind::Selection => ChatDriverEvent::SelectionRequest {
+                request_id,
+                prompt: request.prompt,
+                options: request.options.unwrap_or_default(),
+                task_id: request.task_id,
+                context: request.context,
+                phase: request.phase,
+            },
+        };
+        let delivered = self.sink.on_event(event);
+        let response = match (&request.kind, self.approval_policy) {
+            (HumanLoopKind::Approval, JsonlApprovalPolicy::AutoApprove) => {
+                HumanLoopResponse::Approved
+            }
+            (HumanLoopKind::Approval, JsonlApprovalPolicy::Reject) => HumanLoopResponse::Rejected {
+                reason: Some("JSONL approval policy rejected the request".to_string()),
+            },
+            (HumanLoopKind::Input | HumanLoopKind::Selection, _) => HumanLoopResponse::Rejected {
+                reason: Some(
+                    "JSONL one-shot mode cannot accept follow-up HITL input or selection"
+                        .to_string(),
+                ),
+            },
+        };
+        Box::pin(async move {
+            if delivered {
+                Ok(response)
+            } else {
+                Err(echo_agent::error::ReactError::Other(
+                    "JSONL output closed before the HITL request was delivered".to_string(),
+                ))
+            }
+        })
     }
 }
 
@@ -153,5 +234,54 @@ mod tests {
             status: "completed".to_string(),
         }));
         assert!(lock_output(&captured).is_empty());
+    }
+
+    #[test]
+    fn hitl_provider_emits_typed_request_and_applies_policy() -> Result<(), String> {
+        #[derive(Default)]
+        struct RecordingSink(Mutex<Vec<serde_json::Value>>);
+
+        impl ChatSink for RecordingSink {
+            fn on_event(&self, event: ChatDriverEvent) -> bool {
+                let value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+                lock_events(&self.0).push(value);
+                true
+            }
+        }
+
+        fn lock_events(
+            events: &Mutex<Vec<serde_json::Value>>,
+        ) -> std::sync::MutexGuard<'_, Vec<serde_json::Value>> {
+            events
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        let sink = Arc::new(RecordingSink::default());
+        let provider = JsonlHumanLoopProvider::new(sink.clone(), JsonlApprovalPolicy::AutoApprove);
+        let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
+        let response = runtime
+            .block_on(echo_agent::human_loop::HumanLoopProvider::request(
+                &provider,
+                echo_agent::human_loop::HumanLoopRequest::approval(
+                    "shell",
+                    serde_json::json!({"command": "cargo test"}),
+                ),
+            ))
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            response,
+            echo_agent::human_loop::HumanLoopResponse::Approved
+        ));
+        let events = lock_events(&sink.0);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events
+                .first()
+                .and_then(|event| event.get("source"))
+                .and_then(serde_json::Value::as_str),
+            Some("approval_request")
+        );
+        Ok(())
     }
 }

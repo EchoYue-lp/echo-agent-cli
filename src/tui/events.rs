@@ -2474,6 +2474,16 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 requested_mode,
                 observed_path,
             },
+            ChatDriverEvent::TurnConfiguration {
+                interaction_mode,
+                permission_mode,
+                approval_policy,
+                attachments,
+            } => AgentEvent::Notice(format!(
+                "Turn configuration: mode={interaction_mode}, permission={permission_mode}, \
+                 approval={approval_policy}, attachments={}",
+                attachments.len()
+            )),
             ChatDriverEvent::Interrupt {
                 run_id,
                 goal,
@@ -3475,15 +3485,33 @@ async fn handle_slash_command(
         Some(SlashCommand::System) => {
             use echo_agent::agent::Agent;
             if args.trim().is_empty() {
-                let prompt = agent.read(|value| value.current_system_prompt()).await;
+                let pool_execution = match app.conversation_id.as_deref() {
+                    Some(conversation_id) => {
+                        tui_conversation_execution(app, conversation_id).await.ok()
+                    }
+                    None => None,
+                };
+                let active_agent = pool_execution
+                    .as_ref()
+                    .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+                    .unwrap_or_else(|| agent.clone());
+                let prompt = active_agent
+                    .read(|value| value.current_system_prompt())
+                    .await;
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: prompt,
                 });
             } else {
-                agent
-                    .read(|value| value.set_system_prompt(args.trim()))
-                    .await;
+                if let Some(state) = app.app_state.as_ref() {
+                    state
+                        .apply_system_prompt_to_agents(args.trim().to_string())
+                        .await;
+                } else {
+                    agent
+                        .read(|value| value.set_system_prompt(args.trim()))
+                        .await;
+                }
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: "System prompt updated for this runtime.".to_string(),
@@ -3760,7 +3788,7 @@ async fn handle_slash_command(
                     role: MessageRole::System,
                     content: "Usage: /resume <conversation-id>".to_string(),
                 });
-            } else if let Err(error) = resume_conversation(app, agent, args.trim()).await {
+            } else if let Err(error) = resume_conversation(app, args.trim()).await {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Failed to resume conversation: {error}"),
@@ -4347,11 +4375,15 @@ async fn handle_slash_command(
                         return;
                     }
                 };
-                agent
-                    .write(|value| value.set_permission_mode(normalized))
-                    .await;
-                if let Some(pool) = &app.pool {
-                    pool.apply_permission_mode(normalized.to_string()).await;
+                if let Some(state) = app.app_state.as_ref() {
+                    *state.config.permission_mode.write().await = normalized.to_string();
+                    state
+                        .apply_permission_mode_to_agents(normalized.to_string())
+                        .await;
+                } else {
+                    agent
+                        .write(|value| value.set_permission_mode(normalized))
+                        .await;
                 }
                 app.permission_mode = normalized.to_string();
                 app.messages.push(ChatMessage {
@@ -5343,13 +5375,25 @@ async fn handle_slash_command(
                             TurnDispatchResult::Rejected { error, .. } => Err(error),
                         }
                     } else {
-                        resume_tui_task_run(
-                            store.clone(),
-                            agent.clone(),
-                            run_id.clone(),
-                            app.review_integration.clone(),
-                        )
-                        .await
+                        match store.get_run(&run_id) {
+                            Ok(Some(run)) => {
+                                match tui_conversation_execution(app, &run.conversation_id).await {
+                                    Ok(pool_execution) => {
+                                        resume_tui_task_run(
+                                            store.clone(),
+                                            pool_execution.agent(),
+                                            Some(pool_execution),
+                                            run_id.clone(),
+                                            app.review_integration.clone(),
+                                        )
+                                        .await
+                                    }
+                                    Err(error) => Err(error.to_string()),
+                                }
+                            }
+                            Ok(None) => Err(format!("TaskRun {run_id} was not found")),
+                            Err(error) => Err(error.to_string()),
+                        }
                     }
                 }
                 _ => Err("unsupported task action".to_string()),
@@ -5700,9 +5744,27 @@ async fn handle_slash_command(
                 return;
             };
             let result = if action == SlashCommand::TaskRetry {
+                let pool_execution = match store.get_run(&run_id) {
+                    Ok(Some(run)) => tui_conversation_execution(app, &run.conversation_id)
+                        .await
+                        .map_err(|error| error.to_string()),
+                    Ok(None) => Err(format!("TaskRun {run_id} was not found")),
+                    Err(error) => Err(error.to_string()),
+                };
+                let pool_execution = match pool_execution {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Failed to resolve TaskRun Agent: {error}"),
+                        });
+                        return;
+                    }
+                };
                 retry_tui_task(
                     store.clone(),
-                    agent.clone(),
+                    pool_execution.agent(),
+                    Some(pool_execution),
                     run_id.clone(),
                     task_id.to_string(),
                     app.review_integration.clone(),
@@ -5816,6 +5878,8 @@ async fn handle_slash_command(
                 )]);
                 let result = runtime
                     .execute_main(
+                        app.workspace_execution_scope.workspace_id().to_string(),
+                        app.workspace_execution_scope.root().to_path_buf(),
                         conversation_id,
                         echo_agent_app_core::browser::BrowserAction::Backend,
                         params,
@@ -5854,6 +5918,30 @@ async fn handle_slash_command(
                     .await
                     .unwrap_or_else(|error| format!("Workflow command failed: {error}")),
                 None => "Workflow service is unavailable.".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+            app.rebuild_message_groups();
+        }
+        Some(SlashCommand::Extract) => {
+            let state = app.app_state.clone();
+            let conversation_id = app.conversation_id.clone();
+            let workspace_id = app.workspace_execution_scope.workspace_id().to_string();
+            let content = match (state, conversation_id) {
+                (Some(state), Some(conversation_id)) => state
+                    .execute_structured_extraction_command_for_scope(
+                        &workspace_id,
+                        &conversation_id,
+                        echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Tui,
+                        args,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        format!("Structured extraction command failed: {error}")
+                    }),
+                _ => "Structured extraction service is unavailable.".to_string(),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -5938,14 +6026,20 @@ async fn handle_slash_command(
 async fn resume_tui_task_run(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
+    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
     run_id: String,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 ) -> Result<&'static str, String> {
     let preparation_store = store.clone();
     let preparation_run_id = run_id.clone();
-    start_tui_task_run_driver(store, agent, run_id, review_integration, move || {
-        preparation_store.resume_task_run(&preparation_run_id)
-    })
+    start_tui_task_run_driver(
+        store,
+        agent,
+        pool_execution,
+        run_id,
+        review_integration,
+        move || preparation_store.resume_task_run(&preparation_run_id),
+    )
     .await
     .map_err(|error| error.to_string())?;
     Ok("resumed")
@@ -5954,6 +6048,7 @@ async fn resume_tui_task_run(
 async fn retry_tui_task(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
+    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
     run_id: String,
     task_id: String,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
@@ -5961,6 +6056,7 @@ async fn retry_tui_task(
     let preparation = start_tui_task_retry_driver(
         store,
         agent,
+        pool_execution,
         run_id.clone(),
         task_id.clone(),
         review_integration,
@@ -5981,6 +6077,7 @@ async fn retry_tui_task(
 async fn start_tui_task_retry_driver(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
+    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
     run_id: String,
     task_id: String,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
@@ -6017,6 +6114,7 @@ async fn start_tui_task_retry_driver(
             Ok((memory_generation, layer_manager))
         },
         move |(memory_generation, layer_manager), mut receipt_owner| async move {
+            let _pool_execution = pool_execution;
             if let Some(generation) = memory_generation.as_ref() {
                 receipt_owner.retain(generation.clone());
             }
@@ -6048,6 +6146,7 @@ async fn start_tui_task_retry_driver(
 async fn start_tui_task_run_driver<Prepared, Prepare>(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
+    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
     run_id: String,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     prepare: Prepare,
@@ -6092,6 +6191,7 @@ where
         }, move |(memory_generation, layer_manager)| {
             let prepared = prepare()?;
             Ok((prepared, move |mut receipt_owner: echo_agent_app_core::tasks::task_runtime::RunDriverReceiptOwner| async move {
+                let _pool_execution = pool_execution;
                 if let Some(generation) = memory_generation.as_ref() {
                     receipt_owner.retain(generation.clone());
                 }
@@ -6158,8 +6258,15 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
     if new_id {
         let id = uuid::Uuid::new_v4().to_string();
         app.conversation_id = Some(id.clone());
-        agent.write(|value| value.set_conversation_id(id)).await;
     }
+    let pool_execution = match app.conversation_id.as_deref() {
+        Some(conversation_id) => tui_conversation_execution(app, conversation_id).await.ok(),
+        None => None,
+    };
+    let active_agent = pool_execution
+        .as_ref()
+        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .unwrap_or_else(|| agent.clone());
     app.messages.clear();
     app.tokens = (0, 0, 0);
     app.streaming_text.clear();
@@ -6177,7 +6284,7 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
     app.clear_selection();
     app.context_snapshot.clear_usage();
     app.usage_accumulator.reset();
-    agent
+    active_agent
         .read_async(|value| {
             Box::pin(async move {
                 use echo_agent::agent::Agent;
@@ -6187,11 +6294,7 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
         .await;
 }
 
-async fn resume_conversation(
-    app: &mut TuiApp,
-    agent: &AgentHandle,
-    conversation_id: &str,
-) -> anyhow::Result<()> {
+async fn resume_conversation(app: &mut TuiApp, conversation_id: &str) -> anyhow::Result<()> {
     let store = app
         .conversation_store
         .as_ref()
@@ -6208,10 +6311,9 @@ async fn resume_conversation(
             Vec::new()
         }
     };
-    agent
-        .write(|value| value.set_conversation_id(conversation_id.to_string()))
-        .await;
-    agent
+    let pool_execution = tui_conversation_execution(app, conversation_id).await?;
+    let active_agent = pool_execution.agent();
+    active_agent
         .read_async(|value| Box::pin(async move { value.load_messages(runtime_messages).await }))
         .await;
 
@@ -6256,9 +6358,18 @@ async fn fork_conversation(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("conversation persistence is unavailable"))?;
     let id = uuid::Uuid::new_v4().to_string();
-    let runtime_messages = agent
+    let source_execution = match app.conversation_id.as_deref() {
+        Some(conversation_id) => Some(tui_conversation_execution(app, conversation_id).await?),
+        None => None,
+    };
+    let source_agent = source_execution
+        .as_ref()
+        .map(echo_agent_app_core::agent_pool::AgentPoolExecutionLease::agent)
+        .unwrap_or_else(|| agent.clone());
+    let runtime_messages = source_agent
         .read_async(|value| Box::pin(async move { value.get_messages().await }))
         .await;
+    drop(source_execution);
     let projected = echo_agent::memory::project_messages(&id, &runtime_messages)?;
     let default_title = app
         .conversation_id
@@ -6282,8 +6393,14 @@ async fn fork_conversation(
         })
         .await?;
     store.save_messages(&id, &projected).await?;
-    agent
-        .write(|value| value.set_conversation_id(id.clone()))
+    let target_execution = tui_conversation_execution(app, &id).await?;
+    target_execution
+        .agent()
+        .read_async(|value| {
+            Box::pin(async move {
+                value.load_messages(runtime_messages).await;
+            })
+        })
         .await;
     app.conversation_id = Some(id.clone());
     app.messages.push(ChatMessage {
@@ -6291,6 +6408,23 @@ async fn fork_conversation(
         content: format!("Forked into conversation: {id}"),
     });
     Ok(())
+}
+
+async fn tui_conversation_execution(
+    app: &TuiApp,
+    conversation_id: &str,
+) -> anyhow::Result<echo_agent_app_core::agent_pool::AgentPoolExecutionLease> {
+    let app_state = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TUI application state is unavailable"))?;
+    let runtime = app_state
+        .chat_runtime_for_scope(app.workspace_execution_scope.workspace_id())
+        .await?;
+    runtime
+        .agent_for(conversation_id)
+        .await
+        .map_err(anyhow::Error::msg)
 }
 
 fn refresh_task_runtime_view(app: &mut TuiApp) {
@@ -7182,6 +7316,7 @@ mod tests {
         let error = retry_tui_task(
             store.clone(),
             task_test_agent()?,
+            None,
             "tui-retry-closed".to_string(),
             "retry-task".to_string(),
             None,

@@ -522,7 +522,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     loadingConversationId = null;
     set({ isLoading: false });
     try {
-      await sessionApi.reset();
+      const { workspaceId, activeId } = get();
+      if (activeId) await sessionApi.reset(workspaceId, activeId);
     } catch (e) {
       console.error('Failed to reset session while clearing chat:', e);
     }

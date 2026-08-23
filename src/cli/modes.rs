@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use crate::agent_handle::AgentHandle;
-use crate::cli::args::Args;
+use crate::cli::args::{Args, JsonlApprovalPolicy, JsonlInteractionMode, JsonlPermissionMode};
 use echo_agent::config::AppConfig;
 
 type CliShutdownFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
@@ -193,6 +193,14 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct JsonlRunOptions {
+    pub interaction_mode: JsonlInteractionMode,
+    pub permission_mode: JsonlPermissionMode,
+    pub approval_policy: JsonlApprovalPolicy,
+    pub attachment_paths: Vec<std::path::PathBuf>,
+}
+
 /// Run one prompt through the shared finite chat driver and print only the
 /// canonical, already-journaled application envelope stream.
 pub async fn run_jsonl_mode(
@@ -200,6 +208,7 @@ pub async fn run_jsonl_mode(
     prompt: &str,
     conversation_id: String,
     services: &HeadlessServices,
+    options: JsonlRunOptions,
 ) -> Result<()> {
     if prompt.trim().is_empty() {
         return Err(anyhow::anyhow!("--jsonl requires a non-empty prompt"));
@@ -231,6 +240,63 @@ pub async fn run_jsonl_mode(
         Some(conversation_id.clone()),
         turn_id.clone(),
     );
+    agent
+        .write(|agent| agent.set_permission_mode(options.permission_mode.as_str()))
+        .await;
+
+    let workspace_root = scoped_runtime.execution_scope().root().to_path_buf();
+    let mut attachments = Vec::with_capacity(options.attachment_paths.len());
+    for path in &options.attachment_paths {
+        match echo_agent_app_core::attachments::stage_local_attachment(path, Some(&workspace_root))
+        {
+            Ok(attachment) => attachments.push(attachment),
+            Err(error) => {
+                let cleanup =
+                    echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments)
+                        .err()
+                        .map(|cleanup| format!("; attachment cleanup failed: {cleanup}"))
+                        .unwrap_or_default();
+                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "jsonl_attachment",
+                        format!("failed to stage {}: {error}{cleanup}", path.display()),
+                    ),
+                ));
+                return Err(anyhow::anyhow!(
+                    "failed to stage JSONL attachment {}: {error}{cleanup}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    if !sink.on_event(
+        echo_agent_app_core::chat_driver::ChatDriverEvent::TurnConfiguration {
+            interaction_mode: options.interaction_mode.runtime().as_str().to_string(),
+            permission_mode: options.permission_mode.as_str().to_string(),
+            approval_policy: options.approval_policy.as_str().to_string(),
+            attachments: attachments
+                .iter()
+                .map(
+                    |attachment| echo_agent_app_core::chat_driver::ChatAttachmentDescriptor {
+                        name: attachment.name.clone(),
+                        mime_type: attachment.mime_type.clone(),
+                        source: attachment.source,
+                    },
+                )
+                .collect(),
+        },
+    ) {
+        let _ = echo_agent_app_core::attachments::discard_staged_attachment_refs(&attachments);
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+            echo_agent::error::AgentFailure::message(
+                "jsonl_output",
+                "JSONL output closed before turn configuration was delivered",
+            ),
+        ));
+        return Err(anyhow::anyhow!(
+            "JSONL output closed before turn configuration was delivered"
+        ));
+    }
     if !sink.on_event(
         echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus {
             status: "running".to_string(),
@@ -269,14 +335,8 @@ pub async fn run_jsonl_mode(
         return Err(anyhow::Error::msg(detail));
     }
 
-    let workspace_root = services
-        .app_state
-        .current_workspace()
-        .await
-        .map(|workspace| workspace.root);
     let spill_dir =
-        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(workspace_root.as_deref());
-    let attachments = Vec::<echo_agent_app_core::attachments::AttachmentRef>::new();
+        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(&workspace_root));
     let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: prompt,
@@ -310,12 +370,13 @@ pub async fn run_jsonl_mode(
         root_message_id: turn_id,
         attachments: turn.inline_attachment_refs(),
         cancel: lease.cancellation_token(),
-        interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
+        interaction_mode: options.interaction_mode.runtime(),
         review_integration: scoped_runtime.review_integration(),
         layer_manager: None,
         memory_generation: None,
-        human_loop_provider: Some(services.app_state.connection.hitl_dispatcher.clone()
-            as std::sync::Arc<dyn echo_agent::human_loop::HumanLoopProvider>),
+        human_loop_provider: Some(std::sync::Arc::new(
+            crate::cli::jsonl::JsonlHumanLoopProvider::new(sink.clone(), options.approval_policy),
+        )),
     });
     let turn_cancel = lease.cancellation_token();
     let _pool_execution = pool_execution;

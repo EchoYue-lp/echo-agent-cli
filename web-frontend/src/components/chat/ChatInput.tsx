@@ -23,12 +23,7 @@ import type { ConfiguredModel } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
-import {
-  filterCommands,
-  groupByCategory,
-  CATEGORY_META,
-  type SlashCommand,
-} from '../../lib/slashCommands';
+import { filterCommands, groupByCategory, type SlashCommand } from '../../lib/slashCommands';
 import {
   PERMISSION_MODES,
   PERMISSIONS_CHANGED_EVENT,
@@ -142,19 +137,14 @@ function CommandPalette({ commands, selectedIndex, onSelect }: CommandPalettePro
         <div className="flex items-center gap-2 border-b border-[var(--border-primary)] px-4 py-2">
           <Terminal size={13} className="text-[var(--text-tertiary)]" />
           <span className="text-xs font-medium text-[var(--text-secondary)]">Slash Commands</span>
-          <span className="ml-auto text-[10px] text-[var(--text-tertiary)]">
-            ↑↓ navigate · ↵ select · esc close
-          </span>
         </div>
 
         {/* Command list */}
         <div ref={listRef} className="max-h-[280px] overflow-y-auto px-2 py-2">
           {Array.from(grouped.entries()).map(([category, cmds]) => {
-            const meta = CATEGORY_META[category];
             return (
               <div key={category} className="mb-1">
                 <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] font-semibold uppercase text-[var(--text-tertiary)]">
-                  <span>{meta?.icon ?? '📌'}</span>
                   <span>{category}</span>
                 </div>
                 {cmds.map((cmd) => {

@@ -7,6 +7,47 @@ use echo_agent::memory::ConversationFilter;
 use echo_agent_app_core::types::SessionInfo;
 use serde::Serialize;
 
+async fn session_agent(
+    state: &TauriState,
+    workspace_id: &str,
+    conversation_id: &str,
+) -> Result<echo_agent_app_core::agent_pool::AgentPoolExecutionLease, IpcError> {
+    if conversation_id.trim().is_empty() {
+        return Err(IpcError::Validation(
+            "conversation_id must not be empty".to_string(),
+        ));
+    }
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    runtime
+        .agent_for(conversation_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))
+}
+
+fn ensure_session_mutation_idle(
+    state: &TauriState,
+    workspace_id: &str,
+    conversation_id: &str,
+) -> Result<(), IpcError> {
+    let active = state
+        .app_state
+        .session
+        .foreground_turns
+        .snapshots_for_conversation_scoped(workspace_id, conversation_id)
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    if active.is_empty() {
+        Ok(())
+    } else {
+        Err(IpcError::Validation(format!(
+            "conversation '{conversation_id}' has an active foreground turn"
+        )))
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct SnapshotInfo {
     pub id: String,
@@ -15,11 +56,14 @@ pub struct SnapshotInfo {
 }
 
 #[tauri::command]
-pub async fn get_session(state: tauri::State<'_, TauriState>) -> Result<SessionInfo, IpcError> {
-    Ok(state
-        .app_state
-        .connection
-        .agent
+pub async fn get_session(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+) -> Result<SessionInfo, IpcError> {
+    let execution = session_agent(&state, &workspace_id, &conversation_id).await?;
+    Ok(execution
+        .agent()
         .read_async(|agent| {
             Box::pin(async move {
                 let (message_count, _) = agent.context_stats().await;
@@ -36,11 +80,15 @@ pub async fn get_session(state: tauri::State<'_, TauriState>) -> Result<SessionI
 }
 
 #[tauri::command]
-pub async fn reset_session(state: tauri::State<'_, TauriState>) -> Result<SessionInfo, IpcError> {
-    Ok(state
-        .app_state
-        .connection
-        .agent
+pub async fn reset_session(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
+) -> Result<SessionInfo, IpcError> {
+    ensure_session_mutation_idle(&state, &workspace_id, &conversation_id)?;
+    let execution = session_agent(&state, &workspace_id, &conversation_id).await?;
+    Ok(execution
+        .agent()
         .write_async(|agent| {
             Box::pin(async move {
                 agent.reset().await;
@@ -59,11 +107,13 @@ pub async fn reset_session(state: tauri::State<'_, TauriState>) -> Result<Sessio
 #[tauri::command]
 pub async fn create_checkpoint(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let snapshot_id = state
-        .app_state
-        .connection
-        .agent
+    ensure_session_mutation_idle(&state, &workspace_id, &conversation_id)?;
+    let execution = session_agent(&state, &workspace_id, &conversation_id).await?;
+    let snapshot_id = execution
+        .agent()
         .write_async(|agent| Box::pin(async move { agent.snapshot().await }))
         .await;
 
@@ -79,11 +129,12 @@ pub async fn create_checkpoint(
 #[tauri::command]
 pub async fn list_checkpoints(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
 ) -> Result<Vec<SnapshotInfo>, IpcError> {
-    Ok(state
-        .app_state
-        .connection
-        .agent
+    let execution = session_agent(&state, &workspace_id, &conversation_id).await?;
+    Ok(execution
+        .agent()
         .read(|agent| {
             agent
                 .snapshots()
@@ -101,13 +152,15 @@ pub async fn list_checkpoints(
 #[tauri::command]
 pub async fn restore_checkpoint(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    conversation_id: String,
     snapshot_id: String,
 ) -> Result<serde_json::Value, IpcError> {
+    ensure_session_mutation_idle(&state, &workspace_id, &conversation_id)?;
+    let execution = session_agent(&state, &workspace_id, &conversation_id).await?;
     let sid = snapshot_id.clone();
-    let result = state
-        .app_state
-        .connection
-        .agent
+    let result = execution
+        .agent()
         .write_async(|agent| Box::pin(async move { agent.rollback_to(&sid).await }))
         .await;
 
@@ -123,8 +176,14 @@ pub async fn restore_checkpoint(
 #[tauri::command]
 pub async fn get_latest_session(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = match state.app_state.conversation_store().await {
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(&workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let store = match runtime.conversation_store() {
         Some(s) => s,
         None => {
             return Ok(serde_json::json!({
