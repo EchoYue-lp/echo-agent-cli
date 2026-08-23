@@ -802,12 +802,19 @@ async fn drive_one(
             0,
         )
         .map_err(|error| anyhow!(error.to_string()))?;
-    ensure!(!replay.events.is_empty(), "foreground journal is empty");
+    let current_turn_events = replay
+        .events
+        .iter()
+        .filter(|event| event.root_turn_id == turn_id)
+        .collect::<Vec<_>>();
     ensure!(
-        replay.events.iter().all(|event| {
+        !current_turn_events.is_empty(),
+        "foreground journal has no events for the current root turn"
+    );
+    ensure!(
+        current_turn_events.iter().all(|event| {
             event.workspace_id == address.workspace_id
                 && event.conversation_id.as_deref() == Some(address.conversation_id.as_str())
-                && event.root_turn_id == turn_id
         }),
         "foreground event crossed its exact address"
     );
