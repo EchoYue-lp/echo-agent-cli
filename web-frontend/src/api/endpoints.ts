@@ -259,22 +259,40 @@ export const mcpApi = {
 };
 
 export const memoryApi = {
-  list: (namespace?: string) =>
+  list: (workspaceId: string, namespace?: string) =>
     isTauri()
-      ? apiInvoke<MemoryEntry[]>('list_memory', { namespace })
-      : get<MemoryEntry[]>(`/memory/list${namespace ? `?namespace=${namespace}` : ''}`),
-  add: (entry: { namespace: string; key: string; value: any }) =>
+      ? apiInvoke<MemoryEntry[]>('list_memory', { workspaceId, namespace })
+      : get<MemoryEntry[]>(
+          `/memory/list?workspace_id=${encodeURIComponent(workspaceId)}${namespace ? `&namespace=${encodeURIComponent(namespace)}` : ''}`
+        ),
+  add: (workspaceId: string, entry: { namespace: string; key: string; value: any }) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; key: string; message: string }>('add_memory', entry)
-      : post<{ success: boolean; key: string; message: string }>('/memory', entry),
-  search: (query: string, namespace?: string) =>
+      ? apiInvoke<{ success: boolean; key: string; message: string }>('add_memory', {
+          workspaceId,
+          ...entry,
+        })
+      : post<{ success: boolean; key: string; message: string }>('/memory', {
+          workspace_id: workspaceId,
+          ...entry,
+        }),
+  search: (workspaceId: string, query: string, namespace?: string) =>
     isTauri()
-      ? apiInvoke<MemoryEntry[]>('search_memory', { query, namespace })
-      : post<MemoryEntry[]>('/memory/search', { query, namespace }),
-  delete: (entry: { namespace: string; key: string }) =>
+      ? apiInvoke<MemoryEntry[]>('search_memory', { workspaceId, query, namespace })
+      : post<MemoryEntry[]>('/memory/search', {
+          workspace_id: workspaceId,
+          query,
+          namespace,
+        }),
+  delete: (workspaceId: string, entry: { namespace: string; key: string }) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; message: string }>('delete_memory', entry)
-      : post<{ success: boolean; message: string }>('/memory/delete', entry),
+      ? apiInvoke<{ success: boolean; message: string }>('delete_memory', {
+          workspaceId,
+          ...entry,
+        })
+      : post<{ success: boolean; message: string }>('/memory/delete', {
+          workspace_id: workspaceId,
+          ...entry,
+        }),
   namespaces: () =>
     isTauri()
       ? apiInvoke<NamespacesResponse>('list_namespaces')
@@ -282,22 +300,29 @@ export const memoryApi = {
 };
 
 export const autoMemoryApi = {
-  status: () =>
+  status: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<AutoMemoryStatus>('get_auto_memory_status')
-      : get<AutoMemoryStatus>('/auto-memory/status'),
-  toggle: (enabled: boolean) =>
+      ? apiInvoke<AutoMemoryStatus>('get_auto_memory_status', { workspaceId })
+      : get<AutoMemoryStatus>(
+          `/auto-memory/status?workspace_id=${encodeURIComponent(workspaceId)}`
+        ),
+  toggle: (workspaceId: string, enabled: boolean) =>
     isTauri()
-      ? apiInvoke<AutoMemoryStatus>('toggle_auto_memory', { enabled })
-      : post<AutoMemoryStatus>('/auto-memory/toggle', { enabled }),
-  preview: () =>
+      ? apiInvoke<AutoMemoryStatus>('toggle_auto_memory', { workspaceId, enabled })
+      : post<AutoMemoryStatus>('/auto-memory/toggle', {
+          workspace_id: workspaceId,
+          enabled,
+        }),
+  preview: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<AutoMemoryPreview>('get_auto_memory_observations')
-      : get<AutoMemoryPreview>('/auto-memory/observations'),
-  extract: () =>
+      ? apiInvoke<AutoMemoryPreview>('get_auto_memory_observations', { workspaceId })
+      : get<AutoMemoryPreview>(
+          `/auto-memory/observations?workspace_id=${encodeURIComponent(workspaceId)}`
+        ),
+  extract: (workspaceId: string) =>
     isTauri()
-      ? apiInvoke<AutoMemoryExtractResult>('extract_auto_memory')
-      : post<AutoMemoryExtractResult>('/auto-memory/extract'),
+      ? apiInvoke<AutoMemoryExtractResult>('extract_auto_memory', { workspaceId })
+      : post<AutoMemoryExtractResult>('/auto-memory/extract', { workspace_id: workspaceId }),
 };
 
 export const configApi = {
@@ -2349,40 +2374,28 @@ export interface UnattendedWorktreeMergeResult {
 }
 
 export const worktreeApi = {
-  list: () =>
-    isTauri() ? apiInvoke<WorktreeInfo[]>('list_worktrees') : get<WorktreeInfo[]>('/worktrees'),
-  create: (req: { branch: string; base?: string; path?: string }) =>
-    isTauri()
-      ? apiInvoke<WorktreeInfo>('create_worktree', {
-          branch: req.branch,
-          base: req.base,
-          path: req.path,
-        })
-      : post<WorktreeInfo>('/worktrees', req),
-  remove: (path: string) =>
-    isTauri()
-      ? apiInvoke<{ success: boolean }>('remove_worktree', { path })
-      : del<{ success: boolean }>(`/worktrees?path=${encodeURIComponent(path)}`),
+  list: (workspaceId: string) => apiInvoke<WorktreeInfo[]>('list_worktrees', { workspaceId }),
+  create: (workspaceId: string, req: { branch: string; base?: string; path?: string }) =>
+    apiInvoke<WorktreeInfo>('create_worktree', {
+      workspaceId,
+      branch: req.branch,
+      base: req.base,
+      path: req.path,
+    }),
+  remove: (workspaceId: string, path: string) =>
+    apiInvoke<{ success: boolean }>('remove_worktree', { workspaceId, path }),
   listUnattended: (workspaceId: string) =>
-    isTauri()
-      ? apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees', { workspaceId })
-      : get<UnattendedWorktreeInfo[]>('/worktrees/unattended'),
+    apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees', { workspaceId }),
   mergeUnattended: (workspaceId: string, runId: string) =>
-    isTauri()
-      ? apiInvoke<UnattendedWorktreeMergeResult>('merge_unattended_worktree', {
-          workspaceId,
-          runId,
-        })
-      : post<UnattendedWorktreeMergeResult>(`/worktrees/unattended/${runId}/merge`, {}),
+    apiInvoke<UnattendedWorktreeMergeResult>('merge_unattended_worktree', {
+      workspaceId,
+      runId,
+    }),
   discardUnattended: (workspaceId: string, runId: string) =>
-    isTauri()
-      ? apiInvoke<{ success: boolean; discarded: string }>('discard_unattended_worktree', {
-          workspaceId,
-          runId,
-        })
-      : del<{ success: boolean; discarded: string }>(`/worktrees/unattended/${runId}`),
+    apiInvoke<{ success: boolean; discarded: string }>('discard_unattended_worktree', {
+      workspaceId,
+      runId,
+    }),
   cleanupUnattended: (workspaceId: string) =>
-    isTauri()
-      ? apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { workspaceId })
-      : post<UnattendedWorktreeCleanupResult>('/worktrees/unattended/cleanup', {}),
+    apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees', { workspaceId }),
 };

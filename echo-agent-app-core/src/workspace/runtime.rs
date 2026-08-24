@@ -42,6 +42,53 @@ pub(crate) struct WorkspaceRuntimeHost {
     resources: WorkspaceRuntimeResources,
     task_runtime: OnceCell<Arc<TaskRuntimeStore>>,
     execution: OnceCell<Arc<WorkspaceExecutionRuntime>>,
+    control_lifecycle: std::sync::Mutex<WorkspaceControlLifecycle>,
+}
+
+#[derive(Default)]
+struct WorkspaceControlLifecycle {
+    active: usize,
+    closing: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceControlLease {
+    _receipt: Arc<WorkspaceControlReceipt>,
+}
+
+struct WorkspaceControlReceipt {
+    host: Arc<WorkspaceRuntimeHost>,
+}
+
+struct WorkspaceClosingGuard {
+    host: Arc<WorkspaceRuntimeHost>,
+    active_controls: usize,
+    committed: bool,
+}
+
+impl WorkspaceClosingGuard {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for WorkspaceClosingGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.host.abort_closing();
+        }
+    }
+}
+
+impl Drop for WorkspaceControlReceipt {
+    fn drop(&mut self) {
+        let mut lifecycle = self
+            .host
+            .control_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.active = lifecycle.active.saturating_sub(1);
+    }
 }
 
 /// Workspace-owned execution authorities used by foreground and background
@@ -62,6 +109,7 @@ pub(crate) struct WorkspaceRuntimeActivity {
     pub active_pool_executions: usize,
     pub active_run_drivers: usize,
     pub active_run_driver_receipts: usize,
+    pub active_controls: usize,
 }
 
 impl WorkspaceRuntimeActivity {
@@ -69,6 +117,7 @@ impl WorkspaceRuntimeActivity {
         self.active_pool_executions == 0
             && self.active_run_drivers == 0
             && self.active_run_driver_receipts == 0
+            && self.active_controls == 0
     }
 }
 
@@ -81,6 +130,16 @@ impl WorkspaceRuntimeActivity {
 #[derive(Default)]
 pub(crate) struct WorkspaceRuntimeRegistry {
     hosts: Mutex<HashMap<WorkspaceId, Arc<WorkspaceRuntimeHost>>>,
+    #[cfg(test)]
+    control_acquire_barrier: std::sync::Mutex<Option<WorkspaceControlAcquireTestBarrier>>,
+    #[cfg(test)]
+    close_barrier: std::sync::Mutex<Option<WorkspaceControlAcquireTestBarrier>>,
+}
+
+#[cfg(test)]
+struct WorkspaceControlAcquireTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl WorkspaceRuntimeResources {
@@ -188,6 +247,7 @@ impl WorkspaceRuntimeHost {
             resources,
             task_runtime: OnceCell::new(),
             execution: OnceCell::new(),
+            control_lifecycle: std::sync::Mutex::new(WorkspaceControlLifecycle::default()),
         }))
     }
 
@@ -209,6 +269,59 @@ impl WorkspaceRuntimeHost {
 
     pub(crate) fn execution_scope(&self) -> WorkspaceExecutionScope {
         WorkspaceExecutionScope::workspace(self.id(), self.root())
+    }
+
+    fn acquire_control_lease(self: &Arc<Self>) -> anyhow::Result<WorkspaceControlLease> {
+        let mut lifecycle = self
+            .control_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace control lifecycle lock is poisoned"))?;
+        if lifecycle.closing {
+            anyhow::bail!("workspace '{}' runtime is closing", self.id());
+        }
+        lifecycle.active = lifecycle
+            .active
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("workspace control lease counter exhausted"))?;
+        drop(lifecycle);
+        Ok(WorkspaceControlLease {
+            _receipt: Arc::new(WorkspaceControlReceipt {
+                host: Arc::clone(self),
+            }),
+        })
+    }
+
+    fn active_control_count(&self) -> anyhow::Result<usize> {
+        self.control_lifecycle
+            .lock()
+            .map(|lifecycle| lifecycle.active)
+            .map_err(|_| anyhow::anyhow!("workspace control lifecycle lock is poisoned"))
+    }
+
+    fn begin_closing(self: &Arc<Self>) -> anyhow::Result<WorkspaceClosingGuard> {
+        let mut lifecycle = self
+            .control_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace control lifecycle lock is poisoned"))?;
+        if lifecycle.closing {
+            anyhow::bail!("workspace '{}' runtime is already closing", self.id());
+        }
+        lifecycle.closing = true;
+        let active_controls = lifecycle.active;
+        drop(lifecycle);
+        Ok(WorkspaceClosingGuard {
+            host: Arc::clone(self),
+            active_controls,
+            committed: false,
+        })
+    }
+
+    fn abort_closing(&self) {
+        let mut lifecycle = self
+            .control_lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.closing = false;
     }
 
     /// Open the host's TaskRuntime authority without constructing AgentPool,
@@ -337,6 +450,7 @@ impl WorkspaceExecutionRuntime {
     pub(crate) fn activity(
         &self,
         workspace_id: WorkspaceId,
+        active_controls: usize,
     ) -> anyhow::Result<WorkspaceRuntimeActivity> {
         Ok(WorkspaceRuntimeActivity {
             workspace_id,
@@ -350,6 +464,7 @@ impl WorkspaceExecutionRuntime {
                 .task_runtime
                 .active_run_driver_receipt_count()
                 .map_err(anyhow::Error::msg)?,
+            active_controls,
         })
     }
 
@@ -402,6 +517,110 @@ impl WorkspaceRuntimeRegistry {
         Ok(host)
     }
 
+    /// Resolve and pin one host while the registry membership lock is held.
+    /// Eviction cannot mark the host Closing between lookup and lease acquire.
+    pub(crate) async fn get_or_open_control(
+        &self,
+        workspace: Workspace,
+    ) -> anyhow::Result<(Arc<WorkspaceRuntimeHost>, WorkspaceControlLease)> {
+        let workspace_id = workspace.id.clone();
+        let mut hosts = self.hosts.lock().await;
+        let host = match hosts.get(&workspace_id) {
+            Some(host) => {
+                host.refresh_workspace(workspace).await?;
+                Arc::clone(host)
+            }
+            None => {
+                let host = WorkspaceRuntimeHost::open(workspace).await?;
+                hosts.insert(workspace_id, Arc::clone(&host));
+                host
+            }
+        };
+        let lease = host.acquire_control_lease()?;
+        Ok((host, lease))
+    }
+
+    /// Pin a focused host only if it is still the exact registered generation.
+    pub(crate) async fn acquire_control_for_host(
+        &self,
+        host: &Arc<WorkspaceRuntimeHost>,
+    ) -> anyhow::Result<WorkspaceControlLease> {
+        let hosts = self.hosts.lock().await;
+        let registered = hosts.get(host.id()).ok_or_else(|| {
+            anyhow::anyhow!("workspace '{}' runtime is no longer registered", host.id())
+        })?;
+        if !Arc::ptr_eq(registered, host) {
+            anyhow::bail!("workspace '{}' runtime generation was replaced", host.id());
+        }
+        #[cfg(test)]
+        {
+            let barrier = self
+                .control_acquire_barrier
+                .lock()
+                .map_err(|_| anyhow::anyhow!("control acquire test barrier is poisoned"))?
+                .take();
+            if let Some(barrier) = barrier {
+                let _ = barrier.entered.send(());
+                barrier.release.await.map_err(|_| {
+                    anyhow::anyhow!("control acquire test barrier release was dropped")
+                })?;
+            }
+        }
+        host.acquire_control_lease()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn park_next_control_acquire(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+        String,
+    > {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut barrier = self
+            .control_acquire_barrier
+            .lock()
+            .map_err(|_| "control acquire test barrier is poisoned".to_string())?;
+        if barrier.is_some() {
+            return Err("control acquire test barrier is already installed".to_string());
+        }
+        *barrier = Some(WorkspaceControlAcquireTestBarrier {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        Ok((entered_rx, release_tx))
+    }
+
+    #[cfg(test)]
+    fn park_next_close(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+        String,
+    > {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut barrier = self
+            .close_barrier
+            .lock()
+            .map_err(|_| "workspace close test barrier is poisoned".to_string())?;
+        if barrier.is_some() {
+            return Err("workspace close test barrier is already installed".to_string());
+        }
+        *barrier = Some(WorkspaceControlAcquireTestBarrier {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        Ok((entered_rx, release_tx))
+    }
+
     /// Stable, sorted snapshot of every initialized host generation. The map
     /// lock is released before callers await any runtime publication.
     pub(crate) async fn loaded_execution_runtimes(
@@ -425,13 +644,15 @@ impl WorkspaceRuntimeRegistry {
         let mut activity = Vec::with_capacity(hosts.len());
         for host in hosts.values() {
             match host.execution.get() {
-                Some(runtime) => activity.push(runtime.activity(host.id().clone())?),
+                Some(runtime) => activity
+                    .push(runtime.activity(host.id().clone(), host.active_control_count()?)?),
                 None => activity.push(WorkspaceRuntimeActivity {
                     workspace_id: host.id().clone(),
                     execution_loaded: false,
                     active_pool_executions: 0,
                     active_run_drivers: 0,
                     active_run_driver_receipts: 0,
+                    active_controls: host.active_control_count()?,
                 }),
             }
         }
@@ -449,20 +670,52 @@ impl WorkspaceRuntimeRegistry {
         let Some(host) = hosts.get(workspace_id).cloned() else {
             return Ok(false);
         };
-        if let Some(runtime) = host.execution.get() {
-            let activity = runtime.activity(workspace_id.clone())?;
-            if !activity.is_idle() {
-                anyhow::bail!(
-                    "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {})",
-                    workspace_id,
-                    activity.active_pool_executions,
-                    activity.active_run_drivers,
-                    activity.active_run_driver_receipts
-                );
+        let closing = host.begin_closing()?;
+        #[cfg(test)]
+        {
+            let barrier = self
+                .close_barrier
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workspace close test barrier is poisoned"))?
+                .take();
+            if let Some(barrier) = barrier {
+                let _ = barrier.entered.send(());
+                barrier.release.await.map_err(|_| {
+                    anyhow::anyhow!("workspace close test barrier release was dropped")
+                })?;
             }
+        }
+        let active_controls = closing.active_controls;
+        let activity_result = match host.execution.get() {
+            Some(runtime) => runtime.activity(workspace_id.clone(), active_controls),
+            None => Ok(WorkspaceRuntimeActivity {
+                workspace_id: workspace_id.clone(),
+                execution_loaded: false,
+                active_pool_executions: 0,
+                active_run_drivers: 0,
+                active_run_driver_receipts: 0,
+                active_controls,
+            }),
+        };
+        let activity = match activity_result {
+            Ok(activity) => activity,
+            Err(error) => return Err(error),
+        };
+        if !activity.is_idle() {
+            anyhow::bail!(
+                "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {}, controls: {})",
+                workspace_id,
+                activity.active_pool_executions,
+                activity.active_run_drivers,
+                activity.active_run_driver_receipts,
+                activity.active_controls
+            );
+        }
+        if let Some(runtime) = host.execution.get() {
             runtime.shutdown().await?;
         }
         hosts.remove(workspace_id);
+        closing.commit();
         Ok(true)
     }
 
@@ -920,6 +1173,151 @@ mod tests {
             process_cwd
         );
         mcp.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_lease_blocks_host_eviction_until_last_clone_drops() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("control-lease");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let registry = WorkspaceRuntimeRegistry::new();
+        let workspace = workspace("control-lease", root);
+        let workspace_id = workspace.id.clone();
+        let host = registry
+            .get_or_open(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let lease = registry
+            .acquire_control_for_host(&host)
+            .await
+            .map_err(|error| error.to_string())?;
+        let lease_clone = lease.clone();
+
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace_id)
+                .await
+                .is_err_and(|error| error.to_string().contains("controls: 1"))
+        );
+        drop(lease);
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace_id)
+                .await
+                .is_err()
+        );
+        drop(lease_clone);
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace_id)
+                .await
+                .map_err(|error| error.to_string())?
+        );
+        assert!(
+            registry
+                .acquire_control_for_host(&host)
+                .await
+                .is_err_and(|error| error.to_string().contains("no longer registered"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn registry_serializes_control_pin_before_eviction_closing() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("control-race");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let registry = Arc::new(WorkspaceRuntimeRegistry::new());
+        let workspace = workspace("control-race", root);
+        let workspace_id = workspace.id.clone();
+        let host = registry
+            .get_or_open(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (entered, release) = registry.park_next_control_acquire()?;
+        let acquire_registry = Arc::clone(&registry);
+        let acquire_host = Arc::clone(&host);
+        let acquire = tokio::spawn(async move {
+            acquire_registry
+                .acquire_control_for_host(&acquire_host)
+                .await
+        });
+        entered
+            .await
+            .map_err(|_| "control acquire did not reach test barrier".to_string())?;
+
+        let delete_registry = Arc::clone(&registry);
+        let delete_workspace_id = workspace_id.clone();
+        let delete = tokio::spawn(async move {
+            delete_registry
+                .shutdown_and_evict_if_idle(&delete_workspace_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!delete.is_finished());
+
+        release
+            .send(())
+            .map_err(|_| "control acquire release receiver was dropped".to_string())?;
+        let lease = acquire
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(
+            delete
+                .await
+                .map_err(|error| error.to_string())?
+                .is_err_and(|error| error.to_string().contains("controls: 1"))
+        );
+        drop(lease);
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace_id)
+                .await
+                .map_err(|error| error.to_string())?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn aborted_close_future_reopens_host_lifecycle() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("abort-close");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let registry = Arc::new(WorkspaceRuntimeRegistry::new());
+        let workspace = workspace("abort-close", root);
+        let workspace_id = workspace.id.clone();
+        let host = registry
+            .get_or_open(workspace)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (entered, release) = registry.park_next_close()?;
+        let closing_registry = Arc::clone(&registry);
+        let closing_workspace_id = workspace_id.clone();
+        let closing = tokio::spawn(async move {
+            closing_registry
+                .shutdown_and_evict_if_idle(&closing_workspace_id)
+                .await
+        });
+        entered
+            .await
+            .map_err(|_| "close did not reach test barrier".to_string())?;
+        closing.abort();
+        let _ = closing.await;
+        assert!(release.send(()).is_err());
+
+        let lease = registry
+            .acquire_control_for_host(&host)
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(lease);
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace_id)
+                .await
+                .map_err(|error| error.to_string())?
+        );
         Ok(())
     }
 

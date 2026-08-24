@@ -162,6 +162,7 @@ pub struct HeadlessServiceResources {
     pub command_cell_runtime: std::sync::Arc<
         echo_agent_app_core::tasks::task_runtime::command_cells::CommandCellRuntimeService,
     >,
+    pub browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
 }
 
 /// Composition receipt for the single headless bootstrap shared by CLI and
@@ -456,7 +457,9 @@ pub async fn start_headless_services(
     state.webhook.emitter = resources.webhook_emitter;
     state.connection.pool = Some(resources.pool);
     state.tasks.runtime = resources.task_runtime_store;
-    state = state.with_command_cell_runtime(resources.command_cell_runtime);
+    state = state
+        .with_command_cell_runtime(resources.command_cell_runtime)
+        .with_workspace_delete_hook(resources.browser_runtime);
     match state.recover_committed_conversation_deletions().await {
         Ok(receipts) if !receipts.is_empty() => tracing::info!(
             count = receipts.len(),

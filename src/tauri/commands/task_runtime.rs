@@ -100,7 +100,7 @@ pub async fn get_task_run(
     workspace_id: String,
     run_id: String,
 ) -> Result<Option<TaskRun>, IpcError> {
-    let (_, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
+    let (_runtime, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
     get_scoped_run(&store, &workspace_id, &run_id)
 }
 
@@ -111,7 +111,7 @@ pub async fn get_task_completion_gate(
     workspace_id: String,
     run_id: String,
 ) -> Result<CompletionGateReport, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.completion_gate_report(&run_id).map_err(internal)
 }
 
@@ -125,7 +125,7 @@ pub async fn skip_task_goal_requirement(
     requirement_id: String,
     reason: String,
 ) -> Result<CompletionGateReport, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store
         .skip_goal_requirement(
             &run_id,
@@ -144,7 +144,7 @@ pub async fn get_task_continuation(
     workspace_id: String,
     run_id: String,
 ) -> Result<Option<RunContinuationState>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store
         .get_run_state(&run_id)
         .map(|snapshot| snapshot.and_then(|state| state.continuation))
@@ -162,7 +162,7 @@ pub async fn configure_task_continuation(
     token_budget: Option<u64>,
     time_budget_seconds: Option<u64>,
 ) -> Result<RunContinuationState, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store
         .update_run_continuation_budgets(&run_id, token_budget, time_budget_seconds)
         .map_err(internal)
@@ -179,7 +179,7 @@ pub async fn update_task_run_goal(
     new_goal: String,
     reason: String,
 ) -> Result<TaskRun, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store
         .update_run_goal(
             &run_id,
@@ -199,7 +199,8 @@ pub async fn send_task_subagent_message(
     identity: SubagentControlIdentity,
     instruction: String,
 ) -> Result<SubagentControlReceipt, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
+    let (_runtime, store, _run) =
+        task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
     echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store)
         .send_message(identity, &instruction, SubagentControlActorSource::Gui)
         .await
@@ -214,7 +215,8 @@ pub async fn queue_task_subagent_guidance(
     identity: SubagentControlIdentity,
     instruction: String,
 ) -> Result<SubagentControlReceipt, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
+    let (_runtime, store, _run) =
+        task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
     echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store)
         .queue_guidance(identity, &instruction, SubagentControlActorSource::Gui)
         .map_err(internal)
@@ -227,7 +229,8 @@ pub async fn interrupt_task_subagent(
     workspace_id: String,
     identity: SubagentControlIdentity,
 ) -> Result<SubagentControlReceipt, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
+    let (_runtime, store, _run) =
+        task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
     echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store)
         .interrupt_subagent(identity, SubagentControlActorSource::Gui)
         .await
@@ -241,7 +244,7 @@ pub async fn list_task_background_cells(
     workspace_id: String,
     run_id: String,
 ) -> Result<Vec<BackgroundCellState>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.list_background_cells(&run_id).map_err(internal)
 }
 
@@ -252,7 +255,7 @@ pub async fn latest_task_run_for_conversation(
     workspace_id: String,
     conversation_id: String,
 ) -> Result<Option<TaskRun>, IpcError> {
-    let (_, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
+    let (_runtime, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
     let run = store
         .latest_run_for_conversation(&conversation_id)
         .map_err(internal)?;
@@ -276,7 +279,7 @@ pub async fn list_task_runs(
     workspace_id: String,
     statuses: Option<Vec<String>>,
 ) -> Result<Vec<TaskRun>, IpcError> {
-    let (_, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
+    let (_runtime, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
     let parsed: Vec<TaskRunStatus> = statuses
         .unwrap_or_default()
         .iter()
@@ -309,7 +312,7 @@ pub async fn get_task_plan(
     workspace_id: String,
     run_id: String,
 ) -> Result<Option<TaskPlan>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.get_plan(&run_id).map_err(internal)
 }
 
@@ -320,7 +323,7 @@ pub async fn list_task_todos(
     workspace_id: String,
     run_id: String,
 ) -> Result<Vec<TodoItem>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.list_todos(&run_id).map_err(internal)
 }
 
@@ -339,7 +342,7 @@ pub async fn list_task_events(
         .as_deref()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.list_events(&run_id, since).map_err(internal)
 }
 
@@ -350,7 +353,7 @@ pub async fn list_task_artifacts(
     workspace_id: String,
     run_id: String,
 ) -> Result<Vec<Artifact>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.list_artifacts(&run_id).map_err(internal)
 }
 
@@ -363,7 +366,7 @@ pub async fn list_task_reviews(
     run_id: String,
     task_id: String,
 ) -> Result<Vec<ReviewResult>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.list_reviews(&run_id, &task_id).map_err(internal)
 }
 
@@ -376,7 +379,7 @@ pub async fn get_task_summary(
     run_id: String,
     task_id: String,
 ) -> Result<Option<TaskExecutionSummary>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.get_summary(&run_id, &task_id).map_err(internal)
 }
 
@@ -388,7 +391,7 @@ pub async fn list_recovery_blockers(
     workspace_id: String,
     run_id: String,
 ) -> Result<Vec<RecoveryBlocker>, IpcError> {
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store.list_recovery_blockers(&run_id).map_err(internal)
 }
 
@@ -411,7 +414,7 @@ pub async fn resolve_recovery_task(
             ));
         }
     };
-    let (_, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     store
         .resolve_recovery_task(&run_id, &task_id, decision)
         .map_err(internal)
@@ -936,7 +939,7 @@ pub async fn cancel_task_run(
     workspace_id: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let (_, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     let message_key = Some(run.root_message_id);
     let cancelled = store.request_cancel(&run_id).map_err(internal)?;
     if cancelled {
@@ -957,7 +960,7 @@ pub async fn pause_task_run(
     workspace_id: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let (_, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
+    let (_runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     let message_key = Some(run.root_message_id);
     let paused = store.request_pause(&run_id).map_err(internal)?;
     if paused {

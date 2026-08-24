@@ -16,36 +16,55 @@ fn parse_budget(value: &str, label: &str) -> Result<Option<u64>, String> {
     Ok(Some(budget))
 }
 
-fn current_task_run(
+struct ScopedTaskControl {
+    _runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    snapshot: echo_agent_app_core::tasks::task_runtime::RunStateSnapshot,
+}
+
+async fn current_task_run(
     ctx: &CommandContext,
     requested_run_id: Option<&str>,
-) -> Result<
-    (
-        Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-        echo_agent_app_core::tasks::task_runtime::RunStateSnapshot,
-    ),
-    String,
-> {
+) -> Result<ScopedTaskControl, String> {
     let state = ctx
         .app_state
         .as_ref()
         .ok_or_else(|| "application state is unavailable".to_string())?;
-    let store = state
-        .tasks
-        .runtime
-        .clone()
+    let runtime = state
+        .current_control_runtime()
+        .await
+        .map_err(|error| error.to_string())?;
+    let workspace_id = runtime.execution_scope().workspace_id().to_string();
+    let store = runtime
+        .task_runtime()
         .ok_or_else(|| "TaskRuntime store is unavailable".to_string())?;
-    let conversation_id = ctx
-        .conversation_id
-        .as_deref()
-        .ok_or_else(|| "REPL conversation identity is unavailable".to_string())?;
+    if store.active_workspace_id() != workspace_id {
+        return Err(format!(
+            "TaskRuntime scope mismatch: current workspace '{workspace_id}', store owns '{}'",
+            store.active_workspace_id()
+        ));
+    }
+    let conversation_id = runtime
+        .primary_agent()
+        .read(|agent| agent.conversation_id().map(str::to_string))
+        .await
+        .filter(|conversation_id| !conversation_id.trim().is_empty())
+        .ok_or_else(|| {
+            format!("workspace '{workspace_id}' conversation identity is unavailable")
+        })?;
     let run = match requested_run_id.filter(|run_id| !run_id.trim().is_empty()) {
         Some(run_id) => store.get_run(run_id).map_err(|error| error.to_string())?,
         None => store
-            .latest_run_for_conversation(conversation_id)
+            .latest_run_for_conversation(&conversation_id)
             .map_err(|error| error.to_string())?,
     }
     .ok_or_else(|| "no TaskRun was found for this conversation".to_string())?;
+    if run.workspace_id != workspace_id {
+        return Err(format!(
+            "TaskRun {} belongs to workspace '{}', not current workspace '{}'",
+            run.run_id, run.workspace_id, workspace_id
+        ));
+    }
     if run.conversation_id != conversation_id {
         return Err(format!(
             "TaskRun {} belongs to another conversation",
@@ -56,7 +75,11 @@ fn current_task_run(
         .get_run_state(&run.run_id)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("TaskRun {} has no event projection", run.run_id))?;
-    Ok((store, snapshot))
+    Ok(ScopedTaskControl {
+        _runtime: runtime,
+        store,
+        snapshot,
+    })
 }
 
 fn print_task_run_status(snapshot: &echo_agent_app_core::tasks::task_runtime::RunStateSnapshot) {
@@ -129,7 +152,11 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         Some(run_id) => ("status", Some(run_id)),
         None => ("status", None),
     };
-    let (store, snapshot) = match current_task_run(ctx, requested_run_id) {
+    let ScopedTaskControl {
+        _runtime,
+        store,
+        snapshot,
+    } = match current_task_run(ctx, requested_run_id).await {
         Ok(value) => value,
         Err(error) => {
             println!("\n  TaskRun error: {error}");
@@ -168,8 +195,10 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         "Resume the existing TaskRun {} toward its unchanged Goal. Reload the authoritative TaskRuntime projection and continue the next useful work.",
                         snapshot.run.run_id
                     ),
-                    run_id: snapshot.run.run_id.clone(),
-                    root_message_id: snapshot.run.root_message_id.clone(),
+                    identity:
+                        echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
+                            &snapshot.run,
+                        ),
                 };
             }
         }
@@ -219,7 +248,11 @@ async fn cmd_task_goal(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    let (store, snapshot) = match current_task_run(ctx, parsed.requested_run_id.as_deref()) {
+    let ScopedTaskControl {
+        _runtime,
+        store,
+        snapshot,
+    } = match current_task_run(ctx, parsed.requested_run_id.as_deref()).await {
         Ok(value) => value,
         Err(error) => {
             println!("\n  TaskRun error: {error}");
@@ -272,7 +305,11 @@ fn print_completion_gate(report: &echo_agent_app_core::tasks::task_runtime::Comp
 
 async fn cmd_task_requirements(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let requested_run_id = args.first().copied();
-    let (store, snapshot) = match current_task_run(ctx, requested_run_id) {
+    let ScopedTaskControl {
+        _runtime,
+        store,
+        snapshot,
+    } = match current_task_run(ctx, requested_run_id).await {
         Ok(value) => value,
         Err(error) => {
             println!("\n  TaskRun error: {error}");
@@ -294,7 +331,11 @@ async fn cmd_task_requirement_skip(ctx: &CommandContext, args: &[&str]) -> Comma
             return CommandOutcome::Continue;
         }
     };
-    let (store, snapshot) = match current_task_run(ctx, parsed.requested_run_id.as_deref()) {
+    let ScopedTaskControl {
+        _runtime,
+        store,
+        snapshot,
+    } = match current_task_run(ctx, parsed.requested_run_id.as_deref()).await {
         Ok(value) => value,
         Err(error) => {
             println!("\n  TaskRun error: {error}");
@@ -359,7 +400,11 @@ async fn cmd_subagent_control(
             return CommandOutcome::Continue;
         }
     };
-    let (store, _) = match current_task_run(ctx, Some(&parsed.identity.run_id)) {
+    let ScopedTaskControl {
+        _runtime,
+        store,
+        snapshot: _,
+    } = match current_task_run(ctx, Some(&parsed.identity.run_id)).await {
         Ok(value) => value,
         Err(error) => {
             println!("\n  Subagent control error: {error}");
@@ -454,7 +499,18 @@ cmd!(
 // ── TaskProgressCommand ──────────────────────────────────────────────
 
 async fn cmd_task_progress(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    let handle = ctx.agent.clone();
+    let Some(state) = ctx.app_state.as_ref() else {
+        println!("Task progress control is unavailable.");
+        return CommandOutcome::Continue;
+    };
+    let runtime = match state.current_control_runtime().await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            println!("Task progress unavailable: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let handle = runtime.primary_agent();
     handle
         .read_async(|a| {
             Box::pin(async move {
@@ -488,7 +544,18 @@ cmd!(
 // ── TaskTreeCommand ─────────────────────────────────────────────────
 
 async fn cmd_task_tree(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    let handle = ctx.agent.clone();
+    let Some(state) = ctx.app_state.as_ref() else {
+        println!("Task tree control is unavailable.");
+        return CommandOutcome::Continue;
+    };
+    let runtime = match state.current_control_runtime().await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            println!("Task tree unavailable: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let handle = runtime.primary_agent();
     handle
         .read_async(|a| {
             Box::pin(async move {

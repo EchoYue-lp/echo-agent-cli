@@ -3,6 +3,49 @@
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
 
+async fn current_memory_control(
+    ctx: &CommandContext,
+) -> Result<
+    (
+        crate::cli::command::ScopedReviewControl,
+        Arc<echo_agent::evolution::MemoryLayerManager>,
+    ),
+    String,
+> {
+    let control = ctx.current_review_control().await?;
+    let manager = Arc::new(
+        control
+            .generation
+            .create_layer_manager()
+            .map_err(|error| error.to_string())?,
+    );
+    Ok((control, manager))
+}
+
+async fn current_control_messages(
+    control: &crate::cli::command::ScopedReviewControl,
+) -> Vec<(String, String)> {
+    control
+        .runtime
+        .primary_agent()
+        .read_async(|agent| {
+            Box::pin(async move {
+                let context = agent.context().lock().await;
+                context
+                    .messages()
+                    .iter()
+                    .map(|message| {
+                        (
+                            message.role.as_str().to_string(),
+                            message.content.as_text().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+        })
+        .await
+}
+
 // ── HelpCommand ────────────────────────────────────────────────────────
 
 async fn cmd_help(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
@@ -109,21 +152,10 @@ async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("Usage: /remember <fact>");
         return CommandOutcome::Continue;
     }
-    let Some(integration) = ctx.review_integration.as_ref() else {
-        println!("Layered memory is not configured for this agent.");
-        return CommandOutcome::Continue;
-    };
-    let memory_lease = match integration.lease_generation() {
-        Ok(lease) => lease,
+    let (control, layer_manager) = match current_memory_control(ctx).await {
+        Ok(control) => control,
         Err(error) => {
-            println!("Cannot save memory while the workspace is switching: {error}");
-            return CommandOutcome::Continue;
-        }
-    };
-    let layer_manager = match memory_lease.create_layer_manager() {
-        Ok(manager) => Arc::new(manager),
-        Err(error) => {
-            println!("Failed to initialize layered memory: {error}");
+            println!("Cannot save memory: {error}");
             return CommandOutcome::Continue;
         }
     };
@@ -136,8 +168,9 @@ async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     match layer_manager.write_memory(&key, content.trim(), meta).await {
         Ok(promotion) => {
             if promotion.is_some() {
-                let root = ctx.agent.read(|agent| agent.working_dir()).await;
-                ctx.agent
+                let agent = control.runtime.primary_agent();
+                let root = agent.read(|agent| agent.working_dir()).await;
+                agent
                     .write_async(|agent| {
                         Box::pin(async move {
                             echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
@@ -171,21 +204,10 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("Usage: /forget <key-or-query>");
         return CommandOutcome::Continue;
     }
-    let Some(integration) = ctx.review_integration.as_ref() else {
-        println!("Layered memory is not configured for this agent.");
-        return CommandOutcome::Continue;
-    };
-    let memory_lease = match integration.lease_generation() {
-        Ok(lease) => lease,
+    let (control, layer_manager) = match current_memory_control(ctx).await {
+        Ok(control) => control,
         Err(error) => {
-            println!("Cannot remove memory while the workspace is switching: {error}");
-            return CommandOutcome::Continue;
-        }
-    };
-    let layer_manager = match memory_lease.create_layer_manager() {
-        Ok(manager) => Arc::new(manager),
-        Err(error) => {
-            println!("Failed to initialize layered memory: {error}");
+            println!("Cannot remove memory: {error}");
             return CommandOutcome::Continue;
         }
     };
@@ -217,8 +239,9 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         match layer_manager.delete_memory(&key).await {
             Ok(true) => {
                 if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
-                    let root = ctx.agent.read(|agent| agent.working_dir()).await;
-                    ctx.agent
+                    let agent = control.runtime.primary_agent();
+                    let root = agent.read(|agent| agent.working_dir()).await;
+                    agent
                         .write_async(|agent| {
                             Box::pin(async move {
                                 echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
@@ -250,30 +273,40 @@ cmd!(
 
 // ── MemoryCommand ──────────────────────────────────────────────────────
 
-async fn cmd_memory(_: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("show");
+    let control = match ctx.current_review_control().await {
+        Ok(control) => control,
+        Err(error) => {
+            println!("Memory unavailable: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
 
     match sub {
         "show" => {
-            println!("\n📝 Project Memory\n");
-
-            // User-level: ~/.eko/user.md
             let user_path = echo_agent_app_core::data_root::user_data_path("user.md");
-            print_memory_tier("User", &user_path);
-
-            // Project-level: <project-root>/.eko/project.md
-            let project_path = find_project_root()
-                .map(|r| r.join(".eko").join("project.md"))
-                .unwrap_or_default();
-            print_memory_tier("Project", &project_path);
-
-            // Reflection memory: .eko/memory/PROJECT.md
-            let reflection_path = std::env::current_dir()
-                .unwrap_or_default()
+            let project_path = control
+                .runtime
+                .execution_scope()
+                .root()
                 .join(".eko")
+                .join("project.md");
+            let reflection_path = control
+                .generation
+                .echo_agent_dir()
                 .join("memory")
                 .join("PROJECT.md");
-            print_memory_tier("Reflection", &reflection_path);
+            if let Err(error) = tokio::task::spawn_blocking(move || {
+                println!("\n📝 Project Memory\n");
+                print_memory_tier("User", &user_path);
+                print_memory_tier("Project", &project_path);
+                print_memory_tier("Reflection", &reflection_path);
+            })
+            .await
+            {
+                println!("Failed to join memory read: {error}");
+            }
         }
         _ => {
             println!("Usage: /memory [show]");
@@ -335,16 +368,34 @@ async fn cmd_attach(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     }
     let expanded = shellexpand::tilde(value.trim()).into_owned();
     let path = std::path::PathBuf::from(expanded);
-    let workspace_root = find_project_root();
-    match echo_agent_app_core::attachments::stage_local_attachment(&path, workspace_root.as_deref())
-    {
-        Ok(attachment) => {
+    let state = match ctx.app_state.as_ref() {
+        Some(state) => state,
+        None => {
+            println!("Workspace attachment control is unavailable.");
+            return CommandOutcome::Continue;
+        }
+    };
+    let runtime = match state.current_control_runtime().await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            println!("Cannot stage attachment: {error}");
+            return CommandOutcome::Continue;
+        }
+    };
+    let root = runtime.execution_scope().root().to_path_buf();
+    let staged = tokio::task::spawn_blocking(move || {
+        echo_agent_app_core::attachments::stage_local_attachment(&path, Some(&root))
+    })
+    .await;
+    match staged {
+        Ok(Ok(attachment)) => {
             let name = attachment.name.clone();
             let mime = attachment.mime_type.clone();
             ctx.staged_attachments.lock().await.push(attachment);
             println!("Staged attachment: {name} ({mime})");
         }
-        Err(error) => println!("Failed to stage attachment: {error}"),
+        Ok(Err(error)) => println!("Failed to stage attachment: {error}"),
+        Err(error) => println!("Failed to join attachment staging: {error}"),
     }
     CommandOutcome::Continue
 }
@@ -388,17 +439,6 @@ cmd!(
     cmd_interaction_mode
 );
 
-fn find_project_root() -> Option<std::path::PathBuf> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        if dir.join(".git").exists() || dir.join(".eko").exists() {
-            return Some(dir);
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
 cmd!(
     MemoryCommand,
     "memory",
@@ -412,20 +452,20 @@ cmd!(
 async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("🪞 Generating reflection...");
 
-    let Some(integration) = ctx.review_integration.as_ref() else {
-        println!("⚠️  Review integration is not configured.");
-        return CommandOutcome::Continue;
-    };
-    let memory_generation = match integration.lease_generation() {
-        Ok(generation) => generation,
+    let control = match ctx.current_review_control().await {
+        Ok(control) => control,
         Err(error) => {
-            println!("⚠️  Reflection unavailable during workspace transition: {error}");
+            println!("⚠️  Reflection unavailable: {error}");
             return CommandOutcome::Continue;
         }
     };
 
     // Get LLM client from agent
-    let llm_client = ctx.agent.read(|a| a.llm_client().cloned()).await;
+    let llm_client = control
+        .runtime
+        .primary_agent()
+        .read(|agent| agent.llm_client().cloned())
+        .await;
 
     let Some(llm) = llm_client else {
         println!("⚠️  No LLM client available for reflection.");
@@ -456,7 +496,7 @@ async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     };
 
     // Write to the `.eko` root pinned before the LLM call.
-    let memory_dir = memory_generation.echo_agent_dir().join("memory");
+    let memory_dir = control.generation.echo_agent_dir().join("memory");
     if let Err(error) = std::fs::create_dir_all(&memory_dir) {
         println!("⚠️  Failed to create reflection memory directory: {error}");
         return CommandOutcome::Continue;
@@ -519,36 +559,14 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         }
         "extract" => {
             println!("Extracting observations from current session...");
-            let Some(integration) = ctx.review_integration.as_ref() else {
-                println!("Review integration is not configured.");
-                return CommandOutcome::Continue;
-            };
-            let evidence_lease = match integration.lease_generation() {
-                Ok(lease) => lease,
+            let control = match ctx.current_review_control().await {
+                Ok(control) => control,
                 Err(error) => {
-                    println!(
-                        "Cannot queue memory candidates while the workspace is switching: {error}"
-                    );
+                    println!("Cannot queue memory candidates: {error}");
                     return CommandOutcome::Continue;
                 }
             };
-            let handle = ctx.agent.clone();
-            let messages: Vec<(String, String)> = handle
-                .read_async(|a| {
-                    Box::pin(async move {
-                        let ctx = a.context().lock().await;
-                        ctx.messages()
-                            .iter()
-                            .map(|m| {
-                                (
-                                    m.role.as_str().to_string(),
-                                    m.content.as_text().unwrap_or_default().to_string(),
-                                )
-                            })
-                            .collect()
-                    })
-                })
-                .await;
+            let messages = current_control_messages(&control).await;
 
             let config = AutoMemoryConfig::default();
             let observations = extract_observations(&messages, &config);
@@ -558,7 +576,7 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 return CommandOutcome::Continue;
             }
 
-            let store = evidence_lease.evidence_store();
+            let store = control.generation.evidence_store();
             match queue_observations(&store, &observations, &messages) {
                 Ok(candidates) => println!(
                     "Extracted {} observation(s); {} candidate(s) are in Review Inbox.",
@@ -569,23 +587,14 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             }
         }
         "show" => {
-            let handle = ctx.agent.clone();
-            let messages: Vec<(String, String)> = handle
-                .read_async(|a| {
-                    Box::pin(async move {
-                        let ctx = a.context().lock().await;
-                        ctx.messages()
-                            .iter()
-                            .map(|m| {
-                                (
-                                    m.role.as_str().to_string(),
-                                    m.content.as_text().unwrap_or_default().to_string(),
-                                )
-                            })
-                            .collect()
-                    })
-                })
-                .await;
+            let control = match ctx.current_review_control().await {
+                Ok(control) => control,
+                Err(error) => {
+                    println!("Auto-memory preview unavailable: {error}");
+                    return CommandOutcome::Continue;
+                }
+            };
+            let messages = current_control_messages(&control).await;
 
             let config = AutoMemoryConfig::default();
             let observations = extract_observations(&messages, &config);

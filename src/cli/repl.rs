@@ -29,17 +29,11 @@ static TOTAL_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
 static FILE_CHANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-#[derive(Clone)]
-struct ExplicitTaskRunResume {
-    run_id: String,
-    root_message_id: String,
-}
-
 struct QueuedReplTurn {
     message: String,
     interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
     attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    task_run_resume: Option<ExplicitTaskRunResume>,
+    task_run_resume: Option<echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity>,
 }
 
 #[derive(Default)]
@@ -100,6 +94,7 @@ enum QueuedStartFailureDisposition {
 
 enum ReplTurnStartError {
     Retryable(echo_agent_app_core::foreground_turn::ForegroundTurnError),
+    WorkspaceTransition(String),
     Permanent(String),
 }
 
@@ -125,24 +120,14 @@ impl ReplTurnStartError {
         }
     }
 
-    fn from_scoped_admission(error: echo_agent_app_core::state::ScopedChatTurnError) -> Self {
-        match error {
-            echo_agent_app_core::state::ScopedChatTurnError::Conversation(error) => {
-                Self::from_conversation_admission(error)
-            }
-            echo_agent_app_core::state::ScopedChatTurnError::Runtime(error) => {
-                Self::Permanent(error)
-            }
-        }
-    }
-
     fn should_retain_fifo_head(&self) -> bool {
-        matches!(self, Self::Retryable(_))
+        matches!(self, Self::Retryable(_) | Self::WorkspaceTransition(_))
     }
 
     fn message(&self) -> String {
         match self {
             Self::Retryable(error) => error.to_string(),
+            Self::WorkspaceTransition(error) => error.clone(),
             Self::Permanent(error) => error.clone(),
         }
     }
@@ -160,6 +145,7 @@ struct PreparedReplTurnStart {
 
 struct ActiveReplTurn {
     workspace_id: String,
+    execution_root: std::path::PathBuf,
     conversation_id: String,
     turn_id: String,
     control: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
@@ -1235,7 +1221,6 @@ async fn run_repl_inner(
         .with_scheduler_opt(config.scheduler_runner.clone())
         .with_plugin_runtime_opt(config.plugin_runtime.clone())
         .with_prompt_assembly(config.prompt_assembly.clone())
-        .with_review_integration(config.review_integration.clone())
         .with_app_state_opt(config.app_state.clone())
         .with_conversation_id(config.conversation_id.clone())
         .with_interaction_mode(interaction_mode.clone())
@@ -1518,19 +1503,12 @@ async fn run_repl_inner(
                                 )
                                 .await;
                             }
-                            CommandResult::ResumeTaskRun {
-                                message,
-                                run_id,
-                                root_message_id,
-                            } => {
+                            CommandResult::ResumeTaskRun { message, identity } => {
                                 let input = QueuedReplTurn {
                                     message,
                                     attachments: Vec::new(),
                                     interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
-                                    task_run_resume: Some(ExplicitTaskRunResume {
-                                        run_id,
-                                        root_message_id,
-                                    }),
+                                    task_run_resume: Some(identity),
                                 };
                                 enqueue_idle_input(&mut queued_turns, input);
                                 start_next_queued_turn(
@@ -1879,19 +1857,13 @@ async fn route_active_input(
     agent: &AgentHandle,
     active: &ActiveReplTurn,
     input: QueuedReplTurn,
-    config: &ReplConfig,
+    _config: &ReplConfig,
     queued: &mut ReplTurnQueue,
     output: &OutputRenderer,
 ) -> ActiveInputDisposition {
-    let workspace_root = match config.app_state.as_ref() {
-        Some(state) => state
-            .current_workspace()
-            .await
-            .map(|workspace| workspace.root),
-        None => None,
-    };
-    let spill_dir =
-        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(workspace_root.as_deref());
+    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+        active.execution_root.as_path(),
+    ));
     let prepared = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &input.message,
@@ -1995,7 +1967,7 @@ fn handle_git_action(input: &str, changes: usize, output: &OutputRenderer) {
 
 /// Acquire the authoritative foreground lease and prepare an immutable turn.
 async fn prepare_repl_turn_start(
-    agent: &AgentHandle,
+    _agent: &AgentHandle,
     input: &QueuedReplTurn,
     config: &ReplConfig,
 ) -> Result<PreparedReplTurnStart, ReplTurnStartError> {
@@ -2003,20 +1975,74 @@ async fn prepare_repl_turn_start(
         ReplTurnStartError::Permanent("CLI foreground turn control is unavailable".to_string())
     })?;
     let turn_id = uuid::Uuid::new_v4().to_string();
-    let conversation_id = agent
+    let scoped_runtime =
+        app_state
+            .current_control_runtime()
+            .await
+            .map_err(|error| match error {
+                echo_agent_app_core::state::ScopedControlError::WorkspaceTransition => {
+                    ReplTurnStartError::WorkspaceTransition(error.to_string())
+                }
+                echo_agent_app_core::state::ScopedControlError::Runtime(_) => {
+                    ReplTurnStartError::Permanent(error.to_string())
+                }
+            })?;
+    let conversation_id = scoped_runtime
+        .primary_agent()
         .read(|value| value.conversation_id().map(str::to_string))
         .await
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| config.conversation_id.clone());
+        .ok_or_else(|| {
+            ReplTurnStartError::Permanent(format!(
+                "workspace '{}' conversation identity is unavailable",
+                scoped_runtime.execution_scope().workspace_id()
+            ))
+        })?;
     let control = app_state.session.foreground_turns.clone();
-    let (scoped_runtime, lease) = app_state
-        .begin_scoped_chat_turn_owned(
+    let lease = scoped_runtime
+        .begin_turn(
+            &control,
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
             &conversation_id,
             turn_id.clone(),
         )
         .await
-        .map_err(ReplTurnStartError::from_scoped_admission)?;
+        .map_err(ReplTurnStartError::from_conversation_admission)?;
+    if let Some(resume) = input.task_run_resume.as_ref() {
+        let validation = scoped_runtime
+            .task_runtime()
+            .ok_or_else(|| "TaskRuntime store is unavailable".to_string())
+            .and_then(|store| {
+                store
+                    .get_run(&resume.run_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("TaskRun '{}' no longer exists", resume.run_id))
+            })
+            .and_then(|run| resume.validate_resumable(&run))
+            .and_then(|()| {
+                if resume.workspace_id != scoped_runtime.execution_scope().workspace_id() {
+                    Err(format!(
+                        "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
+                        resume.run_id,
+                        resume.workspace_id,
+                        scoped_runtime.execution_scope().workspace_id()
+                    ))
+                } else if resume.conversation_id != conversation_id {
+                    Err(format!(
+                        "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
+                        resume.run_id, resume.conversation_id, conversation_id
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(detail) = validation {
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
+            ));
+            return Err(ReplTurnStartError::Permanent(detail));
+        }
+    }
     let pool_execution = match scoped_runtime.agent_for(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
@@ -2027,19 +2053,9 @@ async fn prepare_repl_turn_start(
             return Err(ReplTurnStartError::Permanent(detail));
         }
     };
-    let workspace_root = match config.app_state.as_ref() {
-        Some(state) => state
-            .current_workspace()
-            .await
-            .map(|workspace| workspace.root),
-        None => config
-            .project
-            .as_deref()
-            .map(std::path::Path::new)
-            .and_then(|path| path.canonicalize().ok()),
-    };
-    let spill_dir =
-        echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(workspace_root.as_deref());
+    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+        scoped_runtime.execution_scope().root(),
+    ));
     let runtime_authored = input.task_run_resume.is_some();
     let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
@@ -2127,9 +2143,12 @@ fn spawn_prepared_repl_turn(
     });
     let agent_owned = pool_execution.agent();
     let workspace_id = scoped_runtime.execution_scope().workspace_id().to_string();
+    let execution_root = scoped_runtime.execution_scope().root().to_path_buf();
+    let scoped_runtime_guard = scoped_runtime.clone();
     let bound_turn_id = turn_id.clone();
     let (completion_tx, completion) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
+        let _scoped_runtime_guard = scoped_runtime_guard;
         let _pool_execution = pool_execution;
         let _ = live_output.print_user_message(&input.message);
         let _ = live_output.emit("Connecting to model...");
@@ -2169,6 +2188,7 @@ fn spawn_prepared_repl_turn(
 
     ActiveReplTurn {
         workspace_id,
+        execution_root,
         conversation_id,
         turn_id,
         control,
@@ -2398,8 +2418,19 @@ mod tests {
         };
 
         let mut queue = ReplTurnQueue::default();
-        queue.enqueue(queued_turn("first"));
-        queue.enqueue(queued_turn("second"));
+        let mut stale_resume = queued_turn("resume workspace A");
+        stale_resume.task_run_resume = Some(
+            echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity {
+                run_id: "same-run".to_string(),
+                workspace_id: "workspace-a".to_string(),
+                conversation_id: "conversation-a".to_string(),
+                root_message_id: "root-a".to_string(),
+                created_at: chrono::Utc::now(),
+                goal_revision: 1,
+            },
+        );
+        queue.enqueue(stale_resume);
+        queue.enqueue(queued_turn("workspace B normal input"));
         let control = ForegroundTurnControl::default();
         let _active = control
             .begin(ForegroundTurnSurface::Cli, "conversation", "active")
@@ -2418,7 +2449,7 @@ mod tests {
             queue
                 .front_for_idle(false)
                 .map(|turn| turn.message.as_str()),
-            Some("first")
+            Some("resume workspace A")
         );
 
         let suspended = ReplTurnStartError::from_admission(ForegroundTurnError::AdmissionSuspended);
@@ -2428,7 +2459,9 @@ mod tests {
         );
         assert_eq!(queue.len(), 2);
 
-        let permanent = ReplTurnStartError::Permanent("invalid persisted attachment".to_string());
+        let permanent = ReplTurnStartError::Permanent(
+            "TaskRun same-run identity changed after resume was queued".to_string(),
+        );
         assert_eq!(
             queue.settle_start_failure(&permanent),
             QueuedStartFailureDisposition::Consumed
@@ -2438,7 +2471,7 @@ mod tests {
             queue
                 .front_for_idle(false)
                 .map(|turn| turn.message.as_str()),
-            Some("second")
+            Some("workspace B normal input")
         );
         Ok(())
     }
@@ -2563,6 +2596,7 @@ mod tests {
         });
         let mut active = Some(ActiveReplTurn {
             workspace_id: "global".to_string(),
+            execution_root: std::path::PathBuf::from("."),
             conversation_id: "queued-follow-up-conversation".to_string(),
             turn_id: "queued-follow-up-turn".to_string(),
             control: control.clone(),
@@ -2668,6 +2702,7 @@ mod tests {
         });
         let mut active = Some(ActiveReplTurn {
             workspace_id: "global".to_string(),
+            execution_root: std::path::PathBuf::from("."),
             conversation_id: "interrupt-conversation".to_string(),
             turn_id: "interrupt-turn".to_string(),
             control: control.clone(),
@@ -2755,6 +2790,7 @@ mod tests {
         });
         let mut active = Some(ActiveReplTurn {
             workspace_id: "global".to_string(),
+            execution_root: std::path::PathBuf::from("."),
             conversation_id: "sink-failure-conversation".to_string(),
             turn_id: "sink-failure-turn".to_string(),
             control: control.clone(),
@@ -3017,6 +3053,7 @@ mod tests {
         });
         let active = ActiveReplTurn {
             workspace_id: "global".to_string(),
+            execution_root: std::path::PathBuf::from("."),
             conversation_id: "drop-conversation".to_string(),
             turn_id: "drop-turn".to_string(),
             control: control.clone(),
@@ -3083,6 +3120,7 @@ mod tests {
         let turn_id = format!("turn-{reason}");
         let mut active = Some(ActiveReplTurn {
             workspace_id: "global".to_string(),
+            execution_root: std::path::PathBuf::from("."),
             conversation_id: conversation_id.clone(),
             turn_id,
             control: control.clone(),

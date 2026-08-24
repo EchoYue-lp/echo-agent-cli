@@ -286,6 +286,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 config_watcher: config_watcher.clone(),
                 foreground_turns: foreground_turns.clone(),
                 command_cell_runtime: runtime.command_cell_runtime.clone(),
+                browser_runtime: runtime.browser_runtime.clone(),
             },
         )
         .await;
@@ -337,11 +338,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             "💬 通用",
             tui_pending,
             tui_provider.clone(),
-            pool.clone(),
-            task_runtime_store.clone(),
             webhook_emitter.clone(),
             tui_scheduler,
-            runtime.review_integration.clone(),
             conversation_store.clone(),
             conversation_id.clone(),
             app_config
@@ -418,6 +416,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             config_watcher: config_watcher.clone(),
             foreground_turns: foreground_turns.clone(),
             command_cell_runtime: runtime.command_cell_runtime.clone(),
+            browser_runtime: runtime.browser_runtime.clone(),
         },
     )
     .await

@@ -2,11 +2,15 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+#[cfg(test)]
+use echo_agent_app_core::workspace::WorkspaceId;
 use echo_agent_app_core::workspace::migration::LegacyMigrator;
+#[cfg(test)]
 use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
-use echo_agent_app_core::workspace::{Workspace, WorkspaceId, WorkspaceKind};
+use echo_agent_app_core::workspace::{Workspace, WorkspaceKind};
 use std::sync::Arc;
 
+#[cfg(test)]
 fn same_workspace_root(left: &std::path::Path, right: &std::path::Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
@@ -14,6 +18,7 @@ fn same_workspace_root(left: &std::path::Path, right: &std::path::Path) -> bool 
     }
 }
 
+#[cfg(test)]
 fn create_or_open_workspace(
     registry: &WorkspaceRegistry,
     name: &str,
@@ -49,7 +54,7 @@ async fn switch_opened_workspace(
     workspace: Workspace,
 ) -> Result<serde_json::Value, IpcError> {
     let transition = app_state
-        .switch_workspace(workspace.clone())
+        .switch_workspace_registered(workspace.id.clone())
         .await
         .map_err(|error| IpcError::Internal(format!("Failed to switch workspace: {error}")))?;
     let conversation_count = match app_state.conversation_store().await {
@@ -73,6 +78,7 @@ async fn switch_opened_workspace(
         conversation_count,
         "Switched workspace via IPC"
     );
+    let workspace = app_state.current_workspace().await.unwrap_or(workspace);
     Ok(serde_json::json!({
         "success": true,
         "workspace": workspace,
@@ -114,12 +120,11 @@ pub async fn create_workspace(
         crate::tauri::path_validator::validate_workspace_root(root_str)
             .map_err(IpcError::Validation)?;
     }
-    let (workspace, created) = create_or_open_workspace(
-        &state.app_state.workspace.registry,
-        &name,
-        ws_kind,
-        root.as_deref(),
-    )?;
+    let (workspace, created) = state
+        .app_state
+        .create_workspace_owned(&name, ws_kind, root.map(std::path::PathBuf::from))
+        .await
+        .map_err(IpcError::from)?;
     tracing::info!(workspace = %workspace.id, root = %workspace.root.display(), created, "Created or opened workspace via IPC");
     Ok(serde_json::json!({
         "success": true,
@@ -143,12 +148,11 @@ pub async fn create_and_switch_workspace(
         .as_deref()
         .map(WorkspaceKind::from_str_loose)
         .unwrap_or_default();
-    let (workspace, created) = create_or_open_workspace(
-        &state.app_state.workspace.registry,
-        &name,
-        workspace_kind,
-        root.as_deref(),
-    )?;
+    let (workspace, created) = state
+        .app_state
+        .create_workspace_owned(&name, workspace_kind, root.map(std::path::PathBuf::from))
+        .await
+        .map_err(IpcError::from)?;
     match switch_opened_workspace(&state.app_state, workspace.clone()).await {
         Ok(mut response) => {
             if let Some(object) = response.as_object_mut() {
@@ -227,44 +231,14 @@ pub async fn delete_workspace(
 
     state
         .app_state
-        .ensure_workspace_idle_for_delete(&ws_id)
+        .delete_workspace_owned(&ws_id)
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
-
-    if let Some(ref current) = state.app_state.current_workspace().await
-        && current.id == ws_id
-    {
-        state
-            .app_state
-            .exit_workspace()
-            .await
-            .map_err(|error| IpcError::Internal(error.to_string()))?;
-    }
-
-    state
-        .app_state
-        .evict_workspace_for_delete(&ws_id)
-        .await
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
-
-    state.browser_runtime.remove_workspace(ws_id.as_str()).await;
-    state
-        .app_state
-        .purge_workspace_projections_for_delete(&ws_id)
-        .map_err(|error| IpcError::Internal(error.to_string()))?;
-
-    match state.app_state.workspace.registry.delete(&ws_id) {
-        Ok(()) => {
-            tracing::info!(workspace = %id, "Deleted workspace via IPC");
-            Ok(serde_json::json!({
-                "success": true,
-                "message": format!("Workspace '{}' deleted", id),
-            }))
-        }
-        Err(e) => Err(IpcError::Internal(format!(
-            "Failed to delete workspace: {e}"
-        ))),
-    }
+    tracing::info!(workspace = %id, "Deleted workspace via IPC");
+    Ok(serde_json::json!({
+        "success": true,
+        "message": format!("Workspace '{}' deleted", id),
+    }))
 }
 
 #[tauri::command]
@@ -374,9 +348,8 @@ pub async fn link_project(
 
     match state
         .app_state
-        .workspace
-        .registry
-        .link_project(&ws_id, project_path)
+        .link_workspace_project_owned(&ws_id, project_path)
+        .await
     {
         Ok(ws) => {
             tracing::info!(
@@ -431,7 +404,11 @@ pub async fn execute_migration(
         .audit()
         .map_err(|e| IpcError::Internal(format!("Failed to audit: {e}")))?;
 
-    match migrator.execute(&plan, &state.app_state.workspace.registry) {
+    match state
+        .app_state
+        .execute_legacy_migration_owned(migrator, plan)
+        .await
+    {
         Ok(report) => {
             tracing::info!(
                 workspaces = report.workspaces_created.len(),

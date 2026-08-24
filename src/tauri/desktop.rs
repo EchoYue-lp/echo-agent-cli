@@ -214,7 +214,8 @@ async fn run_desktop() -> anyhow::Result<()> {
         .with_prompt_assembly(runtime.prompt_assembly.clone())
         .with_plugin_runtime(Some(runtime.plugin_runtime.clone()))
         .with_config_watcher(Some(config_watcher.clone()))
-        .with_command_cell_runtime(runtime.command_cell_runtime.clone());
+        .with_command_cell_runtime(runtime.command_cell_runtime.clone())
+        .with_workspace_delete_hook(runtime.browser_runtime.clone());
     state_inner.webhook.emitter = webhook_emitter;
     match state_inner.recover_committed_conversation_deletions().await {
         Ok(receipts) if !receipts.is_empty() => tracing::info!(

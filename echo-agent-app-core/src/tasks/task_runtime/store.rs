@@ -2647,6 +2647,17 @@ impl TaskRuntimeStore {
     ) -> Result<TaskRun, StoreError> {
         self.with_run_lock(run_id, || {
             if let Some(existing) = self.get_run(run_id)? {
+                if existing.workspace_id != workspace_id
+                    || existing.conversation_id != conversation_id
+                    || existing.root_message_id != root_message_id
+                    || existing.domain_profile != domain_profile
+                    || existing.route != route
+                    || existing.attended_mode != attended_mode
+                {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "TaskRun '{run_id}' already exists with a different immutable identity"
+                    )));
+                }
                 return Ok(existing);
             }
 
@@ -6762,6 +6773,83 @@ mod tests {
 
     fn fresh() -> TaskRuntimeStore {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn create_run_rejects_same_id_with_different_identity() -> Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        store
+            .create_run(
+                "same-run",
+                "global",
+                "conversation-a",
+                "root-a",
+                DomainProfile::General,
+                "goal-a",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let duplicate = store.create_run(
+            "same-run",
+            "global",
+            "conversation-b",
+            "root-b",
+            DomainProfile::General,
+            "goal-b",
+            "task",
+            AttendedMode::Attended,
+        );
+        assert!(duplicate.is_err_and(|error| error.to_string().contains("different immutable")));
+        Ok(())
+    }
+
+    #[test]
+    fn create_run_retry_remains_idempotent_after_goal_update() -> Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        store
+            .create_run(
+                "goal-run",
+                "global",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "goal A",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("goal-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("goal-run", TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        store
+            .update_run_goal(
+                "goal-run",
+                1,
+                "goal B",
+                "user refined goal",
+                RunGoalActorSource::Cli,
+            )
+            .map_err(|error| error.to_string())?;
+
+        let existing = store
+            .create_run(
+                "goal-run",
+                "global",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "goal A",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(existing.goal, "goal B");
+        assert_eq!(existing.goal_revision, 2);
+        Ok(())
     }
 
     fn last_frame_event_types(

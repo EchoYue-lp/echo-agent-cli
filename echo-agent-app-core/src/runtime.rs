@@ -405,7 +405,8 @@ impl AgentRuntime {
             .with_review_integration(self.review_integration.clone())
             .with_prompt_assembly(self.prompt_assembly.clone())
             .with_plugin_runtime(Some(self.plugin_runtime.clone()))
-            .with_command_cell_runtime(self.command_cell_runtime.clone());
+            .with_command_cell_runtime(self.command_cell_runtime.clone())
+            .with_workspace_delete_hook(self.browser_runtime.clone());
         // Note: task_service and scheduler are started separately by the caller
         // because they need a Store which may be created differently per entry.
         Ok(state)

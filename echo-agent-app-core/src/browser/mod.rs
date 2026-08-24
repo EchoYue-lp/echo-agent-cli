@@ -290,6 +290,38 @@ impl BrowserRuntime {
         self.inner.sessions.remove_workspace(workspace_id).await;
     }
 
+    #[cfg(test)]
+    pub(crate) async fn workspace_projection_counts_for_test(
+        &self,
+        workspace_id: &str,
+    ) -> (usize, usize, usize) {
+        let roots = self
+            .inner
+            .workspace_roots
+            .read()
+            .await
+            .values()
+            .filter(|candidate| candidate.as_str() == workspace_id)
+            .count();
+        let providers = self
+            .inner
+            .approval_providers
+            .read()
+            .await
+            .keys()
+            .filter(|address| address.workspace_id == workspace_id)
+            .count();
+        let sessions = self
+            .inner
+            .sessions
+            .sessions()
+            .await
+            .into_iter()
+            .filter(|session| session.workspace_id == workspace_id)
+            .count();
+        (roots, providers, sessions)
+    }
+
     pub async fn interrupt(&self) {
         for backend in [BrowserBackend::Managed, BrowserBackend::Chrome] {
             let client = self.client_slot(backend).write().await.take();
@@ -1183,6 +1215,14 @@ impl BrowserRuntime {
                 .unwrap_or_else(|| "global".to_string()),
             conversation_id,
         )
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::state::WorkspaceDeleteHook for BrowserRuntime {
+    async fn remove_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+        BrowserRuntime::remove_workspace(self, workspace_id).await;
+        Ok(())
     }
 }
 

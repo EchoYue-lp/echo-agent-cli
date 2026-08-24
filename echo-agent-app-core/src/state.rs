@@ -619,12 +619,53 @@ impl WorkspaceTransitionReceipt {
 }
 
 enum WorkspaceTransitionRequest {
+    Create {
+        name: String,
+        kind: crate::workspace::WorkspaceKind,
+        root: Option<std::path::PathBuf>,
+    },
+    #[cfg(test)]
     Switch(Workspace),
+    SwitchRegistered(crate::workspace::WorkspaceId),
     Exit,
+    Delete(crate::workspace::WorkspaceId),
+    LinkProject {
+        workspace_id: Option<crate::workspace::WorkspaceId>,
+        project_root: std::path::PathBuf,
+    },
+    Migrate {
+        migrator: crate::workspace::migration::LegacyMigrator,
+        plan: crate::workspace::migration::MigrationPlan,
+    },
+}
+
+enum WorkspaceSettlementOutcome {
+    Created(Workspace, bool),
+    Transition(WorkspaceTransitionReceipt),
+    Deleted,
+    Linked(Workspace),
+    Migrated(crate::workspace::migration::MigrationReport),
+}
+
+struct WorkspaceTransitionMarker {
+    transitioning: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+struct WorkspaceTransitionTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl Drop for WorkspaceTransitionMarker {
+    fn drop(&mut self) {
+        self.transitioning
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
 }
 
 type WorkspaceSettlementHandle =
-    tokio::task::JoinHandle<anyhow::Result<WorkspaceTransitionReceipt>>;
+    tokio::task::JoinHandle<anyhow::Result<WorkspaceSettlementOutcome>>;
 
 pub struct WorkspaceState {
     /// Authoritative focused host (`None` means global default paths).
@@ -639,7 +680,12 @@ pub struct WorkspaceState {
     pub global_execution_root: std::path::PathBuf,
     /// Serializes focus changes so two UI or automation requests cannot publish
     /// different focused hosts at the same time.
-    pub transition: Mutex<()>,
+    pub transition: Arc<RwLock<()>>,
+    /// True only while the owned transition future is publishing or settling a
+    /// new focused workspace generation.
+    transitioning: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    transition_test_barrier: std::sync::Mutex<Option<WorkspaceTransitionTestBarrier>>,
     /// Owned non-abortable settlement after a transition request is accepted.
     /// Dropping an IPC/CLI waiter detaches only that waiter; the application
     /// retains this handle until publication or shutdown has awaited it.
@@ -655,6 +701,7 @@ pub struct WorkspaceState {
 /// conversation deletion authority alive until the turn settles.
 #[derive(Clone)]
 pub struct ScopedChatRuntime {
+    _lifetime: ScopedRuntimeLifetime,
     execution_scope: crate::workspace::WorkspaceExecutionScope,
     primary_agent: AgentHandle,
     pool: Option<Arc<crate::agent_pool::AgentPool>>,
@@ -663,6 +710,37 @@ pub struct ScopedChatRuntime {
     conversation_store: Option<Arc<dyn ConversationStore>>,
     runtime_state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
     deletions: Arc<crate::conversation_deletion::ConversationDeletionService>,
+}
+
+pub struct ScopedWorkspaceControl {
+    runtime: ScopedChatRuntime,
+    workspace: Option<Workspace>,
+}
+
+struct ScopedConversationControl {
+    _lifetime: ScopedRuntimeLifetime,
+    store: Arc<dyn ConversationStore>,
+}
+
+impl ScopedWorkspaceControl {
+    pub fn runtime(&self) -> &ScopedChatRuntime {
+        &self.runtime
+    }
+
+    pub fn project_root(&self) -> std::path::PathBuf {
+        self.workspace
+            .as_ref()
+            .and_then(|workspace| workspace.project_root.clone())
+            .unwrap_or_else(|| self.runtime.execution_scope().root().to_path_buf())
+    }
+}
+
+#[derive(Clone)]
+enum ScopedRuntimeLifetime {
+    Global,
+    Workspace {
+        _lease: crate::workspace::runtime::WorkspaceControlLease,
+    },
 }
 
 impl ScopedChatRuntime {
@@ -751,10 +829,31 @@ impl ScopedChatRuntime {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScopedChatTurnError {
+    #[error(transparent)]
+    Control(#[from] ScopedControlError),
     #[error("workspace chat runtime unavailable: {0}")]
     Runtime(String),
     #[error(transparent)]
     Conversation(#[from] crate::conversation_deletion::ConversationDeletionError),
+}
+
+/// Fail-closed resolution error for workspace-scoped control operations.
+///
+/// Control surfaces must not wait through a focus transition and then
+/// accidentally operate on the newly published workspace. They either pin the
+/// exact currently published host generation or report that publication is in
+/// progress.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ScopedControlError {
+    #[error("workspace transition is in progress; retry the control operation")]
+    WorkspaceTransition,
+    #[error("workspace control runtime unavailable: {0}")]
+    Runtime(String),
+}
+
+#[async_trait::async_trait]
+pub trait WorkspaceDeleteHook: Send + Sync {
+    async fn remove_workspace(&self, workspace_id: &str) -> anyhow::Result<()>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1009,9 +1108,18 @@ pub struct AppState {
     pub agent_router: Arc<crate::agent_router::AgentRouter>,
     /// Owned lifetime for asynchronous inbox consumers.
     pub agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
+    /// Product projections that must be retired before workspace metadata can
+    /// be released and the same identity recreated.
+    workspace_delete_hook: Option<Arc<dyn WorkspaceDeleteHook>>,
 }
 
 impl AppState {
+    pub fn workspace_transition_in_progress(&self) -> bool {
+        self.workspace
+            .transitioning
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// 从共享的 Agent 和 HITL Dispatcher 创建状态（用于双模式）
     pub fn from_shared(
         agent: AgentHandle,
@@ -1155,7 +1263,10 @@ impl AppState {
                 current: RwLock::new(None),
                 runtimes: Arc::new(crate::workspace::runtime::WorkspaceRuntimeRegistry::new()),
                 global_conversation,
-                transition: Mutex::new(()),
+                transition: Arc::new(RwLock::new(())),
+                transitioning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                #[cfg(test)]
+                transition_test_barrier: std::sync::Mutex::new(None),
                 settlement: Mutex::new(None),
                 last_transition: RwLock::new(None),
                 global_execution_root: std::env::current_dir()
@@ -1183,6 +1294,7 @@ impl AppState {
             terminal: crate::terminal::TerminalService::new(),
             agent_router: crate::agent_router::AgentRouter::at_default_root(),
             agent_deliveries: Arc::new(crate::agent_router::AgentDeliverySupervisor::default()),
+            workspace_delete_hook: None,
         })
     }
 
@@ -1348,7 +1460,7 @@ impl AppState {
             }
             None => mutation.config.clone(),
         };
-        let _workspace_generation = self.workspace.transition.lock().await;
+        let _workspace_generation = self.workspace.transition.write().await;
         let mut model_pools = self.connection.pool.iter().cloned().collect::<Vec<_>>();
         model_pools.extend(
             self.workspace
@@ -1566,6 +1678,11 @@ impl AppState {
         self
     }
 
+    pub fn with_workspace_delete_hook(mut self, hook: Arc<dyn WorkspaceDeleteHook>) -> Self {
+        self.workspace_delete_hook = Some(hook);
+        self
+    }
+
     pub async fn shutdown_command_cells(&self) -> Result<(), String> {
         match self.command_cell_runtime.as_ref() {
             Some(runtime) => runtime.shutdown().await,
@@ -1602,7 +1719,7 @@ impl AppState {
         conversation: NewConversation,
     ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
     {
-        let _workspace = self.workspace.transition.lock().await;
+        let _workspace = self.workspace.transition.read().await;
         let binding = self.storage.conversation.read().await;
         let store = binding
             .store
@@ -1620,7 +1737,7 @@ impl AppState {
         conversation: NewConversation,
     ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
     {
-        let _workspace = self.workspace.transition.lock().await;
+        let _workspace = self.workspace.transition.read().await;
         let binding = self.storage.conversation.read().await;
         let store = binding
             .store
@@ -1642,7 +1759,7 @@ impl AppState {
         crate::foreground_turn::ForegroundTurnLease,
         crate::conversation_deletion::ConversationDeletionError,
     > {
-        let _workspace = self.workspace.transition.lock().await;
+        let _workspace = self.workspace.transition.read().await;
         let execution_scope = self.current_execution_scope().await;
         let binding = self.storage.conversation.read().await;
         binding
@@ -1665,7 +1782,7 @@ impl AppState {
         crate::conversation_deletion::ConversationDeletionReceipt,
         crate::conversation_deletion::ConversationDeletionError,
     > {
-        let _workspace = self.workspace.transition.lock().await;
+        let _workspace = self.workspace.transition.read().await;
         let runtime = self.current_chat_runtime_inner().await.map_err(|error| {
             crate::conversation_deletion::ConversationDeletionError::ConversationStore(
                 error.to_string(),
@@ -1732,7 +1849,7 @@ impl AppState {
         Vec<crate::conversation_deletion::ConversationDeletionReceipt>,
         crate::conversation_deletion::ConversationDeletionError,
     > {
-        let _workspace = self.workspace.transition.lock().await;
+        let _workspace = self.workspace.transition.read().await;
         let binding = self.storage.conversation.read().await;
         let store = binding
             .store
@@ -1848,6 +1965,10 @@ impl AppState {
     }
 
     async fn reconcile_task_runs_at_boot(&self) -> TaskRunBootReport {
+        // Bootstrap owns lifecycle write admission before any user surface is
+        // started. Raw host recovery below is therefore not concurrent with
+        // create/delete/control lookup.
+        let _lifecycle = self.workspace.transition.write().await;
         let mut report = TaskRunBootReport::default();
         if let Some(store) = self.tasks.runtime.clone() {
             self.reconcile_task_run_scope("global", store, &mut report)
@@ -1930,7 +2051,7 @@ impl AppState {
                     continue;
                 }
             }
-            let runtime = match self.chat_runtime_for_scope(workspace_id).await {
+            let runtime = match self.chat_runtime_for_scope_locked(workspace_id).await {
                 Ok(runtime) => runtime,
                 Err(error) => {
                     report
@@ -2183,6 +2304,157 @@ impl AppState {
 
     // ── 工作区管理 ──
 
+    /// Create workspace metadata under the same lifecycle write admission used
+    /// by switch and delete. A control lookup can never observe a half-created
+    /// registry generation.
+    pub async fn create_workspace_owned(
+        self: &Arc<Self>,
+        name: &str,
+        kind: crate::workspace::WorkspaceKind,
+        root: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<(Workspace, bool)> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Create {
+                name: name.to_string(),
+                kind,
+                root,
+            })
+            .await?
+        {
+            WorkspaceSettlementOutcome::Created(workspace, created) => Ok((workspace, created)),
+            _ => anyhow::bail!("workspace create settlement returned an unexpected outcome"),
+        }
+    }
+
+    async fn create_workspace_inner(
+        &self,
+        name: String,
+        kind: crate::workspace::WorkspaceKind,
+        root: Option<std::path::PathBuf>,
+    ) -> anyhow::Result<(Workspace, bool)> {
+        let _lifecycle = self.workspace.transition.write().await;
+        let registry = Arc::clone(&self.workspace.registry);
+        tokio::task::spawn_blocking(move || {
+            let workspace_id = crate::workspace::WorkspaceId::from_name(&name);
+            let requested_root = root.clone().unwrap_or_else(|| registry.default_root(&name));
+            if let Ok(existing) = registry.open(&workspace_id) {
+                let same_root = match (existing.root.canonicalize(), requested_root.canonicalize())
+                {
+                    (Ok(existing), Ok(requested)) => existing == requested,
+                    _ => existing.root == requested_root,
+                };
+                if root.is_none() || same_root {
+                    return Ok((existing, false));
+                }
+                anyhow::bail!(
+                    "Workspace '{}' already exists at a different path: {}",
+                    workspace_id,
+                    existing.root.display()
+                );
+            }
+            let workspace = match root {
+                Some(root) => registry
+                    .create_at(&name, kind, root)
+                    .map_err(anyhow::Error::msg),
+                None => registry.create(&name, kind).map_err(anyhow::Error::msg),
+            }?;
+            Ok((workspace, true))
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("workspace create task failed: {error}"))?
+    }
+
+    pub async fn link_workspace_project_owned(
+        self: &Arc<Self>,
+        workspace_id: &crate::workspace::WorkspaceId,
+        project_root: std::path::PathBuf,
+    ) -> anyhow::Result<Workspace> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::LinkProject {
+                workspace_id: Some(workspace_id.clone()),
+                project_root,
+            })
+            .await?
+        {
+            WorkspaceSettlementOutcome::Linked(workspace) => Ok(workspace),
+            _ => anyhow::bail!("workspace link settlement returned an unexpected outcome"),
+        }
+    }
+
+    pub async fn link_current_workspace_project_owned(
+        self: &Arc<Self>,
+        project_root: std::path::PathBuf,
+    ) -> anyhow::Result<Workspace> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::LinkProject {
+                workspace_id: None,
+                project_root,
+            })
+            .await?
+        {
+            WorkspaceSettlementOutcome::Linked(workspace) => Ok(workspace),
+            _ => anyhow::bail!("workspace link settlement returned an unexpected outcome"),
+        }
+    }
+
+    async fn link_workspace_project_inner(
+        &self,
+        workspace_id: Option<crate::workspace::WorkspaceId>,
+        project_root: std::path::PathBuf,
+    ) -> anyhow::Result<Workspace> {
+        let _lifecycle = self.workspace.transition.write().await;
+        let workspace_id = match workspace_id {
+            Some(workspace_id) => workspace_id,
+            None => self
+                .workspace
+                .current
+                .read()
+                .await
+                .as_ref()
+                .map(|host| host.id().clone())
+                .ok_or_else(|| anyhow::anyhow!("No active workspace"))?,
+        };
+        let registry = Arc::clone(&self.workspace.registry);
+        let link_workspace_id = workspace_id.clone();
+        let workspace = tokio::task::spawn_blocking(move || {
+            registry.link_project(&link_workspace_id, project_root)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("workspace link task failed: {error}"))??;
+        if let Some(host) = self.workspace.current.read().await.clone()
+            && host.id() == &workspace_id
+        {
+            host.refresh_workspace(workspace.clone()).await?;
+        }
+        Ok(workspace)
+    }
+
+    pub async fn execute_legacy_migration_owned(
+        self: &Arc<Self>,
+        migrator: crate::workspace::migration::LegacyMigrator,
+        plan: crate::workspace::migration::MigrationPlan,
+    ) -> anyhow::Result<crate::workspace::migration::MigrationReport> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Migrate { migrator, plan })
+            .await?
+        {
+            WorkspaceSettlementOutcome::Migrated(report) => Ok(report),
+            _ => anyhow::bail!("workspace migration settlement returned an unexpected outcome"),
+        }
+    }
+
+    async fn execute_legacy_migration_inner(
+        &self,
+        migrator: crate::workspace::migration::LegacyMigrator,
+        plan: crate::workspace::migration::MigrationPlan,
+    ) -> anyhow::Result<crate::workspace::migration::MigrationReport> {
+        let _lifecycle = self.workspace.transition.write().await;
+        let registry = Arc::clone(&self.workspace.registry);
+        tokio::task::spawn_blocking(move || migrator.execute(&plan, registry.as_ref()))
+            .await
+            .map_err(|error| anyhow::anyhow!("workspace migration task failed: {error}"))?
+    }
+
     /// 获取当前活跃工作区（None 表示使用全局默认路径）。
     pub async fn current_workspace(&self) -> Option<Workspace> {
         let current = self.workspace.current.read().await.clone();
@@ -2210,6 +2482,15 @@ impl AppState {
         &self,
         workspace_id: &crate::workspace::WorkspaceId,
     ) -> anyhow::Result<()> {
+        let _lifecycle = self.workspace.transition.read().await;
+        self.ensure_workspace_idle_for_delete_inner(workspace_id)
+            .await
+    }
+
+    async fn ensure_workspace_idle_for_delete_inner(
+        &self,
+        workspace_id: &crate::workspace::WorkspaceId,
+    ) -> anyhow::Result<()> {
         let foreground = self
             .session
             .foreground_turns
@@ -2232,39 +2513,68 @@ impl AppState {
             && !activity.is_idle()
         {
             anyhow::bail!(
-                "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {})",
+                "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {}, controls: {})",
                 workspace_id,
                 activity.active_pool_executions,
                 activity.active_run_drivers,
-                activity.active_run_driver_receipts
+                activity.active_run_driver_receipts,
+                activity.active_controls
             );
         }
         Ok(())
     }
 
-    pub async fn evict_workspace_for_delete(
-        &self,
+    /// Sole workspace deletion transaction. Lock order is lifecycle write
+    /// admission, focused host, runtime registry/host Closing, projections,
+    /// then metadata registry. Explicit controls hold lifecycle read admission
+    /// through host pin, so no orphan runtime can reopen during deletion.
+    pub async fn delete_workspace_owned(
+        self: &Arc<Self>,
         workspace_id: &crate::workspace::WorkspaceId,
-    ) -> anyhow::Result<bool> {
-        self.ensure_workspace_idle_for_delete(workspace_id).await?;
-        self.workspace
-            .runtimes
-            .shutdown_and_evict_if_idle(workspace_id)
-            .await
+    ) -> anyhow::Result<()> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Delete(
+                workspace_id.clone(),
+            ))
+            .await?
+        {
+            WorkspaceSettlementOutcome::Deleted => Ok(()),
+            _ => anyhow::bail!("workspace delete settlement returned an unexpected outcome"),
+        }
     }
 
-    /// Remove process-global secondary projections after the target workspace
-    /// has proven idle and its runtime generation has been evicted.
-    pub fn purge_workspace_projections_for_delete(
+    async fn delete_workspace_inner(
         &self,
         workspace_id: &crate::workspace::WorkspaceId,
     ) -> anyhow::Result<()> {
-        self.storage
-            .chat_events
-            .remove_workspace(workspace_id.as_str())?;
-        self.storage
-            .tool_executions
-            .remove_workspace(workspace_id.as_str())?;
+        let _lifecycle = self.workspace.transition.write().await;
+        self.ensure_workspace_idle_for_delete_inner(workspace_id)
+            .await?;
+        let current = self.workspace.current.read().await.clone();
+        if current
+            .as_ref()
+            .is_some_and(|host| host.id() == workspace_id)
+        {
+            self.exit_workspace_inner_locked().await?;
+        }
+        self.workspace
+            .runtimes
+            .shutdown_and_evict_if_idle(workspace_id)
+            .await?;
+        if let Some(hook) = self.workspace_delete_hook.as_ref() {
+            hook.remove_workspace(workspace_id.as_str()).await?;
+        }
+        let chat_events = Arc::clone(&self.storage.chat_events);
+        let tool_executions = Arc::clone(&self.storage.tool_executions);
+        let registry = Arc::clone(&self.workspace.registry);
+        let workspace_id = workspace_id.clone();
+        tokio::task::spawn_blocking(move || {
+            chat_events.remove_workspace(workspace_id.as_str())?;
+            tool_executions.remove_workspace(workspace_id.as_str())?;
+            registry.delete(&workspace_id).map_err(anyhow::Error::msg)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("workspace deletion task failed: {error}"))??;
         Ok(())
     }
 
@@ -2321,19 +2631,17 @@ impl AppState {
             .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
         let mut endpoints = Vec::new();
         for workspace in workspaces {
-            let host = match self.workspace.runtimes.get_or_open(workspace.clone()).await {
-                Ok(host) => host,
+            let control = match self
+                .conversation_control_for_scope(workspace.id.as_str())
+                .await
+            {
+                Ok(control) => control,
                 Err(error) => {
                     tracing::warn!(workspace = %workspace.id, %error, "Agent endpoint discovery skipped an unavailable workspace");
                     continue;
                 }
             };
-            let conversations = match host
-                .resources()
-                .conversation_store()
-                .list_conversations(Default::default())
-                .await
-            {
+            let conversations = match control.store.list_conversations(Default::default()).await {
                 Ok(conversations) => conversations,
                 Err(error) => {
                     tracing::warn!(workspace = %workspace.id, %error, "Agent endpoint discovery skipped an unreadable conversation store");
@@ -2374,19 +2682,16 @@ impl AppState {
         let Some(conversation_id) = conversation_id.filter(|value| !value.trim().is_empty()) else {
             return Ok(None);
         };
-        let Some(workspace) = self.current_workspace().await else {
+        let Some((workspace_id, control)) = self
+            .current_conversation_control()
+            .await
+            .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?
+        else {
             return Ok(None);
         };
-        let address = crate::agent_router::AgentAddress::new(workspace.id.clone(), conversation_id);
-        let host = self
-            .workspace
-            .runtimes
-            .get_or_open(workspace)
-            .await
-            .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
-        let conversation = host
-            .resources()
-            .conversation_store()
+        let address = crate::agent_router::AgentAddress::new(workspace_id, conversation_id);
+        let conversation = control
+            .store
             .get_conversation(&address.conversation_id)
             .await
             .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?;
@@ -2478,16 +2783,12 @@ impl AppState {
         &self,
         address: &crate::agent_router::AgentAddress,
     ) -> Result<(), AgentMessageSendError> {
-        let workspace = self.registered_workspace_for_agent(address)?;
-        let host = self
-            .workspace
-            .runtimes
-            .get_or_open(workspace)
+        let control = self
+            .conversation_control_for_scope(address.workspace_id.as_str())
             .await
             .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
-        let conversation = host
-            .resources()
-            .conversation_store()
+        let conversation = control
+            .store
             .get_conversation(&address.conversation_id)
             .await
             .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?;
@@ -2498,21 +2799,6 @@ impl AppState {
             });
         }
         Ok(())
-    }
-
-    fn registered_workspace_for_agent(
-        &self,
-        address: &crate::agent_router::AgentAddress,
-    ) -> Result<Workspace, AgentMessageSendError> {
-        self.workspace
-            .registry
-            .list()
-            .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?
-            .into_iter()
-            .find(|workspace| workspace.id == address.workspace_id)
-            .ok_or_else(|| {
-                AgentMessageSendError::WorkspaceNotFound(address.workspace_id.to_string())
-            })
     }
 
     async fn chat_runtime_for_agent(
@@ -2532,9 +2818,102 @@ impl AppState {
         &self,
         workspace_id: &str,
     ) -> anyhow::Result<ScopedChatRuntime> {
+        // Lock order: lifecycle admission -> metadata registry -> runtime
+        // registry/host lifecycle. Workspace deletion takes the write side and
+        // therefore cannot evict or remove metadata between lookup and pin.
+        let _lifecycle = self.workspace.transition.read().await;
+        self.chat_runtime_for_scope_locked(workspace_id).await
+    }
+
+    async fn conversation_control_for_scope(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<ScopedConversationControl> {
+        let _lifecycle = self.workspace.transition.read().await;
         if workspace_id == "global" {
-            let binding = self.storage.conversation.read().await;
+            let binding = &self.workspace.global_conversation;
+            let store = binding
+                .store
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("global conversation store is unavailable"))?;
+            return Ok(ScopedConversationControl {
+                _lifetime: ScopedRuntimeLifetime::Global,
+                store,
+            });
+        }
+
+        let workspace = self
+            .workspace
+            .registry
+            .list()?
+            .into_iter()
+            .find(|workspace| workspace.id.as_str() == workspace_id)
+            .ok_or_else(|| anyhow::anyhow!("workspace '{workspace_id}' is not registered"))?;
+        let (host, control_lease) = self
+            .workspace
+            .runtimes
+            .get_or_open_control(workspace)
+            .await?;
+        Ok(ScopedConversationControl {
+            _lifetime: ScopedRuntimeLifetime::Workspace {
+                _lease: control_lease,
+            },
+            store: host.resources().conversation_store(),
+        })
+    }
+
+    async fn current_conversation_control(
+        &self,
+    ) -> anyhow::Result<Option<(crate::workspace::WorkspaceId, ScopedConversationControl)>> {
+        let _lifecycle = self.workspace.transition.read().await;
+        let Some(host) = self.workspace.current.read().await.clone() else {
+            return Ok(None);
+        };
+        let control_lease = self
+            .workspace
+            .runtimes
+            .acquire_control_for_host(&host)
+            .await?;
+        Ok(Some((
+            host.id().clone(),
+            ScopedConversationControl {
+                _lifetime: ScopedRuntimeLifetime::Workspace {
+                    _lease: control_lease,
+                },
+                store: host.resources().conversation_store(),
+            },
+        )))
+    }
+
+    pub async fn workspace_control_for_scope(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<ScopedWorkspaceControl> {
+        let _lifecycle = self.workspace.transition.read().await;
+        let runtime = self.chat_runtime_for_scope_locked(workspace_id).await?;
+        let workspace = if workspace_id == "global" {
+            None
+        } else {
+            Some(
+                self.workspace
+                    .registry
+                    .open(&crate::workspace::WorkspaceId::from_raw(
+                        workspace_id.to_string(),
+                    ))
+                    .map_err(anyhow::Error::msg)?,
+            )
+        };
+        Ok(ScopedWorkspaceControl { runtime, workspace })
+    }
+
+    async fn chat_runtime_for_scope_locked(
+        &self,
+        workspace_id: &str,
+    ) -> anyhow::Result<ScopedChatRuntime> {
+        if workspace_id == "global" {
+            let binding = &self.workspace.global_conversation;
             return Ok(ScopedChatRuntime {
+                _lifetime: ScopedRuntimeLifetime::Global,
                 execution_scope: crate::workspace::WorkspaceExecutionScope::global(
                     self.workspace.global_execution_root.clone(),
                 ),
@@ -2555,7 +2934,11 @@ impl AppState {
             .into_iter()
             .find(|workspace| workspace.id.as_str() == workspace_id)
             .ok_or_else(|| anyhow::anyhow!("workspace '{workspace_id}' is not registered"))?;
-        let host = self.workspace.runtimes.get_or_open(workspace).await?;
+        let (host, control_lease) = self
+            .workspace
+            .runtimes
+            .get_or_open_control(workspace)
+            .await?;
         let seed_pool = self.connection.pool.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Workspace execution requires the application AgentPool to be initialized"
@@ -2565,6 +2948,9 @@ impl AppState {
         let task_runtime = execution.task_runtime();
         self.attach_task_execution_target_resolver(&task_runtime, seed_pool);
         Ok(ScopedChatRuntime {
+            _lifetime: ScopedRuntimeLifetime::Workspace {
+                _lease: control_lease,
+            },
             execution_scope: host.execution_scope(),
             primary_agent: execution.primary_agent(),
             pool: Some(execution.pool()),
@@ -3152,7 +3538,7 @@ impl AppState {
     pub async fn current_plugin_runtime_owned(
         &self,
     ) -> anyhow::Result<Arc<crate::plugin_runtime::PluginRuntimeService>> {
-        let _transition = self.workspace.transition.lock().await;
+        let _transition = self.workspace.transition.read().await;
         let current = self.workspace.current.read().await.clone();
         if let Some(host) = current {
             let seed_pool = self.connection.pool.as_ref().ok_or_else(|| {
@@ -3263,8 +3649,34 @@ impl AppState {
 
     /// Capture all execution authorities for the currently focused workspace.
     pub async fn current_chat_runtime(&self) -> anyhow::Result<ScopedChatRuntime> {
-        let _transition = self.workspace.transition.lock().await;
+        let _lifecycle = self.workspace.transition.read().await;
         self.current_chat_runtime_inner().await
+    }
+
+    /// Pin the exact currently published runtime for one control operation.
+    ///
+    /// Unlike chat admission, a control command is not queued across a
+    /// workspace transition. Returning a typed transition error keeps a command
+    /// issued against workspace A from silently landing in workspace B.
+    pub async fn current_control_runtime(&self) -> Result<ScopedChatRuntime, ScopedControlError> {
+        if self
+            .workspace
+            .transitioning
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ScopedControlError::WorkspaceTransition);
+        }
+        let _lifecycle = self.workspace.transition.read().await;
+        if self
+            .workspace
+            .transitioning
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ScopedControlError::WorkspaceTransition);
+        }
+        self.current_chat_runtime_inner()
+            .await
+            .map_err(|error| ScopedControlError::Runtime(error.to_string()))
     }
 
     /// Run one structured extraction against the pooled Agent resolved by the
@@ -3355,6 +3767,11 @@ impl AppState {
         let current = self.workspace.current.read().await.clone();
         match current {
             Some(host) => {
+                let control_lease = self
+                    .workspace
+                    .runtimes
+                    .acquire_control_for_host(&host)
+                    .await?;
                 let seed_pool = self.connection.pool.as_ref().ok_or_else(|| {
                     anyhow::anyhow!(
                         "Workspace execution requires the application AgentPool to be initialized"
@@ -3364,6 +3781,9 @@ impl AppState {
                 let task_runtime = execution.task_runtime();
                 self.attach_task_execution_target_resolver(&task_runtime, seed_pool);
                 Ok(ScopedChatRuntime {
+                    _lifetime: ScopedRuntimeLifetime::Workspace {
+                        _lease: control_lease,
+                    },
                     execution_scope: host.execution_scope(),
                     primary_agent: execution.primary_agent(),
                     pool: Some(execution.pool()),
@@ -3377,6 +3797,7 @@ impl AppState {
             None => {
                 let binding = self.storage.conversation.read().await;
                 Ok(ScopedChatRuntime {
+                    _lifetime: ScopedRuntimeLifetime::Global,
                     execution_scope: crate::workspace::WorkspaceExecutionScope::global(
                         self.workspace.global_execution_root.clone(),
                     ),
@@ -3405,7 +3826,7 @@ impl AppState {
         ),
         ScopedChatTurnError,
     > {
-        let _transition = self.workspace.transition.lock().await;
+        let _lifecycle = self.workspace.transition.read().await;
         let runtime = self
             .current_chat_runtime_inner()
             .await
@@ -3421,50 +3842,79 @@ impl AppState {
         Ok((runtime, lease))
     }
 
-    /// Refresh mutable registry metadata without replacing the focused host or
-    /// reopening its immutable runtime resources.
-    pub async fn refresh_current_workspace_metadata(
-        &self,
-        workspace: Workspace,
-    ) -> anyhow::Result<Workspace> {
-        let current = self
-            .workspace
-            .current
-            .read()
-            .await
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("No active workspace"))?;
-        if current.id() != &workspace.id {
-            anyhow::bail!(
-                "Focused workspace identity mismatch: expected {}, received {}",
-                current.id(),
-                workspace.id
-            );
-        }
-        current.refresh_workspace(workspace).await?;
-        Ok(current.workspace().await)
-    }
-
     /// 切换到指定工作区。
     ///
     /// 这会重新初始化 persistence 和 session manager 以使用工作区路径。
-    pub async fn switch_workspace(
+    #[cfg(test)]
+    pub(crate) async fn switch_workspace(
         self: &Arc<Self>,
         workspace: Workspace,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
-        self.run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(workspace))
-            .await
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Switch(workspace))
+            .await?
+        {
+            WorkspaceSettlementOutcome::Transition(receipt) => Ok(receipt),
+            _ => anyhow::bail!("workspace switch settlement returned an unexpected outcome"),
+        }
+    }
+
+    pub async fn switch_workspace_registered(
+        self: &Arc<Self>,
+        workspace_id: crate::workspace::WorkspaceId,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::SwitchRegistered(
+                workspace_id,
+            ))
+            .await?
+        {
+            WorkspaceSettlementOutcome::Transition(receipt) => Ok(receipt),
+            _ => anyhow::bail!("workspace switch settlement returned an unexpected outcome"),
+        }
     }
 
     pub async fn exit_workspace(self: &Arc<Self>) -> anyhow::Result<WorkspaceTransitionReceipt> {
-        self.run_owned_workspace_transition(WorkspaceTransitionRequest::Exit)
-            .await
+        match self
+            .run_owned_workspace_transition(WorkspaceTransitionRequest::Exit)
+            .await?
+        {
+            WorkspaceSettlementOutcome::Transition(receipt) => Ok(receipt),
+            _ => anyhow::bail!("workspace exit settlement returned an unexpected outcome"),
+        }
+    }
+
+    #[cfg(test)]
+    fn park_next_workspace_transition(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+        String,
+    > {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut barrier = self
+            .workspace
+            .transition_test_barrier
+            .lock()
+            .map_err(|_| "workspace transition test barrier lock is poisoned".to_string())?;
+        if barrier.is_some() {
+            return Err("workspace transition test barrier is already installed".to_string());
+        }
+        *barrier = Some(WorkspaceTransitionTestBarrier {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        Ok((entered_rx, release_tx))
     }
 
     async fn run_owned_workspace_transition(
         self: &Arc<Self>,
         request: WorkspaceTransitionRequest,
-    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+    ) -> anyhow::Result<WorkspaceSettlementOutcome> {
         let mut settlement = self.workspace.settlement.lock().await;
         if let Some(previous) = settlement.as_mut() {
             if let Err(error) = await_workspace_settlement(previous).await {
@@ -3476,13 +3926,45 @@ impl AppState {
             settlement.take();
         }
 
+        let marker = self.begin_workspace_transition_marker()?;
         let state = Arc::clone(self);
         *settlement = Some(tokio::spawn(async move {
+            let _marker = marker;
             match request {
-                WorkspaceTransitionRequest::Switch(workspace) => {
-                    state.switch_workspace_inner(workspace).await
-                }
-                WorkspaceTransitionRequest::Exit => state.exit_workspace_inner().await,
+                WorkspaceTransitionRequest::Create { name, kind, root } => state
+                    .create_workspace_inner(name, kind, root)
+                    .await
+                    .map(|(workspace, created)| {
+                        WorkspaceSettlementOutcome::Created(workspace, created)
+                    }),
+                #[cfg(test)]
+                WorkspaceTransitionRequest::Switch(workspace) => state
+                    .switch_workspace_inner(workspace)
+                    .await
+                    .map(WorkspaceSettlementOutcome::Transition),
+                WorkspaceTransitionRequest::SwitchRegistered(workspace_id) => state
+                    .switch_registered_workspace_inner(workspace_id)
+                    .await
+                    .map(WorkspaceSettlementOutcome::Transition),
+                WorkspaceTransitionRequest::Exit => state
+                    .exit_workspace_inner()
+                    .await
+                    .map(WorkspaceSettlementOutcome::Transition),
+                WorkspaceTransitionRequest::Delete(workspace_id) => state
+                    .delete_workspace_inner(&workspace_id)
+                    .await
+                    .map(|()| WorkspaceSettlementOutcome::Deleted),
+                WorkspaceTransitionRequest::LinkProject {
+                    workspace_id,
+                    project_root,
+                } => state
+                    .link_workspace_project_inner(workspace_id, project_root)
+                    .await
+                    .map(WorkspaceSettlementOutcome::Linked),
+                WorkspaceTransitionRequest::Migrate { migrator, plan } => state
+                    .execute_legacy_migration_inner(migrator, plan)
+                    .await
+                    .map(WorkspaceSettlementOutcome::Migrated),
             }
         }));
         let result = match settlement.as_mut() {
@@ -3493,6 +3975,25 @@ impl AppState {
         };
         settlement.take();
         result
+    }
+
+    fn begin_workspace_transition_marker(&self) -> anyhow::Result<WorkspaceTransitionMarker> {
+        if self
+            .workspace
+            .transitioning
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            anyhow::bail!("workspace transition owner is already active");
+        }
+        Ok(WorkspaceTransitionMarker {
+            transitioning: Arc::clone(&self.workspace.transitioning),
+        })
     }
 
     /// Await a detached workspace settlement before tearing down plugin,
@@ -3512,6 +4013,7 @@ impl AppState {
                 active_pool_executions = activity.active_pool_executions,
                 active_run_drivers = activity.active_run_drivers,
                 active_run_driver_receipts = activity.active_run_driver_receipts,
+                active_controls = activity.active_controls,
                 idle = activity.is_idle(),
                 "workspace runtime activity before shutdown"
             );
@@ -3526,11 +4028,47 @@ impl AppState {
         }
     }
 
+    #[cfg(test)]
     async fn switch_workspace_inner(
         &self,
         workspace: Workspace,
     ) -> anyhow::Result<WorkspaceTransitionReceipt> {
-        let _transition = self.workspace.transition.lock().await;
+        let _transition = self.workspace.transition.write().await;
+        #[cfg(test)]
+        {
+            let barrier = self
+                .workspace
+                .transition_test_barrier
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workspace transition test barrier is poisoned"))?
+                .take();
+            if let Some(barrier) = barrier {
+                let _ = barrier.entered.send(());
+                barrier.release.await.map_err(|_| {
+                    anyhow::anyhow!("workspace transition test barrier release was dropped")
+                })?;
+            }
+        }
+        self.switch_workspace_inner_locked(workspace).await
+    }
+
+    async fn switch_registered_workspace_inner(
+        &self,
+        workspace_id: crate::workspace::WorkspaceId,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
+        let _transition = self.workspace.transition.write().await;
+        let workspace = self
+            .workspace
+            .registry
+            .open(&workspace_id)
+            .map_err(anyhow::Error::msg)?;
+        self.switch_workspace_inner_locked(workspace).await
+    }
+
+    async fn switch_workspace_inner_locked(
+        &self,
+        workspace: Workspace,
+    ) -> anyhow::Result<WorkspaceTransitionReceipt> {
         let previous_workspace_id = self
             .workspace
             .current
@@ -3547,6 +4085,18 @@ impl AppState {
             (self.connection.pool.as_ref(), execution.as_ref())
         {
             self.attach_task_execution_target_resolver(&execution.task_runtime(), seed_pool);
+        }
+        if let Some(execution) = execution.as_ref() {
+            let conversation_id = uuid::Uuid::new_v4().to_string();
+            execution
+                .primary_agent()
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent.reset().await;
+                        agent.set_conversation_id(conversation_id);
+                    })
+                })
+                .await;
         }
 
         let workspace = host.workspace().await;
@@ -3603,7 +4153,11 @@ impl AppState {
 
     /// Exit workspace focus without mutating any loaded execution host.
     async fn exit_workspace_inner(&self) -> anyhow::Result<WorkspaceTransitionReceipt> {
-        let _transition = self.workspace.transition.lock().await;
+        let _transition = self.workspace.transition.write().await;
+        self.exit_workspace_inner_locked().await
+    }
+
+    async fn exit_workspace_inner_locked(&self) -> anyhow::Result<WorkspaceTransitionReceipt> {
         let global_execution_root = self
             .workspace
             .global_execution_root
@@ -3618,6 +4172,16 @@ impl AppState {
             .await
             .as_ref()
             .map(|host| host.id().to_string());
+        let conversation_id = uuid::Uuid::new_v4().to_string();
+        self.connection
+            .primary_agent()
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent.reset().await;
+                    agent.set_conversation_id(conversation_id);
+                })
+            })
+            .await;
 
         *self.storage.conversation.write().await = self.workspace.global_conversation.clone();
         *self.workspace.current.write().await = None;
@@ -5036,6 +5600,224 @@ mod workspace_transition_tests {
     use echo_agent::memory::{ConversationStore, FileConversationStore};
     use echo_agent::testing::MockLlmClient;
 
+    struct ParkedWorkspaceDeleteHook {
+        browser: Arc<crate::browser::BrowserRuntime>,
+        entered: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        calls: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl ParkedWorkspaceDeleteHook {
+        fn new(
+            browser: Arc<crate::browser::BrowserRuntime>,
+        ) -> (
+            Arc<Self>,
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ) {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            (
+                Arc::new(Self {
+                    browser,
+                    entered: tokio::sync::Mutex::new(Some(entered_tx)),
+                    release: tokio::sync::Mutex::new(Some(release_rx)),
+                    calls: tokio::sync::Mutex::new(Vec::new()),
+                }),
+                entered_rx,
+                release_tx,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkspaceDeleteHook for ParkedWorkspaceDeleteHook {
+        async fn remove_workspace(&self, workspace_id: &str) -> anyhow::Result<()> {
+            self.browser.remove_workspace(workspace_id).await;
+            self.calls.lock().await.push(workspace_id.to_string());
+            if let Some(entered) = self.entered.lock().await.take() {
+                let _ = entered.send(());
+            }
+            let release = self.release.lock().await.take();
+            if let Some(release) = release {
+                release
+                    .await
+                    .map_err(|_| anyhow::anyhow!("workspace delete hook release was dropped"))?;
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn workspace_delete_hook_settles_before_same_id_recreation() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let old_root = temp.path().join("old-workspace");
+        let new_root = temp.path().join("new-workspace");
+        std::fs::create_dir_all(&old_root).map_err(|error| error.to_string())?;
+        std::fs::create_dir_all(&new_root).map_err(|error| error.to_string())?;
+        let primary = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("workspace delete hook test")
+            .build()
+            .map(AgentHandle::new)
+            .map_err(|error| error.to_string())?;
+        let mcp = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let registry = Arc::new(
+            WorkspaceRegistry::with_base_dir(temp.path().join("registry"))
+                .map_err(|error| error.to_string())?,
+        );
+        let browser = crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig {
+            enabled: false,
+            extension_enabled: false,
+            session_dir: temp.path().join("browser-sessions"),
+            ..Default::default()
+        })
+        .await;
+        let (hook, hook_entered, hook_release) = ParkedWorkspaceDeleteHook::new(browser.clone());
+        let mut state = AppState::from_shared(
+            primary,
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            mcp,
+        )
+        .map_err(|error| error.to_string())?
+        .with_workspace_delete_hook(hook.clone());
+        state.workspace.registry = registry.clone();
+        state.storage.chat_events = Arc::new(
+            crate::chat_event_log::ChatEventLog::open(
+                temp.path().join("chat-events"),
+                crate::chat_event_log::ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.storage.tool_executions = Arc::new(
+            crate::tool_execution::ToolExecutionRepository::open(
+                temp.path().join("tool-executions"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let state = Arc::new(state);
+        let (old_workspace, created) = state
+            .create_workspace_owned(
+                "same-id",
+                crate::workspace::WorkspaceKind::General,
+                Some(old_root),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(created);
+        let old_address = crate::browser::BrowserApprovalAddress::new(
+            old_workspace.id.as_str(),
+            "old-conversation",
+        );
+        let provider: Arc<dyn echo_agent::human_loop::HumanLoopProvider> =
+            Arc::new(crate::hitl::HitlDispatcher::new());
+        let _old_registration = browser
+            .register_approval_provider(
+                old_address.clone(),
+                old_workspace.root.clone(),
+                provider.clone(),
+            )
+            .await;
+        let _old_lease = browser
+            .session_manager()
+            .lease_tab(&old_address, crate::browser::MAIN_TAB_OWNER, None)
+            .await;
+        assert_eq!(
+            browser
+                .workspace_projection_counts_for_test(old_workspace.id.as_str())
+                .await,
+            (1, 1, 1)
+        );
+
+        let delete_state = Arc::clone(&state);
+        let workspace_id = old_workspace.id.clone();
+        let delete =
+            tokio::spawn(async move { delete_state.delete_workspace_owned(&workspace_id).await });
+        hook_entered
+            .await
+            .map_err(|_| "workspace delete hook was not reached".to_string())?;
+        assert!(registry.open(&old_workspace.id).is_ok());
+        assert_eq!(
+            browser
+                .workspace_projection_counts_for_test(old_workspace.id.as_str())
+                .await,
+            (0, 0, 0)
+        );
+
+        let create_state = Arc::clone(&state);
+        let recreate = tokio::spawn(async move {
+            create_state
+                .create_workspace_owned(
+                    "same-id",
+                    crate::workspace::WorkspaceKind::General,
+                    Some(new_root),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!recreate.is_finished());
+        hook_release
+            .send(())
+            .map_err(|_| "workspace delete hook release receiver was dropped".to_string())?;
+        delete
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        let (recreated, created) = recreate
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(created);
+        assert_eq!(recreated.id, old_workspace.id);
+        assert_eq!(
+            registry
+                .open(&recreated.id)
+                .map_err(|error| error.to_string())?
+                .root,
+            recreated.root
+        );
+        state
+            .switch_workspace_registered(recreated.id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let new_address =
+            crate::browser::BrowserApprovalAddress::new(recreated.id.as_str(), "new-conversation");
+        let _new_registration = browser
+            .register_approval_provider(new_address.clone(), recreated.root.clone(), provider)
+            .await;
+        let _new_lease = browser
+            .session_manager()
+            .lease_tab(&new_address, crate::browser::MAIN_TAB_OWNER, None)
+            .await;
+        assert_eq!(
+            browser
+                .workspace_projection_counts_for_test(recreated.id.as_str())
+                .await,
+            (1, 1, 1)
+        );
+        let current_root = state
+            .current_workspace()
+            .await
+            .map(|workspace| workspace.root)
+            .ok_or_else(|| "recreated workspace was not focused".to_string())?
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let recreated_root = recreated
+            .root
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(current_root, recreated_root);
+        assert_eq!(hook.calls.lock().await.as_slice(), &["same-id".to_string()]);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn agent_group_target_resolver_acquires_remote_host_and_rejects_drift()
     -> Result<(), String> {
@@ -5234,10 +6016,14 @@ mod workspace_transition_tests {
             .await
             .map_err(|error| error.to_string())?;
 
-        let source =
-            crate::agent_router::AgentAddress::new(source_workspace.id, "source-conversation");
-        let target =
-            crate::agent_router::AgentAddress::new(target_workspace.id, "target-conversation");
+        let source = crate::agent_router::AgentAddress::new(
+            source_workspace.id.clone(),
+            "source-conversation",
+        );
+        let target = crate::agent_router::AgentAddress::new(
+            target_workspace.id.clone(),
+            "target-conversation",
+        );
         let endpoints = state
             .discover_agent_endpoints()
             .await
@@ -5257,6 +6043,52 @@ mod workspace_transition_tests {
                 .await
                 .map_err(|error| error.to_string())?,
             None
+        );
+
+        let (lookup_entered, lookup_release) =
+            state.workspace.runtimes.park_next_control_acquire()?;
+        let lookup_state = Arc::clone(&state);
+        let lookup = tokio::spawn(async move {
+            lookup_state
+                .current_agent_address(Some("source-conversation"))
+                .await
+        });
+        lookup_entered
+            .await
+            .map_err(|_| "current address lookup did not reach control pin barrier".to_string())?;
+        let switch_state = Arc::clone(&state);
+        let switch =
+            tokio::spawn(async move { switch_state.switch_workspace(target_workspace).await });
+        while !state.workspace_transition_in_progress() {
+            tokio::task::yield_now().await;
+        }
+        lookup_release
+            .send(())
+            .map_err(|_| "current address control pin release was dropped".to_string())?;
+        assert_eq!(
+            lookup
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?,
+            Some(source.clone())
+        );
+        switch
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            state
+                .current_agent_address(Some("source-conversation"))
+                .await
+                .map_err(|error| error.to_string())?,
+            None
+        );
+        assert_eq!(
+            state
+                .current_agent_address(Some("target-conversation"))
+                .await
+                .map_err(|error| error.to_string())?,
+            Some(target.clone())
         );
 
         let mut message = crate::agent_router::AgentMessage::user_text(
@@ -5965,17 +6797,110 @@ mod workspace_transition_tests {
             crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         ));
+        state.storage.chat_events = Arc::new(
+            crate::chat_event_log::ChatEventLog::open(
+                temp.path().join("chat-events"),
+                crate::chat_event_log::ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.storage.tool_executions = Arc::new(
+            crate::tool_execution::ToolExecutionRepository::open(
+                temp.path().join("tool-executions"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let workspace_registry = Arc::new(
+            WorkspaceRegistry::with_base_dir(temp.path().join("workspace-registry"))
+                .map_err(|error| error.to_string())?,
+        );
+        workspace_registry
+            .create_at(
+                "workspace-a",
+                crate::workspace::WorkspaceKind::General,
+                root_a.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        workspace_registry
+            .create_at(
+                "workspace-b",
+                crate::workspace::WorkspaceKind::General,
+                root_b.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        state.workspace.registry = workspace_registry;
         state.set_pool(seed_pool);
         let state = Arc::new(state);
 
+        state
+            .workspace
+            .transitioning
+            .store(true, std::sync::atomic::Ordering::Release);
+        assert!(matches!(
+            state.current_control_runtime().await,
+            Err(ScopedControlError::WorkspaceTransition)
+        ));
+        state
+            .workspace
+            .transitioning
+            .store(false, std::sync::atomic::Ordering::Release);
+
+        let missing_root = temp.path().join("missing-workspace");
+        assert!(
+            state
+                .switch_workspace(workspace("missing", missing_root))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            state
+                .current_control_runtime()
+                .await
+                .map_err(|error| error.to_string())?
+                .execution_scope()
+                .workspace_id(),
+            "global"
+        );
+
+        let (entered, release) = state.park_next_workspace_transition()?;
+        let detached_state = Arc::clone(&state);
+        let detached_workspace = workspace("workspace-a", root_a.clone());
+        let waiter =
+            tokio::spawn(async move { detached_state.switch_workspace(detached_workspace).await });
+        entered
+            .await
+            .map_err(|_| "workspace transition did not reach test barrier".to_string())?;
+        assert!(matches!(
+            state.current_control_runtime().await,
+            Err(ScopedControlError::WorkspaceTransition)
+        ));
+        waiter.abort();
+        let _ = waiter.await;
+        release
+            .send(())
+            .map_err(|_| "workspace transition release receiver was dropped".to_string())?;
         state
             .switch_workspace(workspace("workspace-a", root_a))
             .await
             .map_err(|error| error.to_string())?;
         let runtime_a = state
-            .current_chat_runtime()
+            .current_control_runtime()
             .await
             .map_err(|error| error.to_string())?;
+        let explicit_global = state
+            .chat_runtime_for_scope("global")
+            .await
+            .map_err(|error| error.to_string())?;
+        let explicit_global_store = explicit_global
+            .conversation_store()
+            .ok_or_else(|| "explicit global conversation store missing".to_string())?;
+        let workspace_a_store = runtime_a
+            .conversation_store()
+            .ok_or_else(|| "workspace A conversation store missing".to_string())?;
+        assert!(Arc::ptr_eq(&explicit_global_store, &global_store));
+        assert!(!Arc::ptr_eq(&explicit_global_store, &workspace_a_store));
+        assert!(explicit_global.runtime_state_store().is_none());
+        assert!(runtime_a.runtime_state_store().is_some());
         let foreground_a = state
             .begin_conversation_turn_owned(
                 crate::foreground_turn::ForegroundTurnSurface::Gui,
@@ -5992,16 +6917,71 @@ mod workspace_transition_tests {
             execution_a.agent().read(|agent| agent.working_dir()).await,
             Some(canonical_a.clone())
         );
+        let task_store_a = runtime_a
+            .task_runtime()
+            .ok_or_else(|| "workspace A TaskRuntime missing".to_string())?;
+        task_store_a
+            .create_run(
+                "shared-run",
+                "workspace-a",
+                "same-conversation",
+                "root-a",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "workspace A goal",
+                "task",
+                crate::tasks::task_runtime::AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let memory_a = runtime_a
+            .review_integration()
+            .ok_or_else(|| "workspace A memory integration missing".to_string())?
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let memory_manager_a = memory_a
+            .create_layer_manager()
+            .map_err(|error| error.to_string())?;
+        memory_manager_a
+            .write_memory(
+                "shared-memory",
+                "workspace A memory",
+                echo_agent::memory::MemoryMeta::new(
+                    echo_agent::memory::MemoryType::ProjectFact,
+                    echo_agent::memory::MemorySource::ExplicitSave,
+                    "explicit",
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
 
         let receipt_b = state
             .switch_workspace(workspace("workspace-b", root_b))
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(receipt_b.status, WorkspaceTransitionStatus::Committed);
+        assert!(
+            state
+                .delete_workspace_owned(&crate::workspace::WorkspaceId::from_name("workspace-a"))
+                .await
+                .is_err_and(|error| error.to_string().contains("active foreground"))
+        );
         let runtime_b = state
-            .current_chat_runtime()
+            .current_control_runtime()
             .await
             .map_err(|error| error.to_string())?;
+        let linked_project = temp.path().join("workspace-b-project");
+        std::fs::create_dir_all(&linked_project).map_err(|error| error.to_string())?;
+        let canonical_linked_project = linked_project
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let linked_workspace = state
+            .link_current_workspace_project_owned(linked_project.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(linked_workspace.id.as_str(), "workspace-b");
+        assert_eq!(
+            linked_workspace.project_root,
+            Some(canonical_linked_project)
+        );
         let execution_b = runtime_b
             .agent_for("same-conversation")
             .await
@@ -6010,6 +6990,184 @@ mod workspace_transition_tests {
             execution_b.agent().read(|agent| agent.working_dir()).await,
             Some(canonical_b.clone())
         );
+        let task_store_b = runtime_b
+            .task_runtime()
+            .ok_or_else(|| "workspace B TaskRuntime missing".to_string())?;
+        task_store_b
+            .create_run(
+                "shared-run",
+                "workspace-b",
+                "same-conversation",
+                "root-b",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "workspace B goal",
+                "task",
+                crate::tasks::task_runtime::AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let memory_b = runtime_b
+            .review_integration()
+            .ok_or_else(|| "workspace B memory integration missing".to_string())?
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        let memory_manager_b = memory_b
+            .create_layer_manager()
+            .map_err(|error| error.to_string())?;
+        memory_manager_b
+            .write_memory(
+                "shared-memory",
+                "workspace B memory",
+                echo_agent::memory::MemoryMeta::new(
+                    echo_agent::memory::MemoryType::ProjectFact,
+                    echo_agent::memory::MemorySource::ExplicitSave,
+                    "explicit",
+                ),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let profile_store_a =
+            echo_agent::workspace::state::profiles::ProfileStore::new(memory_a.memory_store());
+        let profile_store_b =
+            echo_agent::workspace::state::profiles::ProfileStore::new(memory_b.memory_store());
+        let mut profile_a = echo_agent::workspace::state::profiles::UserProfile::new();
+        profile_a.set_preference("scope", "workspace A");
+        profile_store_a
+            .save_user_profile(&profile_a)
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut profile_b = echo_agent::workspace::state::profiles::UserProfile::new();
+        profile_b.set_preference("scope", "workspace B");
+        profile_store_b
+            .save_user_profile(&profile_b)
+            .await
+            .map_err(|error| error.to_string())?;
+        let evidence_a = memory_a.evidence_store();
+        let evidence_b = memory_b.evidence_store();
+        evidence_a
+            .upsert(crate::evolution::EvidenceCandidateDraft {
+                kind: crate::evolution::EvidenceKind::ProjectFact,
+                scope: None,
+                content: "workspace A evidence".to_string(),
+                evidence: vec![crate::evolution::EvidenceRef {
+                    source: crate::evolution::EvidenceSource::AutoMemory,
+                    source_run_id: None,
+                    source_role: Some("user".to_string()),
+                    source_turn: Some(1),
+                    source_memory_key: None,
+                    quote: "A quote".to_string(),
+                }],
+                action: None,
+                confidence: 0.9,
+            })
+            .map_err(|error| error.to_string())?;
+        evidence_b
+            .upsert(crate::evolution::EvidenceCandidateDraft {
+                kind: crate::evolution::EvidenceKind::ProjectFact,
+                scope: None,
+                content: "workspace B evidence".to_string(),
+                evidence: vec![crate::evolution::EvidenceRef {
+                    source: crate::evolution::EvidenceSource::AutoMemory,
+                    source_run_id: None,
+                    source_role: Some("user".to_string()),
+                    source_turn: Some(1),
+                    source_memory_key: None,
+                    quote: "B quote".to_string(),
+                }],
+                action: None,
+                confidence: 0.9,
+            })
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            task_store_a
+                .get_run("shared-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.goal),
+            Some("workspace A goal".to_string())
+        );
+        assert_eq!(
+            task_store_b
+                .get_run("shared-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.goal),
+            Some("workspace B goal".to_string())
+        );
+        assert!(
+            task_store_b
+                .request_cancel("shared-run")
+                .map_err(|error| error.to_string())?
+        );
+        assert_eq!(
+            task_store_a
+                .get_run("shared-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(crate::tasks::task_runtime::TaskRunStatus::Pending)
+        );
+        assert_eq!(
+            task_store_b
+                .get_run("shared-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(crate::tasks::task_runtime::TaskRunStatus::Cancelled)
+        );
+        let located_a = memory_manager_a
+            .locate("shared-memory")
+            .await
+            .ok_or_else(|| "workspace A memory missing".to_string())?;
+        let located_b = memory_manager_b
+            .locate("shared-memory")
+            .await
+            .ok_or_else(|| "workspace B memory missing".to_string())?;
+        assert_eq!(located_a.1.content, "workspace A memory");
+        assert_eq!(located_b.1.content, "workspace B memory");
+        assert_eq!(
+            profile_store_a
+                .load_user_profile()
+                .await
+                .map_err(|error| error.to_string())?
+                .and_then(|profile| profile.preferences.get("scope").cloned()),
+            Some("workspace A".to_string())
+        );
+        assert_eq!(
+            profile_store_b
+                .load_user_profile()
+                .await
+                .map_err(|error| error.to_string())?
+                .and_then(|profile| profile.preferences.get("scope").cloned()),
+            Some("workspace B".to_string())
+        );
+        assert!(
+            evidence_a
+                .review_items()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .all(|item| item.candidate.content.contains("workspace A"))
+        );
+        assert!(
+            evidence_b
+                .review_items()
+                .map_err(|error| error.to_string())?
+                .iter()
+                .all(|item| item.candidate.content.contains("workspace B"))
+        );
+        let integration_a = runtime_a
+            .review_integration()
+            .ok_or_else(|| "workspace A review integration missing".to_string())?;
+        let integration_b = runtime_b
+            .review_integration()
+            .ok_or_else(|| "workspace B review integration missing".to_string())?;
+        assert_ne!(
+            integration_a.echo_agent_dir(),
+            integration_b.echo_agent_dir()
+        );
+        assert!(
+            memory_manager_b
+                .delete_memory("shared-memory")
+                .await
+                .map_err(|error| error.to_string())?
+        );
+        assert!(memory_manager_b.locate("shared-memory").await.is_none());
+        assert!(memory_manager_a.locate("shared-memory").await.is_some());
         let pool_a = runtime_a
             .pool()
             .ok_or_else(|| "workspace A pool missing".to_string())?;
@@ -6051,7 +7209,7 @@ mod workspace_transition_tests {
             .await
             .map_err(|error| error.to_string())?;
         let reopened_a = state
-            .current_chat_runtime()
+            .current_control_runtime()
             .await
             .map_err(|error| error.to_string())?;
         assert!(Arc::ptr_eq(
@@ -6077,6 +7235,14 @@ mod workspace_transition_tests {
             std::env::current_dir().map_err(|error| error.to_string())?,
             process_cwd
         );
+        drop(reopened_a);
+        drop(runtime_a);
+        drop(runtime_b);
+        state
+            .delete_workspace_owned(&crate::workspace::WorkspaceId::from_name("workspace-a"))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(state.chat_runtime_for_scope("workspace-a").await.is_err());
         Ok(())
     }
 }
@@ -6302,7 +7468,7 @@ mod service_bootstrap_tests {
 
 async fn await_workspace_settlement(
     handle: &mut WorkspaceSettlementHandle,
-) -> anyhow::Result<WorkspaceTransitionReceipt> {
+) -> anyhow::Result<WorkspaceSettlementOutcome> {
     handle
         .await
         .map_err(|error| anyhow::anyhow!("workspace settlement task failed: {error}"))?

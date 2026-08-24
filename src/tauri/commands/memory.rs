@@ -6,12 +6,83 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::evolution::MemoryLayer;
+use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::memory::{MemoryFilter, MemoryMeta, MemorySource, MemoryType, TypedMemoryEntry};
+use echo_agent_app_core::evolution::ReviewGenerationLease;
+use echo_agent_app_core::state::ScopedChatRuntime;
+use std::sync::Arc;
 
 const AGENT_MEMORY_NAMESPACE: &str = "agent/memories";
 
+struct ScopedMemoryControl {
+    runtime: ScopedChatRuntime,
+    _generation: ReviewGenerationLease,
+    layer_manager: Arc<MemoryLayerManager>,
+}
+
+async fn memory_control_for_workspace(
+    state: &tauri::State<'_, TauriState>,
+    workspace_id: &str,
+) -> Result<ScopedMemoryControl, IpcError> {
+    if workspace_id.trim().is_empty() {
+        return Err(IpcError::Validation(
+            "workspace_id must not be empty".to_string(),
+        ));
+    }
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(workspace_id)
+        .await
+        .map_err(IpcError::from)?;
+    let integration = runtime.review_integration().ok_or_else(|| {
+        IpcError::Internal(format!(
+            "Layered memory is not configured for workspace '{workspace_id}'"
+        ))
+    })?;
+    let generation = integration
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let layer_manager = Arc::new(
+        generation
+            .create_layer_manager()
+            .map_err(|error| IpcError::Internal(error.to_string()))?,
+    );
+    Ok(ScopedMemoryControl {
+        runtime,
+        _generation: generation,
+        layer_manager,
+    })
+}
+
+async fn refresh_hot_projection(control: &ScopedMemoryControl) {
+    let agent = control.runtime.primary_agent();
+    let root = agent.read(|value| value.working_dir()).await;
+    agent
+        .write_async(|value| {
+            Box::pin(async move {
+                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
+                    value,
+                    root.as_deref(),
+                )
+                .await;
+            })
+        })
+        .await;
+    if let Some(pool) = control.runtime.pool() {
+        pool.refresh_hot_memory_context().await;
+    }
+}
+
 fn namespace_supported(namespace: Option<&str>) -> bool {
     namespace.is_none_or(|value| value.is_empty() || value == AGENT_MEMORY_NAMESPACE)
+}
+
+fn validate_namespace_after_scope<T>(
+    control: Result<T, IpcError>,
+    namespace: Option<&str>,
+) -> Result<(T, bool), IpcError> {
+    let control = control?;
+    Ok((control, namespace_supported(namespace)))
 }
 
 fn memory_content(value: &serde_json::Value) -> Option<String> {
@@ -47,22 +118,19 @@ fn entry_json(layer: MemoryLayer, entry: TypedMemoryEntry) -> serde_json::Value 
 #[tauri::command]
 pub async fn list_memory(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     namespace: Option<String>,
     limit: Option<usize>,
 ) -> Result<serde_json::Value, IpcError> {
-    if !namespace_supported(namespace.as_deref()) {
+    let (control, supported) = validate_namespace_after_scope(
+        memory_control_for_workspace(&state, &workspace_id).await,
+        namespace.as_deref(),
+    )?;
+    if !supported {
         return Ok(serde_json::json!([]));
     }
     let limit = limit.unwrap_or(100);
-    let layer_manager = state
-        .app_state
-        .connection
-        .agent
-        .read(|agent| agent.memory_layer_manager().cloned())
-        .await;
-    let Some(layer_manager) = layer_manager else {
-        return Ok(serde_json::json!([]));
-    };
+    let layer_manager = &control.layer_manager;
 
     let mut entries = layer_manager
         .list_hot()
@@ -85,11 +153,16 @@ pub async fn list_memory(
 #[tauri::command]
 pub async fn add_memory(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     namespace: String,
     key: String,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, IpcError> {
-    if !namespace_supported(Some(&namespace)) {
+    let (control, supported) = validate_namespace_after_scope(
+        memory_control_for_workspace(&state, &workspace_id).await,
+        Some(&namespace),
+    )?;
+    if !supported {
         return Ok(serde_json::json!({
             "success": false,
             "error": format!("Unsupported memory namespace: {namespace}"),
@@ -106,19 +179,7 @@ pub async fn add_memory(
     } else {
         key.trim().to_string()
     };
-    let integration = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Layered memory is not configured".into()))?;
-    let memory_lease = integration
-        .lease_generation()
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let layer_manager = std::sync::Arc::new(
-        memory_lease
-            .create_layer_manager()
-            .map_err(|error| IpcError::Internal(error.to_string()))?,
-    );
+    let layer_manager = &control.layer_manager;
     let meta = MemoryMeta::new(
         MemoryType::ProjectFact,
         MemorySource::ExplicitSave,
@@ -127,22 +188,7 @@ pub async fn add_memory(
     match layer_manager.write_memory(&key, content.trim(), meta).await {
         Ok(promotion) => {
             if promotion.is_some() {
-                let agent = state.app_state.connection.primary_agent();
-                let root = agent.read(|value| value.working_dir()).await;
-                agent
-                    .write_async(|value| {
-                        Box::pin(async move {
-                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                value,
-                                root.as_deref(),
-                            )
-                            .await;
-                        })
-                    })
-                    .await;
-                if let Some(pool) = &state.app_state.connection.pool {
-                    pool.refresh_hot_memory_context().await;
-                }
+                refresh_hot_projection(&control).await;
             }
             Ok(serde_json::json!({
                 "success": true,
@@ -160,21 +206,18 @@ pub async fn add_memory(
 #[tauri::command]
 pub async fn search_memory(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     query: String,
     namespace: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    if !namespace_supported(namespace.as_deref()) {
+    let (control, supported) = validate_namespace_after_scope(
+        memory_control_for_workspace(&state, &workspace_id).await,
+        namespace.as_deref(),
+    )?;
+    if !supported {
         return Ok(serde_json::json!([]));
     }
-    let layer_manager = state
-        .app_state
-        .connection
-        .agent
-        .read(|agent| agent.memory_layer_manager().cloned())
-        .await;
-    let Some(layer_manager) = layer_manager else {
-        return Ok(serde_json::json!([]));
-    };
+    let layer_manager = &control.layer_manager;
     match layer_manager.search_layered(query.trim(), 10).await {
         Ok(entries) => Ok(serde_json::Value::Array(
             entries
@@ -192,28 +235,21 @@ pub async fn search_memory(
 #[tauri::command]
 pub async fn delete_memory(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     namespace: String,
     key: String,
 ) -> Result<serde_json::Value, IpcError> {
-    if !namespace_supported(Some(&namespace)) {
+    let (control, supported) = validate_namespace_after_scope(
+        memory_control_for_workspace(&state, &workspace_id).await,
+        Some(&namespace),
+    )?;
+    if !supported {
         return Ok(serde_json::json!({
             "success": false,
             "error": format!("Unsupported memory namespace: {namespace}"),
         }));
     }
-    let integration = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Layered memory is not configured".into()))?;
-    let memory_lease = integration
-        .lease_generation()
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let layer_manager = std::sync::Arc::new(
-        memory_lease
-            .create_layer_manager()
-            .map_err(|error| IpcError::Internal(error.to_string()))?,
-    );
+    let layer_manager = &control.layer_manager;
     let layer = layer_manager
         .locate(key.trim())
         .await
@@ -221,22 +257,7 @@ pub async fn delete_memory(
     match layer_manager.delete_memory(key.trim()).await {
         Ok(deleted) => {
             if deleted && layer == Some(MemoryLayer::Hot) {
-                let agent = state.app_state.connection.primary_agent();
-                let root = agent.read(|value| value.working_dir()).await;
-                agent
-                    .write_async(|value| {
-                        Box::pin(async move {
-                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                value,
-                                root.as_deref(),
-                            )
-                            .await;
-                        })
-                    })
-                    .await;
-                if let Some(pool) = &state.app_state.connection.pool {
-                    pool.refresh_hot_memory_context().await;
-                }
+                refresh_hot_projection(&control).await;
             }
             Ok(serde_json::json!({
                 "success": deleted,
@@ -278,5 +299,14 @@ mod tests {
         assert!(namespace_supported(None));
         assert!(namespace_supported(Some(AGENT_MEMORY_NAMESPACE)));
         assert!(!namespace_supported(Some("default")));
+    }
+
+    #[test]
+    fn invalid_scope_precedes_unsupported_namespace_policy() {
+        let validation = Err::<(), _>(IpcError::Validation("workspace is deleted".to_string()));
+        assert!(matches!(
+            validate_namespace_after_scope(validation, Some("unsupported")),
+            Err(IpcError::Validation(message)) if message == "workspace is deleted"
+        ));
     }
 }

@@ -19,6 +19,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use tauri::Emitter;
 
 fn current_echo_agent_dir(state: &TauriState) -> PathBuf {
@@ -264,8 +265,41 @@ pub async fn clear_audit_logs(
 // Auto Memory
 // ════════════════════════════════════════════════════════════════════════════
 
-async fn current_agent_messages(state: &TauriState) -> Vec<(String, String)> {
-    let agent = state.app_state.connection.primary_agent();
+struct ScopedAutoMemoryControl {
+    runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    generation: echo_agent_app_core::evolution::ReviewGenerationLease,
+}
+
+async fn auto_memory_control_for_workspace(
+    state: &TauriState,
+    workspace_id: &str,
+) -> Result<ScopedAutoMemoryControl, IpcError> {
+    if workspace_id.trim().is_empty() {
+        return Err(IpcError::Validation(
+            "workspace_id must not be empty".to_string(),
+        ));
+    }
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(workspace_id)
+        .await
+        .map_err(IpcError::from)?;
+    let integration = runtime.review_integration().ok_or_else(|| {
+        IpcError::Internal(format!(
+            "Review integration is not configured for workspace '{workspace_id}'"
+        ))
+    })?;
+    let generation = integration
+        .lease_generation()
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    Ok(ScopedAutoMemoryControl {
+        runtime,
+        generation,
+    })
+}
+
+async fn scoped_agent_messages(control: &ScopedAutoMemoryControl) -> Vec<(String, String)> {
+    let agent = control.runtime.primary_agent();
     agent
         .read_async(|agent| {
             Box::pin(async move {
@@ -285,7 +319,7 @@ async fn current_agent_messages(state: &TauriState) -> Vec<(String, String)> {
 }
 
 async fn auto_memory_config_status(
-    state: &TauriState,
+    control: &ScopedAutoMemoryControl,
 ) -> Result<
     (
         echo_agent_app_core::auto_memory::AutoMemoryConfig,
@@ -299,19 +333,37 @@ async fn auto_memory_config_status(
             .load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
-    let messages = current_agent_messages(state).await;
+    let messages = scoped_agent_messages(control).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
-    let root = workspace_project_root(state).await?;
-    let inbox_path =
-        echo_agent_app_core::workspace::layout::WorkspaceLayout::evidence_candidates(&root);
+    let inbox_path = control.generation.evidence_store().path().to_path_buf();
     Ok((config, observations.len(), inbox_path))
+}
+
+fn commit_auto_memory_toggle_after_validation<T>(
+    validation: Result<T, IpcError>,
+    enabled: bool,
+) -> Result<T, IpcError> {
+    let validated = validation?;
+    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    Ok(validated)
+}
+
+fn auto_memory_extract_control_after_validation<T>(
+    validation: Result<T, IpcError>,
+    enabled: bool,
+) -> Result<Option<T>, IpcError> {
+    let validated = validation?;
+    Ok(enabled.then_some(validated))
 }
 
 #[tauri::command]
 pub async fn get_auto_memory_status(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let (config, observation_count, memory_path) = auto_memory_config_status(&state).await?;
+    let control = auto_memory_control_for_workspace(&state, &workspace_id).await?;
+    let (config, observation_count, memory_path) = auto_memory_config_status(&control).await?;
     Ok(json!({
         "enabled": config.enabled,
         "observation_count": observation_count,
@@ -323,23 +375,40 @@ pub async fn get_auto_memory_status(
 #[tauri::command]
 pub async fn toggle_auto_memory(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     enabled: bool,
 ) -> Result<serde_json::Value, IpcError> {
-    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-        .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    get_auto_memory_status(state).await
+    // Enablement is intentionally process-global product policy; workspace_id
+    // selects and validates the exact observation/review generation returned
+    // with the receipt. Validation must happen before the global policy write.
+    let control = commit_auto_memory_toggle_after_validation(
+        auto_memory_control_for_workspace(&state, &workspace_id).await,
+        enabled,
+    )?;
+    let (config, observation_count, memory_path) = auto_memory_config_status(&control).await?;
+    Ok(json!({
+        "enabled": config.enabled,
+        "observation_count": observation_count,
+        "config": config,
+        "memory_path": memory_path.display().to_string(),
+    }))
 }
 
 #[tauri::command]
 pub async fn extract_auto_memory(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
         enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
             .load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
-    if !config.enabled {
+    let control = auto_memory_extract_control_after_validation(
+        auto_memory_control_for_workspace(&state, &workspace_id).await,
+        config.enabled,
+    )?;
+    let Some(control) = control else {
         return Ok(json!({
             "success": false,
             "count": 0,
@@ -347,19 +416,11 @@ pub async fn extract_auto_memory(
             "formatted": "",
             "message": "Auto Memory is disabled",
         }));
-    }
+    };
 
-    let integration = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .ok_or_else(|| IpcError::Internal("Review integration is not configured".into()))?;
-    let evidence_lease = integration
-        .lease_generation()
-        .map_err(|error| IpcError::Validation(error.to_string()))?;
-    let messages = current_agent_messages(&state).await;
+    let messages = scoped_agent_messages(&control).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
-    let store = evidence_lease.evidence_store();
+    let store = control.generation.evidence_store();
     let candidates =
         echo_agent_app_core::auto_memory::queue_observations(&store, &observations, &messages)
             .map_err(IpcError::Internal)?;
@@ -380,13 +441,15 @@ pub async fn extract_auto_memory(
 #[tauri::command]
 pub async fn get_auto_memory_observations(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
         enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
             .load(std::sync::atomic::Ordering::Relaxed),
         ..Default::default()
     };
-    let messages = current_agent_messages(&state).await;
+    let control = auto_memory_control_for_workspace(&state, &workspace_id).await?;
+    let messages = scoped_agent_messages(&control).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
     let count = observations.len();
     let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(&observations);
@@ -1790,6 +1853,30 @@ async fn workspace_project_root_for(
         .ok_or_else(|| IpcError::NotFound(format!("Workspace '{workspace_id}' not found")))
 }
 
+struct ScopedWorktreeControl {
+    _control: echo_agent_app_core::state::ScopedWorkspaceControl,
+    repo_root: PathBuf,
+    store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+}
+
+async fn worktree_control_for_workspace(
+    state: &TauriState,
+    workspace_id: &str,
+) -> Result<ScopedWorktreeControl, IpcError> {
+    let control = state
+        .app_state
+        .workspace_control_for_scope(workspace_id)
+        .await
+        .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let repo_root = control.project_root();
+    let store = control.runtime().task_runtime();
+    Ok(ScopedWorktreeControl {
+        _control: control,
+        repo_root,
+        store,
+    })
+}
+
 async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError> {
     if let Some(workspace) = state.app_state.current_workspace().await {
         Ok(workspace.project_root.unwrap_or(workspace.root))
@@ -1820,6 +1907,12 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<String, IpcError> {
 fn git_repo_root(start: &Path) -> Result<PathBuf, IpcError> {
     let root = run_git(start, &["rev-parse", "--show-toplevel"])?;
     Ok(PathBuf::from(root))
+}
+
+async fn git_repo_root_async(start: PathBuf) -> Result<PathBuf, IpcError> {
+    tokio::task::spawn_blocking(move || git_repo_root(&start))
+        .await
+        .map_err(|error| IpcError::Internal(format!("Failed to join git root lookup: {error}")))?
 }
 
 fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
@@ -1953,92 +2046,116 @@ fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), IpcEr
 #[tauri::command]
 pub async fn list_worktrees(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let start = workspace_project_root(&state).await?;
-    let repo_root = git_repo_root(&start)?;
-    let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-    Ok(json!(parse_worktree_list(&output, &repo_root)))
+    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
+    let start = control.repo_root.clone();
+    let worktrees = tokio::task::spawn_blocking(move || {
+        let repo_root = git_repo_root(&start)?;
+        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
+        Ok::<Vec<WorktreeInfo>, IpcError>(parse_worktree_list(&output, &repo_root))
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join worktree listing: {error}")))??;
+    drop(control);
+    Ok(json!(worktrees))
 }
 
 #[tauri::command]
 pub async fn create_worktree(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     branch: String,
     base: Option<String>,
     path: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let start = workspace_project_root(&state).await?;
-    let repo_root = git_repo_root(&start)?;
+    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
+    let start = control.repo_root.clone();
     let branch = branch.trim().to_string();
-    validate_branch_name(&repo_root, &branch)?;
-
-    let target = path
-        .filter(|p| !p.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or(default_worktree_path(&repo_root, &branch)?);
-    validate_worktree_target(&repo_root, &target)?;
-
     let base_ref = base
         .and_then(|s| {
             let trimmed = s.trim().to_string();
             (!trimmed.is_empty()).then_some(trimmed)
         })
         .unwrap_or_else(|| "HEAD".to_string());
-    let target_str = target.to_string_lossy().to_string();
-    run_git(
-        &repo_root,
-        &["worktree", "add", "-b", &branch, &target_str, &base_ref],
-    )?;
-
-    let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-    parse_worktree_list(&output, &repo_root)
-        .into_iter()
-        .find(|wt| wt.path == target_str)
-        .map(|wt| json!(wt))
-        .ok_or_else(|| IpcError::Internal("Created worktree was not found in git output".into()))
+    let repo_root = git_repo_root_async(start).await?;
+    let merge_lock =
+        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+    let _merge_guard = merge_lock.lock().await;
+    let created = tokio::task::spawn_blocking(move || {
+        validate_branch_name(&repo_root, &branch)?;
+        let target = path
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(default_worktree_path(&repo_root, &branch)?);
+        validate_worktree_target(&repo_root, &target)?;
+        let target_str = target.to_string_lossy().to_string();
+        run_git(
+            &repo_root,
+            &["worktree", "add", "-b", &branch, &target_str, &base_ref],
+        )?;
+        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
+        parse_worktree_list(&output, &repo_root)
+            .into_iter()
+            .find(|worktree| worktree.path == target_str)
+            .ok_or_else(|| {
+                IpcError::Internal("Created worktree was not found in git output".into())
+            })
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join worktree create: {error}")))??;
+    drop(control);
+    Ok(json!(created))
 }
 
 #[tauri::command]
 pub async fn remove_worktree(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
     path: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let start = workspace_project_root(&state).await?;
-    let repo_root = git_repo_root(&start)?;
-    let target = PathBuf::from(path.trim());
-    if target.as_os_str().is_empty() {
-        return Err(IpcError::Validation("Worktree path cannot be empty".into()));
-    }
-
-    let canonical_repo = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.clone());
-    let canonical_target = target
-        .canonicalize()
-        .map_err(|e| IpcError::Validation(format!("Cannot resolve worktree path: {e}")))?;
-    if canonical_target == canonical_repo {
-        return Err(IpcError::Validation(
-            "Refusing to remove the primary repository worktree".into(),
-        ));
-    }
-
-    let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
-    let known = parse_worktree_list(&output, &repo_root)
-        .into_iter()
-        .any(|wt| {
-            PathBuf::from(wt.path)
-                .canonicalize()
-                .map(|p| p == canonical_target)
-                .unwrap_or(false)
-        });
-    if !known {
-        return Err(IpcError::Validation(
-            "Path is not a registered git worktree".into(),
-        ));
-    }
-
-    let target_str = target.to_string_lossy().to_string();
-    run_git(&repo_root, &["worktree", "remove", &target_str])?;
+    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
+    let start = control.repo_root.clone();
+    let repo_root = git_repo_root_async(start).await?;
+    let merge_lock =
+        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+    let _merge_guard = merge_lock.lock().await;
+    tokio::task::spawn_blocking(move || {
+        let target = PathBuf::from(path.trim());
+        if target.as_os_str().is_empty() {
+            return Err(IpcError::Validation("Worktree path cannot be empty".into()));
+        }
+        let canonical_repo = repo_root
+            .canonicalize()
+            .unwrap_or_else(|_| repo_root.clone());
+        let canonical_target = target.canonicalize().map_err(|error| {
+            IpcError::Validation(format!("Cannot resolve worktree path: {error}"))
+        })?;
+        if canonical_target == canonical_repo {
+            return Err(IpcError::Validation(
+                "Refusing to remove the primary repository worktree".into(),
+            ));
+        }
+        let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
+        let known = parse_worktree_list(&output, &repo_root)
+            .into_iter()
+            .any(|worktree| {
+                PathBuf::from(worktree.path)
+                    .canonicalize()
+                    .map(|path| path == canonical_target)
+                    .unwrap_or(false)
+            });
+        if !known {
+            return Err(IpcError::Validation(
+                "Path is not a registered git worktree".into(),
+            ));
+        }
+        let target_str = target.to_string_lossy().to_string();
+        run_git(&repo_root, &["worktree", "remove", &target_str]).map(|_| ())
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join worktree removal: {error}")))??;
+    drop(control);
     Ok(json!({"success": true}))
 }
 
@@ -2047,13 +2164,9 @@ pub async fn list_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
-    let store = state
-        .app_state
-        .chat_runtime_for_scope(&workspace_id)
-        .await
-        .map_err(|error| IpcError::Validation(error.to_string()))?
-        .task_runtime();
+    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
+    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let store = control.store.clone();
 
     let unattended = tokio::task::spawn_blocking(move || {
         echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
@@ -2064,6 +2177,7 @@ pub async fn list_unattended_worktrees(
     .await
     .map_err(|error| IpcError::Internal(format!("Failed to join worktree listing: {error}")))?
     .map_err(|error| IpcError::Internal(format!("Failed to list unattended worktrees: {error}")))?;
+    drop(control);
 
     let result: Vec<serde_json::Value> = unattended
         .into_iter()
@@ -2094,13 +2208,9 @@ pub async fn merge_unattended_worktree(
     workspace_id: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
-    let store = state
-        .app_state
-        .chat_runtime_for_scope(&workspace_id)
-        .await
-        .map_err(|error| IpcError::Validation(error.to_string()))?
-        .task_runtime();
+    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
+    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let store = control.store.clone();
     if store
         .as_ref()
         .and_then(|store| store.get_run(&run_id).ok().flatten())
@@ -2124,6 +2234,7 @@ pub async fn merge_unattended_worktree(
     .await
     .map_err(|error| IpcError::Internal(format!("Failed to join worktree merge: {error}")))?
     .map_err(|error| IpcError::Internal(format!("Failed to merge unattended worktree: {error}")))?;
+    drop(control);
 
     Ok(json!({
         "success": true,
@@ -2142,13 +2253,9 @@ pub async fn discard_unattended_worktree(
     workspace_id: String,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
-    let store = state
-        .app_state
-        .chat_runtime_for_scope(&workspace_id)
-        .await
-        .map_err(|error| IpcError::Validation(error.to_string()))?
-        .task_runtime();
+    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
+    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let store = control.store.clone();
     let merge_lock =
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
@@ -2165,6 +2272,7 @@ pub async fn discard_unattended_worktree(
     .map_err(|error| {
         IpcError::Internal(format!("Failed to discard unattended worktree: {error}"))
     })?;
+    drop(control);
 
     Ok(json!({"success": true, "discarded": run_id}))
 }
@@ -2174,13 +2282,9 @@ pub async fn cleanup_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let repo_root = workspace_project_root_for(&state, &workspace_id).await?;
-    let store = state
-        .app_state
-        .chat_runtime_for_scope(&workspace_id)
-        .await
-        .map_err(|error| IpcError::Validation(error.to_string()))?
-        .task_runtime();
+    let control = worktree_control_for_workspace(&state, &workspace_id).await?;
+    let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
+    let store = control.store.clone();
     let merge_lock =
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
@@ -2195,6 +2299,7 @@ pub async fn cleanup_unattended_worktrees(
     .map_err(|error| {
         IpcError::Internal(format!("Failed to clean unattended worktrees: {error}"))
     })?;
+    drop(control);
 
     Ok(json!({
         "removed": result.removed,
@@ -2264,4 +2369,45 @@ pub async fn get_mcp_server(
         "connected_at": null,
         "error": health.and_then(|h| h.error.clone()),
     }))
+}
+
+#[cfg(test)]
+mod scoped_control_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_auto_memory_scope_does_not_commit_global_toggle() {
+        let previous = crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let result = commit_auto_memory_toggle_after_validation::<()>(
+            Err(IpcError::Validation("workspace was deleted".to_string())),
+            !previous,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+                .load(std::sync::atomic::Ordering::Relaxed),
+            previous
+        );
+    }
+
+    #[test]
+    fn invalid_auto_memory_scope_precedes_disabled_policy() {
+        let result = auto_memory_extract_control_after_validation::<()>(
+            Err(IpcError::Validation("workspace was deleted".to_string())),
+            false,
+        );
+        assert!(matches!(
+            result,
+            Err(IpcError::Validation(message)) if message == "workspace was deleted"
+        ));
+    }
+
+    #[test]
+    fn primary_and_unattended_mutations_share_repo_lock() {
+        let repo = std::env::temp_dir().join("eko-worktree-lock-contract");
+        let primary = echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo);
+        let unattended = echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo);
+        assert!(Arc::ptr_eq(&primary, &unattended));
+    }
 }

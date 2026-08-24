@@ -20,8 +20,7 @@ pub enum CommandResult {
     /// Execute a resume turn explicitly bound to one TaskRun.
     ResumeTaskRun {
         message: String,
-        run_id: String,
-        root_message_id: String,
+        identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
     },
 }
 
@@ -35,7 +34,6 @@ pub struct CommandHandler {
     scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
-    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     interaction_mode:
         Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
     staged_attachments:
@@ -55,7 +53,6 @@ impl CommandHandler {
             scheduler: None,
             plugin_runtime: None,
             prompt_assembly: None,
-            review_integration: None,
             interaction_mode: Arc::new(tokio::sync::RwLock::new(
                 echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             )),
@@ -136,14 +133,6 @@ impl CommandHandler {
         self
     }
 
-    pub fn with_review_integration(
-        mut self,
-        review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
-    ) -> Self {
-        self.review_integration = review_integration;
-        self
-    }
-
     pub fn with_app_state_opt(
         mut self,
         app_state: Option<Arc<echo_agent_app_core::state::AppState>>,
@@ -212,7 +201,6 @@ impl CommandHandler {
                 scheduler: self.scheduler.clone(),
                 plugin_runtime: self.plugin_runtime.clone(),
                 prompt_assembly: self.prompt_assembly.clone(),
-                review_integration: self.review_integration.clone(),
                 interaction_mode: self.interaction_mode.clone(),
                 staged_attachments: self.staged_attachments.clone(),
                 app_state: self.app_state.clone(),
@@ -228,16 +216,8 @@ impl CommandHandler {
                     crate::cli::command::CommandOutcome::Chat(msg) => {
                         return CommandResult::Chat(msg);
                     }
-                    crate::cli::command::CommandOutcome::ResumeTaskRun {
-                        message,
-                        run_id,
-                        root_message_id,
-                    } => {
-                        return CommandResult::ResumeTaskRun {
-                            message,
-                            run_id,
-                            root_message_id,
-                        };
+                    crate::cli::command::CommandOutcome::ResumeTaskRun { message, identity } => {
+                        return CommandResult::ResumeTaskRun { message, identity };
                     }
                 }
             }
