@@ -238,6 +238,22 @@ impl FileTaskStore {
             .iter()
             .map(|task| (task.task_id.as_str(), task))
             .collect::<std::collections::HashMap<_, _>>();
+        let runtime_tasks = plan
+            .tasks
+            .iter()
+            .map(|spec| {
+                let state = execution
+                    .get(spec.id.as_str())
+                    .cloned()
+                    .cloned()
+                    .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
+                PlanTask::from_parts(spec.clone(), state)
+                    .to_task()
+                    .map_err(FileReadError::InvalidPlan)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let dependency_states = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks)
+            .dependency_states(&runtime_tasks);
         let mut todos = Vec::with_capacity(plan.tasks.len());
         for spec in &plan.tasks {
             let default_status = execution
@@ -246,6 +262,29 @@ impl FileTaskStore {
                 .unwrap_or(TodoStatus::Pending);
             // Fold this task's Task* events to recover non-authoritative display metadata.
             let runtime = fold_task_runtime(&loaded.events, &spec.id);
+            let dependency_block = dependency_states
+                .get(&spec.id)
+                .and_then(|state| match state {
+                    echo_agent::tasks::DagDependencyState::BlockedByFailure {
+                        failed_ancestor_ids,
+                    } => Some(failed_ancestor_ids),
+                    _ => None,
+                });
+            let status = if default_status == TodoStatus::Pending && dependency_block.is_some() {
+                TodoStatus::Blocked
+            } else {
+                default_status
+            };
+            let summary = if default_status == TodoStatus::Pending {
+                dependency_block.map_or(runtime.summary, |ancestor_ids| {
+                    Some(format!(
+                        "blocked by failed ancestor task(s): {}",
+                        ancestor_ids.join(", ")
+                    ))
+                })
+            } else {
+                runtime.summary
+            };
             todos.push(TodoItem {
                 id: spec.id.clone(),
                 run_id: loaded.state.run.run_id.clone(),
@@ -255,11 +294,11 @@ impl FileTaskStore {
                 // Historical Task* events only supply fields that are not
                 // stored in EkoTaskExecution; otherwise an earlier Blocked event
                 // can overwrite a later plan skip/reset.
-                status: default_status,
+                status,
                 owner_agent: runtime.owner_agent,
                 started_at: runtime.started_at,
                 completed_at: runtime.completed_at,
-                summary: runtime.summary,
+                summary,
             });
         }
         // Sort by sort_order to match SQL's display ordering.
@@ -490,6 +529,8 @@ fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
 pub enum FileReadError {
     #[error(transparent)]
     Shadow(#[from] super::file_shadow::ShadowError),
+    #[error("invalid task graph: {0}")]
+    InvalidPlan(String),
 }
 
 #[cfg(test)]
@@ -899,6 +940,67 @@ mod tests {
         let scan = FileTaskStore::from_root(tmp.path())?.scan_runs()?;
         assert!(scan.runs.iter().any(|run| run.run_id == "healthy"));
         assert!(scan.issues.iter().any(|issue| issue.run_id == "broken"));
+        Ok(())
+    }
+
+    #[test]
+    fn dependency_block_is_derived_and_disappears_after_ancestor_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
+        store.create_run(
+            "derived-block",
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::AiCoding,
+            "derive dependency state",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        let upstream = task("upstream", PlanTaskKind::ReadOnlyReview);
+        let mut downstream = task("downstream", PlanTaskKind::Summary);
+        downstream.depends_on = vec![upstream.id.clone()];
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: "derived-block-plan".to_string(),
+            run_id: "derived-block".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::AiCoding,
+            goal_revision: 1,
+            goal_sha256: crate::tasks::task_runtime::task_goal_sha256("derive dependency state"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![upstream, downstream],
+        })?;
+        store.transition_run("derived-block", TaskRunStatus::Running)?;
+        store.set_task_status(
+            "derived-block",
+            "upstream",
+            TodoStatus::Failed,
+            None,
+            Some("upstream failed"),
+        )?;
+        store.transition_run("derived-block", TaskRunStatus::Failed)?;
+
+        let file = FileTaskStore::from_root(tmp.path())?;
+        let blocked = file.list_todos("derived-block")?;
+        assert_eq!(
+            blocked
+                .iter()
+                .find(|todo| todo.task_id == "downstream")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Blocked)
+        );
+        store.retry_blocked_task("derived-block", "upstream")?;
+        let unblocked = file.list_todos("derived-block")?;
+        assert_eq!(
+            unblocked
+                .iter()
+                .find(|todo| todo.task_id == "downstream")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Pending)
+        );
         Ok(())
     }
 }

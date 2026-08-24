@@ -1,10 +1,10 @@
-//! EKO adapter for the framework runtime DAG executor.
+//! EKO adapter for the framework runtime task service.
 //!
 //! Converts EKO `TaskPlan` snapshots into the framework's product-neutral task
 //! view, then injects EKO dispatch, review, persistence, worktree, and event
 //! policy. Dependency traversal, revision safe points, Subagent waves,
 //! cancellation, failure propagation, and stall detection live in
-//! `echo_orchestration::tasks::RuntimeDagExecutor`.
+//! `echo_orchestration::tasks::RuntimeTaskService`.
 //!
 //! - read-only tasks (read_only_review, investigation, test_plan, review,
 //!   summary) run concurrently up to the configured Subagent limit, each delegated
@@ -99,7 +99,9 @@ impl ProcessExecutionGovernor {
 }
 
 use super::completion_gate::{artifact_matches, verification_matches};
-use super::store::{ClaimWriteOutcome, StoreError, SubagentReleaseRecord, TaskRuntimeStore};
+use super::store::{
+    RuntimeTaskProductSettlement, StoreError, SubagentReleaseRecord, TaskRuntimeStore,
+};
 use super::types::*;
 
 /// EKO product-resource limits. Only the Subagent cap is passed to the
@@ -300,16 +302,15 @@ fn task_worktree_label(agent_role: &str, run_id: &str, task_id: &str) -> String 
 pub enum RunOutcome {
     Completed,
     Failed {
-        failed_task_id: String,
+        failed_task_id: Option<String>,
         error: String,
     },
     Cancelled,
-    /// A task failed and the run is paused for user/agent decision. The
-    /// failed task is marked `Failed`; downstream dependents are `Blocked`.
-    /// The run is transitioned to `Paused`. The user can retry, skip, or
-    /// edit the plan before resuming.
+    /// Execution paused for a user or product decision. The optional task id
+    /// identifies the direct cause; dependency blockers remain a derived DAG
+    /// projection rather than persisted descendant status.
     Paused {
-        failed_task_id: String,
+        failed_task_id: Option<String>,
         error: String,
     },
 }
@@ -427,17 +428,25 @@ pub async fn execute_run(
     parent_cancel: CancellationToken,
     memory_policy: super::memory_bridge::MemoryPolicy,
 ) -> Result<RunOutcome, ExecError> {
-    let run = store
-        .get_run(run_id)?
-        .ok_or(ExecError::RunNotFound(run_id.to_string()))?;
+    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
+    let initial_run_id = run_id.to_string();
+    let (run, initial_plan) = blocking
+        .run("load runtime execution admission", move |store| {
+            let run = store
+                .get_run(&initial_run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(initial_run_id.clone()))?;
+            let plan = store
+                .get_plan(&initial_run_id)?
+                .ok_or(StoreError::PlanNotFound(initial_run_id))?;
+            Ok((run, plan))
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
     // The caller must have transitioned Pending → Running before spawning
     // the executor. Here we only accept Running.
     if run.status != TaskRunStatus::Running {
         return Err(ExecError::NotRunning(run_id.to_string(), run.status));
     }
-    let initial_plan = store
-        .get_plan(run_id)?
-        .ok_or(ExecError::NoPlan(run_id.to_string()))?;
     tracing::info!(
         run_id = %run_id,
         task_count = initial_plan.tasks.len(),
@@ -465,9 +474,15 @@ pub async fn execute_run(
 
     let mut drain_cycle = 0usize;
     let outcome = loop {
-        let plan = store
-            .get_plan(run_id)?
-            .ok_or(ExecError::NoPlan(run_id.to_string()))?;
+        let plan_run_id = run_id.to_string();
+        let plan = blocking
+            .run("load runtime drain plan", move |store| {
+                store
+                    .get_plan(&plan_run_id)?
+                    .ok_or(StoreError::PlanNotFound(plan_run_id))
+            })
+            .await
+            .map_err(|error| ExecError::Other(error.to_string()))?;
         let unresolved_count = plan
             .tasks
             .iter()
@@ -483,7 +498,13 @@ pub async fn execute_run(
             })
             .count();
         if unresolved_count == 0 {
-            let report = store.completion_gate_report(run_id)?;
+            let report_run_id = run_id.to_string();
+            let report = blocking
+                .run("load runtime completion gate", move |store| {
+                    store.completion_gate_report(&report_run_id)
+                })
+                .await
+                .map_err(|error| ExecError::Other(error.to_string()))?;
             if !report.ready {
                 let error = report
                     .blockers
@@ -491,17 +512,33 @@ pub async fn execute_run(
                     .map(|item| format!("{:?}: {}", item.code, item.detail))
                     .collect::<Vec<_>>()
                     .join("; ");
-                store.request_pause_with_reason(
-                    run_id,
-                    RunPauseReason::NeedsInput,
-                    Some(&error),
-                )?;
+                let pause_run_id = run_id.to_string();
+                let pause_error = error.clone();
+                blocking
+                    .run("pause rejected runtime completion", move |store| {
+                        store
+                            .request_pause_with_reason(
+                                &pause_run_id,
+                                RunPauseReason::NeedsInput,
+                                Some(&pause_error),
+                            )
+                            .map(|_| ())
+                    })
+                    .await
+                    .map_err(|error| ExecError::Other(error.to_string()))?;
                 break Ok(RunOutcome::Paused {
-                    failed_task_id: "<completion_gate>".to_string(),
+                    failed_task_id: None,
                     error,
                 });
             }
-            if store.complete_run_if_quiescent(run_id)? {
+            let complete_run_id = run_id.to_string();
+            if blocking
+                .run("commit quiescent runtime completion", move |store| {
+                    store.complete_run_if_quiescent(&complete_run_id)
+                })
+                .await
+                .map_err(|error| ExecError::Other(error.to_string()))?
+            {
                 break Ok(RunOutcome::Completed);
             }
             drain_cycle = drain_cycle.saturating_add(1);
@@ -547,7 +584,15 @@ pub async fn execute_run(
     // Run record when a RunStore is available.
     match &outcome {
         Ok(RunOutcome::Completed) => {
-            store.finalize_run(run_id, TaskRunStatus::Completed, None)?;
+            let final_run_id = run_id.to_string();
+            blocking
+                .run("finalize completed runtime run", move |store| {
+                    store
+                        .finalize_run(&final_run_id, TaskRunStatus::Completed, None)
+                        .map(|_| ())
+                })
+                .await
+                .map_err(|error| ExecError::Other(error.to_string()))?;
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
@@ -596,19 +641,22 @@ pub async fn execute_run(
                     }),
                 ),
             );
-            // Running → Failed is legal. Use None for synthetic task ids
-            // (<none>/<join>) to avoid orphan task_id events.
-            let tid = if failed_task_id.starts_with('<') {
-                None
-            } else {
-                Some(failed_task_id.as_str())
-            };
-            store.finalize_run_with_note_task(
-                run_id,
-                TaskRunStatus::Failed,
-                tid,
-                Some(&format!("run failed: {error}")),
-            )?;
+            let final_run_id = run_id.to_string();
+            let final_task_id = failed_task_id.clone();
+            let final_error = format!("run failed: {error}");
+            blocking
+                .run("finalize failed runtime run", move |store| {
+                    store
+                        .finalize_run_with_note_task(
+                            &final_run_id,
+                            TaskRunStatus::Failed,
+                            final_task_id.as_deref(),
+                            Some(&final_error),
+                        )
+                        .map(|_| ())
+                })
+                .await
+                .map_err(|error| ExecError::Other(error.to_string()))?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -628,7 +676,15 @@ pub async fn execute_run(
                     serde_json::json!({ "status": "cancelled" }),
                 ),
             );
-            finalize_cancelled_run_state(&store, run_id)?;
+            let final_run_id = run_id.to_string();
+            blocking
+                .run("finalize cancelled runtime run", move |store| {
+                    store
+                        .finalize_run(&final_run_id, TaskRunStatus::Cancelled, None)
+                        .map(|_| ())
+                })
+                .await
+                .map_err(|error| ExecError::Other(error.to_string()))?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -666,8 +722,15 @@ pub async fn execute_run(
                     }),
                 ),
             );
-            let task_id = (!failed_task_id.starts_with('<')).then_some(failed_task_id.as_str());
-            store.settle_paused_tasks(run_id, task_id, &format!("run paused: {error}"))?;
+            let note_run_id = run_id.to_string();
+            let note_task_id = failed_task_id.clone();
+            let note = format!("run paused: {error}");
+            blocking
+                .run("note paused runtime run", move |store| {
+                    store.note(&note_run_id, note_task_id.as_deref(), &note)
+                })
+                .await
+                .map_err(|error| ExecError::Other(error.to_string()))?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -687,11 +750,16 @@ pub async fn execute_run(
                     serde_json::json!({ "error": e.to_string() }),
                 ),
             );
-            store.finalize_run(
-                run_id,
-                TaskRunStatus::Failed,
-                Some(&format!("executor error: {e}")),
-            )?;
+            let final_run_id = run_id.to_string();
+            let final_error = format!("executor error: {e}");
+            blocking
+                .run("finalize runtime executor error", move |store| {
+                    store
+                        .finalize_run(&final_run_id, TaskRunStatus::Failed, Some(&final_error))
+                        .map(|_| ())
+                })
+                .await
+                .map_err(|error| ExecError::Other(error.to_string()))?;
         }
     }
     outcome
@@ -709,10 +777,6 @@ fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String
                 .collect()
         })
         .unwrap_or_else(|error| vec![error.to_string()])
-}
-
-fn finalize_cancelled_run_state(store: &TaskRuntimeStore, run_id: &str) -> Result<(), StoreError> {
-    store.finalize_cancelled_tasks_and_run(run_id)
 }
 
 /// Structured completion assessment. Separates "real execution failure"
@@ -836,6 +900,7 @@ trait TaskDispatcher: Send + Sync {
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
+        blocking: TaskRuntimeBlockingAdapter,
         context: echo_agent::tasks::TaskSubagentContext,
         claim: echo_agent::tasks::TaskClaim,
         task: PlanTask,
@@ -852,6 +917,7 @@ trait TaskDispatcher: Send + Sync {
     fn integrate(
         &self,
         _store: Arc<TaskRuntimeStore>,
+        _blocking: TaskRuntimeBlockingAdapter,
         _run_id: String,
         _task: PlanTask,
         _execution_id: String,
@@ -879,6 +945,7 @@ struct RealTaskDispatcher {
 
 async fn resolve_task_execution_agent(
     store: &TaskRuntimeStore,
+    blocking: &TaskRuntimeBlockingAdapter,
     run_id: &str,
     task: &PlanTask,
     local_agent: crate::agent_handle::AgentHandle,
@@ -898,10 +965,15 @@ async fn resolve_task_execution_agent(
             task.id, target.subagent_role, task.agent_role
         ));
     }
-    let run = store
-        .get_run(run_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("TaskRun '{run_id}' does not exist"))?;
+    let load_run_id = run_id.to_string();
+    let run = blocking
+        .run("load task execution target run", move |store| {
+            store
+                .get_run(&load_run_id)?
+                .ok_or(StoreError::RunNotFound(load_run_id))
+        })
+        .await
+        .map_err(|error| error.to_string())?;
     let leader = crate::agent_router::AgentAddress::new(
         crate::workspace::WorkspaceId::from_raw(run.workspace_id),
         run.conversation_id,
@@ -921,6 +993,7 @@ impl TaskDispatcher for RealTaskDispatcher {
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
+        blocking: TaskRuntimeBlockingAdapter,
         context: echo_agent::tasks::TaskSubagentContext,
         claim: echo_agent::tasks::TaskClaim,
         task: PlanTask,
@@ -942,7 +1015,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                 permit = PROCESS_EXECUTION_GOVERNOR.subagent.acquire() => permit.map_err(|error| TaskDispatchFailure::failed(task_id.clone(), error.to_string()))?,
             };
             let (execution_agent, target_lease) =
-                resolve_task_execution_agent(&store, &run_id, &task, local_agent)
+                resolve_task_execution_agent(&store, &blocking, &run_id, &task, local_agent)
                     .await
                     .map_err(|error| TaskDispatchFailure::failed(task_id, error))?;
             // Scope run_id + cancel + trace_sink into task-local so Subagent-internal
@@ -961,6 +1034,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                 async {
                     execute_task(
                         store,
+                        blocking,
                         execution_agent,
                         write_sem,
                         shell_sem,
@@ -985,6 +1059,7 @@ impl TaskDispatcher for RealTaskDispatcher {
     fn integrate(
         &self,
         store: Arc<TaskRuntimeStore>,
+        blocking: TaskRuntimeBlockingAdapter,
         run_id: String,
         task: PlanTask,
         execution_id: String,
@@ -1010,11 +1085,17 @@ impl TaskDispatcher for RealTaskDispatcher {
             }
 
             let (execution_agent, target_lease) =
-                resolve_task_execution_agent(&store, &run_id, &task, local_agent).await?;
-            let run = store
-                .get_run(&run_id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| format!("TaskRun '{run_id}' does not exist"))?;
+                resolve_task_execution_agent(&store, &blocking, &run_id, &task, local_agent)
+                    .await?;
+            let load_run_id = run_id.clone();
+            let run = blocking
+                .run("load worktree integration run", move |store| {
+                    store
+                        .get_run(&load_run_id)?
+                        .ok_or(StoreError::RunNotFound(load_run_id))
+                })
+                .await
+                .map_err(|error| error.to_string())?;
             let workspace_id = run.workspace_id;
             let conversation_id = run.conversation_id;
 
@@ -1040,11 +1121,18 @@ impl TaskDispatcher for RealTaskDispatcher {
             let label = task_worktree_label(&task.agent_role, &run_id, &task.id);
             let ownership = super::planner::file_ownership(&task);
             let branch = super::worktree::fork_branch_name(&label);
-            let _ = store.note(
-                &run_id,
-                Some(&task.id),
-                &format!("worktree integration started: execution={execution_id}, branch={branch}"),
-            );
+            let start_run_id = run_id.clone();
+            let start_task_id = task.id.clone();
+            let start_message =
+                format!("worktree integration started: execution={execution_id}, branch={branch}");
+            if let Err(error) = blocking
+                .run("note worktree integration start", move |store| {
+                    store.note(&start_run_id, Some(&start_task_id), &start_message)
+                })
+                .await
+            {
+                tracing::warn!(run_id, task_id = %task.id, %error, "failed to note worktree integration start");
+            }
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::task(
@@ -1080,13 +1168,25 @@ impl TaskDispatcher for RealTaskDispatcher {
             let result = match outcome {
                 Ok(outcome) => {
                     let summary = outcome.summary();
-                    let _ = store.note(&run_id, Some(&task.id), &summary);
-                    if let Some(warning) = &outcome.cleanup_warning {
-                        let _ = store.note(
-                            &run_id,
-                            Some(&task.id),
-                            &format!("worktree cleanup warning: {warning}"),
-                        );
+                    let note_run_id = run_id.clone();
+                    let note_task_id = task.id.clone();
+                    let note_summary = summary.clone();
+                    let cleanup_warning = outcome.cleanup_warning.clone();
+                    if let Err(error) = blocking
+                        .run("note worktree integration result", move |store| {
+                            store.note(&note_run_id, Some(&note_task_id), &note_summary)?;
+                            if let Some(warning) = cleanup_warning {
+                                store.note(
+                                    &note_run_id,
+                                    Some(&note_task_id),
+                                    &format!("worktree cleanup warning: {warning}"),
+                                )?;
+                            }
+                            Ok(())
+                        })
+                        .await
+                    {
+                        tracing::warn!(run_id, task_id = %task.id, %error, "failed to note worktree integration result");
                     }
                     emit_exec(
                         trace_sink.as_ref(),
@@ -1112,11 +1212,17 @@ impl TaskDispatcher for RealTaskDispatcher {
                 }
                 Err(error) => {
                     let message = error.to_string();
-                    let _ = store.note(
-                        &run_id,
-                        Some(&task.id),
-                        &format!("worktree integration failed: {message}"),
-                    );
+                    let note_run_id = run_id.clone();
+                    let note_task_id = task.id.clone();
+                    let failure_note = format!("worktree integration failed: {message}");
+                    if let Err(error) = blocking
+                        .run("note worktree integration failure", move |store| {
+                            store.note(&note_run_id, Some(&note_task_id), &failure_note)
+                        })
+                        .await
+                    {
+                        tracing::warn!(run_id, task_id = %task.id, %error, "failed to note worktree integration failure");
+                    }
                     emit_exec(
                         trace_sink.as_ref(),
                         ExecEvent::task(
@@ -1147,6 +1253,26 @@ struct TaskDispatchSuccess {
     task_id: String,
     result: SubagentTaskResult,
     full_output: String,
+    suggested_tasks: Vec<SuggestedTask>,
+}
+
+fn task_execution_summary_candidate(
+    run_id: &str,
+    task: &PlanTask,
+    result: SubagentTaskResult,
+    suggested_tasks: Vec<SuggestedTask>,
+    decisions: Vec<String>,
+) -> TaskExecutionSummary {
+    TaskExecutionSummary {
+        run_id: run_id.to_string(),
+        task_id: task.id.clone(),
+        subagent_name: task.agent_role.clone(),
+        result,
+        decisions,
+        next_implications: Vec::new(),
+        suggested_tasks,
+        created_at: chrono::Utc::now(),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1189,38 +1315,34 @@ impl TaskExecutionUsage {
     }
 }
 
-fn persist_framework_subagent_usage(
-    store: &TaskRuntimeStore,
+async fn finalize_framework_subagent_result(
+    blocking: TaskRuntimeBlockingAdapter,
     run_id: &str,
     execution_id: &str,
-    result: &echo_agent::agent::subagent::SubagentResult,
-) -> Result<TaskExecutionUsage, ExecutionFailure> {
-    let usage = TaskExecutionUsage::from_framework(result);
-    store
-        .account_subagent_usage(
-            run_id,
-            execution_id,
-            "framework_dispatch_total",
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.duration_ms(),
-        )
+    result: echo_agent::agent::subagent::SubagentResult,
+) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
+    let usage = TaskExecutionUsage::from_framework(&result);
+    let usage_run_id = run_id.to_string();
+    let usage_execution_id = execution_id.to_string();
+    let persisted_usage = usage.clone();
+    blocking
+        .run("persist framework Subagent usage", move |store| {
+            store.account_subagent_usage(
+                &usage_run_id,
+                &usage_execution_id,
+                "framework_dispatch_total",
+                persisted_usage.input_tokens,
+                persisted_usage.output_tokens,
+                persisted_usage.duration_ms(),
+            )
+        })
+        .await
         .map_err(|error| {
             ExecutionFailure::failed(format!(
                 "failed to persist Subagent usage for {execution_id}: {error}"
             ))
             .with_usage(usage.clone())
         })?;
-    Ok(usage)
-}
-
-fn finalize_framework_subagent_result(
-    store: &TaskRuntimeStore,
-    run_id: &str,
-    execution_id: &str,
-    result: echo_agent::agent::subagent::SubagentResult,
-) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
-    let usage = persist_framework_subagent_usage(store, run_id, execution_id, &result)?;
     if result.outcome.status != echo_agent::agent::subagent::SubagentStatus::Completed {
         let status = result.outcome.status.into();
         let message = if result.outcome.summary.trim().is_empty() {
@@ -1374,6 +1496,7 @@ fn select_ownership_safe_wave(ready: Vec<PlanTask>) -> Vec<PlanTask> {
 
 struct EkoRuntimeDagController<W: TaskDispatcher> {
     store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     dispatcher: Arc<W>,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     write_sem: Arc<Semaphore>,
@@ -1382,67 +1505,121 @@ struct EkoRuntimeDagController<W: TaskDispatcher> {
     file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
     trace_sink: Option<ExecSink>,
     cancel: CancellationToken,
-    plan_tasks: std::sync::Mutex<HashMap<String, PlanTask>>,
+    resolution_metadata: std::sync::Mutex<HashMap<String, RuntimeTaskProductSettlement>>,
+}
+
+#[derive(Clone)]
+pub struct TaskRuntimeBlockingAdapter {
+    store: Arc<TaskRuntimeStore>,
+}
+
+const PROCESS_TASK_RUNTIME_FILE_IO_LIMIT: usize = 8;
+static PROCESS_TASK_RUNTIME_FILE_IO: std::sync::LazyLock<Arc<Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(Semaphore::new(PROCESS_TASK_RUNTIME_FILE_IO_LIMIT)));
+
+impl TaskRuntimeBlockingAdapter {
+    pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
+        Self { store }
+    }
+
+    pub async fn run<T, F>(
+        &self,
+        operation: &'static str,
+        function: F,
+    ) -> echo_agent::error::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<TaskRuntimeStore>) -> Result<T, StoreError> + Send + 'static,
+    {
+        let permit = PROCESS_TASK_RUNTIME_FILE_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                echo_agent::error::ReactError::Other(format!(
+                    "TaskRuntime blocking adapter closed during {operation}: {error}"
+                ))
+            })?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            function(store)
+        })
+        .await
+        .map_err(|error| {
+            echo_agent::error::ReactError::Other(format!(
+                "TaskRuntime blocking operation {operation} failed to join: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            echo_agent::error::ReactError::Other(format!(
+                "TaskRuntime blocking operation {operation} failed: {error}"
+            ))
+        })
+    }
 }
 
 impl<W: TaskDispatcher> EkoRuntimeDagController<W> {
-    fn plan_task(&self, task_id: &str) -> echo_agent::error::Result<PlanTask> {
-        self.plan_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(task_id)
-            .cloned()
-            .ok_or_else(|| {
-                echo_agent::error::ReactError::Other(format!(
-                    "plan task '{task_id}' missing from active revision"
-                ))
-            })
+    fn plan_task(runtime_task: &echo_agent::tasks::Task) -> echo_agent::error::Result<PlanTask> {
+        PlanTask::try_from(runtime_task.clone()).map_err(echo_agent::error::ReactError::Other)
     }
 
-    fn review_stop_disposition(&self, run_id: &str) -> echo_agent::tasks::RuntimeStopDisposition {
-        let unattended = self
-            .store
-            .get_run(run_id)
-            .ok()
-            .flatten()
-            .is_some_and(|run| run.attended_mode == AttendedMode::Unattended);
-        if unattended {
+    async fn review_stop_disposition(
+        &self,
+        run_id: &str,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeStopDisposition> {
+        let run_id = run_id.to_string();
+        let run = self
+            .blocking
+            .run("load run review disposition", move |store| {
+                store
+                    .get_run(&run_id)?
+                    .ok_or(StoreError::RunNotFound(run_id))
+            })
+            .await?;
+        Ok(if run.attended_mode == AttendedMode::Unattended {
             echo_agent::tasks::RuntimeStopDisposition::Fail
         } else {
             echo_agent::tasks::RuntimeStopDisposition::Pause
+        })
+    }
+
+    async fn note(
+        &self,
+        run_id: &str,
+        task_id: Option<&str>,
+        message: impl Into<String>,
+    ) -> echo_agent::error::Result<()> {
+        let run_id = run_id.to_string();
+        let task_id = task_id.map(str::to_string);
+        let message = message.into();
+        self.blocking
+            .run("append runtime task note", move |store| {
+                store.note(&run_id, task_id.as_deref(), &message)
+            })
+            .await
+    }
+
+    fn stage_resolution_metadata(
+        &self,
+        claim_id: &str,
+        metadata: RuntimeTaskProductSettlement,
+    ) -> echo_agent::error::Result<()> {
+        let mut metadata_by_claim = self
+            .resolution_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match metadata_by_claim.entry(claim_id.to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(metadata);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(echo_agent::error::ReactError::Other(format!(
+                    "resolution metadata for claim '{claim_id}' was staged more than once"
+                )))
+            }
         }
-    }
-
-    fn set_claimed_status(
-        &self,
-        run_id: &str,
-        task: &PlanTask,
-        claim: &echo_agent::tasks::TaskClaim,
-        status: TodoStatus,
-        summary: Option<&str>,
-    ) -> echo_agent::error::Result<bool> {
-        self.store
-            .set_claimed_task_status(
-                run_id,
-                &task.id,
-                claim,
-                status,
-                Some(&task.agent_role),
-                summary,
-            )
-            .map(|outcome| outcome == ClaimWriteOutcome::Applied)
-            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
-    }
-
-    fn claim_is_current(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        claim: &echo_agent::tasks::TaskClaim,
-    ) -> echo_agent::error::Result<bool> {
-        self.store
-            .task_claim_is_current(run_id, task_id, claim)
-            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
     }
 }
 
@@ -1456,32 +1633,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         &self,
         run_id: &str,
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimePlanSnapshot> {
-        let plan = self
-            .store
-            .get_plan(run_id)
-            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
-            .ok_or_else(|| {
-                echo_agent::error::ReactError::Other(format!("run {run_id} has no plan"))
-            })?;
-        let runtime_tasks = plan
-            .tasks
-            .iter()
-            .map(PlanTask::to_task)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(echo_agent::error::ReactError::Other)?;
-        let by_id = plan
-            .tasks
-            .into_iter()
-            .map(|task| (task.id.clone(), task))
-            .collect();
-        *self
-            .plan_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = by_id;
-        Ok(echo_agent::tasks::RuntimePlanSnapshot {
-            revision: plan.revision,
-            tasks: runtime_tasks,
-        })
+        let run_id = run_id.to_string();
+        self.blocking
+            .run("load exact revisioned task graph", move |store| {
+                store.load_runtime_plan_snapshot(&run_id)
+            })
+            .await
     }
 
     async fn claim_task(
@@ -1490,24 +1647,52 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         task: &echo_agent::tasks::Task,
         expected_revision: u64,
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskClaimOutcome> {
-        self.store
-            .claim_task(run_id, task, expected_revision)
-            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+        let run_id = run_id.to_string();
+        let task = task.clone();
+        self.blocking
+            .run("claim runtime task", move |store| {
+                store.claim_runtime_task(&run_id, &task, expected_revision)
+            })
+            .await
+    }
+
+    async fn claim_is_current(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+    ) -> echo_agent::error::Result<bool> {
+        let run_id = run_id.to_string();
+        let task_id = task_id.to_string();
+        let claim = claim.clone();
+        self.blocking
+            .run("check runtime task claim", move |store| {
+                store.runtime_task_claim_is_current(&run_id, &task_id, &claim)
+            })
+            .await
     }
 
     fn select_ready_wave(
         &self,
-        _tasks: &[echo_agent::tasks::Task],
+        tasks: &[echo_agent::tasks::Task],
         ready_task_ids: Vec<String>,
     ) -> Vec<String> {
-        let by_id = self
-            .plan_tasks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let ready = ready_task_ids
-            .into_iter()
-            .filter_map(|task_id| by_id.get(&task_id).cloned())
-            .collect();
+            .iter()
+            .filter_map(|task_id| {
+                tasks
+                    .iter()
+                    .find(|task| task.spec.id == *task_id)
+                    .cloned()
+                    .and_then(|task| match PlanTask::try_from(task) {
+                        Ok(task) => Some(task),
+                        Err(error) => {
+                            tracing::error!(task_id, %error, "invalid EKO task extension in ready frontier");
+                            None
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
         select_ownership_safe_wave(ready)
             .into_iter()
             .map(|task| task.id)
@@ -1520,15 +1705,27 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         claim: echo_agent::tasks::TaskClaim,
         runtime_task: echo_agent::tasks::Task,
     ) -> echo_agent::error::Result<Self::DispatchOutput> {
-        let task = self.plan_task(&runtime_task.spec.id)?;
+        let task = Self::plan_task(&runtime_task)?;
         let active_task_id = task.id.clone();
         let execution_id = subagent_execution_id(&context.run_id, &task.id, &claim);
-        match self.store.recoverable_subagent_result_for_attempt(
-            &context.run_id,
-            &task.id,
-            claim.revision,
-            claim.attempt,
-        ) {
+        let recovery_run_id = context.run_id.clone();
+        let recovery_task_id = task.id.clone();
+        let recovery_execution_id = execution_id.clone();
+        let recovery_revision = claim.revision;
+        let recovery_attempt = claim.attempt;
+        let recovery = self
+            .blocking
+            .run("load recoverable Subagent result", move |store| {
+                store.recoverable_subagent_result_for_attempt(
+                    &recovery_run_id,
+                    &recovery_task_id,
+                    &recovery_execution_id,
+                    recovery_revision,
+                    recovery_attempt,
+                )
+            })
+            .await;
+        match recovery {
             Ok(Some(recovered)) => {
                 tracing::info!(
                     run_id = %context.run_id,
@@ -1536,15 +1733,26 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     execution_id,
                     "task_runtime: reusing durable Subagent result after restart"
                 );
-                let _ = self.store.note(
-                    &context.run_id,
-                    Some(&task.id),
-                    "reused completed Subagent result; continuing at review boundary",
-                );
+                let note_run_id = context.run_id.clone();
+                let note_task_id = task.id.clone();
+                if let Err(error) = self
+                    .blocking
+                    .run("note recovered Subagent result", move |store| {
+                        store.note(
+                            &note_run_id,
+                            Some(&note_task_id),
+                            "reused completed Subagent result; continuing at review boundary",
+                        )
+                    })
+                    .await
+                {
+                    tracing::warn!(run_id = %context.run_id, task_id = %task.id, %error, "failed to note recovered Subagent result");
+                }
                 return Ok(TaskDispatchSuccess {
                     task_id: task.id,
                     result: recovered.result,
                     full_output: recovered.full_output,
+                    suggested_tasks: Vec::new(),
                 });
             }
             Ok(None) => {}
@@ -1559,6 +1767,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         self.dispatcher
             .dispatch(
                 self.store.clone(),
+                self.blocking.clone(),
                 context,
                 claim,
                 task,
@@ -1586,40 +1795,58 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         claim: echo_agent::tasks::TaskClaim,
         runtime_task: echo_agent::tasks::Task,
         dispatch: echo_agent::error::Result<Self::DispatchOutput>,
-    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskResolution> {
-        let task = self.plan_task(&runtime_task.spec.id)?;
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskResolutionRequest> {
+        let task = Self::plan_task(&runtime_task)?;
         let dispatched = match dispatch {
             Ok(dispatched) => dispatched,
             Err(error) => {
                 let message = error.to_string();
                 let status = echo_agent::agent::subagent::subagent_status_from_error(&error);
-                let todo_status = match status {
-                    echo_agent::agent::subagent::SubagentStatus::Cancelled => TodoStatus::Cancelled,
-                    echo_agent::agent::subagent::SubagentStatus::TimedOut => TodoStatus::TimedOut,
+                let request = match status {
+                    echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                        echo_agent::tasks::RuntimeTaskResolutionRequest::Cancelled
+                    }
+                    echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                        echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                            error: format!("Subagent timed out: {message}"),
+                        }
+                    }
                     echo_agent::agent::subagent::SubagentStatus::Completed
-                    | echo_agent::agent::subagent::SubagentStatus::Failed => TodoStatus::Failed,
+                    | echo_agent::agent::subagent::SubagentStatus::Failed => {
+                        echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                            error: message.clone(),
+                        }
+                    }
                 };
-                if !self.set_claimed_status(
-                    run_id,
-                    &task,
-                    &claim,
-                    todo_status,
-                    Some(&format!("error: {message}")),
-                )? {
-                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
-                }
-                return Ok(if todo_status == TodoStatus::Cancelled {
-                    echo_agent::tasks::RuntimeTaskResolution::Cancelled
-                } else {
-                    echo_agent::tasks::RuntimeTaskResolution::Failed { error: message }
-                });
+                let result = SubagentTaskResult::terminal(
+                    status.into(),
+                    message.clone(),
+                    vec![message.clone()],
+                );
+                self.stage_resolution_metadata(
+                    &claim.claim_id,
+                    RuntimeTaskProductSettlement {
+                        summary: Some(message.clone()),
+                        execution_summary: Some(task_execution_summary_candidate(
+                            run_id,
+                            &task,
+                            result,
+                            Vec::new(),
+                            vec![message],
+                        )),
+                        review: None,
+                        diagnostic_note: None,
+                    },
+                )?;
+                return Ok(request);
             }
         };
 
         let TaskDispatchSuccess {
             task_id,
-            result,
+            mut result,
             full_output,
+            suggested_tasks,
         } = dispatched;
         if task_id != task.id {
             return Err(echo_agent::error::ReactError::Other(format!(
@@ -1630,40 +1857,25 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
 
         match assess_task_execution(&task, &result) {
             CompletionAssessment::ExecutionFailed { reason } => {
-                let claimed_retry_count = claim.attempt.saturating_sub(1);
-                if claimed_retry_count < task.max_retries {
-                    let next_retry = claimed_retry_count.saturating_add(1);
-                    let retry_summary =
-                        format!("execution failed (attempt {next_retry}): {reason}");
-                    let requeued = self
-                        .store
-                        .requeue_claimed_task(run_id, &task.id, &claim, None, &retry_summary)
-                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
-                    if requeued == ClaimWriteOutcome::Superseded {
-                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
-                    }
-                    let _ = self.store.note(
+                self.stage_resolution_metadata(
+                    &claim.claim_id,
+                    RuntimeTaskProductSettlement {
+                        summary: Some(reason.clone()),
+                        execution_summary: Some(task_execution_summary_candidate(
                             run_id,
-                            Some(&task.id),
-                            &format!(
-                                "attempt {next_retry} failed: {reason}; auto-retrying (retry_count {} -> {next_retry})",
-                                claimed_retry_count
-                            ),
-                        );
-                    Ok(echo_agent::tasks::RuntimeTaskResolution::Pending)
-                } else {
-                    let error = format!("execution failed after max retries: {reason}");
-                    if !self.set_claimed_status(
-                        run_id,
-                        &task,
-                        &claim,
-                        TodoStatus::Failed,
-                        Some(&error),
-                    )? {
-                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
-                    }
-                    Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error })
-                }
+                            &task,
+                            result,
+                            suggested_tasks,
+                            vec![format!("execution failed: {reason}")],
+                        )),
+                        review: None,
+                        diagnostic_note: None,
+                    },
+                )?;
+                Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Requeue {
+                    failure_fingerprint: None,
+                    error: format!("execution failed: {reason}"),
+                })
             }
             CompletionAssessment::AcceptancePending {
                 missing_checks,
@@ -1674,24 +1886,36 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     missing_checks.join(", "),
                     missing_artifacts.join(", "),
                 );
-                if !self.set_claimed_status(
-                    run_id,
-                    &task,
-                    &claim,
-                    TodoStatus::Blocked,
-                    Some(&reason),
-                )? {
-                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
-                }
-                let _ = self.store.note(run_id, Some(&task.id), &reason);
-                Ok(echo_agent::tasks::RuntimeTaskResolution::Blocked {
+                let disposition = self.review_stop_disposition(run_id).await?;
+                self.stage_resolution_metadata(
+                    &claim.claim_id,
+                    RuntimeTaskProductSettlement {
+                        summary: Some(reason.clone()),
+                        execution_summary: Some(task_execution_summary_candidate(
+                            run_id,
+                            &task,
+                            result,
+                            suggested_tasks,
+                            vec![reason.clone()],
+                        )),
+                        review: None,
+                        diagnostic_note: Some(reason.clone()),
+                    },
+                )?;
+                Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
                     error: reason,
-                    disposition: self.review_stop_disposition(run_id),
+                    disposition,
                 })
             }
             CompletionAssessment::Executed => {
-                if !self.claim_is_current(run_id, &task.id, &claim)? {
-                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                if !echo_agent::tasks::RuntimeDagController::claim_is_current(
+                    self, run_id, &task.id, &claim,
+                )
+                .await?
+                {
+                    return Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                        error: "dispatch completed after its claim was superseded".to_string(),
+                    });
                 }
                 let summary = result.summary.clone();
                 let review_output = if full_output.trim().is_empty() {
@@ -1700,63 +1924,64 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     full_output.as_str()
                 };
                 let review = run_review_gate(
-                    self.store.clone(),
+                    self.blocking.clone(),
                     self.reviewer_llm.clone(),
                     run_id,
                     &task,
                     review_output,
                 )
                 .await;
-                let block_reason = match review {
-                    ReviewGateOutcome::Pass => None,
-                    ReviewGateOutcome::NeedsFix(_fix_task) => {
-                        let _ = self.store.note(
-                            run_id,
-                            Some(&task.id),
-                            "review returned needs_fix; task blocked, run stopped",
-                        );
-                        Some("review needs fix; awaiting explicit retry".to_string())
+                let (block_reason, review_candidate) = match review {
+                    ReviewGateOutcome::Pass(review) => (None, review),
+                    ReviewGateOutcome::NeedsFix(_fix_task, review) => (
+                        Some("review needs fix; awaiting explicit retry".to_string()),
+                        Some(review),
+                    ),
+                    ReviewGateOutcome::Suspend { reason, review } => {
+                        (Some(format!("review suspended: {reason}")), review)
                     }
-                    ReviewGateOutcome::Suspend(reason) => {
-                        let _ = self.store.note(
-                            run_id,
-                            Some(&task.id),
-                            &format!("circuit breaker: {reason}"),
-                        );
-                        Some(format!("review suspended: {reason}"))
-                    }
-                    ReviewGateOutcome::Skipped => {
-                        let _ = self.store.note(
-                            run_id,
-                            Some(&task.id),
-                            "no reviewer LLM; task blocked (no auto-pass per M7)",
-                        );
-                        Some("reviewer unavailable; blocked pending LLM".to_string())
-                    }
+                    ReviewGateOutcome::Skipped => (
+                        Some("reviewer unavailable; blocked pending LLM".to_string()),
+                        None,
+                    ),
                 };
                 if let Some(reason) = block_reason {
-                    if !self.set_claimed_status(
-                        run_id,
-                        &task,
-                        &claim,
-                        TodoStatus::Blocked,
-                        Some(&reason),
-                    )? {
-                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
-                    }
-                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Blocked {
+                    let disposition = self.review_stop_disposition(run_id).await?;
+                    self.stage_resolution_metadata(
+                        &claim.claim_id,
+                        RuntimeTaskProductSettlement {
+                            summary: Some(reason.clone()),
+                            execution_summary: Some(task_execution_summary_candidate(
+                                run_id,
+                                &task,
+                                result,
+                                suggested_tasks,
+                                vec![reason.clone()],
+                            )),
+                            review: review_candidate,
+                            diagnostic_note: Some(reason.clone()),
+                        },
+                    )?;
+                    return Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
                         error: reason,
-                        disposition: self.review_stop_disposition(run_id),
+                        disposition,
                     });
                 }
 
-                if !self.claim_is_current(run_id, &task.id, &claim)? {
-                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                if !echo_agent::tasks::RuntimeDagController::claim_is_current(
+                    self, run_id, &task.id, &claim,
+                )
+                .await?
+                {
+                    return Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                        error: "review completed after its claim was superseded".to_string(),
+                    });
                 }
                 let execution_id = subagent_execution_id(run_id, &task.id, &claim);
                 match integrate_reviewed_task(
                     self.dispatcher.clone(),
                     self.store.clone(),
+                    self.blocking.clone(),
                     run_id,
                     &task,
                     &execution_id,
@@ -1766,34 +1991,77 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 )
                 .await
                 {
-                    Ok(completion_summary) => {
-                        if !self.set_claimed_status(
+                    Ok((completion_summary, changed_files)) => {
+                        if !changed_files.is_empty() {
+                            result.touched_files.written = changed_files;
+                        }
+                        let execution_summary = task_execution_summary_candidate(
                             run_id,
                             &task,
-                            &claim,
-                            TodoStatus::Completed,
-                            Some(&completion_summary),
-                        )? {
-                            return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
-                        }
-                        Ok(echo_agent::tasks::RuntimeTaskResolution::Completed)
+                            result,
+                            suggested_tasks,
+                            vec![completion_summary.clone()],
+                        );
+                        self.stage_resolution_metadata(
+                            &claim.claim_id,
+                            RuntimeTaskProductSettlement {
+                                summary: Some(completion_summary),
+                                execution_summary: Some(execution_summary),
+                                review: review_candidate,
+                                diagnostic_note: None,
+                            },
+                        )?;
+                        Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Completed)
                     }
                     Err(error) => {
                         let error = format!("worktree integration failed: {error}");
-                        if !self.set_claimed_status(
-                            run_id,
-                            &task,
-                            &claim,
-                            TodoStatus::Failed,
-                            Some(&error),
-                        )? {
-                            return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                        result.status = SubagentRunStatus::Failed;
+                        if !result.remaining_work.contains(&error) {
+                            result.remaining_work.push(error.clone());
                         }
-                        Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error })
+                        self.stage_resolution_metadata(
+                            &claim.claim_id,
+                            RuntimeTaskProductSettlement {
+                                summary: Some(error.clone()),
+                                execution_summary: Some(task_execution_summary_candidate(
+                                    run_id,
+                                    &task,
+                                    result,
+                                    suggested_tasks,
+                                    vec![error.clone()],
+                                )),
+                                review: review_candidate,
+                                diagnostic_note: Some(error.clone()),
+                            },
+                        )?;
+                        Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Failed { error })
                     }
                 }
             }
         }
+    }
+
+    async fn settle_resolution(
+        &self,
+        run_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+        runtime_task: &echo_agent::tasks::Task,
+        request: echo_agent::tasks::RuntimeTaskResolutionRequest,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskResolution> {
+        let product = self
+            .resolution_metadata
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&claim.claim_id)
+            .unwrap_or_default();
+        let run_id = run_id.to_string();
+        let task_id = runtime_task.spec.id.clone();
+        let claim = claim.clone();
+        self.blocking
+            .run("settle runtime task resolution", move |store| {
+                store.settle_runtime_task_resolution(&run_id, &task_id, &claim, request, product)
+            })
+            .await
     }
 
     async fn abandon_claim(
@@ -1802,37 +2070,32 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         claim: &echo_agent::tasks::TaskClaim,
         runtime_task: &echo_agent::tasks::Task,
         abandonment: echo_agent::tasks::RuntimeClaimAbandonment,
-    ) -> echo_agent::error::Result<()> {
-        let task = self.plan_task(&runtime_task.spec.id)?;
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskSettlementOutcome> {
         let (status, summary) = match abandonment {
-            echo_agent::tasks::RuntimeClaimAbandonment::Cancelled => (
-                TodoStatus::Cancelled,
-                "dispatch cancelled before resolution".to_string(),
-            ),
+            echo_agent::tasks::RuntimeClaimAbandonment::Interrupted { disposition } => {
+                match disposition {
+                    echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled => (
+                        echo_agent::tasks::TaskStatus::Cancelled,
+                        "dispatch cancelled before resolution".to_string(),
+                    ),
+                    echo_agent::tasks::RuntimeInterruptionDisposition::Paused { reason } => (
+                        echo_agent::tasks::TaskStatus::Paused(reason.clone()),
+                        reason,
+                    ),
+                }
+            }
             echo_agent::tasks::RuntimeClaimAbandonment::Failed { error } => {
-                (TodoStatus::Failed, error)
+                (echo_agent::tasks::TaskStatus::Failed(error.clone()), error)
             }
         };
-        let _ = self.set_claimed_status(run_id, &task, claim, status, Some(&summary))?;
-        Ok(())
-    }
-
-    async fn block_task(
-        &self,
-        run_id: &str,
-        task: &echo_agent::tasks::Task,
-        reason: &str,
-    ) -> echo_agent::error::Result<()> {
-        self.store
-            .set_task_status(
-                run_id,
-                &task.spec.id,
-                TodoStatus::Blocked,
-                None,
-                Some(reason),
-            )
-            .map(|_| ())
-            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+        let run_id = run_id.to_string();
+        let task_id = runtime_task.spec.id.clone();
+        let claim = claim.clone();
+        self.blocking
+            .run("settle abandoned runtime task claim", move |store| {
+                store.settle_runtime_task_claim(&run_id, &task_id, &claim, status, Some(summary))
+            })
+            .await
     }
 
     async fn failed_task_disposition(
@@ -1844,34 +2107,48 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         if all_unfinished_failed_or_blocked {
             Ok(echo_agent::tasks::RuntimeStopDisposition::Fail)
         } else {
-            Ok(self.review_stop_disposition(run_id))
+            self.review_stop_disposition(run_id).await
         }
     }
 
-    async fn interruption_outcome(
+    async fn interruption_disposition(
         &self,
         run_id: &str,
-    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeDagOutcome> {
-        let paused = self
-            .store
-            .get_run(run_id)
-            .ok()
-            .flatten()
-            .is_some_and(|run| run.status == TaskRunStatus::Paused);
-        Ok(if paused {
-            echo_agent::tasks::RuntimeDagOutcome::Paused {
-                failed_task_id: "<pause>".to_string(),
-                error: "paused by user".to_string(),
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeInterruptionDisposition> {
+        let run_id = run_id.to_string();
+        let run = self
+            .blocking
+            .run("load runtime interruption intent", move |store| {
+                store
+                    .get_run(&run_id)?
+                    .ok_or(StoreError::RunNotFound(run_id))
+            })
+            .await?;
+        Ok(if run.status == TaskRunStatus::Paused {
+            echo_agent::tasks::RuntimeInterruptionDisposition::Paused {
+                reason: "paused by user".to_string(),
             }
         } else {
-            echo_agent::tasks::RuntimeDagOutcome::Cancelled
+            echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled
         })
     }
 
+    async fn settle_interruption(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        disposition: echo_agent::tasks::RuntimeInterruptionDisposition,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeInterruptionSettlementOutcome> {
+        let run_id = run_id.to_string();
+        self.blocking
+            .run("settle runtime task interruption", move |store| {
+                store.settle_runtime_task_interruption(&run_id, expected_revision, disposition)
+            })
+            .await
+    }
+
     async fn note_stalled(&self, run_id: &str, reason: &str) -> echo_agent::error::Result<()> {
-        self.store
-            .note(run_id, None, reason)
-            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+        self.note(run_id, None, reason.to_string()).await
     }
 }
 
@@ -1885,9 +2162,10 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
     parent_cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
 ) -> Result<RunOutcome, ExecError> {
-    let run_store = store.clone();
+    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
     let controller = Arc::new(EkoRuntimeDagController {
         store,
+        blocking: blocking.clone(),
         dispatcher: Arc::new(dispatcher),
         reviewer_llm,
         write_sem: Arc::new(Semaphore::new(limits.max_concurrent_writes.max(1))),
@@ -1896,27 +2174,41 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
         file_write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         trace_sink,
         cancel: parent_cancel.clone(),
-        plan_tasks: std::sync::Mutex::new(HashMap::new()),
+        resolution_metadata: std::sync::Mutex::new(HashMap::new()),
     });
-    let executor = echo_agent::tasks::RuntimeDagExecutor::new(
+    let runtime_tasks = echo_agent::tasks::RuntimeTaskService::new(
         controller,
-        echo_agent::tasks::RuntimeDagExecutorConfig {
+        echo_agent::tasks::RuntimeTaskServiceConfig {
             max_concurrent_subagents: limits.max_concurrent_subagents,
             ..Default::default()
         },
     );
-    let outcome = executor
+    let outcome = runtime_tasks
         .execute(run_id, parent_cancel)
         .await
         .map_err(|error| ExecError::Other(error.to_string()))?;
     let terminal_status = match &outcome {
         echo_agent::tasks::RuntimeDagOutcome::Failed { .. } => Some(TaskRunStatus::Failed),
+        echo_agent::tasks::RuntimeDagOutcome::Stalled { .. } => Some(TaskRunStatus::Failed),
         echo_agent::tasks::RuntimeDagOutcome::Paused { .. } => Some(TaskRunStatus::Paused),
-        echo_agent::tasks::RuntimeDagOutcome::Completed
-        | echo_agent::tasks::RuntimeDagOutcome::Cancelled => None,
+        echo_agent::tasks::RuntimeDagOutcome::Cancelled => Some(TaskRunStatus::Cancelled),
+        echo_agent::tasks::RuntimeDagOutcome::Completed => None,
     };
     if let Some(status) = terminal_status {
-        let _ = run_store.transition_run(run_id, status);
+        let transition_run_id = run_id.to_string();
+        blocking
+            .run("transition runtime task run", move |store| {
+                let current = store
+                    .get_run(&transition_run_id)?
+                    .ok_or_else(|| StoreError::RunNotFound(transition_run_id.clone()))?;
+                if current.status == status {
+                    Ok(current)
+                } else {
+                    store.transition_run(&transition_run_id, status)
+                }
+            })
+            .await
+            .map_err(|error| ExecError::Other(error.to_string()))?;
     }
     Ok(match outcome {
         echo_agent::tasks::RuntimeDagOutcome::Completed => RunOutcome::Completed,
@@ -1924,15 +2216,16 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
             failed_task_id,
             error,
         } => RunOutcome::Failed {
-            failed_task_id,
+            failed_task_id: Some(failed_task_id),
             error,
         },
-        echo_agent::tasks::RuntimeDagOutcome::Paused {
-            failed_task_id,
-            error,
-        } => RunOutcome::Paused {
-            failed_task_id,
-            error,
+        echo_agent::tasks::RuntimeDagOutcome::Paused { task_id, reason } => RunOutcome::Paused {
+            failed_task_id: task_id,
+            error: reason,
+        },
+        echo_agent::tasks::RuntimeDagOutcome::Stalled { reason } => RunOutcome::Failed {
+            failed_task_id: None,
+            error: reason,
         },
         echo_agent::tasks::RuntimeDagOutcome::Cancelled => RunOutcome::Cancelled,
     })
@@ -1942,16 +2235,18 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
 async fn integrate_reviewed_task<W: TaskDispatcher + 'static>(
     dispatcher: Arc<W>,
     store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     run_id: &str,
     task: &PlanTask,
     execution_id: &str,
     summary: &str,
     cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
-) -> Result<String, String> {
+) -> Result<(String, Vec<String>), String> {
     let integration = match dispatcher
         .integrate(
             store.clone(),
+            blocking.clone(),
             run_id.to_string(),
             task.clone(),
             execution_id.to_string(),
@@ -1961,63 +2256,32 @@ async fn integrate_reviewed_task<W: TaskDispatcher + 'static>(
         .await
     {
         Ok(integration) => integration,
-        Err(error) => {
-            if let Ok(Some(mut persisted)) = store.get_summary(run_id, &task.id) {
-                persisted.result.status = SubagentRunStatus::Failed;
-                let remaining = format!("worktree integration failed: {error}");
-                if !persisted.result.remaining_work.contains(&remaining) {
-                    persisted.result.remaining_work.push(remaining.clone());
-                }
-                if !persisted.decisions.contains(&remaining) {
-                    persisted.decisions.push(remaining);
-                }
-                if let Err(persist_error) = store.put_summary(&persisted) {
-                    tracing::warn!(
-                        run_id,
-                        task_id = %task.id,
-                        error = %persist_error,
-                        "failed to persist worktree integration failure"
-                    );
-                }
-            }
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     let Some(integration) = integration else {
-        return Ok(summary.to_string());
+        return Ok((summary.to_string(), Vec::new()));
     };
 
     let integration_summary = integration.summary();
-    if let Ok(Some(mut persisted)) = store.get_summary(run_id, &task.id) {
-        if !integration.changed_files.is_empty() {
-            persisted.result.touched_files.written = integration.changed_files.clone();
-        }
-        if !persisted.decisions.contains(&integration_summary) {
-            persisted.decisions.push(integration_summary.clone());
-        }
-        if let Err(error) = store.put_summary(&persisted) {
-            tracing::warn!(
-                run_id,
-                task_id = %task.id,
-                %error,
-                "failed to persist worktree integration summary"
-            );
-        }
-    }
-    Ok(format!("{summary} | {integration_summary}"))
+    let changed_files = integration.changed_files.clone();
+    Ok((format!("{summary} | {integration_summary}"), changed_files))
 }
 
 /// Outcome of the review gate over a freshly-completed task.
 #[allow(clippy::large_enum_variant)] // PlanTask is Clone and short-lived in the review path; Box would add indirection with no win
 enum ReviewGateOutcome {
     /// Task passed review (or is read-only and self-reviewing). Mark Completed.
-    Pass,
-    /// Review found fixable issues → re-queue this fix task (same id, bumped
-    /// retry_count, review-informed brief) for the next wave.
-    NeedsFix(PlanTask),
+    Pass(Option<ReviewResult>),
+    /// Review found fixable issues. The claim-bound review candidate is
+    /// published with a typed Blocked settlement; only an explicit retry may
+    /// restart the task.
+    NeedsFix(PlanTask, ReviewResult),
     /// Circuit breaker tripped (retry budget exhausted or repeated fingerprint).
     /// The run should be Suspended.
-    Suspend(String),
+    Suspend {
+        reason: String,
+        review: Option<ReviewResult>,
+    },
     /// No reviewer LLM configured. M7 requires a stop rather than auto-pass.
     Skipped,
 }
@@ -2027,7 +2291,7 @@ enum ReviewGateOutcome {
 /// (when available) against the domain checklist. Applies the circuit
 /// breaker on NeedsFix/Blocked outcomes.
 async fn run_review_gate(
-    store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     run_id: &str,
     task: &PlanTask,
@@ -2037,7 +2301,7 @@ async fn run_review_gate(
     // AND is not an implementation/debugging kind (those are always gated
     // because prose about mutations cannot be trusted).
     if !super::review::requires_review(task) {
-        return ReviewGateOutcome::Pass;
+        return ReviewGateOutcome::Pass(None);
     }
     let Some(llm) = reviewer_llm else {
         return ReviewGateOutcome::Skipped;
@@ -2049,8 +2313,8 @@ async fn run_review_gate(
     const MAX_REVIEW_RETRIES: u32 = 2;
     let mut retries: u32 = 0;
     let review = loop {
-        match super::review::review_task(&llm, &store, run_id, task, subagent_output).await {
-            Ok(r) => break r,
+        match super::review::review_task(&llm, run_id, task, subagent_output).await {
+            Ok(review) => break review,
             Err(e) => {
                 retries += 1;
                 if retries <= MAX_REVIEW_RETRIES {
@@ -2069,25 +2333,49 @@ async fn run_review_gate(
                 let reason = format!(
                     "review gate failed after {MAX_REVIEW_RETRIES} retries ({e}); run suspended pending user input"
                 );
-                let _ = store.note(run_id, Some(&task.id), &reason);
-                return ReviewGateOutcome::Suspend(reason);
+                return ReviewGateOutcome::Suspend {
+                    reason,
+                    review: None,
+                };
             }
         }
     };
 
     match review.outcome {
-        ReviewOutcome::Pass => ReviewGateOutcome::Pass,
+        ReviewOutcome::Pass => ReviewGateOutcome::Pass(Some(review)),
         ReviewOutcome::NeedsFix => {
-            match super::review::circuit_breaker_action(&store, task, &review, 2) {
-                super::review::BreakerAction::CreateFix => {
-                    ReviewGateOutcome::NeedsFix(super::review::build_fix_task(task, &review))
+            let prior_run_id = review.run_id.clone();
+            let prior_task_id = task.id.clone();
+            let mut prior = match blocking
+                .run("load runtime task review history", move |store| {
+                    store.list_reviews(&prior_run_id, &prior_task_id)
+                })
+                .await
+            {
+                Ok(prior) => prior,
+                Err(error) => {
+                    return ReviewGateOutcome::Suspend {
+                        reason: format!("review history unavailable: {error}"),
+                        review: Some(review),
+                    };
                 }
-                super::review::BreakerAction::Suspend { reason } => {
-                    ReviewGateOutcome::Suspend(reason)
-                }
+            };
+            prior.push(review.clone());
+            match super::review::circuit_breaker_action_from_prior(task, &review, &prior, 2) {
+                super::review::BreakerAction::CreateFix => ReviewGateOutcome::NeedsFix(
+                    super::review::build_fix_task(task, &review),
+                    review,
+                ),
+                super::review::BreakerAction::Suspend { reason } => ReviewGateOutcome::Suspend {
+                    reason,
+                    review: Some(review),
+                },
             }
         }
-        ReviewOutcome::Blocked => ReviewGateOutcome::Suspend("review returned blocked".to_string()),
+        ReviewOutcome::Blocked => ReviewGateOutcome::Suspend {
+            reason: "review returned blocked".to_string(),
+            review: Some(review),
+        },
     }
 }
 
@@ -2099,6 +2387,7 @@ async fn run_review_gate(
 #[allow(clippy::too_many_arguments)] // store + semaphores + locks + sinks all thread through
 async fn execute_task(
     store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     primary_agent: crate::agent_handle::AgentHandle,
     write_sem: Arc<Semaphore>,
     shell_sem: Arc<Semaphore>,
@@ -2113,18 +2402,18 @@ async fn execute_task(
 ) -> TaskDispatchResult {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
-    let run_context = store
-        .get_run(&run_id)
+    let load_run_id = run_id.clone();
+    let run_context = blocking
+        .run("load dispatch run identity", move |store| {
+            store
+                .get_run(&load_run_id)?
+                .ok_or(StoreError::RunNotFound(load_run_id))
+        })
+        .await
         .map_err(|error| {
             TaskDispatchFailure::failed(
                 task_id.clone(),
                 format!("failed to load TaskRun identity: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            TaskDispatchFailure::failed(
-                task_id.clone(),
-                format!("TaskRun '{run_id}' does not exist"),
             )
         })?;
     let workspace_id = run_context.workspace_id.clone();
@@ -2178,6 +2467,7 @@ async fn execute_task(
     // A PlanTask is a stable plan node; each dispatch attempt is a distinct
     // SubagentRun. Never collapse retries back to the bare task id.
     let attempt = claim.attempt;
+    let claim_revision = claim.revision;
     let execution_id = subagent_execution_id(&run_id, &task_id, &claim);
     let contract = subagent_runtime_contract(&primary_agent, &task.agent_role, &task.kind).await;
     tracing::info!(
@@ -2364,8 +2654,22 @@ async fn execute_task(
     // Summary Chain: gather the summaries of this task's completed
     // dependencies, so the Subagent gets compact upstream context instead of
     // (or in addition to) re-reading everything from scratch (plan §1039).
-    let dep_summaries = collect_dependency_summaries(&store, &run_id, &task);
-    let parent_goal = store.get_run(&run_id).ok().flatten().map(|run| run.goal);
+    let prompt_run_id = run_id.clone();
+    let prompt_task = task.clone();
+    let (dep_summaries, parent_goal) = blocking
+        .run("load task prompt context", move |store| {
+            let dependencies =
+                collect_dependency_summaries(store.as_ref(), &prompt_run_id, &prompt_task)?;
+            let goal = store.get_run(&prompt_run_id)?.map(|run| run.goal);
+            Ok((dependencies, goal))
+        })
+        .await
+        .map_err(|error| {
+            TaskDispatchFailure::failed(
+                task_id.clone(),
+                format!("failed to load Subagent prompt context: {error}"),
+            )
+        })?;
 
     let workspace_root = primary_workspace_root_for_prompt(
         &contract.isolation_requested,
@@ -2418,7 +2722,7 @@ async fn execute_task(
             &run_id,
             &task_id,
             &execution_id,
-            claim.revision,
+            claim_revision,
             attempt,
         )
         .map_err(|error| {
@@ -2427,47 +2731,64 @@ async fn execute_task(
                 format!("invalid Subagent attempt identity: {error}"),
             )
         })?;
-        let guard = store
-            .record_controlled_subagent_assigned(
-                &run_id,
-                &task_id,
-                &execution_id,
-                &task.agent_role,
-                &task.title,
-                claim.revision,
-                attempt,
-                task.kind.is_read_only(),
-                dispatch_hooks_from_runtime,
-                framework_executor.clone(),
-            )
+        let assigned_run_id = run_id.clone();
+        let assigned_task_id = task_id.clone();
+        let assigned_execution_id = execution_id.clone();
+        let assigned_role = task.agent_role.clone();
+        let assigned_title = task.title.clone();
+        let assigned_read_only = task.kind.is_read_only();
+        let assigned_control_identity = control_identity.clone();
+        let assigned_executor = framework_executor.clone();
+        let guard = blocking
+            .run("persist controlled Subagent assignment", move |store| {
+                let guard = store.record_controlled_subagent_assigned(
+                    &assigned_run_id,
+                    &assigned_task_id,
+                    &assigned_execution_id,
+                    &assigned_role,
+                    &assigned_title,
+                    claim_revision,
+                    attempt,
+                    assigned_read_only,
+                    dispatch_hooks_from_runtime,
+                    assigned_executor.clone(),
+                )?;
+                store.deliver_pending_subagent_guidance(
+                    &assigned_control_identity,
+                    &assigned_executor,
+                )?;
+                Ok(guard)
+            })
+            .await
             .map_err(|error| {
                 TaskDispatchFailure::failed(
                     task_id.clone(),
                     format!("failed to persist Subagent start boundary: {error}"),
                 )
             })?;
-        store
-            .deliver_pending_subagent_guidance(&control_identity, &framework_executor)
-            .map_err(|error| {
-                TaskDispatchFailure::failed(
-                    task_id.clone(),
-                    format!("failed to deliver queued Subagent guidance: {error}"),
-                )
-            })?;
         Some((framework_identity, guard))
     } else {
-        store
-            .record_subagent_assigned(
-                &run_id,
-                &task_id,
-                &execution_id,
-                &task.agent_role,
-                &task.title,
-                claim.revision,
-                attempt,
-                task.kind.is_read_only(),
-                dispatch_hooks_from_runtime,
-            )
+        let assigned_run_id = run_id.clone();
+        let assigned_task_id = task_id.clone();
+        let assigned_execution_id = execution_id.clone();
+        let assigned_role = task.agent_role.clone();
+        let assigned_title = task.title.clone();
+        let assigned_read_only = task.kind.is_read_only();
+        blocking
+            .run("persist Subagent assignment", move |store| {
+                store.record_subagent_assigned(
+                    &assigned_run_id,
+                    &assigned_task_id,
+                    &assigned_execution_id,
+                    &assigned_role,
+                    &assigned_title,
+                    claim_revision,
+                    attempt,
+                    assigned_read_only,
+                    dispatch_hooks_from_runtime,
+                )
+            })
+            .await
             .map_err(|error| {
                 TaskDispatchFailure::failed(
                     task_id.clone(),
@@ -2483,7 +2804,7 @@ async fn execute_task(
         &execution_id,
         &task,
         &contract,
-        claim.revision,
+        claim_revision,
         attempt,
         &conversation_id,
         Some(&root_message_id),
@@ -2531,7 +2852,13 @@ async fn execute_task(
                     terminal_status = ?sub_result.outcome.status,
                     "task_runtime: read-only subagent settled"
                 );
-                finalize_framework_subagent_result(&store, &run_id, &execution_id, sub_result)
+                finalize_framework_subagent_result(
+                    blocking.clone(),
+                    &run_id,
+                    &execution_id,
+                    sub_result,
+                )
+                .await
             }
             Err(e) => {
                 tracing::warn!(
@@ -2555,7 +2882,7 @@ async fn execute_task(
         );
         let dispatch_result = run_writer_subagent(
             &primary_agent,
-            store.clone(),
+            blocking.clone(),
             &run_id,
             &execution_id,
             &task_isolation_id(&run_id, &task_id),
@@ -2587,7 +2914,13 @@ async fn execute_task(
                     terminal_status = ?sub_result.outcome.status,
                     "task_runtime: writer subagent settled"
                 );
-                finalize_framework_subagent_result(&store, &run_id, &execution_id, sub_result)
+                finalize_framework_subagent_result(
+                    blocking.clone(),
+                    &run_id,
+                    &execution_id,
+                    sub_result,
+                )
+                .await
             }
             Err(error) => Err(if task_cancel.is_cancelled() {
                 ExecutionFailure::cancelled("task cancelled")
@@ -2618,7 +2951,7 @@ async fn execute_task(
         );
         run_main_agent_task(
             &primary_agent,
-            store.clone(),
+            blocking.clone(),
             &run_id,
             &task,
             &execution_id,
@@ -2644,34 +2977,55 @@ async fn execute_task(
                 output_chars = full_output.chars().count(),
                 "task_runtime: task completed"
             );
-            super::ledger::archive_trace(&run_id, &task_id, &full_output, None);
-            let _ = super::ledger::write_progress(&store, &run_id, None);
-            if let Err(e) = store.put_summary(&TaskExecutionSummary {
-                run_id: run_id.clone(),
-                task_id: task_id.clone(),
-                subagent_name: task.agent_role.clone(),
-                result: task_result.clone(),
-                decisions: vec![],
-                next_implications: vec![],
-                suggested_tasks: suggested_tasks.clone(),
-                created_at: chrono::Utc::now(),
-            }) {
-                tracing::warn!(task_id = %task_id, error = %e, "failed to persist TaskExecutionSummary");
-            }
-            if let Err(error) = store.record_subagent_released(SubagentReleaseRecord {
-                run_id: &run_id,
-                task_id: &task_id,
-                execution_id: &execution_id,
-                agent_name: &task.agent_role,
-                task_subject: &task.title,
-                plan_revision: claim.revision,
-                attempt,
-                status: task_result.status.as_str(),
-                result: Some(&task_result),
-                full_output: Some(&full_output),
-                usage: Some(&usage.durable),
-                dispatch_hook: dispatch_hooks_from_runtime,
-            }) {
+            let persisted_run_id = run_id.clone();
+            let persisted_task_id = task_id.clone();
+            let persisted_execution_id = execution_id.clone();
+            let persisted_agent_role = task.agent_role.clone();
+            let persisted_task_title = task.title.clone();
+            let persisted_result = task_result.clone();
+            let persisted_output = full_output.clone();
+            let persisted_usage = usage.durable.clone();
+            let suggestion_note = (!suggested_tasks.is_empty()).then(|| {
+                let titles = suggested_tasks
+                    .iter()
+                    .map(|suggestion| suggestion.title.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                format!(
+                    "subagent suggested {} follow-up task(s): [{titles}]. Not auto-inserted into plan; promote via task_update if desired.",
+                    suggested_tasks.len()
+                )
+            });
+            if let Err(error) = blocking
+                .run("persist successful Subagent boundary", move |store| {
+                    super::ledger::archive_trace(
+                        &persisted_run_id,
+                        &persisted_task_id,
+                        &persisted_output,
+                        None,
+                    );
+                    super::ledger::write_progress(store.as_ref(), &persisted_run_id, None)?;
+                    store.record_subagent_released(SubagentReleaseRecord {
+                        run_id: &persisted_run_id,
+                        task_id: &persisted_task_id,
+                        execution_id: &persisted_execution_id,
+                        agent_name: &persisted_agent_role,
+                        task_subject: &persisted_task_title,
+                        plan_revision: claim_revision,
+                        attempt,
+                        status: persisted_result.status.as_str(),
+                        result: Some(&persisted_result),
+                        full_output: Some(&persisted_output),
+                        usage: Some(&persisted_usage),
+                        dispatch_hook: dispatch_hooks_from_runtime,
+                    })?;
+                    if let Some(note) = suggestion_note {
+                        store.note(&persisted_run_id, Some(&persisted_task_id), &note)?;
+                    }
+                    Ok(())
+                })
+                .await
+            {
                 return Err(TaskDispatchFailure::failed(
                     task_id,
                     format!("Subagent completed but terminal boundary was not persisted: {error}"),
@@ -2683,22 +3037,9 @@ async fn execute_task(
             // forever on looping parents. The primary agent / user can promote a
             // suggestion via task_update when desired. Record a Note so the
             // suggestions are visible in the event stream regardless.
-            if !suggested_tasks.is_empty() {
-                let titles: Vec<&str> = suggested_tasks.iter().map(|s| s.title.as_str()).collect();
-                let _ = store.note(
-                    &run_id,
-                    Some(&task_id),
-                    &format!(
-                        "subagent suggested {} follow-up task(s): [{}]. \
-                         Not auto-inserted into plan; promote via task_update if desired.",
-                        suggested_tasks.len(),
-                        titles.join("; "),
-                    ),
-                );
-            }
             let terminal_payload = serde_json::json!({
                 "execution_id": &execution_id,
-                "plan_revision": claim.revision,
+                "plan_revision": claim_revision,
                 "attempt": attempt,
                 "conversation_id": conversation_id,
                 "message_id": root_message_id,
@@ -2741,6 +3082,7 @@ async fn execute_task(
                 task_id,
                 result: task_result,
                 full_output,
+                suggested_tasks,
             })
         }
         Err(failure) => {
@@ -2749,32 +3091,33 @@ async fn execute_task(
             let usage = failure.usage;
             let task_result =
                 SubagentTaskResult::terminal(status, message.clone(), vec![message.clone()]);
-            if let Err(error) = store.put_summary(&TaskExecutionSummary {
-                run_id: run_id.clone(),
-                task_id: task_id.clone(),
-                subagent_name: task.agent_role.clone(),
-                result: task_result.clone(),
-                decisions: Vec::new(),
-                next_implications: Vec::new(),
-                suggested_tasks: Vec::new(),
-                created_at: chrono::Utc::now(),
-            }) {
-                tracing::warn!(task_id = %task_id, %error, "failed to persist terminal TaskExecutionSummary");
-            }
-            if let Err(error) = store.record_subagent_released(SubagentReleaseRecord {
-                run_id: &run_id,
-                task_id: &task_id,
-                execution_id: &execution_id,
-                agent_name: &task.agent_role,
-                task_subject: &task.title,
-                plan_revision: claim.revision,
-                attempt,
-                status: status.as_str(),
-                result: Some(&task_result),
-                full_output: Some(&message),
-                usage: usage.as_ref().map(|value| &value.durable),
-                dispatch_hook: dispatch_hooks_from_runtime,
-            }) {
+            let persisted_run_id = run_id.clone();
+            let persisted_task_id = task_id.clone();
+            let persisted_execution_id = execution_id.clone();
+            let persisted_agent_role = task.agent_role.clone();
+            let persisted_task_title = task.title.clone();
+            let persisted_result = task_result.clone();
+            let persisted_message = message.clone();
+            let persisted_usage = usage.as_ref().map(|value| value.durable.clone());
+            if let Err(error) = blocking
+                .run("persist failed Subagent boundary", move |store| {
+                    store.record_subagent_released(SubagentReleaseRecord {
+                        run_id: &persisted_run_id,
+                        task_id: &persisted_task_id,
+                        execution_id: &persisted_execution_id,
+                        agent_name: &persisted_agent_role,
+                        task_subject: &persisted_task_title,
+                        plan_revision: claim_revision,
+                        attempt,
+                        status: status.as_str(),
+                        result: Some(&persisted_result),
+                        full_output: Some(&persisted_message),
+                        usage: persisted_usage.as_ref(),
+                        dispatch_hook: dispatch_hooks_from_runtime,
+                    })
+                })
+                .await
+            {
                 tracing::warn!(
                     run_id = %run_id,
                     task_id = %task_id,
@@ -2800,7 +3143,7 @@ async fn execute_task(
             }
             let terminal_payload = serde_json::json!({
                 "execution_id": &execution_id,
-                "plan_revision": claim.revision,
+                "plan_revision": claim_revision,
                 "attempt": attempt,
                 "conversation_id": conversation_id,
                 "message_id": root_message_id,
@@ -2947,30 +3290,28 @@ fn normalize_suggested_task(raw: RawSuggestedTask) -> Option<SuggestedTask> {
 /// task boundary) over the truncated todo.summary text, so downstream Subagents
 /// get full context: summary, touched files, decisions, and remaining work.
 fn collect_dependency_summaries(
-    store: &Arc<TaskRuntimeStore>,
+    store: &TaskRuntimeStore,
     run_id: &str,
     task: &PlanTask,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, StoreError> {
     if task.depends_on.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
-    let Ok(todos) = store.list_todos(run_id) else {
-        return Vec::new();
-    };
-    task.depends_on
+    let todos = store.list_todos(run_id)?;
+    let summaries = task
+        .depends_on
         .iter()
-        .filter_map(|dep_id| {
-            todos.iter().find(|t| &t.task_id == dep_id).and_then(|t| {
-                if t.status != TodoStatus::Completed {
-                    return None;
-                }
-                // Prefer the structured summary when available; fall back to
-                // the truncated todo text for tasks that predate put_summary.
-                let structured = store
-                    .get_summary(run_id, &t.task_id)
-                    .ok()
-                    .flatten()
-                    .map(|s| {
+        .map(|dep_id| {
+            todos
+                .iter()
+                .find(|t| &t.task_id == dep_id)
+                .map_or(Ok(None), |t| {
+                    if t.status != TodoStatus::Completed {
+                        return Ok(None);
+                    }
+                    // Prefer the structured summary when available; fall back to
+                    // the truncated todo text for tasks that predate put_summary.
+                    let structured = store.get_summary(run_id, &t.task_id)?.map(|s| {
                         let mut parts: Vec<String> = Vec::new();
                         if !s.result.summary.trim().is_empty() {
                             parts.push(format!("完成: {}", s.result.summary));
@@ -2986,14 +3327,15 @@ fn collect_dependency_summaries(
                         }
                         (t.title.clone(), parts.join(" | "))
                     });
-                structured.or_else(|| {
-                    t.summary
-                        .as_deref()
-                        .map(|s| (t.title.clone(), s.to_string()))
+                    Ok(structured.or_else(|| {
+                        t.summary
+                            .as_deref()
+                            .map(|s| (t.title.clone(), s.to_string()))
+                    }))
                 })
-            })
         })
-        .collect()
+        .collect::<Result<Vec<_>, StoreError>>()?;
+    Ok(summaries.into_iter().flatten().collect())
 }
 
 struct SubagentRuntimeContract {
@@ -3267,7 +3609,7 @@ fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_agent::t
 #[allow(clippy::too_many_arguments)] // handles + cancel + sink thread through; matches framework dispatch style
 async fn run_writer_subagent(
     primary_agent: &crate::agent_handle::AgentHandle,
-    store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     run_id: &str,
     execution_id: &str,
     isolation_id: &str,
@@ -3283,7 +3625,17 @@ async fn run_writer_subagent(
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer Subagent sees the same images/files as the primary agent would
     // (parity with run_main_agent_task, executor.rs:1373-1380).
-    let run_record = store.get_run(run_id).ok().flatten();
+    let load_run_id = run_id.to_string();
+    let run_record = blocking
+        .run("load writer Subagent attachments", move |store| {
+            store.get_run(&load_run_id)
+        })
+        .await
+        .map_err(|error| {
+            ExecutionFailure::failed(format!(
+                "failed to load writer Subagent attachments: {error}"
+            ))
+        })?;
     let root_message_id = run_record.as_ref().map(|r| r.root_message_id.clone());
     let conversation_id = run_record.as_ref().map(|r| r.conversation_id.clone());
     let run_message: Option<echo_agent::llm::types::Message> = run_record.as_ref().and_then(|r| {
@@ -3425,7 +3777,7 @@ fn file_access_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<(
 #[allow(clippy::too_many_arguments)]
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
-    store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     run_id: &str,
     task: &PlanTask,
     execution_id: &str,
@@ -3440,12 +3792,17 @@ async fn run_main_agent_task(
 
     // Rebuild a multimodal Message when the run carries user attachments, so
     // writer Subagents see the same images/files as the main agent (#1b).
-    let run_record = store
-        .get_run(&run_id)
+    let load_run_id = run_id.clone();
+    let run_record = blocking
+        .run("load primary task attachments", move |store| {
+            store
+                .get_run(&load_run_id)?
+                .ok_or(StoreError::RunNotFound(load_run_id))
+        })
+        .await
         .map_err(|error| {
             ExecutionFailure::failed(format!("failed to load TaskRun identity: {error}"))
-        })?
-        .ok_or_else(|| ExecutionFailure::failed(format!("TaskRun '{run_id}' does not exist")))?;
+        })?;
     let workspace_id = run_record.workspace_id.clone();
     let conversation_id = run_record.conversation_id.clone();
     let root_message_id = Some(run_record.root_message_id.clone());
@@ -3463,6 +3820,7 @@ async fn run_main_agent_task(
             let prompt = prompt.to_string();
             let run_message = run_message.clone();
             let execution_id = execution_id.clone();
+            let blocking = blocking.clone();
             Box::pin(async move {
                 let event_cancel = cancel.clone();
                 let visible_tools = crate::tool_exposure::initial_visible_tools(
@@ -3625,15 +3983,21 @@ async fn run_main_agent_task(
                                 usage.input_tokens.saturating_add(input_tokens);
                             usage.output_tokens =
                                 usage.output_tokens.saturating_add(output_tokens);
-                            store
-                                .account_subagent_usage(
-                                    &run_id,
-                                    &execution_id,
-                                    &source_event_id,
-                                    input_tokens,
-                                    output_tokens,
-                                    0,
-                                )
+                            let usage_run_id = run_id.clone();
+                            let usage_execution_id = execution_id.clone();
+                            let usage_event_id = source_event_id.clone();
+                            blocking
+                                .run("persist primary Subagent usage", move |store| {
+                                    store.account_subagent_usage(
+                                        &usage_run_id,
+                                        &usage_execution_id,
+                                        &usage_event_id,
+                                        input_tokens,
+                                        output_tokens,
+                                        0,
+                                    )
+                                })
+                                .await
                                 .map_err(|error| {
                                     event_cancel.cancel();
                                     ExecutionFailure::failed(format!(
@@ -3678,14 +4042,24 @@ async fn run_main_agent_task(
                                 pending_file_access.insert(call_id.clone(), access);
                             }
                             let replay_safe = tool_call_is_replay_safe(agent, name);
-                            if let Err(error) = store.record_tool_started(
-                                &run_id,
-                                &task_id,
-                                &execution_id,
-                                &call_id,
-                                name,
-                                replay_safe,
-                            ) {
+                            let tool_run_id = run_id.clone();
+                            let tool_task_id = task_id.clone();
+                            let tool_execution_id = execution_id.clone();
+                            let tool_call_id = call_id.clone();
+                            let tool_name = name.clone();
+                            if let Err(error) = blocking
+                                .run("persist tool start boundary", move |store| {
+                                    store.record_tool_started(
+                                        &tool_run_id,
+                                        &tool_task_id,
+                                        &tool_execution_id,
+                                        &tool_call_id,
+                                        &tool_name,
+                                        replay_safe,
+                                    )
+                                })
+                                .await
+                            {
                                 event_cancel.cancel();
                                 return Err(ExecutionFailure::failed(format!(
                                     "failed to persist tool start boundary for {name}: {error}"
@@ -3770,16 +4144,29 @@ async fn run_main_agent_task(
                                     },
                                 );
                             }
-                            if let Err(error) = store.record_tool_finished(
-                                &run_id,
-                                &task_id,
-                                &execution_id,
-                                &call_id,
-                                &name,
-                                result.success,
-                                &result_text,
-                                result.failure.as_ref(),
-                            ) {
+                            let tool_run_id = run_id.clone();
+                            let tool_task_id = task_id.clone();
+                            let tool_execution_id = execution_id.clone();
+                            let tool_call_id = call_id.clone();
+                            let tool_name = name.clone();
+                            let tool_result_text = result_text.clone();
+                            let tool_success = result.success;
+                            let tool_failure = result.failure.clone();
+                            if let Err(error) = blocking
+                                .run("persist tool terminal boundary", move |store| {
+                                    store.record_tool_finished(
+                                        &tool_run_id,
+                                        &tool_task_id,
+                                        &tool_execution_id,
+                                        &tool_call_id,
+                                        &tool_name,
+                                        tool_success,
+                                        &tool_result_text,
+                                        tool_failure.as_ref(),
+                                    )
+                                })
+                                .await
+                            {
                                 event_cancel.cancel();
                                 return Err(ExecutionFailure::failed(format!(
                                     "tool {name} settled but its terminal boundary was not persisted: {error}"
@@ -3891,15 +4278,20 @@ async fn run_main_agent_task(
                     ),
                     iterations: None,
                 };
-                store
-                    .account_subagent_usage(
-                        &run_id,
-                        &execution_id,
-                        "primary_subagent_duration",
-                        0,
-                        0,
-                        duration_ms,
-                    )
+                let duration_run_id = run_id.clone();
+                let duration_execution_id = execution_id.clone();
+                blocking
+                    .run("persist primary Subagent duration", move |store| {
+                        store.account_subagent_usage(
+                            &duration_run_id,
+                            &duration_execution_id,
+                            "primary_subagent_duration",
+                            0,
+                            0,
+                            duration_ms,
+                        )
+                    })
+                    .await
                     .map_err(|error| {
                         ExecutionFailure::failed(format!(
                             "failed to persist primary Subagent duration: {error}"
@@ -4092,21 +4484,25 @@ pub async fn drive_agent_run(
     trace_sink: Option<ExecSink>,
 ) -> Result<String, ExecError> {
     let child_cancel = parent_cancel.child_token();
-    let _cancel_registration = store
-        .register_run_cancellation(run_id, child_cancel.clone())
+    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
+    let admission_run_id = run_id.to_string();
+    let admission_cancel = child_cancel.clone();
+    let (_cancel_registration, run_for_scope) = blocking
+        .run("register agent-driven run", move |store| {
+            let registration = store
+                .register_run_cancellation(&admission_run_id, admission_cancel)
+                .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+            let run = store
+                .get_run(&admission_run_id)?
+                .ok_or(StoreError::RunNotFound(admission_run_id))?;
+            Ok((registration, run))
+        })
+        .await
         .map_err(|error| ExecError::Other(format!("register run cancellation: {error}")))?;
-    let run_for_scope = store.get_run(run_id).ok().flatten();
-    let conversation_id_for_scope = run_for_scope
-        .as_ref()
-        .map(|run| run.conversation_id.clone());
-    let message_id_for_scope = run_for_scope
-        .as_ref()
-        .map(|run| run.root_message_id.clone())
+    let conversation_id_for_scope = run_for_scope.conversation_id.clone();
+    let message_id_for_scope = Some(run_for_scope.root_message_id.clone())
         .filter(|message_id| !message_id.trim().is_empty());
-    let attended_mode = run_for_scope
-        .as_ref()
-        .map(|run| run.attended_mode)
-        .unwrap_or_default();
+    let attended_mode = run_for_scope.attended_mode;
 
     // Drive the Agent's ReAct loop in the run's context. It may call
     // task_create + task_execute; attended_mode on the persisted run controls
@@ -4142,7 +4538,7 @@ pub async fn drive_agent_run(
             let invocation = echo_agent::agent::AgentInvocationContext {
                 history: None,
                 runtime: Some(echo_agent::tools::ExternalRunContext {
-                    conversation_id: conversation_id_for_scope.clone(),
+                    conversation_id: Some(conversation_id_for_scope.clone()),
                     run_id: Some(run_id_for_scope.clone()),
                     turn_id: message_id_for_scope.clone(),
                     execution_id: None,
@@ -4259,27 +4655,56 @@ pub async fn drive_agent_run(
         && !child_cancel.is_cancelled()
     {
         let message = format!("run agent stream failed: {error}");
-        store.finalize_run(run_id, TaskRunStatus::Failed, Some(&message))?;
+        let failed_run_id = run_id.to_string();
+        blocking
+            .run("finalize agent stream failure", move |store| {
+                store
+                    .finalize_run(&failed_run_id, TaskRunStatus::Failed, Some(&message))
+                    .map(|_| ())
+            })
+            .await
+            .map_err(|error| ExecError::Other(error.to_string()))?;
     }
 
+    let plan_run_id = run_id.to_string();
+    let plan_exists = blocking
+        .run("inspect agent-driven run plan", move |store| {
+            store.get_plan(&plan_run_id).map(|plan| plan.is_some())
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
     if stream_result.failure.is_none()
         && !child_cancel.is_cancelled()
         && plan_policy == RunPlanPolicy::AllowDirect
-        && store.get_plan(run_id)?.is_none()
+        && !plan_exists
         && let Some(final_answer) = stream_result.final_answer.as_deref()
         && let Err(error) = materialize_direct_completion(&store, run_id, final_answer).await
     {
         let message = format!("failed to persist direct completion evidence: {error}");
-        store.finalize_run(run_id, TaskRunStatus::Failed, Some(&message))?;
+        let failed_run_id = run_id.to_string();
+        blocking
+            .run("finalize direct completion failure", move |store| {
+                store
+                    .finalize_run(&failed_run_id, TaskRunStatus::Failed, Some(&message))
+                    .map(|_| ())
+            })
+            .await
+            .map_err(|error| ExecError::Other(error.to_string()))?;
     }
 
     // Determine final outcome from the store (task_execute/execute_run
     // may have already transitioned the run to a terminal state).
+    let final_run_id = run_id.to_string();
     let final_status = Some(
-        store
-            .get_run(run_id)?
-            .ok_or_else(|| ExecError::RunNotFound(run_id.to_string()))?
-            .status,
+        blocking
+            .run("load agent-driven run outcome", move |store| {
+                store
+                    .get_run(&final_run_id)?
+                    .map(|run| run.status)
+                    .ok_or(StoreError::RunNotFound(final_run_id))
+            })
+            .await
+            .map_err(|error| ExecError::Other(error.to_string()))?,
     );
 
     match final_status {
@@ -4325,11 +4750,31 @@ pub async fn drive_agent_run(
             // Still Running or unknown — the agent stream ending is not proof
             // that the plan satisfied its result contract.
             if child_cancel.is_cancelled() {
-                store.finalize_run(run_id, TaskRunStatus::Cancelled, None)?;
+                let cancelled_run_id = run_id.to_string();
+                blocking
+                    .run("finalize cancelled agent-driven run", move |store| {
+                        store
+                            .finalize_run(&cancelled_run_id, TaskRunStatus::Cancelled, None)
+                            .map(|_| ())
+                    })
+                    .await
+                    .map_err(|error| ExecError::Other(error.to_string()))?;
             } else {
-                let report = store.completion_gate_report(run_id)?;
+                let report_run_id = run_id.to_string();
+                let report = blocking
+                    .run("load agent-driven completion gate", move |store| {
+                        store.completion_gate_report(&report_run_id)
+                    })
+                    .await
+                    .map_err(|error| ExecError::Other(error.to_string()))?;
                 if report.ready {
-                    let _completed = store.complete_run_if_quiescent(run_id)?;
+                    let completed_run_id = run_id.to_string();
+                    let _completed = blocking
+                        .run("complete agent-driven run", move |store| {
+                            store.complete_run_if_quiescent(&completed_run_id)
+                        })
+                        .await
+                        .map_err(|error| ExecError::Other(error.to_string()))?;
                 } else {
                     let blockers = report
                         .blockers
@@ -4337,13 +4782,21 @@ pub async fn drive_agent_run(
                         .map(|item| format!("{:?}: {}", item.code, item.detail))
                         .collect::<Vec<_>>()
                         .join("; ");
-                    store.request_pause_with_reason(
-                        run_id,
-                        RunPauseReason::NeedsInput,
-                        Some(&format!(
-                            "completion gate rejected agent-driven run: {blockers}"
-                        )),
-                    )?;
+                    let paused_run_id = run_id.to_string();
+                    let pause_detail =
+                        format!("completion gate rejected agent-driven run: {blockers}");
+                    blocking
+                        .run("pause agent-driven run", move |store| {
+                            store
+                                .request_pause_with_reason(
+                                    &paused_run_id,
+                                    RunPauseReason::NeedsInput,
+                                    Some(&pause_detail),
+                                )
+                                .map(|_| ())
+                        })
+                        .await
+                        .map_err(|error| ExecError::Other(error.to_string()))?;
                 }
             }
             tracing::info!(
@@ -4356,9 +4809,15 @@ pub async fn drive_agent_run(
         }
     }
 
-    let settled = store
-        .get_run(run_id)?
-        .ok_or_else(|| ExecError::RunNotFound(run_id.to_string()))?;
+    let settled_run_id = run_id.to_string();
+    let settled = blocking
+        .run("verify agent-driven run settlement", move |store| {
+            store
+                .get_run(&settled_run_id)?
+                .ok_or(StoreError::RunNotFound(settled_run_id))
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
     if !matches!(
         settled.status,
         TaskRunStatus::Completed
@@ -4380,9 +4839,15 @@ async fn materialize_direct_completion(
     run_id: &str,
     final_answer: &str,
 ) -> Result<(), ExecError> {
-    let run = store
-        .get_run(run_id)?
-        .ok_or_else(|| ExecError::RunNotFound(run_id.to_string()))?;
+    let load_run_id = run_id.to_string();
+    let run = TaskRuntimeBlockingAdapter::new(store.clone())
+        .run("load direct completion run", move |store| {
+            store
+                .get_run(&load_run_id)?
+                .ok_or(StoreError::RunNotFound(load_run_id))
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
     let title = {
         let value = run.goal.chars().take(120).collect::<String>();
         if value.trim().is_empty() {
@@ -4457,10 +4922,16 @@ pub(crate) async fn drive_existing_cron_run(
         UnattendedWriteMode::default(),
     )
     .await?;
-    let status = store
-        .get_run(&run_id)?
-        .map(|run| run.status)
-        .ok_or_else(|| ExecError::RunNotFound(run_id.clone()))?;
+    let status_run_id = run_id.clone();
+    let status = TaskRuntimeBlockingAdapter::new(store.clone())
+        .run("load cron run outcome", move |store| {
+            store
+                .get_run(&status_run_id)?
+                .map(|run| run.status)
+                .ok_or(StoreError::RunNotFound(status_run_id))
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
     match status {
         TaskRunStatus::Completed => Ok(run_id),
         TaskRunStatus::Failed => Err(ExecError::Other(format!(
@@ -5246,6 +5717,54 @@ Read the runtime path and found one missing branch.
         assert_eq!(clamp(20), 8);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_runtime_blocking_adapter_keeps_async_heartbeat_responsive() -> Result<(), String>
+    {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let adapter = TaskRuntimeBlockingAdapter::new(store);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let operation = tokio::spawn(async move {
+            adapter
+                .run("blocking adapter heartbeat test", move |_store| {
+                    let _ignored = entered_tx.send(());
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(|error| {
+                            StoreError::InvalidPlan(format!(
+                                "blocking adapter test release failed: {error}"
+                            ))
+                        })?;
+                    Ok(())
+                })
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered_rx)
+            .await
+            .map_err(|_| "blocking operation did not start".to_string())?
+            .map_err(|_| "blocking operation start signal was dropped".to_string())?;
+        let heartbeat_started = std::time::Instant::now();
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "async heartbeat stalled behind TaskRuntime file I/O".to_string())?;
+        if heartbeat_started.elapsed() >= std::time::Duration::from_millis(250) {
+            return Err("async heartbeat did not remain responsive".to_string());
+        }
+        release_tx
+            .send(())
+            .map_err(|error| format!("failed to release blocking operation: {error}"))?;
+        operation
+            .await
+            .map_err(|error| format!("blocking adapter task failed to join: {error}"))?
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
     #[test]
     fn task_prompt_is_read_only_for_reviews() -> Result<(), String> {
         let task = PlanTask {
@@ -5323,11 +5842,13 @@ Read the runtime path and found one missing branch.
     #[test]
     fn run_outcome_failed_carries_task_id() -> Result<(), String> {
         let o = RunOutcome::Failed {
-            failed_task_id: "t3".into(),
+            failed_task_id: Some("t3".into()),
             error: "boom".into(),
         };
         match o {
-            RunOutcome::Failed { failed_task_id, .. } => assert_eq!(failed_task_id, "t3"),
+            RunOutcome::Failed { failed_task_id, .. } => {
+                assert_eq!(failed_task_id.as_deref(), Some("t3"));
+            }
             other => return Err(format!("expected failed outcome, got {other:?}")),
         }
         Ok(())
@@ -5556,6 +6077,7 @@ Read the runtime path and found one missing branch.
         fn dispatch(
             &self,
             _store: Arc<TaskRuntimeStore>,
+            _blocking: TaskRuntimeBlockingAdapter,
             context: echo_agent::tasks::TaskSubagentContext,
             _claim: echo_agent::tasks::TaskClaim,
             task: PlanTask,
@@ -5605,6 +6127,7 @@ Read the runtime path and found one missing branch.
                         task_id,
                         result,
                         full_output,
+                        suggested_tasks: Vec::new(),
                     }),
                     Some(Err(error)) => Err(TaskDispatchFailure::failed(task_id, error)),
                     // Default: generic success for unscripted tasks.
@@ -5612,6 +6135,7 @@ Read the runtime path and found one missing branch.
                         task_id,
                         result: successful_task_result("ok"),
                         full_output: "ok".to_string(),
+                        suggested_tasks: Vec::new(),
                     }),
                 };
                 dispatcher
@@ -5625,6 +6149,7 @@ Read the runtime path and found one missing branch.
         fn integrate(
             &self,
             _store: Arc<TaskRuntimeStore>,
+            _blocking: TaskRuntimeBlockingAdapter,
             _run_id: String,
             task: PlanTask,
             _execution_id: String,
@@ -6245,7 +6770,7 @@ Read the runtime path and found one missing branch.
             .await
         });
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             for gate in &cancelled_gates {
                 gate.started.notified().await;
             }
@@ -6255,14 +6780,13 @@ Read the runtime path and found one missing branch.
         .map_err(|_| "dispatch/cancellation boundary was not reached".to_string())?;
         cancel.cancel();
 
-        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), execution)
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
             .await
             .map_err(|_| "runtime cancellation timed out".to_string())?
             .map_err(|error| format!("runtime task failed to join: {error}"))?
             .map_err(|error| error.to_string())?;
         assert!(matches!(outcome, RunOutcome::Cancelled));
 
-        finalize_cancelled_run_state(&store, &run_id).map_err(|error| error.to_string())?;
         let todos = store
             .list_todos(&run_id)
             .map_err(|error| error.to_string())?;
@@ -6286,6 +6810,86 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "cancelled run missing".to_string())?;
         assert_eq!(run.status, TaskRunStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mid_wave_pause_preserves_completed_siblings_without_retry() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tasks = (0..8)
+            .map(|index| solo_readonly_task(&format!("pause-task-{index}")))
+            .collect::<Vec<_>>();
+        let run_id = seed_run(&store, tasks.clone())?;
+        let dispatcher = ScriptedDispatcher::new();
+        for task in tasks.iter().take(4) {
+            dispatcher.succeed(&task.id, "completed before pause");
+        }
+        let mut paused_gates = Vec::new();
+        for task in tasks.iter().skip(4) {
+            dispatcher.succeed(&task.id, "pending after pause");
+            paused_gates.push(dispatcher.gate(&task.id));
+        }
+        let cancel = CancellationToken::new();
+        let execution = {
+            let run_store = store.clone();
+            let run_dispatcher = dispatcher.clone();
+            let run_id = run_id.clone();
+            let run_cancel = cancel.clone();
+            tokio::spawn(async move {
+                execute_runtime_plan(
+                    run_store,
+                    run_dispatcher,
+                    None,
+                    &run_id,
+                    EkoExecutionLimits {
+                        max_concurrent_subagents: 8,
+                        ..EkoExecutionLimits::default()
+                    },
+                    run_cancel,
+                    None,
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for gate in &paused_gates {
+                gate.started.notified().await;
+            }
+            dispatcher.wait_for_returns(4).await;
+        })
+        .await
+        .map_err(|_| "dispatch/pause boundary was not reached".to_string())?;
+        store
+            .transition_run(&run_id, TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        cancel.cancel();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+            .await
+            .map_err(|_| "runtime pause timed out".to_string())?
+            .map_err(|error| format!("runtime task failed to join: {error}"))?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(outcome, RunOutcome::Paused { .. }));
+        let plan = store
+            .get_plan(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "paused plan missing".to_string())?;
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .filter(|task| task.status == TodoStatus::Completed)
+                .count(),
+            4
+        );
+        assert_eq!(
+            plan.tasks
+                .iter()
+                .filter(|task| task.status == TodoStatus::Pending)
+                .count(),
+            4
+        );
+        assert!(plan.tasks.iter().all(|task| task.retry_count == 0));
+        assert!(plan.tasks.iter().all(|task| task.claim.is_none()));
         Ok(())
     }
 
@@ -6491,7 +7095,7 @@ Read the runtime path and found one missing branch.
 
         match outcome {
             RunOutcome::Failed { failed_task_id, .. } => {
-                assert_eq!(failed_task_id, "a");
+                assert_eq!(failed_task_id.as_deref(), Some("a"));
             }
             other => return Err(format!("expected Failed, got {other:?}")),
         }
@@ -6795,7 +7399,7 @@ Read the runtime path and found one missing branch.
 
         let output = run_main_agent_task(
             &handle,
-            store,
+            TaskRuntimeBlockingAdapter::new(store),
             &run_id,
             &task,
             &execution_id,

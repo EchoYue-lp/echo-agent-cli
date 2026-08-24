@@ -65,8 +65,8 @@ pub use execution_target::TaskExecutionTargetResolver;
 pub(crate) use executor::drive_unattended_run;
 pub use executor::{
     EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, ProcessExecutionResourceSnapshot,
-    RunOutcome, execute_run, preflight_unattended_plan, preflight_unattended_task,
-    process_execution_resource_snapshot,
+    RunOutcome, TaskRuntimeBlockingAdapter, execute_run, preflight_unattended_plan,
+    preflight_unattended_task, process_execution_resource_snapshot,
 };
 pub use ledger::{export_path, render_progress, write_progress};
 pub use memory_bridge::{
@@ -79,10 +79,7 @@ pub use profiles::ProfileTemplate;
 pub use register::{
     bind_task_execute_to_pool, register_task_tools_on_agent, task_revision_service_for_agent,
 };
-pub use review::{
-    BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
-    review_task,
-};
+pub use review::{BreakerAction, ReviewError, build_fix_task, requires_review, review_task};
 pub use revisioned_adapter::{
     apply_eko_task_update, build_eko_task_revision_service, commit_eko_task_plan,
 };

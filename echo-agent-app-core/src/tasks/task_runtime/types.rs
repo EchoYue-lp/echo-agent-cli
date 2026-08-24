@@ -401,13 +401,15 @@ impl TodoStatus {
             echo_agent::tasks::TaskStatus::Pending => Ok(TodoStatus::Pending),
             echo_agent::tasks::TaskStatus::Running => Ok(TodoStatus::Running),
             echo_agent::tasks::TaskStatus::Blocked(_) => Ok(TodoStatus::Blocked),
+            echo_agent::tasks::TaskStatus::Paused(_) => Err(format!(
+                "framework task status {status:?} is projected as pending at the EKO pause boundary"
+            )),
             echo_agent::tasks::TaskStatus::Completed => Ok(TodoStatus::Completed),
             echo_agent::tasks::TaskStatus::Failed(_) => Ok(TodoStatus::Failed),
             echo_agent::tasks::TaskStatus::Cancelled => Ok(TodoStatus::Cancelled),
             echo_agent::tasks::TaskStatus::TimedOut { .. } => Ok(TodoStatus::TimedOut),
             echo_agent::tasks::TaskStatus::Skipped => Ok(TodoStatus::Skipped),
-            echo_agent::tasks::TaskStatus::Retrying { .. }
-            | echo_agent::tasks::TaskStatus::Paused(_) => Err(format!(
+            echo_agent::tasks::TaskStatus::Retrying { .. } => Err(format!(
                 "framework task status {status:?} has no lossless EKO todo projection"
             )),
         }
@@ -420,8 +422,8 @@ impl TodoStatus {
             echo_agent::tasks::TaskStatus::Pending => TodoStatus::Pending,
             echo_agent::tasks::TaskStatus::Running
             | echo_agent::tasks::TaskStatus::Retrying { .. } => TodoStatus::Running,
-            echo_agent::tasks::TaskStatus::Blocked(_)
-            | echo_agent::tasks::TaskStatus::Paused(_) => TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Blocked(_) => TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Paused(_) => TodoStatus::Pending,
             echo_agent::tasks::TaskStatus::Completed => TodoStatus::Completed,
             echo_agent::tasks::TaskStatus::Failed(_) => TodoStatus::Failed,
             echo_agent::tasks::TaskStatus::Cancelled => TodoStatus::Cancelled,
@@ -2610,9 +2612,9 @@ impl SubagentRun {
     }
 }
 
-/// Result of a review gate over a task. When `outcome == NeedsFix`, the
-/// runtime (PR 4) creates a new fix task and links it via
-/// `created_fix_task_id`.
+/// Result of a review gate over one exact task claim. `NeedsFix` blocks the
+/// current task until an explicit retry or task revision; it does not create a
+/// parallel task graph.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "ReviewResult")]
 pub struct ReviewResult {
@@ -2699,8 +2701,6 @@ impl TaskExecutionSummary {
             } else {
                 vec![self.result.summary.clone()]
             },
-            files_read: self.result.touched_files.read.clone(),
-            files_changed: self.result.touched_files.written.clone(),
             decisions: self.decisions.clone(),
             failures: if self.result.status == SubagentRunStatus::Completed {
                 self.result.remaining_work.clone()
@@ -2722,6 +2722,15 @@ impl TaskExecutionSummary {
                 .iter()
                 .map(SuggestedTask::to_runtime_suggested_task)
                 .collect(),
+            extension: serde_json::json!({
+                "eko": {
+                    "schema": "task_execution_summary.v1",
+                    "contract_version": self.result.contract_version,
+                    "touched_files": self.result.touched_files,
+                    "artifacts": self.result.artifacts,
+                    "evidence": self.result.evidence,
+                }
+            }),
             created_at: self.created_at,
         }
     }
@@ -3028,7 +3037,7 @@ mod tests {
     }
 
     #[test]
-    fn task_execution_summary_converts_suggestions_to_framework() {
+    fn task_execution_summary_converts_suggestions_to_framework() -> Result<(), String> {
         let summary = TaskExecutionSummary {
             run_id: "r1".to_string(),
             task_id: "t1".to_string(),
@@ -3066,12 +3075,36 @@ mod tests {
         assert_eq!(runtime.suggested_tasks.len(), 1);
         assert_eq!(
             runtime
+                .extension
+                .pointer("/eko/touched_files/read/0")
+                .and_then(serde_json::Value::as_str),
+            Some("runtime.rs")
+        );
+        assert_eq!(
+            runtime
                 .suggested_tasks
                 .first()
                 .and_then(|task| task.extension.get("kind"))
                 .and_then(serde_json::Value::as_str),
             Some("implementation")
         );
+        let mut encoded = serde_json::to_value(&runtime).map_err(|error| error.to_string())?;
+        if let Some(extension) = encoded
+            .get_mut("extension")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            extension.insert(
+                "future_product_field".to_string(),
+                serde_json::json!({ "nested": [1, 2, 3] }),
+            );
+        }
+        let decoded: echo_agent::tasks::TaskExecutionSummary =
+            serde_json::from_value(encoded).map_err(|error| error.to_string())?;
+        assert_eq!(
+            decoded.extension.get("future_product_field"),
+            Some(&serde_json::json!({ "nested": [1, 2, 3] }))
+        );
+        Ok(())
     }
 
     #[test]

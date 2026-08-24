@@ -101,6 +101,7 @@ image = { version = "0.25", default-features = false, features = ["png"], option
 strip-ansi-escapes = { version = "0.2", optional = true }
 
 [dev-dependencies]
+echo-agent-app-core = { path = "./echo-agent-app-core", features = ["test-utils"] }
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", default-features = false, features = ["testing"] }
 
 [build-dependencies]

@@ -12,6 +12,7 @@
 | [架构说明](./architecture.md)                | 框架/应用边界、运行时所有权、数据流和文件布局 |
 | [配置指南](./configuration.md)               | 模型、MCP、Hooks、Browser、Channel 与环境变量 |
 | [Provider 架构](./architecture/providers.md) | 动态 Provider、模型协议和思考能力解析         |
+| [RuntimeTaskService 决策](./architecture/runtime-task-service.md) | Task DAG 权威、EKO adapter、journal 与 blocking 边界 |
 | [Skill 同步](./skill-sync.md)                | 内置/用户 Skill、启用状态与上游同步           |
 | [项目状态](./MASTER-PLAN.md)                 | 当前权威路径、活跃工作与下一步                |
 

@@ -20,6 +20,7 @@ use std::sync::Arc;
 use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::prelude::{MemoryMeta, MemorySource, MemoryType};
 
+use super::executor::TaskRuntimeBlockingAdapter;
 use super::store::TaskRuntimeStore;
 use super::types::*;
 
@@ -118,7 +119,13 @@ async fn write_memory_candidate_inner(
     store: &Arc<TaskRuntimeStore>,
     event: MemoryEvent,
 ) {
-    let candidates = build_candidates(store, &event).await;
+    let candidates = match build_candidates(store, &event).await {
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%error, "TaskRuntime memory candidate context unavailable");
+            return;
+        }
+    };
     for candidate in candidates {
         let category = candidate.category.clone();
         let meta = MemoryMeta::new(candidate.memory_type, candidate.source, candidate.category)
@@ -161,17 +168,23 @@ struct MemoryCandidate {
 async fn build_candidates(
     store: &Arc<TaskRuntimeStore>,
     event: &MemoryEvent,
-) -> Vec<MemoryCandidate> {
+) -> Result<Vec<MemoryCandidate>, String> {
     match event {
         MemoryEvent::RunCompleted { run_id, goal } => {
             // Summarize completed todos into a decision/fix memory.
-            let todos = store.list_todos(run_id).unwrap_or_default();
+            let load_run_id = run_id.clone();
+            let todos = TaskRuntimeBlockingAdapter::new(store.clone())
+                .run("load memory candidate todos", move |store| {
+                    store.list_todos(&load_run_id)
+                })
+                .await
+                .map_err(|error| error.to_string())?;
             let completed: Vec<&TodoItem> = todos
                 .iter()
                 .filter(|t| t.status == TodoStatus::Completed)
                 .collect();
             if completed.is_empty() {
-                return Vec::new();
+                return Ok(Vec::new());
             }
             let body = completed
                 .iter()
@@ -182,14 +195,14 @@ async fn build_candidates(
                 .collect::<Vec<_>>()
                 .join("\n");
             let content = format!("Completed complex task.\nGoal: {goal}\nAccomplished:\n{body}");
-            vec![MemoryCandidate {
+            Ok(vec![MemoryCandidate {
                 key: format!("taskrun:completed:{run_id}"),
                 content,
                 memory_type: MemoryType::ArchitectureDecision, // verified fix / decision
                 source: MemorySource::AutoExtracted,
                 category: "task_completion".to_string(),
                 confidence: 0.8,
-            }]
+            }])
         }
         MemoryEvent::RepeatedTaskFailure {
             run_id,
@@ -202,14 +215,14 @@ async fn build_candidates(
                  This bug pattern recurred across review retries — consider it a \
                  known pitfall for similar future work."
             );
-            vec![MemoryCandidate {
+            Ok(vec![MemoryCandidate {
                 key: format!("taskrun:failure:{fingerprint}"),
                 content,
                 memory_type: MemoryType::DebuggingLesson,
                 source: MemorySource::ErrorResolution,
                 category: "repeated_failure".to_string(),
                 confidence: 0.7,
-            }]
+            }])
         }
         MemoryEvent::RunCancelledByUser { run_id, goal } => {
             let content = format!(
@@ -217,34 +230,32 @@ async fn build_candidates(
                  The user chose not to proceed with this goal — treat as a \
                  preference signal for similar requests."
             );
-            vec![MemoryCandidate {
+            Ok(vec![MemoryCandidate {
                 key: format!("taskrun:cancelled:{run_id}"),
                 content,
                 memory_type: MemoryType::UserPreference,
                 source: MemorySource::UserCorrection,
                 category: "user_rejection".to_string(),
                 confidence: 0.6,
-            }]
+            }])
         }
         MemoryEvent::ReviewFoundIssue {
             run_id,
             task_title,
             issue_category,
             issue_message,
-        } => {
-            vec![MemoryCandidate {
-                key: format!("taskrun:review_issue:{issue_category}"),
-                content: format!(
-                    "Review found issue.\nTask: {task_title}\nRun: {run_id}\n\
+        } => Ok(vec![MemoryCandidate {
+            key: format!("taskrun:review_issue:{issue_category}"),
+            content: format!(
+                "Review found issue.\nTask: {task_title}\nRun: {run_id}\n\
                      Category: {issue_category}\nIssue: {issue_message}\n\
                      This issue class appeared in review — watch for it in similar future work."
-                ),
-                memory_type: MemoryType::DebuggingLesson,
-                source: MemorySource::AutoExtracted,
-                category: format!("review_issue:{issue_category}"),
-                confidence: 0.7,
-            }]
-        }
+            ),
+            memory_type: MemoryType::DebuggingLesson,
+            source: MemorySource::AutoExtracted,
+            category: format!("review_issue:{issue_category}"),
+            confidence: 0.7,
+        }]),
     }
 }
 
@@ -299,7 +310,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn build_candidates_for_completed_run_summarizes_todos() {
+    async fn build_candidates_for_completed_run_summarizes_todos() -> Result<(), String> {
         let store = seeded_store();
         let cands = build_candidates(
             &store,
@@ -308,16 +319,20 @@ mod tests {
                 goal: "Review runtime".into(),
             },
         )
-        .await;
+        .await?;
         assert_eq!(cands.len(), 1);
-        assert!(cands[0].content.contains("Review chat.rs"));
-        assert!(cands[0].content.contains("found gap"));
-        assert!(cands[0].key.starts_with("taskrun:completed:"));
-        assert_eq!(cands[0].source, MemorySource::AutoExtracted);
+        let candidate = cands
+            .first()
+            .ok_or_else(|| "completed memory candidate missing".to_string())?;
+        assert!(candidate.content.contains("Review chat.rs"));
+        assert!(candidate.content.contains("found gap"));
+        assert!(candidate.key.starts_with("taskrun:completed:"));
+        assert_eq!(candidate.source, MemorySource::AutoExtracted);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn build_candidates_for_repeated_failure_carries_fingerprint() {
+    async fn build_candidates_for_repeated_failure_carries_fingerprint() -> Result<(), String> {
         let store = seeded_store();
         let cands = build_candidates(
             &store,
@@ -327,15 +342,19 @@ mod tests {
                 fingerprint: "missing-test".into(),
             },
         )
-        .await;
+        .await?;
         assert_eq!(cands.len(), 1);
-        assert!(cands[0].content.contains("missing-test"));
-        assert_eq!(cands[0].memory_type, MemoryType::DebuggingLesson);
-        assert_eq!(cands[0].source, MemorySource::ErrorResolution);
+        let candidate = cands
+            .first()
+            .ok_or_else(|| "failure memory candidate missing".to_string())?;
+        assert!(candidate.content.contains("missing-test"));
+        assert_eq!(candidate.memory_type, MemoryType::DebuggingLesson);
+        assert_eq!(candidate.source, MemorySource::ErrorResolution);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn build_candidates_for_cancelled_run_is_a_preference() {
+    async fn build_candidates_for_cancelled_run_is_a_preference() -> Result<(), String> {
         let store = seeded_store();
         let cands = build_candidates(
             &store,
@@ -344,10 +363,14 @@ mod tests {
                 goal: "Refactor everything".into(),
             },
         )
-        .await;
+        .await?;
         assert_eq!(cands.len(), 1);
-        assert_eq!(cands[0].memory_type, MemoryType::UserPreference);
-        assert_eq!(cands[0].source, MemorySource::UserCorrection);
+        let candidate = cands
+            .first()
+            .ok_or_else(|| "cancel memory candidate missing".to_string())?;
+        assert_eq!(candidate.memory_type, MemoryType::UserPreference);
+        assert_eq!(candidate.source, MemorySource::UserCorrection);
+        Ok(())
     }
 
     #[tokio::test]

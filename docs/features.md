@@ -29,6 +29,8 @@
 
 TaskRuntime 的框架/应用边界是稳定的：框架拥有 DAG、状态迁移和通用 task tools；
 EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surface 的呈现。
+具体 authority、原子 settlement 和 blocking I/O 约束见
+[RuntimeTaskService 适配决策](./architecture/runtime-task-service.md)。
 
 ## 工具与扩展
 

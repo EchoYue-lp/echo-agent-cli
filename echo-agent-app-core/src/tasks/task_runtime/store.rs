@@ -44,6 +44,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("invalid plan: {0}")]
     InvalidPlan(String),
+    #[error("runtime task mutation: {0}")]
+    RuntimeTaskMutation(#[from] echo_agent::tasks::RuntimeTaskMutationError),
     #[error("plan revision conflict for run {run_id}: expected {expected}, current {current}")]
     PlanConflict {
         run_id: String,
@@ -78,12 +80,6 @@ pub enum StoreError {
         conversation_id: String,
         run_ids: Vec<String>,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimWriteOutcome {
-    Applied,
-    Superseded,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -521,6 +517,8 @@ pub struct TaskRuntimeStore {
     fail_next_cell_started: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_cell_started_projection: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_runtime_mutation_projection: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_cell_terminal_remaining: std::sync::atomic::AtomicUsize,
     /// File-backed event authority and deterministic projections.
@@ -981,65 +979,6 @@ pub struct RunCancellationRegistration {
     run_id: String,
     token: echo_agent::agent::CancellationToken,
     previous: Option<echo_agent::agent::CancellationToken>,
-    terminalize_on_cancel: bool,
-}
-
-impl RunCancellationRegistration {
-    fn arm_terminal_settlement(&mut self) {
-        self.terminalize_on_cancel = true;
-    }
-}
-
-impl RunCancellationRegistration {
-    fn finalize_cancelled_run(&self) {
-        let run = match self.store.get_run(&self.run_id) {
-            Ok(Some(run)) => run,
-            Ok(None) => return,
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %self.run_id,
-                    %error,
-                    "could not inspect cancelled run while releasing its driver"
-                );
-                return;
-            }
-        };
-        if !matches!(
-            run.status,
-            TaskRunStatus::Pending | TaskRunStatus::Running | TaskRunStatus::Failed
-        ) {
-            return;
-        }
-
-        if let Err(error) = self
-            .store
-            .transition_run(&self.run_id, TaskRunStatus::Cancelled)
-        {
-            // Another owner may have completed the run between the read and
-            // transition. Only report the failure if it remains non-terminal.
-            let remains_non_terminal =
-                self.store
-                    .get_run(&self.run_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|current| {
-                        matches!(
-                            current.status,
-                            TaskRunStatus::Pending
-                                | TaskRunStatus::Running
-                                | TaskRunStatus::Paused
-                                | TaskRunStatus::Failed
-                        )
-                    });
-            if remains_non_terminal {
-                tracing::warn!(
-                    run_id = %self.run_id,
-                    %error,
-                    "could not finalize cancelled run while releasing its driver"
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1070,6 +1009,155 @@ struct TaskStatusEvent<'a> {
     claim: Option<&'a echo_agent::tasks::TaskClaim>,
 }
 
+fn review_runtime_event(
+    review: &ReviewResult,
+    claim: Option<&echo_agent::tasks::TaskClaim>,
+) -> RuntimeJournalEvent {
+    let kind = match review.outcome {
+        ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
+        ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
+        ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
+    };
+    RuntimeJournalEvent::for_append(
+        review.run_id.as_str(),
+        Some(review.task_id.as_str()),
+        None,
+        kind,
+        serde_json::json!({
+            "review_id": review.id,
+            "reviewer": review.reviewer_agent,
+            "outcome": review.outcome.as_str(),
+            "issues": review.issues,
+            "failure_fingerprint": review.failure_fingerprint,
+            "created_fix_task_id": review.created_fix_task_id,
+            "created_at": echo_agent::utils::time::to_local(review.created_at).to_rfc3339(),
+            "claim_id": claim.map(|claim| claim.claim_id.as_str()),
+            "plan_revision": claim.map(|claim| claim.revision),
+            "attempt": claim.map(|claim| claim.attempt),
+            "spec_hash": claim.map(|claim| claim.spec_hash.as_str()),
+        }),
+    )
+}
+
+fn runtime_status_projection(status: &echo_agent::tasks::TaskStatus) -> (TodoStatus, Option<&str>) {
+    match status {
+        echo_agent::tasks::TaskStatus::Pending => (TodoStatus::Pending, None),
+        echo_agent::tasks::TaskStatus::Running => (TodoStatus::Running, None),
+        echo_agent::tasks::TaskStatus::Blocked(detail) => {
+            (TodoStatus::Blocked, Some(detail.as_str()))
+        }
+        echo_agent::tasks::TaskStatus::Completed => (TodoStatus::Completed, None),
+        echo_agent::tasks::TaskStatus::Failed(detail) => {
+            (TodoStatus::Failed, Some(detail.as_str()))
+        }
+        echo_agent::tasks::TaskStatus::Skipped => (TodoStatus::Skipped, None),
+        echo_agent::tasks::TaskStatus::Cancelled => (TodoStatus::Cancelled, None),
+        echo_agent::tasks::TaskStatus::TimedOut { error } => {
+            (TodoStatus::TimedOut, Some(error.as_str()))
+        }
+        echo_agent::tasks::TaskStatus::Retrying { last_error, .. } => {
+            (TodoStatus::Running, Some(last_error.as_str()))
+        }
+        echo_agent::tasks::TaskStatus::Paused(detail) => {
+            (TodoStatus::Pending, Some(detail.as_str()))
+        }
+    }
+}
+
+fn runtime_task_event_kind(status: TodoStatus) -> RuntimeEventKind {
+    match status {
+        TodoStatus::Running => RuntimeEventKind::TaskStarted,
+        TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
+        TodoStatus::Failed => RuntimeEventKind::TaskFailed,
+        TodoStatus::Cancelled => RuntimeEventKind::TaskCancelled,
+        TodoStatus::TimedOut => RuntimeEventKind::TaskTimedOut,
+        TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
+        TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
+        TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
+    }
+}
+
+fn runtime_execution_change_event(
+    run_id: &str,
+    before: &echo_agent::tasks::Task,
+    after: &echo_agent::tasks::Task,
+    summary: Option<&str>,
+) -> Result<Option<RuntimeJournalEvent>, StoreError> {
+    if before.execution == after.execution {
+        return Ok(None);
+    }
+    if before.spec != after.spec {
+        return Err(StoreError::InvalidPlan(format!(
+            "runtime mutation changed task specification '{}'",
+            after.spec.id
+        )));
+    }
+    let extension =
+        EkoTaskSpec::from_task_spec(after.spec.clone()).map_err(StoreError::InvalidPlan)?;
+    let (status, status_detail) = runtime_status_projection(&after.execution.status);
+    let now = echo_agent::utils::time::now_local().to_rfc3339();
+    let started = matches!(
+        after.execution.status,
+        echo_agent::tasks::TaskStatus::Running | echo_agent::tasks::TaskStatus::Retrying { .. }
+    );
+    let finished = after.execution.status.is_terminal();
+    Ok(Some(RuntimeJournalEvent::for_append(
+        run_id,
+        Some(&after.spec.id),
+        None,
+        runtime_task_event_kind(status),
+        serde_json::json!({
+            "status": status.as_str(),
+            "status_detail": status_detail,
+            "claim": after.execution.claim,
+            "execution_id": after
+                .execution
+                .claim
+                .as_ref()
+                .map(|claim| claim.execution_id(run_id, &after.spec.id)),
+            "retry_count": after.execution.retry_count,
+            "failure_fingerprint": after.execution.failure_fingerprint,
+            "owner_agent": extension.agent_role,
+            "title": after.spec.title,
+            "summary": summary,
+            "started_at": if started { Some(now.as_str()) } else { None },
+            "completed_at": if finished { Some(now.as_str()) } else { None },
+        }),
+    )))
+}
+
+fn runtime_execution_change_events(
+    run_id: &str,
+    before: &echo_agent::tasks::RuntimePlanSnapshot,
+    after: &echo_agent::tasks::RuntimePlanSnapshot,
+    summary: Option<&str>,
+) -> Result<Vec<RuntimeJournalEvent>, StoreError> {
+    if before.tasks.len() != after.tasks.len() {
+        return Err(StoreError::InvalidPlan(
+            "execution diff changed the revisioned task graph shape".to_string(),
+        ));
+    }
+    let mut events = Vec::new();
+    for after_task in &after.tasks {
+        let before_task = before
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == after_task.spec.id)
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(format!(
+                    "runtime mutation introduced task '{}'",
+                    after_task.spec.id
+                ))
+            })?;
+        if let Some(event) =
+            runtime_execution_change_event(run_id, before_task, after_task, summary)?
+        {
+            events.push(event);
+        }
+    }
+    Ok(events)
+}
+
 pub(crate) struct SubagentReleaseRecord<'a> {
     pub run_id: &'a str,
     pub task_id: &'a str,
@@ -1085,10 +1173,17 @@ pub(crate) struct SubagentReleaseRecord<'a> {
     pub dispatch_hook: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RuntimeTaskProductSettlement {
+    pub summary: Option<String>,
+    pub execution_summary: Option<TaskExecutionSummary>,
+    pub review: Option<ReviewResult>,
+    pub diagnostic_note: Option<String>,
+}
+
 impl Drop for RunCancellationRegistration {
     fn drop(&mut self) {
-        let cancelled = self.token.is_cancelled();
-        let owns_registration = if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
+        if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
             let is_current = map
                 .get(&self.run_id)
                 .is_some_and(|current| current == &self.token);
@@ -1098,16 +1193,7 @@ impl Drop for RunCancellationRegistration {
                 } else {
                     map.remove(&self.run_id);
                 }
-                true
-            } else {
-                false
             }
-        } else {
-            false
-        };
-
-        if cancelled && owns_registration && self.terminalize_on_cancel {
-            self.finalize_cancelled_run();
         }
         self.store.run_driver_idle.notify_waiters();
     }
@@ -1189,6 +1275,8 @@ impl TaskRuntimeStore {
             fail_next_cell_started: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_cell_started_projection: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_next_runtime_mutation_projection: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_cell_terminal_remaining: std::sync::atomic::AtomicUsize::new(0),
             shadow,
@@ -1663,6 +1751,12 @@ impl TaskRuntimeStore {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_runtime_mutation_projection_for_test(&self) {
+        self.fail_next_runtime_mutation_projection
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
     pub(crate) fn fail_cell_terminal_writes_for_test(&self, count: usize) {
         self.fail_cell_terminal_remaining
             .store(count, std::sync::atomic::Ordering::SeqCst);
@@ -1932,7 +2026,7 @@ impl TaskRuntimeStore {
         let run_id = admission.run_id.clone();
         let cancel = admission.cancel.clone();
         let cancellation_registration =
-            self.register_run_cancellation_internal(&run_id, cancel.clone(), false)?;
+            self.register_run_cancellation_internal(&run_id, cancel.clone())?;
         let (start_sender, start_receiver) = tokio::sync::oneshot::channel();
         let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
         let mut supervisor = self
@@ -1992,11 +2086,10 @@ impl TaskRuntimeStore {
         );
         supervisor.driver_settlements.spawn_on(async move {
             let mut generation_lease = Some(generation_lease);
-            let mut cancellation_registration = cancellation_registration;
+            let _cancellation_registration = cancellation_registration;
             let start = start_receiver.await;
             let (mut result, should_settle) = match start {
                 Ok(RunDriverStart::Execute(future)) => {
-                    cancellation_registration.arm_terminal_settlement();
                     let result = match tokio::spawn(future).await {
                         Ok(result) => result,
                         Err(error) => {
@@ -2007,7 +2100,6 @@ impl TaskRuntimeStore {
                     (result, true)
                 }
                 Ok(RunDriverStart::PreparationFailed(error)) => {
-                    cancellation_registration.arm_terminal_settlement();
                     (Err(error), true)
                 }
                 Ok(RunDriverStart::Reject(error)) => (Err(error), false),
@@ -3034,27 +3126,30 @@ impl TaskRuntimeStore {
             if run.status == TaskRunStatus::Completed {
                 return Ok(());
             }
-            let todos = self.list_todos(run_id)?;
-            let mut events = todos
-                .iter()
-                .filter(|todo| {
-                    matches!(
-                        todo.status,
-                        TodoStatus::Pending | TodoStatus::Running | TodoStatus::Blocked
-                    )
-                })
-                .map(|todo| {
-                    task_status_runtime_event(TaskStatusEvent {
-                        run_id,
-                        task_id: &todo.task_id,
-                        task_subject: &todo.title,
-                        status: TodoStatus::Cancelled,
-                        owner_agent: None,
-                        summary: Some("cancelled with parent run"),
-                        claim: None,
-                    })
-                })
-                .collect::<Vec<_>>();
+            let mut events = if let Some(graph) = self.load_revisioned_task_graph(run_id)? {
+                let before = graph.snapshot;
+                let mut after = before.clone();
+                let settlement = echo_agent::tasks::settle_runtime_interruption(
+                    &mut after,
+                    before.revision,
+                    echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled,
+                )?;
+                if settlement
+                    == echo_agent::tasks::RuntimeInterruptionSettlementOutcome::ReloadSnapshot
+                {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "run {run_id} changed while holding its cancellation lock"
+                    )));
+                }
+                runtime_execution_change_events(
+                    run_id,
+                    &before,
+                    &after,
+                    Some("cancelled with parent run"),
+                )?
+            } else {
+                Vec::new()
+            };
             if run.status != TaskRunStatus::Cancelled {
                 if !run.status.can_transition_to(TaskRunStatus::Cancelled) {
                     return Err(StoreError::IllegalTransition {
@@ -3085,42 +3180,6 @@ impl TaskRuntimeStore {
                 self.shadow.append_event_batch(run_id, events)?;
                 self.shadow.rewrite_plan(run_id)?;
             }
-            Ok(())
-        })
-    }
-
-    pub(crate) fn settle_paused_tasks(
-        &self,
-        run_id: &str,
-        task_id: Option<&str>,
-        message: &str,
-    ) -> Result<(), StoreError> {
-        self.with_run_lock(run_id, || {
-            let todos = self.list_todos(run_id)?;
-            let mut events = todos
-                .iter()
-                .filter(|todo| todo.status == TodoStatus::Running)
-                .map(|todo| {
-                    task_status_runtime_event(TaskStatusEvent {
-                        run_id,
-                        task_id: &todo.task_id,
-                        task_subject: &todo.title,
-                        status: TodoStatus::Pending,
-                        owner_agent: None,
-                        summary: Some("paused; pending resume"),
-                        claim: None,
-                    })
-                })
-                .collect::<Vec<_>>();
-            events.push(RuntimeJournalEvent::for_append(
-                run_id,
-                task_id,
-                None,
-                RuntimeEventKind::Note,
-                serde_json::json!({ "message": message }),
-            ));
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
             Ok(())
         })
     }
@@ -3248,39 +3307,72 @@ impl TaskRuntimeStore {
         run: &TaskRun,
         reset_provider_retry: bool,
     ) -> Result<(), StoreError> {
-        self.shadow.append_event_batch(
-            run_id,
-            vec![
-                RuntimeJournalEvent::for_append(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::RunStatusChanged,
-                    serde_json::json!({
-                        "from": run.status.as_str(),
-                        "to": TaskRunStatus::Running.as_str(),
-                    }),
-                ),
-                RuntimeJournalEvent::for_append(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::RunPauseReasonChanged,
-                    serde_json::json!({ "reason": serde_json::Value::Null }),
-                ),
-                RuntimeJournalEvent::for_append(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::RunContinuationResumed,
-                    serde_json::json!({
-                        "deferred": false,
-                        "reset_blocker_audit": true,
-                        "reset_provider_retry": reset_provider_retry,
-                    }),
-                ),
-            ],
-        )?;
+        let mut events = if let Some(graph) = self.load_revisioned_task_graph(run_id)? {
+            let before = graph.snapshot;
+            let mut after = before.clone();
+            let paused_tasks = before
+                .tasks
+                .iter()
+                .filter(|task| {
+                    matches!(
+                        task.execution.status,
+                        echo_agent::tasks::TaskStatus::Paused(_)
+                    )
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for paused in paused_tasks {
+                match echo_agent::tasks::resume_runtime_task(&mut after, &paused, before.revision)?
+                {
+                    echo_agent::tasks::RuntimeTaskResumeOutcome::Resumed => {}
+                    echo_agent::tasks::RuntimeTaskResumeOutcome::Superseded => {
+                        return Err(StoreError::InvalidPlan(format!(
+                            "paused task '{}' changed while holding its resume lock",
+                            paused.spec.id
+                        )));
+                    }
+                }
+            }
+            runtime_execution_change_events(
+                run_id,
+                &before,
+                &after,
+                Some("resumed without consuming retry budget"),
+            )?
+        } else {
+            Vec::new()
+        };
+        events.extend([
+            RuntimeJournalEvent::for_append(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({
+                    "from": run.status.as_str(),
+                    "to": TaskRunStatus::Running.as_str(),
+                }),
+            ),
+            RuntimeJournalEvent::for_append(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunPauseReasonChanged,
+                serde_json::json!({ "reason": serde_json::Value::Null }),
+            ),
+            RuntimeJournalEvent::for_append(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunContinuationResumed,
+                serde_json::json!({
+                    "deferred": false,
+                    "reset_blocker_audit": true,
+                    "reset_provider_retry": reset_provider_retry,
+                }),
+            ),
+        ]);
+        self.shadow.append_event_batch(run_id, events)?;
         self.shadow.rewrite_plan(run_id)?;
         Ok(())
     }
@@ -3462,14 +3554,13 @@ impl TaskRuntimeStore {
         run_id: &str,
         token: echo_agent::agent::CancellationToken,
     ) -> Result<RunCancellationRegistration, StoreError> {
-        self.register_run_cancellation_internal(run_id, token, true)
+        self.register_run_cancellation_internal(run_id, token)
     }
 
     fn register_run_cancellation_internal(
         self: &std::sync::Arc<Self>,
         run_id: &str,
         token: echo_agent::agent::CancellationToken,
-        terminalize_on_cancel: bool,
     ) -> Result<RunCancellationRegistration, StoreError> {
         let previous = self
             .run_cancel_tokens
@@ -3481,7 +3572,6 @@ impl TaskRuntimeStore {
             run_id: run_id.to_string(),
             token,
             previous,
-            terminalize_on_cancel,
         })
     }
 
@@ -3508,16 +3598,14 @@ impl TaskRuntimeStore {
         }
     }
 
-    fn cancel_active_run(&self, run_id: &str) -> bool {
-        if let Ok(mut map) = self.run_cancel_tokens.lock() {
-            #[allow(clippy::collapsible_if)]
-            // nested let-Ok/let-Some reads clearer than a let-chain
-            if let Some(token) = map.remove(run_id) {
-                token.cancel();
-                return true;
-            }
-        }
-        false
+    fn active_run_cancel_token(
+        &self,
+        run_id: &str,
+    ) -> Option<echo_agent::agent::CancellationToken> {
+        self.run_cancel_tokens
+            .lock()
+            .ok()
+            .and_then(|map| map.get(run_id).cloned())
     }
 
     /// Request cancellation through the single TaskRuntime control path.
@@ -3526,7 +3614,11 @@ impl TaskRuntimeStore {
     /// directly when they are not executing.
     pub fn request_cancel(&self, run_id: &str) -> Result<bool, StoreError> {
         let _operation = self.shadow_operation()?;
-        if self.cancel_active_run(run_id) {
+        if let Some(token) = self.active_run_cancel_token(run_id) {
+            // Durable Cancelled is committed before signalling the driver. It
+            // therefore wins a concurrent Paused intent at the controller cut.
+            self.finalize_cancelled_tasks_and_run(run_id)?;
+            token.cancel();
             super::continuation::clear_launcher(self, run_id);
             self.stop_owned_command_cells(run_id)?;
             return Ok(true);
@@ -3675,6 +3767,7 @@ impl TaskRuntimeStore {
         run_id: &str,
     ) -> Result<Option<echo_agent::tasks::RevisionedTaskGraph>, StoreError> {
         let _operation = self.shadow_operation()?;
+        self.shadow.ensure_projections_current(run_id)?;
         let Some(plan) = self.shadow.read_plan(run_id)? else {
             return Ok(None);
         };
@@ -4088,9 +4181,10 @@ impl TaskRuntimeStore {
 
     // ── Task / todo mutations ───────────────────────────────────────────
 
-    /// Update a plan task's status and its mirrored todo row, emitting a
-    /// kind-appropriate event. Used by the scheduler (PR 3) and review
-    /// gates (PR 4).
+    /// Test-only fixture helper. Production task transitions are exclusively
+    /// owned by the framework runtime and revision services above.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
     pub fn set_task_status(
         &self,
         run_id: &str,
@@ -4123,144 +4217,277 @@ impl TaskRuntimeStore {
         })
     }
 
-    /// Atomically claim a Pending task from one exact plan revision.
-    pub fn claim_task(
+    /// Load one coherent framework snapshot under the run mutation lock.
+    pub(crate) fn load_runtime_plan_snapshot(
+        &self,
+        run_id: &str,
+    ) -> Result<echo_agent::tasks::RuntimePlanSnapshot, StoreError> {
+        self.with_run_lock(run_id, || {
+            self.load_revisioned_task_graph(run_id)?
+                .map(|graph| graph.snapshot)
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))
+        })
+    }
+
+    fn persist_runtime_execution_changes(
+        &self,
+        run_id: &str,
+        before: &echo_agent::tasks::RuntimePlanSnapshot,
+        after: &echo_agent::tasks::RuntimePlanSnapshot,
+        summary: Option<&str>,
+        mut product_events: Vec<RuntimeJournalEvent>,
+    ) -> Result<(), StoreError> {
+        let mut events = runtime_execution_change_events(run_id, before, after, summary)?;
+        events.append(&mut product_events);
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.shadow.append_event_batch(run_id, events)?;
+        #[cfg(test)]
+        if self
+            .fail_next_runtime_mutation_projection
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            tracing::warn!(
+                run_id,
+                "runtime mutation committed with injected projection degradation"
+            );
+            return Ok(());
+        }
+        match self.shadow.rewrite_plan(run_id) {
+            Ok(()) => Ok(()),
+            Err(super::file_shadow::ShadowError::CommittedProjectionDegraded { seq, detail }) => {
+                tracing::warn!(
+                    run_id,
+                    seq,
+                    %detail,
+                    "runtime mutation committed; derived projection will self-heal on read"
+                );
+                Ok(())
+            }
+            Err(error) => Err(StoreError::Shadow(error)),
+        }
+    }
+
+    /// Atomically claim a Pending task through the framework's canonical
+    /// compare-and-set transformation.
+    pub fn claim_runtime_task(
         &self,
         run_id: &str,
         expected_task: &echo_agent::tasks::Task,
         expected_revision: u64,
     ) -> Result<echo_agent::tasks::RuntimeTaskClaimOutcome, StoreError> {
         self.with_run_lock(run_id, || {
-            let plan = self
-                .get_plan(run_id)?
+            let mut graph = self
+                .load_revisioned_task_graph(run_id)?
                 .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-            if plan.revision != expected_revision {
-                return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
-            }
-            let Some(task) = plan
-                .tasks
-                .iter()
-                .find(|task| task.id == expected_task.spec.id)
-            else {
-                return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
-            };
-            let current = task.to_task().map_err(StoreError::InvalidPlan)?;
-            if task.status != TodoStatus::Pending || current.spec != expected_task.spec {
-                return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
-            }
-            let claim = echo_agent::tasks::TaskClaim::new(
+            let before = graph.snapshot.clone();
+            let outcome = echo_agent::tasks::claim_runtime_task(
+                &mut graph.snapshot,
+                expected_task,
                 expected_revision,
-                task.retry_count.saturating_add(1),
-                current
-                    .spec
-                    .stable_hash()
-                    .map_err(StoreError::InvalidPlan)?,
-            );
-            self.append_task_status_event(TaskStatusEvent {
-                run_id,
-                task_id: &task.id,
-                task_subject: &task.title,
-                status: TodoStatus::Running,
-                owner_agent: Some(&task.agent_role),
-                summary: None,
-                claim: Some(&claim),
-            })?;
-            Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim))
-        })
-    }
-
-    /// Commit a status only if the same claimed attempt is still Running.
-    pub fn set_claimed_task_status(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        claim: &echo_agent::tasks::TaskClaim,
-        status: TodoStatus,
-        owner_agent: Option<&str>,
-        summary: Option<&str>,
-    ) -> Result<ClaimWriteOutcome, StoreError> {
-        self.with_run_lock(run_id, || {
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-            let Some(task) = plan.tasks.iter().find(|task| task.id == task_id) else {
-                return Ok(ClaimWriteOutcome::Superseded);
-            };
-            if task.status != TodoStatus::Running || task.claim.as_ref() != Some(claim) {
-                return Ok(ClaimWriteOutcome::Superseded);
-            }
-            self.append_task_status_event(TaskStatusEvent {
-                run_id,
-                task_id,
-                task_subject: &task.title,
-                status,
-                owner_agent,
-                summary,
-                claim: Some(claim),
-            })?;
-            Ok(ClaimWriteOutcome::Applied)
-        })
-    }
-
-    /// Atomically requeue one failed claimed attempt and advance its retry
-    /// counter without exposing an unclaimed Pending window.
-    pub fn requeue_claimed_task(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        claim: &echo_agent::tasks::TaskClaim,
-        failure_fingerprint: Option<&str>,
-        summary: &str,
-    ) -> Result<ClaimWriteOutcome, StoreError> {
-        self.with_run_lock(run_id, || {
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-            let Some(task) = plan.tasks.iter().find(|task| task.id == task_id) else {
-                return Ok(ClaimWriteOutcome::Superseded);
-            };
-            if task.status != TodoStatus::Running || task.claim.as_ref() != Some(claim) {
-                return Ok(ClaimWriteOutcome::Superseded);
-            }
-            let next = task.retry_count.saturating_add(1);
-            self.shadow.append_event_line(
-                run_id,
-                Some(task_id),
-                None,
-                RuntimeEventKind::TodoUpdated,
-                serde_json::json!({
-                    "status": TodoStatus::Pending.as_str(),
-                    "status_detail": null,
-                    "owner_agent": task.agent_role,
-                    "summary": summary,
-                    "retry_count": next,
-                    "failure_fingerprint": failure_fingerprint,
-                    "claim": null,
-                    "started_at": null,
-                    "completed_at": null,
-                }),
             )?;
-            self.shadow.rewrite_plan(run_id)?;
-            Ok(ClaimWriteOutcome::Applied)
+            self.persist_runtime_execution_changes(
+                run_id,
+                &before,
+                &graph.snapshot,
+                None,
+                Vec::new(),
+            )?;
+            Ok(outcome)
         })
     }
 
-    pub fn task_claim_is_current(
+    /// Verify one physical claim against the exact persisted framework graph.
+    pub fn runtime_task_claim_is_current(
         &self,
         run_id: &str,
         task_id: &str,
         claim: &echo_agent::tasks::TaskClaim,
     ) -> Result<bool, StoreError> {
-        let plan = self
-            .get_plan(run_id)?
-            .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-        Ok(plan.tasks.iter().any(|task| {
-            task.id == task_id
-                && task.status == TodoStatus::Running
-                && task.claim.as_ref() == Some(claim)
-        }))
+        self.with_run_lock(run_id, || {
+            let graph = self
+                .load_revisioned_task_graph(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            echo_agent::tasks::runtime_claim_is_current(&graph.snapshot, task_id, claim)
+                .map_err(StoreError::from)
+        })
     }
 
+    /// Atomically commit one framework-owned dispatch resolution.
+    pub(crate) fn settle_runtime_task_resolution(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+        request: echo_agent::tasks::RuntimeTaskResolutionRequest,
+        product: RuntimeTaskProductSettlement,
+    ) -> Result<echo_agent::tasks::RuntimeTaskResolution, StoreError> {
+        self.with_run_lock(run_id, || {
+            let mut graph = self
+                .load_revisioned_task_graph(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let before = graph.snapshot.clone();
+            let outcome = echo_agent::tasks::settle_runtime_resolution(
+                &mut graph.snapshot,
+                task_id,
+                claim,
+                request,
+            )?;
+            let RuntimeTaskProductSettlement {
+                summary,
+                execution_summary,
+                review,
+                diagnostic_note,
+            } = product;
+            let mut product_events = Vec::new();
+            if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded {
+                if let Some(summary) = execution_summary {
+                    product_events.push(RuntimeJournalEvent::for_append(
+                        run_id,
+                        Some(task_id),
+                        None,
+                        RuntimeEventKind::Note,
+                        serde_json::json!({
+                            "kind": "summary_persisted",
+                            "summary": summary,
+                        }),
+                    ));
+                }
+                if let Some(review) = review {
+                    product_events.push(review_runtime_event(&review, Some(claim)));
+                }
+                if let Some(message) = diagnostic_note {
+                    product_events.push(RuntimeJournalEvent::for_append(
+                        run_id,
+                        Some(task_id),
+                        None,
+                        RuntimeEventKind::Note,
+                        serde_json::json!({
+                            "message": message,
+                            "claim_id": claim.claim_id,
+                            "plan_revision": claim.revision,
+                            "attempt": claim.attempt,
+                            "spec_hash": claim.spec_hash,
+                        }),
+                    ));
+                }
+            }
+            self.persist_runtime_execution_changes(
+                run_id,
+                &before,
+                &graph.snapshot,
+                summary.as_deref(),
+                product_events,
+            )?;
+            Ok(outcome)
+        })
+    }
+
+    /// Settle one exact claim to a terminal or product-blocked state.
+    pub fn settle_runtime_task_claim(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+        status: echo_agent::tasks::TaskStatus,
+        summary: Option<String>,
+    ) -> Result<echo_agent::tasks::RuntimeTaskSettlementOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            let mut graph = self
+                .load_revisioned_task_graph(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let before = graph.snapshot.clone();
+            let outcome = echo_agent::tasks::settle_runtime_claim(
+                &mut graph.snapshot,
+                task_id,
+                claim,
+                status,
+            )?;
+            self.persist_runtime_execution_changes(
+                run_id,
+                &before,
+                &graph.snapshot,
+                summary.as_deref(),
+                Vec::new(),
+            )?;
+            Ok(outcome)
+        })
+    }
+
+    /// Settle all unfinished tasks for one exact run-level interruption.
+    pub fn settle_runtime_task_interruption(
+        &self,
+        run_id: &str,
+        expected_revision: u64,
+        disposition: echo_agent::tasks::RuntimeInterruptionDisposition,
+    ) -> Result<echo_agent::tasks::RuntimeInterruptionSettlementOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            let mut graph = self
+                .load_revisioned_task_graph(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let before = graph.snapshot.clone();
+            let summary = match &disposition {
+                echo_agent::tasks::RuntimeInterruptionDisposition::Cancelled => {
+                    "run cancelled".to_string()
+                }
+                echo_agent::tasks::RuntimeInterruptionDisposition::Paused { reason } => {
+                    reason.clone()
+                }
+            };
+            let outcome = echo_agent::tasks::settle_runtime_interruption(
+                &mut graph.snapshot,
+                expected_revision,
+                disposition,
+            )?;
+            self.persist_runtime_execution_changes(
+                run_id,
+                &before,
+                &graph.snapshot,
+                Some(&summary),
+                Vec::new(),
+            )?;
+            Ok(outcome)
+        })
+    }
+
+    /// Explicitly retry one exact unclaimed task. Run restart policy remains
+    /// outside this framework mutation.
+    pub fn retry_runtime_task(
+        &self,
+        run_id: &str,
+        expected_task: &echo_agent::tasks::Task,
+        expected_revision: u64,
+    ) -> Result<echo_agent::tasks::RuntimeTaskRetryOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            let mut graph = self
+                .load_revisioned_task_graph(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let before = graph.snapshot.clone();
+            let outcome = echo_agent::tasks::retry_runtime_task(
+                &mut graph.snapshot,
+                expected_task,
+                expected_revision,
+            )?;
+            let summary = match outcome {
+                echo_agent::tasks::RuntimeTaskRetryOutcome::Retried { retry_count } => {
+                    Some(format!("explicit retry (retry_count {retry_count})"))
+                }
+                echo_agent::tasks::RuntimeTaskRetryOutcome::Exhausted { .. }
+                | echo_agent::tasks::RuntimeTaskRetryOutcome::Superseded => None,
+            };
+            self.persist_runtime_execution_changes(
+                run_id,
+                &before,
+                &graph.snapshot,
+                summary.as_deref(),
+                Vec::new(),
+            )?;
+            Ok(outcome)
+        })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
     fn append_task_status_event(&self, event: TaskStatusEvent<'_>) -> Result<(), StoreError> {
         let run_id = event.run_id;
         self.shadow
@@ -4269,52 +4496,13 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Bump execution retry metadata without mutating the task specification.
-    pub fn increment_retry_count(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        failure_fingerprint: Option<&str>,
-    ) -> Result<u32, StoreError> {
-        self.with_run_lock(run_id, || {
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            let task = plan
-                .tasks
-                .iter()
-                .find(|t| t.id == task_id)
-                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
-            let next = task.retry_count.saturating_add(1);
-            self.shadow.append_event_line(
-                run_id,
-                Some(task_id),
-                None,
-                RuntimeEventKind::TodoUpdated,
-                serde_json::json!({
-                    "status": task.status.as_str(),
-                    "retry_count": next,
-                    "failure_fingerprint": failure_fingerprint,
-                }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
-            Ok(next)
-        })
-    }
-
     /// Atomically retry a Blocked/Failed task in a Paused/Failed run.
     ///
-    /// Performs the full guard → retry_count bump → Pending → Running
-    /// transition under a single per-run write lock, so concurrent
-    /// retry_blocked_task callers cannot both pass the budget check and
-    /// double-bump retry_count. Returns the new attempt number on success,
-    /// or a StoreError on any precondition failure (run/task not in a
-    /// retryable state, retry budget exhausted). The caller is responsible
-    /// for spawning the executor after this returns Ok.
+    /// Framework retry state and the EKO run restart event are appended in one
+    /// journal batch. Dependency blockers remain a framework DAG projection;
+    /// this product transaction never discovers descendants from summary text.
     pub fn retry_blocked_task(&self, run_id: &str, task_id: &str) -> Result<u32, StoreError> {
         self.with_run_lock(run_id, || {
-            // 1. Run must be Paused or Failed (the states acceptance failure
-            //    produces). Any other status is a concurrent retry / misuse.
             let run = self
                 .get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
@@ -4324,38 +4512,6 @@ impl TaskRuntimeStore {
                     run_id, run.status
                 )));
             }
-            // 2. Task must be Blocked, Failed, or TimedOut. A cancellation is
-            // an explicit user decision and is not silently turned into retry.
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-            let task = plan
-                .tasks
-                .iter()
-                .find(|t| t.id == task_id)
-                .cloned()
-                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
-            if !matches!(
-                task.status,
-                TodoStatus::Blocked | TodoStatus::Failed | TodoStatus::TimedOut
-            ) {
-                return Err(StoreError::InvalidPlan(format!(
-                    "task {} is {:?}; retry requires Blocked, Failed, or TimedOut",
-                    task_id, task.status
-                )));
-            }
-            // 3. Budget check.
-            if task.retry_count >= task.max_retries {
-                return Err(StoreError::InvalidPlan(format!(
-                    "task {} retry budget exhausted ({}/{})",
-                    task_id, task.retry_count, task.max_retries
-                )));
-            }
-
-            // 4. Precompute the complete product transaction before writing.
-            //    Title/description stay unchanged; attempt id derives from
-            //    retry_count+1 at dispatch time.
-            let next = task.retry_count.saturating_add(1);
             if !run.status.can_transition_to(TaskRunStatus::Running) {
                 return Err(StoreError::IllegalTransition {
                     run_id: run_id.to_string(),
@@ -4363,142 +4519,76 @@ impl TaskRuntimeStore {
                     to: TaskRunStatus::Running.as_str().to_string(),
                 });
             }
-            let todos = self.list_todos(run_id)?;
-            let upstream_blocked: std::collections::HashSet<String> = todos
+            let mut graph = self
+                .load_revisioned_task_graph(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let expected_task = graph
+                .snapshot
+                .tasks
                 .iter()
-                .filter(|todo| {
-                    todo.status == TodoStatus::Blocked
-                        && todo.summary.as_deref() == Some("blocked: upstream task failed")
-                })
-                .map(|todo| todo.task_id.clone())
-                .collect();
-            let mut recovered = std::collections::HashSet::from([task_id.to_string()]);
-            let mut descendants = Vec::new();
-            loop {
-                let mut changed = false;
-                for candidate in &plan.tasks {
-                    if candidate.status != TodoStatus::Blocked
-                        || !upstream_blocked.contains(&candidate.id)
-                        || recovered.contains(&candidate.id)
-                        || !candidate
-                            .depends_on
-                            .iter()
-                            .any(|dep| recovered.contains(dep))
-                    {
-                        continue;
-                    }
-                    let still_blocked = candidate.depends_on.iter().any(|dep_id| {
-                        plan.tasks
-                            .iter()
-                            .find(|dep| dep.id == *dep_id)
-                            .is_some_and(|dep| {
-                                matches!(
-                                    dep.status,
-                                    TodoStatus::Failed
-                                        | TodoStatus::TimedOut
-                                        | TodoStatus::Cancelled
-                                        | TodoStatus::Blocked
-                                ) && !recovered.contains(dep_id)
-                            })
-                    });
-                    if still_blocked {
-                        continue;
-                    }
-                    recovered.insert(candidate.id.clone());
-                    descendants.push(candidate.clone());
-                    changed = true;
+                .find(|task| task.spec.id == task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
+            let before = graph.snapshot.clone();
+            let outcome = echo_agent::tasks::retry_runtime_task(
+                &mut graph.snapshot,
+                &expected_task,
+                before.revision,
+            )?;
+            let next = match outcome {
+                echo_agent::tasks::RuntimeTaskRetryOutcome::Retried { retry_count } => retry_count,
+                echo_agent::tasks::RuntimeTaskRetryOutcome::Exhausted {
+                    retry_count,
+                    max_retries,
+                } => {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "task {task_id} retry budget exhausted ({retry_count}/{max_retries})"
+                    )));
                 }
-                if !changed {
-                    break;
+                echo_agent::tasks::RuntimeTaskRetryOutcome::Superseded => {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "task {task_id} changed before retry"
+                    )));
                 }
-            }
-
-            let mut events = vec![RuntimeJournalEvent::for_append(
-                run_id,
-                Some(task_id),
-                None,
-                RuntimeEventKind::TodoUpdated,
-                serde_json::json!({
-                    "owner_agent": task.agent_role,
-                    "started_at": null,
-                    "completed_at": null,
-                    "status": "pending",
-                    "retry_count": next,
-                    "failure_fingerprint": task.failure_fingerprint,
-                    "summary": format!("user-initiated retry (attempt {next})"),
-                }),
-            )];
-
-            // A hard task failure propagates `Blocked` to its downstream
-            // dependents. Retrying only the failed node would leave those
-            // descendants permanently unschedulable because the DAG frontier
-            // accepts Pending tasks only. Reset precisely the descendants whose
-            // persisted blocker was created by that upstream-failure propagation;
-            // acceptance/review blockers keep their independent Blocked state.
-            for descendant in descendants {
-                events.push(RuntimeJournalEvent::for_append(
+            };
+            let product_events = vec![
+                RuntimeJournalEvent::for_append(
                     run_id,
-                    Some(&descendant.id),
                     None,
-                    RuntimeEventKind::TodoUpdated,
+                    None,
+                    RuntimeEventKind::Note,
                     serde_json::json!({
-                        "owner_agent": descendant.agent_role,
-                        "started_at": null,
-                        "completed_at": null,
-                        "status": "pending",
-                        "summary": format!("unblocked after retrying upstream task {task_id}"),
+                        "message": format!("user retried blocked task {task_id} (attempt {next})"),
                     }),
-                ));
-            }
-            events.push(RuntimeJournalEvent::for_append(
+                ),
+                RuntimeJournalEvent::for_append(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunStatusChanged,
+                    serde_json::json!({
+                        "from": run.status.as_str(),
+                        "to": TaskRunStatus::Running.as_str(),
+                    }),
+                ),
+            ];
+            let summary = format!("user-initiated retry (attempt {next})");
+            self.persist_runtime_execution_changes(
                 run_id,
-                None,
-                None,
-                RuntimeEventKind::Note,
-                serde_json::json!({
-                    "message": format!("user retried blocked task {task_id} (attempt {next})"),
-                }),
-            ));
-            events.push(RuntimeJournalEvent::for_append(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::RunStatusChanged,
-                serde_json::json!({
-                    "from": run.status.as_str(),
-                    "to": TaskRunStatus::Running.as_str(),
-                }),
-            ));
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+                &before,
+                &graph.snapshot,
+                Some(&summary),
+                product_events,
+            )?;
             Ok(next)
         })
     }
 
-    pub fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
+    #[cfg(test)]
+    pub(crate) fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
         self.with_run_lock(&r.run_id, || {
-            // U1c phase-0/0bc step-2: file authority. Review* carries the full
-            // review so FileTaskStore.list_reviews can derive it. No SQL.
-            let kind = match r.outcome {
-                ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
-                ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
-                ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
-            };
-            self.shadow.append_event_line(
-                r.run_id.as_str(),
-                Some(r.task_id.as_str()),
-                None,
-                kind,
-                serde_json::json!({
-                    "review_id": r.id,
-                    "reviewer": r.reviewer_agent,
-                    "outcome": r.outcome.as_str(),
-                    "issues": r.issues,
-                    "failure_fingerprint": r.failure_fingerprint,
-                    "created_fix_task_id": r.created_fix_task_id,
-                    "created_at": echo_agent::utils::time::to_local(r.created_at).to_rfc3339(),
-                }),
-            )?;
+            self.shadow
+                .append_event_batch(&r.run_id, vec![review_runtime_event(r, None)])?;
             self.shadow.rewrite_plan(&r.run_id)?;
             Ok(())
         })
@@ -4912,6 +5002,7 @@ impl TaskRuntimeStore {
                     Some(claim) => self.recoverable_subagent_result_for_attempt(
                         &run.run_id,
                         &task_id,
+                        &claim.execution_id(&run.run_id, &task_id),
                         claim.revision,
                         claim.attempt,
                     )?,
@@ -6300,13 +6391,24 @@ impl TaskRuntimeStore {
         &self,
         run_id: &str,
         task_id: &str,
+        execution_id: &str,
         plan_revision: u64,
         attempt: u32,
     ) -> Result<Option<RecoverableSubagentResult>, StoreError> {
-        let mut result = None;
-        // Audit allowlist: restart result reuse needs the full logical-attempt
-        // assignment/release sequence and its retained full output.
-        for event in self.list_events(run_id, 0)? {
+        let events = self.list_events(run_id, 0)?;
+        let current_claim_index = events.iter().position(|event| {
+            event.task_id.as_deref() == Some(task_id)
+                && event.event_type == RuntimeEventKind::TaskStarted
+                && json_string(&event.payload, "execution_id").as_deref() == Some(execution_id)
+        });
+        let mut current_result = None;
+        let mut prior_result = None;
+        // Audit allowlist: exact physical-attempt recovery needs the complete
+        // assignment/release sequence to enforce its TaskStarted cut.
+        // The same physical execution may recover its own completed release.
+        // A reclaimed execution may reuse only a release committed before its
+        // TaskStarted claim event; a late old release cannot cross that cut.
+        for (index, event) in events.into_iter().enumerate() {
             let matches_attempt = event.task_id.as_deref() == Some(task_id)
                 && event
                     .payload
@@ -6321,10 +6423,14 @@ impl TaskRuntimeStore {
             if !matches_attempt {
                 continue;
             }
+            let event_execution_id = json_string(&event.payload, "execution_id");
+            let targets_current = event_execution_id.as_deref() == Some(execution_id);
+            let targets_prior = current_claim_index.is_some_and(|claim_index| index < claim_index);
             match event.event_type {
-                RuntimeEventKind::SubagentAssigned => result = None,
+                RuntimeEventKind::SubagentAssigned if targets_current => current_result = None,
+                RuntimeEventKind::SubagentAssigned if targets_prior => prior_result = None,
                 RuntimeEventKind::SubagentReleased => {
-                    result =
+                    let candidate =
                         if json_string(&event.payload, "status").as_deref() == Some("completed") {
                             event
                                 .payload
@@ -6342,11 +6448,16 @@ impl TaskRuntimeStore {
                         } else {
                             None
                         };
+                    if targets_current {
+                        current_result = candidate;
+                    } else if targets_prior {
+                        prior_result = candidate;
+                    }
                 }
                 _ => {}
             }
         }
-        Ok(result)
+        Ok(current_result.or(prior_result))
     }
 
     /// Current unresolved recovery barriers, folded from append-only events.
@@ -6403,41 +6514,119 @@ impl TaskRuntimeStore {
                         "task {task_id} has no unresolved recovery barrier"
                     ))
                 })?;
-            let plan = self
-                .get_plan(run_id)?
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let current = self
+                .load_revisioned_task_graph(run_id)?
                 .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-            let task = plan
+            let expected_task = current
+                .snapshot
                 .tasks
                 .iter()
-                .find(|task| task.id == task_id)
+                .find(|task| task.spec.id == task_id)
+                .cloned()
                 .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
-            let (status, summary) = match decision {
-                RecoveryDecision::Retry => {
-                    (TodoStatus::Pending, "recovery retry confirmed by user")
-                }
-                RecoveryDecision::Skip => (TodoStatus::Skipped, "recovery skip confirmed by user"),
-            };
-            let events = vec![
-                RuntimeJournalEvent::for_append(
-                    run_id,
-                    Some(task_id),
-                    blocker.execution_id.as_deref(),
-                    RuntimeEventKind::RecoveryResolved,
-                    serde_json::json!({
-                        "decision": decision.as_str(),
-                        "previous_reason": blocker.reason,
-                    }),
-                ),
-                task_status_runtime_event(TaskStatusEvent {
-                    run_id,
-                    task_id,
-                    task_subject: &task.title,
-                    status,
-                    owner_agent: None,
-                    summary: Some(summary),
-                    claim: None,
+            let recovery_event = RuntimeJournalEvent::for_append(
+                run_id,
+                Some(task_id),
+                blocker.execution_id.as_deref(),
+                RuntimeEventKind::RecoveryResolved,
+                serde_json::json!({
+                    "decision": decision.as_str(),
+                    "previous_reason": blocker.reason,
                 }),
-            ];
+            );
+            let events = match decision {
+                RecoveryDecision::Retry => {
+                    let before = current.snapshot;
+                    let mut after = before.clone();
+                    match echo_agent::tasks::retry_runtime_task(
+                        &mut after,
+                        &expected_task,
+                        before.revision,
+                    )? {
+                        echo_agent::tasks::RuntimeTaskRetryOutcome::Retried { .. } => {}
+                        echo_agent::tasks::RuntimeTaskRetryOutcome::Exhausted {
+                            retry_count,
+                            max_retries,
+                        } => {
+                            return Err(StoreError::InvalidPlan(format!(
+                                "task {task_id} recovery retry budget exhausted ({retry_count}/{max_retries})"
+                            )));
+                        }
+                        echo_agent::tasks::RuntimeTaskRetryOutcome::Superseded => {
+                            return Err(StoreError::InvalidPlan(format!(
+                                "task {task_id} changed before recovery retry"
+                            )));
+                        }
+                    }
+                    let mut events = vec![recovery_event];
+                    events.extend(runtime_execution_change_events(
+                        run_id,
+                        &before,
+                        &after,
+                        Some("recovery retry confirmed by user"),
+                    )?);
+                    events
+                }
+                RecoveryDecision::Skip => {
+                    let application = echo_agent::tasks::TaskPatchEngine::apply_operations(
+                        &current.snapshot.tasks,
+                        vec![echo_agent::tasks::TaskPlanPatchOp::Skip {
+                            task_id: task_id.to_string(),
+                        }],
+                        false,
+                    )
+                    .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+                    echo_agent::tasks::PlanValidator::default()
+                        .validate_task_snapshot(&application.tasks)
+                        .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))?;
+                    let next_revision = current
+                        .snapshot
+                        .revision
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            StoreError::InvalidPlan("plan revision overflow".to_string())
+                        })?;
+                    let prepared = prepare_revisioned_graph_commit(
+                        run_id,
+                        &run,
+                        Some(&current),
+                        echo_agent::tasks::TaskGraphCommit {
+                            expected_revision: Some(current.snapshot.revision),
+                            next: echo_agent::tasks::RevisionedTaskGraph {
+                                snapshot: echo_agent::tasks::RuntimePlanSnapshot {
+                                    revision: next_revision,
+                                    tasks: application.tasks,
+                                },
+                                context: current.context.clone(),
+                            },
+                            reason: format!(
+                                "resolve recovery barrier for task {task_id} by skipping it"
+                            ),
+                            effects: application.effects,
+                        },
+                    )?;
+                    let mut events = vec![
+                        RuntimeJournalEvent::for_append(
+                            run_id,
+                            None,
+                            None,
+                            RuntimeEventKind::PlanRevisionCommitted,
+                            prepared.payload,
+                        ),
+                        recovery_event,
+                    ];
+                    events.extend(runtime_execution_change_events(
+                        run_id,
+                        &current.snapshot,
+                        &prepared.next.snapshot,
+                        Some("recovery skip confirmed by user"),
+                    )?);
+                    events
+                }
+            };
             self.shadow.append_event_batch(run_id, events)?;
             self.shadow.rewrite_plan(run_id)?;
             Ok(())
@@ -9354,7 +9543,7 @@ mod tests {
             .find(|todo| todo.task_id == "t1")
             .ok_or_else(|| "cancelled Todo missing".to_string())?;
         assert_eq!(todo.status, TodoStatus::Cancelled);
-        assert_eq!(todo.owner_agent.as_deref(), Some("subagent"));
+        assert_eq!(todo.owner_agent.as_deref(), Some("code_reviewer"));
         assert_eq!(
             store
                 .get_run("r1")
@@ -9532,8 +9721,7 @@ mod tests {
     }
 
     #[test]
-    fn retry_failed_upstream_restores_only_propagated_blocked_descendants() -> Result<(), StoreError>
-    {
+    fn canonical_runtime_store_retry_keeps_dependency_blockers_derived() -> Result<(), StoreError> {
         let store = fresh();
         store.create_run(
             "retry-run",
@@ -9569,12 +9757,6 @@ mod tests {
                     ..sample_task_body("child")
                 },
                 PlanTask {
-                    id: "grandchild".to_string(),
-                    agent_role: "explorer".to_string(),
-                    depends_on: vec!["child".to_string()],
-                    ..sample_task_body("grandchild")
-                },
-                PlanTask {
                     id: "acceptance-blocked".to_string(),
                     agent_role: "reviewer".to_string(),
                     ..sample_task_body("acceptance-blocked")
@@ -9589,15 +9771,6 @@ mod tests {
             Some("implementer"),
             Some("execution failed"),
         )?;
-        for task_id in ["child", "grandchild"] {
-            store.set_task_status(
-                "retry-run",
-                task_id,
-                TodoStatus::Blocked,
-                None,
-                Some("blocked: upstream task failed"),
-            )?;
-        }
         store.set_task_status(
             "retry-run",
             "acceptance-blocked",
@@ -9607,25 +9780,42 @@ mod tests {
         )?;
         store.transition_run("retry-run", TaskRunStatus::Failed)?;
 
-        assert_eq!(store.retry_blocked_task("retry-run", "upstream")?, 1);
-        let todos = store.list_todos("retry-run")?;
-        for task_id in ["upstream", "child", "grandchild"] {
-            let todo = todos
-                .iter()
-                .find(|todo| todo.task_id == task_id)
-                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
-            assert_eq!(todo.status, TodoStatus::Pending, "{task_id}");
-        }
-        let upstream = todos
+        let before = store.load_runtime_plan_snapshot("retry-run")?;
+        let expected_task = before
+            .tasks
             .iter()
-            .find(|todo| todo.task_id == "upstream")
+            .find(|task| task.spec.id == "upstream")
+            .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("upstream".to_string()))?;
-        assert_eq!(upstream.owner_agent.as_deref(), Some("implementer"));
-        let independent = todos
-            .iter()
+        let mut expected = before.clone();
+        let expected_outcome =
+            echo_agent::tasks::retry_runtime_task(&mut expected, &expected_task, before.revision)?;
+        assert_eq!(
+            expected_outcome,
+            echo_agent::tasks::RuntimeTaskRetryOutcome::Retried { retry_count: 1 }
+        );
+        assert_eq!(store.retry_blocked_task("retry-run", "upstream")?, 1);
+        let stored = store.load_runtime_plan_snapshot("retry-run")?;
+        assert_eq!(stored.revision, expected.revision);
+        assert_eq!(stored.tasks, expected.tasks);
+        let child = store
+            .list_todos("retry-run")?
+            .into_iter()
+            .find(|todo| todo.task_id == "child")
+            .ok_or_else(|| StoreError::TaskNotFound("child".to_string()))?;
+        assert_eq!(child.status, TodoStatus::Pending);
+        let independent = store
+            .list_todos("retry-run")?
+            .into_iter()
             .find(|todo| todo.task_id == "acceptance-blocked")
             .ok_or_else(|| StoreError::TaskNotFound("acceptance-blocked".to_string()))?;
         assert_eq!(independent.status, TodoStatus::Blocked);
+        let upstream = store
+            .list_todos("retry-run")?
+            .into_iter()
+            .find(|todo| todo.task_id == "upstream")
+            .ok_or_else(|| StoreError::TaskNotFound("upstream".to_string()))?;
+        assert_eq!(upstream.owner_agent.as_deref(), Some("implementer"));
         assert_eq!(
             store
                 .get_run("retry-run")?
@@ -9635,14 +9825,15 @@ mod tests {
         );
         assert_eq!(
             last_frame_event_types(&store, "retry-run").map_err(StoreError::InvalidPlan)?,
-            [
-                "todo_updated",
-                "todo_updated",
-                "todo_updated",
-                "note",
-                "run_status_changed",
-            ]
+            ["todo_updated", "note", "run_status_changed"]
         );
+        assert!(store.list_events("retry-run", 0)?.iter().all(|event| {
+            event
+                .payload
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|summary| !summary.contains("unblocked after retrying upstream"))
+        }));
         Ok(())
     }
 
@@ -9884,7 +10075,55 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_registration_drop_finalizes_running_run() -> Result<(), StoreError> {
+    fn active_cancel_durably_overrides_a_prior_pause_intent() -> Result<(), StoreError> {
+        let store = std::sync::Arc::new(fresh());
+        seed_plan(&store);
+        let snapshot = store.load_runtime_plan_snapshot("r1")?;
+        let task = snapshot
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let _claim = match store.claim_runtime_task("r1", &task, snapshot.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "claim unexpectedly reloaded".to_string(),
+                ));
+            }
+        };
+        let token = echo_agent::agent::CancellationToken::new();
+        let registration = store.register_run_cancellation("r1", token.clone())?;
+
+        assert!(store.request_pause("r1")?);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Paused
+        );
+        assert!(store.request_cancel("r1")?);
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Cancelled
+        );
+        assert!(
+            store
+                .load_runtime_plan_snapshot("r1")?
+                .tasks
+                .iter()
+                .all(|task| task.execution.status.is_terminal())
+        );
+        drop(registration);
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_registration_drop_only_releases_in_memory_ownership() -> Result<(), StoreError> {
         let store = std::sync::Arc::new(fresh());
         store.create_run(
             "cancelled-driver",
@@ -9906,8 +10145,49 @@ mod tests {
         let run = store
             .get_run("cancelled-driver")?
             .ok_or_else(|| StoreError::RunNotFound("cancelled-driver".to_string()))?;
-        assert_eq!(run.status, TaskRunStatus::Cancelled);
+        assert_eq!(run.status, TaskRunStatus::Running);
         assert!(!store.is_run_active("cancelled-driver"));
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_request_retains_driver_ownership_until_registration_drop() -> Result<(), StoreError> {
+        let store = std::sync::Arc::new(fresh());
+        store.create_run(
+            "cancel-request-driver",
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "cancel active driver without releasing its registry slot",
+            "",
+            AttendedMode::Unattended,
+        )?;
+        store.transition_run("cancel-request-driver", TaskRunStatus::Running)?;
+        let token = echo_agent::agent::CancellationToken::new();
+        let registration =
+            store.register_run_cancellation("cancel-request-driver", token.clone())?;
+
+        assert!(store.request_cancel("cancel-request-driver")?);
+        assert!(token.is_cancelled());
+        assert!(store.is_run_active("cancel-request-driver"));
+        assert_eq!(
+            store
+                .get_run("cancel-request-driver")?
+                .ok_or_else(|| StoreError::RunNotFound("cancel-request-driver".to_string()))?
+                .status,
+            TaskRunStatus::Cancelled
+        );
+
+        drop(registration);
+        assert!(!store.is_run_active("cancel-request-driver"));
+        assert_eq!(
+            store
+                .get_run("cancel-request-driver")?
+                .ok_or_else(|| StoreError::RunNotFound("cancel-request-driver".to_string()))?
+                .status,
+            TaskRunStatus::Cancelled
+        );
         Ok(())
     }
 
@@ -9938,7 +10218,7 @@ mod tests {
         let run = store
             .get_run("nested-cancelled-driver")?
             .ok_or_else(|| StoreError::RunNotFound("nested-cancelled-driver".to_string()))?;
-        assert_eq!(run.status, TaskRunStatus::Cancelled);
+        assert_eq!(run.status, TaskRunStatus::Running);
         assert!(store.is_run_active("nested-cancelled-driver"));
         assert!(!outer_token.is_cancelled());
 
@@ -9974,7 +10254,7 @@ mod tests {
             .and_then(|plan| plan.tasks.into_iter().next())
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         let runtime_task = task.to_task().map_err(StoreError::InvalidPlan)?;
-        let claim = match store.claim_task("r1", &runtime_task, 1)? {
+        let claim = match store.claim_runtime_task("r1", &runtime_task, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(
@@ -10038,7 +10318,7 @@ mod tests {
             .cloned()
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         let runtime_task = task.to_task().map_err(StoreError::InvalidPlan)?;
-        let claim = match store.claim_task("r1", &runtime_task, 1)? {
+        let claim = match store.claim_runtime_task("r1", &runtime_task, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(
@@ -10083,6 +10363,7 @@ mod tests {
             store.recoverable_subagent_result_for_attempt(
                 "r1",
                 "t1",
+                &execution_id,
                 claim.revision,
                 claim.attempt,
             )?,
@@ -10155,6 +10436,63 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(todo.status, TodoStatus::Pending);
         assert_eq!(store.resume_task_run("r1")?.status, TaskRunStatus::Running);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_recovery_skip_commits_revision_and_resolution_in_one_batch()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.apply_task_patch_for_test(
+            "r1",
+            &TaskUpdateRequest {
+                base_revision: 1,
+                reason: "exercise canonical recovery skip".to_string(),
+                operations: vec![TaskUpdateOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        kind: Some(PlanTaskKind::Implementation),
+                        ..Default::default()
+                    },
+                }],
+            },
+        )?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.record_subagent_assigned(
+            "r1", "t1", "t1:1", "subagent", "Task 1", 2, 1, false, true,
+        )?;
+        store.record_tool_started("r1", "t1", "t1:1", "call-write", "write_file", false)?;
+        assert_eq!(store.recover_incomplete()?, 1);
+        let before = store.load_runtime_plan_snapshot("r1")?;
+        let expected_revision = before
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| StoreError::InvalidPlan("test plan revision overflow".to_string()))?;
+
+        store.resolve_recovery_task("r1", "t1", RecoveryDecision::Skip)?;
+
+        let after = store.load_runtime_plan_snapshot("r1")?;
+        assert_eq!(after.revision, expected_revision);
+        let skipped = after
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(
+            skipped.execution.status,
+            echo_agent::tasks::TaskStatus::Skipped
+        );
+        assert!(skipped.execution.claim.is_none());
+        assert!(store.list_recovery_blockers("r1")?.is_empty());
+        assert_eq!(
+            last_frame_event_types(&store, "r1").map_err(StoreError::InvalidPlan)?,
+            [
+                "plan_revision_committed",
+                "recovery_resolved",
+                "task_skipped",
+            ]
+        );
         Ok(())
     }
 
@@ -10313,7 +10651,472 @@ mod tests {
     }
 
     #[test]
-    fn claim_reloads_when_task_update_wins_revision_race() -> Result<(), StoreError> {
+    fn canonical_runtime_store_claim_and_settlement_match_framework_fields()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let before = store.load_runtime_plan_snapshot("r1")?;
+        let expected_task = before
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let mut framework_claimed = before.clone();
+        let framework_claim = match echo_agent::tasks::claim_runtime_task(
+            &mut framework_claimed,
+            &expected_task,
+            before.revision,
+        )? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "framework unexpectedly rejected a fresh claim".to_string(),
+                ));
+            }
+        };
+        store.fail_next_runtime_mutation_projection_for_test();
+        let stored_claim = match store.claim_runtime_task("r1", &expected_task, before.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "store unexpectedly rejected a fresh claim".to_string(),
+                ));
+            }
+        };
+        assert_eq!(stored_claim.revision, framework_claim.revision);
+        assert_eq!(stored_claim.attempt, framework_claim.attempt);
+        assert_eq!(stored_claim.spec_hash, framework_claim.spec_hash);
+        let framework_task = framework_claimed
+            .tasks
+            .iter_mut()
+            .find(|task| task.spec.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        framework_task.execution.claim = Some(stored_claim.clone());
+        let stored_claimed = store.load_runtime_plan_snapshot("r1")?;
+        assert_eq!(stored_claimed.revision, framework_claimed.revision);
+        assert_eq!(stored_claimed.tasks, framework_claimed.tasks);
+
+        let claim_event = store
+            .list_events("r1", 0)?
+            .into_iter()
+            .last()
+            .ok_or_else(|| StoreError::InvalidPlan("claim event missing".to_string()))?;
+        for field in [
+            "status",
+            "status_detail",
+            "claim",
+            "retry_count",
+            "failure_fingerprint",
+            "owner_agent",
+            "summary",
+        ] {
+            assert!(claim_event.payload.get(field).is_some(), "missing {field}");
+        }
+
+        let mut framework_settled = framework_claimed;
+        assert_eq!(
+            echo_agent::tasks::settle_runtime_claim(
+                &mut framework_settled,
+                "t1",
+                &stored_claim,
+                echo_agent::tasks::TaskStatus::Completed,
+            )?,
+            echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled
+        );
+        store.fail_next_runtime_mutation_projection_for_test();
+        assert_eq!(
+            store.settle_runtime_task_claim(
+                "r1",
+                "t1",
+                &stored_claim,
+                echo_agent::tasks::TaskStatus::Completed,
+                Some("reviewed completion".to_string()),
+            )?,
+            echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled
+        );
+        let stored = store.load_runtime_plan_snapshot("r1")?;
+        assert_eq!(stored.revision, framework_settled.revision);
+        assert_eq!(stored.tasks, framework_settled.tasks);
+        let terminal = stored
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert!(terminal.execution.claim.is_none());
+        assert_eq!(
+            terminal.execution.status,
+            echo_agent::tasks::TaskStatus::Completed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_runtime_store_requeue_matches_framework_and_rejects_aba_claim()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let initial = store.load_runtime_plan_snapshot("r1")?;
+        let expected_task = initial
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let first_claim = match store.claim_runtime_task("r1", &expected_task, initial.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "fresh requeue claim unexpectedly required reload".to_string(),
+                ));
+            }
+        };
+        let claimed = store.load_runtime_plan_snapshot("r1")?;
+        let request = echo_agent::tasks::RuntimeTaskResolutionRequest::Requeue {
+            failure_fingerprint: Some("compile-fingerprint".to_string()),
+            error: "cargo check failed".to_string(),
+        };
+        let mut framework_requeued = claimed.clone();
+        let framework_resolution = echo_agent::tasks::settle_runtime_resolution(
+            &mut framework_requeued,
+            "t1",
+            &first_claim,
+            request.clone(),
+        )?;
+        store.fail_next_runtime_mutation_projection_for_test();
+        assert_eq!(
+            store.settle_runtime_task_resolution(
+                "r1",
+                "t1",
+                &first_claim,
+                request,
+                RuntimeTaskProductSettlement {
+                    summary: Some("retry after cargo check".to_string()),
+                    ..RuntimeTaskProductSettlement::default()
+                },
+            )?,
+            framework_resolution
+        );
+        let stored_requeued = store.load_runtime_plan_snapshot("r1")?;
+        assert_eq!(stored_requeued.revision, framework_requeued.revision);
+        assert_eq!(stored_requeued.tasks, framework_requeued.tasks);
+        let requeued = framework_requeued
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(
+            requeued.execution.status,
+            echo_agent::tasks::TaskStatus::Pending
+        );
+        assert_eq!(requeued.execution.retry_count, 1);
+        assert_eq!(
+            requeued.execution.failure_fingerprint.as_deref(),
+            Some("compile-fingerprint")
+        );
+        assert!(requeued.execution.claim.is_none());
+
+        let second_claim = match store.claim_runtime_task("r1", requeued, initial.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "requeued task unexpectedly required reload".to_string(),
+                ));
+            }
+        };
+        assert_ne!(first_claim.claim_id, second_claim.claim_id);
+        let completed_summary = TaskExecutionSummary {
+            run_id: "r1".to_string(),
+            task_id: "t1".to_string(),
+            subagent_name: "subagent".to_string(),
+            result: SubagentTaskResult::terminal(
+                SubagentRunStatus::Completed,
+                "new physical claim result",
+                Vec::new(),
+            ),
+            decisions: Vec::new(),
+            next_implications: Vec::new(),
+            suggested_tasks: Vec::new(),
+            created_at: Utc::now(),
+        };
+        let current_review = ReviewResult {
+            id: "review-new-claim".to_string(),
+            run_id: "r1".to_string(),
+            task_id: "t1".to_string(),
+            reviewer_agent: "reviewer".to_string(),
+            outcome: ReviewOutcome::Pass,
+            issues: Vec::new(),
+            failure_fingerprint: None,
+            created_fix_task_id: None,
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            store.settle_runtime_task_resolution(
+                "r1",
+                "t1",
+                &second_claim,
+                echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+                RuntimeTaskProductSettlement {
+                    summary: Some("new physical claim result".to_string()),
+                    execution_summary: Some(completed_summary.clone()),
+                    review: Some(current_review),
+                    diagnostic_note: Some("accepted new claim review".to_string()),
+                },
+            )?,
+            echo_agent::tasks::RuntimeTaskResolution::Completed
+        );
+        let stale_summary = TaskExecutionSummary {
+            result: SubagentTaskResult::terminal(
+                SubagentRunStatus::Completed,
+                "stale physical claim result",
+                Vec::new(),
+            ),
+            ..completed_summary
+        };
+        let stale_review = ReviewResult {
+            id: "review-stale-claim".to_string(),
+            run_id: "r1".to_string(),
+            task_id: "t1".to_string(),
+            reviewer_agent: "reviewer".to_string(),
+            outcome: ReviewOutcome::NeedsFix,
+            issues: Vec::new(),
+            failure_fingerprint: Some("stale-fingerprint".to_string()),
+            created_fix_task_id: None,
+            created_at: Utc::now(),
+        };
+        assert_eq!(
+            store.settle_runtime_task_resolution(
+                "r1",
+                "t1",
+                &first_claim,
+                echo_agent::tasks::RuntimeTaskResolutionRequest::Completed,
+                RuntimeTaskProductSettlement {
+                    summary: Some("stale physical claim result".to_string()),
+                    execution_summary: Some(stale_summary),
+                    review: Some(stale_review),
+                    diagnostic_note: Some("stale claim review note".to_string()),
+                },
+            )?,
+            echo_agent::tasks::RuntimeTaskResolution::Superseded
+        );
+        assert_eq!(
+            store
+                .get_summary("r1", "t1")?
+                .ok_or_else(|| StoreError::TaskNotFound("t1 summary".to_string()))?
+                .result
+                .summary,
+            "new physical claim result"
+        );
+        let reviews = store.list_reviews("r1", "t1")?;
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(
+            reviews.first().map(|review| review.id.as_str()),
+            Some("review-new-claim")
+        );
+        let notes = store.list_events("r1", 0)?;
+        assert!(notes.iter().any(|event| {
+            event
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                == Some("accepted new claim review")
+        }));
+        assert!(!notes.iter().any(|event| {
+            event
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                == Some("stale claim review note")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_runtime_store_pause_interruption_is_lossless() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let initial = store.load_runtime_plan_snapshot("r1")?;
+        let expected_task = initial
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let claim = match store.claim_runtime_task("r1", &expected_task, initial.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "fresh interruption claim unexpectedly required reload".to_string(),
+                ));
+            }
+        };
+        let claimed = store.load_runtime_plan_snapshot("r1")?;
+        let mut framework_paused = claimed.clone();
+        let disposition = echo_agent::tasks::RuntimeInterruptionDisposition::Paused {
+            reason: "user requested pause".to_string(),
+        };
+        let framework_outcome = echo_agent::tasks::settle_runtime_interruption(
+            &mut framework_paused,
+            claimed.revision,
+            disposition.clone(),
+        )?;
+        store.fail_next_runtime_mutation_projection_for_test();
+        assert_eq!(
+            store.settle_runtime_task_interruption("r1", claimed.revision, disposition)?,
+            framework_outcome
+        );
+        let stored_paused = store.load_runtime_plan_snapshot("r1")?;
+        assert_eq!(stored_paused.revision, framework_paused.revision);
+        assert!(!store.runtime_task_claim_is_current("r1", "t1", &claim)?);
+        let paused = framework_paused
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(
+            paused.execution.status,
+            echo_agent::tasks::TaskStatus::Paused("user requested pause".to_string())
+        );
+        assert!(paused.execution.claim.is_none());
+        let retry_count_before_resume = paused.execution.retry_count;
+        let persisted = stored_paused
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(
+            persisted.execution.status,
+            echo_agent::tasks::TaskStatus::Pending
+        );
+        assert_eq!(persisted.execution.retry_count, retry_count_before_resume);
+        store.transition_run("r1", TaskRunStatus::Paused)?;
+        store.resume_task_run("r1")?;
+        let resumed = store
+            .load_runtime_plan_snapshot("r1")?
+            .tasks
+            .into_iter()
+            .find(|task| task.spec.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(
+            resumed.execution.status,
+            echo_agent::tasks::TaskStatus::Pending
+        );
+        assert_eq!(resumed.execution.retry_count, retry_count_before_resume);
+        assert!(resumed.execution.claim.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn recovered_result_requires_exact_physical_claim_after_pause_resume() -> Result<(), StoreError>
+    {
+        let store = fresh();
+        seed_plan(&store);
+        let initial = store.load_runtime_plan_snapshot("r1")?;
+        let expected = initial
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let old_claim = match store.claim_runtime_task("r1", &expected, initial.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "initial claim reloaded".to_string(),
+                ));
+            }
+        };
+        let old_execution_id = old_claim.execution_id("r1", "t1");
+        store.record_subagent_assigned(
+            "r1",
+            "t1",
+            &old_execution_id,
+            "subagent",
+            "Review runtime",
+            old_claim.revision,
+            old_claim.attempt,
+            true,
+            true,
+        )?;
+        store.settle_runtime_task_interruption(
+            "r1",
+            initial.revision,
+            echo_agent::tasks::RuntimeInterruptionDisposition::Paused {
+                reason: "pause for exact recovery test".to_string(),
+            },
+        )?;
+        store.transition_run("r1", TaskRunStatus::Paused)?;
+        store.resume_task_run("r1")?;
+        let resumed = store.load_runtime_plan_snapshot("r1")?;
+        let resumed_task = resumed
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let new_claim = match store.claim_runtime_task("r1", &resumed_task, resumed.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "resumed claim reloaded".to_string(),
+                ));
+            }
+        };
+        assert_eq!(new_claim.attempt, old_claim.attempt);
+        let new_execution_id = new_claim.execution_id("r1", "t1");
+        store.record_subagent_assigned(
+            "r1",
+            "t1",
+            &new_execution_id,
+            "subagent",
+            "Review runtime",
+            new_claim.revision,
+            new_claim.attempt,
+            true,
+            true,
+        )?;
+        let stale_result = SubagentTaskResult::terminal(
+            SubagentRunStatus::Completed,
+            "late result from old physical claim",
+            Vec::new(),
+        );
+        store.record_subagent_released(SubagentReleaseRecord {
+            run_id: "r1",
+            task_id: "t1",
+            execution_id: &old_execution_id,
+            agent_name: "subagent",
+            task_subject: "Review runtime",
+            plan_revision: old_claim.revision,
+            attempt: old_claim.attempt,
+            status: "completed",
+            result: Some(&stale_result),
+            full_output: Some("late result from old physical claim"),
+            usage: None,
+            dispatch_hook: true,
+        })?;
+
+        assert!(
+            store
+                .recoverable_subagent_result_for_attempt(
+                    "r1",
+                    "t1",
+                    &new_execution_id,
+                    new_claim.revision,
+                    new_claim.attempt,
+                )?
+                .is_none()
+        );
+        assert!(
+            store
+                .recoverable_subagent_result_for_attempt(
+                    "r1",
+                    "t1",
+                    &old_execution_id,
+                    old_claim.revision,
+                    old_claim.attempt,
+                )?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_runtime_store_revision_reload_wins_task_update_race() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
         let expected = store
@@ -10335,7 +11138,7 @@ mod tests {
             },
         )?;
 
-        let outcome = store.claim_task("r1", &expected, 1)?;
+        let outcome = store.claim_runtime_task("r1", &expected, 1)?;
 
         assert_eq!(
             outcome,
@@ -10365,7 +11168,7 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
             .to_task()
             .map_err(StoreError::InvalidPlan)?;
-        let claim = match store.claim_task("r1", &expected, 1)? {
+        let claim = match store.claim_runtime_task("r1", &expected, 1)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(
@@ -10381,16 +11184,18 @@ mod tests {
             Some("cancelled by user"),
         )?;
 
-        let outcome = store.set_claimed_task_status(
+        let outcome = store.settle_runtime_task_claim(
             "r1",
             "t1",
             &claim,
-            TodoStatus::Completed,
-            Some("code_reviewer"),
-            Some("stale completion"),
+            echo_agent::tasks::TaskStatus::Completed,
+            Some("stale completion".to_string()),
         )?;
 
-        assert_eq!(outcome, ClaimWriteOutcome::Superseded);
+        assert_eq!(
+            outcome,
+            echo_agent::tasks::RuntimeTaskSettlementOutcome::Superseded
+        );
         let task = store
             .get_plan("r1")?
             .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
@@ -10481,7 +11286,7 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(patched_task.retry_count, 0);
         let patched_runtime = patched_task.to_task().map_err(StoreError::InvalidPlan)?;
-        let new_claim = match store.claim_task("r1", &patched_runtime, patched.revision)? {
+        let new_claim = match store.claim_runtime_task("r1", &patched_runtime, patched.revision)? {
             echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
             echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
                 return Err(StoreError::InvalidPlan(
@@ -10498,6 +11303,7 @@ mod tests {
                 .recoverable_subagent_result_for_attempt(
                     "r1",
                     "t1",
+                    &old_execution_id,
                     old_claim.revision,
                     old_claim.attempt,
                 )?
@@ -10508,6 +11314,7 @@ mod tests {
                 .recoverable_subagent_result_for_attempt(
                     "r1",
                     "t1",
+                    &new_execution_id,
                     new_claim.revision,
                     new_claim.attempt,
                 )?

@@ -52,6 +52,7 @@ tempfile = "3"  # Sprint 10: EkoDataWorkspaceFactory per-subagent tmpdir (was de
 
 [features]
 telemetry = ["echo-agent/telemetry"]
+test-utils = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("__ts_rs"))'] }

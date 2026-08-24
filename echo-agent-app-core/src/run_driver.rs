@@ -24,7 +24,9 @@ use echo_agent::agent::CancellationToken;
 use echo_agent::evolution::MemoryLayerManager;
 
 use crate::agent_pool::AgentPool;
-use crate::tasks::task_runtime::executor::{ExecSink, RunOutcome, RunPlanPolicy, drive_agent_run};
+use crate::tasks::task_runtime::executor::{
+    ExecSink, RunOutcome, RunPlanPolicy, TaskRuntimeBlockingAdapter, drive_agent_run,
+};
 use crate::tasks::task_runtime::memory_bridge::{MemoryEvent, MemoryPolicy};
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
 use crate::tasks::task_runtime::types::{TaskRunStatus, UnattendedWriteMode};
@@ -94,7 +96,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         Ok(lease) => lease,
         Err(error) => {
             let message = format!("pool acquire failed for run {run_id}: {error}");
-            settle_driver_error(&store, &run_id, &message, cancel.is_cancelled())?;
+            settle_driver_error(store.clone(), &run_id, &message, cancel.is_cancelled()).await?;
             return Err(message);
         }
     };
@@ -123,11 +125,12 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
     .await;
     if let Err(error) = &result {
         settle_driver_error(
-            &settlement_store,
+            settlement_store,
             &settlement_run_id,
             error,
             settlement_cancel.is_cancelled(),
-        )?;
+        )
+        .await?;
     }
     // The TaskRuntime supervisor releases the pool receipt only after its own
     // durable terminal readback (or after settlement debt retry succeeds).
@@ -158,20 +161,25 @@ async fn drive_run_async_inner(
         )
     })?;
 
-    let run = payload
-        .store
-        .get_run(&payload.run_id)
-        .map_err(|error| format!("read final run status failed: {error}"))?
-        .ok_or_else(|| format!("run {} disappeared after execution", payload.run_id))?;
+    let load_run_id = payload.run_id.clone();
+    let run =
+        TaskRuntimeBlockingAdapter::new(payload.store.clone())
+            .run("load final supervised run status", move |store| {
+                store.get_run(&load_run_id)?.ok_or(
+                    crate::tasks::task_runtime::StoreError::RunNotFound(load_run_id),
+                )
+            })
+            .await
+            .map_err(|error| format!("read final run status failed: {error}"))?;
     let outcome = match run.status {
         TaskRunStatus::Completed => RunOutcome::Completed,
         TaskRunStatus::Cancelled => RunOutcome::Cancelled,
         TaskRunStatus::Failed => RunOutcome::Failed {
-            failed_task_id: "<run>".to_string(),
+            failed_task_id: None,
             error: "agent-driven run failed".to_string(),
         },
         TaskRunStatus::Paused => RunOutcome::Paused {
-            failed_task_id: "<run>".to_string(),
+            failed_task_id: None,
             error: "agent-driven run paused".to_string(),
         },
         status => {
@@ -207,8 +215,8 @@ async fn drive_run_async_inner(
     Ok(outcome)
 }
 
-fn settle_driver_error(
-    store: &TaskRuntimeStore,
+async fn settle_driver_error(
+    store: Arc<TaskRuntimeStore>,
     run_id: &str,
     error: &str,
     cancelled: bool,
@@ -218,8 +226,13 @@ fn settle_driver_error(
     } else {
         TaskRunStatus::Failed
     };
-    store
-        .finalize_run(run_id, target, Some(error))
+    let run_id = run_id.to_string();
+    let error = error.to_string();
+    TaskRuntimeBlockingAdapter::new(store)
+        .run("settle supervised run error", move |store| {
+            store.finalize_run(&run_id, target, Some(&error))
+        })
+        .await
         .map(|_| ())
         .map_err(|settlement_error| settlement_error.to_string())
 }
@@ -238,15 +251,14 @@ mod tests {
         assert_send_static::<RunPayload>();
     }
 
-    /// Run-level cancel token roundtrip (spec §5.5): register → cancel triggers
-    /// the token → second cancel is a no-op (token removed). Mirrors the
-    /// task-level `cancel_task` semantics.
+    /// Run-level cancel token roundtrip: cancellation does not release driver
+    /// ownership; the registration remains until the driver settles and drops.
     #[test]
     fn run_cancel_token_roundtrip() -> Result<(), String> {
         use crate::tasks::task_runtime::store::TaskRuntimeStore;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tok = CancellationToken::new();
-        let _registration = store
+        let registration = store
             .register_run_cancellation("r1", tok.clone())
             .map_err(|error| error.to_string())?;
         assert!(
@@ -257,11 +269,13 @@ mod tests {
         );
         assert!(tok.is_cancelled(), "token should be cancelled");
         assert!(
-            !store
+            store
                 .request_cancel("r1")
                 .map_err(|error| error.to_string())?,
-            "second request_cancel is a no-op — token already removed"
+            "the active driver remains addressable until registration drop"
         );
+        drop(registration);
+        assert!(!store.is_run_active("r1"));
         Ok(())
     }
 

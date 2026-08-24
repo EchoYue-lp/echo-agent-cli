@@ -6,9 +6,8 @@
 //! one of:
 //!
 //! - [`ReviewOutcome::Pass`] — task is genuinely complete; downstream proceeds.
-//! - [`ReviewOutcome::NeedsFix`] — a new fix task is created, linked to this
-//!   review via `created_fix_task_id`, and the original task's
-//!   `failure_fingerprint` is set. The fix task re-enters the DAG.
+//! - [`ReviewOutcome::NeedsFix`] — the current task is blocked at a typed review
+//!   boundary until an explicit retry or task revision is requested.
 //! - [`ReviewOutcome::Blocked`] — the review itself can't make progress
 //!   (repeated identical failures). Trips the circuit breaker → the run
 //!   suspends and asks the user to intervene.
@@ -26,6 +25,7 @@ use echo_agent::llm::{ChatRequest, LlmClient, ResponseFormat};
 use echo_agent::prelude::Message;
 
 use super::profiles::ProfileTemplate;
+#[cfg(test)]
 use super::store::TaskRuntimeStore;
 use super::types::*;
 
@@ -38,8 +38,6 @@ pub enum ReviewError {
     Llm(String),
     #[error("LLM returned malformed JSON: {0}")]
     Json(String),
-    #[error("store: {0}")]
-    Store(#[from] super::store::StoreError),
 }
 
 /// Which tasks get reviewed. Anything with explicit `acceptance_criteria`
@@ -81,7 +79,6 @@ struct ReviewIssueDraft {
 /// Blocked, trip the circuit breaker.
 pub async fn review_task(
     llm: &Arc<dyn LlmClient>,
-    store: &Arc<TaskRuntimeStore>,
     run_id: &str,
     task: &PlanTask,
     subagent_output: &str,
@@ -131,7 +128,6 @@ pub async fn review_task(
         created_at: chrono::Utc::now(),
     };
 
-    store.add_review(&review)?;
     tracing::info!(
         run_id = run_id,
         task_id = %task.id,
@@ -149,11 +145,24 @@ pub async fn review_task(
 /// - `task.retry_count >= task.max_retries` → `Suspend` (ask user).
 /// - the same `failure_fingerprint` has appeared on ≥ `same_failure_threshold`
 ///   prior reviews of this task → `Suspend`.
-/// - otherwise → `CreateFix` (increment retry_count, let the DAG retry).
-pub fn circuit_breaker_action(
+/// - otherwise → `CreateFix` (the caller may offer an explicit retry).
+#[cfg(test)]
+fn circuit_breaker_action(
     store: &Arc<TaskRuntimeStore>,
     task: &PlanTask,
     review: &ReviewResult,
+    same_failure_threshold: u32,
+) -> BreakerAction {
+    let prior = store
+        .list_reviews(&review.run_id, &task.id)
+        .unwrap_or_default();
+    circuit_breaker_action_from_prior(task, review, &prior, same_failure_threshold)
+}
+
+pub fn circuit_breaker_action_from_prior(
+    task: &PlanTask,
+    review: &ReviewResult,
+    prior: &[ReviewResult],
     same_failure_threshold: u32,
 ) -> BreakerAction {
     // Rule 1: retry budget exhausted.
@@ -170,9 +179,6 @@ pub fn circuit_breaker_action(
     // (run_id, task_id) so a task id collision across runs (ids are slug
     // derived from titles) can't bleed one run's failure history into another.
     if let Some(fp) = &review.failure_fingerprint {
-        let Ok(prior) = store.list_reviews(&review.run_id, &task.id) else {
-            return BreakerAction::CreateFix;
-        };
         let same_count = prior
             .iter()
             .filter(|r| r.failure_fingerprint.as_deref() == Some(fp.as_str()))
@@ -190,9 +196,6 @@ pub fn circuit_breaker_action(
     // Rule 3 (G7): same review issue CLASS repeats across generated fix tasks.
     // If the same issue category (e.g. "missing-test", "architecture") keeps
     // appearing across retries, the fix isn't converging → suspend (plan §822).
-    let Ok(prior) = store.list_reviews(&review.run_id, &task.id) else {
-        return BreakerAction::CreateFix;
-    };
     let issue_categories: Vec<&str> = review.issues.iter().map(|i| i.category.as_str()).collect();
     if !issue_categories.is_empty() {
         let repeated_classes: Vec<String> = issue_categories

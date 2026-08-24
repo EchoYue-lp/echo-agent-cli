@@ -1,5 +1,5 @@
 //! `task_execute` submits one committed task-graph revision to the framework
-//! runtime DAG executor.
+//! runtime task service.
 //!
 //! # 设计意图 (spec §3.1.1)
 //!
@@ -26,8 +26,10 @@ use echo_agent::tools::{Tool, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex as TokioMutex;
 
-use super::executor::{RunOutcome, execute_run, preflight_unattended_plan};
-use super::store::TaskRuntimeStore;
+use super::executor::{
+    RunOutcome, TaskRuntimeBlockingAdapter, execute_run, preflight_unattended_plan,
+};
+use super::store::{StoreError, TaskRuntimeStore};
 use super::types::{
     AttendedMode, TaskExecutionSummary, TaskRunStatus, TodoItem, TodoStatus, UnattendedWriteMode,
 };
@@ -291,8 +293,17 @@ impl Tool for ExecuteTaskTool {
                     "task_execute requires the committed revision.",
                 ));
             };
-            let materialized_plan = match self.store.get_plan(&run_id) {
-                Ok(Some(plan)) if !plan.tasks.is_empty() => plan,
+            let blocking = TaskRuntimeBlockingAdapter::new(self.store.clone());
+            let admission_run_id = run_id.clone();
+            let (materialized_plan, admission_run) = match blocking
+                .run("load task_execute admission", move |store| {
+                    let plan = store.get_plan(&admission_run_id)?;
+                    let run = store.get_run(&admission_run_id)?;
+                    Ok((plan, run))
+                })
+                .await
+            {
+                Ok((Some(plan), Some(run))) if !plan.tasks.is_empty() => (plan, run),
                 Ok(_) => {
                     return Ok(ToolResult::error(format!(
                         "task_execute requires at least one persisted task for run {run_id}. Call task_create, then refresh with task_list."
@@ -317,13 +328,7 @@ impl Tool for ExecuteTaskTool {
                 .unwrap_or_else(|_| tokio_util::sync::CancellationToken::new());
 
             // ── Read attended mode once for unattended preflight ──
-            let attended_mode = self
-                .store
-                .get_run(&run_id)
-                .ok()
-                .flatten()
-                .map(|r| r.attended_mode)
-                .unwrap_or_default();
+            let attended_mode = admission_run.attended_mode;
 
             // ── U1c phase-1 CP A: unattended preflight ──
             // Only when attended_mode=Unattended: scan the full plan for
@@ -333,12 +338,19 @@ impl Tool for ExecuteTaskTool {
                 && let Err(rejection) =
                     preflight_unattended_plan(&materialized_plan.tasks, self.write_mode)
             {
-                let _ = self.store.transition_run(&run_id, TaskRunStatus::Failed);
-                let _ = self.store.note(
-                    &run_id,
-                    None,
-                    &format!("CP A preflight rejected: {}", rejection.reason),
-                );
+                let rejected_run_id = run_id.clone();
+                let rejection_note = format!("CP A preflight rejected: {}", rejection.reason);
+                if let Err(error) = blocking
+                    .run("reject unattended task execution", move |store| {
+                        store.transition_run(&rejected_run_id, TaskRunStatus::Failed)?;
+                        store.note(&rejected_run_id, None, &rejection_note)
+                    })
+                    .await
+                {
+                    return Ok(ToolResult::error(format!(
+                        "Unattended preflight was rejected but terminal persistence failed: {error}"
+                    )));
+                }
                 return Ok(ToolResult::error(format!(
                     "Unattended run rejected by preflight: {}. \
                      ReadOnlyPlanNoShell mode only allows read tasks, \
@@ -350,11 +362,7 @@ impl Tool for ExecuteTaskTool {
             // Route is diagnostic policy metadata. Plan review/approval is not
             // a TaskRun state transition; risky tools remain governed by the
             // shared permission/HITL contract during execution.
-            let route_str = self
-                .store
-                .get_run_route(&run_id)
-                .unwrap_or_default()
-                .unwrap_or_default();
+            let route_str = admission_run.route;
 
             // ── Read trace_sink from task_local ──
             // (stage4 P4.1) cache_user_id read from single source inside
@@ -370,28 +378,41 @@ impl Tool for ExecuteTaskTool {
                 attended_mode = %attended_mode.as_str(),
                 has_trace_sink = trace_sink.is_some(),
                 write_mode = ?self.write_mode,
-                "task_execute: dispatching runtime DAG executor"
+                "task_execute: dispatching runtime task service"
             );
             tracing::info!(run_id = %run_id, "task_execute: waiting for run execution lock");
             // RAII guard: 持锁 + Drop 时清理 RUN_EXECUTION_LOCKS entry (P1-1 修复)。
             let _run_guard = acquire_run_execution_lock(&run_id).await;
             tracing::info!(run_id = %run_id, "task_execute: acquired run execution lock");
-            let run = match self.store.get_run(&run_id) {
-                Ok(Some(run)) => run,
-                Ok(None) => {
-                    return Ok(ToolResult::error(format!(
-                        "Task run disappeared before execution: {run_id}"
-                    )));
-                }
+            let reload_run_id = run_id.clone();
+            let (run, unresolved, completed_summaries) = match blocking
+                .run("reload task_execute state", move |store| {
+                    let run = store
+                        .get_run(&reload_run_id)?
+                        .ok_or_else(|| StoreError::RunNotFound(reload_run_id.clone()))?;
+                    let unresolved = has_unresolved_tasks(store.as_ref(), &reload_run_id)?;
+                    let summaries = if run.status == TaskRunStatus::Completed && !unresolved {
+                        Some(build_run_summaries(store.as_ref(), &reload_run_id)?)
+                    } else {
+                        None
+                    };
+                    Ok((run, unresolved, summaries))
+                })
+                .await
+            {
+                Ok(state) => state,
                 Err(error) => {
                     return Ok(ToolResult::error(format!(
                         "Failed to reload the task run before execution: {error}"
                     )));
                 }
             };
-            if run.status == TaskRunStatus::Completed && !has_unresolved_tasks(&self.store, &run_id)
-            {
-                let summaries = build_run_summaries(&self.store, &run_id);
+            if run.status == TaskRunStatus::Completed && !unresolved {
+                let summaries = completed_summaries.ok_or_else(|| {
+                    echo_agent::error::ReactError::Other(
+                        "completed task run summary snapshot is unavailable".to_string(),
+                    )
+                })?;
                 tracing::info!(
                     run_id = %run_id,
                     summary_chars = summaries.chars().count(),
@@ -407,12 +428,20 @@ impl Tool for ExecuteTaskTool {
             // Pending. The exact task_execute owner starts that durable run
             // only after it holds the per-run execution lock, so a prepared
             // graph cannot appear Running before an executor exists.
-            if run.status == TaskRunStatus::Pending
-                && let Err(error) = self.store.transition_run(&run_id, TaskRunStatus::Running)
-            {
-                return Ok(ToolResult::error(format!(
-                    "Failed to start the committed task graph: {error}"
-                )));
+            if run.status == TaskRunStatus::Pending {
+                let start_run_id = run_id.clone();
+                if let Err(error) = blocking
+                    .run("start committed task graph", move |store| {
+                        store
+                            .transition_run(&start_run_id, TaskRunStatus::Running)
+                            .map(|_| ())
+                    })
+                    .await
+                {
+                    return Ok(ToolResult::error(format!(
+                        "Failed to start the committed task graph: {error}"
+                    )));
+                }
             }
 
             // ── §10.1: 必须 await RunOutcome, 不得 fire-and-forget ──
@@ -471,7 +500,20 @@ impl Tool for ExecuteTaskTool {
                 Ok(RunOutcome::Completed) => {
                     // 把各 subagent 的 summary 拼进返回文本,给主 agent 写最终答案的
                     // 素材(否则主 agent 只拿到一句"计划执行完成",无法产出实质答案)。
-                    let summaries = build_run_summaries(&self.store, &run_id);
+                    let summary_run_id = run_id.clone();
+                    let summaries = match blocking
+                        .run("load completed task summaries", move |store| {
+                            build_run_summaries(store.as_ref(), &summary_run_id)
+                        })
+                        .await
+                    {
+                        Ok(summaries) => summaries,
+                        Err(error) => {
+                            return Ok(ToolResult::error(format!(
+                                "Task graph completed but summaries could not be read: {error}"
+                            )));
+                        }
+                    };
                     tracing::info!(
                         run_id = %run_id,
                         summary_chars = summaries.chars().count(),
@@ -495,7 +537,7 @@ impl Tool for ExecuteTaskTool {
                 }) => {
                     tracing::warn!(
                         run_id = %run_id,
-                        failed_task_id = %failed_task_id,
+                        failed_task_id = ?failed_task_id,
                         error = %error,
                         "task_execute: failed"
                     );
@@ -513,7 +555,7 @@ impl Tool for ExecuteTaskTool {
                 }) => {
                     tracing::warn!(
                         run_id = %run_id,
-                        failed_task_id = %failed_task_id,
+                        failed_task_id = ?failed_task_id,
                         error = %error,
                         "task_execute: paused"
                     );
@@ -625,51 +667,62 @@ fn task_execute_outcome_text(outcome: &RunOutcome, summaries: &str) -> String {
         RunOutcome::Failed {
             failed_task_id,
             error,
-        } => format!("计划执行失败 (任务 {failed_task_id}): {error}。可调整计划后重试。"),
+        } => failed_task_id.as_ref().map_or_else(
+            || format!("计划执行失败: {error}。可调整计划后重试。"),
+            |task_id| format!("计划执行失败 (任务 {task_id}): {error}。可调整计划后重试。"),
+        ),
         RunOutcome::Paused {
             failed_task_id,
             error,
-        } => format!("计划因任务 {failed_task_id} 失败而暂停: {error}。"),
+        } => failed_task_id.as_ref().map_or_else(
+            || format!("计划已暂停: {error}。"),
+            |task_id| format!("计划因任务 {task_id} 暂停: {error}。"),
+        ),
     }
 }
 
-fn build_run_summaries(store: &TaskRuntimeStore, run_id: &str) -> String {
-    let todos = store.list_todos(run_id).unwrap_or_default();
+fn build_run_summaries(store: &TaskRuntimeStore, run_id: &str) -> Result<String, StoreError> {
+    let todos = store.list_todos(run_id)?;
     let tasks = store
-        .get_plan(run_id)
-        .ok()
-        .flatten()
+        .get_plan(run_id)?
         .map(|p| p.tasks)
-        .unwrap_or_default();
+        .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
 
     let mut sections = Vec::new();
     for task in tasks {
         let todo = todos.iter().find(|t| t.task_id == task.id);
+        if todo.map(|todo| todo.status) != Some(TodoStatus::Completed) {
+            continue;
+        }
         let owner = todo
             .and_then(|t| t.owner_agent.as_deref())
             .filter(|s| !s.is_empty())
             .unwrap_or(task.agent_role.as_str());
         let body = store
-            .get_summary(run_id, &task.id)
-            .ok()
-            .flatten()
+            .get_summary(run_id, &task.id)?
             .map(|summary| format_execution_summary(&summary))
             .or_else(|| todo.and_then(todo_summary))
-            .unwrap_or_else(|| "subagent completed but no summary was recorded".to_string());
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(format!(
+                    "completed task '{}' has no durable execution summary",
+                    task.id
+                ))
+            })?;
         sections.push(format!("## {} ({})\n{}", task.title, owner, body));
     }
 
     if sections.is_empty() {
-        return "未找到已执行的 subagent 产出。".to_string();
+        return Err(StoreError::InvalidPlan(format!(
+            "run {run_id} has no recorded Subagent output"
+        )));
     }
-    sections.join("\n\n")
+    Ok(sections.join("\n\n"))
 }
 
-fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
+fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> Result<bool, StoreError> {
     store
-        .get_plan(run_id)
-        .ok()
-        .flatten()
+        .get_plan(run_id)?
+        .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))
         .map(|plan| {
             plan.tasks.iter().any(|task| {
                 !matches!(
@@ -682,7 +735,6 @@ fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
                 )
             })
         })
-        .unwrap_or(false)
 }
 
 fn todo_summary(todo: &TodoItem) -> Option<String> {
@@ -975,8 +1027,17 @@ mod tests {
                 created_at: chrono::Utc::now(),
             })
             .map_err(|e| e.to_string())?;
+        store
+            .set_task_status(
+                "r1",
+                "t1",
+                TodoStatus::Completed,
+                Some("explorer"),
+                Some("梳理 runtime、agent_pool、task_runtime 的职责"),
+            )
+            .map_err(|error| error.to_string())?;
 
-        let text = build_run_summaries(&store, "r1");
+        let text = build_run_summaries(&store, "r1").map_err(|error| error.to_string())?;
         assert!(text.contains("核心运行时"));
         assert!(text.contains("梳理 runtime"));
         assert!(text.contains("runtime.rs"));
@@ -990,11 +1051,11 @@ mod tests {
             RunOutcome::Completed,
             RunOutcome::Cancelled,
             RunOutcome::Failed {
-                failed_task_id: "failed-task".to_string(),
+                failed_task_id: Some("failed-task".to_string()),
                 error: "failed".to_string(),
             },
             RunOutcome::Paused {
-                failed_task_id: "paused-task".to_string(),
+                failed_task_id: Some("paused-task".to_string()),
                 error: "paused".to_string(),
             },
         ];
