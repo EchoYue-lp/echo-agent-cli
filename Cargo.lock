@@ -1741,6 +1741,7 @@ dependencies = [
  "futures",
  "glob",
  "jsonschema",
+ "libc",
  "parking_lot",
  "regex",
  "reqwest 0.12.28",
