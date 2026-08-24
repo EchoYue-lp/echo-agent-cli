@@ -308,6 +308,18 @@ impl crate::chat_driver::ChatSink for JournaledChatSink {
             )
         })
     }
+
+    fn deferred_continuation_sink(&self) -> Option<Arc<dyn crate::chat_driver::ChatSink>> {
+        Some(Self::wrap(
+            Arc::new(JournalOnlySink),
+            self.log.clone(),
+            self.tool_execution_projector.clone(),
+            self.surface,
+            self.workspace_id.clone(),
+            self.conversation_id.clone(),
+            self.turn_id.clone(),
+        ))
+    }
 }
 
 impl ChatEventLog {

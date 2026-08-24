@@ -2445,11 +2445,11 @@ async fn cancel_active_tui_turn(app: &mut TuiApp) -> Result<(), String> {
         .clone();
     app.status_msg = "Cancelling...".to_string();
     control
-        .cancel_and_wait_scoped(
+        .root_cancel_and_wait_scoped(
             &snapshot.workspace_id,
             ForegroundTurnSurface::Tui,
             &snapshot.conversation_id,
-            &snapshot.active_turn_id,
+            &snapshot.root_turn_id,
         )
         .await
         .map(|_| ())

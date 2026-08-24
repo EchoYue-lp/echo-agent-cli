@@ -175,6 +175,13 @@ pub trait ChatSink: Send + Sync + 'static {
     fn continuation_sink(&self) -> Option<std::sync::Arc<dyn ChatSink>> {
         None
     }
+
+    /// Return a sink that is safe to retain after the foreground operation has
+    /// settled. Deferred TaskRuns may wake later, so they keep durable journal
+    /// projection while releasing surface renderers and their channels.
+    fn deferred_continuation_sink(&self) -> Option<std::sync::Arc<dyn ChatSink>> {
+        None
+    }
 }
 
 /// Build the EKO TaskRuntime sink carried through task-local run context.
@@ -897,6 +904,12 @@ async fn drive_prepared_chat(
     mut prepared: PreparedChatExecution,
     pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
 ) -> Result<ChatTurnOutcome, String> {
+    let continuation_dispatch_owned = prepared.binding.transcript_visibility
+        == TurnVisibility::Internal
+        && matches!(
+            prepared.binding.origin,
+            RunTurnOrigin::Continuation | RunTurnOrigin::Recovery
+        );
     if let Some(provider) = prepared.resources.human_loop_provider.clone() {
         agent
             .write_async(|agent| {
@@ -907,6 +920,7 @@ async fn drive_prepared_chat(
             .await;
     }
     if prepared.drives_task_run
+        && !continuation_dispatch_owned
         && let Some(store) = prepared.store.as_ref()
     {
         crate::tasks::task_runtime::continuation::register_launcher(
@@ -915,9 +929,10 @@ async fn drive_prepared_chat(
             agent.clone(),
             prepared.resources.clone(),
             prepared.binding.root_message_id.clone(),
+            prepared.foreground_progress.clone(),
         );
     }
-    let result = if let Some(registration) = prepared.task_driver_registration.take() {
+    let mut result = if let Some(registration) = prepared.task_driver_registration.take() {
         let store = prepared
             .store
             .as_ref()
@@ -987,6 +1002,7 @@ async fn drive_prepared_chat(
         .await
     };
     if prepared.drives_task_run
+        && !continuation_dispatch_owned
         && let Some(store) = prepared.store.as_ref()
     {
         let outcome = crate::tasks::task_runtime::continuation::request_continue(
@@ -994,11 +1010,40 @@ async fn drive_prepared_chat(
             &prepared.formal_run_id,
             RunTurnOrigin::Continuation,
         );
-        tracing::debug!(
-            run_id = %prepared.formal_run_id,
-            ?outcome,
-            "finite RunTurn requested continuation"
-        );
+        if let crate::tasks::task_runtime::continuation::ContinueRequestOutcome::Running(request) =
+            outcome
+        {
+            tracing::debug!(
+                run_id = %prepared.formal_run_id,
+                disposition = ?request.disposition,
+                "finite RunTurn requested continuation"
+            );
+            if prepared.foreground_progress.is_some() {
+                let completion = request.completion.wait().await?;
+                if completion.terminal != TurnOutcome::Completed
+                    && let Ok(outcome) = result.as_mut()
+                {
+                    outcome.terminal = completion.terminal;
+                }
+                tracing::debug!(
+                    run_id = %prepared.formal_run_id,
+                    reason = ?completion.reason,
+                    "foreground continuation chain settled"
+                );
+            }
+        } else {
+            tracing::debug!(
+                run_id = %prepared.formal_run_id,
+                ?outcome,
+                "finite RunTurn has no continuation launcher"
+            );
+            if prepared.foreground_progress.is_some() {
+                return Err(format!(
+                    "foreground TaskRun {} lost its continuation launcher",
+                    prepared.formal_run_id
+                ));
+            }
+        }
     }
     let requested_mode = prepared.interaction_mode.as_str();
     let observed_path = observe_execution_path(
@@ -1404,7 +1449,7 @@ struct ChatTurnModelScope {
 struct EkoTurnEventSink {
     state: std::sync::Arc<std::sync::Mutex<EkoTurnEventSinkState>>,
     sender: tokio::sync::mpsc::Sender<EkoTurnProjectionRequest>,
-    _worker: tokio::task::JoinHandle<()>,
+    _projector_task: tokio::task::JoinHandle<()>,
 }
 
 struct EkoTurnEventSinkState {
@@ -1439,8 +1484,8 @@ impl EkoTurnEventSink {
             downstream_failure: None,
         }));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
-        let worker_state = std::sync::Arc::clone(&state);
-        let worker = tokio::task::spawn_blocking(move || {
+        let projector_state = std::sync::Arc::clone(&state);
+        let projector_task = tokio::task::spawn_blocking(move || {
             while let Some(request) = receiver.blocking_recv() {
                 match request {
                     EkoTurnProjectionRequest::Event {
@@ -1449,7 +1494,7 @@ impl EkoTurnEventSink {
                     } => {
                         let result = project_eko_turn_event(
                             &sink,
-                            &worker_state,
+                            &projector_state,
                             active_run_id.as_deref(),
                             runtime_store.as_deref(),
                             &turn_id,
@@ -1468,7 +1513,7 @@ impl EkoTurnEventSink {
         Self {
             state,
             sender,
-            _worker: worker,
+            _projector_task: projector_task,
         }
     }
 
@@ -1510,7 +1555,7 @@ impl EkoTurnEventSink {
     }
 
     #[cfg(test)]
-    async fn stop_worker_for_test(&self) -> Result<(), String> {
+    async fn stop_projector_for_test(&self) -> Result<(), String> {
         let (acknowledgement, receiver) = tokio::sync::oneshot::channel();
         self.sender
             .send(EkoTurnProjectionRequest::Stop { acknowledgement })
@@ -1819,6 +1864,105 @@ mod tests {
             instruction: text.to_string(),
             resources: vec![],
             authorship: crate::prepared_turn::InstructionAuthorship::User,
+        }
+    }
+
+    struct SecondTurnBarrierLlmClient {
+        inner: echo_agent::testing::MockLlmClient,
+        calls: std::sync::atomic::AtomicUsize,
+        second_started: tokio::sync::Notify,
+        release_second: tokio::sync::Notify,
+    }
+
+    impl SecondTurnBarrierLlmClient {
+        fn new() -> Self {
+            Self {
+                inner: echo_agent::testing::MockLlmClient::new()
+                    .with_model_name("foreground-continuation")
+                    .with_responses([
+                        "first finite turn",
+                        "second finite turn",
+                        "unexpected third finite turn",
+                    ]),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                second_started: tokio::sync::Notify::new(),
+                release_second: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn gate_second(
+            &self,
+            call: usize,
+            cancel: echo_agent::agent::CancellationToken,
+        ) -> echo_agent::error::Result<()> {
+            if call < 2 {
+                return Ok(());
+            }
+            if call == 2 {
+                self.second_started.notify_waiters();
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => Err(echo_agent::error::ReactError::Other(
+                    "second continuation call cancelled".to_string(),
+                )),
+                _ = self.release_second.notified() => Ok(()),
+            }
+        }
+
+        async fn wait_for_second(&self) {
+            if self.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2 {
+                return;
+            }
+            self.second_started.notified().await;
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl echo_agent::llm::LlmClient for SecondTurnBarrierLlmClient {
+        fn chat(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> futures::future::BoxFuture<'_, echo_agent::error::Result<echo_agent::llm::ChatResponse>>
+        {
+            Box::pin(async move {
+                let call = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .saturating_add(1);
+                let cancel = request.cancel_token.clone().unwrap_or_default();
+                self.gate_second(call, cancel).await?;
+                self.inner.chat(request).await
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> futures::future::BoxFuture<
+            '_,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    echo_agent::error::Result<echo_agent::llm::ChatChunk>,
+                >,
+            >,
+        > {
+            Box::pin(async move {
+                let call = self
+                    .calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    .saturating_add(1);
+                let cancel = request.cancel_token.clone().unwrap_or_default();
+                self.gate_second(call, cancel).await?;
+                self.inner.chat_stream(request).await
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "foreground-continuation"
         }
     }
 
@@ -2438,11 +2582,11 @@ mod tests {
             WebhookTurnObserver::new(None, "test-model".to_string()),
             None,
             None,
-            "closed-worker-turn".to_string(),
+            "closed-projector-turn".to_string(),
             TurnVisibility::Visible,
         );
-        adapter.stop_worker_for_test().await?;
-        let identity = EventIdentity::new("closed-worker-stream", "closed-worker-turn")
+        adapter.stop_projector_for_test().await?;
+        let identity = EventIdentity::new("closed-projector-stream", "closed-projector-turn")
             .map_err(|error| error.to_string())?;
         let envelope = EventEnvelope::new(
             &identity,
@@ -2451,12 +2595,17 @@ mod tests {
             AgentEvent::Token("undelivered".to_string()),
         )
         .map_err(|error| error.to_string())?;
-        let error = adapter
-            .on_event(envelope)
-            .await
-            .expect_err("closed worker must reject delivery");
+        let error = match adapter.on_event(envelope).await {
+            Err(error) => error,
+            Ok(control) => {
+                return Err(format!(
+                    "closed projector accepted delivery with {control:?}"
+                ));
+            }
+        };
         assert!(error.to_string().contains("sink_projector_closed"));
-        let outcome = adapter.finish("closed-worker-turn".to_string(), TurnOutcome::Cancelled)?;
+        let outcome =
+            adapter.finish("closed-projector-turn".to_string(), TurnOutcome::Cancelled)?;
         assert!(matches!(
             outcome.terminal,
             TurnOutcome::Failed(ref failure) if failure.code == "sink_projector_closed"
@@ -2481,9 +2630,36 @@ mod tests {
         })
         .await
         .map_err(|_| {
+            let current_status = store
+                .get_run(run_id)
+                .ok()
+                .flatten()
+                .map(|run| run.status.as_str().to_string())
+                .unwrap_or_else(|| "missing".to_string());
+            let event_types = store
+                .list_events(run_id, 0)
+                .map(|events| {
+                    events
+                        .into_iter()
+                        .map(|event| {
+                            format!(
+                                "{:?}[status={:?},turn={:?},reason={:?},kind={:?}]",
+                                event.event_type,
+                                event.payload.get("status"),
+                                event.payload.get("turn_id"),
+                                event.payload.get("reason"),
+                                event.payload.get("kind"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+                .unwrap_or_else(|error| format!("unavailable:{error}"));
+            let continuation_state =
+                crate::tasks::task_runtime::continuation::runtime_state_for_test(store, run_id);
             format!(
-                "timed out waiting for {run_id} to become {}",
-                expected.as_str()
+                "timed out waiting for {run_id} to become {}; current={current_status}; continuation={continuation_state:?}; events={event_types}",
+                expected.as_str(),
             )
         })?
     }
@@ -3139,6 +3315,170 @@ mod tests {
                 .map(|pause| pause.reason),
             Some(crate::tasks::task_runtime::RunPauseReason::BootRecovery)
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreground_owner_spans_second_run_turn_steer_and_root_cancel() -> Result<(), String> {
+        use std::sync::Arc;
+
+        let llm = Arc::new(SecondTurnBarrierLlmClient::new());
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("foreground-continuation")
+                .llm_client(llm.clone())
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let control = crate::foreground_turn::ForegroundTurnControl::default();
+        let lease = control
+            .begin(
+                crate::foreground_turn::ForegroundTurnSurface::Cli,
+                "foreground-continuation-conversation",
+                "foreground-root",
+            )
+            .map_err(|error| error.to_string())?;
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            execution_scope: test_execution_scope(),
+            pool: None,
+            store: Some(store.clone()),
+            sink: Arc::new(MockChatSink::default()),
+            webhook_emitter: None,
+            conv_id: Some("foreground-continuation-conversation".to_string()),
+            root_message_id: "foreground-root".to_string(),
+            attachments: Vec::new(),
+            cancel: lease.cancellation_token(),
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Task,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let driven_agent = agent.clone();
+        let drive = tokio::spawn(async move {
+            crate::foreground_turn::drive_foreground_chat(
+                lease,
+                &driven_agent,
+                &make_turn("keep the foreground owner across finite turns"),
+                resources,
+            )
+            .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), llm.wait_for_second())
+            .await
+            .map_err(|_| "second continuation model call did not start".to_string())?;
+        let run_id =
+            crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("foreground-root");
+        let started = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|event| event.event_type == RuntimeEventKind::RunTurnStarted)
+            .collect::<Vec<_>>();
+        if started.len() != 2 {
+            return Err(format!(
+                "expected exactly two active RunTurns, found {} after {} model calls",
+                started.len(),
+                llm.call_count()
+            ));
+        }
+        let second_turn_id = started
+            .get(1)
+            .and_then(|event| event.payload.get("turn_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "second RunTurn id is missing".to_string())?
+            .to_string();
+        let snapshot = control
+            .snapshot(
+                crate::foreground_turn::ForegroundTurnSurface::Cli,
+                "foreground-continuation-conversation",
+            )
+            .ok_or_else(|| "foreground owner settled before the second RunTurn".to_string())?;
+        assert_eq!(snapshot.root_turn_id, "foreground-root");
+        assert_eq!(snapshot.active_turn_id, second_turn_id);
+        assert_eq!(
+            crate::tasks::task_runtime::continuation::launcher_generation_for_test(&store, &run_id),
+            Some(1),
+            "Continuation-origin turns must not recursively register launchers"
+        );
+
+        let steered_turn = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            agent.steer_input(
+                Some(&second_turn_id),
+                echo_agent::prelude::Message::user("focus the second finite turn".to_string()),
+            ),
+        )
+        .await
+        .map_err(|_| "steer into the second RunTurn timed out".to_string())?
+        .map_err(|error| error.to_string())?;
+        assert_eq!(steered_turn, second_turn_id);
+        let joined_waiter = control
+            .settlement_waiter_scoped(
+                "global",
+                crate::foreground_turn::ForegroundTurnSurface::Cli,
+                "foreground-continuation-conversation",
+                "foreground-root",
+            )
+            .map_err(|error| error.to_string())?;
+        let cancel_waiter = control
+            .request_root_cancel(
+                crate::foreground_turn::ForegroundTurnSurface::Cli,
+                "foreground-continuation-conversation",
+                "foreground-root",
+            )
+            .map_err(|error| error.to_string())?;
+
+        let (joined, cancelled, driven) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(joined_waiter.wait(), cancel_waiter.wait(), drive)
+            })
+            .await
+            .map_err(|_| "root cancellation did not settle the continuation chain".to_string())?;
+        let joined = joined.map_err(|error| error.to_string())?;
+        let cancelled = cancelled.map_err(|error| error.to_string())?;
+        assert_eq!(joined, cancelled);
+        assert_eq!(cancelled.turn_id, "foreground-root");
+        assert_eq!(cancelled.outcome, TurnOutcome::Cancelled);
+        assert_eq!(
+            driven.map_err(|error| error.to_string())??,
+            TurnOutcome::Cancelled
+        );
+        assert!(
+            control
+                .snapshot(
+                    crate::foreground_turn::ForegroundTurnSurface::Cli,
+                    "foreground-continuation-conversation",
+                )
+                .is_none()
+        );
+        let started_after_cancel = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|event| event.event_type == RuntimeEventKind::RunTurnStarted)
+            .count();
+        assert_eq!(
+            started_after_cancel, 2,
+            "root cancel admitted a third RunTurn"
+        );
+        let next = control
+            .begin(
+                crate::foreground_turn::ForegroundTurnSurface::Cli,
+                "foreground-continuation-conversation",
+                "next-root",
+            )
+            .map_err(|error| error.to_string())?;
+        next.settle(TurnOutcome::Completed);
+        store
+            .shutdown_run_drivers()
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 

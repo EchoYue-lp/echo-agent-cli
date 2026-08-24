@@ -13,7 +13,9 @@ use std::sync::{Arc, Mutex};
 use echo_agent::agent::{AgentEvent, AgentHandle, CancellationToken};
 use tokio::sync::watch;
 
-use crate::chat_driver::{ChatDriverEvent, ChatSink, TurnOutcome, drive_chat, drive_chat_turn};
+use crate::chat_driver::{
+    ChatDriverEvent, ChatSink, ChatTurnOutcome, TurnOutcome, drive_chat, drive_chat_turn,
+};
 use crate::chat_resources::ChatResources;
 use crate::prepared_turn::PreparedUserTurn;
 
@@ -174,6 +176,60 @@ impl ForegroundTurnProgress {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = turn_id.to_string();
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.0.cancel.clone()
+    }
+
+    /// Run one finite continuation invocation under the original foreground
+    /// entry. This restores the task-local identity across supervisor spawns,
+    /// but deliberately carries no settlement capability.
+    pub(crate) async fn scope_chat<Execute, ExecuteFuture>(
+        &self,
+        resources: Arc<ChatResources>,
+        execute: Execute,
+    ) -> Result<ChatTurnOutcome, String>
+    where
+        Execute: FnOnce(Arc<ChatResources>) -> ExecuteFuture,
+        ExecuteFuture: std::future::Future<Output = Result<ChatTurnOutcome, String>>,
+    {
+        let cancel = self.cancellation_token();
+        let delivery = Arc::new(DownstreamDeliveryState::default());
+        let sink: Arc<dyn ChatSink> = Arc::new(CancellationAwareChatSink {
+            inner: Arc::clone(&resources.sink),
+            cancel: cancel.clone(),
+            delivery: Arc::clone(&delivery),
+        });
+        let controlled_resources = Arc::new(ChatResources {
+            execution_scope: resources.execution_scope.clone(),
+            pool: resources.pool.clone(),
+            store: resources.store.clone(),
+            sink,
+            webhook_emitter: resources.webhook_emitter.clone(),
+            conv_id: resources.conv_id.clone(),
+            root_message_id: resources.root_message_id.clone(),
+            attachments: resources.attachments.clone(),
+            cancel,
+            interaction_mode: resources.interaction_mode,
+            review_integration: resources.review_integration.clone(),
+            layer_manager: resources.layer_manager.clone(),
+            memory_generation: resources.memory_generation.clone(),
+            human_loop_provider: resources.human_loop_provider.clone(),
+        });
+        let result = CURRENT_FOREGROUND_TURN
+            .scope(Arc::clone(&self.0), execute(controlled_resources))
+            .await;
+        if !delivery.terminal_delivery_failed() {
+            return result;
+        }
+        result.map(|mut outcome| {
+            outcome.terminal = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                "downstream_disconnect",
+                "chat event consumer closed before terminal delivery",
+            ));
+            outcome
+        })
     }
 }
 
@@ -859,6 +915,23 @@ impl ForegroundTurnControl {
             .await
     }
 
+    pub async fn root_cancel_and_wait_scoped(
+        &self,
+        workspace_id: &str,
+        surface: ForegroundTurnSurface,
+        conversation_id: &str,
+        expected_root_turn_id: &str,
+    ) -> Result<ForegroundTurnSettlement, ForegroundTurnError> {
+        self.request_root_cancel_scoped(
+            workspace_id,
+            surface,
+            conversation_id,
+            expected_root_turn_id,
+        )?
+        .wait()
+        .await
+    }
+
     /// Permanently close foreground admission, cancel every exact active turn,
     /// and wait for their existing driver leases to publish settlement.
     ///
@@ -1118,6 +1191,10 @@ impl ChatSink for CancellationAwareChatSink {
 
     fn continuation_sink(&self) -> Option<Arc<dyn ChatSink>> {
         Some(Arc::clone(&self.inner))
+    }
+
+    fn deferred_continuation_sink(&self) -> Option<Arc<dyn ChatSink>> {
+        self.inner.deferred_continuation_sink()
     }
 }
 

@@ -97,6 +97,9 @@ input
 3. accepted turn 使用一次解析得到的 workspace runtime，不能在执行中再次读取 UI focus。
 4. framework conversation/checkpoint 内容是权威；前端 store 只维护可重建投影。
 5. terminal settlement 由 app-core 产生，文本事件或组件卸载不能提前释放 busy 状态。
+6. 长程 TaskRun 的多个有限 RunTurn 共享一个 foreground root owner；active turn id 可推进，
+   root id、cancel token 和最终 settlement authority 保持不变。完整决策见
+   [Foreground continuation ADR](./adr/0005-foreground-continuation-owner.md)。
 
 ## TaskRun 数据流
 
@@ -124,6 +127,10 @@ Store、Journal、Checkpoint、Trace 的产品边界和完整权威矩阵见
 长程任务在同一 TaskRun 上增加 RunTurn continuation、Goal/Requirement/Evidence、budget、
 provider retry 和 boot admission，不建立第二套 task graph。后台 command cell 也只作为
 TaskRun 外部命令的 durable owner，不替代 PlanTask/Subagent。
+
+一个用户可见的长程 operation 只由外层 `ForegroundTurnLease` settlement。后续 RunTurn
+通过不可 settlement 的 progress handle 更新 current active id，并由 continuation completion
+receipt 把 Deferred/Stop 反馈给外层 owner；surface cancel 使用 root id，steer 使用 active id。
 
 ## 文件持久化
 

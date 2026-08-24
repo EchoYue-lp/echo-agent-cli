@@ -3748,6 +3748,7 @@ impl TaskRuntimeStore {
     /// directly when they are not executing.
     pub fn request_cancel(&self, run_id: &str) -> Result<bool, StoreError> {
         let _operation = self.shadow_operation()?;
+        let continuation_cut = super::continuation::capture_generation_cut(self, run_id);
         let tokens = self.active_run_cancel_tokens(run_id);
         if !tokens.is_empty() {
             // Durable Cancelled is committed before signalling the driver. It
@@ -3756,7 +3757,7 @@ impl TaskRuntimeStore {
             for token in tokens {
                 token.cancel();
             }
-            super::continuation::clear_launcher(self, run_id);
+            super::continuation::clear_launcher_at_cut(self, run_id, continuation_cut);
             self.stop_owned_command_cells(run_id)?;
             return Ok(true);
         }
@@ -3769,7 +3770,7 @@ impl TaskRuntimeStore {
             | TaskRunStatus::Paused
             | TaskRunStatus::Failed => {
                 self.finalize_cancelled_tasks_and_run(run_id)?;
-                super::continuation::clear_launcher(self, run_id);
+                super::continuation::clear_launcher_at_cut(self, run_id, continuation_cut);
                 self.stop_owned_command_cells(run_id)?;
                 Ok(true)
             }
@@ -3793,6 +3794,7 @@ impl TaskRuntimeStore {
         reason: RunPauseReason,
         detail: Option<&str>,
     ) -> Result<bool, StoreError> {
+        let continuation_cut = super::continuation::capture_generation_cut(self, run_id);
         let tokens = self.active_run_cancel_tokens(run_id);
         let transition = self.with_run_lock(run_id, || {
             let run = self
@@ -3836,7 +3838,7 @@ impl TaskRuntimeStore {
         for token in tokens {
             token.cancel();
         }
-        super::continuation::clear_launcher(self, run_id);
+        super::continuation::clear_launcher_at_cut(self, run_id, continuation_cut);
         Ok(true)
     }
 
@@ -5359,6 +5361,16 @@ impl TaskRuntimeStore {
         self.schedule_provider_retry_at(run_id, error_fingerprint, Utc::now())
     }
 
+    #[cfg(test)]
+    pub(crate) fn schedule_provider_retry_at_for_test(
+        &self,
+        run_id: &str,
+        error_fingerprint: &str,
+        now: DateTime<Utc>,
+    ) -> Result<ProviderRetryDisposition, StoreError> {
+        self.schedule_provider_retry_at(run_id, error_fingerprint, now)
+    }
+
     fn schedule_provider_retry_at(
         &self,
         run_id: &str,
@@ -5370,6 +5382,7 @@ impl TaskRuntimeStore {
                 "provider retry fingerprint must not be empty".to_string(),
             ));
         }
+        let continuation_cut = super::continuation::capture_generation_cut(self, run_id);
         let tokens = self.active_run_cancel_tokens(run_id);
         let disposition = self.with_run_lock(run_id, || {
             let run = self
@@ -5479,7 +5492,7 @@ impl TaskRuntimeStore {
             for token in tokens {
                 token.cancel();
             }
-            super::continuation::clear_launcher(self, run_id);
+            super::continuation::clear_launcher_at_cut(self, run_id, continuation_cut);
         }
         Ok(disposition)
     }
@@ -5498,6 +5511,7 @@ impl TaskRuntimeStore {
                 "continuation budgets must be positive or omitted".to_string(),
             ));
         }
+        let continuation_cut = super::continuation::capture_generation_cut(self, run_id);
         let tokens = self.active_run_cancel_tokens(run_id);
         let (updated, paused) = self.with_run_lock(run_id, || {
             let run = self
@@ -5561,7 +5575,7 @@ impl TaskRuntimeStore {
             for token in tokens {
                 token.cancel();
             }
-            super::continuation::clear_launcher(self, run_id);
+            super::continuation::clear_launcher_at_cut(self, run_id, continuation_cut);
         }
         Ok(updated)
     }
@@ -5742,6 +5756,7 @@ impl TaskRuntimeStore {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<bool, StoreError> {
+        let continuation_cut = super::continuation::capture_generation_cut(self, run_id);
         let tokens = self.active_run_cancel_tokens(run_id);
         let exhausted = self.with_run_lock(run_id, || {
             let active_turn_id = self
@@ -5798,7 +5813,7 @@ impl TaskRuntimeStore {
             for token in tokens {
                 token.cancel();
             }
-            super::continuation::clear_launcher(self, run_id);
+            super::continuation::clear_launcher_at_cut(self, run_id, continuation_cut);
         }
         Ok(exhausted)
     }
@@ -5816,6 +5831,7 @@ impl TaskRuntimeStore {
         output_tokens: u64,
         duration_ms: u64,
     ) -> Result<bool, StoreError> {
+        let continuation_cut = super::continuation::capture_generation_cut(self, run_id);
         let tokens = self.active_run_cancel_tokens(run_id);
         let exhausted = self.with_run_lock(run_id, || {
             let Some(current) = self
@@ -5906,7 +5922,7 @@ impl TaskRuntimeStore {
             for token in tokens {
                 token.cancel();
             }
-            super::continuation::clear_launcher(self, run_id);
+            super::continuation::clear_launcher_at_cut(self, run_id, continuation_cut);
         }
         Ok(exhausted)
     }

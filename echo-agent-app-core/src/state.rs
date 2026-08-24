@@ -2105,6 +2105,7 @@ impl AppState {
                 runtime.primary_agent(),
                 resources,
                 run.root_message_id.clone(),
+                None,
             );
             match reconciler
                 .resume(&run.run_id, true, false, &self.tasks.cancel_token)
@@ -2116,8 +2117,7 @@ impl AppState {
                         &run.run_id,
                         crate::tasks::task_runtime::RunTurnOrigin::Recovery,
                     ) {
-                        crate::tasks::task_runtime::continuation::ContinueRequestOutcome::Started
-                        | crate::tasks::task_runtime::continuation::ContinueRequestOutcome::AlreadyRunning => {
+                        crate::tasks::task_runtime::continuation::ContinueRequestOutcome::Running(_) => {
                             report.resumed = report.resumed.saturating_add(1);
                         }
                         outcome => {

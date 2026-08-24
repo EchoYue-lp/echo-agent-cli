@@ -176,7 +176,7 @@ impl Drop for ActiveReplTurn {
         {
             return;
         }
-        if let Err(error) = self.control.request_cancel_scoped(
+        if let Err(error) = self.control.request_root_cancel_scoped(
             &self.workspace_id,
             echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
             &self.conversation_id,
@@ -184,13 +184,10 @@ impl Drop for ActiveReplTurn {
         ) {
             tracing::debug!(%error, "dropped CLI turn could not request exact cancellation");
         }
-        if let Some(task) = self.task.as_ref() {
-            task.abort();
-        }
         // Drop cannot await. Normal REPL exits use cancel_and_drain_active;
-        // this defensive boundary cancels the exact owner before aborting its
-        // sole supervisor. Dropping the supervisor drops its lease, which
-        // settles the foreground registry without detaching an inner task.
+        // this defensive boundary requests root cancellation and then detaches
+        // the sole outer owner so it can publish settlement after every finite
+        // continuation driver has actually released.
     }
 }
 
@@ -1780,7 +1777,7 @@ async fn cancel_and_drain_active(
     output: &OutputRenderer,
 ) -> Option<PendingGitAction> {
     let identity = active.as_ref()?;
-    let waiter = match control.request_cancel_scoped(
+    let waiter = match control.request_root_cancel_scoped(
         &identity.workspace_id,
         echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
         &identity.conversation_id,
@@ -1882,34 +1879,45 @@ async fn route_active_input(
             // never leave the FIFO pointing at a deleted temporary file.
             let fallback = queued_turn_from_prepared(&input, &prepared);
             match prepared.to_message() {
-                Ok(message) => match settle_steer_attempt(
-                    agent.steer_input(Some(&active.turn_id), message).await,
-                    fallback,
-                    queued,
-                ) {
-                    Ok(turn_id) => {
-                        output.print_info(&format!("Guidance injected into turn {turn_id}"));
-                        ActiveInputDisposition::Steered
+                Ok(message) => {
+                    let active_turn_id = active
+                        .control
+                        .snapshot_scoped(
+                            &active.workspace_id,
+                            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                            &active.conversation_id,
+                        )
+                        .filter(|snapshot| snapshot.root_turn_id == active.turn_id)
+                        .map(|snapshot| snapshot.active_turn_id);
+                    let steer = match active_turn_id.as_deref() {
+                        Some(turn_id) => agent.steer_input(Some(turn_id), message).await,
+                        None => Err(echo_agent::agent::TurnSteerError::NoActiveTurn),
+                    };
+                    match settle_steer_attempt(steer, fallback, queued) {
+                        Ok(turn_id) => {
+                            output.print_info(&format!("Guidance injected into turn {turn_id}"));
+                            ActiveInputDisposition::Steered
+                        }
+                        Err(
+                            echo_agent::agent::TurnSteerError::NoActiveTurn
+                            | echo_agent::agent::TurnSteerError::NotSteerable { .. }
+                            | echo_agent::agent::TurnSteerError::TurnMismatch { .. },
+                        ) => {
+                            output.print_info(&format!(
+                                "Current stage is not steerable; queued {} follow-up(s)",
+                                queued.len()
+                            ));
+                            ActiveInputDisposition::Queued
+                        }
+                        Err(error) => {
+                            output.print_warning(&format!(
+                                "Steer failed ({error}); queued {} follow-up(s)",
+                                queued.len()
+                            ));
+                            ActiveInputDisposition::Queued
+                        }
                     }
-                    Err(
-                        echo_agent::agent::TurnSteerError::NoActiveTurn
-                        | echo_agent::agent::TurnSteerError::NotSteerable { .. }
-                        | echo_agent::agent::TurnSteerError::TurnMismatch { .. },
-                    ) => {
-                        output.print_info(&format!(
-                            "Current stage is not steerable; queued {} follow-up(s)",
-                            queued.len()
-                        ));
-                        ActiveInputDisposition::Queued
-                    }
-                    Err(error) => {
-                        output.print_warning(&format!(
-                            "Steer failed ({error}); queued {} follow-up(s)",
-                            queued.len()
-                        ));
-                        ActiveInputDisposition::Queued
-                    }
-                },
+                }
                 Err(error) => {
                     queued.enqueue(fallback);
                     output.print_warning(&format!(
@@ -3094,7 +3102,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_active_turn_aborts_supervisor_and_clears_registry() -> Result<(), String> {
+    async fn dropping_active_turn_requests_root_cancel_and_owner_settles_registry()
+    -> Result<(), String> {
         let control = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
         let lease = control
             .begin(
@@ -3103,9 +3112,14 @@ mod tests {
                 "drop-turn",
             )
             .map_err(|error| error.to_string())?;
+        let cancel = lease.cancellation_token();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
-            let _lease = lease;
-            std::future::pending::<()>().await;
+            cancel.cancelled().await;
+            let _delivered = cancelled_tx.send(());
+            let _released = release_rx.await;
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
             0
         });
         let active = ActiveReplTurn {
@@ -3120,6 +3134,25 @@ mod tests {
         };
         drop(active);
 
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_rx)
+            .await
+            .map_err(|_| "dropped CLI handle did not request root cancellation".to_string())?
+            .map_err(|_| "root cancellation observer ended early".to_string())?;
+        let snapshot = control
+            .snapshot(
+                echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Cli,
+                "drop-conversation",
+            )
+            .ok_or_else(|| {
+                "Drop released the foreground registry before owner settlement".to_string()
+            })?;
+        if !snapshot.cancellation_requested {
+            return Err("Drop did not mark the foreground root cancelled".to_string());
+        }
+        release_tx
+            .send(())
+            .map_err(|_| "foreground owner release receiver closed".to_string())?;
+
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             while control
                 .snapshot(
@@ -3132,7 +3165,7 @@ mod tests {
             }
         })
         .await
-        .map_err(|_| "aborted supervisor did not settle the foreground registry".to_string())?;
+        .map_err(|_| "detached owner did not settle the foreground registry".to_string())?;
         Ok(())
     }
 

@@ -112,10 +112,9 @@ fn channel_render_event_stream(
                     }));
                 }
             }
-            // The first finite foreground turn settles before its independent
-            // continuation turns. Keep consuming both driver events and HITL
-            // prompts until the retained continuation sink closes, then publish
-            // the foreground terminal receipt last.
+            // The single foreground owner spans every finite continuation turn.
+            // Publish its terminal receipt only after the renderer channel has
+            // closed, preserving all driver events and HITL prompts before Done.
             if !driver_open
                 && let Some(outcome) = terminal_outcome.take()
             {
@@ -650,11 +649,11 @@ impl AppChannelMessageHandler {
                 Some(
                     match self
                         .foreground_turns
-                        .cancel_and_wait_scoped(
+                        .root_cancel_and_wait_scoped(
                             runtime.execution_scope().workspace_id(),
                             ForegroundTurnSurface::Channel,
                             conv,
-                            &snapshot.active_turn_id,
+                            &snapshot.root_turn_id,
                         )
                         .await
                     {
@@ -685,11 +684,11 @@ impl AppChannelMessageHandler {
                     conv,
                 ) && let Err(error) = self
                     .foreground_turns
-                    .cancel_and_wait_scoped(
+                    .root_cancel_and_wait_scoped(
                         runtime.execution_scope().workspace_id(),
                         ForegroundTurnSurface::Channel,
                         conv,
-                        &snapshot.active_turn_id,
+                        &snapshot.root_turn_id,
                     )
                     .await
                     && !matches!(error, ForegroundTurnError::NoActiveTurn { .. })
@@ -2350,7 +2349,7 @@ mod tests {
 
     #[cfg(feature = "channels")]
     #[tokio::test]
-    async fn continuation_prompt_is_delivered_after_first_turn_terminal() -> Result<(), String> {
+    async fn continuation_prompt_is_delivered_before_foreground_terminal() -> Result<(), String> {
         use echo_agent_app_core::chat_driver::TurnOutcome;
         use futures::StreamExt;
 
@@ -2380,7 +2379,7 @@ mod tests {
             first,
             super::ChannelRenderEvent::Prompt(ref prompt) if prompt == "Approve continuation?"
         ) {
-            return Err("first-turn terminal overtook the continuation prompt".to_string());
+            return Err("foreground terminal overtook the continuation prompt".to_string());
         }
         drop(driver_tx);
         let second = stream
