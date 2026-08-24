@@ -22,9 +22,11 @@ use echo_agent::tools::TraceSinkFn;
 pub use echo_agent::runtime::TurnOutcome;
 
 use crate::tasks::task_runtime::executor::ExecEvent;
+#[cfg(test)]
+use crate::tasks::task_runtime::turn_lifecycle::RunTurnDecision;
 use crate::tasks::task_runtime::types::{
-    RunPauseReason, RunTurnBinding, RunTurnOrigin, RunTurnStatus, RuntimeEventKind,
-    TaskRunResumeIdentity, TaskRunStatus, TurnVisibility,
+    RunTurnBinding, RunTurnOrigin, RuntimeEventKind, TaskRunResumeIdentity, TaskRunStatus,
+    TurnVisibility,
 };
 
 /// Complete product event stream consumed by every interactive surface.
@@ -244,6 +246,7 @@ impl WebhookTurnObserver {
             AgentEvent::LlmUsage {
                 prompt_tokens,
                 completion_tokens,
+                usage_reported: true,
                 ..
             } => {
                 self.input_tokens = self.input_tokens.saturating_add(*prompt_tokens);
@@ -447,7 +450,9 @@ where
     let execution = match tokio::select! {
         biased;
         _ = acquire_cancel.cancelled() => {
-            prepared.reject_before_driver_start("continuation cancelled during pool admission")?;
+            prepared
+                .reject_before_driver_start("continuation cancelled during pool admission")
+                .await?;
             return Err("continuation cancelled during pool admission".to_string());
         }
         result = pool.acquire(pool_key) => result,
@@ -455,7 +460,7 @@ where
         Ok(execution) => execution,
         Err(error) => {
             let message = format!("AgentPool admission failed: {error}");
-            prepared.reject_before_driver_start(&message)?;
+            prepared.reject_before_driver_start(&message).await?;
             return Err(message);
         }
     };
@@ -464,13 +469,15 @@ where
     let configuration = tokio::select! {
         biased;
         _ = configure_cancel.cancelled() => {
-            prepared.reject_before_driver_start("continuation cancelled during agent configuration")?;
+            prepared
+                .reject_before_driver_start("continuation cancelled during agent configuration")
+                .await?;
             return Err("continuation cancelled during agent configuration".to_string());
         }
         result = configure(agent.clone()) => result,
     };
     if let Err(error) = configuration {
-        prepared.reject_before_driver_start(&error)?;
+        prepared.reject_before_driver_start(&error).await?;
         return Err(error);
     }
     drive_prepared_chat(agent, turn, *prepared, Some(execution)).await
@@ -553,7 +560,7 @@ impl PreparedChatExecution {
     /// shutdown is boot-recoverable and explicit cancellation is terminal.
     /// Untyped admission failures require input; only typed LLM failures enter
     /// durable provider retry.
-    fn reject_before_driver_start(mut self, detail: &str) -> Result<(), String> {
+    async fn reject_before_driver_start(mut self, detail: &str) -> Result<(), String> {
         if !self.drives_task_run {
             if let Some(registration) = self.task_driver_registration.take() {
                 registration.reject(detail.to_string());
@@ -566,72 +573,23 @@ impl PreparedChatExecution {
             }
             return Ok(());
         };
-        let admission_open = store.is_run_driver_admission_open();
-        let cancelled = self.cancel.is_cancelled();
-        let turn_status = if cancelled {
-            RunTurnStatus::Cancelled
+        let rejection = if !store.is_run_driver_admission_open() {
+            crate::tasks::task_runtime::turn_lifecycle::PreDriverRejection::Shutdown
+        } else if self.cancel.is_cancelled() {
+            crate::tasks::task_runtime::turn_lifecycle::PreDriverRejection::Cancelled
         } else {
-            RunTurnStatus::Failed
+            crate::tasks::task_runtime::turn_lifecycle::PreDriverRejection::Admission
         };
-        let fingerprint = if !admission_open {
-            "runtime_shutdown"
-        } else if cancelled {
-            "user_cancelled"
-        } else {
-            "continuation_admission"
-        };
-        let settlement = store
-            .finish_run_turn(
-                &self.formal_run_id,
-                crate::tasks::task_runtime::store::RunTurnCompletion {
-                    turn_id: &self.turn_id,
-                    status: turn_status,
-                    elapsed_seconds: 0,
-                    final_message_id: None,
-                    error_fingerprint: Some(fingerprint),
-                },
-            )
-            .map_err(|error| error.to_string())
-            .and_then(|_| {
-                let run_is_running = store
-                    .get_run(&self.formal_run_id)
-                    .map_err(|error| error.to_string())?
-                    .is_some_and(|run| run.status == TaskRunStatus::Running);
-                if !run_is_running {
-                    return Ok(());
-                }
-                if !admission_open {
-                    store
-                        .request_pause_with_reason(
-                            &self.formal_run_id,
-                            RunPauseReason::BootRecovery,
-                            Some("application shutdown interrupted pre-driver admission"),
-                        )
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                } else if cancelled {
-                    store
-                        .transition_run(&self.formal_run_id, TaskRunStatus::Cancelled)
-                        .map_err(|error| error.to_string())?;
-                    crate::tasks::task_runtime::continuation::clear_launcher(
-                        store,
-                        &self.formal_run_id,
-                    );
-                    store
-                        .stop_owned_command_cells(&self.formal_run_id)
-                        .map_err(|error| error.to_string())?;
-                    Ok(())
-                } else {
-                    store
-                        .request_pause_with_reason(
-                            &self.formal_run_id,
-                            RunPauseReason::NeedsInput,
-                            Some(detail),
-                        )
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
-                }
-            });
+        let blocking = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone());
+        let settlement = crate::tasks::task_runtime::turn_lifecycle::reject_before_driver_start(
+            &blocking,
+            store,
+            &self.formal_run_id,
+            &self.turn_id,
+            detail,
+            rejection,
+        )
+        .await;
         if let Some(registration) = self.task_driver_registration.take() {
             registration.reject(detail.to_string());
         }
@@ -1079,12 +1037,6 @@ struct RegisteredTurnDriver {
     foreground_progress: Option<crate::foreground_turn::ForegroundTurnProgress>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RunTurnDecision {
-    Stop,
-    Continue,
-}
-
 async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<ChatTurnOutcome, String> {
     if let Some(progress) = driver.foreground_progress.as_ref() {
         progress.advance(&driver.binding.turn_id);
@@ -1126,7 +1078,8 @@ async fn drive_registered_turn(driver: RegisteredTurnDriver) -> Result<ChatTurnO
         &driver.run_id,
         outcome,
         Some(&driver.trace_sink),
-    )?;
+    )
+    .await?;
     result
 }
 
@@ -1194,200 +1147,26 @@ fn ensure_task_mode_run(
     Ok(())
 }
 
-fn finalize_run_turn(
+async fn finalize_run_turn(
     store: &std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
     run_id: &str,
     outcome: &ChatTurnOutcome,
     trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
-) -> Result<RunTurnDecision, String> {
-    use crate::tasks::task_runtime::{RunPauseReason, TaskRunStatus};
-
-    let (status, error_fingerprint) = match &outcome.terminal {
-        TurnOutcome::Completed => (RunTurnStatus::Ended, None),
-        TurnOutcome::Cancelled => (RunTurnStatus::Cancelled, Some("cancelled".to_string())),
-        TurnOutcome::Failed(failure) => (
-            RunTurnStatus::Failed,
-            Some(agent_failure_fingerprint(failure)),
-        ),
-    };
-    let continuation = store
-        .finish_run_turn(
-            run_id,
-            crate::tasks::task_runtime::store::RunTurnCompletion {
-                turn_id: &outcome.turn_id,
-                status,
-                elapsed_seconds: outcome.elapsed_seconds,
-                final_message_id: outcome.final_message_id.as_deref(),
-                error_fingerprint: error_fingerprint.as_deref(),
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    let run = store
-        .get_run(run_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("TaskRun disappeared while finishing RunTurn: {run_id}"))?;
-    if continuation.enabled && !store.is_run_driver_admission_open() {
-        if run.status == TaskRunStatus::Running {
-            let _paused = store
-                .request_pause_with_reason(
-                    run_id,
-                    RunPauseReason::BootRecovery,
-                    Some("application shutdown interrupted an active continuation turn"),
-                )
-                .map_err(|error| error.to_string())?;
-        }
-        return Ok(RunTurnDecision::Stop);
-    }
-    if let TurnOutcome::Failed(failure) = &outcome.terminal
-        && failure.retryable
-        && failure.category == echo_agent::error::AgentFailureCategory::Llm
-    {
-        let fingerprint = error_fingerprint
-            .as_deref()
-            .ok_or_else(|| "typed provider failure lost its stable fingerprint".to_string())?;
-        return store
-            .schedule_provider_retry(run_id, fingerprint)
-            .map(|disposition| match disposition {
-                crate::tasks::task_runtime::store::ProviderRetryDisposition::Scheduled(_) => {
-                    RunTurnDecision::Continue
-                }
-                crate::tasks::task_runtime::store::ProviderRetryDisposition::Exhausted(_) => {
-                    RunTurnDecision::Stop
-                }
-            })
-            .map_err(|error| error.to_string());
-    }
-    if run.status != TaskRunStatus::Running {
-        return Ok(RunTurnDecision::Stop);
-    }
-
-    match &outcome.terminal {
-        TurnOutcome::Cancelled => {
-            store
-                .transition_run(run_id, TaskRunStatus::Cancelled)
-                .map_err(|error| error.to_string())?;
-            store
-                .stop_owned_command_cells(run_id)
-                .map_err(|error| error.to_string())?;
-            if let Some(trace_sink) = trace_sink {
-                trace_sink(ExecEvent::run(
-                    run.workspace_id.clone(),
-                    run.conversation_id.clone(),
-                    run_id.to_string(),
-                    RuntimeEventKind::RunCancelled,
-                    serde_json::json!({ "status": "cancelled", "mode": "task" }),
-                ));
-            }
-            return Ok(RunTurnDecision::Stop);
-        }
-        TurnOutcome::Failed(failure) => {
-            if failure.retryable {
-                let _paused = store
-                    .request_pause_with_reason(
-                        run_id,
-                        RunPauseReason::NeedsInput,
-                        Some(&failure.message),
-                    )
-                    .map_err(|error| error.to_string())?;
-            } else {
-                store
-                    .transition_run(run_id, TaskRunStatus::Failed)
-                    .map_err(|error| error.to_string())?;
-            }
-            return Ok(RunTurnDecision::Stop);
-        }
-        TurnOutcome::Completed => {}
-    }
-
-    if continuation
-        .token_budget
-        .is_some_and(|budget| continuation.tokens_used >= budget)
-    {
-        let _paused = store
-            .request_pause_with_reason(
-                run_id,
-                RunPauseReason::TokenBudget,
-                Some("the configured long-horizon token budget was exhausted"),
-            )
-            .map_err(|error| error.to_string())?;
-        return Ok(RunTurnDecision::Stop);
-    }
-    if continuation
-        .time_budget_seconds
-        .is_some_and(|budget| continuation.time_used_seconds >= budget)
-    {
-        let _paused = store
-            .request_pause_with_reason(
-                run_id,
-                RunPauseReason::TimeBudget,
-                Some("the configured long-horizon time budget was exhausted"),
-            )
-            .map_err(|error| error.to_string())?;
-        return Ok(RunTurnDecision::Stop);
-    }
-    let active_cells = store
-        .defer_continuation_for_active_cells(run_id)
-        .map_err(|error| error.to_string())?;
-    if active_cells > 0 {
-        tracing::info!(
-            run_id,
-            active_cells,
-            "long-horizon continuation deferred until background cells settle"
-        );
-        return Ok(RunTurnDecision::Stop);
-    }
-    if continuation
-        .blocker_audit
-        .as_ref()
-        .is_some_and(|audit| audit.consecutive_turns >= 3)
-    {
-        let _paused = store
-            .request_pause_with_reason(
-                run_id,
-                RunPauseReason::RepeatedBlocker,
-                Some("three consecutive RunTurns ended without TaskRuntime progress"),
-            )
-            .map_err(|error| error.to_string())?;
-        return Ok(RunTurnDecision::Stop);
-    }
-    if continuation.enabled && !continuation.deferred {
-        return Ok(RunTurnDecision::Continue);
-    }
-
-    let reason = match store.get_plan(run_id) {
-        Ok(Some(_)) => "Task mode turn ended before task_execute reached a terminal result",
-        _ => "Task mode turn ended without creating a formal plan",
-    };
-    store
-        .note(run_id, None, reason)
-        .map_err(|error| error.to_string())?;
-    store
-        .transition_run(run_id, TaskRunStatus::Failed)
-        .map_err(|error| error.to_string())?;
-    if let Some(trace_sink) = trace_sink {
-        trace_sink(ExecEvent::run(
-            run.workspace_id,
-            run.conversation_id,
-            run_id.to_string(),
-            RuntimeEventKind::RunFailed,
-            serde_json::json!({ "error": reason, "mode": "task" }),
-        ));
-    }
-    Ok(RunTurnDecision::Stop)
-}
-
-fn agent_failure_fingerprint(failure: &echo_agent::error::AgentFailure) -> String {
-    let typed_identity = format!(
-        "{:?}|{:?}|{}|{}",
-        failure.category,
-        failure.terminal_kind,
-        failure.code,
-        failure
-            .http_status
-            .map(|status| status.to_string())
-            .unwrap_or_else(|| "none".to_string())
-    );
-    crate::tasks::task_runtime::task_goal_sha256(&typed_identity)
+) -> Result<crate::tasks::task_runtime::turn_lifecycle::RunTurnDecision, String> {
+    let blocking = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone());
+    crate::tasks::task_runtime::turn_lifecycle::finalize_run_turn(
+        &blocking,
+        store,
+        run_id,
+        &crate::tasks::task_runtime::turn_lifecycle::RunTurnTerminal {
+            turn_id: &outcome.turn_id,
+            terminal: &outcome.terminal,
+            elapsed_seconds: outcome.elapsed_seconds,
+            final_message_id: outcome.final_message_id.as_deref(),
+        },
+        trace_sink,
+    )
+    .await
 }
 
 fn observe_execution_path(
@@ -1608,6 +1387,7 @@ fn project_eko_turn_event(
             AgentEvent::LlmUsage {
                 prompt_tokens,
                 completion_tokens,
+                usage_reported: true,
                 ..
             } => {
                 if let Some(store) = runtime_store {
@@ -2033,8 +1813,8 @@ mod tests {
         Ok(store)
     }
 
-    #[test]
-    fn typed_retryable_llm_failure_schedules_without_persisting_provider_message()
+    #[tokio::test]
+    async fn typed_retryable_llm_failure_schedules_without_persisting_provider_message()
     -> Result<(), String> {
         let store = prepare_run_turn_for_finalization("provider-retry", "provider-turn")?;
         let failure = echo_agent::error::AgentFailure {
@@ -2047,7 +1827,7 @@ mod tests {
         };
         let outcome = ChatTurnOutcome::failed("provider-turn".to_string(), failure);
         assert_eq!(
-            finalize_run_turn(&store, "provider-retry", &outcome, None)?,
+            finalize_run_turn(&store, "provider-retry", &outcome, None).await?,
             RunTurnDecision::Continue
         );
         let snapshot = store
@@ -2130,14 +1910,15 @@ mod tests {
         );
         assert!(failure.retryable);
         assert_eq!(
-            finalize_run_turn(&store, "setup-retry", &outcome, None)?,
+            finalize_run_turn(&store, "setup-retry", &outcome, None).await?,
             RunTurnDecision::Continue
         );
         Ok(())
     }
 
-    #[test]
-    fn retryable_non_llm_failure_requires_input_instead_of_provider_retry() -> Result<(), String> {
+    #[tokio::test]
+    async fn retryable_non_llm_failure_requires_input_instead_of_provider_retry()
+    -> Result<(), String> {
         let store = prepare_run_turn_for_finalization("io-failure", "io-turn")?;
         let failure = echo_agent::error::AgentFailure {
             category: echo_agent::error::AgentFailureCategory::Io,
@@ -2149,7 +1930,7 @@ mod tests {
         };
         let outcome = ChatTurnOutcome::failed("io-turn".to_string(), failure);
         assert_eq!(
-            finalize_run_turn(&store, "io-failure", &outcome, None)?,
+            finalize_run_turn(&store, "io-failure", &outcome, None).await?,
             RunTurnDecision::Stop
         );
         let continuation = store
@@ -2165,8 +1946,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn provider_failure_at_token_limit_pauses_as_provider_unavailable() -> Result<(), String> {
+    #[tokio::test]
+    async fn provider_failure_at_token_limit_pauses_as_provider_unavailable() -> Result<(), String>
+    {
         let store = prepare_run_turn_for_finalization("provider-budget", "budget-turn")?;
         store
             .update_run_continuation_budgets("provider-budget", Some(1), None)
@@ -2186,7 +1968,7 @@ mod tests {
         };
         let outcome = ChatTurnOutcome::failed("budget-turn".to_string(), failure);
         assert_eq!(
-            finalize_run_turn(&store, "provider-budget", &outcome, None)?,
+            finalize_run_turn(&store, "provider-budget", &outcome, None).await?,
             RunTurnDecision::Stop
         );
         let continuation = store
@@ -2417,11 +2199,42 @@ mod tests {
     #[tokio::test]
     async fn eko_turn_sink_preserves_product_receipt_fields() -> Result<(), String> {
         let sink = std::sync::Arc::new(MockChatSink::default());
+        let store = std::sync::Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let workspace_id = store.active_workspace_id();
+        store
+            .create_run(
+                "receipt-run",
+                &workspace_id,
+                "receipt-conversation",
+                "receipt-message",
+                crate::tasks::task_runtime::DomainProfile::General,
+                "account reported usage",
+                "test",
+                crate::tasks::task_runtime::AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("receipt-run", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("receipt-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .claim_run_turn(
+                "receipt-run",
+                "receipt-turn",
+                RunTurnOrigin::User,
+                TurnVisibility::Visible,
+            )
+            .map_err(|error| error.to_string())?;
         let adapter = EkoTurnEventSink::new(
             sink.clone(),
             WebhookTurnObserver::new(None, "test-model".to_string()),
-            None,
-            None,
+            Some("receipt-run".to_string()),
+            Some(store.clone()),
             "receipt-turn".to_string(),
             TurnVisibility::Visible,
         );
@@ -2429,10 +2242,19 @@ mod tests {
             Some("receipt-conversation".to_string()),
             "receipt-turn",
             "receipt-turn",
-            None,
+            Some("receipt-run".to_string()),
         )
         .map_err(|error| error.to_string())?;
         let events = [
+            AgentEvent::LlmUsage {
+                model: "unreported".to_string(),
+                prompt_tokens: 100,
+                completion_tokens: 200,
+                total_tokens: 300,
+                cached_prompt_tokens: 0,
+                cache_creation_prompt_tokens: 0,
+                usage_reported: false,
+            },
             AgentEvent::LlmUsage {
                 model: "test-model".to_string(),
                 prompt_tokens: 11,
@@ -2470,7 +2292,13 @@ mod tests {
         assert_eq!(outcome.compaction_count, 1);
         assert_eq!(outcome.final_answer.as_deref(), Some("finished"));
         assert_eq!(outcome.final_message_id.as_deref(), Some("receipt-turn"));
-        assert_eq!(sink.event_count(), 3);
+        assert_eq!(sink.event_count(), 4);
+        let continuation = store
+            .get_run_state("receipt-run")
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| "receipt continuation missing".to_string())?;
+        assert_eq!(continuation.tokens_used, 18);
         Ok(())
     }
 
@@ -2501,10 +2329,12 @@ mod tests {
             AgentEvent::Token("undelivered".to_string()),
         )
         .map_err(|error| error.to_string())?;
-        let error = adapter
-            .on_event(envelope)
-            .await
-            .expect_err("rejected envelope must fail delivery");
+        let error = match adapter.on_event(envelope).await {
+            Err(error) => error,
+            Ok(control) => {
+                return Err(format!("rejected envelope was accepted with {control:?}"));
+            }
+        };
         assert!(error.to_string().contains("downstream_disconnect"));
 
         let outcome = adapter.finish("rejected-turn".to_string(), TurnOutcome::Cancelled)?;
@@ -3601,6 +3431,13 @@ mod tests {
                 .map(|audit| audit.consecutive_turns),
             Some(3)
         );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while chat_sink.execution_paths().len() < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "third continuation execution path was not projected".to_string())?;
         assert_eq!(
             chat_sink.execution_paths(),
             vec![
@@ -4343,7 +4180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drive_chat_streams_agent_events_via_sink() {
+    async fn drive_chat_streams_agent_events_via_sink() -> Result<(), String> {
         use echo_agent::agent::CancellationToken;
         use std::sync::Arc;
         let mock = Arc::new(
@@ -4356,14 +4193,14 @@ mod tests {
                 .model("t")
                 .llm_client(mock)
                 .build()
-                .expect("test agent should build"),
+                .map_err(|error| error.to_string())?,
         );
         let cancel = CancellationToken::new();
         let chat_sink = Arc::new(MockChatSink::default());
         let sink: Arc<dyn ChatSink> = chat_sink.clone();
         let store = Arc::new(
             crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
-                .expect("in-memory store"),
+                .map_err(|error| error.to_string())?,
         );
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
@@ -4381,9 +4218,7 @@ mod tests {
             memory_generation: None,
             human_loop_provider: None,
         });
-        let outcome = drive_chat(&agent, &make_turn("hi"), res)
-            .await
-            .expect("drive_chat should succeed");
+        let outcome = drive_chat(&agent, &make_turn("hi"), res).await?;
         assert_eq!(outcome, TurnOutcome::Completed);
         // The agent's FinalAnswer is streamed through the sink.
         assert!(
@@ -4398,7 +4233,7 @@ mod tests {
         assert!(
             store
                 .get_run(&crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("m1"))
-                .expect("read task run")
+                .map_err(|error| error.to_string())?
                 .is_none(),
             "ordinary chat must not create a TaskRun"
         );
@@ -4412,6 +4247,7 @@ mod tests {
             "optional no-run driver should settle normally: {shutdown_result:?}"
         );
         assert_eq!(store.active_run_driver_count().unwrap_or_default(), 0);
+        Ok(())
     }
 
     #[tokio::test]

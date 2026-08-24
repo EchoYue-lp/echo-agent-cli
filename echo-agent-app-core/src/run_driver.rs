@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use echo_agent::agent::CancellationToken;
 use echo_agent::evolution::MemoryLayerManager;
+use echo_agent::human_loop::HumanLoopProvider;
 
 use crate::agent_pool::AgentPool;
 use crate::tasks::task_runtime::executor::{
@@ -55,6 +56,10 @@ pub struct RunPayload {
     pub prompt: String,
     /// Whether this Run must materialize a formal plan before completion.
     pub plan_policy: RunPlanPolicy,
+    /// Surface-owned approval/input transport for an attended independent run.
+    /// Unattended launchers pass `None`, so they never wait on an interactive
+    /// provider that has no owner.
+    pub human_loop_provider: Option<Arc<dyn HumanLoopProvider>>,
     pub(crate) receipt_owner: crate::tasks::task_runtime::store::RunDriverReceiptOwner,
 }
 
@@ -67,6 +72,16 @@ struct RunExecutionPayload {
     trace_sink: Option<ExecSink>,
     prompt: String,
     plan_policy: RunPlanPolicy,
+}
+
+fn admitted_human_loop_provider(
+    attended_mode: crate::tasks::task_runtime::AttendedMode,
+    provider: Option<Arc<dyn HumanLoopProvider>>,
+) -> Option<Arc<dyn HumanLoopProvider>> {
+    match attended_mode {
+        crate::tasks::task_runtime::AttendedMode::Attended => provider,
+        crate::tasks::task_runtime::AttendedMode::Unattended => None,
+    }
 }
 
 /// Drive an already-created TaskRuntime run to completion on an isolated pool
@@ -84,6 +99,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         trace_sink,
         prompt,
         plan_policy,
+        human_loop_provider,
         mut receipt_owner,
     } = payload;
     if let Some(generation) = memory_generation.as_ref() {
@@ -102,6 +118,27 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
     };
     let pool_agent = pool_lease.agent();
     receipt_owner.retain(pool.retain_for_supervised_run(run_id.clone(), pool_lease));
+    let hitl_run_id = run_id.clone();
+    let attended_mode = TaskRuntimeBlockingAdapter::new(store.clone())
+        .run("load independent run HITL policy", move |store| {
+            store
+                .get_run(&hitl_run_id)?
+                .map(|run| run.attended_mode)
+                .ok_or(crate::tasks::task_runtime::StoreError::RunNotFound(
+                    hitl_run_id,
+                ))
+        })
+        .await
+        .map_err(|error| format!("load independent run HITL policy failed: {error}"))?;
+    if let Some(provider) = admitted_human_loop_provider(attended_mode, human_loop_provider) {
+        pool_agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent.set_human_loop_provider_preserving_approvals(provider);
+                })
+            })
+            .await;
+    }
     let execute_plan =
         crate::tasks::task_runtime::ExecuteTaskTool::new(store.clone(), pool_agent.clone());
     pool_agent
@@ -241,6 +278,20 @@ async fn settle_driver_error(
 mod tests {
     use super::*;
 
+    struct FixedHumanLoopProvider;
+
+    impl HumanLoopProvider for FixedHumanLoopProvider {
+        fn request(
+            &self,
+            _request: echo_agent::human_loop::HumanLoopRequest,
+        ) -> futures::future::BoxFuture<
+            '_,
+            echo_agent::error::Result<echo_agent::human_loop::HumanLoopResponse>,
+        > {
+            Box::pin(async { Ok(echo_agent::human_loop::HumanLoopResponse::Approved) })
+        }
+    }
+
     /// Compile-time guarantee that `RunPayload` is `Send + 'static` — the
     /// prerequisite for `tokio::spawn(drive_run_async(payload))` on the
     /// background path (spec §5.6 mine 1). If any field loses `Send`, this
@@ -249,6 +300,23 @@ mod tests {
     fn run_payload_is_send_and_static() {
         fn assert_send_static<T: Send + 'static>() {}
         assert_send_static::<RunPayload>();
+    }
+
+    #[test]
+    fn independent_run_hitl_policy_preserves_only_attended_surface_provider() -> Result<(), String>
+    {
+        use crate::tasks::task_runtime::AttendedMode;
+
+        let provider: Arc<dyn HumanLoopProvider> = Arc::new(FixedHumanLoopProvider);
+        let attended =
+            admitted_human_loop_provider(AttendedMode::Attended, Some(Arc::clone(&provider)))
+                .ok_or_else(|| "attended run dropped its surface HITL provider".to_string())?;
+        assert!(Arc::ptr_eq(&attended, &provider));
+        assert!(
+            admitted_human_loop_provider(AttendedMode::Unattended, Some(provider)).is_none(),
+            "unattended run retained an interactive HITL provider"
+        );
+        Ok(())
     }
 
     /// Run-level cancel token roundtrip: cancellation does not release driver

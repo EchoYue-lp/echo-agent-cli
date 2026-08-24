@@ -1033,6 +1033,12 @@ impl CreateComplexTaskTool {
                 tracing::warn!(error = %e, "failed to bind attachments to run");
             }
         }
+        if let Err(e) = store.configure_run_continuation(&run_id, true, false, None, None) {
+            registration.fail_preparation(e.to_string());
+            return Ok(ToolResult::error(format!(
+                "Failed to configure run continuation: {e}"
+            )));
+        }
         if let Err(e) = store.transition_run(&run_id, super::types::TaskRunStatus::Running) {
             registration.fail_preparation(e.to_string());
             return Ok(ToolResult::error(format!(
@@ -1061,6 +1067,7 @@ impl CreateComplexTaskTool {
                 trace_sink,
                 prompt: run_prompt,
                 plan_policy,
+                human_loop_provider: res.human_loop_provider.clone(),
                 receipt_owner,
             })
         });

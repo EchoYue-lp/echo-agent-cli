@@ -52,6 +52,7 @@ pub mod store;
 pub mod subagent_control;
 pub mod task_execute_tool;
 pub mod task_tools;
+pub(crate) mod turn_lifecycle;
 pub mod types;
 pub mod worktree;
 

@@ -393,7 +393,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn scheduler_reservation_is_drained_by_concurrent_runtime_shutdown() -> Result<(), String>
+    async fn scheduler_reservation_is_boot_resumable_during_runtime_shutdown() -> Result<(), String>
     {
         let llm = MockLlmClient::new().with_response("should be cancelled");
         let agent = ReactAgentBuilder::new()
@@ -453,10 +453,24 @@ mod tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(store.active_run_driver_count()?, 0);
         assert_eq!(store.active_run_driver_receipt_count()?, 0);
-        let cancelled = store
-            .list_runs_in(&[TaskRunStatus::Cancelled])
+        let paused = store
+            .list_runs_in(&[TaskRunStatus::Paused])
             .map_err(|error| error.to_string())?;
-        assert_eq!(cancelled.len(), 1);
+        assert_eq!(paused.len(), 1);
+        let run_id = paused
+            .first()
+            .map(|run| run.run_id.as_str())
+            .ok_or_else(|| "shutdown did not retain the accepted scheduler run".to_string())?;
+        let pause_reason = store
+            .get_run_state(run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .and_then(|continuation| continuation.pause)
+            .map(|pause| pause.reason);
+        assert_eq!(
+            pause_reason,
+            Some(crate::tasks::task_runtime::RunPauseReason::BootRecovery)
+        );
         Ok(())
     }
 }

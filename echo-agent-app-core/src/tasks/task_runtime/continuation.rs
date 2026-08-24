@@ -124,10 +124,16 @@ struct ActiveDispatch {
     cancel: CancellationToken,
 }
 
+struct OwnedWake {
+    generation: u64,
+    wake: std::sync::Weak<tokio::sync::Notify>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ContinuationGenerationCut {
     launcher: Option<u64>,
     active: Option<u64>,
+    owned: Option<u64>,
 }
 
 impl ContinuationGenerationCut {
@@ -147,6 +153,7 @@ struct ContinuationState {
     launchers: HashMap<String, RegisteredLauncher>,
     active: HashMap<String, ActiveDispatch>,
     pending_wakeups: HashSet<String>,
+    owned_wakes: HashMap<String, OwnedWake>,
     next_generation: u64,
 }
 
@@ -705,18 +712,29 @@ impl TaskContinuationRuntime {
     }
 
     fn wake(self: &Arc<Self>, run_id: &str) {
-        let request_now = {
+        let (owned_wake, request_now) = {
             let mut state = self
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if state.active.contains_key(run_id) {
+            let owned_wake = state
+                .owned_wakes
+                .get(run_id)
+                .and_then(|owned| owned.wake.upgrade());
+            let request_now = if owned_wake.is_some() {
+                false
+            } else if state.active.contains_key(run_id) {
                 state.pending_wakeups.insert(run_id.to_string());
                 false
             } else {
                 true
-            }
+            };
+            (owned_wake, request_now)
         };
+        if let Some(wake) = owned_wake {
+            wake.notify_one();
+            return;
+        }
         if request_now {
             let outcome = self.request(run_id, RunTurnOrigin::Continuation);
             tracing::debug!(run_id, ?outcome, "continuation wake requested");
@@ -731,11 +749,12 @@ impl TaskContinuationRuntime {
         ContinuationGenerationCut {
             launcher: state.launchers.get(run_id).map(|entry| entry.generation),
             active: state.active.get(run_id).map(|entry| entry.generation),
+            owned: state.owned_wakes.get(run_id).map(|entry| entry.generation),
         }
     }
 
     fn clear_launcher_at_cut(&self, run_id: &str, cut: ContinuationGenerationCut) {
-        let (launcher, dispatch_cancel) = {
+        let (launcher, dispatch_cancel, owned_wake) = {
             let mut state = self
                 .state
                 .lock()
@@ -753,16 +772,24 @@ impl TaskContinuationRuntime {
             if launcher.is_some() || dispatch_cancel.is_some() {
                 state.pending_wakeups.remove(run_id);
             }
-            (launcher, dispatch_cancel)
+            let owned_wake = state.owned_wakes.get(run_id).and_then(|owned| {
+                (cut.owned == Some(owned.generation))
+                    .then(|| owned.wake.upgrade())
+                    .flatten()
+            });
+            (launcher, dispatch_cancel, owned_wake)
         };
         drop(launcher);
         if let Some(dispatch_cancel) = dispatch_cancel {
             dispatch_cancel.cancel();
         }
+        if let Some(owned_wake) = owned_wake {
+            owned_wake.notify_one();
+        }
     }
 
     fn clear_launcher_unconditional(&self, run_id: &str) {
-        let (launcher, dispatch_cancel) = {
+        let (launcher, dispatch_cancel, owned_wake) = {
             let mut state = self
                 .state
                 .lock()
@@ -770,17 +797,24 @@ impl TaskContinuationRuntime {
             let launcher = state.launchers.remove(run_id);
             state.pending_wakeups.remove(run_id);
             let dispatch_cancel = state.active.get(run_id).map(|active| active.cancel.clone());
-            (launcher, dispatch_cancel)
+            let owned_wake = state
+                .owned_wakes
+                .get(run_id)
+                .and_then(|owned| owned.wake.upgrade());
+            (launcher, dispatch_cancel, owned_wake)
         };
         drop(launcher);
         if let Some(dispatch_cancel) = dispatch_cancel {
             dispatch_cancel.cancel();
         }
+        if let Some(owned_wake) = owned_wake {
+            owned_wake.notify_one();
+        }
     }
 
     fn clear_all_launchers(&self) {
         self.shutdown.cancel();
-        let (launchers, dispatch_cancels) = {
+        let (launchers, dispatch_cancels, owned_wakes) = {
             let mut state = self
                 .state
                 .lock()
@@ -792,11 +826,19 @@ impl TaskContinuationRuntime {
                 .values()
                 .map(|active| active.cancel.clone())
                 .collect::<Vec<_>>();
-            (launchers, dispatch_cancels)
+            let owned_wakes = state
+                .owned_wakes
+                .values()
+                .filter_map(|owned| owned.wake.upgrade())
+                .collect::<Vec<_>>();
+            (launchers, dispatch_cancels, owned_wakes)
         };
         drop(launchers);
         for dispatch_cancel in dispatch_cancels {
             dispatch_cancel.cancel();
+        }
+        for owned_wake in owned_wakes {
+            owned_wake.notify_one();
         }
     }
 }
@@ -1009,6 +1051,84 @@ fn continuation_eligibility(store: &TaskRuntimeStore, run_id: &str) -> Continuat
         return ContinuationEligibility::Stop;
     }
     ContinuationEligibility::Ready
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnedContinueOutcome {
+    Ready,
+    Stop,
+    Cancelled,
+    Shutdown,
+}
+
+/// Wait for the next finite turn while the current canonical driver still owns
+/// its registration. This shares the detached runtime's eligibility, durable
+/// provider deadline, shutdown token, and cell wake source, but owns no second
+/// active/generation/pending state.
+pub(crate) async fn await_owned_continue(
+    store: &Arc<TaskRuntimeStore>,
+    run_id: &str,
+    cancel: &CancellationToken,
+) -> OwnedContinueOutcome {
+    let runtime = runtime_for(store);
+    let wake = Arc::new(tokio::sync::Notify::new());
+    let owned_generation = {
+        let mut state = runtime
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.next_generation = state.next_generation.saturating_add(1).max(1);
+        let generation = state.next_generation;
+        state.owned_wakes.insert(
+            run_id.to_string(),
+            OwnedWake {
+                generation,
+                wake: Arc::downgrade(&wake),
+            },
+        );
+        generation
+    };
+
+    let outcome = loop {
+        let notified = wake.notified();
+        match continuation_eligibility(store, run_id) {
+            ContinuationEligibility::Ready => break OwnedContinueOutcome::Ready,
+            ContinuationEligibility::Stop => break OwnedContinueOutcome::Stop,
+            ContinuationEligibility::Deferred => {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break OwnedContinueOutcome::Cancelled,
+                    _ = runtime.shutdown.cancelled() => break OwnedContinueOutcome::Shutdown,
+                    _ = notified => {}
+                }
+            }
+            ContinuationEligibility::RetryAt(deadline) => {
+                let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break OwnedContinueOutcome::Cancelled,
+                    _ = runtime.shutdown.cancelled() => break OwnedContinueOutcome::Shutdown,
+                    _ = notified => {}
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+        }
+    };
+    let mut state = runtime
+        .state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let matches_current = state.owned_wakes.get(run_id).is_some_and(|registered| {
+        registered.generation == owned_generation
+            && registered
+                .wake
+                .upgrade()
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &wake))
+    });
+    if matches_current {
+        state.owned_wakes.remove(run_id);
+    }
+    outcome
 }
 
 fn runtime_for(store: &Arc<TaskRuntimeStore>) -> Arc<TaskContinuationRuntime> {
@@ -1352,6 +1472,135 @@ mod tests {
                 crate::chat_driver::TurnOutcome::Completed
             }
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owned_driver_waits_for_deferred_wake_without_detached_handoff() -> Result<(), String> {
+        use super::super::types::{AttendedMode, DomainProfile};
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        store
+            .create_run(
+                "owned-deferred",
+                "default",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "wait for cells",
+                "test",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("owned-deferred", true, true, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("owned-deferred", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_continuation_deferred("owned-deferred", true)
+            .map_err(|error| error.to_string())?;
+
+        let waiter_store = store.clone();
+        let wait = tokio::spawn(async move {
+            await_owned_continue(&waiter_store, "owned-deferred", &CancellationToken::new()).await
+        });
+        let runtime = runtime_for(&store);
+        for _ in 0..64 {
+            if runtime
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .owned_wakes
+                .contains_key("owned-deferred")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            runtime
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .owned_wakes
+                .contains_key("owned-deferred"),
+            "owned waiter did not register its wake source"
+        );
+        store
+            .set_continuation_deferred("owned-deferred", false)
+            .map_err(|error| error.to_string())?;
+        runtime.wake("owned-deferred");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+            .await
+            .map_err(|_| "owned deferred waiter missed its wake".to_string())?
+            .map_err(|error| error.to_string())?;
+        assert_eq!(outcome, OwnedContinueOutcome::Ready);
+        assert!(
+            runtime_for(&store)
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .active
+                .is_empty(),
+            "owned waiter created detached active state"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn generation_cut_preserves_replacement_owned_waiter() -> Result<(), String> {
+        let runtime = TaskContinuationRuntime::new(Weak::new());
+        let old_wake = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .map_err(|_| "continuation state is unavailable".to_string())?;
+            state.owned_wakes.insert(
+                "run".to_string(),
+                OwnedWake {
+                    generation: 1,
+                    wake: Arc::downgrade(&old_wake),
+                },
+            );
+        }
+        let old_cut = runtime.capture_generation_cut("run");
+        let replacement_wake = Arc::new(tokio::sync::Notify::new());
+        {
+            let mut state = runtime
+                .state
+                .lock()
+                .map_err(|_| "continuation state is unavailable".to_string())?;
+            state.owned_wakes.insert(
+                "run".to_string(),
+                OwnedWake {
+                    generation: 2,
+                    wake: Arc::downgrade(&replacement_wake),
+                },
+            );
+        }
+
+        runtime.clear_launcher_at_cut("run", old_cut);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                replacement_wake.notified(),
+            )
+            .await
+            .is_err(),
+            "an old control cut woke the replacement owned driver"
+        );
+
+        runtime.clear_launcher_unconditional("run");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            replacement_wake.notified(),
+        )
+        .await
+        .map_err(|_| "unconditional clear did not wake the current owned driver".to_string())?;
         Ok(())
     }
 

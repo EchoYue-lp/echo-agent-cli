@@ -38,7 +38,9 @@ use std::sync::Arc;
 
 use echo_agent::agent::subagent::{ContextTransferPolicy, SubagentPromptInput};
 use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
-use futures::StreamExt;
+use echo_agent::runtime::{
+    AgentTurnDriver, EventSink, SinkControl, TurnMode, TurnOutcome, TurnReceipt, TurnRequest,
+};
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
 /// Process-wide EKO resource ceiling shared by every workspace and TaskRun.
@@ -431,12 +433,6 @@ pub enum RunPlanPolicy {
     AllowDirect,
 }
 
-#[derive(Debug, Default)]
-struct AgentDriveStreamResult {
-    failure: Option<String>,
-    final_answer: Option<String>,
-}
-
 /// Workspace-mutating tools that an unattended primary Agent must not call
 /// directly unless the user explicitly selected `InPlace` mode.
 ///
@@ -459,11 +455,12 @@ const UNATTENDED_DIRECT_MUTATION_TOOLS: [&str; 12] = [
     "create_complex_task",
 ];
 
-fn unattended_direct_disabled_tools(
+fn direct_mutation_disabled_tools(
     attended_mode: AttendedMode,
     write_mode: UnattendedWriteMode,
 ) -> Option<HashSet<String>> {
-    if attended_mode != AttendedMode::Unattended || write_mode == UnattendedWriteMode::InPlace {
+    let _ = attended_mode;
+    if write_mode == UnattendedWriteMode::InPlace {
         return None;
     }
     Some(
@@ -692,15 +689,21 @@ pub async fn execute_run(
     // Run record when a RunStore is available.
     match &outcome {
         Ok(RunOutcome::Completed) => {
-            let final_run_id = run_id.to_string();
-            blocking
-                .run("finalize completed runtime run", move |store| {
+            let status_run_id = run_id.to_string();
+            let goal_completed = blocking
+                .run("inspect runtime Goal completion", move |store| {
                     store
-                        .finalize_run(&final_run_id, TaskRunStatus::Completed, None)
-                        .map(|_| ())
+                        .get_run(&status_run_id)?
+                        .map(|run| run.status == TaskRunStatus::Completed)
+                        .ok_or(StoreError::RunNotFound(status_run_id))
                 })
                 .await
                 .map_err(|error| ExecError::Other(error.to_string()))?;
+            if !goal_completed {
+                // The active RunTurn owns the atomic RunTurnFinished + Goal
+                // completion batch and publishes the terminal projection.
+                return outcome;
+            }
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
@@ -711,8 +714,9 @@ pub async fn execute_run(
                     serde_json::json!({ "status": "completed" }),
                 ),
             );
-            // Completion was already committed atomically by
-            // complete_run_if_quiescent inside the drain loop.
+            // With an active primary RunTurn, Goal completion is committed by
+            // turn_lifecycle in the same batch as RunTurnFinished. Without an
+            // active turn, complete_run_if_quiescent committed it above.
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -1421,6 +1425,23 @@ impl TaskExecutionUsage {
     fn duration_ms(&self) -> u64 {
         self.durable.duration_ms.unwrap_or(0)
     }
+
+    fn from_turn_receipt(receipt: &TurnReceipt) -> Self {
+        let duration_ms = u64::try_from(receipt.elapsed.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            durable: SubagentRunUsage {
+                duration_ms: Some(duration_ms),
+                tokens_used: (receipt.llm_calls > 0).then(|| {
+                    receipt
+                        .prompt_tokens
+                        .saturating_add(receipt.completion_tokens)
+                }),
+                iterations: None,
+            },
+            input_tokens: receipt.prompt_tokens,
+            output_tokens: receipt.completion_tokens,
+        }
+    }
 }
 
 async fn finalize_framework_subagent_result(
@@ -1462,6 +1483,7 @@ async fn finalize_framework_subagent_result(
             status,
             message,
             usage: Some(usage),
+            agent_failure: None,
         });
     }
     let task_result = SubagentTaskResult::from_framework(&result);
@@ -1473,6 +1495,7 @@ struct ExecutionFailure {
     status: SubagentRunStatus,
     message: String,
     usage: Option<TaskExecutionUsage>,
+    agent_failure: Option<echo_agent::error::AgentFailure>,
 }
 
 impl ExecutionFailure {
@@ -1481,6 +1504,7 @@ impl ExecutionFailure {
             status: SubagentRunStatus::Failed,
             message: message.into(),
             usage: None,
+            agent_failure: None,
         }
     }
 
@@ -1489,6 +1513,7 @@ impl ExecutionFailure {
             status: SubagentRunStatus::Cancelled,
             message: message.into(),
             usage: None,
+            agent_failure: None,
         }
     }
 
@@ -1506,6 +1531,7 @@ impl ExecutionFailure {
             status,
             message: message.into(),
             usage: None,
+            agent_failure: Some(failure.clone()),
         }
     }
 
@@ -1515,6 +1541,7 @@ impl ExecutionFailure {
             status,
             message: format!("{context}: {error}"),
             usage: None,
+            agent_failure: Some(echo_agent::error::AgentFailure::from_react_error(&error)),
         }
     }
 
@@ -1530,11 +1557,561 @@ impl std::fmt::Display for ExecutionFailure {
     }
 }
 
+fn attach_agent_failure_evidence(
+    result: &mut SubagentTaskResult,
+    failure: &echo_agent::error::AgentFailure,
+) {
+    result.evidence.push(SubagentEvidenceResult {
+        kind: "agent_failure".to_string(),
+        subject: failure.code.clone(),
+        outcome: Some(
+            match failure.terminal_kind {
+                echo_agent::error::AgentTerminalKind::Failed => "failed",
+                echo_agent::error::AgentTerminalKind::Cancelled => "cancelled",
+                echo_agent::error::AgentTerminalKind::TimedOut => "timed_out",
+                echo_agent::error::AgentTerminalKind::PermissionDenied => "permission_denied",
+            }
+            .to_string(),
+        ),
+        details: failure.message.chars().take(1_200).collect(),
+        source: SubagentVerificationSource::Observed,
+        attributes: serde_json::to_value(failure).unwrap_or(serde_json::Value::Null),
+    });
+}
+
+#[derive(Clone)]
+struct EkoAgentTurnContext {
+    workspace_id: String,
+    conversation_id: String,
+    run_id: String,
+    task_id: Option<String>,
+    execution_id: Option<String>,
+    agent_role: Option<String>,
+}
+
+impl EkoAgentTurnContext {
+    fn run(run: &TaskRun) -> Self {
+        Self {
+            workspace_id: run.workspace_id.clone(),
+            conversation_id: run.conversation_id.clone(),
+            run_id: run.run_id.clone(),
+            task_id: None,
+            execution_id: None,
+            agent_role: None,
+        }
+    }
+
+    fn primary_task(run: &TaskRun, task: &PlanTask, execution_id: &str) -> Self {
+        Self {
+            workspace_id: run.workspace_id.clone(),
+            conversation_id: run.conversation_id.clone(),
+            run_id: run.run_id.clone(),
+            task_id: Some(task.id.clone()),
+            execution_id: Some(execution_id.to_string()),
+            agent_role: Some(task.agent_role.clone()),
+        }
+    }
+
+    fn event(&self, kind: RuntimeEventKind, payload: serde_json::Value) -> ExecEvent {
+        let event = match (&self.task_id, &self.execution_id) {
+            (Some(task_id), Some(execution_id)) => ExecEvent::subagent(
+                self.workspace_id.clone(),
+                self.conversation_id.clone(),
+                self.run_id.clone(),
+                task_id.clone(),
+                execution_id.clone(),
+                kind,
+                payload,
+            ),
+            _ => ExecEvent::run(
+                self.workspace_id.clone(),
+                self.conversation_id.clone(),
+                self.run_id.clone(),
+                kind,
+                payload,
+            ),
+        };
+        if let Some(agent_role) = self.agent_role.as_ref() {
+            event.with_agent(agent_role.clone())
+        } else {
+            event
+        }
+    }
+}
+
+struct PrimaryTaskTurnPersistence {
+    blocking: TaskRuntimeBlockingAdapter,
+    replay_safe_tools: HashSet<String>,
+}
+
+struct RunTurnPersistence {
+    blocking: TaskRuntimeBlockingAdapter,
+    turn_id: String,
+}
+
+#[derive(Default)]
+struct EkoAgentTurnState {
+    output: String,
+    in_thinking: bool,
+    pending_verification: HashMap<String, String>,
+    pending_file_access: HashMap<String, (bool, String)>,
+    observed_evidence: Vec<echo_agent::agent::subagent::SubagentEvidence>,
+    observed_artifacts: Vec<echo_agent::agent::subagent::SubagentArtifact>,
+    mutating_tool_observed: bool,
+}
+
+struct EkoAgentTurnObservation {
+    output: String,
+    observed_evidence: Vec<echo_agent::agent::subagent::SubagentEvidence>,
+    observed_artifacts: Vec<echo_agent::agent::subagent::SubagentArtifact>,
+    mutating_tool_observed: bool,
+}
+
+/// The sole EKO adapter below [`AgentTurnDriver`] for TaskRuntime-owned turns.
+///
+/// Framework code owns stream startup, envelope sequencing, exact terminal
+/// detection, typed failures, cancellation, and provider-reported receipt
+/// accounting. This sink owns only EKO product projection and persistence:
+/// `ExecEvent`, exact event-id usage, tool boundaries, evidence, and artifacts.
+struct EkoAgentTurnSink {
+    context: EkoAgentTurnContext,
+    trace_sink: Option<ExecSink>,
+    primary_task: Option<PrimaryTaskTurnPersistence>,
+    run_turn: Option<RunTurnPersistence>,
+    mutating_tools: HashSet<String>,
+    state: std::sync::Mutex<EkoAgentTurnState>,
+}
+
+impl EkoAgentTurnSink {
+    fn for_run(
+        run: &TaskRun,
+        turn_id: &str,
+        blocking: TaskRuntimeBlockingAdapter,
+        mutating_tools: HashSet<String>,
+        trace_sink: Option<ExecSink>,
+    ) -> Self {
+        Self {
+            context: EkoAgentTurnContext::run(run),
+            trace_sink,
+            primary_task: None,
+            run_turn: Some(RunTurnPersistence {
+                blocking,
+                turn_id: turn_id.to_string(),
+            }),
+            mutating_tools,
+            state: std::sync::Mutex::new(EkoAgentTurnState::default()),
+        }
+    }
+
+    fn for_primary_task(
+        run: &TaskRun,
+        task: &PlanTask,
+        execution_id: &str,
+        blocking: TaskRuntimeBlockingAdapter,
+        replay_safe_tools: HashSet<String>,
+        trace_sink: Option<ExecSink>,
+    ) -> Self {
+        Self {
+            context: EkoAgentTurnContext::primary_task(run, task, execution_id),
+            trace_sink,
+            primary_task: Some(PrimaryTaskTurnPersistence {
+                blocking,
+                replay_safe_tools,
+            }),
+            run_turn: None,
+            mutating_tools: HashSet::new(),
+            state: std::sync::Mutex::new(EkoAgentTurnState::default()),
+        }
+    }
+
+    fn emit(&self, kind: RuntimeEventKind, payload: serde_json::Value) {
+        emit_exec(self.trace_sink.as_ref(), self.context.event(kind, payload));
+    }
+
+    fn finish(&self, final_answer: Option<&str>) -> EkoAgentTurnObservation {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(final_answer) = final_answer.filter(|answer| !answer.is_empty()) {
+            state.output = final_answer.to_string();
+        }
+        EkoAgentTurnObservation {
+            output: std::mem::take(&mut state.output),
+            observed_evidence: std::mem::take(&mut state.observed_evidence),
+            observed_artifacts: std::mem::take(&mut state.observed_artifacts),
+            mutating_tool_observed: state.mutating_tool_observed,
+        }
+    }
+
+    fn persistence_error(
+        operation: &str,
+        error: impl std::fmt::Display,
+    ) -> echo_agent::error::ReactError {
+        echo_agent::error::ReactError::Other(format!("{operation}: {error}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl EventSink for EkoAgentTurnSink {
+    async fn on_event(
+        &self,
+        envelope: echo_agent::agent::EventEnvelope,
+    ) -> echo_agent::error::Result<SinkControl> {
+        let source_event_id = envelope.event_id.to_string();
+        match envelope.payload {
+            AgentEvent::Token(content) => {
+                let in_thinking = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if !state.in_thinking {
+                        state.output.push_str(&content);
+                    }
+                    state.in_thinking
+                };
+                self.emit(
+                    if in_thinking {
+                        RuntimeEventKind::ThinkingDelta
+                    } else {
+                        RuntimeEventKind::TokenDelta
+                    },
+                    serde_json::json!({ "content": content }),
+                );
+            }
+            AgentEvent::ThinkStart => {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .in_thinking = true;
+                self.emit(RuntimeEventKind::ThinkingStarted, serde_json::json!({}));
+            }
+            AgentEvent::ThinkEnd {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                self.state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .in_thinking = false;
+                self.emit(
+                    RuntimeEventKind::ThinkingEnded,
+                    serde_json::json!({
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                    }),
+                );
+            }
+            AgentEvent::LlmUsage {
+                model,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                cached_prompt_tokens,
+                cache_creation_prompt_tokens,
+                usage_reported,
+            } => {
+                if usage_reported && let Some(primary_task) = self.primary_task.as_ref() {
+                    let run_id = self.context.run_id.clone();
+                    let execution_id = self.context.execution_id.clone().ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "primary task turn is missing its execution identity".to_string(),
+                        )
+                    })?;
+                    let input_tokens = u64::try_from(prompt_tokens).unwrap_or(u64::MAX);
+                    let output_tokens = u64::try_from(completion_tokens).unwrap_or(u64::MAX);
+                    let usage_event_id = source_event_id.clone();
+                    primary_task
+                        .blocking
+                        .run("persist primary Subagent usage", move |store| {
+                            store.account_subagent_usage(
+                                &run_id,
+                                &execution_id,
+                                &usage_event_id,
+                                input_tokens,
+                                output_tokens,
+                                0,
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            Self::persistence_error(
+                                "failed to persist primary Subagent usage",
+                                error,
+                            )
+                        })?;
+                }
+                if usage_reported && let Some(run_turn) = self.run_turn.as_ref() {
+                    let run_id = self.context.run_id.clone();
+                    let turn_id = run_turn.turn_id.clone();
+                    let input_tokens = u64::try_from(prompt_tokens).unwrap_or(u64::MAX);
+                    let output_tokens = u64::try_from(completion_tokens).unwrap_or(u64::MAX);
+                    let usage_event_id = source_event_id.clone();
+                    run_turn
+                        .blocking
+                        .run("persist primary RunTurn usage", move |store| {
+                            store
+                                .account_run_turn_usage(
+                                    &run_id,
+                                    &turn_id,
+                                    &usage_event_id,
+                                    input_tokens,
+                                    output_tokens,
+                                )
+                                .map(|_| ())
+                        })
+                        .await
+                        .map_err(|error| {
+                            Self::persistence_error(
+                                "failed to persist primary RunTurn usage",
+                                error,
+                            )
+                        })?;
+                }
+                self.emit(
+                    RuntimeEventKind::Usage,
+                    serde_json::json!({
+                        "model": model,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                        "cached_prompt_tokens": cached_prompt_tokens,
+                        "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
+                        "usage_reported": usage_reported,
+                        "usage_event_id": source_event_id,
+                    }),
+                );
+            }
+            AgentEvent::ToolCall {
+                call_id,
+                invocation,
+            } => {
+                let name = invocation.name.clone();
+                let args = invocation.args.clone();
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state.mutating_tool_observed |= self.mutating_tools.contains(&name);
+                    if let Some(check) = verification_check_from_agent_tool(&name, &args) {
+                        state.pending_verification.insert(call_id.clone(), check);
+                    }
+                    if let Some(access) = file_access_from_agent_tool(&name, &args) {
+                        state.pending_file_access.insert(call_id.clone(), access);
+                    }
+                }
+                if let Some(primary_task) = self.primary_task.as_ref() {
+                    let run_id = self.context.run_id.clone();
+                    let task_id = self.context.task_id.clone().ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "primary task turn is missing its task identity".to_string(),
+                        )
+                    })?;
+                    let execution_id = self.context.execution_id.clone().ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "primary task turn is missing its execution identity".to_string(),
+                        )
+                    })?;
+                    let tool_call_id = call_id.clone();
+                    let tool_name = name.clone();
+                    let replay_safe = primary_task.replay_safe_tools.contains(&name);
+                    primary_task
+                        .blocking
+                        .run("persist tool start boundary", move |store| {
+                            store.record_tool_started(
+                                &run_id,
+                                &task_id,
+                                &execution_id,
+                                &tool_call_id,
+                                &tool_name,
+                                replay_safe,
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            Self::persistence_error("failed to persist tool start boundary", error)
+                        })?;
+                }
+                self.emit(
+                    RuntimeEventKind::ToolStarted,
+                    serde_json::json!({
+                        "call_id": call_id,
+                        "invocation": invocation,
+                    }),
+                );
+            }
+            AgentEvent::ToolResult {
+                call_id,
+                name,
+                result,
+            } => {
+                let result_text = if result.success {
+                    result.output.clone()
+                } else {
+                    result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| result.output.clone())
+                };
+                {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(check) = state.pending_verification.remove(&call_id) {
+                        state.observed_evidence.push(
+                            echo_agent::agent::subagent::SubagentEvidence {
+                                kind: "verification".to_string(),
+                                subject: check,
+                                outcome: Some(if result.success {
+                                    "passed".to_string()
+                                } else {
+                                    "failed".to_string()
+                                }),
+                                details: result_text.chars().take(500).collect(),
+                                source:
+                                    echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                                attributes: serde_json::Value::Null,
+                            },
+                        );
+                    }
+                    if result.success
+                        && let Some((write, path)) = state.pending_file_access.remove(&call_id)
+                    {
+                        state.observed_evidence.push(
+                            echo_agent::agent::subagent::SubagentEvidence {
+                                kind: if write { "file_write" } else { "file_read" }.to_string(),
+                                subject: path,
+                                outcome: Some("succeeded".to_string()),
+                                details: String::new(),
+                                source:
+                                    echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
+                                attributes: serde_json::Value::Null,
+                            },
+                        );
+                    } else {
+                        state.pending_file_access.remove(&call_id);
+                    }
+                    if let Some(artifact) =
+                        echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(
+                            &result.metadata,
+                        )
+                    {
+                        state.observed_artifacts.push(
+                            echo_agent::agent::subagent::SubagentArtifact {
+                                path: artifact.path.to_string_lossy().to_string(),
+                                kind: "tool_log".to_string(),
+                                bytes: Some(artifact.artifact_bytes),
+                                sha256: Some(artifact.sha256),
+                                producer_execution_id: self.context.execution_id.clone(),
+                                available: artifact.path.is_file(),
+                            },
+                        );
+                    }
+                }
+                if let Some(primary_task) = self.primary_task.as_ref() {
+                    let run_id = self.context.run_id.clone();
+                    let task_id = self.context.task_id.clone().ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "primary task turn is missing its task identity".to_string(),
+                        )
+                    })?;
+                    let execution_id = self.context.execution_id.clone().ok_or_else(|| {
+                        echo_agent::error::ReactError::Other(
+                            "primary task turn is missing its execution identity".to_string(),
+                        )
+                    })?;
+                    let tool_call_id = call_id.clone();
+                    let tool_name = name.clone();
+                    let tool_result_text = result_text.clone();
+                    let tool_success = result.success;
+                    let tool_failure = result.failure.clone();
+                    primary_task
+                        .blocking
+                        .run("persist tool terminal boundary", move |store| {
+                            store.record_tool_finished(
+                                &run_id,
+                                &task_id,
+                                &execution_id,
+                                &tool_call_id,
+                                &tool_name,
+                                tool_success,
+                                &tool_result_text,
+                                tool_failure.as_ref(),
+                            )
+                        })
+                        .await
+                        .map_err(|error| {
+                            Self::persistence_error(
+                                "tool settled but its terminal boundary was not persisted",
+                                error,
+                            )
+                        })?;
+                }
+                self.emit(
+                    RuntimeEventKind::ToolCompleted,
+                    serde_json::json!({
+                        "call_id": call_id,
+                        "name": name,
+                        "result": result,
+                    }),
+                );
+            }
+            AgentEvent::ToolStream {
+                call_id,
+                name,
+                event,
+            } => {
+                let payload = match event {
+                    echo_agent::tools::ToolStreamEvent::Progress { message, percent } => {
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "name": name,
+                            "message": message,
+                            "percent": percent,
+                        })
+                    }
+                    echo_agent::tools::ToolStreamEvent::Output { channel, chunk } => {
+                        serde_json::json!({
+                            "call_id": call_id,
+                            "name": name,
+                            "channel": match channel {
+                                echo_agent::tools::ToolOutputChannel::Stdout => "stdout",
+                                echo_agent::tools::ToolOutputChannel::Stderr => "stderr",
+                                echo_agent::tools::ToolOutputChannel::Log => "log",
+                            },
+                            "chunk": chunk,
+                        })
+                    }
+                    echo_agent::tools::ToolStreamEvent::Complete(_) => {
+                        return Ok(SinkControl::Continue);
+                    }
+                };
+                self.emit(RuntimeEventKind::ToolOutput, payload);
+            }
+            AgentEvent::FinalAnswer(answer) => {
+                if !answer.is_empty() {
+                    self.state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .output = answer;
+                }
+            }
+            AgentEvent::Cancelled | AgentEvent::Error { .. } => {}
+            _ => {}
+        }
+        Ok(SinkControl::Continue)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TaskDispatchFailure {
     task_id: String,
     status: SubagentRunStatus,
     message: String,
+    agent_failure: Option<echo_agent::error::AgentFailure>,
 }
 
 impl TaskDispatchFailure {
@@ -1543,6 +2120,7 @@ impl TaskDispatchFailure {
             task_id: task_id.into(),
             status: SubagentRunStatus::Failed,
             message: message.into(),
+            agent_failure: None,
         }
     }
 
@@ -1551,6 +2129,7 @@ impl TaskDispatchFailure {
             task_id: task_id.into(),
             status: SubagentRunStatus::Cancelled,
             message: message.into(),
+            agent_failure: None,
         }
     }
 
@@ -1559,6 +2138,7 @@ impl TaskDispatchFailure {
             task_id: task_id.into(),
             status: failure.status,
             message: failure.message,
+            agent_failure: failure.agent_failure,
         }
     }
 
@@ -1614,6 +2194,7 @@ struct EkoRuntimeDagController<W: TaskDispatcher> {
     trace_sink: Option<ExecSink>,
     cancel: CancellationToken,
     resolution_metadata: std::sync::Mutex<HashMap<String, RuntimeTaskProductSettlement>>,
+    dispatch_failures: std::sync::Mutex<HashMap<String, TaskDispatchFailure>>,
 }
 
 #[derive(Clone)]
@@ -1915,6 +2496,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             ),
         }
 
+        let claim_id = claim.claim_id.clone();
         self.dispatcher
             .dispatch(
                 self.store.clone(),
@@ -1936,6 +2518,12 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         failure.task_id, active_task_id
                     ));
                 }
+                if failure.agent_failure.is_some() {
+                    self.dispatch_failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .insert(claim_id, failure.clone());
+                }
                 failure.into_react()
             })
     }
@@ -1951,29 +2539,69 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         let dispatched = match dispatch {
             Ok(dispatched) => dispatched,
             Err(error) => {
-                let message = error.to_string();
-                let status = echo_agent::agent::subagent::subagent_status_from_error(&error);
-                let request = match status {
-                    echo_agent::agent::subagent::SubagentStatus::Cancelled => {
-                        echo_agent::tasks::RuntimeTaskResolutionRequest::Cancelled
-                    }
-                    echo_agent::agent::subagent::SubagentStatus::TimedOut => {
-                        echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
-                            error: format!("Subagent timed out: {message}"),
+                let typed_failure = self
+                    .dispatch_failures
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&claim.claim_id)
+                    .and_then(|failure| failure.agent_failure);
+                let message = typed_failure
+                    .as_ref()
+                    .map(|failure| failure.message.clone())
+                    .unwrap_or_else(|| error.to_string());
+                let status = typed_failure
+                    .as_ref()
+                    .map(|failure| match failure.terminal_kind {
+                        echo_agent::error::AgentTerminalKind::Cancelled => {
+                            echo_agent::agent::subagent::SubagentStatus::Cancelled
                         }
+                        echo_agent::error::AgentTerminalKind::TimedOut => {
+                            echo_agent::agent::subagent::SubagentStatus::TimedOut
+                        }
+                        echo_agent::error::AgentTerminalKind::Failed
+                        | echo_agent::error::AgentTerminalKind::PermissionDenied => {
+                            echo_agent::agent::subagent::SubagentStatus::Failed
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        echo_agent::agent::subagent::subagent_status_from_error(&error)
+                    });
+                let request = if let Some(failure) = typed_failure.as_ref().filter(|failure| {
+                    failure.retryable
+                        && failure.category == echo_agent::error::AgentFailureCategory::Llm
+                }) {
+                    echo_agent::tasks::RuntimeTaskResolutionRequest::Requeue {
+                        failure_fingerprint: Some(
+                            super::turn_lifecycle::agent_failure_fingerprint(failure),
+                        ),
+                        error: failure.message.clone(),
                     }
-                    echo_agent::agent::subagent::SubagentStatus::Completed
-                    | echo_agent::agent::subagent::SubagentStatus::Failed => {
-                        echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
-                            error: message.clone(),
+                } else {
+                    match status {
+                        echo_agent::agent::subagent::SubagentStatus::Cancelled => {
+                            echo_agent::tasks::RuntimeTaskResolutionRequest::Cancelled
+                        }
+                        echo_agent::agent::subagent::SubagentStatus::TimedOut => {
+                            echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                                error: format!("Subagent timed out: {message}"),
+                            }
+                        }
+                        echo_agent::agent::subagent::SubagentStatus::Completed
+                        | echo_agent::agent::subagent::SubagentStatus::Failed => {
+                            echo_agent::tasks::RuntimeTaskResolutionRequest::Failed {
+                                error: message.clone(),
+                            }
                         }
                     }
                 };
-                let result = SubagentTaskResult::terminal(
+                let mut result = SubagentTaskResult::terminal(
                     status.into(),
                     message.clone(),
                     vec![message.clone()],
                 );
+                if let Some(failure) = typed_failure.as_ref() {
+                    attach_agent_failure_evidence(&mut result, failure);
+                }
                 self.stage_resolution_metadata(
                     &claim.claim_id,
                     RuntimeTaskProductSettlement {
@@ -1987,6 +2615,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         )),
                         review: None,
                         diagnostic_note: None,
+                        typed_terminal: typed_failure,
                     },
                 )?;
                 return Ok(request);
@@ -2021,6 +2650,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         )),
                         review: None,
                         diagnostic_note: None,
+                        typed_terminal: None,
                     },
                 )?;
                 Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Requeue {
@@ -2051,6 +2681,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                         )),
                         review: None,
                         diagnostic_note: Some(reason.clone()),
+                        typed_terminal: None,
                     },
                 )?;
                 Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
@@ -2111,6 +2742,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                             )),
                             review: review_candidate,
                             diagnostic_note: Some(reason.clone()),
+                            typed_terminal: None,
                         },
                     )?;
                     return Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Blocked {
@@ -2160,6 +2792,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                                 execution_summary: Some(execution_summary),
                                 review: review_candidate,
                                 diagnostic_note: None,
+                                typed_terminal: None,
                             },
                         )?;
                         Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Completed)
@@ -2183,6 +2816,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                                 )),
                                 review: review_candidate,
                                 diagnostic_note: Some(error.clone()),
+                                typed_terminal: None,
                             },
                         )?;
                         Ok(echo_agent::tasks::RuntimeTaskResolutionRequest::Failed { error })
@@ -2205,14 +2839,80 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&claim.claim_id)
             .unwrap_or_default();
+        let typed_timeout = matches!(
+            product
+                .typed_terminal
+                .as_ref()
+                .map(|failure| failure.terminal_kind),
+            Some(echo_agent::error::AgentTerminalKind::TimedOut)
+        );
+        let committed_payload = product
+            .execution_summary
+            .as_ref()
+            .map(|summary| {
+                serde_json::json!({
+                    "terminal_status": summary.result.status.as_str(),
+                    "summary": &summary.result.summary,
+                    "artifacts": &summary.result.artifacts,
+                    "verification": &summary.result.verification,
+                    "remaining_work": &summary.result.remaining_work,
+                    "touched_files": &summary.result.touched_files,
+                    "agent_failure": &product.typed_terminal,
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({}));
         let run_id = run_id.to_string();
         let task_id = runtime_task.spec.id.clone();
+        let agent_role = Self::plan_task(runtime_task)?.agent_role;
         let claim = claim.clone();
-        self.blocking
+        let (outcome, run) = self
+            .blocking
             .run("settle runtime task resolution", move |store| {
-                store.settle_runtime_task_resolution(&run_id, &task_id, &claim, request, product)
+                let outcome = store
+                    .settle_runtime_task_resolution(&run_id, &task_id, &claim, request, product)?;
+                let run = store.get_run(&run_id)?;
+                Ok((outcome, run))
             })
-            .await
+            .await?;
+        let terminal_event = match &outcome {
+            echo_agent::tasks::RuntimeTaskResolution::Completed => {
+                Some(RuntimeEventKind::TaskCompleted)
+            }
+            echo_agent::tasks::RuntimeTaskResolution::Skipped => {
+                Some(RuntimeEventKind::TaskSkipped)
+            }
+            echo_agent::tasks::RuntimeTaskResolution::Failed { .. } if typed_timeout => {
+                Some(RuntimeEventKind::TaskTimedOut)
+            }
+            echo_agent::tasks::RuntimeTaskResolution::Failed { .. } => {
+                Some(RuntimeEventKind::TaskFailed)
+            }
+            echo_agent::tasks::RuntimeTaskResolution::Blocked { .. } => {
+                Some(RuntimeEventKind::TaskBlocked)
+            }
+            echo_agent::tasks::RuntimeTaskResolution::Cancelled => {
+                Some(RuntimeEventKind::TaskCancelled)
+            }
+            echo_agent::tasks::RuntimeTaskResolution::Pending
+            | echo_agent::tasks::RuntimeTaskResolution::Superseded => None,
+        };
+        if let Some(run) = run
+            && let Some(terminal_event) = terminal_event
+        {
+            emit_exec(
+                self.trace_sink.as_ref(),
+                ExecEvent::task(
+                    run.workspace_id,
+                    run.conversation_id,
+                    run.run_id,
+                    runtime_task.spec.id.clone(),
+                    terminal_event,
+                    committed_payload,
+                )
+                .with_agent(agent_role),
+            );
+        }
+        Ok(outcome)
     }
 
     async fn abandon_claim(
@@ -2239,14 +2939,48 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 (echo_agent::tasks::TaskStatus::Failed(error.clone()), error)
             }
         };
+        let terminal_event = match &status {
+            echo_agent::tasks::TaskStatus::Cancelled => RuntimeEventKind::TaskCancelled,
+            echo_agent::tasks::TaskStatus::Paused(_) => RuntimeEventKind::TaskBlocked,
+            echo_agent::tasks::TaskStatus::Failed(_) => RuntimeEventKind::TaskFailed,
+            _ => RuntimeEventKind::TaskFailed,
+        };
+        let payload = serde_json::json!({ "summary": &summary });
+        let agent_role = Self::plan_task(runtime_task)?.agent_role;
         let run_id = run_id.to_string();
         let task_id = runtime_task.spec.id.clone();
         let claim = claim.clone();
-        self.blocking
+        let (outcome, run) = self
+            .blocking
             .run("settle abandoned runtime task claim", move |store| {
-                store.settle_runtime_task_claim(&run_id, &task_id, &claim, status, Some(summary))
+                let outcome = store.settle_runtime_task_claim(
+                    &run_id,
+                    &task_id,
+                    &claim,
+                    status,
+                    Some(summary),
+                )?;
+                let run = store.get_run(&run_id)?;
+                Ok((outcome, run))
             })
-            .await
+            .await?;
+        if outcome == echo_agent::tasks::RuntimeTaskSettlementOutcome::Settled
+            && let Some(run) = run
+        {
+            emit_exec(
+                self.trace_sink.as_ref(),
+                ExecEvent::task(
+                    run.workspace_id,
+                    run.conversation_id,
+                    run.run_id,
+                    runtime_task.spec.id.clone(),
+                    terminal_event,
+                    payload,
+                )
+                .with_agent(agent_role),
+            );
+        }
+        Ok(outcome)
     }
 
     async fn failed_task_disposition(
@@ -2326,6 +3060,7 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
         trace_sink,
         cancel: parent_cancel.clone(),
         resolution_metadata: std::sync::Mutex::new(HashMap::new()),
+        dispatch_failures: std::sync::Mutex::new(HashMap::new()),
     });
     let runtime_tasks = echo_agent::tasks::RuntimeTaskService::new(
         controller,
@@ -3217,18 +3952,6 @@ async fn execute_task(
                 )
                 .with_agent(task.agent_role.clone()),
             );
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::task(
-                    workspace_id.clone(),
-                    conversation_id.clone(),
-                    run_id.clone(),
-                    task_id.clone(),
-                    RuntimeEventKind::TaskCompleted,
-                    terminal_payload,
-                )
-                .with_agent(task.agent_role.clone()),
-            );
             Ok(TaskDispatchSuccess {
                 task_id,
                 result: task_result,
@@ -3240,8 +3963,12 @@ async fn execute_task(
             let status = failure.status;
             let message = failure.message;
             let usage = failure.usage;
-            let task_result =
+            let agent_failure = failure.agent_failure;
+            let mut task_result =
                 SubagentTaskResult::terminal(status, message.clone(), vec![message.clone()]);
+            if let Some(agent_failure) = agent_failure.as_ref() {
+                attach_agent_failure_evidence(&mut task_result, agent_failure);
+            }
             let persisted_run_id = run_id.clone();
             let persisted_task_id = task_id.clone();
             let persisted_execution_id = execution_id.clone();
@@ -3307,14 +4034,8 @@ async fn execute_task(
                 "remaining_work": &task_result.remaining_work,
                 "touched_files": &task_result.touched_files,
                 "usage": usage.as_ref().map(|value| &value.durable),
+                "agent_failure": &agent_failure,
             });
-            let task_terminal_event = match status {
-                SubagentRunStatus::Cancelled => RuntimeEventKind::TaskCancelled,
-                SubagentRunStatus::TimedOut => RuntimeEventKind::TaskTimedOut,
-                SubagentRunStatus::Running
-                | SubagentRunStatus::Completed
-                | SubagentRunStatus::Failed => RuntimeEventKind::TaskFailed,
-            };
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::subagent(
@@ -3328,24 +4049,13 @@ async fn execute_task(
                 )
                 .with_agent(task.agent_role.clone()),
             );
-            emit_exec(
-                trace_sink.as_ref(),
-                ExecEvent::task(
-                    workspace_id,
-                    conversation_id,
-                    run_id,
-                    task_id.clone(),
-                    task_terminal_event,
-                    terminal_payload,
-                )
-                .with_agent(task.agent_role.clone()),
-            );
             Err(TaskDispatchFailure::from_execution(
                 task_id,
                 ExecutionFailure {
                     status,
                     message,
                     usage,
+                    agent_failure,
                 },
             ))
         }
@@ -3888,6 +4598,24 @@ fn tool_call_is_replay_safe(agent: &echo_agent::agent::ReactAgent, tool_name: &s
     })
 }
 
+fn tool_call_may_mutate_workspace(agent: &echo_agent::agent::ReactAgent, tool_name: &str) -> bool {
+    if UNATTENDED_DIRECT_MUTATION_TOOLS.contains(&tool_name) {
+        return true;
+    }
+    agent
+        .tool_manager()
+        .get_tool(tool_name)
+        .is_some_and(|tool| {
+            tool.permissions().iter().any(|permission| {
+                matches!(
+                    permission,
+                    echo_agent::prelude::ToolPermission::Write
+                        | echo_agent::prelude::ToolPermission::Execute
+                )
+            })
+        })
+}
+
 fn verification_check_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<String> {
     let normalized = name.to_ascii_lowercase().replace('-', "_");
     if !matches!(
@@ -3937,12 +4665,9 @@ async fn run_main_agent_task(
     trace_sink: Option<ExecSink>,
 ) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
     let run_id = run_id.to_string();
-    let task_id = task.id.clone();
-    let agent_role = task.agent_role.clone();
     let execution_id = execution_id.to_string();
 
-    // Rebuild a multimodal Message when the run carries user attachments, so
-    // writer Subagents see the same images/files as the main agent (#1b).
+    // Preserve the user's attachments for primary verification tasks.
     let load_run_id = run_id.clone();
     let run_record = blocking
         .run("load primary task attachments", move |store| {
@@ -3954,16 +4679,11 @@ async fn run_main_agent_task(
         .map_err(|error| {
             ExecutionFailure::failed(format!("failed to load TaskRun identity: {error}"))
         })?;
-    let workspace_id = run_record.workspace_id.clone();
-    let conversation_id = run_record.conversation_id.clone();
     let root_message_id = Some(run_record.root_message_id.clone());
-    let run_message: Option<echo_agent::llm::types::Message> = {
-        let r = &run_record;
-        if r.attachments.is_empty() {
-            None
-        } else {
-            crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
-        }
+    let run_message = if run_record.attachments.is_empty() {
+        None
+    } else {
+        crate::attachments::build_message_from_refs(prompt, &run_record.attachments).ok()
     };
 
     primary_agent
@@ -3972,8 +4692,9 @@ async fn run_main_agent_task(
             let run_message = run_message.clone();
             let execution_id = execution_id.clone();
             let blocking = blocking.clone();
+            let run_record = run_record.clone();
+            let task = task.clone();
             Box::pin(async move {
-                let event_cancel = cancel.clone();
                 let visible_tools = crate::tool_exposure::initial_visible_tools(
                     InteractionMode::Task,
                     &agent.tool_names(),
@@ -3983,11 +4704,10 @@ async fn run_main_agent_task(
                     &agent.tool_definitions(),
                     &visible_tools,
                 );
-                let visible_tools = Some(visible_tools);
                 let invocation = echo_agent::agent::AgentInvocationContext {
                     history: None,
                     runtime: Some(echo_agent::tools::ExternalRunContext {
-                        conversation_id: Some(conversation_id.clone()),
+                        conversation_id: Some(run_record.conversation_id.clone()),
                         run_id: Some(run_id.clone()),
                         turn_id: root_message_id.clone(),
                         execution_id: Some(execution_id.clone()),
@@ -4002,435 +4722,64 @@ async fn run_main_agent_task(
                     disabled_tools: Some(crate::tool_exposure::disabled_tools_for_mode(
                         InteractionMode::Task,
                     )),
-                    visible_tools,
+                    visible_tools: Some(visible_tools),
                     run_budget: None,
                 };
                 let event_identity = echo_agent::agent::EventIdentity::from_invocation(&invocation)
-                    .map_err(|error| ExecutionFailure::from_react(error, "invalid task event identity"))?;
-                // Multimodal path when the run has attachments; plain text otherwise.
-                let raw_stream = if let Some(msg) = run_message {
-                    agent
-                        .execute_stream_message_with_invocation_context(
-                            msg,
-                            cancel,
-                            invocation,
-                        )
-                        .await
-                        .map_err(|error| {
-                            ExecutionFailure::from_react(error, "main agent stream failed")
-                        })?
-                } else {
-                    agent
-                        .execute_stream_with_invocation_context(&prompt, cancel, invocation)
-                        .await
-                        .map_err(|error| {
-                            ExecutionFailure::from_react(error, "main agent stream failed")
-                        })?
-                };
-                let mut stream = echo_agent::agent::envelope_event_stream(
-                    raw_stream,
-                    event_identity,
+                    .map_err(|error| {
+                        ExecutionFailure::from_react(error, "invalid task event identity")
+                    })?;
+                let replay_safe_tools = agent
+                    .tool_names()
+                    .into_iter()
+                    .filter(|name| tool_call_is_replay_safe(agent, name))
+                    .collect();
+                let sink = EkoAgentTurnSink::for_primary_task(
+                    &run_record,
+                    &task,
+                    &execution_id,
+                    blocking.clone(),
+                    replay_safe_tools,
+                    trace_sink,
                 );
-                let mut output = String::new();
-                let mut in_thinking = false;
-                let mut pending_verification = HashMap::<String, String>::new();
-                let mut pending_file_access = HashMap::<String, (bool, String)>::new();
-                let mut observed_evidence = Vec::new();
-                let mut observed_artifacts = Vec::new();
-                let started = std::time::Instant::now();
-                let mut usage = TaskExecutionUsage::default();
+                let request = match run_message {
+                    Some(message) => TurnRequest::from_message(event_identity, message),
+                    None => TurnRequest::new(event_identity, prompt),
+                }
+                .mode(TurnMode::Execute)
+                .cancel(cancel)
+                .invocation(invocation);
+                let receipt = AgentTurnDriver.drive(agent, request, &sink).await;
+                let usage = TaskExecutionUsage::from_turn_receipt(&receipt);
+                let observation = sink.finish(receipt.final_answer.as_deref());
 
-                while let Some(event_result) = stream.next().await {
-                    let envelope = event_result.map_err(|error| {
-                            ExecutionFailure::from_react(error, "main agent stream failed")
-                        })?;
-                    let source_event_id = envelope.event_id.to_string();
-                    let event = envelope.payload;
-                    match event {
-                        AgentEvent::Token(content) => {
-                            if in_thinking {
-                                emit_exec(
-                                    trace_sink.as_ref(),
-                                    ExecEvent::subagent(
-                                        workspace_id.clone(),
-                                        conversation_id.clone(),
-                                        run_id.clone(),
-                                        task_id.clone(),
-                                        execution_id.clone(),
-                                        RuntimeEventKind::ThinkingDelta,
-                                        serde_json::json!({ "content": content }),
-                                    )
-                                    .with_agent(agent_role.clone()),
-                                );
-                            } else {
-                                output.push_str(&content);
-                                emit_exec(
-                                    trace_sink.as_ref(),
-                                    ExecEvent::subagent(
-                                        workspace_id.clone(),
-                                        conversation_id.clone(),
-                                        run_id.clone(),
-                                        task_id.clone(),
-                                        execution_id.clone(),
-                                        RuntimeEventKind::TokenDelta,
-                                        serde_json::json!({ "content": content }),
-                                    )
-                                    .with_agent(agent_role.clone()),
-                                );
-                            }
-                        }
-                        AgentEvent::ThinkStart => {
-                            in_thinking = true;
-                            emit_exec(
-                                trace_sink.as_ref(),
-                                ExecEvent::subagent(
-                                    workspace_id.clone(),
-                                    conversation_id.clone(),
-                                    run_id.clone(),
-                                    task_id.clone(),
-                                    execution_id.clone(),
-                                    RuntimeEventKind::ThinkingStarted,
-                                    serde_json::json!({}),
-                                )
-                                .with_agent(agent_role.clone()),
-                            );
-                        }
-                        AgentEvent::ThinkEnd {
-                            prompt_tokens,
-                            completion_tokens,
-                        } => {
-                            in_thinking = false;
-                            emit_exec(
-                                trace_sink.as_ref(),
-                                ExecEvent::subagent(
-                                    workspace_id.clone(),
-                                    conversation_id.clone(),
-                                    run_id.clone(),
-                                    task_id.clone(),
-                                    execution_id.clone(),
-                                    RuntimeEventKind::ThinkingEnded,
-                                    serde_json::json!({
-                                        "prompt_tokens": prompt_tokens,
-                                        "completion_tokens": completion_tokens,
-                                    }),
-                                )
-                                .with_agent(agent_role.clone()),
-                            );
-                        }
-                        AgentEvent::LlmUsage {
-                            model,
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens,
-                            cached_prompt_tokens,
-                            cache_creation_prompt_tokens,
-                            usage_reported,
-                        } => {
-                            let input_tokens =
-                                u64::try_from(prompt_tokens).unwrap_or(u64::MAX);
-                            let output_tokens =
-                                u64::try_from(completion_tokens).unwrap_or(u64::MAX);
-                            usage.input_tokens =
-                                usage.input_tokens.saturating_add(input_tokens);
-                            usage.output_tokens =
-                                usage.output_tokens.saturating_add(output_tokens);
-                            let usage_run_id = run_id.clone();
-                            let usage_execution_id = execution_id.clone();
-                            let usage_event_id = source_event_id.clone();
-                            blocking
-                                .run("persist primary Subagent usage", move |store| {
-                                    store.account_subagent_usage(
-                                        &usage_run_id,
-                                        &usage_execution_id,
-                                        &usage_event_id,
-                                        input_tokens,
-                                        output_tokens,
-                                        0,
-                                    )
-                                })
-                                .await
-                                .map_err(|error| {
-                                    event_cancel.cancel();
-                                    ExecutionFailure::failed(format!(
-                                        "failed to persist primary Subagent usage: {error}"
-                                    ))
-                                    .with_usage(usage.clone())
-                                })?;
-                            let usage_payload = serde_json::json!({
-                                "model": model,
-                                "prompt_tokens": prompt_tokens,
-                                "completion_tokens": completion_tokens,
-                                "total_tokens": total_tokens,
-                                "cached_prompt_tokens": cached_prompt_tokens,
-                                "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
-                                "usage_reported": usage_reported,
-                                "usage_event_id": source_event_id,
-                            });
-                            emit_exec(
-                                trace_sink.as_ref(),
-                                ExecEvent::subagent(
-                                    workspace_id.clone(),
-                                    conversation_id.clone(),
-                                    run_id.clone(),
-                                    task_id.clone(),
-                                    execution_id.clone(),
-                                    RuntimeEventKind::Usage,
-                                    usage_payload,
-                                )
-                                .with_agent(agent_role.clone()),
-                            );
-                        }
-                        AgentEvent::ToolCall {
-                            call_id,
-                            invocation,
-                        } => {
-                            let name = &invocation.name;
-                            let args = &invocation.args;
-                            if let Some(check) = verification_check_from_agent_tool(name, args) {
-                                pending_verification.insert(call_id.clone(), check);
-                            }
-                            if let Some(access) = file_access_from_agent_tool(name, args) {
-                                pending_file_access.insert(call_id.clone(), access);
-                            }
-                            let replay_safe = tool_call_is_replay_safe(agent, name);
-                            let tool_run_id = run_id.clone();
-                            let tool_task_id = task_id.clone();
-                            let tool_execution_id = execution_id.clone();
-                            let tool_call_id = call_id.clone();
-                            let tool_name = name.clone();
-                            if let Err(error) = blocking
-                                .run("persist tool start boundary", move |store| {
-                                    store.record_tool_started(
-                                        &tool_run_id,
-                                        &tool_task_id,
-                                        &tool_execution_id,
-                                        &tool_call_id,
-                                        &tool_name,
-                                        replay_safe,
-                                    )
-                                })
-                                .await
-                            {
-                                event_cancel.cancel();
-                                return Err(ExecutionFailure::failed(format!(
-                                    "failed to persist tool start boundary for {name}: {error}"
-                                )));
-                            }
-                            emit_exec(
-                                trace_sink.as_ref(),
-                                ExecEvent::subagent(
-                                    workspace_id.clone(),
-                                    conversation_id.clone(),
-                                    run_id.clone(),
-                                    task_id.clone(),
-                                    execution_id.clone(),
-                                    RuntimeEventKind::ToolStarted,
-                                    serde_json::json!({
-                                        "call_id": call_id,
-                                        "invocation": invocation,
-                                    }),
-                                )
-                                .with_agent(agent_role.clone()),
-                            );
-                        }
-                        AgentEvent::ToolResult {
-                            call_id,
-                            name,
-                            result,
-                        } => {
-                            let result_text = if result.success {
-                                result.output.clone()
-                            } else {
-                                result
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| result.output.clone())
-                            };
-                            if let Some(check) = pending_verification.remove(&call_id) {
-                                observed_evidence.push(
-                                    echo_agent::agent::subagent::SubagentEvidence {
-                                        kind: "verification".to_string(),
-                                        subject: check,
-                                        outcome: Some(if result.success {
-                                            "passed".to_string()
-                                        } else {
-                                            "failed".to_string()
-                                        }),
-                                        details: result_text.chars().take(500).collect(),
-                                        source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
-                                        attributes: serde_json::Value::Null,
-                                    },
-                                );
-                            }
-                            if result.success
-                                && let Some((write, path)) = pending_file_access.remove(&call_id)
-                            {
-                                observed_evidence.push(
-                                    echo_agent::agent::subagent::SubagentEvidence {
-                                        kind: if write { "file_write" } else { "file_read" }
-                                            .to_string(),
-                                        subject: path,
-                                        outcome: Some("succeeded".to_string()),
-                                        details: String::new(),
-                                        source: echo_agent::agent::subagent::SubagentEvidenceSource::Observed,
-                                        attributes: serde_json::Value::Null,
-                                    },
-                                );
-                            } else {
-                                pending_file_access.remove(&call_id);
-                            }
-                            if let Some(artifact) =
-                                echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(
-                                    &result.metadata,
-                                )
-                            {
-                                observed_artifacts.push(
-                                    echo_agent::agent::subagent::SubagentArtifact {
-                                        path: artifact.path.to_string_lossy().to_string(),
-                                        kind: "tool_log".to_string(),
-                                        bytes: Some(artifact.artifact_bytes),
-                                        sha256: Some(artifact.sha256),
-                                        producer_execution_id: Some(execution_id.clone()),
-                                        available: artifact.path.is_file(),
-                                    },
-                                );
-                            }
-                            let tool_run_id = run_id.clone();
-                            let tool_task_id = task_id.clone();
-                            let tool_execution_id = execution_id.clone();
-                            let tool_call_id = call_id.clone();
-                            let tool_name = name.clone();
-                            let tool_result_text = result_text.clone();
-                            let tool_success = result.success;
-                            let tool_failure = result.failure.clone();
-                            if let Err(error) = blocking
-                                .run("persist tool terminal boundary", move |store| {
-                                    store.record_tool_finished(
-                                        &tool_run_id,
-                                        &tool_task_id,
-                                        &tool_execution_id,
-                                        &tool_call_id,
-                                        &tool_name,
-                                        tool_success,
-                                        &tool_result_text,
-                                        tool_failure.as_ref(),
-                                    )
-                                })
-                                .await
-                            {
-                                event_cancel.cancel();
-                                return Err(ExecutionFailure::failed(format!(
-                                    "tool {name} settled but its terminal boundary was not persisted: {error}"
-                                )));
-                            }
-                            emit_exec(
-                                trace_sink.as_ref(),
-                                ExecEvent::subagent(
-                                    workspace_id.clone(),
-                                    conversation_id.clone(),
-                                    run_id.clone(),
-                                    task_id.clone(),
-                                    execution_id.clone(),
-                                    RuntimeEventKind::ToolCompleted,
-                                    serde_json::json!({
-                                        "call_id": call_id,
-                                        "name": name,
-                                        "result": result,
-                                    }),
-                                )
-                                .with_agent(agent_role.clone()),
-                            );
-                        }
-                        AgentEvent::ToolStream {
-                            call_id,
-                            name,
-                            event,
-                        } => {
-                            let (event_type, payload) = match event {
-                                echo_agent::tools::ToolStreamEvent::Progress {
-                                    message,
-                                    percent,
-                                } => (RuntimeEventKind::ToolOutput, serde_json::json!({
-                                    "call_id": call_id,
-                                    "name": name,
-                                    "message": message,
-                                    "percent": percent,
-                                })),
-                                echo_agent::tools::ToolStreamEvent::Output { channel, chunk } => {
-                                    (RuntimeEventKind::ToolOutput, serde_json::json!({
-                                        "call_id": call_id,
-                                        "name": name,
-                                        "channel": match channel {
-                                            echo_agent::tools::ToolOutputChannel::Stdout => "stdout",
-                                            echo_agent::tools::ToolOutputChannel::Stderr => "stderr",
-                                            echo_agent::tools::ToolOutputChannel::Log => "log",
-                                        },
-                                        "chunk": chunk,
-                                    }))
-                                }
-                                echo_agent::tools::ToolStreamEvent::Complete(_) => continue,
-                            };
-                            emit_exec(
-                                trace_sink.as_ref(),
-                                ExecEvent::subagent(
-                                    workspace_id.clone(),
-                                    conversation_id.clone(),
-                                    run_id.clone(),
-                                    task_id.clone(),
-                                    execution_id.clone(),
-                                    event_type,
-                                    payload,
-                                )
-                                .with_agent(agent_role.clone()),
-                            );
-                        }
-                        AgentEvent::FinalAnswer(answer) => {
-                            #[allow(clippy::collapsible_match)]
-                            // guard is a method call on the bound value, not a pattern; collapsing obscures it
-                            if !answer.is_empty() {
-                                output = answer;
-                            }
-                        }
-                        AgentEvent::Cancelled => {
-                            return Err(ExecutionFailure::cancelled("task cancelled"));
-                        }
-                        AgentEvent::Error {
-                            source,
-                            message,
-                            failure,
-                        } => {
-                            return Err(ExecutionFailure::from_agent_failure(
-                                &failure,
-                                format!("{source}: {message}"),
-                            ));
-                        }
-                        _ => {}
+                match receipt.outcome {
+                    TurnOutcome::Completed => {}
+                    TurnOutcome::Cancelled => {
+                        return Err(ExecutionFailure::cancelled("task cancelled").with_usage(usage));
+                    }
+                    TurnOutcome::Failed(failure) => {
+                        let message = failure.message.clone();
+                        return Err(ExecutionFailure::from_agent_failure(&failure, message)
+                            .with_usage(usage));
                     }
                 }
 
                 let working_dir = agent.working_dir();
                 let mut outcome = echo_agent::agent::subagent::parse_subagent_outcome(
-                    &output,
+                    &observation.output,
                     echo_agent::agent::subagent::SubagentStatus::Completed,
                     Some(&execution_id),
                     working_dir.as_deref(),
                 );
                 echo_agent::agent::subagent::merge_observed_evidence(
                     &mut outcome,
-                    observed_evidence,
-                    observed_artifacts,
+                    observation.observed_evidence,
+                    observation.observed_artifacts,
                 );
-                let duration_ms =
-                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                usage.durable = SubagentRunUsage {
-                    duration_ms: Some(duration_ms),
-                    tokens_used: Some(
-                        usage.input_tokens.saturating_add(usage.output_tokens),
-                    ),
-                    iterations: None,
-                };
                 let duration_run_id = run_id.clone();
                 let duration_execution_id = execution_id.clone();
+                let duration_ms = usage.duration_ms();
                 blocking
                     .run("persist primary Subagent duration", move |store| {
                         store.account_subagent_usage(
@@ -4451,14 +4800,13 @@ async fn run_main_agent_task(
                     })?;
                 Ok((
                     SubagentTaskResult::from_framework_outcome(&outcome),
-                    output,
+                    observation.output,
                     usage,
                 ))
             })
         })
         .await
 }
-
 /// RAII guard that releases file write locks when dropped (G5).
 struct FileLockGuard {
     /// Per-file async mutex guards. Dropping releases all per-file locks.
@@ -4475,6 +4823,11 @@ fn save_trace(
     status: &str,
 ) {
     let Some(rs) = run_store else { return };
+    let Some(trace_status) = trace_run_status(status) else {
+        // The framework trace schema has no Paused state. Omitting this optional
+        // diagnostic record is truthful; projecting Paused as Completed is not.
+        return;
+    };
     let run = echo_agent::trace::Run {
         run_id: run_id.to_string(),
         parent_run_id: None,
@@ -4484,12 +4837,7 @@ fn save_trace(
         turn_id: None,
         execution_id: None,
         session_id: conversation_id.to_string(),
-        status: match status {
-            "completed" => echo_agent::trace::RunStatus::Completed,
-            "failed" => echo_agent::trace::RunStatus::Failed,
-            "cancelled" => echo_agent::trace::RunStatus::Cancelled,
-            _ => echo_agent::trace::RunStatus::Completed,
-        },
+        status: trace_status,
         input: goal.to_string(),
         events: vec![],
         final_output: None,
@@ -4512,6 +4860,16 @@ fn save_trace(
             tracing::debug!(run_id = %log_id, "trace Run saved");
         }
     });
+}
+
+fn trace_run_status(status: &str) -> Option<echo_agent::trace::RunStatus> {
+    match status {
+        "completed" => Some(echo_agent::trace::RunStatus::Completed),
+        "failed" => Some(echo_agent::trace::RunStatus::Failed),
+        "cancelled" => Some(echo_agent::trace::RunStatus::Cancelled),
+        "paused" => None,
+        _ => None,
+    }
 }
 
 // ── Unattended run adapter (cron / background AgentChat) ────────────────
@@ -4582,6 +4940,7 @@ pub(crate) fn create_unattended_run(
         "parallel_readonly_delegation",
         AttendedMode::Unattended,
     )?;
+    store.configure_run_continuation(run_id, true, true, None, None)?;
 
     // 2. Transition Pending → Running.
     store.transition_run(run_id, TaskRunStatus::Running)?;
@@ -4610,6 +4969,89 @@ pub(crate) async fn drive_unattended_run(
         write_mode,
         RunPlanPolicy::AllowDirect,
         None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_owned_agent_turn(
+    blocking: TaskRuntimeBlockingAdapter,
+    primary_agent: &crate::agent_handle::AgentHandle,
+    run: &TaskRun,
+    turn_id: &str,
+    prompt: &str,
+    cancel: CancellationToken,
+    disabled_tools: HashSet<String>,
+    trace_sink: Option<ExecSink>,
+) -> Result<(TurnReceipt, EkoAgentTurnObservation), ExecError> {
+    let run_id = run.run_id.clone();
+    let conversation_id = run.conversation_id.clone();
+    let message_id = Some(run.root_message_id.clone()).filter(|value| !value.trim().is_empty());
+    let turn_id = turn_id.to_string();
+    let prompt = prompt.to_string();
+    let core_trace_sink = exec_trace_sink_to_core(trace_sink.clone());
+    let trace_sink_for_scope = trace_sink.clone();
+    super::task_tools::with_run_context(
+        run_id.clone(),
+        cancel.clone(),
+        trace_sink_for_scope,
+        async {
+            let agent_inner = primary_agent.inner().clone();
+            let agent = agent_inner.read().await;
+            let visible_tools = crate::tool_exposure::initial_visible_tools(
+                InteractionMode::Auto,
+                &agent.tool_names(),
+            );
+            crate::tool_exposure::record_mode_schema_budget(
+                InteractionMode::Auto,
+                &agent.tool_definitions(),
+                &visible_tools,
+            );
+            let mutating_tools: HashSet<String> = agent
+                .tool_names()
+                .into_iter()
+                .filter(|name| tool_call_may_mutate_workspace(&agent, name))
+                .collect();
+            let mut disabled_tools = disabled_tools;
+            disabled_tools.extend(mutating_tools.iter().cloned());
+            let invocation = echo_agent::agent::AgentInvocationContext {
+                history: None,
+                runtime: Some(echo_agent::tools::ExternalRunContext {
+                    conversation_id: Some(conversation_id),
+                    run_id: Some(run_id.clone()),
+                    turn_id: Some(turn_id.clone()),
+                    execution_id: None,
+                    isolation_id: None,
+                    message_id,
+                    cancel: Some(Arc::new(cancel.clone())),
+                    trace_sink: core_trace_sink,
+                    delegation_policy: None,
+                }),
+                working_dir: None,
+                cancel: None,
+                disabled_tools: Some(disabled_tools),
+                visible_tools: Some(visible_tools),
+                run_budget: None,
+            };
+            let event_identity = echo_agent::agent::EventIdentity::from_invocation(&invocation)
+                .map_err(|error| {
+                    ExecError::Other(format!("invalid run agent event identity: {error}"))
+                })?;
+            let sink = EkoAgentTurnSink::for_run(
+                run,
+                &turn_id,
+                blocking,
+                mutating_tools,
+                trace_sink.clone(),
+            );
+            let request = TurnRequest::new(event_identity, prompt)
+                .mode(TurnMode::Execute)
+                .cancel(cancel)
+                .invocation(invocation);
+            let receipt = AgentTurnDriver.drive(&*agent, request, &sink).await;
+            let observation = sink.finish(receipt.final_answer.as_deref());
+            Ok((receipt, observation))
+        },
     )
     .await
 }
@@ -4650,216 +5092,186 @@ pub async fn drive_agent_run(
         })
         .await
         .map_err(|error| ExecError::Other(format!("register run cancellation: {error}")))?;
-    let conversation_id_for_scope = run_for_scope.conversation_id.clone();
-    let message_id_for_scope = Some(run_for_scope.root_message_id.clone())
-        .filter(|message_id| !message_id.trim().is_empty());
     let attended_mode = run_for_scope.attended_mode;
-
-    // Drive the Agent's ReAct loop in the run's context. It may call
-    // task_create + task_execute; attended_mode on the persisted run controls
-    // whether unattended preflight applies.
-    let run_id_for_scope = run_id.to_string();
-    let cancel_for_scope = child_cancel.clone();
-    let prompt_owned = unattended_run_prompt(prompt, attended_mode, write_mode);
+    let prompt = unattended_run_prompt(prompt, attended_mode, write_mode);
     let mut disabled_tools =
-        unattended_direct_disabled_tools(attended_mode, write_mode).unwrap_or_default();
+        direct_mutation_disabled_tools(attended_mode, write_mode).unwrap_or_default();
     disabled_tools.extend(crate::tool_exposure::disabled_tools_for_mode(
         InteractionMode::Auto,
     ));
-    let trace_sink_for_scope = trace_sink.clone();
-    let core_trace_sink = exec_trace_sink_to_core(trace_sink);
-
-    let stream_result = super::task_tools::with_run_context(
-        run_id_for_scope.clone(),
-        cancel_for_scope.clone(),
-        trace_sink_for_scope,
-        async {
-            let agent_inner = primary_agent.inner().clone();
-            let agent = agent_inner.read().await;
-            let visible_tools = crate::tool_exposure::initial_visible_tools(
-                InteractionMode::Auto,
-                &agent.tool_names(),
-            );
-            crate::tool_exposure::record_mode_schema_budget(
-                InteractionMode::Auto,
-                &agent.tool_definitions(),
-                &visible_tools,
-            );
-            let visible_tools = Some(visible_tools);
-            let invocation = echo_agent::agent::AgentInvocationContext {
-                history: None,
-                runtime: Some(echo_agent::tools::ExternalRunContext {
-                    conversation_id: Some(conversation_id_for_scope.clone()),
-                    run_id: Some(run_id_for_scope.clone()),
-                    turn_id: message_id_for_scope.clone(),
-                    execution_id: None,
-                    isolation_id: None,
-                    message_id: message_id_for_scope.clone(),
-                    cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
-                    trace_sink: core_trace_sink,
-                    delegation_policy: None,
-                }),
-                working_dir: None,
-                cancel: None,
-                disabled_tools: Some(disabled_tools),
-                visible_tools,
-                run_budget: None,
-            };
-            let event_identity =
-                match echo_agent::agent::EventIdentity::from_invocation(&invocation) {
-                    Ok(identity) => identity,
-                    Err(error) => {
-                        tracing::error!(
-                            source_id = %source_id,
-                            run_id = %run_id_for_scope,
-                            error = %error,
-                            "Run agent event identity is invalid"
-                        );
-                        return AgentDriveStreamResult {
-                            failure: Some(error.to_string()),
-                            final_answer: None,
-                        };
-                    }
-                };
-
-            // Execute the prompt. The agent's ReAct loop will call
-            // task_create + task_execute, which runs the plan through
-            // execute_run with all safety gates (preflight, approval skip).
-            match agent
-                .execute_stream_with_invocation_context(
-                    &prompt_owned,
-                    cancel_for_scope.clone(),
-                    invocation,
-                )
-                .await
-            {
-                Ok(raw_stream) => {
-                    let mut stream =
-                        echo_agent::agent::envelope_event_stream(raw_stream, event_identity);
-                    let mut final_answer = None;
-                    // Drain the stream to completion. Interactive callers may
-                    // receive events through the invocation trace sink; every
-                    // caller must still consume the stream to finish the Run.
-                    while let Some(event_result) = stream.next().await {
-                        if cancel_for_scope.is_cancelled() {
-                            break;
-                        }
-                        match event_result {
-                            Ok(event) => match event.payload {
-                                AgentEvent::Error {
-                                    source, message, ..
-                                } => {
-                                    let error = format!("{source}: {message}");
-                                    tracing::warn!(
-                                        source_id = %source_id,
-                                        run_id = %run_id_for_scope,
-                                        %error,
-                                        "Run agent emitted terminal error"
-                                    );
-                                    return AgentDriveStreamResult {
-                                        failure: Some(error),
-                                        final_answer,
-                                    };
-                                }
-                                AgentEvent::FinalAnswer(answer) if !answer.trim().is_empty() => {
-                                    final_answer = Some(answer);
-                                }
-                                _ => {}
-                            },
-                            Err(e) => {
-                                tracing::warn!(
-                                    source_id = %source_id,
-                                    run_id = %run_id_for_scope,
-                                    error = %e,
-                                    "Run agent stream error"
-                                );
-                                return AgentDriveStreamResult {
-                                    failure: Some(e.to_string()),
-                                    final_answer,
-                                };
-                            }
-                        }
-                    }
-                    AgentDriveStreamResult {
-                        failure: None,
-                        final_answer,
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(
-                        source_id = %source_id,
-                        run_id = %run_id_for_scope,
-                        error = %e,
-                        "Run agent failed to start stream"
-                    );
-                    AgentDriveStreamResult {
-                        failure: Some(e.to_string()),
-                        final_answer: None,
-                    }
-                }
+    let continuation_configured = blocking
+        .run("validate agent-driven continuation", {
+            let run_id = run_id.to_string();
+            move |store| {
+                store.get_run_state(&run_id).map(|snapshot| {
+                    snapshot
+                        .and_then(|state| state.continuation)
+                        .is_some_and(|continuation| continuation.enabled)
+                })
             }
-        },
-    )
-    .await;
-
-    if let Some(error) = stream_result.failure.as_deref()
-        && !child_cancel.is_cancelled()
-    {
-        let message = format!("run agent stream failed: {error}");
-        let failed_run_id = run_id.to_string();
-        blocking
-            .run("finalize agent stream failure", move |store| {
-                store
-                    .finalize_run(&failed_run_id, TaskRunStatus::Failed, Some(&message))
-                    .map(|_| ())
-            })
-            .await
-            .map_err(|error| ExecError::Other(error.to_string()))?;
-    }
-
-    let plan_run_id = run_id.to_string();
-    let plan_exists = blocking
-        .run("inspect agent-driven run plan", move |store| {
-            store.get_plan(&plan_run_id).map(|plan| plan.is_some())
         })
         .await
         .map_err(|error| ExecError::Other(error.to_string()))?;
-    if stream_result.failure.is_none()
-        && !child_cancel.is_cancelled()
-        && plan_policy == RunPlanPolicy::AllowDirect
-        && !plan_exists
-        && let Some(final_answer) = stream_result.final_answer.as_deref()
-        && let Err(error) = materialize_direct_completion(&store, run_id, final_answer).await
-    {
-        let message = format!("failed to persist direct completion evidence: {error}");
-        let failed_run_id = run_id.to_string();
-        blocking
-            .run("finalize direct completion failure", move |store| {
-                store
-                    .finalize_run(&failed_run_id, TaskRunStatus::Failed, Some(&message))
-                    .map(|_| ())
+    if !continuation_configured {
+        return Err(ExecError::Other(format!(
+            "run {run_id} must configure continuation in its creation transaction"
+        )));
+    }
+
+    let mut origin = RunTurnOrigin::User;
+    loop {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let claim_run_id = run_id.to_string();
+        let claim_turn_id = turn_id.clone();
+        let claim = blocking
+            .run("claim owned agent RunTurn", move |store| {
+                store.claim_run_turn(
+                    &claim_run_id,
+                    &claim_turn_id,
+                    origin,
+                    TurnVisibility::Internal,
+                )
             })
             .await
             .map_err(|error| ExecError::Other(error.to_string()))?;
-    }
-
-    // Determine final outcome from the store (task_execute/execute_run
-    // may have already transitioned the run to a terminal state).
-    let final_run_id = run_id.to_string();
-    let final_status = Some(
-        blocking
-            .run("load agent-driven run outcome", move |store| {
-                store
-                    .get_run(&final_run_id)?
-                    .map(|run| run.status)
-                    .ok_or(StoreError::RunNotFound(final_run_id))
+        match claim {
+            super::store::RunTurnClaimOutcome::Started(_) => {}
+            super::store::RunTurnClaimOutcome::NotSubmitted(reason) => {
+                return Err(ExecError::Other(format!(
+                    "owned RunTurn was not submitted for {run_id}: {reason:?}"
+                )));
+            }
+        }
+        let (turn_receipt, turn_observation) = drive_owned_agent_turn(
+            blocking.clone(),
+            &primary_agent,
+            &run_for_scope,
+            &turn_id,
+            &prompt,
+            child_cancel.clone(),
+            disabled_tools.clone(),
+            trace_sink.clone(),
+        )
+        .await?;
+        let mut terminal = turn_receipt.outcome;
+        let plan_exists = blocking
+            .run("inspect agent-driven run plan", {
+                let run_id = run_id.to_string();
+                move |store| store.get_plan(&run_id).map(|plan| plan.is_some())
             })
             .await
-            .map_err(|error| ExecError::Other(error.to_string()))?,
-    );
+            .map_err(|error| ExecError::Other(error.to_string()))?;
+        if matches!(&terminal, TurnOutcome::Completed)
+            && !child_cancel.is_cancelled()
+            && plan_policy == RunPlanPolicy::AllowDirect
+            && !plan_exists
+        {
+            if turn_observation.mutating_tool_observed {
+                terminal = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                    "direct_mutation_requires_plan",
+                    "a mutating tool was attempted outside a materialized TaskPlan",
+                ));
+            } else if !turn_observation.output.trim().is_empty()
+                && let Err(error) =
+                    materialize_direct_completion(&store, run_id, turn_observation).await
+            {
+                terminal = TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                    "direct_completion",
+                    format!("failed to persist direct completion evidence: {error}"),
+                ));
+            }
+        }
+        if let TurnOutcome::Failed(failure) = &terminal {
+            tracing::warn!(
+                source_id,
+                run_id,
+                failure_category = ?failure.category,
+                terminal_kind = ?failure.terminal_kind,
+                failure_code = %failure.code,
+                retryable = failure.retryable,
+                http_status = ?failure.http_status,
+                "Run agent emitted typed terminal failure"
+            );
+        }
+        let terminal_record = super::turn_lifecycle::RunTurnTerminal {
+            turn_id: &turn_id,
+            terminal: &terminal,
+            elapsed_seconds: u64::try_from(turn_receipt.elapsed.as_millis())
+                .unwrap_or(u64::MAX)
+                .saturating_add(999)
+                / 1_000,
+            final_message_id: None,
+        };
+        let persisted =
+            super::turn_lifecycle::persist_run_turn_terminal(&blocking, run_id, &terminal_record)
+                .await
+                .map_err(ExecError::Other)?;
+        let decision = super::turn_lifecycle::decide_after_persisted_run_turn(
+            &blocking,
+            &store,
+            run_id,
+            &terminal_record,
+            persisted,
+            trace_sink.as_ref(),
+        )
+        .await
+        .map_err(ExecError::Other)?;
+        if decision == super::turn_lifecycle::RunTurnDecision::Stop {
+            break;
+        }
+        match super::continuation::await_owned_continue(&store, run_id, &child_cancel).await {
+            super::continuation::OwnedContinueOutcome::Ready => {
+                origin = RunTurnOrigin::Continuation;
+            }
+            super::continuation::OwnedContinueOutcome::Stop => break,
+            super::continuation::OwnedContinueOutcome::Cancelled => {
+                let cancelled_run_id = run_id.to_string();
+                blocking
+                    .run("cancel owned agent continuation", move |store| {
+                        store.transition_run(&cancelled_run_id, TaskRunStatus::Cancelled)?;
+                        store.stop_owned_command_cells(&cancelled_run_id)
+                    })
+                    .await
+                    .map_err(|error| ExecError::Other(error.to_string()))?;
+                break;
+            }
+            super::continuation::OwnedContinueOutcome::Shutdown => {
+                let paused_run_id = run_id.to_string();
+                blocking
+                    .run(
+                        "pause owned agent continuation for shutdown",
+                        move |store| {
+                            store
+                                .request_pause_with_reason(
+                                    &paused_run_id,
+                                    RunPauseReason::BootRecovery,
+                                    Some("application shutdown interrupted an owned continuation"),
+                                )
+                                .map(|_| ())
+                        },
+                    )
+                    .await
+                    .map_err(|error| ExecError::Other(error.to_string()))?;
+                break;
+            }
+        }
+    }
+
+    // `task_execute`, direct completion, or the shared RunTurn lifecycle owns
+    // settlement. The driver only verifies the durable result.
+    let final_run_id = run_id.to_string();
+    let final_status = blocking
+        .run("load agent-driven run outcome", move |store| {
+            store
+                .get_run(&final_run_id)?
+                .map(|run| run.status)
+                .ok_or(StoreError::RunNotFound(final_run_id))
+        })
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
 
     match final_status {
-        Some(TaskRunStatus::Completed) => {
+        TaskRunStatus::Completed => {
             tracing::info!(
                 source_id = %source_id,
                 fire_id = %fire_id,
@@ -4874,7 +5286,7 @@ pub async fn drive_agent_run(
             // from the autonomous chat path (create_complex_task), which DOES
             // block-write its completion memory for recall.
         }
-        Some(TaskRunStatus::Failed) => {
+        TaskRunStatus::Failed => {
             tracing::warn!(
                 source_id = %source_id,
                 fire_id = %fire_id,
@@ -4882,7 +5294,7 @@ pub async fn drive_agent_run(
                 "Agent-driven run failed"
             );
         }
-        Some(TaskRunStatus::Cancelled) => {
+        TaskRunStatus::Cancelled => {
             tracing::info!(
                 source_id = %source_id,
                 fire_id = %fire_id,
@@ -4890,73 +5302,18 @@ pub async fn drive_agent_run(
                 "Agent-driven run cancelled"
             );
         }
-        Some(TaskRunStatus::Paused) => {
+        TaskRunStatus::Paused => {
             tracing::info!(
                 source_id = %source_id,
                 run_id = %run_id,
                 "Agent-driven run paused and remains resumable"
             );
         }
-        _ => {
-            // Still Running or unknown — the agent stream ending is not proof
-            // that the plan satisfied its result contract.
-            if child_cancel.is_cancelled() {
-                let cancelled_run_id = run_id.to_string();
-                blocking
-                    .run("finalize cancelled agent-driven run", move |store| {
-                        store
-                            .finalize_run(&cancelled_run_id, TaskRunStatus::Cancelled, None)
-                            .map(|_| ())
-                    })
-                    .await
-                    .map_err(|error| ExecError::Other(error.to_string()))?;
-            } else {
-                let report_run_id = run_id.to_string();
-                let report = blocking
-                    .run("load agent-driven completion gate", move |store| {
-                        store.completion_gate_report(&report_run_id)
-                    })
-                    .await
-                    .map_err(|error| ExecError::Other(error.to_string()))?;
-                if report.ready {
-                    let completed_run_id = run_id.to_string();
-                    let _completed = blocking
-                        .run("complete agent-driven run", move |store| {
-                            store.complete_run_if_quiescent(&completed_run_id)
-                        })
-                        .await
-                        .map_err(|error| ExecError::Other(error.to_string()))?;
-                } else {
-                    let blockers = report
-                        .blockers
-                        .iter()
-                        .map(|item| format!("{:?}: {}", item.code, item.detail))
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    let paused_run_id = run_id.to_string();
-                    let pause_detail =
-                        format!("completion gate rejected agent-driven run: {blockers}");
-                    blocking
-                        .run("pause agent-driven run", move |store| {
-                            store
-                                .request_pause_with_reason(
-                                    &paused_run_id,
-                                    RunPauseReason::NeedsInput,
-                                    Some(&pause_detail),
-                                )
-                                .map(|_| ())
-                        })
-                        .await
-                        .map_err(|error| ExecError::Other(error.to_string()))?;
-                }
-            }
-            tracing::info!(
-                source_id = %source_id,
-                fire_id = %fire_id,
-                run_id = %run_id,
-                final_status = ?final_status,
-                "Agent-driven run stream finished; transitioned to terminal"
-            );
+        status => {
+            return Err(ExecError::Other(format!(
+                "run {run_id} did not settle after its owned continuation; read back {}",
+                status.as_str()
+            )));
         }
     }
 
@@ -4988,8 +5345,9 @@ pub async fn drive_agent_run(
 async fn materialize_direct_completion(
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
-    final_answer: &str,
+    observation: EkoAgentTurnObservation,
 ) -> Result<(), ExecError> {
+    let final_answer = observation.output;
     let load_run_id = run_id.to_string();
     let run = TaskRuntimeBlockingAdapter::new(store.clone())
         .run("load direct completion run", move |store| {
@@ -5028,15 +5386,22 @@ async fn materialize_direct_completion(
             ..PlanTask::default()
         }],
     };
+    let mut framework_outcome = echo_agent::agent::subagent::parse_subagent_outcome(
+        &final_answer,
+        echo_agent::agent::subagent::SubagentStatus::Completed,
+        Some(&format!("{run_id}:direct-answer")),
+        None,
+    );
+    echo_agent::agent::subagent::merge_observed_evidence(
+        &mut framework_outcome,
+        observation.observed_evidence,
+        observation.observed_artifacts,
+    );
     let summary = TaskExecutionSummary {
         run_id: run_id.to_string(),
         task_id: task_id.to_string(),
         subagent_name: "primary-agent".to_string(),
-        result: SubagentTaskResult::terminal(
-            SubagentRunStatus::Completed,
-            final_answer,
-            Vec::new(),
-        ),
+        result: SubagentTaskResult::from_framework_outcome(&framework_outcome),
         decisions: Vec::new(),
         next_implications: Vec::new(),
         suggested_tasks: Vec::new(),
@@ -5046,7 +5411,7 @@ async fn materialize_direct_completion(
         store.clone(),
         plan,
         summary,
-        final_answer.to_string(),
+        final_answer,
     )
     .await
     .map_err(|error| ExecError::Other(format!("commit direct TaskPlan: {error}")))?;
@@ -5199,6 +5564,141 @@ pub fn preflight_unattended_task(
 mod tests {
     use super::*;
     use echo_agent::agent::subagent::SubagentPromptCompiler;
+    use futures::future::BoxFuture;
+    use futures::stream::{self, BoxStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ScriptedTurnAgent {
+        script: fn() -> Vec<AgentEvent>,
+    }
+
+    struct PermissionCountingTool {
+        name: String,
+        permission: echo_agent::prelude::ToolPermission,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl PermissionCountingTool {
+        fn new(
+            name: &str,
+            permission: echo_agent::prelude::ToolPermission,
+            calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                name: name.to_string(),
+                permission,
+                calls,
+            }
+        }
+    }
+
+    impl echo_agent::tools::Tool for PermissionCountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Dynamically registered permission test tool"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            })
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _parameters: echo_agent::tools::ToolParameters,
+        ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<echo_agent::tools::ToolResult>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Ok(echo_agent::tools::ToolResult::success(
+                    "dynamic tool executed",
+                ))
+            })
+        }
+
+        fn permissions(&self) -> Vec<echo_agent::prelude::ToolPermission> {
+            vec![self.permission]
+        }
+    }
+
+    impl ScriptedTurnAgent {
+        fn new(script: fn() -> Vec<AgentEvent>) -> Self {
+            Self { script }
+        }
+    }
+
+    impl Agent for ScriptedTurnAgent {
+        fn name(&self) -> &str {
+            "scripted-task-turn"
+        }
+
+        fn model_name(&self) -> &str {
+            "scripted-model"
+        }
+
+        fn system_prompt(&self) -> &str {
+            ""
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _task: &'a str,
+        ) -> BoxFuture<'a, echo_agent::error::Result<String>> {
+            Box::pin(async { Ok(String::new()) })
+        }
+
+        fn execute_stream<'a>(
+            &'a self,
+            _task: &'a str,
+        ) -> BoxFuture<
+            'a,
+            echo_agent::error::Result<BoxStream<'a, echo_agent::error::Result<AgentEvent>>>,
+        > {
+            let events = (self.script)();
+            Box::pin(async move {
+                Ok(Box::pin(stream::iter(events.into_iter().map(Ok))) as BoxStream<'a, _>)
+            })
+        }
+    }
+
+    fn turn_identity(
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<echo_agent::agent::EventIdentity, String> {
+        echo_agent::agent::EventIdentity::for_chat(
+            Some("task-turn-conversation".to_string()),
+            turn_id,
+            turn_id,
+            Some(run_id.to_string()),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    async fn drive_scripted_run_turn(
+        run: &TaskRun,
+        turn_id: &str,
+        script: fn() -> Vec<AgentEvent>,
+    ) -> Result<TurnReceipt, String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let sink = EkoAgentTurnSink::for_run(
+            run,
+            turn_id,
+            TaskRuntimeBlockingAdapter::new(store),
+            HashSet::new(),
+            None,
+        );
+        let request =
+            TurnRequest::new(turn_identity(&run.run_id, turn_id)?, "test").mode(TurnMode::Execute);
+        Ok(AgentTurnDriver
+            .drive(&ScriptedTurnAgent::new(script), request, &sink)
+            .await)
+    }
 
     fn compiled_task_prompt(
         task: &PlanTask,
@@ -5229,13 +5729,358 @@ mod tests {
             .task_input)
     }
 
+    async fn drive_dynamic_permission_case(
+        permission: echo_agent::prelude::ToolPermission,
+        tool_name: &str,
+        source_id: &str,
+    ) -> Result<(TaskRunStatus, usize, bool), String> {
+        use echo_agent::testing::MockLlmClient;
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = Arc::new(
+            MockLlmClient::new()
+                .with_model_name("dynamic-permission")
+                .then_tool_call("dynamic-call", tool_name, r#"{"path":"README.md"}"#)
+                .with_response("x".repeat(1_301)),
+        );
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("dynamic-permission")
+                .llm_client(mock)
+                .tool(Box::new(PermissionCountingTool::new(
+                    tool_name,
+                    permission,
+                    calls.clone(),
+                )))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = launch_unattended_run(
+            store.clone(),
+            agent,
+            "test",
+            source_id,
+            "fire-1",
+            "exercise a dynamically registered tool",
+            CancellationToken::new(),
+            UnattendedWriteMode::Disabled,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let status = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .map(|run| run.status)
+            .ok_or_else(|| "dynamic permission run missing".to_string())?;
+        let has_plan = store
+            .get_plan(&run_id)
+            .map_err(|error| error.to_string())?
+            .is_some();
+        Ok((status, calls.load(Ordering::SeqCst), has_plan))
+    }
+
+    #[tokio::test]
+    async fn task_turn_driver_rejects_stream_without_terminal() -> Result<(), String> {
+        fn missing_terminal() -> Vec<AgentEvent> {
+            vec![AgentEvent::Token("partial output".to_string())]
+        }
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![solo_readonly_task("missing-terminal")])?;
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "missing-terminal run was not created".to_string())?;
+        let receipt =
+            drive_scripted_run_turn(&run, "missing-terminal-turn", missing_terminal).await?;
+
+        assert!(matches!(receipt.outcome, TurnOutcome::Failed(_)));
+        assert!(receipt.final_answer.is_none());
+        assert_eq!(
+            TaskExecutionUsage::from_turn_receipt(&receipt)
+                .durable
+                .tokens_used,
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_turn_usage_counts_only_provider_reported_events() -> Result<(), String> {
+        fn usage_script() -> Vec<AgentEvent> {
+            vec![
+                AgentEvent::LlmUsage {
+                    model: "unknown-usage".to_string(),
+                    prompt_tokens: 100,
+                    completion_tokens: 200,
+                    total_tokens: 300,
+                    cached_prompt_tokens: 0,
+                    cache_creation_prompt_tokens: 0,
+                    usage_reported: false,
+                },
+                AgentEvent::LlmUsage {
+                    model: "reported-usage".to_string(),
+                    prompt_tokens: 3,
+                    completion_tokens: 4,
+                    total_tokens: 7,
+                    cached_prompt_tokens: 1,
+                    cache_creation_prompt_tokens: 0,
+                    usage_reported: true,
+                },
+                AgentEvent::FinalAnswer("done".to_string()),
+            ]
+        }
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let task = PlanTask {
+            id: "reported-usage".to_string(),
+            title: "Count reported usage".to_string(),
+            agent_role: "primary".to_string(),
+            ..PlanTask::default()
+        };
+        let run_id = seed_run(&store, vec![task.clone()])?;
+        store
+            .configure_run_continuation(&run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        let execution_id = format!("{run_id}:reported-usage:1:1");
+        store
+            .record_subagent_assigned(
+                &run_id,
+                &task.id,
+                &execution_id,
+                &task.agent_role,
+                &task.title,
+                1,
+                1,
+                false,
+                false,
+            )
+            .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "reported-usage run was not created".to_string())?;
+        let sink = EkoAgentTurnSink::for_primary_task(
+            &run,
+            &task,
+            &execution_id,
+            TaskRuntimeBlockingAdapter::new(store.clone()),
+            HashSet::new(),
+            None,
+        );
+        let request = TurnRequest::new(turn_identity(&run_id, "reported-usage-turn")?, "test")
+            .mode(TurnMode::Execute);
+        let receipt = AgentTurnDriver
+            .drive(&ScriptedTurnAgent::new(usage_script), request, &sink)
+            .await;
+
+        assert!(matches!(receipt.outcome, TurnOutcome::Completed));
+        assert_eq!(receipt.prompt_tokens, 3);
+        assert_eq!(receipt.completion_tokens, 4);
+        assert_eq!(receipt.llm_calls, 1);
+        let subagent_run = store
+            .list_subagent_runs(&run_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|candidate| candidate.subagent_run_id == execution_id)
+            .ok_or_else(|| "reported-usage SubagentRun was not persisted".to_string())?;
+        assert_eq!(subagent_run.usage.tokens_used, Some(7));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_turn_driver_preserves_typed_provider_timeout_and_cancel() -> Result<(), String> {
+        fn provider_failure() -> Vec<AgentEvent> {
+            let failure = echo_agent::error::AgentFailure {
+                category: echo_agent::error::AgentFailureCategory::Llm,
+                terminal_kind: echo_agent::error::AgentTerminalKind::TimedOut,
+                retryable: true,
+                code: "llm_timeout".to_string(),
+                http_status: Some(504),
+                message: "provider timed out".to_string(),
+            };
+            vec![AgentEvent::Error {
+                source: "llm".to_string(),
+                message: failure.message.clone(),
+                failure,
+            }]
+        }
+
+        fn cancelled() -> Vec<AgentEvent> {
+            vec![AgentEvent::Cancelled]
+        }
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![solo_readonly_task("typed-terminal")])?;
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "typed-terminal run was not created".to_string())?;
+        let failed = drive_scripted_run_turn(&run, "provider-timeout", provider_failure).await?;
+        match failed.outcome {
+            TurnOutcome::Failed(failure) => {
+                assert_eq!(
+                    failure.category,
+                    echo_agent::error::AgentFailureCategory::Llm
+                );
+                assert_eq!(
+                    failure.terminal_kind,
+                    echo_agent::error::AgentTerminalKind::TimedOut
+                );
+                assert!(failure.retryable);
+                assert_eq!(failure.code, "llm_timeout");
+                assert_eq!(failure.http_status, Some(504));
+            }
+            other => return Err(format!("expected typed provider failure, got {other:?}")),
+        }
+        let cancelled = drive_scripted_run_turn(&run, "cancelled-turn", cancelled).await?;
+        assert!(matches!(cancelled.outcome, TurnOutcome::Cancelled));
+        Ok(())
+    }
+
+    #[test]
+    fn typed_provider_timeout_requeues_then_settles_canonical_timed_out_status()
+    -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let task = PlanTask {
+            id: "provider-timeout".to_string(),
+            title: "Call provider".to_string(),
+            max_retries: 1,
+            ..PlanTask::default()
+        };
+        let run_id = seed_run(&store, vec![task.clone()])?;
+        let failure = echo_agent::error::AgentFailure {
+            category: echo_agent::error::AgentFailureCategory::Llm,
+            terminal_kind: echo_agent::error::AgentTerminalKind::TimedOut,
+            retryable: true,
+            code: "llm_timeout".to_string(),
+            http_status: Some(504),
+            message: "provider timed out".to_string(),
+        };
+
+        for expected_outcome in ["pending", "failed"] {
+            let snapshot = store
+                .load_runtime_plan_snapshot(&run_id)
+                .map_err(|error| error.to_string())?;
+            let runtime_task = snapshot
+                .tasks
+                .iter()
+                .find(|candidate| candidate.spec.id == task.id)
+                .cloned()
+                .ok_or_else(|| "provider timeout task missing".to_string())?;
+            let claim = match store
+                .claim_runtime_task(&run_id, &runtime_task, snapshot.revision)
+                .map_err(|error| error.to_string())?
+            {
+                echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+                echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                    return Err("provider timeout claim unexpectedly reloaded".to_string());
+                }
+            };
+            let mut result = SubagentTaskResult::terminal(
+                SubagentRunStatus::TimedOut,
+                failure.message.clone(),
+                vec![failure.message.clone()],
+            );
+            attach_agent_failure_evidence(&mut result, &failure);
+            let resolution = store
+                .settle_runtime_task_resolution(
+                    &run_id,
+                    &task.id,
+                    &claim,
+                    echo_agent::tasks::RuntimeTaskResolutionRequest::Requeue {
+                        failure_fingerprint: Some(
+                            crate::tasks::task_runtime::turn_lifecycle::agent_failure_fingerprint(
+                                &failure,
+                            ),
+                        ),
+                        error: failure.message.clone(),
+                    },
+                    RuntimeTaskProductSettlement {
+                        summary: Some(failure.message.clone()),
+                        execution_summary: Some(task_execution_summary_candidate(
+                            &run_id,
+                            &task,
+                            result,
+                            Vec::new(),
+                            vec![failure.message.clone()],
+                        )),
+                        review: None,
+                        diagnostic_note: None,
+                        typed_terminal: Some(failure.clone()),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            match expected_outcome {
+                "pending" => assert_eq!(
+                    resolution,
+                    echo_agent::tasks::RuntimeTaskResolution::Pending
+                ),
+                "failed" => assert!(matches!(
+                    resolution,
+                    echo_agent::tasks::RuntimeTaskResolution::Failed { .. }
+                )),
+                _ => return Err("invalid expected timeout outcome".to_string()),
+            }
+        }
+
+        let todo = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|todo| todo.task_id == task.id)
+            .ok_or_else(|| "provider timeout Todo missing".to_string())?;
+        assert_eq!(todo.status, TodoStatus::TimedOut);
+        let summary = store
+            .get_summary(&run_id, &task.id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "provider timeout summary missing".to_string())?;
+        assert!(summary.result.evidence.iter().any(|evidence| {
+            evidence.kind == "agent_failure"
+                && evidence
+                    .attributes
+                    .get("code")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("llm_timeout")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dynamic_write_execute_tools_are_disabled_before_handler_dispatch() -> Result<(), String>
+    {
+        let write = drive_dynamic_permission_case(
+            echo_agent::prelude::ToolPermission::Write,
+            "read_file",
+            "dynamic-write",
+        )
+        .await?;
+        assert_eq!(write, (TaskRunStatus::Failed, 0, false));
+
+        let execute = drive_dynamic_permission_case(
+            echo_agent::prelude::ToolPermission::Execute,
+            "grep",
+            "dynamic-execute",
+        )
+        .await?;
+        assert_eq!(execute, (TaskRunStatus::Failed, 0, false));
+
+        let read = drive_dynamic_permission_case(
+            echo_agent::prelude::ToolPermission::Read,
+            "read_file",
+            "dynamic-read",
+        )
+        .await?;
+        assert_eq!(read, (TaskRunStatus::Completed, 1, true));
+        Ok(())
+    }
+
     #[test]
     fn unattended_worktree_mode_routes_mutations_through_formal_plans() {
-        let disabled = unattended_direct_disabled_tools(
-            AttendedMode::Unattended,
-            UnattendedWriteMode::Worktree,
-        )
-        .unwrap_or_default();
+        let disabled =
+            direct_mutation_disabled_tools(AttendedMode::Unattended, UnattendedWriteMode::Worktree)
+                .unwrap_or_default();
 
         assert!(disabled.contains("shell"));
         assert!(disabled.contains("apply_patch"));
@@ -5255,20 +6100,14 @@ mod tests {
     }
 
     #[test]
-    fn attended_and_in_place_runs_keep_direct_tools_available() {
+    fn independent_runs_hide_mutations_unless_in_place_is_explicit() {
         assert!(
-            unattended_direct_disabled_tools(
-                AttendedMode::Attended,
-                UnattendedWriteMode::Worktree,
-            )
-            .is_none()
+            direct_mutation_disabled_tools(AttendedMode::Attended, UnattendedWriteMode::Worktree,)
+                .is_some_and(|disabled| disabled.contains("apply_patch"))
         );
         assert!(
-            unattended_direct_disabled_tools(
-                AttendedMode::Unattended,
-                UnattendedWriteMode::InPlace,
-            )
-            .is_none()
+            direct_mutation_disabled_tools(AttendedMode::Unattended, UnattendedWriteMode::InPlace,)
+                .is_none()
         );
         assert_eq!(
             unattended_run_prompt(
@@ -5277,6 +6116,15 @@ mod tests {
                 UnattendedWriteMode::InPlace,
             ),
             "inspect the repository"
+        );
+    }
+
+    #[test]
+    fn paused_run_is_not_projected_as_completed_trace() {
+        assert_eq!(trace_run_status("paused"), None);
+        assert_eq!(
+            trace_run_status("completed"),
+            Some(echo_agent::trace::RunStatus::Completed)
         );
     }
 
@@ -5693,7 +6541,7 @@ Read the runtime path and found one missing branch.
         // (submit) can hand it to the Tauri layer. A simple prompt (mock returns
         // "ok", agent never calls task_execute) is materialized as a one-task
         // Plan and completes through the shared evidence gate (Q5).
-        use echo_agent::testing::MockLlmClient;
+        use echo_agent::testing::{MockLlmClient, MockTool};
         use std::sync::Arc;
         let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
         let direct_answer = "x".repeat(1_301);
@@ -5704,12 +6552,30 @@ Read the runtime path and found one missing branch.
         let mock = Arc::new(
             MockLlmClient::new()
                 .with_model_name("t")
-                .with_response(direct_answer.clone()),
+                .then_tool_call("direct-read", "read_file", r#"{"path":"README.md"}"#)
+                .with_response_usage(
+                    direct_answer.clone(),
+                    echo_agent::llm::types::Usage {
+                        prompt_tokens: Some(3),
+                        completion_tokens: Some(4),
+                        total_tokens: Some(7),
+                        ..Default::default()
+                    },
+                ),
         );
         let agent = crate::agent_handle::AgentHandle::new(
             echo_agent::agent::ReactAgentBuilder::new()
                 .model("t")
                 .llm_client(mock)
+                .tool(Box::new(
+                    MockTool::new("read_file")
+                        .with_parameters(serde_json::json!({
+                            "type": "object",
+                            "properties": { "path": { "type": "string" } },
+                            "required": ["path"]
+                        }))
+                        .with_response("project documentation"),
+                ))
                 .build()
                 .map_err(|error| error.to_string())?,
         );
@@ -5732,7 +6598,27 @@ Read the runtime path and found one missing branch.
             .get_run(&run_id)
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "run should exist".to_string())?;
-        assert_eq!(run.status, TaskRunStatus::Completed);
+        assert_eq!(
+            run.status,
+            TaskRunStatus::Completed,
+            "direct run events: {:?}",
+            store
+                .list_events(&run_id, 0)
+                .map_err(|error| error.to_string())?
+        );
+        let continuation = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .and_then(|state| state.continuation)
+            .ok_or_else(|| "direct completion continuation missing".to_string())?;
+        assert_eq!(continuation.tokens_used, 7);
+        assert_eq!(
+            continuation
+                .last_turn
+                .as_ref()
+                .map(|turn| (turn.input_tokens, turn.output_tokens)),
+            Some((3, 4))
+        );
         let plan = store
             .get_plan(&run_id)
             .map_err(|error| error.to_string())?
@@ -5749,6 +6635,15 @@ Read the runtime path and found one missing branch.
             .find(|todo| todo.task_id == "direct-answer")
             .ok_or_else(|| "direct completion Todo missing".to_string())?;
         assert_eq!(todo.summary.as_deref(), Some(direct_answer.as_str()));
+        let summary = store
+            .get_summary(&run_id, "direct-answer")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "direct completion summary missing".to_string())?;
+        assert!(
+            summary.result.evidence.iter().any(|evidence| {
+                evidence.kind == "file_read" && evidence.subject == "README.md"
+            })
+        );
         let report = store
             .completion_gate_report(&run_id)
             .map_err(|error| error.to_string())?;
@@ -5756,13 +6651,28 @@ Read the runtime path and found one missing branch.
         let journal =
             std::fs::read_to_string(shadow_root.path().join(&run_id).join("events.jsonl"))
                 .map_err(|error| error.to_string())?;
-        let frame: serde_json::Value = serde_json::from_str(
-            journal
-                .lines()
-                .last()
-                .ok_or_else(|| "direct completion journal has no frame".to_string())?,
-        )
-        .map_err(|error| error.to_string())?;
+        let frames = journal
+            .lines()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
+        let frame = frames
+            .iter()
+            .find(|frame| {
+                frame
+                    .get("records")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|records| {
+                        records.iter().any(|record| {
+                            record
+                                .get("event")
+                                .and_then(|event| event.get("event_type"))
+                                .and_then(serde_json::Value::as_str)
+                                == Some("plan_revision_committed")
+                        })
+                    })
+            })
+            .ok_or_else(|| "direct completion transaction frame missing".to_string())?;
         let event_types = frame
             .get("records")
             .and_then(serde_json::Value::as_array)
@@ -5782,9 +6692,178 @@ Read the runtime path and found one missing branch.
                 "task_started",
                 "note",
                 "task_completed",
-                "run_status_changed",
             ]
         );
+        let completion_frame = frames
+            .iter()
+            .find(|frame| {
+                frame
+                    .get("records")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|records| {
+                        let kinds = records
+                            .iter()
+                            .filter_map(|record| {
+                                record
+                                    .get("event")
+                                    .and_then(|event| event.get("event_type"))
+                                    .and_then(serde_json::Value::as_str)
+                            })
+                            .collect::<Vec<_>>();
+                        kinds == ["run_turn_finished", "run_status_changed"]
+                    })
+            })
+            .ok_or_else(|| {
+                "RunTurn terminal and Goal completion were not committed atomically".to_string()
+            })?;
+        assert!(completion_frame.get("records").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owned_run_turn_uses_durable_provider_retry_before_direct_completion()
+    -> Result<(), String> {
+        use echo_agent::testing::MockLlmClient;
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let mock = Arc::new(
+            MockLlmClient::new()
+                .with_model_name("t")
+                .with_network_error("provider temporarily unavailable")
+                .with_network_error("provider temporarily unavailable")
+                .with_network_error("provider temporarily unavailable")
+                .with_network_error("provider temporarily unavailable")
+                .with_response("recovered provider answer"),
+        );
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("t")
+                .llm_client(mock)
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = launch_unattended_run(
+            store.clone(),
+            agent,
+            "test",
+            "provider-retry",
+            "fire-1",
+            "recover from provider failure",
+            CancellationToken::new(),
+            UnattendedWriteMode::Disabled,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "provider retry run missing".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Completed);
+        let state = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "provider retry state missing".to_string())?;
+        let continuation = state
+            .continuation
+            .ok_or_else(|| "provider retry continuation missing".to_string())?;
+        assert!(continuation.provider_retry.is_none());
+        assert!(continuation.next_turn_ordinal >= 2);
+        let events = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            events
+                .iter()
+                .any(|event| { event.event_type == RuntimeEventKind::RunProviderRetryScheduled })
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == RuntimeEventKind::RunTurnFinished
+                && event
+                    .payload
+                    .get("agent_failure")
+                    .and_then(|failure| failure.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("llm_network")
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunTurnStarted)
+                .count(),
+            2
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_completion_rejects_real_apply_patch_tool_path() -> Result<(), String> {
+        use echo_agent::testing::{MockLlmClient, MockTool};
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let mock = Arc::new(
+            MockLlmClient::new()
+                .with_model_name("t")
+                .then_tool_call(
+                    "direct-write",
+                    "apply_patch",
+                    r#"{"path":"src/lib.rs","patch":"unsafe mutation"}"#,
+                )
+                .with_response("mutation attempted"),
+        );
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("t")
+                .llm_client(mock)
+                .tool(Box::new(
+                    MockTool::new("apply_patch")
+                        .with_parameters(serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "path": { "type": "string" },
+                                "patch": { "type": "string" }
+                            },
+                            "required": ["path", "patch"]
+                        }))
+                        .with_response("must not execute directly"),
+                ))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = launch_unattended_run(
+            store.clone(),
+            agent,
+            "test",
+            "direct-write",
+            "fire-1",
+            "attempt a direct mutation",
+            CancellationToken::new(),
+            UnattendedWriteMode::Disabled,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "direct mutation run missing".to_string())?;
+        assert_eq!(run.status, TaskRunStatus::Failed);
+        assert!(
+            store
+                .get_plan(&run_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        let events = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?;
+        assert!(events.iter().any(|event| {
+            event.event_type == RuntimeEventKind::RunTurnFinished
+                && event
+                    .payload
+                    .get("agent_failure")
+                    .and_then(|failure| failure.get("code"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some("direct_mutation_requires_plan")
+        }));
         Ok(())
     }
 
@@ -5810,6 +6889,9 @@ Read the runtime path and found one missing branch.
                 "agent_autonomous",
                 AttendedMode::Attended,
             )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(run_id, true, false, None, None)
             .map_err(|error| error.to_string())?;
         store
             .transition_run(run_id, TaskRunStatus::Running)
@@ -6958,6 +8040,22 @@ Read the runtime path and found one missing branch.
         let run_id = seed_run(&store, vec![solo_readonly_task("a")])?;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("a", "reviewed");
+        let observed_statuses = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let status_store = store.clone();
+        let status_run_id = run_id.clone();
+        let captured_statuses = observed_statuses.clone();
+        let trace_sink: ExecSink = Arc::new(move |event| {
+            if event.event == RuntimeEventKind::TaskCompleted
+                && let Ok(todos) = status_store.list_todos(&status_run_id)
+                && let Some(status) = todos
+                    .into_iter()
+                    .find(|todo| todo.task_id == "a")
+                    .map(|todo| todo.status)
+                && let Ok(mut statuses) = captured_statuses.lock()
+            {
+                statuses.push(status);
+            }
+        });
 
         let outcome = execute_runtime_plan(
             store.clone(),
@@ -6966,7 +8064,7 @@ Read the runtime path and found one missing branch.
             &run_id,
             EkoExecutionLimits::default(),
             CancellationToken::new(),
-            None,
+            Some(trace_sink),
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -6977,6 +8075,12 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?;
         let todo = todos.first().ok_or_else(|| "todo a missing".to_string())?;
         assert_eq!(todo.status, TodoStatus::Completed);
+        assert_eq!(
+            *observed_statuses
+                .lock()
+                .map_err(|error| error.to_string())?,
+            [TodoStatus::Completed]
+        );
         Ok(())
     }
 
@@ -7662,6 +8766,18 @@ Read the runtime path and found one missing branch.
             .lock()
             .map_err(|error| format!("trace events lock poisoned: {error}"))?
             .clone();
+        let tool_started_position = events
+            .iter()
+            .position(|event| event.event == RuntimeEventKind::ToolStarted)
+            .ok_or_else(|| "tool_started event was not emitted".to_string())?;
+        let tool_completed_position = events
+            .iter()
+            .position(|event| event.event == RuntimeEventKind::ToolCompleted)
+            .ok_or_else(|| "tool_completed event was not emitted".to_string())?;
+        assert!(
+            tool_started_position < tool_completed_position,
+            "tool terminal event overtook its start boundary: {events:?}"
+        );
         assert!(
             events.iter().any(|event| {
                 event.event == RuntimeEventKind::ToolStarted

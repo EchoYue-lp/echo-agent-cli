@@ -1181,6 +1181,7 @@ pub(crate) struct RuntimeTaskProductSettlement {
     pub execution_summary: Option<TaskExecutionSummary>,
     pub review: Option<ReviewResult>,
     pub diagnostic_note: Option<String>,
+    pub typed_terminal: Option<echo_agent::error::AgentFailure>,
 }
 
 enum RunTurnClaimPreparation {
@@ -3611,6 +3612,17 @@ impl TaskRuntimeStore {
             if !report.ready {
                 return Ok(false);
             }
+            let active_turn = self
+                .get_run_state(run_id)?
+                .and_then(|state| state.continuation)
+                .and_then(|continuation| continuation.active_turn);
+            if active_turn.is_some() {
+                // The owning RunTurn commits Goal completion in the same
+                // journal batch as RunTurnFinished. Returning true tells the
+                // task executor the graph is quiescent without opening a
+                // Completed + active-turn crash window.
+                return Ok(true);
+            }
             self.shadow.append_event_line(
                 run_id,
                 None,
@@ -4055,6 +4067,15 @@ impl TaskRuntimeStore {
                     run.status.as_str()
                 )));
             }
+            let active_turn = self
+                .get_run_state(run_id)?
+                .and_then(|state| state.continuation)
+                .and_then(|continuation| continuation.active_turn);
+            if active_turn.is_none() {
+                return Err(StoreError::InvalidPlan(
+                    "direct completion requires an active canonical RunTurn".to_string(),
+                ));
+            }
             let current = self.load_revisioned_task_graph(run_id)?;
             let prepared = prepare_revisioned_graph_commit(run_id, &run, current.as_ref(), commit)?;
             let task = prepared.plan.tasks.first().ok_or_else(|| {
@@ -4072,9 +4093,10 @@ impl TaskRuntimeStore {
                 || summary.result.status != SubagentRunStatus::Completed
                 || summary.result.summary.trim().is_empty()
                 || !summary.result.remaining_work.is_empty()
-                || !summary.result.artifacts.is_empty()
-                || !summary.result.evidence.is_empty()
-                || !summary.result.verification.is_empty()
+                || summary.result.evidence.iter().any(|evidence| {
+                    evidence.kind == "file_write"
+                        && evidence.outcome.as_deref() == Some("succeeded")
+                })
                 || !summary.result.touched_files.written.is_empty()
                 || task_summary.trim().is_empty()
             {
@@ -4094,8 +4116,6 @@ impl TaskRuntimeStore {
                     "direct completion is blocked by active or unresolved runtime work".to_string(),
                 ));
             }
-            let requirement_count =
-                super::completion_gate::requirements_for_revision(&prepared.plan).len();
             let events = vec![
                 RuntimeJournalEvent::for_append(
                     run_id,
@@ -4132,20 +4152,6 @@ impl TaskRuntimeStore {
                     summary: Some(task_summary),
                     claim: None,
                 }),
-                RuntimeJournalEvent::for_append(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::RunStatusChanged,
-                    serde_json::json!({
-                        "from": TaskRunStatus::Running.as_str(),
-                        "to": TaskRunStatus::Completed.as_str(),
-                        "plan_revision": prepared.plan.revision,
-                        "goal_revision": prepared.plan.goal_revision,
-                        "requirement_count": requirement_count,
-                        "direct_completion": true,
-                    }),
-                ),
             ];
             self.shadow.append_event_batch(run_id, events)?;
             self.shadow.rewrite_plan(run_id)?;
@@ -4473,7 +4479,29 @@ impl TaskRuntimeStore {
                 execution_summary,
                 review,
                 diagnostic_note,
+                typed_terminal,
             } = product;
+            if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded
+                && matches!(
+                    typed_terminal.as_ref().map(|failure| failure.terminal_kind),
+                    Some(echo_agent::error::AgentTerminalKind::TimedOut)
+                )
+                && matches!(
+                    outcome,
+                    echo_agent::tasks::RuntimeTaskResolution::Failed { .. }
+                )
+                && let Some(task) = graph
+                    .snapshot
+                    .tasks
+                    .iter_mut()
+                    .find(|task| task.spec.id == task_id)
+            {
+                let error = typed_terminal
+                    .as_ref()
+                    .map(|failure| failure.message.clone())
+                    .unwrap_or_else(|| "Subagent timed out".to_string());
+                task.execution.status = echo_agent::tasks::TaskStatus::TimedOut { error };
+            }
             let mut product_events = Vec::new();
             if outcome != echo_agent::tasks::RuntimeTaskResolution::Superseded {
                 if let Some(summary) = execution_summary {
@@ -5972,6 +6000,15 @@ impl TaskRuntimeStore {
         run_id: &str,
         completion: RunTurnCompletion<'_>,
     ) -> Result<RunContinuationState, StoreError> {
+        self.finish_run_turn_with_agent_failure(run_id, completion, None)
+    }
+
+    pub(crate) fn finish_run_turn_with_agent_failure(
+        &self,
+        run_id: &str,
+        completion: RunTurnCompletion<'_>,
+        agent_failure: Option<&echo_agent::error::AgentFailure>,
+    ) -> Result<RunContinuationState, StoreError> {
         self.with_run_lock(run_id, || {
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
@@ -6012,7 +6049,7 @@ impl TaskRuntimeStore {
                 let blocker_fingerprint = (!made_progress).then(|| {
                     blocker_fingerprint(completion.error_fingerprint, &progress_fingerprint)
                 });
-                self.shadow.append_event_line(
+                let mut terminal_events = vec![RuntimeJournalEvent::for_append(
                     run_id,
                     None,
                     None,
@@ -6027,8 +6064,33 @@ impl TaskRuntimeStore {
                         "progress_fingerprint": progress_fingerprint,
                         "made_progress": made_progress,
                         "blocker_fingerprint": blocker_fingerprint,
+                        "agent_failure": agent_failure,
                     }),
-                )?;
+                )];
+                let run = self
+                    .get_run(run_id)?
+                    .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+                if completion.status == RunTurnStatus::Ended && run.status == TaskRunStatus::Running
+                {
+                    let report = self.completion_gate_report(run_id)?;
+                    if report.ready {
+                        terminal_events.push(RuntimeJournalEvent::for_append(
+                            run_id,
+                            None,
+                            None,
+                            RuntimeEventKind::RunStatusChanged,
+                            serde_json::json!({
+                                "from": TaskRunStatus::Running.as_str(),
+                                "to": TaskRunStatus::Completed.as_str(),
+                                "plan_revision": report.plan_revision,
+                                "goal_revision": report.goal_revision,
+                                "requirement_count": report.requirements.len(),
+                                "completed_with_run_turn": completion.turn_id,
+                            }),
+                        ));
+                    }
+                }
+                self.shadow.append_event_batch(run_id, terminal_events)?;
                 self.shadow.rewrite_plan(run_id)?;
             }
             self.get_run_state(run_id)?
@@ -11341,6 +11403,7 @@ mod tests {
                     execution_summary: Some(completed_summary.clone()),
                     review: Some(current_review),
                     diagnostic_note: Some("accepted new claim review".to_string()),
+                    typed_terminal: None,
                 },
             )?,
             echo_agent::tasks::RuntimeTaskResolution::Completed
@@ -11375,6 +11438,7 @@ mod tests {
                     execution_summary: Some(stale_summary),
                     review: Some(stale_review),
                     diagnostic_note: Some("stale claim review note".to_string()),
+                    typed_terminal: None,
                 },
             )?,
             echo_agent::tasks::RuntimeTaskResolution::Superseded
