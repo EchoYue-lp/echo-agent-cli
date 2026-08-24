@@ -6,8 +6,10 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use chrono::{DateTime, Utc};
 use echo_agent::state::journal::{
-    ApplyReceipt, CheckpointStore, CheckpointedReducer, EventJournal, FileCheckpointStore,
-    FileEventJournal, JournalDurabilityStatus, MemoryCheckpointStore,
+    ApplyBatchReceipt, ApplyReceipt, CheckpointStore, CheckpointedApplyError, CheckpointedReducer,
+    EventJournal, FileCheckpointStore, FileEventJournal, JournalBatchAppendError,
+    JournalBatchCommitStatus, JournalBatchLookup, JournalDurabilityStatus, MemoryCheckpointStore,
+    PreparedJournalBatch,
 };
 use echo_agent::utils::fs::{FileDurability, atomic_write, create_dir_all_durable};
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,7 @@ use super::file_shadow::{ProjectionRefreshStats, ShadowError};
 use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
 
 const REPLAY_BATCH: usize = 512;
+const MAX_BATCH_COMMIT_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -102,7 +105,16 @@ pub(crate) struct RunAuthorityState {
 
 pub(crate) struct RunAuthority {
     event_path: PathBuf,
+    checkpoint_path: PathBuf,
+    expected_run_id: String,
     state: Mutex<Option<RunAuthorityState>>,
+    #[cfg(test)]
+    fail_next_post_commit_validation: std::sync::atomic::AtomicBool,
+}
+
+pub(crate) struct RunBatchAppendReceipt {
+    pub(crate) events: Vec<Arc<RuntimeTaskEvent>>,
+    pub(crate) apply: ApplyBatchReceipt,
 }
 
 enum RegistryStatus {
@@ -267,7 +279,11 @@ impl RunAuthority {
                 let opened = Self::open_state(&event_path, checkpoint_path).and_then(|state| {
                     let authority = Arc::new(Self {
                         event_path: event_path.clone(),
+                        checkpoint_path: checkpoint_path.to_path_buf(),
+                        expected_run_id: expected_run_id.to_string(),
                         state: Mutex::new(Some(state)),
+                        #[cfg(test)]
+                        fail_next_post_commit_validation: std::sync::atomic::AtomicBool::new(false),
                     });
                     authority.validate_run_id(expected_run_id)?;
                     Ok(authority)
@@ -388,6 +404,7 @@ impl RunAuthority {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn append(
         &self,
         event: RuntimeJournalEvent,
@@ -400,52 +417,242 @@ impl RunAuthority {
         event: RuntimeJournalEvent,
         observer: impl FnOnce(&RuntimeTaskEvent),
     ) -> Result<(Arc<RuntimeTaskEvent>, ApplyReceipt), ShadowError> {
+        let mut observer = Some(observer);
+        let batch = self.append_batch_with_observer(vec![event], |event| {
+            if let Some(observer) = observer.take() {
+                observer(event);
+            }
+        })?;
+        let event = batch.events.into_iter().next().ok_or_else(|| {
+            ShadowError::Rebuild("single-event batch committed without a projection".to_string())
+        })?;
+        Ok((
+            event,
+            ApplyReceipt {
+                batch_id: batch.apply.batch_id,
+                sequence: batch.apply.first_sequence,
+                journal: batch.apply.journal,
+                commit: batch.apply.commit,
+                checkpoint: batch.apply.checkpoint,
+            },
+        ))
+    }
+
+    pub(crate) fn append_batch(
+        &self,
+        events: Vec<RuntimeJournalEvent>,
+    ) -> Result<RunBatchAppendReceipt, ShadowError> {
+        self.append_batch_with_observer(events, |_| {})
+    }
+
+    pub(crate) fn append_batch_with_observer(
+        &self,
+        events: Vec<RuntimeJournalEvent>,
+        mut observer: impl FnMut(&RuntimeTaskEvent),
+    ) -> Result<RunBatchAppendReceipt, ShadowError> {
+        let prepared = PreparedJournalBatch::new(events)
+            .map_err(|error| ShadowError::Encode(error.to_string()))?;
         let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        let state = guard
-            .as_mut()
-            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
-        let next_sequence = state.journal.next_sequence();
-        if next_sequence > i64::MAX as u64 {
-            return Err(ShadowError::SequenceCapacityExceeded { next_sequence });
-        }
-        Self::retry_durability_debt(state, &self.event_path);
-        let receipt = match state.reducer.apply(event) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                let error = ShadowError::Io(error.to_string());
+        let mut prepared = Some(prepared);
+        let mut attempts = 0_usize;
+        let mut reconciled_projection = None;
+
+        loop {
+            attempts = attempts.saturating_add(1);
+            let state = guard.as_mut().ok_or_else(|| {
+                ShadowError::AuthorityClosed(self.event_path.display().to_string())
+            })?;
+            Self::retry_durability_debt(state, &self.event_path);
+            let batch = prepared.take().ok_or_else(|| {
+                ShadowError::Rebuild("prepared TaskRuntime batch ownership was lost".to_string())
+            })?;
+            let batch_id = batch.batch_id().to_string();
+            let payload_digest = batch.payload_digest().to_string();
+            let projected = match reconciled_projection.take() {
+                Some(projected) => projected,
+                None => project_prepared_batch(&batch, state.journal.next_sequence())?,
+            };
+
+            let mut receipt =
+                match state.reducer.apply_batch(batch) {
+                    Ok(receipt) => receipt,
+                    Err(CheckpointedApplyError::Journal(
+                        JournalBatchAppendError::NotCommitted { batch, error },
+                    )) if attempts < MAX_BATCH_COMMIT_ATTEMPTS => {
+                        prepared = Some(batch);
+                        tracing::warn!(
+                            path = %self.event_path.display(),
+                            batch_id = %batch_id,
+                            attempt = attempts,
+                            %error,
+                            "retrying an uncommitted TaskRuntime batch"
+                        );
+                        continue;
+                    }
+                    Err(CheckpointedApplyError::Journal(
+                        JournalBatchAppendError::NotCommitted { error, .. },
+                    )) => {
+                        let stale = guard.take();
+                        drop(stale);
+                        return Err(ShadowError::BatchNotCommitted {
+                            batch_id,
+                            attempts,
+                            detail: error,
+                        });
+                    }
+                    Err(CheckpointedApplyError::Journal(error))
+                        if matches!(
+                            error,
+                            JournalBatchAppendError::OutcomeUnknown { .. }
+                                | JournalBatchAppendError::AuthorityPoisoned { .. }
+                        ) =>
+                    {
+                        let detail = error.to_string();
+                        let batch = error.into_prepared().ok_or_else(|| {
+                            ShadowError::BatchOutcomeUnknown {
+                                batch_id: batch_id.clone(),
+                                payload_digest: payload_digest.clone(),
+                                detail: "journal did not return prepared batch ownership"
+                                    .to_string(),
+                            }
+                        })?;
+                        let stale = guard.take();
+                        drop(stale);
+                        let reopened = Self::open_state(&self.event_path, &self.checkpoint_path)
+                            .map_err(|error| ShadowError::BatchOutcomeUnknown {
+                                batch_id: batch_id.clone(),
+                                payload_digest: payload_digest.clone(),
+                                detail: format!("{detail}; verified reopen failed: {error}"),
+                            })?;
+                        validate_state_run_id(&reopened, &self.expected_run_id)?;
+                        match reopened.journal.lookup_batch(&batch).map_err(|error| {
+                            ShadowError::BatchOutcomeUnknown {
+                                batch_id: batch_id.clone(),
+                                payload_digest: payload_digest.clone(),
+                                detail: format!("{detail}; batch lookup failed: {error}"),
+                            }
+                        })? {
+                            JournalBatchLookup::AlreadyCommitted(committed) => {
+                                reconciled_projection =
+                                    Some(project_journal_records(committed.records())?);
+                                *guard = Some(reopened);
+                                prepared = Some(batch);
+                                continue;
+                            }
+                            JournalBatchLookup::Absent if attempts < MAX_BATCH_COMMIT_ATTEMPTS => {
+                                *guard = Some(reopened);
+                                prepared = Some(batch);
+                                continue;
+                            }
+                            JournalBatchLookup::Absent => {
+                                return Err(ShadowError::BatchOutcomeUnknown {
+                                    batch_id,
+                                    payload_digest,
+                                    detail: format!(
+                                        "{detail}; batch remained absent after {attempts} attempts"
+                                    ),
+                                });
+                            }
+                            JournalBatchLookup::Conflict { error } => {
+                                drop(reopened);
+                                return Err(ShadowError::BatchIdentityConflict {
+                                    batch_id,
+                                    payload_digest,
+                                    detail: error,
+                                });
+                            }
+                        }
+                    }
+                    Err(CheckpointedApplyError::Journal(error)) => {
+                        let detail = error.to_string();
+                        let stale = guard.take();
+                        drop(stale);
+                        return Err(ShadowError::BatchIdentityConflict {
+                            batch_id,
+                            payload_digest,
+                            detail,
+                        });
+                    }
+                    Err(CheckpointedApplyError::CommittedInvariant { error, .. }) => {
+                        let stale = guard.take();
+                        drop(stale);
+                        return Err(ShadowError::BatchOutcomeUnknown {
+                            batch_id,
+                            payload_digest,
+                            detail: error,
+                        });
+                    }
+                    Err(CheckpointedApplyError::Prepare(error)) => {
+                        return Err(ShadowError::Encode(error.to_string()));
+                    }
+                };
+            #[cfg(test)]
+            if self
+                .fail_next_post_commit_validation
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
                 let stale = guard.take();
                 drop(stale);
-                return Err(error);
+                return Err(ShadowError::BatchOutcomeUnknown {
+                    batch_id,
+                    payload_digest,
+                    detail: "injected post-commit TaskRuntime validation failure".to_string(),
+                });
             }
-        };
-        let runtime_event = state.reducer.with_state(|projection| {
-            validate_projection_health(projection)?;
-            projection.last_projected_event().ok_or_else(|| {
-                ShadowError::Rebuild(format!(
-                    "journal sequence {} committed without an EKO event projection",
-                    receipt.sequence
-                ))
-            })
-        })?;
-        let expected =
-            i64::try_from(receipt.sequence).map_err(|_| ShadowError::SequenceOutOfRange {
-                sequence: receipt.sequence,
-            })?;
-        if runtime_event.seq != expected {
-            return Err(ShadowError::Rebuild(format!(
-                "journal receipt sequence {} does not match projected event sequence {}",
-                receipt.sequence, runtime_event.seq
-            )));
-        }
-        match &receipt.journal {
-            JournalDurabilityStatus::Confirmed => state.durability_debt = None,
-            JournalDurabilityStatus::Degraded { error } => {
-                state.durability_debt = Some(error.clone());
-                Self::retry_durability_debt(state, &self.event_path);
+            if let Err(error) = validate_batch_receipt(&receipt, &projected) {
+                let detail = error.to_string();
+                let stale = guard.take();
+                drop(stale);
+                return Err(ShadowError::BatchOutcomeUnknown {
+                    batch_id,
+                    payload_digest,
+                    detail,
+                });
             }
+            match &receipt.journal {
+                JournalDurabilityStatus::Confirmed => state.durability_debt = None,
+                JournalDurabilityStatus::Unconfirmed => {
+                    state.durability_debt = Some(format!(
+                        "reconciled TaskRuntime batch {} has unconfirmed durability",
+                        receipt.batch_id
+                    ));
+                    Self::retry_durability_debt(state, &self.event_path);
+                    receipt.journal = match state.durability_debt.as_ref() {
+                        Some(error) => JournalDurabilityStatus::Degraded {
+                            error: error.clone(),
+                        },
+                        None => JournalDurabilityStatus::Confirmed,
+                    };
+                }
+                JournalDurabilityStatus::Degraded { error } => {
+                    state.durability_debt = Some(error.clone());
+                    Self::retry_durability_debt(state, &self.event_path);
+                    receipt.journal = match state.durability_debt.as_ref() {
+                        Some(error) => JournalDurabilityStatus::Degraded {
+                            error: error.clone(),
+                        },
+                        None => JournalDurabilityStatus::Confirmed,
+                    };
+                }
+            }
+            if let Err(error) = state.reducer.with_state(validate_projection_health) {
+                let detail = error.to_string();
+                let stale = guard.take();
+                drop(stale);
+                return Err(ShadowError::BatchOutcomeUnknown {
+                    batch_id,
+                    payload_digest,
+                    detail,
+                });
+            }
+            for event in &projected {
+                observer(event.as_ref());
+            }
+            return Ok(RunBatchAppendReceipt {
+                events: projected,
+                apply: receipt,
+            });
         }
-        observer(runtime_event.as_ref());
-        Ok((runtime_event, receipt))
     }
 
     fn retry_durability_debt(state: &mut RunAuthorityState, path: &Path) {
@@ -466,19 +673,7 @@ impl RunAuthority {
         let state = guard
             .as_ref()
             .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
-        state.reducer.with_state(|projection| {
-            validate_projection_health(projection)?;
-            if projection
-                .seen_run_ids()
-                .iter()
-                .any(|run_id| run_id != expected_run_id)
-            {
-                return Err(ShadowError::Rebuild(format!(
-                    "TaskRuntime journal contains an event for a run other than {expected_run_id}"
-                )));
-            }
-            Ok(())
-        })
+        validate_state_run_id(state, expected_run_id)
     }
 
     pub(crate) fn replay_after(
@@ -626,6 +821,12 @@ impl RunAuthority {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_post_commit_validation_for_test(&self) {
+        self.fail_next_post_commit_validation
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub(crate) fn begin_invalidate(path: &Path) -> Result<RunInvalidationGuard, ShadowError> {
         let path = canonical_event_path(path, false)?;
         Self::begin_invalidate_paths(vec![path])
@@ -722,6 +923,120 @@ impl RunAuthority {
         }
         Ok(RunInvalidationGuard { slots })
     }
+}
+
+fn validate_state_run_id(
+    state: &RunAuthorityState,
+    expected_run_id: &str,
+) -> Result<(), ShadowError> {
+    state.reducer.with_state(|projection| {
+        validate_projection_health(projection)?;
+        if projection
+            .seen_run_ids()
+            .iter()
+            .any(|run_id| run_id != expected_run_id)
+        {
+            return Err(ShadowError::Rebuild(format!(
+                "TaskRuntime journal contains an event for a run other than {expected_run_id}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+fn project_prepared_batch(
+    batch: &PreparedJournalBatch<RuntimeJournalEvent>,
+    first_sequence: u64,
+) -> Result<Vec<Arc<RuntimeTaskEvent>>, ShadowError> {
+    let count = u64::try_from(batch.len()).map_err(|_| ShadowError::SequenceCapacityExceeded {
+        next_sequence: first_sequence,
+    })?;
+    let next_sequence =
+        first_sequence
+            .checked_add(count)
+            .ok_or(ShadowError::SequenceCapacityExceeded {
+                next_sequence: first_sequence,
+            })?;
+    if first_sequence == 0 || next_sequence.saturating_sub(1) > i64::MAX as u64 {
+        return Err(ShadowError::SequenceCapacityExceeded {
+            next_sequence: first_sequence,
+        });
+    }
+    batch
+        .events()
+        .iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let index =
+                u64::try_from(index).map_err(|_| ShadowError::SequenceCapacityExceeded {
+                    next_sequence: first_sequence,
+                })?;
+            let sequence =
+                first_sequence
+                    .checked_add(index)
+                    .ok_or(ShadowError::SequenceCapacityExceeded {
+                        next_sequence: first_sequence,
+                    })?;
+            event
+                .project(sequence)
+                .map(Arc::new)
+                .map_err(|sequence| ShadowError::SequenceOutOfRange { sequence })
+        })
+        .collect()
+}
+
+fn project_journal_records(
+    records: &[echo_agent::state::journal::JournalRecord<RuntimeJournalEvent>],
+) -> Result<Vec<Arc<RuntimeTaskEvent>>, ShadowError> {
+    records
+        .iter()
+        .map(|record| {
+            record
+                .event
+                .project(record.sequence)
+                .map(Arc::new)
+                .map_err(|sequence| ShadowError::SequenceOutOfRange { sequence })
+        })
+        .collect()
+}
+
+fn validate_batch_receipt(
+    receipt: &ApplyBatchReceipt,
+    projected: &[Arc<RuntimeTaskEvent>],
+) -> Result<(), ShadowError> {
+    let projected_count = u64::try_from(projected.len()).map_err(|_| {
+        ShadowError::Rebuild("TaskRuntime projected batch count exceeds u64".to_string())
+    })?;
+    let first = projected.first().ok_or_else(|| {
+        ShadowError::Rebuild("TaskRuntime batch committed without projections".to_string())
+    })?;
+    let last = projected.last().ok_or_else(|| {
+        ShadowError::Rebuild("TaskRuntime batch committed without projections".to_string())
+    })?;
+    let first_sequence =
+        u64::try_from(first.seq).map_err(|_| ShadowError::SequenceOutOfRange { sequence: 0 })?;
+    let last_sequence =
+        u64::try_from(last.seq).map_err(|_| ShadowError::SequenceOutOfRange { sequence: 0 })?;
+    if receipt.record_count != projected_count
+        || receipt.first_sequence != first_sequence
+        || receipt.last_sequence != last_sequence
+    {
+        return Err(ShadowError::Rebuild(format!(
+            "journal batch receipt {}..={} ({} records) does not match EKO projection {}..={} ({} records)",
+            receipt.first_sequence,
+            receipt.last_sequence,
+            receipt.record_count,
+            first_sequence,
+            last_sequence,
+            projected_count
+        )));
+    }
+    if receipt.commit == JournalBatchCommitStatus::AlreadyCommitted
+        && receipt.journal == JournalDurabilityStatus::Unconfirmed
+    {
+        return Ok(());
+    }
+    Ok(())
 }
 
 fn validate_projection_health(projection: &EventFoldState) -> Result<(), ShadowError> {

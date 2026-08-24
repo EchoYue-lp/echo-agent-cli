@@ -603,8 +603,12 @@ pub async fn execute_run(
             } else {
                 Some(failed_task_id.as_str())
             };
-            store.note(run_id, tid, &format!("run failed: {error}"))?;
-            store.finalize_run(run_id, TaskRunStatus::Failed, None)?;
+            store.finalize_run_with_note_task(
+                run_id,
+                TaskRunStatus::Failed,
+                tid,
+                Some(&format!("run failed: {error}")),
+            )?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -662,24 +666,8 @@ pub async fn execute_run(
                     }),
                 ),
             );
-            // The runtime adapter or control path already transitioned Running → Paused.
-            // Any Subagent that was in flight no longer exists after cancellation,
-            // so make it pending again for the resume drain.
-            for todo in store
-                .list_todos(run_id)?
-                .into_iter()
-                .filter(|todo| todo.status == TodoStatus::Running)
-            {
-                store.set_task_status(
-                    run_id,
-                    &todo.task_id,
-                    TodoStatus::Pending,
-                    None,
-                    Some("paused; pending resume"),
-                )?;
-            }
             let task_id = (!failed_task_id.starts_with('<')).then_some(failed_task_id.as_str());
-            store.note(run_id, task_id, &format!("run paused: {error}"))?;
+            store.settle_paused_tasks(run_id, task_id, &format!("run paused: {error}"))?;
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -724,22 +712,7 @@ fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String
 }
 
 fn finalize_cancelled_run_state(store: &TaskRuntimeStore, run_id: &str) -> Result<(), StoreError> {
-    for todo in store.list_todos(run_id)?.into_iter().filter(|todo| {
-        matches!(
-            todo.status,
-            TodoStatus::Pending | TodoStatus::Running | TodoStatus::Blocked
-        )
-    }) {
-        store.set_task_status(
-            run_id,
-            &todo.task_id,
-            TodoStatus::Cancelled,
-            None,
-            Some("cancelled with parent run"),
-        )?;
-    }
-    store.finalize_run(run_id, TaskRunStatus::Cancelled, None)?;
-    Ok(())
+    store.finalize_cancelled_tasks_and_run(run_id)
 }
 
 /// Structured completion assessment. Separates "real execution failure"
@@ -4439,17 +4412,7 @@ async fn materialize_direct_completion(
             ..PlanTask::default()
         }],
     };
-    super::revisioned_adapter::commit_eko_task_plan(store.clone(), plan)
-        .await
-        .map_err(|error| ExecError::Other(format!("commit direct TaskPlan: {error}")))?;
-    store.set_task_status(
-        run_id,
-        task_id,
-        TodoStatus::Running,
-        Some("primary-agent"),
-        None,
-    )?;
-    store.put_summary(&TaskExecutionSummary {
+    let summary = TaskExecutionSummary {
         run_id: run_id.to_string(),
         task_id: task_id.to_string(),
         subagent_name: "primary-agent".to_string(),
@@ -4462,14 +4425,15 @@ async fn materialize_direct_completion(
         next_implications: Vec::new(),
         suggested_tasks: Vec::new(),
         created_at: chrono::Utc::now(),
-    })?;
-    store.set_task_status(
-        run_id,
-        task_id,
-        TodoStatus::Completed,
-        Some("primary-agent"),
-        Some(final_answer),
-    )?;
+    };
+    super::revisioned_adapter::commit_eko_direct_completion(
+        store.clone(),
+        plan,
+        summary,
+        final_answer.to_string(),
+    )
+    .await
+    .map_err(|error| ExecError::Other(format!("commit direct TaskPlan: {error}")))?;
     Ok(())
 }
 
@@ -5110,6 +5074,7 @@ Read the runtime path and found one missing branch.
         use echo_agent::testing::MockLlmClient;
         use std::sync::Arc;
         let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let direct_answer = "x".repeat(1_301);
         let store = Arc::new(
             TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
                 .map_err(|error| error.to_string())?,
@@ -5117,7 +5082,7 @@ Read the runtime path and found one missing branch.
         let mock = Arc::new(
             MockLlmClient::new()
                 .with_model_name("t")
-                .with_response("ok"),
+                .with_response(direct_answer.clone()),
         );
         let agent = crate::agent_handle::AgentHandle::new(
             echo_agent::agent::ReactAgentBuilder::new()
@@ -5155,10 +5120,49 @@ Read the runtime path and found one missing branch.
             plan.tasks.first().map(|task| task.id.as_str()),
             Some("direct-answer")
         );
+        let todo = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|todo| todo.task_id == "direct-answer")
+            .ok_or_else(|| "direct completion Todo missing".to_string())?;
+        assert_eq!(todo.summary.as_deref(), Some(direct_answer.as_str()));
         let report = store
             .completion_gate_report(&run_id)
             .map_err(|error| error.to_string())?;
         assert!(report.ready, "direct completion evidence: {report:?}");
+        let journal =
+            std::fs::read_to_string(shadow_root.path().join(&run_id).join("events.jsonl"))
+                .map_err(|error| error.to_string())?;
+        let frame: serde_json::Value = serde_json::from_str(
+            journal
+                .lines()
+                .last()
+                .ok_or_else(|| "direct completion journal has no frame".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let event_types = frame
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "direct completion frame has no records".to_string())?
+            .iter()
+            .filter_map(|record| {
+                record
+                    .get("event")
+                    .and_then(|event| event.get("event_type"))
+                    .and_then(serde_json::Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            [
+                "plan_revision_committed",
+                "task_started",
+                "note",
+                "task_completed",
+                "run_status_changed",
+            ]
+        );
         Ok(())
     }
 

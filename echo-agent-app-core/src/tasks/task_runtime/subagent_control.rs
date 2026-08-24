@@ -12,6 +12,7 @@ use echo_agent::agent::subagent::{
     SubagentAttemptIdentity, SubagentControlPhase, SubagentExecutor,
 };
 
+use super::run_authority::RuntimeJournalEvent;
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::{
     RuntimeEventKind, SubagentControlActorSource, SubagentControlIdentity, SubagentControlReceipt,
@@ -109,27 +110,41 @@ impl SubagentControlService {
                 return Ok(ControlBegin::Existing(receipt));
             }
             validate_plan_target(&self.store, &identity)?;
-            append_guidance_event(
-                &self.store,
-                &identity,
-                RuntimeEventKind::SubagentGuidanceQueued,
-                SubagentGuidanceKind::LiveMessage,
-                actor_source,
-                Some(instruction),
-                serde_json::json!({}),
-            )?;
             match exact_active_target(&self.store, &identity) {
-                Ok(target) => Ok(ControlBegin::New(target)),
-                Err(error) => {
-                    let detail = error.to_string();
+                Ok(target) => {
                     append_guidance_event(
                         &self.store,
                         &identity,
-                        RuntimeEventKind::SubagentGuidanceRejected,
+                        RuntimeEventKind::SubagentGuidanceQueued,
                         SubagentGuidanceKind::LiveMessage,
                         actor_source,
-                        None,
-                        serde_json::json!({ "reason": detail }),
+                        Some(instruction),
+                        serde_json::json!({}),
+                    )?;
+                    Ok(ControlBegin::New(target))
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    self.store.shadow.append_event_batch(
+                        &identity.run_id,
+                        vec![
+                            guidance_event(
+                                &identity,
+                                RuntimeEventKind::SubagentGuidanceQueued,
+                                SubagentGuidanceKind::LiveMessage,
+                                actor_source,
+                                Some(instruction),
+                                serde_json::json!({}),
+                            ),
+                            guidance_event(
+                                &identity,
+                                RuntimeEventKind::SubagentGuidanceRejected,
+                                SubagentGuidanceKind::LiveMessage,
+                                actor_source,
+                                None,
+                                serde_json::json!({ "reason": detail }),
+                            ),
+                        ],
                     )?;
                     Ok(ControlBegin::Existing(rejected_receipt(
                         identity.clone(),
@@ -194,23 +209,35 @@ impl SubagentControlService {
                 return Ok(ControlBegin::Existing(receipt));
             }
             validate_plan_target(&self.store, &identity)?;
-            append_interrupt_event(
-                &self.store,
-                &identity,
-                RuntimeEventKind::SubagentInterruptRequested,
-                actor_source,
-                serde_json::json!({}),
-            )?;
             match exact_active_target(&self.store, &identity) {
-                Ok(target) => Ok(ControlBegin::New(target)),
-                Err(error) => {
-                    let detail = error.to_string();
+                Ok(target) => {
                     append_interrupt_event(
                         &self.store,
                         &identity,
-                        RuntimeEventKind::SubagentInterruptSettled,
+                        RuntimeEventKind::SubagentInterruptRequested,
                         actor_source,
-                        serde_json::json!({ "accepted": false, "reason": detail }),
+                        serde_json::json!({}),
+                    )?;
+                    Ok(ControlBegin::New(target))
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    self.store.shadow.append_event_batch(
+                        &identity.run_id,
+                        vec![
+                            interrupt_event(
+                                &identity,
+                                RuntimeEventKind::SubagentInterruptRequested,
+                                actor_source,
+                                serde_json::json!({}),
+                            ),
+                            interrupt_event(
+                                &identity,
+                                RuntimeEventKind::SubagentInterruptSettled,
+                                actor_source,
+                                serde_json::json!({ "accepted": false, "reason": detail }),
+                            ),
+                        ],
                     )?;
                     Ok(ControlBegin::Existing(rejected_receipt(
                         identity.clone(),
@@ -649,6 +676,28 @@ fn append_guidance_event(
     instruction: Option<&str>,
     extra: serde_json::Value,
 ) -> Result<(), StoreError> {
+    store.shadow.append_event_batch(
+        &identity.run_id,
+        vec![guidance_event(
+            identity,
+            event_type,
+            kind,
+            actor_source,
+            instruction,
+            extra,
+        )],
+    )?;
+    Ok(())
+}
+
+fn guidance_event(
+    identity: &SubagentControlIdentity,
+    event_type: RuntimeEventKind,
+    kind: SubagentGuidanceKind,
+    actor_source: SubagentControlActorSource,
+    instruction: Option<&str>,
+    extra: serde_json::Value,
+) -> RuntimeJournalEvent {
     let mut payload = command_payload(identity, actor_source);
     payload.insert(
         "kind".to_string(),
@@ -661,14 +710,13 @@ fn append_guidance_event(
         );
     }
     merge_payload(&mut payload, extra);
-    store.shadow.append_event_line(
+    RuntimeJournalEvent::for_append(
         &identity.run_id,
         Some(&identity.task_id),
         Some(&identity.execution_id),
         event_type,
         serde_json::Value::Object(payload),
-    )?;
-    Ok(())
+    )
 }
 
 fn append_interrupt_event(
@@ -678,16 +726,28 @@ fn append_interrupt_event(
     actor_source: SubagentControlActorSource,
     extra: serde_json::Value,
 ) -> Result<(), StoreError> {
+    store.shadow.append_event_batch(
+        &identity.run_id,
+        vec![interrupt_event(identity, event_type, actor_source, extra)],
+    )?;
+    Ok(())
+}
+
+fn interrupt_event(
+    identity: &SubagentControlIdentity,
+    event_type: RuntimeEventKind,
+    actor_source: SubagentControlActorSource,
+    extra: serde_json::Value,
+) -> RuntimeJournalEvent {
     let mut payload = command_payload(identity, actor_source);
     merge_payload(&mut payload, extra);
-    store.shadow.append_event_line(
+    RuntimeJournalEvent::for_append(
         &identity.run_id,
         Some(&identity.task_id),
         Some(&identity.execution_id),
         event_type,
         serde_json::Value::Object(payload),
-    )?;
-    Ok(())
+    )
 }
 
 fn command_payload(
@@ -864,6 +924,36 @@ mod tests {
         Ok(store)
     }
 
+    fn last_frame_event_types(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<Vec<String>, String> {
+        let contents =
+            std::fs::read_to_string(store.active_shadow_root().join(run_id).join("events.jsonl"))
+                .map_err(|error| error.to_string())?;
+        let frame: serde_json::Value = serde_json::from_str(
+            contents
+                .lines()
+                .last()
+                .ok_or_else(|| "Subagent control journal has no frame".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        frame
+            .get("records")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "Subagent control frame has no records".to_string())?
+            .iter()
+            .map(|record| {
+                record
+                    .get("event")
+                    .and_then(|event| event.get("event_type"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| "Subagent control record has no event type".to_string())
+            })
+            .collect()
+    }
+
     fn identity(
         run_id: &str,
         task_id: &str,
@@ -1000,6 +1090,10 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(message.status, SubagentControlStatus::Rejected);
+        assert_eq!(
+            last_frame_event_types(&store, "run-late")?,
+            ["subagent_guidance_queued", "subagent_guidance_rejected"]
+        );
 
         let interrupt = service
             .interrupt_subagent(
@@ -1012,6 +1106,10 @@ mod tests {
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(interrupt.status, SubagentControlStatus::Rejected);
+        assert_eq!(
+            last_frame_event_types(&store, "run-late")?,
+            ["subagent_interrupt_requested", "subagent_interrupt_settled"]
+        );
         let events = store
             .list_events("run-late", 0)
             .map_err(|error| error.to_string())?;
