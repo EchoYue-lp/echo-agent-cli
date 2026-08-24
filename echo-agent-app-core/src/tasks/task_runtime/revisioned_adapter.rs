@@ -16,7 +16,7 @@ use super::store::{InitialRunTriggerMetadata, StoreError, TaskRuntimeStore};
 use super::task_tools::{TaskCapabilityCatalog, current_run_id, formal_run_id_for_turn};
 use super::types::{
     AttendedMode, DomainProfile, EkoPlanMetadata, EkoTaskExtension, PlanTaskKind,
-    TaskExecutionTarget, TaskRun, TaskUpdateRequest,
+    TaskExecutionSummary, TaskExecutionTarget, TaskRun, TaskUpdateRequest,
 };
 
 #[derive(Clone)]
@@ -27,12 +27,20 @@ struct PendingInitialRun {
 }
 
 type PendingInitialRuns = Arc<Mutex<HashMap<String, PendingInitialRun>>>;
+#[derive(Clone)]
+struct PendingDirectCompletion {
+    summary: TaskExecutionSummary,
+    task_summary: String,
+}
+
+type PendingDirectCompletions = Arc<Mutex<HashMap<String, PendingDirectCompletion>>>;
 
 /// File persistence adapter. It deliberately has no patch or validation
 /// logic; those remain authoritative in the framework service.
 pub struct EkoRevisionedTaskStore {
     store: Arc<TaskRuntimeStore>,
     pending_initial_runs: PendingInitialRuns,
+    pending_direct_completions: PendingDirectCompletions,
 }
 
 impl EkoRevisionedTaskStore {
@@ -40,6 +48,7 @@ impl EkoRevisionedTaskStore {
         Self {
             store,
             pending_initial_runs: Arc::new(Mutex::new(HashMap::new())),
+            pending_direct_completions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -50,6 +59,18 @@ impl EkoRevisionedTaskStore {
         Self {
             store,
             pending_initial_runs,
+            pending_direct_completions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn with_pending_direct_completion(
+        store: Arc<TaskRuntimeStore>,
+        pending_direct_completions: PendingDirectCompletions,
+    ) -> Self {
+        Self {
+            store,
+            pending_initial_runs: Arc::new(Mutex::new(HashMap::new())),
+            pending_direct_completions,
         }
     }
 }
@@ -76,8 +97,14 @@ impl RevisionedTaskStore for EkoRevisionedTaskStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(scope_id)
             .cloned();
-        let committed = match pending {
-            Some(pending) => self
+        let pending_direct = self
+            .pending_direct_completions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(scope_id)
+            .cloned();
+        let committed = match (pending, pending_direct) {
+            (Some(pending), None) => self
                 .store
                 .compare_and_publish_initial_revisioned_task_graph(
                     &pending.run,
@@ -85,12 +112,25 @@ impl RevisionedTaskStore for EkoRevisionedTaskStore {
                     pending.continuation,
                     commit,
                 ),
-            None => self
+            (None, Some(completion)) => self.store.compare_and_commit_direct_completion(
+                scope_id,
+                commit,
+                &completion.summary,
+                &completion.task_summary,
+            ),
+            (None, None) => self
                 .store
                 .compare_and_commit_revisioned_task_graph(scope_id, commit),
+            (Some(_), Some(_)) => Err(StoreError::InvalidPlan(format!(
+                "TaskRun {scope_id} cannot be both an initial publication and direct completion"
+            ))),
         }
         .map_err(store_error)?;
         self.pending_initial_runs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(scope_id);
+        self.pending_direct_completions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(scope_id);
@@ -559,6 +599,48 @@ pub async fn commit_eko_task_plan(
     load_committed_plan(&store, run_id)
 }
 
+/// Framework-validate a fixed direct-answer graph, then atomically persist the
+/// graph, structured evidence, task settlement, and run settlement.
+pub(crate) async fn commit_eko_direct_completion(
+    store: Arc<TaskRuntimeStore>,
+    plan: super::types::TaskPlan,
+    summary: TaskExecutionSummary,
+    task_summary: String,
+) -> Result<super::types::TaskPlan, TaskRevisionError> {
+    let run = store
+        .get_run(&plan.run_id)
+        .map_err(|error| TaskRevisionError::Backend {
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| TaskRevisionError::GraphNotFound {
+            scope_id: plan.run_id.clone(),
+        })?;
+    let (run_id, context, tasks) = plan_graph_input(plan, run)?;
+    if summary.run_id != run_id {
+        return Err(TaskRevisionError::InvalidInput {
+            message: "direct completion summary belongs to another TaskRun".to_string(),
+        });
+    }
+    let pending_direct_completions = Arc::new(Mutex::new(HashMap::from([(
+        run_id.clone(),
+        PendingDirectCompletion {
+            summary,
+            task_summary,
+        },
+    )])));
+    let service = TaskRevisionService::new(
+        Arc::new(EkoRevisionedTaskStore::with_pending_direct_completion(
+            store.clone(),
+            pending_direct_completions,
+        )),
+        Arc::new(DefaultTaskToolPolicy::new(run_id.clone())),
+    );
+    service
+        .create_prepared(&run_id, context, tasks, "initial complete plan".to_string())
+        .await?;
+    load_committed_plan(&store, run_id)
+}
+
 /// Publish a prepared TaskRun and its first framework-validated graph as one
 /// visible file generation. EKO owns this local-file transaction; graph
 /// validation, revision calculation, and CAS remain framework-owned.
@@ -725,6 +807,104 @@ mod tests {
                 .is_none()
         );
         assert!(!root.join("rollback-run").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_completion_rejects_mutating_evidence_without_publishing_plan()
+    -> Result<(), String> {
+        use super::super::types::{
+            ExecutionMode, PlanTask, SubagentEvidenceResult, SubagentRunStatus, SubagentTaskResult,
+            SubagentVerificationSource, TaskExecutionSummary, TaskPlan, TaskRunStatus,
+        };
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = "direct-mutating-evidence";
+        store
+            .create_run(
+                run_id,
+                "workspace",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "answer without side effects",
+                "agent_autonomous",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let task_id = "direct-answer";
+        let plan = TaskPlan {
+            plan_id: format!("plan:{run_id}"),
+            run_id: run_id.to_string(),
+            revision: 0,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: super::super::types::task_goal_sha256("answer without side effects"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: task_id.to_string(),
+                title: "Direct answer".to_string(),
+                description: "answer without side effects".to_string(),
+                kind: PlanTaskKind::Summary,
+                agent_role: "primary-agent".to_string(),
+                domain_profile: DomainProfile::General,
+                ..PlanTask::default()
+            }],
+        };
+        let mut result =
+            SubagentTaskResult::terminal(SubagentRunStatus::Completed, "done", Vec::new());
+        result.evidence.push(SubagentEvidenceResult {
+            kind: "file_write".to_string(),
+            subject: "src/lib.rs".to_string(),
+            outcome: Some("succeeded".to_string()),
+            details: "unexpected mutation".to_string(),
+            source: SubagentVerificationSource::Observed,
+            attributes: serde_json::json!({}),
+        });
+        let summary = TaskExecutionSummary {
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            subagent_name: "primary-agent".to_string(),
+            result,
+            decisions: Vec::new(),
+            next_implications: Vec::new(),
+            suggested_tasks: Vec::new(),
+            created_at: chrono::Utc::now(),
+        };
+
+        let error = commit_eko_direct_completion(
+            store.clone(),
+            plan,
+            summary,
+            "complete answer".to_string(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| "mutating direct evidence was accepted".to_string())?;
+        assert!(error.to_string().contains("direct completion"));
+        assert!(
+            store
+                .get_plan(run_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .get_run(run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "direct evidence TaskRun missing".to_string())?
+                .status,
+            TaskRunStatus::Running
+        );
         Ok(())
     }
 

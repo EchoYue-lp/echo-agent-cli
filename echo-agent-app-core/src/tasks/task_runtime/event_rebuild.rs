@@ -103,8 +103,6 @@ pub(crate) struct EventFoldState {
     #[serde(default)]
     seen_run_ids: std::collections::BTreeSet<String>,
     #[serde(skip)]
-    last_projected_event: Option<std::sync::Arc<RuntimeTaskEvent>>,
-    #[serde(skip)]
     sequence_overflow: Option<u64>,
     #[serde(skip)]
     missing_record_sequence: bool,
@@ -119,12 +117,6 @@ impl EventFoldState {
         &self.seen_run_ids
     }
 
-    pub(crate) fn last_projected_event(&self) -> Option<std::sync::Arc<RuntimeTaskEvent>> {
-        self.last_projected_event
-            .as_ref()
-            .map(std::sync::Arc::clone)
-    }
-
     pub(crate) fn sequence_overflow(&self) -> Option<u64> {
         self.sequence_overflow
     }
@@ -135,7 +127,6 @@ impl EventFoldState {
 
     fn apply_projected_event(&mut self, event: RuntimeTaskEvent) {
         self.apply_runtime_event(&event);
-        self.last_projected_event = Some(std::sync::Arc::new(event));
         self.sequence_overflow = None;
         self.missing_record_sequence = false;
     }
@@ -156,7 +147,6 @@ impl EventFoldState {
             active_tools,
             recovery_blockers,
             seen_run_ids,
-            last_projected_event: _,
             sequence_overflow: _,
             missing_record_sequence: _,
         } = self;

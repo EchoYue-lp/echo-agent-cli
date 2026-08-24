@@ -40,6 +40,8 @@ pub struct FileTaskShadow {
     #[cfg(test)]
     fail_initial_publish_before_rename: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
+    fail_initial_batch_durability: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
     deletion_pause: Arc<Mutex<Option<TestPause>>>,
     #[cfg(test)]
     rebind_pause: Arc<Mutex<Option<TestPause>>>,
@@ -64,6 +66,8 @@ impl FileTaskShadow {
             event_hook: Arc::new(OnceLock::new()),
             #[cfg(test)]
             fail_initial_publish_before_rename: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_initial_batch_durability: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             deletion_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -92,6 +96,7 @@ impl FileTaskShadow {
             })),
             event_hook: Arc::new(OnceLock::new()),
             fail_initial_publish_before_rename: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fail_initial_batch_durability: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deletion_pause: Arc::new(Mutex::new(None)),
             rebind_pause: Arc::new(Mutex::new(None)),
             fail_root_sync_on_call: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -445,8 +450,42 @@ impl FileTaskShadow {
                 &staging_directory.join("checkpoint.json"),
                 run_id,
             )?;
-            for event in events {
-                committed.push(authority.append(event)?.0);
+            let batch = authority.append_batch(events)?;
+            #[cfg(test)]
+            let batch = {
+                let mut batch = batch;
+                if self
+                    .fail_initial_batch_durability
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    batch.apply.journal =
+                        echo_agent::state::journal::JournalDurabilityStatus::Degraded {
+                            error: "injected persistent initial journal durability failure"
+                                .to_string(),
+                        };
+                }
+                batch
+            };
+            if let echo_agent::state::journal::JournalDurabilityStatus::Confirmed =
+                &batch.apply.journal
+            {
+                committed = batch.events;
+            } else {
+                let detail = match &batch.apply.journal {
+                    echo_agent::state::journal::JournalDurabilityStatus::Unconfirmed => {
+                        "journal durability remains unconfirmed".to_string()
+                    }
+                    echo_agent::state::journal::JournalDurabilityStatus::Degraded { error } => {
+                        error.clone()
+                    }
+                    echo_agent::state::journal::JournalDurabilityStatus::Confirmed => {
+                        "journal durability changed during staging validation".to_string()
+                    }
+                };
+                return Err(ShadowError::InitialBatchDurabilityDegraded {
+                    run_id: run_id.to_string(),
+                    detail,
+                });
             }
             authority.refresh_projections(false)?;
             sync_directory(&staging_directory)
@@ -490,6 +529,12 @@ impl FileTaskShadow {
     #[cfg(test)]
     pub(crate) fn fail_next_initial_publish_before_rename(&self) {
         self.fail_initial_publish_before_rename
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn fail_next_initial_batch_durability_for_test(&self) {
+        self.fail_initial_batch_durability
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -550,12 +595,44 @@ impl FileTaskShadow {
             .ok_or_else(|| ShadowError::Io("TaskRuntime authority unavailable".to_string()))?;
         let event = RuntimeJournalEvent::for_append(run_id, task_id, step_id, event_type, payload);
         let hook = self.event_hook.get().cloned();
-        let persisted = match authority.append_with_observer(event, |persisted| {
+        match authority.append_with_observer(event, |persisted| {
             if let Some(hook) = hook.as_ref() {
                 hook(persisted);
             }
         }) {
-            Ok((event, _receipt)) => event,
+            Ok((persisted, _receipt)) => Ok(persisted),
+            Err(error) => {
+                self.clear_cached_authority(run_id, &authority);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn append_event_batch(
+        &self,
+        run_id: &str,
+        events: Vec<RuntimeJournalEvent>,
+    ) -> Result<Vec<Arc<RuntimeTaskEvent>>, ShadowError> {
+        if events.is_empty() {
+            return Err(ShadowError::Encode(
+                "TaskRuntime batch must contain at least one event".to_string(),
+            ));
+        }
+        if events.iter().any(|event| event.run_id() != run_id) {
+            return Err(ShadowError::Encode(
+                "TaskRuntime batch contains an event for another run".to_string(),
+            ));
+        }
+        let authority = self
+            .authority(run_id, true)?
+            .ok_or_else(|| ShadowError::Io("TaskRuntime authority unavailable".to_string()))?;
+        let hook = self.event_hook.get().cloned();
+        let persisted = match authority.append_batch_with_observer(events, |persisted| {
+            if let Some(hook) = hook.as_ref() {
+                hook(persisted);
+            }
+        }) {
+            Ok(receipt) => receipt.events,
             Err(error) => {
                 self.clear_cached_authority(run_id, &authority);
                 return Err(error);
@@ -800,6 +877,10 @@ pub enum ShadowError {
     CommittedProjectionDegraded { seq: i64, detail: String },
     #[error("TaskRun {run_id} is visible but root publication durability degraded: {detail}")]
     CommittedPublicationDegraded { run_id: String, detail: String },
+    #[error(
+        "TaskRun {run_id} initial journal batch is hidden because durability degraded: {detail}"
+    )]
+    InitialBatchDurabilityDegraded { run_id: String, detail: String },
     #[error("TaskRun deletion is staged at {tombstone} but durability degraded: {detail}")]
     CommittedDeletionDegraded { tombstone: String, detail: String },
     #[error("TaskRuntime root generation is transitioning")]
@@ -810,6 +891,28 @@ pub enum ShadowError {
     SequenceCapacityExceeded { next_sequence: u64 },
     #[error("journal sequence {sequence} exceeds the EKO i64 cursor domain")]
     SequenceOutOfRange { sequence: u64 },
+    #[error("TaskRuntime batch {batch_id} was not committed after {attempts} attempts: {detail}")]
+    BatchNotCommitted {
+        batch_id: String,
+        attempts: usize,
+        detail: String,
+    },
+    #[error(
+        "TaskRuntime batch {batch_id} ({payload_digest}) has an unknown outcome after verified reopen: {detail}"
+    )]
+    BatchOutcomeUnknown {
+        batch_id: String,
+        payload_digest: String,
+        detail: String,
+    },
+    #[error(
+        "TaskRuntime batch {batch_id} ({payload_digest}) conflicts with journal authority: {detail}"
+    )]
+    BatchIdentityConflict {
+        batch_id: String,
+        payload_digest: String,
+        detail: String,
+    },
 }
 
 #[cfg(test)]
@@ -1822,6 +1925,126 @@ mod tests {
     }
 
     #[test]
+    fn first_batch_hook_observes_the_complete_physical_frame() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "batch-hook").map_err(|error| error.to_string())?;
+        let event_path = temp.path().join("batch-hook/events.jsonl");
+        let observed_record_counts = Arc::new(Mutex::new(Vec::new()));
+        let hook_counts = Arc::clone(&observed_record_counts);
+        assert!(shadow.try_attach_event_hook(Arc::new(move |_event| {
+            let count = std::fs::read_to_string(&event_path)
+                .ok()
+                .and_then(|contents| contents.lines().last().map(str::to_string))
+                .and_then(|line| serde_json::from_str::<serde_json::Value>(&line).ok())
+                .and_then(|frame| {
+                    frame
+                        .get("records")
+                        .and_then(serde_json::Value::as_array)
+                        .map(Vec::len)
+                })
+                .unwrap_or_default();
+            hook_counts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(count);
+        })));
+        shadow
+            .append_event_batch(
+                "batch-hook",
+                (0..3)
+                    .map(|ordinal| {
+                        RuntimeJournalEvent::for_append(
+                            "batch-hook",
+                            None,
+                            None,
+                            RuntimeEventKind::Note,
+                            serde_json::json!({ "ordinal": ordinal }),
+                        )
+                    })
+                    .collect(),
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            observed_record_counts
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[3, 3, 3]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_batches_never_interleave_events_or_hooks() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "batch-order").map_err(|error| error.to_string())?;
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let hook_observed = Arc::clone(&observed);
+        assert!(shadow.try_attach_event_hook(Arc::new(move |event| {
+            hook_observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event.seq);
+        })));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for group in ["a", "b"] {
+            let writer = shadow.clone();
+            let start = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                writer.append_event_batch(
+                    "batch-order",
+                    (0..3)
+                        .map(|ordinal| {
+                            RuntimeJournalEvent::for_append(
+                                "batch-order",
+                                None,
+                                None,
+                                RuntimeEventKind::Note,
+                                serde_json::json!({ "group": group, "ordinal": ordinal }),
+                            )
+                        })
+                        .collect(),
+                )
+            }));
+        }
+        barrier.wait();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| "batch append thread panicked".to_string())?
+                .map_err(|error| error.to_string())?;
+        }
+        let groups = shadow
+            .read_events("batch-order")
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .skip(1)
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("group")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            groups == ["a", "a", "a", "b", "b", "b"] || groups == ["b", "b", "b", "a", "a", "a"]
+        );
+        assert_eq!(
+            observed
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_slice(),
+            &[2, 3, 4, 5, 6, 7]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn delete_closes_other_shadow_then_same_id_recreates_at_sequence_one() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let deleting = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
@@ -2251,6 +2474,23 @@ mod tests {
             &[1, 2]
         );
         assert!(temp.path().join("publish-degraded/events.jsonl").is_file());
+        let journal = std::fs::read_to_string(temp.path().join("publish-degraded/events.jsonl"))
+            .map_err(|error| error.to_string())?;
+        assert_eq!(journal.lines().count(), 1);
+        let frame: serde_json::Value = serde_json::from_str(
+            journal
+                .lines()
+                .next()
+                .ok_or_else(|| "initial publication frame missing".to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            frame
+                .get("records")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
         drop(shadow);
         assert_eq!(
             FileTaskShadow::new(temp.path())
@@ -2259,6 +2499,80 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .len(),
             2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn degraded_initial_batch_stays_hidden_and_dispatches_no_hooks() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let hook_observed = Arc::clone(&observed);
+        assert!(shadow.try_attach_event_hook(Arc::new(move |_event| {
+            hook_observed.fetch_add(1, Ordering::SeqCst);
+        })));
+        let timestamp = chrono::Utc::now();
+        let goal = "hidden degraded publication";
+        let events = vec![
+            RuntimeJournalEvent::new(
+                "hidden-degraded",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": goal,
+                    "goal_revision": 1,
+                    "goal_sha256": crate::tasks::task_runtime::task_goal_sha256(goal),
+                    "domain_profile": "general",
+                    "workspace_id": "workspace",
+                    "conversation_id": "conversation",
+                    "root_message_id": "message",
+                    "route": "complex",
+                    "attended_mode": "attended",
+                }),
+                timestamp,
+            ),
+            RuntimeJournalEvent::new(
+                "hidden-degraded",
+                None,
+                None,
+                RuntimeEventKind::PlanRevisionCommitted,
+                serde_json::json!({
+                    "reason": "initial",
+                    "base_revision": 0,
+                    "skipped_task_ids": [],
+                    "plan": PlanRevision {
+                        plan_id: "plan".to_string(),
+                        run_id: "hidden-degraded".to_string(),
+                        revision: 1,
+                        domain_profile: DomainProfile::General,
+                        goal_revision: 1,
+                        goal_sha256: crate::tasks::task_runtime::task_goal_sha256(goal),
+                        assumptions: Vec::new(),
+                        risks: Vec::new(),
+                        execution_mode: ExecutionMode::Sequential,
+                        tasks: Vec::new(),
+                    },
+                }),
+                timestamp,
+            ),
+        ];
+        shadow.fail_next_initial_batch_durability_for_test();
+        assert!(matches!(
+            shadow.publish_initial_event_batch("hidden-degraded", events),
+            Err(ShadowError::InitialBatchDurabilityDegraded { .. })
+        ));
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        assert!(!temp.path().join("hidden-degraded").exists());
+        assert!(
+            std::fs::read_dir(temp.path())
+                .map_err(|error| error.to_string())?
+                .filter_map(Result::ok)
+                .all(|entry| !entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".preparing-"))
         );
         Ok(())
     }
@@ -2318,6 +2632,66 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .seq,
             2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn post_commit_validation_failure_closes_aliases_and_cold_recovery_sees_full_batch()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "post-commit").map_err(|error| error.to_string())?;
+        let observed = Arc::new(AtomicUsize::new(0));
+        let hook_observed = Arc::clone(&observed);
+        assert!(shadow.try_attach_event_hook(Arc::new(move |_event| {
+            hook_observed.fetch_add(1, Ordering::SeqCst);
+        })));
+        let alias = shadow
+            .authority("post-commit", false)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "post-commit authority missing".to_string())?;
+        alias.fail_next_post_commit_validation_for_test();
+
+        assert!(matches!(
+            shadow.append_event_line(
+                "post-commit",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({ "marker": "committed-before-validation" }),
+            ),
+            Err(ShadowError::BatchOutcomeUnknown { detail, .. })
+                if detail.contains("injected post-commit")
+        ));
+        assert_eq!(observed.load(Ordering::SeqCst), 0);
+        assert!(matches!(
+            alias.append(RuntimeJournalEvent::for_append(
+                "post-commit",
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({ "stale": true }),
+            )),
+            Err(ShadowError::AuthorityClosed(_))
+        ));
+
+        let cold = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let events = cold
+            .read_events("post-commit")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    event
+                        .payload
+                        .get("marker")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("committed-before-validation")
+                })
+                .count(),
+            1
         );
         Ok(())
     }
@@ -2409,65 +2783,57 @@ mod tests {
     }
 
     #[test]
-    fn multi_event_failure_exposes_exact_committed_prefix_without_retry() -> Result<(), String> {
-        for first_kind in [
-            RuntimeEventKind::RunGoalUpdated,
-            RuntimeEventKind::RunCancelled,
-        ] {
-            let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
-            let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
-            run_created(&shadow, "prefix").map_err(|error| error.to_string())?;
-            let event_path = temp.path().join("prefix/events.jsonl");
-            let backup = temp.path().join("prefix/events.backup");
-            let sabotage_path = event_path.clone();
-            let sabotage_backup = backup.clone();
-            assert!(shadow.try_attach_event_hook(Arc::new(move |event| {
-                if event.event_type == first_kind {
-                    let _renamed = std::fs::rename(&sabotage_path, &sabotage_backup);
-                    let _created = std::fs::create_dir(&sabotage_path);
-                }
-            })));
-            shadow
-                .append_event_line(
-                    "prefix",
+    fn event_batch_is_all_or_none_when_the_authority_is_unwritable() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        run_created(&shadow, "atomic").map_err(|error| error.to_string())?;
+        let before = shadow
+            .read_events("atomic")
+            .map_err(|error| error.to_string())?;
+        drop(shadow);
+        let event_path = temp.path().join("atomic/events.jsonl");
+        let backup = temp.path().join("atomic/events.backup");
+        std::fs::rename(&event_path, &backup).map_err(|error| error.to_string())?;
+        std::fs::create_dir(&event_path).map_err(|error| error.to_string())?;
+
+        let broken = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let result = broken.append_event_batch(
+            "atomic",
+            vec![
+                RuntimeJournalEvent::for_append(
+                    "atomic",
                     None,
                     None,
-                    first_kind,
-                    serde_json::json!({"operation": "prefix"}),
-                )
-                .map_err(|error| error.to_string())?;
-            assert!(
-                shadow
-                    .append_event_line(
-                        "prefix",
-                        None,
-                        None,
-                        RuntimeEventKind::Note,
-                        serde_json::json!({"operation": "suffix"}),
-                    )
-                    .is_err()
-            );
-            std::fs::remove_dir(&event_path).map_err(|error| error.to_string())?;
-            std::fs::rename(&backup, &event_path).map_err(|error| error.to_string())?;
-            let cold = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
-            let events = cold
-                .read_events("prefix")
-                .map_err(|error| error.to_string())?;
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| event.event_type == first_kind)
-                    .count(),
-                1
-            );
-            assert!(!events.iter().any(|event| {
+                    RuntimeEventKind::RunGoalUpdated,
+                    serde_json::json!({"operation": "first"}),
+                ),
+                RuntimeJournalEvent::for_append(
+                    "atomic",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"operation": "second"}),
+                ),
+            ],
+        );
+        assert!(result.is_err());
+        drop(broken);
+        std::fs::remove_dir(&event_path).map_err(|error| error.to_string())?;
+        std::fs::rename(&backup, &event_path).map_err(|error| error.to_string())?;
+        let cold = FileTaskShadow::new(temp.path()).map_err(|error| error.to_string())?;
+        let after = cold
+            .read_events("atomic")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(after.len(), before.len());
+        assert!(!after.iter().any(|event| {
+            matches!(
                 event
                     .payload
                     .get("operation")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("suffix")
-            }));
-        }
+                    .and_then(serde_json::Value::as_str),
+                Some("first" | "second")
+            )
+        }));
         Ok(())
     }
 }
