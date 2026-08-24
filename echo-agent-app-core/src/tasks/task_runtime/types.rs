@@ -892,6 +892,57 @@ pub struct TaskRun {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Immutable TaskRun identity captured when a surface queues a resume turn.
+///
+/// A later lookup must match every field and remain paused. This prevents a
+/// delayed command from driving a deleted-and-recreated run that reused the
+/// same external run id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRunResumeIdentity {
+    pub run_id: String,
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub root_message_id: String,
+    pub created_at: DateTime<Utc>,
+    pub goal_revision: u64,
+}
+
+impl TaskRunResumeIdentity {
+    pub fn capture(run: &TaskRun) -> Self {
+        Self {
+            run_id: run.run_id.clone(),
+            workspace_id: run.workspace_id.clone(),
+            conversation_id: run.conversation_id.clone(),
+            root_message_id: run.root_message_id.clone(),
+            created_at: run.created_at,
+            goal_revision: run.goal_revision,
+        }
+    }
+
+    pub fn validate_resumable(&self, run: &TaskRun) -> Result<(), String> {
+        if run.run_id != self.run_id
+            || run.workspace_id != self.workspace_id
+            || run.conversation_id != self.conversation_id
+            || run.root_message_id != self.root_message_id
+            || run.created_at != self.created_at
+            || run.goal_revision != self.goal_revision
+        {
+            return Err(format!(
+                "TaskRun '{}' identity changed after resume was queued",
+                self.run_id
+            ));
+        }
+        if run.status != TaskRunStatus::Paused {
+            return Err(format!(
+                "TaskRun '{}' is {}; resume requires paused",
+                self.run_id,
+                run.status.as_str()
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Stable digest used to bind Plans and evidence to the authoritative Goal.
 pub fn task_goal_sha256(goal: &str) -> String {
     format!("{:x}", Sha256::digest(goal.as_bytes()))
@@ -3194,5 +3245,36 @@ mod tests {
             assert_eq!(DomainProfile::from_str(p.as_str()), Some(p));
         }
         assert_eq!(DomainProfile::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn delayed_resume_rejects_deleted_and_recreated_run_identity() {
+        let now = Utc::now();
+        let mut run = TaskRun {
+            run_id: "same-run".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+            root_message_id: "root-a".to_string(),
+            domain_profile: DomainProfile::General,
+            status: TaskRunStatus::Paused,
+            goal: "goal".to_string(),
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("goal"),
+            plan_id: None,
+            route: "task".to_string(),
+            attended_mode: AttendedMode::Attended,
+            attachments: Vec::new(),
+            created_at: now,
+            updated_at: now,
+        };
+        let identity = TaskRunResumeIdentity::capture(&run);
+        assert!(identity.validate_resumable(&run).is_ok());
+
+        run.created_at = now + chrono::Duration::milliseconds(1);
+        assert!(
+            identity
+                .validate_resumable(&run)
+                .is_err_and(|error| error.contains("identity changed"))
+        );
     }
 }

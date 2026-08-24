@@ -618,7 +618,7 @@ pub async fn run_event_loop(
         }
 
         if last_runtime_refresh.elapsed() >= Duration::from_millis(250) {
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
             last_runtime_refresh = Instant::now();
         }
 
@@ -1045,6 +1045,8 @@ fn apply_turn_settlement(app: &mut TuiApp, turn_id: &str, outcome: &TurnOutcome)
     app.is_processing = false;
     app.active_turn_id = None;
     app.active_turn_workspace_id = None;
+    app.active_turn_conversation_id = None;
+    app.active_turn_execution_root = None;
     app.active_turn_agent = None;
     app.status_msg = match outcome {
         TurnOutcome::Completed => "Ready".to_string(),
@@ -1529,17 +1531,33 @@ async fn handle_enter(
     if let TurnDispatchResult::Rejected { turn, error, .. } =
         dispatch_turn(app, agent, agent_tx, turn).await
     {
-        restore_undispatched_turn(app, turn, error);
+        restore_undispatched_turn(app, *turn, error);
     }
 }
 
 enum TurnDispatchResult {
     Started,
     Rejected {
-        turn: QueuedTurn,
+        turn: Box<QueuedTurn>,
         error: String,
         retryable: bool,
     },
+}
+
+fn tui_admission_error_is_retryable(
+    error: &echo_agent_app_core::state::ScopedChatTurnError,
+) -> bool {
+    matches!(
+        error,
+        echo_agent_app_core::state::ScopedChatTurnError::Control(
+            echo_agent_app_core::state::ScopedControlError::WorkspaceTransition
+        ) | echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
+                    | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
+            )
+        )
+    )
 }
 
 async fn dispatch_turn(
@@ -1554,50 +1572,67 @@ async fn dispatch_turn(
         Some(state) => state.clone(),
         None => {
             return TurnDispatchResult::Rejected {
-                turn,
+                turn: Box::new(turn),
                 error: "TUI application state is unavailable".to_string(),
                 retryable: false,
             };
         }
     };
     let foreground_turns = app_state.session.foreground_turns.clone();
-    let (scoped_runtime, lease) = match begin_tui_foreground_turn(app, &turn_id).await {
-        Ok(admission) => admission,
-        Err(error) => {
-            tracing::warn!(%error, turn_id, "failed to acquire TUI foreground turn");
-            let retryable = matches!(
-                &error,
-                echo_agent_app_core::state::ScopedChatTurnError::Conversation(
-                    echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                        echo_agent_app_core::foreground_turn::ForegroundTurnError::Busy { .. }
-                            | echo_agent_app_core::foreground_turn::ForegroundTurnError::AdmissionSuspended
-                    )
-                )
-            );
-            return TurnDispatchResult::Rejected {
-                turn,
-                error: format!("Unable to start foreground turn: {error}"),
-                retryable,
-            };
-        }
-    };
-    let conversation_id = match app.conversation_id.as_deref() {
-        Some(conversation_id) => conversation_id,
-        None => {
+    let (scoped_runtime, conversation_id, lease) =
+        match begin_tui_foreground_turn(app, &turn_id).await {
+            Ok(admission) => admission,
+            Err(error) => {
+                tracing::warn!(%error, turn_id, "failed to acquire TUI foreground turn");
+                let retryable = tui_admission_error_is_retryable(&error);
+                return TurnDispatchResult::Rejected {
+                    turn: Box::new(turn),
+                    error: format!("Unable to start foreground turn: {error}"),
+                    retryable,
+                };
+            }
+        };
+    if let Some(resume) = turn.run_resume.as_ref() {
+        let identity = &resume.identity;
+        let validation = scoped_runtime
+            .task_runtime()
+            .ok_or_else(|| "TaskRuntime store is unavailable".to_string())
+            .and_then(|store| {
+                store
+                    .get_run(&identity.run_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| format!("TaskRun '{}' no longer exists", identity.run_id))
+            })
+            .and_then(|run| identity.validate_resumable(&run))
+            .and_then(|()| {
+                if identity.workspace_id != scoped_runtime.execution_scope().workspace_id() {
+                    Err(format!(
+                        "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
+                        identity.run_id,
+                        identity.workspace_id,
+                        scoped_runtime.execution_scope().workspace_id()
+                    ))
+                } else if identity.conversation_id != conversation_id {
+                    Err(format!(
+                        "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
+                        identity.run_id, identity.conversation_id, conversation_id
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+        if let Err(detail) = validation {
             lease.settle(TurnOutcome::Failed(
-                echo_agent::error::AgentFailure::message(
-                    "conversation_id",
-                    "TUI conversation id is unavailable",
-                ),
+                echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
             ));
             return TurnDispatchResult::Rejected {
-                turn,
-                error: "TUI conversation id is unavailable".to_string(),
+                turn: Box::new(turn),
+                error: detail,
                 retryable: false,
             };
         }
-    };
-    let pool_execution = match scoped_runtime.agent_for(conversation_id).await {
+    }
+    let pool_execution = match scoped_runtime.agent_for(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
             let detail = format!("TUI AgentPool admission failed: {error}");
@@ -1605,17 +1640,17 @@ async fn dispatch_turn(
                 echo_agent::error::AgentFailure::message("agent_pool", detail.clone()),
             ));
             return TurnDispatchResult::Rejected {
-                turn,
+                turn: Box::new(turn),
                 error: detail,
                 retryable: true,
             };
         }
     };
-    if let Some(conversation_id) = app.conversation_id.as_deref() {
+    {
         let title: String = turn.text.chars().take(80).collect();
         if let Err(error) = scoped_runtime
             .ensure_conversation(echo_agent::memory::NewConversation {
-                conversation_id: conversation_id.to_string(),
+                conversation_id: conversation_id.clone(),
                 user_id: "default".to_string(),
                 agent_type: None,
                 title: Some(title),
@@ -1628,7 +1663,7 @@ async fn dispatch_turn(
                 echo_agent::error::AgentFailure::message("conversation_store", detail.clone()),
             ));
             return TurnDispatchResult::Rejected {
-                turn,
+                turn: Box::new(turn),
                 error: detail,
                 retryable: false,
             };
@@ -1642,18 +1677,18 @@ async fn dispatch_turn(
         app_state.storage.chat_events.clone(),
         app_state.storage.tool_executions.clone(),
         scoped_runtime.execution_scope().workspace_id().to_string(),
-        app.conversation_id.clone(),
+        Some(conversation_id.clone()),
         turn_id.clone(),
     );
-    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
-        app.workspace_root.as_deref(),
-    );
+    let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+        scoped_runtime.execution_scope().root(),
+    ));
     let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
         echo_agent_app_core::prepared_turn::UserTurnInput {
             text: &turn.text,
             attachments: &turn.attachments,
             spill_dir: &spill_dir,
-            conversation_id: app.conversation_id.as_deref(),
+            conversation_id: Some(&conversation_id),
             turn_id: Some(&turn_id),
         },
     ) {
@@ -1665,7 +1700,7 @@ async fn dispatch_turn(
                 echo_agent::error::AgentFailure::message("prepared_turn", detail.clone()),
             ));
             return TurnDispatchResult::Rejected {
-                turn,
+                turn: Box::new(turn),
                 error: detail,
                 retryable: false,
             };
@@ -1686,7 +1721,7 @@ async fn dispatch_turn(
         webhook_emitter: app.webhook_emitter.clone(),
         // TUI/GUI parity (AGENTS.md): bind this turn to the session's
         // conversation id so TaskRuntime runs + transcript projection work.
-        conv_id: app.conversation_id.clone(),
+        conv_id: Some(conversation_id.clone()),
         root_message_id: turn_id.clone(),
         // Bind staged refs so subagents in an autonomous run see them too.
         attachments: task_attachments,
@@ -1702,8 +1737,12 @@ async fn dispatch_turn(
     let agent_owned = pool_execution.agent();
     let active_turn_agent = agent_owned.clone();
     let active_turn_workspace_id = scoped_runtime.execution_scope().workspace_id().to_string();
+    let active_turn_conversation_id = conversation_id.clone();
+    let active_turn_execution_root = scoped_runtime.execution_scope().root().to_path_buf();
+    let scoped_runtime_guard = scoped_runtime.clone();
     let settled_turn_id = turn_id.clone();
     if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
+        let _scoped_runtime_guard = scoped_runtime_guard;
         let _pool_execution = pool_execution;
         let outcome = match std::panic::AssertUnwindSafe(send_to_agent(
             &agent_owned,
@@ -1727,7 +1766,7 @@ async fn dispatch_turn(
         });
     }) {
         return TurnDispatchResult::Rejected {
-            turn: retry_turn,
+            turn: Box::new(retry_turn),
             error: format!("Unable to supervise foreground turn: {error}"),
             retryable: false,
         };
@@ -1735,6 +1774,8 @@ async fn dispatch_turn(
     app.start_turn(&display_text);
     app.active_turn_id = Some(turn_id);
     app.active_turn_workspace_id = Some(active_turn_workspace_id);
+    app.active_turn_conversation_id = Some(active_turn_conversation_id);
+    app.active_turn_execution_root = Some(active_turn_execution_root);
     app.active_turn_agent = Some(active_turn_agent);
     TurnDispatchResult::Started
 }
@@ -1757,6 +1798,7 @@ async fn begin_tui_foreground_turn(
 ) -> Result<
     (
         echo_agent_app_core::state::ScopedChatRuntime,
+        String,
         ForegroundTurnLease,
     ),
     echo_agent_app_core::state::ScopedChatTurnError,
@@ -1766,16 +1808,31 @@ async fn begin_tui_foreground_turn(
             "TUI application state is unavailable".to_string(),
         )
     })?;
-    let conversation_id = app.conversation_id.as_deref().ok_or({
-        echo_agent_app_core::state::ScopedChatTurnError::Conversation(
-            echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
-                echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId,
-            ),
-        )
-    })?;
-    app_state
-        .begin_scoped_chat_turn_owned(ForegroundTurnSurface::Tui, conversation_id, turn_id)
+    let runtime = app_state
+        .current_control_runtime()
         .await
+        .map_err(echo_agent_app_core::state::ScopedChatTurnError::Control)?;
+    let conversation_id = runtime
+        .primary_agent()
+        .read(|agent| agent.conversation_id().map(str::to_string))
+        .await
+        .filter(|conversation_id| !conversation_id.trim().is_empty())
+        .ok_or({
+            echo_agent_app_core::state::ScopedChatTurnError::Conversation(
+                echo_agent_app_core::conversation_deletion::ConversationDeletionError::Foreground(
+                    echo_agent_app_core::foreground_turn::ForegroundTurnError::EmptyConversationId,
+                ),
+            )
+        })?;
+    let lease = runtime
+        .begin_turn(
+            &app_state.session.foreground_turns,
+            ForegroundTurnSurface::Tui,
+            &conversation_id,
+            turn_id,
+        )
+        .await?;
+    Ok((runtime, conversation_id, lease))
 }
 
 fn restore_undispatched_turn(app: &mut TuiApp, turn: QueuedTurn, error: String) {
@@ -1802,7 +1859,7 @@ fn active_tui_turn(app: &TuiApp) -> Result<ForegroundTurnSnapshot, String> {
         .as_ref()
         .ok_or_else(|| "TUI application state is unavailable".to_string())?;
     let conversation_id = app
-        .conversation_id
+        .active_turn_conversation_id
         .as_deref()
         .ok_or_else(|| "TUI conversation id is unavailable".to_string())?;
     let expected_turn_id = app
@@ -1827,6 +1884,18 @@ fn active_tui_turn(app: &TuiApp) -> Result<ForegroundTurnSnapshot, String> {
     Ok(snapshot)
 }
 
+fn active_tui_input_scope(app: &TuiApp) -> Result<(&std::path::Path, &str), String> {
+    let execution_root = app
+        .active_turn_execution_root
+        .as_deref()
+        .ok_or_else(|| "TUI active execution root is unavailable".to_string())?;
+    let conversation_id = app
+        .active_turn_conversation_id
+        .as_deref()
+        .ok_or_else(|| "TUI active conversation identity is unavailable".to_string())?;
+    Ok((execution_root, conversation_id))
+}
+
 async fn dispatch_next_queued(
     app: &mut TuiApp,
     agent: &AgentHandle,
@@ -1847,7 +1916,7 @@ fn project_queued_dispatch(app: &mut TuiApp, result: TurnDispatchResult) {
             error,
             retryable: true,
         } => {
-            app.queued_turns.push_front(turn);
+            app.queued_turns.push_front(*turn);
             app.status_msg = format!("Queued turn is waiting for admission: {error}");
         }
         TurnDispatchResult::Rejected {
@@ -2722,10 +2791,11 @@ fn run_turn_binding_for_queued_turn(
     turn_id: &str,
 ) -> Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding> {
     turn.run_resume.as_ref().map(|resume| {
+        let identity = &resume.identity;
         echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume(
-            resume.run_id.clone(),
+            identity.run_id.clone(),
             turn_id.to_string(),
-            resume.root_message_id.clone(),
+            identity.root_message_id.clone(),
         )
     })
 }
@@ -2810,16 +2880,19 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
     };
     let subcommand = tokens.first().map(String::as_str).unwrap_or("list");
     let run_id = tokens.get(1).cloned();
-    let repo_root = match git_repo_root(app.workspace_execution_scope.root()) {
+    let (runtime, store) = match current_tui_task_runtime(app).await {
+        Ok(control) => control,
+        Err(error) => return format!("Task runtime unavailable: {error}"),
+    };
+    let repo_root = match git_repo_root(runtime.execution_scope().root()) {
         Ok(path) => path,
         Err(error) => return format!("Current workspace is not a Git repository: {error}"),
     };
-    let store = app.task_runtime_store.clone();
 
     match subcommand {
         "list" | "ls" => {
             let result = tokio::task::spawn_blocking(move || {
-                list_unattended_worktrees(&repo_root, store.as_deref())
+                list_unattended_worktrees(&repo_root, Some(store.as_ref()))
             })
             .await;
             match result {
@@ -2832,7 +2905,7 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let lock = repo_merge_lock(&repo_root);
             let _guard = lock.lock().await;
             let result = tokio::task::spawn_blocking(move || {
-                cleanup_unattended_worktrees(&repo_root, store.as_deref())
+                cleanup_unattended_worktrees(&repo_root, Some(store.as_ref()))
             })
             .await;
             match result {
@@ -2860,7 +2933,7 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let _guard = lock.lock().await;
             let run_id_for_merge = run_id.clone();
             let result = tokio::task::spawn_blocking(move || {
-                merge_unattended_worktree(&repo_root, &run_id_for_merge, store.as_deref())
+                merge_unattended_worktree(&repo_root, &run_id_for_merge, Some(store.as_ref()))
             })
             .await;
             match result {
@@ -2891,7 +2964,7 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let _guard = lock.lock().await;
             let run_id_for_discard = run_id.clone();
             let result = tokio::task::spawn_blocking(move || {
-                discard_unattended_worktree(&repo_root, &run_id_for_discard, store.as_deref())
+                discard_unattended_worktree(&repo_root, &run_id_for_discard, Some(store.as_ref()))
             })
             .await;
             match result {
@@ -3076,9 +3149,158 @@ fn push_system_message(app: &mut TuiApp, content: String) {
     });
 }
 
+async fn current_tui_control_runtime(
+    app: &TuiApp,
+) -> Result<echo_agent_app_core::state::ScopedChatRuntime, String> {
+    let state = app
+        .app_state
+        .as_ref()
+        .ok_or_else(|| "TUI application state is unavailable".to_string())?;
+    state
+        .current_control_runtime()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+async fn current_tui_task_runtime(
+    app: &TuiApp,
+) -> Result<
+    (
+        echo_agent_app_core::state::ScopedChatRuntime,
+        Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    ),
+    String,
+> {
+    let runtime = current_tui_control_runtime(app).await?;
+    let workspace_id = runtime.execution_scope().workspace_id();
+    let store = runtime
+        .task_runtime()
+        .ok_or_else(|| format!("Task runtime is unavailable for workspace '{workspace_id}'"))?;
+    if store.active_workspace_id() != workspace_id {
+        return Err(format!(
+            "TaskRuntime scope mismatch: current workspace '{workspace_id}', store owns '{}'",
+            store.active_workspace_id()
+        ));
+    }
+    Ok((runtime, store))
+}
+
+async fn current_tui_runtime_conversation_id(
+    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+) -> Result<String, String> {
+    runtime
+        .primary_agent()
+        .read(|agent| agent.conversation_id().map(str::to_string))
+        .await
+        .filter(|conversation_id| !conversation_id.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "workspace '{}' conversation identity is unavailable",
+                runtime.execution_scope().workspace_id()
+            )
+        })
+}
+
+async fn resolve_tui_task_run(
+    app: &TuiApp,
+    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+    store: &echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore,
+    requested_run_id: Option<&str>,
+) -> Result<echo_agent_app_core::tasks::task_runtime::TaskRun, String> {
+    let workspace_id = runtime.execution_scope().workspace_id();
+    let conversation_id = current_tui_runtime_conversation_id(runtime).await?;
+    let implicit_view = requested_run_id
+        .is_none()
+        .then_some(app.task_runtime_view.as_ref())
+        .flatten();
+    let run_id = match requested_run_id.filter(|run_id| !run_id.trim().is_empty()) {
+        Some(run_id) => run_id.to_string(),
+        None => implicit_view
+            .map(|view| view.run_id.clone())
+            .ok_or_else(|| "No active task run. Supply a run id explicitly.".to_string())?,
+    };
+    let run = store
+        .get_run(&run_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("TaskRun {run_id} was not found"))?;
+    validate_tui_task_run_scope(&run, workspace_id, &conversation_id, implicit_view)?;
+    Ok(run)
+}
+
+fn validate_tui_task_run_scope(
+    run: &echo_agent_app_core::tasks::task_runtime::TaskRun,
+    workspace_id: &str,
+    conversation_id: &str,
+    implicit_view: Option<&TaskRuntimeView>,
+) -> Result<(), String> {
+    if run.workspace_id != workspace_id || run.conversation_id != conversation_id {
+        return Err(format!(
+            "TaskRun '{}' belongs to workspace '{}' conversation '{}', not current workspace '{}' conversation '{}'",
+            run.run_id, run.workspace_id, run.conversation_id, workspace_id, conversation_id
+        ));
+    }
+    if let Some(view) = implicit_view
+        && (view.workspace_id != workspace_id
+            || view.conversation_id != conversation_id
+            || view.run_created_at != run.created_at)
+    {
+        return Err(format!(
+            "TaskRuntime view for '{}' is stale after a workspace or run generation change",
+            run.run_id
+        ));
+    }
+    Ok(())
+}
+
+async fn current_tui_memory_control(
+    app: &TuiApp,
+) -> Result<
+    (
+        echo_agent_app_core::state::ScopedChatRuntime,
+        echo_agent_app_core::evolution::ReviewGenerationLease,
+        Arc<echo_agent::evolution::MemoryLayerManager>,
+    ),
+    String,
+> {
+    let runtime = current_tui_control_runtime(app).await?;
+    let workspace_id = runtime.execution_scope().workspace_id();
+    let integration = runtime.review_integration().ok_or_else(|| {
+        format!("Layered memory is not configured for workspace '{workspace_id}'")
+    })?;
+    let generation = integration
+        .lease_generation()
+        .map_err(|error| error.to_string())?;
+    let layer_manager = Arc::new(
+        generation
+            .create_layer_manager()
+            .map_err(|error| error.to_string())?,
+    );
+    Ok((runtime, generation, layer_manager))
+}
+
+async fn refresh_tui_hot_memory_projection(
+    runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+) {
+    let agent = runtime.primary_agent();
+    let root = agent.read(|value| value.working_dir()).await;
+    agent
+        .write_async(|value| {
+            Box::pin(async move {
+                echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
+                    value,
+                    root.as_deref(),
+                )
+                .await;
+            })
+        })
+        .await;
+    if let Some(pool) = runtime.pool() {
+        pool.refresh_hot_memory_context().await;
+    }
+}
+
 async fn refresh_workspace_generation(
     app: &mut TuiApp,
-    agent: &AgentHandle,
     state: &echo_agent_app_core::state::AppState,
 ) {
     if let Err(error) = app.discard_unsubmitted_attachments() {
@@ -3086,15 +3308,27 @@ async fn refresh_workspace_generation(
     }
     app.task_runtime_view = None;
     app.subagent_runs.clear();
-    app.workspace_root = state
-        .current_workspace()
-        .await
-        .map(|workspace| workspace.root);
-    app.workspace_execution_scope = state.current_execution_scope().await;
-    app.conversation_store = state.conversation_store().await;
-    app.conversation_id = agent
-        .read(|value| value.conversation_id().map(str::to_string))
-        .await;
+    let runtime = state.current_control_runtime().await.ok();
+    let fallback_scope = state.current_execution_scope().await;
+    app.workspace_root = runtime
+        .as_ref()
+        .map(|runtime| runtime.execution_scope().root().to_path_buf());
+    app.workspace_execution_scope = runtime
+        .as_ref()
+        .map(|runtime| runtime.execution_scope().clone())
+        .unwrap_or(fallback_scope);
+    app.conversation_store = runtime
+        .as_ref()
+        .and_then(echo_agent_app_core::state::ScopedChatRuntime::conversation_store);
+    app.conversation_id = match runtime {
+        Some(runtime) => {
+            runtime
+                .primary_agent()
+                .read(|agent| agent.conversation_id().map(str::to_string))
+                .await
+        }
+        None => None,
+    };
     app.messages.clear();
     app.messages.push(ChatMessage {
         role: MessageRole::System,
@@ -3519,11 +3753,8 @@ async fn handle_slash_command(
             }
         }
         Some(SlashCommand::Memory) => {
-            let layer_manager = agent
-                .read(|value| value.memory_layer_manager().cloned())
-                .await;
-            let content = match layer_manager {
-                Some(layer_manager) => {
+            let content = match current_tui_memory_control(app).await {
+                Ok((_runtime, _generation, layer_manager)) => {
                     let mut items = layer_manager
                         .list_hot()
                         .into_iter()
@@ -3545,7 +3776,7 @@ async fn handle_slash_command(
                         items.join("\n")
                     }
                 }
-                None => "Layered memory is not configured for this agent.".to_string(),
+                Err(error) => error,
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -3556,30 +3787,13 @@ async fn handle_slash_command(
             if args.trim().is_empty() {
                 return push_system_message(app, "Usage: /remember <fact>".to_string());
             }
-            let Some(integration) = app.review_integration.as_ref() else {
-                return push_system_message(
-                    app,
-                    "Layered memory is not configured for this agent.".to_string(),
-                );
-            };
-            let memory_generation = match integration.lease_generation() {
-                Ok(lease) => lease,
-                Err(error) => {
-                    return push_system_message(
-                        app,
-                        format!("Cannot save memory while the workspace is switching: {error}"),
-                    );
-                }
-            };
-            let layer_manager = match memory_generation.create_layer_manager() {
-                Ok(manager) => Arc::new(manager),
-                Err(error) => {
-                    return push_system_message(
-                        app,
-                        format!("Failed to initialize layered memory: {error}"),
-                    );
-                }
-            };
+            let (runtime, _memory_generation, layer_manager) =
+                match current_tui_memory_control(app).await {
+                    Ok(control) => control,
+                    Err(error) => {
+                        return push_system_message(app, format!("Cannot save memory: {error}"));
+                    }
+                };
             let key = uuid::Uuid::new_v4().to_string();
             let meta = echo_agent::memory::MemoryMeta::new(
                 echo_agent::memory::MemoryType::ProjectFact,
@@ -3589,21 +3803,7 @@ async fn handle_slash_command(
             let content = match layer_manager.write_memory(&key, args.trim(), meta).await {
                 Ok(promotion) => {
                     if promotion.is_some() {
-                        let root = agent.read(|value| value.working_dir()).await;
-                        agent
-                            .write_async(|value| {
-                                Box::pin(async move {
-                                    echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                        value,
-                                        root.as_deref(),
-                                    )
-                                    .await;
-                                })
-                            })
-                            .await;
-                        if let Some(pool) = &app.pool {
-                            pool.refresh_hot_memory_context().await;
-                        }
+                        refresh_tui_hot_memory_projection(&runtime).await;
                     }
                     format!("Memory saved with key: {key}")
                 }
@@ -3618,30 +3818,13 @@ async fn handle_slash_command(
             if args.trim().is_empty() {
                 return push_system_message(app, "Usage: /forget <key-or-query>".to_string());
             }
-            let Some(integration) = app.review_integration.as_ref() else {
-                return push_system_message(
-                    app,
-                    "Layered memory is not configured for this agent.".to_string(),
-                );
-            };
-            let memory_generation = match integration.lease_generation() {
-                Ok(lease) => lease,
-                Err(error) => {
-                    return push_system_message(
-                        app,
-                        format!("Cannot remove memory while the workspace is switching: {error}"),
-                    );
-                }
-            };
-            let layer_manager = match memory_generation.create_layer_manager() {
-                Ok(manager) => Arc::new(manager),
-                Err(error) => {
-                    return push_system_message(
-                        app,
-                        format!("Failed to initialize layered memory: {error}"),
-                    );
-                }
-            };
+            let (runtime, _memory_generation, layer_manager) =
+                match current_tui_memory_control(app).await {
+                    Ok(control) => control,
+                    Err(error) => {
+                        return push_system_message(app, format!("Cannot remove memory: {error}"));
+                    }
+                };
             let query = args.trim();
             let key = if layer_manager.locate(query).await.is_some() {
                 Some(query.to_string())
@@ -3676,21 +3859,7 @@ async fn handle_slash_command(
                     match layer_manager.delete_memory(&key).await {
                         Ok(true) => {
                             if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
-                                let root = agent.read(|value| value.working_dir()).await;
-                                agent
-                                    .write_async(|value| {
-                                        Box::pin(async move {
-                                            echo_agent_app_core::unified_memory::refresh_hot_memory_projection(
-                                                value,
-                                                root.as_deref(),
-                                            )
-                                            .await;
-                                        })
-                                    })
-                                    .await;
-                                if let Some(pool) = &app.pool {
-                                    pool.refresh_hot_memory_context().await;
-                                }
+                                refresh_tui_hot_memory_projection(&runtime).await;
                             }
                             format!("Removed memory: {key}")
                         }
@@ -4375,9 +4544,6 @@ async fn handle_slash_command(
                     agent
                         .write(|value| value.set_permission_mode(framework_mode))
                         .await;
-                    if let Some(pool) = &app.pool {
-                        pool.apply_permission_mode(framework_mode).await;
-                    }
                 }
                 app.permission_mode = normalized.to_string();
                 app.messages.push(ChatMessage {
@@ -4408,28 +4574,18 @@ async fn handle_slash_command(
                     "Auto-memory disabled.".to_string()
                 }
                 "extract" | "show" => {
-                    let evidence_generation = if sub == "extract" {
-                        let Some(integration) = app.review_integration.as_ref() else {
-                            return push_system_message(
-                                app,
-                                "Review integration is not configured.".to_string(),
-                            );
-                        };
-                        match integration.lease_generation() {
-                            Ok(lease) => Some(lease),
+                    let (runtime, evidence_generation, _layer_manager) =
+                        match current_tui_memory_control(app).await {
+                            Ok(control) => control,
                             Err(error) => {
                                 return push_system_message(
                                     app,
-                                    format!(
-                                        "Cannot queue memory candidates while the workspace is switching: {error}"
-                                    ),
+                                    format!("Cannot inspect auto-memory: {error}"),
                                 );
                             }
-                        }
-                    } else {
-                        None
-                    };
-                    let messages: Vec<(String, String)> = agent
+                        };
+                    let scoped_agent = runtime.primary_agent();
+                    let messages: Vec<(String, String)> = scoped_agent
                         .read_async(|value| {
                             Box::pin(async move {
                                 let context = value.context().lock().await;
@@ -4459,12 +4615,6 @@ async fn handle_slash_command(
                             format_observations_for_memory(&observations)
                         }
                     } else {
-                        let Some(evidence_generation) = evidence_generation.as_ref() else {
-                            return push_system_message(
-                                app,
-                                "Review generation is not available.".to_string(),
-                            );
-                        };
                         let store = evidence_generation.evidence_store();
                         match queue_observations(&store, &observations, &messages) {
                             Ok(candidates) => format!(
@@ -4494,26 +4644,19 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::RunReview) => {
-            let Some(review_integration) = app.review_integration.as_ref() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Review integration is not configured.".to_string(),
-                });
-                return;
-            };
-            let review_lease = match review_integration.lease_generation() {
-                Ok(lease) => lease,
+            let (runtime, review_lease, layer_manager) = match current_tui_memory_control(app).await
+            {
+                Ok(control) => control,
                 Err(error) => {
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
-                        content: format!(
-                            "Run review unavailable during workspace transition: {error}"
-                        ),
+                        content: format!("Run review unavailable: {error}"),
                     });
                     return;
                 }
             };
-            let (run_store, llm_client) = agent
+            let scoped_agent = runtime.primary_agent();
+            let (run_store, llm_client) = scoped_agent
                 .read(|value| (value.run_store.clone(), value.llm_client().cloned()))
                 .await;
 
@@ -4556,16 +4699,6 @@ async fn handle_slash_command(
                 Some(review_lease.memory_store()),
                 Some(run_store),
             );
-            let layer_manager = match review_lease.create_layer_manager() {
-                Ok(manager) => Arc::new(manager),
-                Err(error) => {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: format!("Review memory initialization failed: {error}"),
-                    });
-                    return;
-                }
-            };
             let reviewer = reviewer.with_layer_manager(layer_manager);
 
             app.messages.push(ChatMessage {
@@ -4642,43 +4775,15 @@ async fn handle_slash_command(
                 .unwrap_or("list");
             let candidate_id = parts.next();
             let content = parts.next();
-            let writes_evidence = matches!(sub, "edit" | "reject" | "accept" | "undo");
-            let memory_generation = if writes_evidence {
-                match app.review_integration.as_ref() {
-                    Some(integration) => match integration.lease_generation() {
-                        Ok(lease) => Some(lease),
-                        Err(error) => {
-                            return push_system_message(
-                                app,
-                                format!(
-                                    "Cannot update Review Inbox while the workspace is switching: {error}"
-                                ),
-                            );
-                        }
-                    },
-                    None => {
-                        return push_system_message(
-                            app,
-                            "Review integration is not configured.".to_string(),
-                        );
-                    }
+            let (_runtime, memory_generation, layer_manager) = match current_tui_memory_control(app)
+                .await
+            {
+                Ok(control) => control,
+                Err(error) => {
+                    return push_system_message(app, format!("Review Inbox unavailable: {error}"));
                 }
-            } else {
-                None
             };
-            let store = memory_generation
-                .as_ref()
-                .map(|lease| lease.evidence_store())
-                .or_else(|| {
-                    app.review_integration
-                        .as_ref()
-                        .map(|integration| integration.evidence_store())
-                })
-                .unwrap_or_else(|| {
-                    echo_agent_app_core::evolution::EvidenceStore::new(
-                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                    )
-                });
+            let store = memory_generation.evidence_store();
             let result = match sub {
                 "list" | "ls" | "pending" | "expired" | "stale" | "applied"
                 | "undoable" => {
@@ -4772,31 +4877,19 @@ async fn handle_slash_command(
                     None => "Usage: /evidence-inbox reject <candidate-id>".to_string(),
                 },
                 "accept" | "undo" => match candidate_id {
-                    Some(id) => match memory_generation.as_ref() {
-                        Some(lease) => {
-                            let layer_manager = match lease.create_layer_manager() {
-                                Ok(manager) => Arc::new(manager),
-                                Err(error) => {
-                                    return push_system_message(
-                                        app,
-                                        format!("Failed to initialize layered memory: {error}"),
-                                    );
-                                }
-                            };
-                            let action = if sub == "accept" {
-                                store.accept(id, content, &layer_manager).await
-                            } else {
-                                store.undo(id, &layer_manager).await
-                            };
-                            match action {
-                                Ok(candidate) => {
-                                    format!("{} is now {:?}.", candidate.candidate_id, candidate.status)
-                                }
-                                Err(error) => format!("Review Inbox action failed: {error}"),
+                    Some(id) => {
+                        let action = if sub == "accept" {
+                            store.accept(id, content, &layer_manager).await
+                        } else {
+                            store.undo(id, &layer_manager).await
+                        };
+                        match action {
+                            Ok(candidate) => {
+                                format!("{} is now {:?}.", candidate.candidate_id, candidate.status)
                             }
+                            Err(error) => format!("Review Inbox action failed: {error}"),
                         }
-                        None => "Review generation is not available.".to_string(),
-                    },
+                    }
                     None => format!("Usage: /evidence-inbox {sub} <candidate-id>"),
                 },
                 _ => "Usage: /evidence-inbox <pending|expired|undoable|show|edit|accept|reject|undo> [candidate-id] [content]".to_string(),
@@ -4807,21 +4900,26 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::EvolutionDashboard) => {
-            let (store, run_store) = agent
-                .read(|value| (value.store().cloned(), value.run_store.clone()))
-                .await;
-            let Some(store) = store else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "No memory store configured.".to_string(),
-                });
-                return;
+            let (runtime, memory_generation, _layer_manager) =
+                match current_tui_memory_control(app).await {
+                    Ok(control) => control,
+                    Err(error) => {
+                        return push_system_message(
+                            app,
+                            format!("Evolution dashboard unavailable: {error}"),
+                        );
+                    }
+                };
+            let scoped_agent = runtime.primary_agent();
+            let run_store = scoped_agent.read(|value| value.run_store.clone()).await;
+            let store = memory_generation.memory_store();
+            let Some(integration) = runtime.review_integration() else {
+                return push_system_message(
+                    app,
+                    "Review integration is not configured.".to_string(),
+                );
             };
-            let echo_agent_dir = app
-                .review_integration
-                .as_ref()
-                .map(|integration| integration.echo_agent_dir())
-                .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
+            let echo_agent_dir = integration.echo_agent_dir();
             let change_log = match echo_agent::evolution::JsonlChangeLog::new(
                 echo_agent_dir.join("evolution").join("change-log.jsonl"),
             ) {
@@ -4841,8 +4939,15 @@ async fn handle_slash_command(
                 content: echo_agent_app_core::evolution::Dashboard::format_metrics(&metrics),
             });
         }
-        Some(SlashCommand::MemoryReview) => match app.review_integration.as_ref() {
-            Some(review_integration) => {
+        Some(SlashCommand::MemoryReview) => match current_tui_memory_control(app).await {
+            Ok((runtime, _memory_generation, _layer_manager)) => {
+                let Some(review_integration) = runtime.review_integration() else {
+                    push_system_message(
+                        app,
+                        "Memory review integration is not configured.".to_string(),
+                    );
+                    return;
+                };
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: "📋 Running memory review...".to_string(),
@@ -4865,25 +4970,31 @@ async fn handle_slash_command(
                     }
                 }
             }
-            None => {
+            Err(error) => {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
-                    content: "Memory review integration is not configured for this agent."
-                        .to_string(),
+                    content: format!("Memory review unavailable: {error}"),
                 });
             }
         },
         Some(SlashCommand::SkillCandidates) => {
             // List candidates and drafts from Curator state
-            let curator = app
-                .review_integration
-                .as_ref()
-                .map(|integration| integration.curator())
-                .unwrap_or_else(|| {
-                    echo_agent_app_core::evolution::workspace_curator(
-                        &echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                    )
-                });
+            let runtime = match current_tui_control_runtime(app).await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return push_system_message(
+                        app,
+                        format!("Skill candidates unavailable: {error}"),
+                    );
+                }
+            };
+            let Some(integration) = runtime.review_integration() else {
+                return push_system_message(
+                    app,
+                    "Review integration is not configured.".to_string(),
+                );
+            };
+            let curator = integration.curator();
             let state = match curator.load_state() {
                 Ok(state) => state,
                 Err(error) => {
@@ -4956,7 +5067,7 @@ async fn handle_slash_command(
             )
             .await;
             if result.generation_changed {
-                refresh_workspace_generation(app, agent, app_state.as_ref()).await;
+                refresh_workspace_generation(app, app_state.as_ref()).await;
             }
             push_system_message(app, result.output);
         }
@@ -5197,7 +5308,7 @@ async fn handle_slash_command(
         Some(SlashCommand::Tasks) => {
             app.sidebar_visible = true;
             app.sidebar_tab = 2;
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
             let mut content = app
                 .task_runtime_view
                 .as_ref()
@@ -5226,15 +5337,22 @@ async fn handle_slash_command(
                     return;
                 }
             };
-            let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(
-                app.workspace_root.as_deref(),
-            );
+            let (execution_root, conversation_id) = match active_tui_input_scope(app) {
+                Ok(scope) => scope,
+                Err(_) => {
+                    queue_steer_follow_up(app, instruction, attachments);
+                    return;
+                }
+            };
+            let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+                execution_root,
+            ));
             let prepared = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
                 echo_agent_app_core::prepared_turn::UserTurnInput {
                     text: instruction,
                     attachments: &attachments,
                     spill_dir: &spill_dir,
-                    conversation_id: app.conversation_id.as_deref(),
+                    conversation_id: Some(conversation_id),
                     turn_id: Some(&snapshot.active_turn_id),
                 },
             ) {
@@ -5296,27 +5414,22 @@ async fn handle_slash_command(
             let Some(action) = slash_cmd else {
                 return;
             };
-            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
-            let run_id = if args.trim().is_empty() {
-                app.task_runtime_view
-                    .as_ref()
-                    .map(|view| view.run_id.clone())
-            } else {
-                Some(args.trim().to_string())
+            let requested_run_id = (!args.trim().is_empty()).then_some(args.trim());
+            let run = match resolve_tui_task_run(app, &runtime, &store, requested_run_id).await {
+                Ok(run) => run,
+                Err(error) => {
+                    push_system_message(app, format!("Task run action failed: {error}"));
+                    return;
+                }
             };
-            let Some(run_id) = run_id else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "No active task run. Supply a run id explicitly.".to_string(),
-                });
-                return;
-            };
+            let run_id = run.run_id.clone();
             let result = match action {
                 SlashCommand::TaskCancel => store
                     .request_cancel(&run_id)
@@ -5358,8 +5471,9 @@ async fn handle_slash_command(
                                 attachments: Vec::new(),
                                 interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
                                 run_resume: Some(crate::tui::QueuedRunResume {
-                                    run_id: continuation_run.run_id,
-                                    root_message_id: continuation_run.root_message_id,
+                                    identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
+                                        &continuation_run,
+                                    ),
                                 }),
                             },
                         )
@@ -5369,23 +5483,17 @@ async fn handle_slash_command(
                             TurnDispatchResult::Rejected { error, .. } => Err(error),
                         }
                     } else {
-                        match store.get_run(&run_id) {
-                            Ok(Some(run)) => {
-                                match tui_conversation_execution(app, &run.conversation_id).await {
-                                    Ok(pool_execution) => {
-                                        resume_tui_task_run(
-                                            store.clone(),
-                                            pool_execution.agent(),
-                                            Some(pool_execution),
-                                            run_id.clone(),
-                                            app.review_integration.clone(),
-                                        )
-                                        .await
-                                    }
-                                    Err(error) => Err(error.to_string()),
-                                }
+                        match runtime.agent_for(&run.conversation_id).await {
+                            Ok(pool_execution) => {
+                                resume_tui_task_run(
+                                    store.clone(),
+                                    pool_execution.agent(),
+                                    Some(pool_execution),
+                                    run_id.clone(),
+                                    runtime.review_integration(),
+                                )
+                                .await
                             }
-                            Ok(None) => Err(format!("TaskRun {run_id} was not found")),
                             Err(error) => Err(error.to_string()),
                         }
                     }
@@ -5399,15 +5507,15 @@ async fn handle_slash_command(
                     Err(error) => format!("Task run action failed: {error}"),
                 },
             });
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
         }
         Some(SlashCommand::TaskBudget) => {
-            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
             let mut values = args.split_whitespace();
             let Some(token_value) = values.next() else {
@@ -5426,23 +5534,18 @@ async fn handle_slash_command(
                 });
                 return;
             };
-            let run_id = values.next().map(str::to_string).or_else(|| {
-                app.task_runtime_view
-                    .as_ref()
-                    .map(|view| view.run_id.clone())
-            });
-            let result = run_id
-                .ok_or_else(|| "No active task run. Supply a run id explicitly.".to_string())
-                .and_then(|run_id| {
-                    parse_tui_budget(token_value, "token").and_then(|tokens| {
-                        parse_tui_budget(time_value, "time").and_then(|time| {
-                            store
-                                .update_run_continuation_budgets(&run_id, tokens, time)
-                                .map(|_| run_id)
-                                .map_err(|error| error.to_string())
-                        })
+            let requested_run_id = values.next();
+            let result = match resolve_tui_task_run(app, &runtime, &store, requested_run_id).await {
+                Ok(run) => parse_tui_budget(token_value, "token").and_then(|tokens| {
+                    parse_tui_budget(time_value, "time").and_then(|time| {
+                        store
+                            .update_run_continuation_budgets(&run.run_id, tokens, time)
+                            .map(|_| run.run_id)
+                            .map_err(|error| error.to_string())
                     })
-                });
+                }),
+                Err(error) => Err(error),
+            };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: match result {
@@ -5450,37 +5553,39 @@ async fn handle_slash_command(
                     Err(error) => format!("Task budget update failed: {error}"),
                 },
             });
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
         }
         Some(SlashCommand::TaskGoal) => {
-            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
             let values = args.split_whitespace().collect::<Vec<_>>();
-            let result =
-                crate::task_run_control::parse_run_goal_update_args(&values).and_then(|parsed| {
-                    let run_id = parsed.requested_run_id.or_else(|| {
-                        app.task_runtime_view
-                            .as_ref()
-                            .map(|view| view.run_id.clone())
-                    });
-                    let run_id = run_id.ok_or_else(|| {
-                        "No active task run. Supply a run id explicitly.".to_string()
-                    })?;
-                    store
+            let result = match crate::task_run_control::parse_run_goal_update_args(&values) {
+                Ok(parsed) => match resolve_tui_task_run(
+                    app,
+                    &runtime,
+                    &store,
+                    parsed.requested_run_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(run) => store
                         .update_run_goal(
-                            &run_id,
+                            &run.run_id,
                             parsed.expected_goal_revision,
                             &parsed.new_goal,
                             &parsed.reason,
                             echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
                         )
-                        .map_err(|error| error.to_string())
-                });
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: match result {
@@ -5491,32 +5596,23 @@ async fn handle_slash_command(
                     Err(error) => format!("Task Goal update failed: {error}"),
                 },
             });
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
         }
         Some(SlashCommand::TaskRequirements) => {
-            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
-            let run_id = args
-                .split_whitespace()
-                .next()
-                .map(str::to_string)
-                .or_else(|| {
-                    app.task_runtime_view
-                        .as_ref()
-                        .map(|view| view.run_id.clone())
-                });
-            let result = run_id
-                .ok_or_else(|| "No active task run. Supply a run id explicitly.".to_string())
-                .and_then(|run_id| {
-                    store
-                        .completion_gate_report(&run_id)
-                        .map_err(|error| error.to_string())
-                });
+            let requested_run_id = args.split_whitespace().next();
+            let result = match resolve_tui_task_run(app, &runtime, &store, requested_run_id).await {
+                Ok(run) => store
+                    .completion_gate_report(&run.run_id)
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error),
+            };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: match result {
@@ -5526,34 +5622,36 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::TaskRequirementSkip) => {
-            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
             let values = args.split_whitespace().collect::<Vec<_>>();
-            let result =
-                crate::task_run_control::parse_requirement_skip_args(&values).and_then(|parsed| {
-                    let run_id = parsed.requested_run_id.or_else(|| {
-                        app.task_runtime_view
-                            .as_ref()
-                            .map(|view| view.run_id.clone())
-                    });
-                    let run_id = run_id.ok_or_else(|| {
-                        "No active task run. Supply a run id explicitly.".to_string()
-                    })?;
-                    store
+            let result = match crate::task_run_control::parse_requirement_skip_args(&values) {
+                Ok(parsed) => match resolve_tui_task_run(
+                    app,
+                    &runtime,
+                    &store,
+                    parsed.requested_run_id.as_deref(),
+                )
+                .await
+                {
+                    Ok(run) => store
                         .skip_goal_requirement(
-                            &run_id,
+                            &run.run_id,
                             parsed.expected_goal_revision,
                             &parsed.requirement_id,
                             &parsed.reason,
                             echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
                         )
-                        .map_err(|error| error.to_string())
-                });
+                        .map_err(|error| error.to_string()),
+                    Err(error) => Err(error),
+                },
+                Err(error) => Err(error),
+            };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: match result {
@@ -5561,19 +5659,19 @@ async fn handle_slash_command(
                     Err(error) => format!("Requirement Skip failed: {error}"),
                 },
             });
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
         }
         Some(
             action @ (SlashCommand::SubagentMessage
             | SlashCommand::SubagentFollowup
             | SlashCommand::SubagentInterrupt),
         ) => {
-            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
             let (usage, instruction_required) = match action {
                 SlashCommand::SubagentMessage => {
@@ -5593,6 +5691,13 @@ async fn handle_slash_command(
                 usage,
                 instruction_required,
             );
+            if let Ok(parsed) = parsed.as_ref()
+                && let Err(error) =
+                    resolve_tui_task_run(app, &runtime, &store, Some(&parsed.identity.run_id)).await
+            {
+                push_system_message(app, format!("Subagent control failed: {error}"));
+                return;
+            }
             let result = match parsed {
                 Ok(parsed) => {
                     let service =
@@ -5661,30 +5766,25 @@ async fn handle_slash_command(
                     Err(error) => format!("Subagent control failed: {error}"),
                 },
             });
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
         }
         Some(SlashCommand::TaskRecovery) => {
-            let Some(store) = app.task_runtime_store.as_ref() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
-            let run_id = if args.trim().is_empty() {
-                app.task_runtime_view
-                    .as_ref()
-                    .map(|view| view.run_id.clone())
-            } else {
-                Some(args.trim().to_string())
+            let requested_run_id = (!args.trim().is_empty()).then_some(args.trim());
+            let run = match resolve_tui_task_run(app, &runtime, &store, requested_run_id).await {
+                Ok(run) => run,
+                Err(error) => {
+                    push_system_message(app, format!("Recovery read failed: {error}"));
+                    return;
+                }
             };
-            let Some(run_id) = run_id else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "No active task run. Supply a run id explicitly.".to_string(),
-                });
-                return;
-            };
+            let run_id = run.run_id;
             let content = match store.list_recovery_blockers(&run_id) {
                 Ok(blockers) if blockers.is_empty() => {
                     format!("Task run {run_id} has no recovery blockers.")
@@ -5710,12 +5810,12 @@ async fn handle_slash_command(
             let Some(action) = slash_cmd else {
                 return;
             };
-            let Some(store) = app.task_runtime_store.as_ref() else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "Task runtime is unavailable.".to_string(),
-                });
-                return;
+            let (runtime, store) = match current_tui_task_runtime(app).await {
+                Ok(control) => control,
+                Err(error) => {
+                    push_system_message(app, format!("Task runtime is unavailable: {error}"));
+                    return;
+                }
             };
             let mut parts = args.split_whitespace();
             let Some(task_id) = parts.next() else {
@@ -5725,26 +5825,20 @@ async fn handle_slash_command(
                 });
                 return;
             };
-            let run_id = parts.next().map(str::to_string).or_else(|| {
-                app.task_runtime_view
-                    .as_ref()
-                    .map(|view| view.run_id.clone())
-            });
-            let Some(run_id) = run_id else {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: "No active task run. Supply a run id explicitly.".to_string(),
-                });
-                return;
+            let requested_run_id = parts.next();
+            let run = match resolve_tui_task_run(app, &runtime, &store, requested_run_id).await {
+                Ok(run) => run,
+                Err(error) => {
+                    push_system_message(app, format!("Task recovery control failed: {error}"));
+                    return;
+                }
             };
+            let run_id = run.run_id.clone();
             let result = if action == SlashCommand::TaskRetry {
-                let pool_execution = match store.get_run(&run_id) {
-                    Ok(Some(run)) => tui_conversation_execution(app, &run.conversation_id)
-                        .await
-                        .map_err(|error| error.to_string()),
-                    Ok(None) => Err(format!("TaskRun {run_id} was not found")),
-                    Err(error) => Err(error.to_string()),
-                };
+                let pool_execution = runtime
+                    .agent_for(&run.conversation_id)
+                    .await
+                    .map_err(|error| error.to_string());
                 let pool_execution = match pool_execution {
                     Ok(execution) => execution,
                     Err(error) => {
@@ -5761,7 +5855,7 @@ async fn handle_slash_command(
                     Some(pool_execution),
                     run_id.clone(),
                     task_id.to_string(),
-                    app.review_integration.clone(),
+                    runtime.review_integration(),
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -5782,7 +5876,7 @@ async fn handle_slash_command(
                     Err(error) => format!("Failed to retry/skip task: {error}"),
                 },
             });
-            refresh_task_runtime_view(app);
+            refresh_task_runtime_view(app).await;
         }
         Some(SlashCommand::Preview) => {
             match resolve_tui_workspace_file(app.workspace_execution_scope.root(), args) {
@@ -6270,6 +6364,8 @@ async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id:
     }
     app.active_turn_id = None;
     app.active_turn_workspace_id = None;
+    app.active_turn_conversation_id = None;
+    app.active_turn_execution_root = None;
     app.active_turn_agent = None;
     app.task_runtime_view = None;
     app.subagent_runs.clear();
@@ -6413,24 +6509,34 @@ async fn tui_conversation_execution(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("TUI application state is unavailable"))?;
     let runtime = app_state
-        .chat_runtime_for_scope(app.workspace_execution_scope.workspace_id())
-        .await?;
+        .current_control_runtime()
+        .await
+        .map_err(anyhow::Error::msg)?;
     runtime
         .agent_for(conversation_id)
         .await
         .map_err(anyhow::Error::msg)
 }
 
-fn refresh_task_runtime_view(app: &mut TuiApp) {
-    let Some(store) = &app.task_runtime_store else {
+async fn refresh_task_runtime_view(app: &mut TuiApp) {
+    let (runtime, store) = match current_tui_task_runtime(app).await {
+        Ok(control) => control,
+        Err(error) => {
+            tracing::debug!(%error, "TUI TaskRuntime projection is unavailable");
+            app.task_runtime_view = None;
+            return;
+        }
+    };
+    let conversation_id = runtime
+        .primary_agent()
+        .read(|agent| agent.conversation_id().map(str::to_string))
+        .await
+        .filter(|conversation_id| !conversation_id.trim().is_empty());
+    let Some(conversation_id) = conversation_id else {
         app.task_runtime_view = None;
         return;
     };
-    let Some(conversation_id) = app.conversation_id.as_deref() else {
-        app.task_runtime_view = None;
-        return;
-    };
-    let run = match store.latest_run_for_conversation(conversation_id) {
+    let run = match store.latest_run_for_conversation(&conversation_id) {
         Ok(run) => run,
         Err(e) => {
             tracing::warn!(error = %e, "TUI failed to refresh TaskRuntime run");
@@ -6482,7 +6588,10 @@ fn refresh_task_runtime_view(app: &mut TuiApp) {
         })
         .unwrap_or_default();
     app.task_runtime_view = Some(TaskRuntimeView {
+        workspace_id: runtime.execution_scope().workspace_id().to_string(),
+        conversation_id,
         run_id: run.run_id,
+        run_created_at: run.created_at,
         goal: run.goal,
         goal_revision: run.goal_revision,
         status: run.status.as_str().to_string(),
@@ -7192,12 +7301,14 @@ fn parse_interaction_mode(
 #[cfg(test)]
 mod tests {
     use super::{
-        TurnDispatchResult, apply_turn_settlement, complete_file_reference, delete_previous_word,
-        format_task_runtime_view, format_unattended_worktrees, handle_approval_key, handle_esc,
-        move_cursor_vertical, parse_interaction_mode, project_queued_dispatch,
-        queue_steer_follow_up, queued_turn_from_prepared, render_cancelled_event,
-        render_error_event, resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
-        run_turn_binding_for_queued_turn, slash_command_allowed_while_busy, update_subagent_runs,
+        TurnDispatchResult, active_tui_input_scope, apply_turn_settlement, complete_file_reference,
+        delete_previous_word, dispatch_next_queued, format_task_runtime_view,
+        format_unattended_worktrees, handle_approval_key, handle_esc, move_cursor_vertical,
+        parse_interaction_mode, project_queued_dispatch, queue_steer_follow_up,
+        queued_turn_from_prepared, render_cancelled_event, render_error_event,
+        resolve_tui_workspace_file, retry_tui_task, reverse_history_search,
+        run_turn_binding_for_queued_turn, slash_command_allowed_while_busy,
+        tui_admission_error_is_retryable, update_subagent_runs, validate_tui_task_run_scope,
     };
     use crate::tui::{
         ChatMessage, MessageRole, QueuedRunResume, QueuedTurn, TaskRuntimeRequirementView,
@@ -7421,13 +7532,25 @@ mod tests {
             attachments: Vec::new(),
             interaction_mode: InteractionMode::Task,
             run_resume: Some(QueuedRunResume {
-                run_id: "exact-run".to_string(),
-                root_message_id: "exact-root-message".to_string(),
+                identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity {
+                    run_id: "exact-run".to_string(),
+                    workspace_id: "workspace-a".to_string(),
+                    conversation_id: "conversation-a".to_string(),
+                    root_message_id: "exact-root-message".to_string(),
+                    created_at: chrono::Utc::now(),
+                    goal_revision: 1,
+                },
             }),
         };
 
         let binding = run_turn_binding_for_queued_turn(&turn, "new-turn")
             .ok_or_else(|| "resume binding missing".to_string())?;
+        assert_eq!(
+            turn.run_resume
+                .as_ref()
+                .map(|resume| resume.identity.workspace_id.as_str()),
+            Some("workspace-a")
+        );
         assert_eq!(binding.run_id.as_deref(), Some("exact-run"));
         assert_eq!(binding.turn_id, "new-turn");
         assert_eq!(binding.root_message_id, "exact-root-message");
@@ -7439,6 +7562,20 @@ mod tests {
             binding.transcript_visibility,
             echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible
         );
+        Ok(())
+    }
+
+    #[test]
+    fn active_steer_scope_ignores_later_workspace_focus_projection() -> Result<(), String> {
+        let mut app = app();
+        app.active_turn_execution_root = Some(std::path::PathBuf::from("/workspace-a"));
+        app.active_turn_conversation_id = Some("conversation-a".to_string());
+        app.workspace_root = Some(std::path::PathBuf::from("/workspace-b"));
+        app.conversation_id = Some("conversation-b".to_string());
+
+        let (root, conversation_id) = active_tui_input_scope(&app)?;
+        assert_eq!(root, std::path::Path::new("/workspace-a"));
+        assert_eq!(conversation_id, "conversation-a");
         Ok(())
     }
 
@@ -7510,12 +7647,15 @@ mod tests {
         };
         app.queued_turns.push_back(second);
 
+        let transition_error = echo_agent_app_core::state::ScopedChatTurnError::Control(
+            echo_agent_app_core::state::ScopedControlError::WorkspaceTransition,
+        );
         project_queued_dispatch(
             &mut app,
             TurnDispatchResult::Rejected {
-                turn: first,
-                error: "workspace transition".to_string(),
-                retryable: true,
+                turn: Box::new(first),
+                error: transition_error.to_string(),
+                retryable: tui_admission_error_is_retryable(&transition_error),
             },
         );
 
@@ -7534,6 +7674,103 @@ mod tests {
             app.queued_turns.get(1).map(|turn| turn.text.as_str()),
             Some("second")
         );
+    }
+
+    #[tokio::test]
+    async fn real_workspace_transition_retains_and_then_starts_queued_turn_once()
+    -> Result<(), String> {
+        let temp = std::env::temp_dir().join(format!("eko-tui-scope-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
+        let agent = task_test_agent()?;
+        agent
+            .write(|agent| agent.set_conversation_id("conversation-a".to_string()))
+            .await;
+        let conversation_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(
+            echo_agent::memory::FileConversationStore::new(temp.join("conversations"))
+                .map_err(|error| error.to_string())?,
+        );
+        let mcp_runtime = Arc::new(
+            echo_agent_app_core::mcp_config_runtime::McpConfigRuntime::from_snapshot(
+                temp.join("mcp.json"),
+                echo_agent::mcp::McpConfigFile::default(),
+            ),
+        );
+        let mut state = echo_agent_app_core::state::AppState::from_shared(
+            agent.clone(),
+            None,
+            Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new()),
+            Some(conversation_store),
+            None,
+            Default::default(),
+            mcp_runtime,
+        )
+        .map_err(|error| error.to_string())?;
+        state.tasks.runtime = Some(Arc::new(
+            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        ));
+        state.storage.chat_events = Arc::new(
+            echo_agent_app_core::chat_event_log::ChatEventLog::open(
+                temp.join("chat-events"),
+                echo_agent_app_core::chat_event_log::ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.storage.tool_executions = Arc::new(
+            echo_agent_app_core::tool_execution::ToolExecutionRepository::open(
+                temp.join("tool-executions"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let state = Arc::new(state);
+        let mut app = app();
+        app.app_state = Some(Arc::clone(&state));
+        std::fs::write(temp.join("queued.txt"), "queued attachment")
+            .map_err(|error| error.to_string())?;
+        app.queued_turns.push_back(QueuedTurn {
+            text: "exactly once".to_string(),
+            attachments: vec![echo_agent_app_core::attachments::AttachmentRef {
+                path: temp.join("queued.txt"),
+                name: "queued.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                source: echo_agent_app_core::types::AttachmentSource::Upload,
+            }],
+            interaction_mode: InteractionMode::Auto,
+            run_resume: None,
+        });
+        let lifecycle = state.workspace.transition.write().await;
+        let exit_state = Arc::clone(&state);
+        let exit = tokio::spawn(async move { exit_state.exit_workspace().await });
+        while !state.workspace_transition_in_progress() {
+            tokio::task::yield_now().await;
+        }
+        let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_next_queued(&mut app, &agent, agent_tx.clone()).await;
+        assert_eq!(app.queued_turns.len(), 1);
+        assert_eq!(
+            app.queued_turns.front().map(|turn| turn.text.as_str()),
+            Some("exactly once")
+        );
+        assert_eq!(
+            app.queued_turns.front().map(|turn| turn.attachments.len()),
+            Some(1)
+        );
+
+        drop(lifecycle);
+        exit.await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        dispatch_next_queued(&mut app, &agent, agent_tx).await;
+        assert!(app.queued_turns.is_empty());
+        assert!(app.is_processing);
+        assert!(
+            app.active_turn_conversation_id
+                .as_deref()
+                .is_some_and(|conversation_id| {
+                    !conversation_id.is_empty() && conversation_id != "conversation-a"
+                })
+        );
+        Ok(())
     }
 
     #[test]
@@ -7889,7 +8126,10 @@ mod tests {
     #[test]
     fn task_runtime_projection_formats_plan_state() {
         let view = TaskRuntimeView {
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
             run_id: "run-1".to_string(),
+            run_created_at: chrono::Utc::now(),
             goal: "补齐 TUI".to_string(),
             goal_revision: 3,
             status: "running".to_string(),
@@ -7928,9 +8168,62 @@ mod tests {
     }
 
     #[test]
+    fn stale_workspace_view_cannot_select_same_run_id_in_new_workspace() {
+        let created_at = chrono::Utc::now();
+        let view = TaskRuntimeView {
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+            run_id: "same-run".to_string(),
+            run_created_at: created_at,
+            goal: "goal A".to_string(),
+            goal_revision: 1,
+            status: "paused".to_string(),
+            continuation_enabled: false,
+            turn_ordinal: None,
+            tokens_used: 0,
+            token_budget: None,
+            time_used_seconds: 0,
+            time_budget_seconds: None,
+            compaction_count: 0,
+            pause_reason: None,
+            pause_detail: None,
+            deferred: false,
+            active_cell_count: 0,
+            tasks: Vec::new(),
+            completion_ready: false,
+            requirements: Vec::new(),
+        };
+        let run = echo_agent_app_core::tasks::task_runtime::TaskRun {
+            run_id: "same-run".to_string(),
+            workspace_id: "workspace-b".to_string(),
+            conversation_id: "conversation-b".to_string(),
+            root_message_id: "root-b".to_string(),
+            domain_profile: DomainProfile::General,
+            status: TaskRunStatus::Paused,
+            goal: "goal B".to_string(),
+            goal_revision: 1,
+            goal_sha256: echo_agent_app_core::tasks::task_runtime::task_goal_sha256("goal B"),
+            plan_id: None,
+            route: "task".to_string(),
+            attended_mode: AttendedMode::Attended,
+            attachments: Vec::new(),
+            created_at: created_at + chrono::Duration::milliseconds(1),
+            updated_at: created_at + chrono::Duration::milliseconds(1),
+        };
+
+        assert!(
+            validate_tui_task_run_scope(&run, "workspace-b", "conversation-b", Some(&view))
+                .is_err_and(|error| error.contains("stale"))
+        );
+    }
+
+    #[test]
     fn task_runtime_projection_formats_exhausted_time_budget_without_underflow() {
         let view = TaskRuntimeView {
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
             run_id: "run-time-budget".to_string(),
+            run_created_at: chrono::Utc::now(),
             goal: "finish within the configured time".to_string(),
             goal_revision: 1,
             status: "paused".to_string(),

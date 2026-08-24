@@ -42,8 +42,7 @@ pub enum CommandOutcome {
     /// Resume one exact long-horizon TaskRun through a finite foreground turn.
     ResumeTaskRun {
         message: String,
-        run_id: String,
-        root_message_id: String,
+        identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
     },
 }
 
@@ -103,8 +102,6 @@ pub struct CommandContext {
     pub plugin_runtime: Option<Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>>,
     /// Static prompt-module report captured during runtime bootstrap.
     pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
-    /// Workspace-bound review/evolution integration shared with the runtime.
-    pub review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     /// Mutable Chat / Task / Auto interaction mode for subsequent turns.
     pub interaction_mode:
         Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
@@ -127,7 +124,6 @@ impl CommandContext {
             scheduler: None,
             plugin_runtime: None,
             prompt_assembly: None,
-            review_integration: None,
             interaction_mode: Arc::new(tokio::sync::RwLock::new(
                 echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
             )),
@@ -187,16 +183,41 @@ impl CommandContext {
         self
     }
 
-    pub fn with_review_integration(
-        mut self,
-        review_integration: Arc<echo_agent_app_core::evolution::ReviewIntegration>,
-    ) -> Self {
-        self.review_integration = Some(review_integration);
-        self
-    }
-
     pub fn is_coding_mode(&self) -> bool {
         self.current_mode == "coding"
+    }
+}
+
+pub struct ScopedReviewControl {
+    pub runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    pub integration: Arc<echo_agent_app_core::evolution::ReviewIntegration>,
+    pub generation: echo_agent_app_core::evolution::ReviewGenerationLease,
+}
+
+impl CommandContext {
+    pub async fn current_review_control(&self) -> Result<ScopedReviewControl, String> {
+        let state = self
+            .app_state
+            .as_ref()
+            .ok_or_else(|| "application state is unavailable".to_string())?;
+        let runtime = state
+            .current_control_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let integration = runtime.review_integration().ok_or_else(|| {
+            format!(
+                "Review integration is not configured for workspace '{}'",
+                runtime.execution_scope().workspace_id()
+            )
+        })?;
+        let generation = integration
+            .lease_generation()
+            .map_err(|error| error.to_string())?;
+        Ok(ScopedReviewControl {
+            runtime,
+            integration,
+            generation,
+        })
     }
 }
 

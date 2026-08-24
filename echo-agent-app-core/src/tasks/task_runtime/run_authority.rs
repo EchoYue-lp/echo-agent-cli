@@ -438,6 +438,9 @@ impl RunAuthority {
             )));
         }
         match &receipt.journal {
+            JournalDurabilityStatus::Unconfirmed => {
+                Self::retry_durability_debt(state, &self.event_path);
+            }
             JournalDurabilityStatus::Confirmed => state.durability_debt = None,
             JournalDurabilityStatus::Degraded { error } => {
                 state.durability_debt = Some(error.clone());

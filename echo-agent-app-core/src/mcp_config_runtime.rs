@@ -392,6 +392,12 @@ pub struct McpConfigRuntime {
 }
 
 impl McpConfigRuntime {
+    /// Construct the application-owned authority from an explicit persisted
+    /// snapshot. Embedders use this when assembling `AppState` directly.
+    pub fn from_snapshot(path: PathBuf, snapshot: McpConfigFile) -> Self {
+        Self::new(path, snapshot)
+    }
+
     pub(crate) fn new(path: PathBuf, snapshot: McpConfigFile) -> Self {
         let unreconciled_user_names = snapshot.mcp_servers.keys().cloned().collect();
         let ownership = McpNameOwnershipRegistry::new(snapshot.mcp_servers.keys().cloned());

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   Check,
@@ -20,10 +20,20 @@ type ReviewAction = 'merge' | 'discard';
 
 export function WorktreePanel() {
   const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
+  const scopeRef = useRef({ workspaceId, generation: 0 });
+  if (scopeRef.current.workspaceId !== workspaceId) {
+    scopeRef.current = { workspaceId, generation: scopeRef.current.generation + 1 };
+  }
+  const scopeGeneration = scopeRef.current.generation;
+  const fetchRequestRef = useRef(0);
+  const actionRequestRef = useRef(0);
   const [worktrees, setWorktrees] = useState<WorktreeInfo[]>([]);
   const [unattended, setUnattended] = useState<UnattendedWorktreeInfo[]>([]);
+  const [dataScopeGeneration, setDataScopeGeneration] = useState(-1);
   const [loading, setLoading] = useState(true);
+  const [loadingScopeGeneration, setLoadingScopeGeneration] = useState(-1);
   const [error, setError] = useState<string | null>(null);
+  const [errorScopeGeneration, setErrorScopeGeneration] = useState(-1);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newBranch, setNewBranch] = useState('');
   const [newBase, setNewBase] = useState('');
@@ -35,23 +45,68 @@ export function WorktreePanel() {
   );
   const [reviewing, setReviewing] = useState<string | null>(null);
   const [cleaning, setCleaning] = useState(false);
+  const [actionScopeGeneration, setActionScopeGeneration] = useState(-1);
+  const [reviewActionScopeGeneration, setReviewActionScopeGeneration] = useState(-1);
+
+  const requestIsCurrent = useCallback(
+    (requestWorkspaceId: string, requestGeneration: number) =>
+      scopeRef.current.workspaceId === requestWorkspaceId &&
+      scopeRef.current.generation === requestGeneration &&
+      workspaceIdForView(useWorkspaceStore.getState().current?.id) === requestWorkspaceId,
+    []
+  );
+  const visibleError = errorScopeGeneration === scopeGeneration ? error : null;
+  const visibleCreating = actionScopeGeneration === scopeGeneration ? creating : false;
+  const visibleRemoving = actionScopeGeneration === scopeGeneration ? removing : null;
+  const visibleReviewing = actionScopeGeneration === scopeGeneration ? reviewing : null;
+  const visibleCleaning = actionScopeGeneration === scopeGeneration ? cleaning : false;
+  const visibleReviewAction = reviewActionScopeGeneration === scopeGeneration ? reviewAction : null;
+  const chooseReviewAction = (runId: string, action: ReviewAction) => {
+    setReviewActionScopeGeneration(scopeGeneration);
+    setReviewAction({ runId, action });
+  };
 
   const fetchWorktrees = useCallback(async () => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = fetchRequestRef.current + 1;
+    fetchRequestRef.current = requestToken;
     try {
+      setLoadingScopeGeneration(requestGeneration);
       setLoading(true);
+      setErrorScopeGeneration(requestGeneration);
       setError(null);
       const [allWorktrees, unattendedWorktrees] = await Promise.all([
-        worktreeApi.list(),
+        worktreeApi.list(workspaceId),
         worktreeApi.listUnattended(workspaceId),
       ]);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        fetchRequestRef.current !== requestToken
+      )
+        return;
+      setDataScopeGeneration(requestGeneration);
       setWorktrees(allWorktrees);
       setUnattended(unattendedWorktrees);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to load worktrees');
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        fetchRequestRef.current === requestToken
+      ) {
+        setDataScopeGeneration(requestGeneration);
+        setWorktrees([]);
+        setUnattended([]);
+        setErrorScopeGeneration(requestGeneration);
+        setError(e instanceof Error ? e.message : 'Failed to load worktrees');
+      }
     } finally {
-      setLoading(false);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        fetchRequestRef.current === requestToken
+      ) {
+        setLoading(false);
+      }
     }
-  }, [workspaceId]);
+  }, [requestIsCurrent, workspaceId]);
 
   useEffect(() => {
     void fetchWorktrees();
@@ -59,68 +114,175 @@ export function WorktreePanel() {
 
   const handleCreate = async () => {
     if (!newBranch.trim()) return;
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = actionRequestRef.current + 1;
+    actionRequestRef.current = requestToken;
+    setActionScopeGeneration(requestGeneration);
+    setRemoving(null);
+    setReviewing(null);
+    setCleaning(false);
     setCreating(true);
     try {
-      await worktreeApi.create({
+      await worktreeApi.create(workspaceId, {
         branch: newBranch.trim(),
         base: newBase.trim() || undefined,
       });
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        actionRequestRef.current !== requestToken
+      )
+        return;
       setNewBranch('');
       setNewBase('');
       setShowCreateForm(false);
       await fetchWorktrees();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to create worktree');
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setErrorScopeGeneration(requestGeneration);
+        setError(e instanceof Error ? e.message : 'Failed to create worktree');
+      }
     } finally {
-      setCreating(false);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setCreating(false);
+      }
     }
   };
 
   const handleRemove = async (path: string) => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = actionRequestRef.current + 1;
+    actionRequestRef.current = requestToken;
+    setActionScopeGeneration(requestGeneration);
+    setCreating(false);
+    setReviewing(null);
+    setCleaning(false);
     setRemoving(path);
     try {
-      await worktreeApi.remove(path);
+      await worktreeApi.remove(workspaceId, path);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        actionRequestRef.current !== requestToken
+      )
+        return;
       setConfirmDelete(null);
       await fetchWorktrees();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to remove worktree');
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setErrorScopeGeneration(requestGeneration);
+        setError(e instanceof Error ? e.message : 'Failed to remove worktree');
+      }
     } finally {
-      setRemoving(null);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setRemoving(null);
+      }
     }
   };
 
   const handleReviewAction = async (runId: string, action: ReviewAction) => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = actionRequestRef.current + 1;
+    actionRequestRef.current = requestToken;
+    setActionScopeGeneration(requestGeneration);
+    setCreating(false);
+    setRemoving(null);
+    setCleaning(false);
     setReviewing(runId);
     try {
       if (action === 'merge') {
         const result = await worktreeApi.mergeUnattended(workspaceId, runId);
-        if (result.cleanup_warning) setError(result.cleanup_warning);
+        if (
+          !requestIsCurrent(workspaceId, requestGeneration) ||
+          actionRequestRef.current !== requestToken
+        )
+          return;
+        if (result.cleanup_warning) {
+          setErrorScopeGeneration(requestGeneration);
+          setError(result.cleanup_warning);
+        }
       } else {
         await worktreeApi.discardUnattended(workspaceId, runId);
       }
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        actionRequestRef.current !== requestToken
+      )
+        return;
       setReviewAction(null);
       await fetchWorktrees();
     } catch (e) {
-      setError(e instanceof Error ? e.message : `Failed to ${action} worktree`);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setErrorScopeGeneration(requestGeneration);
+        setError(e instanceof Error ? e.message : `Failed to ${action} worktree`);
+      }
     } finally {
-      setReviewing(null);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setReviewing(null);
+      }
     }
   };
 
   const handleCleanup = async () => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = actionRequestRef.current + 1;
+    actionRequestRef.current = requestToken;
+    setActionScopeGeneration(requestGeneration);
+    setCreating(false);
+    setRemoving(null);
+    setReviewing(null);
     setCleaning(true);
     try {
       const result = await worktreeApi.cleanupUnattended(workspaceId);
-      if (result.errors.length > 0) setError(result.errors.join('\n'));
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        actionRequestRef.current !== requestToken
+      )
+        return;
+      if (result.errors.length > 0) {
+        setErrorScopeGeneration(requestGeneration);
+        setError(result.errors.join('\n'));
+      }
       await fetchWorktrees();
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to clean worktrees');
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setErrorScopeGeneration(requestGeneration);
+        setError(e instanceof Error ? e.message : 'Failed to clean worktrees');
+      }
     } finally {
-      setCleaning(false);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        actionRequestRef.current === requestToken
+      ) {
+        setCleaning(false);
+      }
     }
   };
 
-  if (loading) {
+  const visibleLoading = loadingScopeGeneration === scopeGeneration ? loading : true;
+  const visibleUnattended = dataScopeGeneration === scopeGeneration ? unattended : [];
+  const scopedWorktrees = dataScopeGeneration === scopeGeneration ? worktrees : [];
+
+  if (visibleLoading) {
     return (
       <div className="flex items-center justify-center py-12">
         <Loader2 size={24} className="animate-spin text-[var(--text-tertiary)]" />
@@ -128,8 +290,10 @@ export function WorktreePanel() {
     );
   }
 
-  const cleanableCount = unattended.filter((item) => !item.active && !item.has_changes).length;
-  const visibleWorktrees = worktrees.filter(
+  const cleanableCount = visibleUnattended.filter(
+    (item) => !item.active && !item.has_changes
+  ).length;
+  const visibleWorktrees = scopedWorktrees.filter(
     (worktree) => !worktree.branch.startsWith('eko-unattended-')
   );
 
@@ -145,10 +309,10 @@ export function WorktreePanel() {
         </button>
       </div>
 
-      {error && (
+      {visibleError && (
         <div className="flex items-start gap-2 rounded-lg border border-[var(--color-error)]/30 bg-[var(--color-error)]/5 px-4 py-3 text-sm text-[var(--color-error)]">
           <AlertCircle size={14} className="mt-0.5 shrink-0" />
-          <span className="whitespace-pre-wrap">{error}</span>
+          <span className="whitespace-pre-wrap">{visibleError}</span>
           <button
             onClick={() => setError(null)}
             className="ml-auto rounded-md p-1 hover:bg-[var(--color-error)]/10"
@@ -159,25 +323,32 @@ export function WorktreePanel() {
         </div>
       )}
 
-      {unattended.length > 0 && (
+      {visibleUnattended.length > 0 && (
         <section className="space-y-2">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <h3 className="text-sm font-semibold text-[var(--text-primary)]">EKO review queue</h3>
-              <span className="text-xs text-[var(--text-tertiary)]">{unattended.length}</span>
+              <span className="text-xs text-[var(--text-tertiary)]">
+                {visibleUnattended.length}
+              </span>
             </div>
             <button
               onClick={handleCleanup}
-              disabled={cleaning || cleanableCount === 0}
+              disabled={visibleCleaning || cleanableCount === 0}
               className="btn flex items-center gap-2 disabled:opacity-50"
             >
-              {cleaning ? <Loader2 size={14} className="animate-spin" /> : <RotateCcw size={14} />}
+              {visibleCleaning ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : (
+                <RotateCcw size={14} />
+              )}
               Clean unchanged ({cleanableCount})
             </button>
           </div>
 
-          {unattended.map((item) => {
-            const pendingAction = reviewAction?.runId === item.run_id ? reviewAction.action : null;
+          {visibleUnattended.map((item) => {
+            const pendingAction =
+              visibleReviewAction?.runId === item.run_id ? visibleReviewAction.action : null;
             return (
               <div
                 key={item.run_id}
@@ -230,14 +401,14 @@ export function WorktreePanel() {
                     <>
                       <button
                         onClick={() => handleReviewAction(item.run_id, pendingAction)}
-                        disabled={reviewing === item.run_id}
+                        disabled={visibleReviewing === item.run_id}
                         className={`rounded-md px-2 py-1 text-[11px] font-medium text-white disabled:opacity-50 ${
                           pendingAction === 'merge'
                             ? 'bg-[var(--accent)]'
                             : 'bg-[var(--color-error)]'
                         }`}
                       >
-                        {reviewing === item.run_id ? (
+                        {visibleReviewing === item.run_id ? (
                           <Loader2 size={11} className="animate-spin" />
                         ) : (
                           'Confirm'
@@ -254,7 +425,7 @@ export function WorktreePanel() {
                   ) : (
                     <>
                       <button
-                        onClick={() => setReviewAction({ runId: item.run_id, action: 'merge' })}
+                        onClick={() => chooseReviewAction(item.run_id, 'merge')}
                         disabled={item.active || !item.has_changes}
                         className="rounded-md p-1.5 text-[var(--text-tertiary)] hover:bg-[var(--accent)]/10 hover:text-[var(--accent)] disabled:opacity-30"
                         title="Merge into current checkout"
@@ -262,7 +433,7 @@ export function WorktreePanel() {
                         <GitMerge size={14} />
                       </button>
                       <button
-                        onClick={() => setReviewAction({ runId: item.run_id, action: 'discard' })}
+                        onClick={() => chooseReviewAction(item.run_id, 'discard')}
                         disabled={item.active}
                         className="rounded-md p-1.5 text-[var(--text-tertiary)] hover:bg-[var(--color-error)]/10 hover:text-[var(--color-error)] disabled:opacity-30"
                         title="Discard worktree and branch"
@@ -326,10 +497,14 @@ export function WorktreePanel() {
             <div className="flex items-center gap-2 pt-1">
               <button
                 onClick={handleCreate}
-                disabled={!newBranch.trim() || creating}
+                disabled={!newBranch.trim() || visibleCreating}
                 className="btn btn-primary flex items-center gap-2 disabled:opacity-50"
               >
-                {creating ? <Loader2 size={14} className="animate-spin" /> : <Check size={14} />}
+                {visibleCreating ? (
+                  <Loader2 size={14} className="animate-spin" />
+                ) : (
+                  <Check size={14} />
+                )}
                 Create
               </button>
               <button
@@ -395,10 +570,10 @@ export function WorktreePanel() {
                       <>
                         <button
                           onClick={() => handleRemove(worktree.path)}
-                          disabled={removing === worktree.path}
+                          disabled={visibleRemoving === worktree.path}
                           className="rounded-md bg-[var(--color-error)] px-2 py-1 text-[11px] font-medium text-white disabled:opacity-50"
                         >
-                          {removing === worktree.path ? (
+                          {visibleRemoving === worktree.path ? (
                             <Loader2 size={11} className="animate-spin" />
                           ) : (
                             'Confirm'

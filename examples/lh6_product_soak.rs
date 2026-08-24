@@ -543,6 +543,7 @@ async fn bootstrap(
             config_watcher: config_watcher.clone(),
             foreground_turns,
             command_cell_runtime: runtime.command_cell_runtime.clone(),
+            browser_runtime: runtime.browser_runtime.clone(),
         },
     )
     .await?;

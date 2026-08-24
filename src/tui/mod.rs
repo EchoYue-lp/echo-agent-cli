@@ -27,7 +27,6 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use echo_agent_app_core::context_window::{ContextUsageAccumulator, ContextWindowSnapshot};
-use echo_agent_app_core::evolution::ReviewIntegration;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -220,8 +219,7 @@ pub struct TaskProgressEntry {
 /// Exact TaskRun identity retained while a TUI resume turn is queued.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedRunResume {
-    pub run_id: String,
-    pub root_message_id: String,
+    pub identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
 }
 
 /// A user turn submitted while the foreground agent is still busy.
@@ -236,7 +234,10 @@ pub struct QueuedTurn {
 /// Read-only TUI projection of the authoritative TaskRuntime state.
 #[derive(Clone, Debug, Default)]
 pub struct TaskRuntimeView {
+    pub workspace_id: String,
+    pub conversation_id: String,
     pub run_id: String,
+    pub run_created_at: chrono::DateTime<chrono::Utc>,
     pub goal: String,
     pub goal_revision: u64,
     pub status: String,
@@ -305,6 +306,10 @@ pub struct TuiApp {
     pub active_turn_id: Option<String>,
     /// Workspace identity captured with the active turn.
     pub active_turn_workspace_id: Option<String>,
+    /// Conversation identity captured with the active turn.
+    pub active_turn_conversation_id: Option<String>,
+    /// Execution root captured with the active turn.
+    pub active_turn_execution_root: Option<std::path::PathBuf>,
     /// Exact workspace agent retained for steering the active turn.
     pub active_turn_agent: Option<AgentHandle>,
     /// FIFO turns submitted while the foreground agent is busy.
@@ -395,13 +400,6 @@ pub struct TuiApp {
     /// Session-owned HITL transport replayed onto continuation pool agents.
     pub human_loop_provider:
         Option<std::sync::Arc<echo_agent_app_core::hitl::TuiHumanLoopProvider>>,
-    /// AgentPool for acquiring an isolated agent per background run (Phase B3).
-    /// Set by `run_tui` at startup; `handle_enter` reads it to build
-    /// `ChatResources` for `drive_chat`. `None` until set.
-    pub pool: Option<std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>>,
-    /// TaskRuntimeStore for create_run / cancel_run (Phase B3). Set by `run_tui`.
-    pub task_runtime_store:
-        Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     /// Shared webhook emitter for chat/tool lifecycle events.
     pub webhook_emitter: Option<std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>>,
     /// Shared scheduler used by direct `/cron` commands.
@@ -418,11 +416,6 @@ pub struct TuiApp {
     /// `drive_chat(multimodal=Some)`, then drains the buffer. Empty = plain
     /// text turn.
     pub pending_attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    /// ReviewIntegration for memory-layer access (TUI/GUI parity, AGENTS.md):
-    /// when `Some`, `handle_enter` builds a `layer_manager` per turn so
-    /// autonomous runs block-write their completion memory (`taskrun:completed`).
-    /// `None` = no review/memory subsystem (writes become no-ops). Set by `run_tui`.
-    pub review_integration: Option<std::sync::Arc<ReviewIntegration>>,
     /// Conversation id for this TUI session (TUI/GUI parity). Binds chat turns
     /// and TaskRuntime runs to one conversation; enables transcript projection.
     /// Generated once per session in `run_tui`.
@@ -854,6 +847,8 @@ impl TuiApp {
             is_processing: false,
             active_turn_id: None,
             active_turn_workspace_id: None,
+            active_turn_conversation_id: None,
+            active_turn_execution_root: None,
             active_turn_agent: None,
             queued_turns: VecDeque::new(),
             streaming_text: String::new(),
@@ -897,15 +892,12 @@ impl TuiApp {
             selection_end: None,
             pending_approval: None,
             human_loop_provider: None,
-            pool: None,
-            task_runtime_store: None,
             webhook_emitter: None,
             scheduler: None,
             plugin_runtime: None,
             task_runtime_view: None,
             subagent_runs: Vec::new(),
             pending_attachments: Vec::new(),
-            review_integration: None,
             conversation_id: None,
             conversation_store: None,
             app_state: None,
@@ -1995,20 +1987,15 @@ async fn settle_tui_foreground_on_exit(
 ///
 /// This function handles all terminal setup/teardown via [`TerminalGuard`],
 /// so the terminal is always restored even on panic or early return.
-#[allow(clippy::too_many_arguments)] // startup entry: agent + services + config + pool + store + review_integration all wired here
+#[allow(clippy::too_many_arguments)] // startup entry: agent + shared services + config are wired here
 pub async fn run_tui(
     agent: AgentHandle,
     tui_config: &echo_agent_app_core::config::TuiConfig,
     mode_display: &str,
     tui_pending: echo_agent_app_core::hitl::PendingApprovalQueue,
     tui_provider: std::sync::Arc<echo_agent_app_core::hitl::TuiHumanLoopProvider>,
-    pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
-    task_runtime_store: Option<
-        std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-    >,
     webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
-    review_integration: Option<std::sync::Arc<ReviewIntegration>>,
     conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     conversation_id: String,
     configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
@@ -2070,11 +2057,8 @@ pub async fn run_tui(
     app.max_display_chars = tui_config.max_display_chars;
     app.pending_approval = Some(tui_pending);
     app.human_loop_provider = Some(tui_provider);
-    app.pool = Some(pool);
-    app.task_runtime_store = task_runtime_store;
     app.webhook_emitter = Some(webhook_emitter);
     app.scheduler = scheduler;
-    app.review_integration = review_integration;
     // One conversation id per TUI session (parity with GUI's per-conversation id):
     // binds this session's chat turns + TaskRuntime runs + transcript projection.
     app.conversation_id = Some(conversation_id.clone());

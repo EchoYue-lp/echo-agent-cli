@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   autoMemoryApi,
   memoryApi,
@@ -7,11 +7,32 @@ import {
 } from '../../api/endpoints';
 import type { MemoryEntry } from '../../types/api';
 import { Brain, Loader2, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
+import { workspaceIdForView } from '../../lib/viewAddress';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 
 const AGENT_MEMORY_NAMESPACE = 'agent/memories';
 
+function isCurrentWorkspace(workspaceId: string): boolean {
+  return workspaceIdForView(useWorkspaceStore.getState().current?.id) === workspaceId;
+}
+
 export function MemoryPanel() {
+  const workspaceId = useWorkspaceStore((state) => workspaceIdForView(state.current?.id));
+  const scopeRef = useRef({ workspaceId, generation: 0 });
+  if (scopeRef.current.workspaceId !== workspaceId) {
+    scopeRef.current = {
+      workspaceId,
+      generation: scopeRef.current.generation + 1,
+    };
+  }
+  const scopeGeneration = scopeRef.current.generation;
+  const entriesRequestRef = useRef(0);
+  const autoStatusRequestRef = useRef(0);
+  const autoActionRequestRef = useRef(0);
+  const memoryMutationRequestRef = useRef(0);
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
+  const [entriesWorkspaceId, setEntriesWorkspaceId] = useState('');
+  const [entriesScopeGeneration, setEntriesScopeGeneration] = useState(-1);
   const [namespaces, setNamespaces] = useState<string[]>([]);
   const [selectedNs, setSelectedNs] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
@@ -23,53 +44,155 @@ export function MemoryPanel() {
   });
   const [autoStatus, setAutoStatus] = useState<AutoMemoryStatus | null>(null);
   const [autoPreview, setAutoPreview] = useState<AutoMemoryObservation[]>([]);
+  const [autoWorkspaceId, setAutoWorkspaceId] = useState('');
+  const [autoStatusScopeGeneration, setAutoStatusScopeGeneration] = useState(-1);
+  const [autoPreviewScopeGeneration, setAutoPreviewScopeGeneration] = useState(-1);
   const [autoBusy, setAutoBusy] = useState(false);
+  const [autoBusyScopeGeneration, setAutoBusyScopeGeneration] = useState(-1);
   const [autoMessage, setAutoMessage] = useState<string | null>(null);
+  const visibleEntries =
+    entriesWorkspaceId === workspaceId && entriesScopeGeneration === scopeGeneration ? entries : [];
+  const visibleAutoStatus =
+    autoWorkspaceId === workspaceId && autoStatusScopeGeneration === scopeGeneration
+      ? autoStatus
+      : null;
+  const visibleAutoPreview =
+    autoWorkspaceId === workspaceId && autoPreviewScopeGeneration === scopeGeneration
+      ? autoPreview
+      : [];
+  const visibleAutoMessage =
+    autoWorkspaceId === workspaceId && autoPreviewScopeGeneration === scopeGeneration
+      ? autoMessage
+      : null;
+  const visibleAutoBusy = autoBusyScopeGeneration === scopeGeneration ? autoBusy : false;
+
+  const requestIsCurrent = useCallback(
+    (requestWorkspaceId: string, requestGeneration: number) =>
+      scopeRef.current.workspaceId === requestWorkspaceId &&
+      scopeRef.current.generation === requestGeneration &&
+      isCurrentWorkspace(requestWorkspaceId),
+    []
+  );
 
   const loadAutoMemoryStatus = useCallback(async () => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = autoStatusRequestRef.current + 1;
+    autoStatusRequestRef.current = requestToken;
     try {
-      const status = await autoMemoryApi.status();
+      const status = await autoMemoryApi.status(workspaceId);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        autoStatusRequestRef.current !== requestToken
+      )
+        return;
+      setAutoWorkspaceId(workspaceId);
+      setAutoStatusScopeGeneration(requestGeneration);
       setAutoStatus(status);
     } catch (e) {
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        autoStatusRequestRef.current === requestToken
+      ) {
+        setAutoWorkspaceId(workspaceId);
+        setAutoStatusScopeGeneration(requestGeneration);
+        setAutoStatus(null);
+      }
       console.error(e);
     }
-  }, []);
+  }, [requestIsCurrent, workspaceId]);
 
   const toggleAutoMemory = async () => {
-    if (!autoStatus || autoBusy) return;
+    if (!visibleAutoStatus || visibleAutoBusy) return;
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = autoActionRequestRef.current + 1;
+    autoActionRequestRef.current = requestToken;
+    setAutoBusyScopeGeneration(requestGeneration);
     setAutoBusy(true);
     setAutoMessage(null);
     try {
-      const status = await autoMemoryApi.toggle(!autoStatus.enabled);
+      const status = await autoMemoryApi.toggle(workspaceId, !visibleAutoStatus.enabled);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        autoActionRequestRef.current !== requestToken
+      )
+        return;
+      setAutoWorkspaceId(workspaceId);
+      setAutoStatusScopeGeneration(requestGeneration);
       setAutoStatus(status);
       if (!status.enabled) setAutoPreview([]);
     } catch (e) {
-      setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 更新失败');
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        autoActionRequestRef.current === requestToken
+      ) {
+        setAutoWorkspaceId(workspaceId);
+        setAutoPreviewScopeGeneration(requestGeneration);
+        setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 更新失败');
+      }
     } finally {
-      setAutoBusy(false);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        autoActionRequestRef.current === requestToken
+      ) {
+        setAutoBusy(false);
+      }
     }
   };
 
   const previewAutoMemory = async () => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = autoActionRequestRef.current + 1;
+    autoActionRequestRef.current = requestToken;
+    setAutoBusyScopeGeneration(requestGeneration);
     setAutoBusy(true);
     setAutoMessage(null);
     try {
-      const preview = await autoMemoryApi.preview();
+      const preview = await autoMemoryApi.preview(workspaceId);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        autoActionRequestRef.current !== requestToken
+      )
+        return;
+      setAutoWorkspaceId(workspaceId);
+      setAutoPreviewScopeGeneration(requestGeneration);
       setAutoPreview(preview.observations);
       setAutoMessage(preview.count === 0 ? '当前会话没有可提取观察' : null);
       await loadAutoMemoryStatus();
     } catch (e) {
-      setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 预览失败');
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        autoActionRequestRef.current === requestToken
+      ) {
+        setAutoWorkspaceId(workspaceId);
+        setAutoPreviewScopeGeneration(requestGeneration);
+        setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 预览失败');
+      }
     } finally {
-      setAutoBusy(false);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        autoActionRequestRef.current === requestToken
+      ) {
+        setAutoBusy(false);
+      }
     }
   };
 
   const extractAutoMemory = async () => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = autoActionRequestRef.current + 1;
+    autoActionRequestRef.current = requestToken;
+    setAutoBusyScopeGeneration(requestGeneration);
     setAutoBusy(true);
     setAutoMessage(null);
     try {
-      const result = await autoMemoryApi.extract();
+      const result = await autoMemoryApi.extract(workspaceId);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        autoActionRequestRef.current !== requestToken
+      )
+        return;
+      setAutoWorkspaceId(workspaceId);
+      setAutoPreviewScopeGeneration(requestGeneration);
       setAutoPreview(result.observations);
       setAutoMessage(
         result.success
@@ -78,20 +201,53 @@ export function MemoryPanel() {
       );
       await loadAutoMemoryStatus();
     } catch (e) {
-      setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 提取失败');
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        autoActionRequestRef.current === requestToken
+      ) {
+        setAutoWorkspaceId(workspaceId);
+        setAutoPreviewScopeGeneration(requestGeneration);
+        setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 提取失败');
+      }
     } finally {
-      setAutoBusy(false);
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        autoActionRequestRef.current === requestToken
+      ) {
+        setAutoBusy(false);
+      }
     }
   };
 
-  const loadEntries = useCallback(async (ns?: string) => {
-    try {
-      const data = await memoryApi.list(ns || undefined);
-      setEntries(data);
-    } catch (e) {
-      console.error(e);
-    }
-  }, []);
+  const loadEntries = useCallback(
+    async (ns?: string) => {
+      const requestGeneration = scopeRef.current.generation;
+      const requestToken = entriesRequestRef.current + 1;
+      entriesRequestRef.current = requestToken;
+      try {
+        const data = await memoryApi.list(workspaceId, ns || undefined);
+        if (
+          !requestIsCurrent(workspaceId, requestGeneration) ||
+          entriesRequestRef.current !== requestToken
+        )
+          return;
+        setEntriesWorkspaceId(workspaceId);
+        setEntriesScopeGeneration(requestGeneration);
+        setEntries(data);
+      } catch (e) {
+        if (
+          requestIsCurrent(workspaceId, requestGeneration) &&
+          entriesRequestRef.current === requestToken
+        ) {
+          setEntriesWorkspaceId(workspaceId);
+          setEntriesScopeGeneration(requestGeneration);
+          setEntries([]);
+        }
+        console.error(e);
+      }
+    },
+    [requestIsCurrent, workspaceId]
+  );
 
   useEffect(() => {
     memoryApi
@@ -107,15 +263,36 @@ export function MemoryPanel() {
       loadEntries(selectedNs || undefined);
       return;
     }
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = entriesRequestRef.current + 1;
+    entriesRequestRef.current = requestToken;
     try {
-      const data = await memoryApi.search(searchQuery, selectedNs || undefined);
+      const data = await memoryApi.search(workspaceId, searchQuery, selectedNs || undefined);
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        entriesRequestRef.current !== requestToken
+      )
+        return;
+      setEntriesWorkspaceId(workspaceId);
+      setEntriesScopeGeneration(requestGeneration);
       setEntries(data);
     } catch (e) {
+      if (
+        requestIsCurrent(workspaceId, requestGeneration) &&
+        entriesRequestRef.current === requestToken
+      ) {
+        setEntriesWorkspaceId(workspaceId);
+        setEntriesScopeGeneration(requestGeneration);
+        setEntries([]);
+      }
       console.error(e);
     }
   };
 
   const add = async () => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = memoryMutationRequestRef.current + 1;
+    memoryMutationRequestRef.current = requestToken;
     try {
       let parsedValue: any = addForm.value;
       try {
@@ -124,27 +301,47 @@ export function MemoryPanel() {
         /* keep as string */
       }
 
-      await memoryApi.add({
+      await memoryApi.add(workspaceId, {
         namespace: addForm.namespace,
         key: addForm.key,
         value: parsedValue,
       });
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        memoryMutationRequestRef.current !== requestToken
+      )
+        return;
       setShowAdd(false);
       setAddForm({ namespace: AGENT_MEMORY_NAMESPACE, key: '', value: '' });
       memoryApi
         .namespaces()
-        .then((data) => setNamespaces(data.namespaces.map((ns) => ns.join('/'))))
+        .then((data) => {
+          if (
+            requestIsCurrent(workspaceId, requestGeneration) &&
+            memoryMutationRequestRef.current === requestToken
+          ) {
+            setNamespaces(data.namespaces.map((ns) => ns.join('/')));
+          }
+        })
         .catch(console.error);
-      loadEntries(selectedNs || undefined);
+      void loadEntries(selectedNs || undefined);
     } catch (e) {
       console.error(e);
     }
   };
 
   const remove = async (namespace: string, key: string) => {
+    const requestGeneration = scopeRef.current.generation;
+    const requestToken = memoryMutationRequestRef.current + 1;
+    memoryMutationRequestRef.current = requestToken;
     try {
-      await memoryApi.delete({ namespace, key });
-      loadEntries(selectedNs || undefined);
+      await memoryApi.delete(workspaceId, { namespace, key });
+      if (
+        !requestIsCurrent(workspaceId, requestGeneration) ||
+        memoryMutationRequestRef.current !== requestToken
+      )
+        return;
+      void loadEntries(selectedNs || undefined);
     } catch (e) {
       console.error(e);
     }
@@ -165,10 +362,11 @@ export function MemoryPanel() {
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold" style={{ color: s.text }}>
-          记忆 ({entries.length})
+          记忆 ({visibleEntries.length})
         </h3>
         <button
           onClick={() => setShowAdd(!showAdd)}
+          aria-label="添加记忆"
           className="rounded-md p-1 transition-colors"
           style={{ color: s.textTer }}
         >
@@ -185,54 +383,62 @@ export function MemoryPanel() {
                 Auto Memory
               </div>
               <div className="truncate text-[11px]" style={{ color: s.textTer }}>
-                候选 {autoStatus?.observation_count ?? 0} · 阈值{' '}
-                {Math.round((autoStatus?.config.min_confidence ?? 0.7) * 100)}%
+                候选 {visibleAutoStatus?.observation_count ?? 0} · 阈值{' '}
+                {Math.round((visibleAutoStatus?.config.min_confidence ?? 0.7) * 100)}%
               </div>
             </div>
           </div>
           <button
             onClick={toggleAutoMemory}
-            disabled={!autoStatus || autoBusy}
+            disabled={!visibleAutoStatus || visibleAutoBusy}
             className="rounded-full px-2 py-1 text-[11px] font-medium transition-colors disabled:opacity-50"
             style={{
-              background: autoStatus?.enabled ? 'var(--color-success-bg)' : s.bgHover,
-              color: autoStatus?.enabled ? 'var(--color-success)' : s.textSec,
+              background: visibleAutoStatus?.enabled ? 'var(--color-success-bg)' : s.bgHover,
+              color: visibleAutoStatus?.enabled ? 'var(--color-success)' : s.textSec,
             }}
           >
-            {autoStatus?.enabled ? 'ON' : 'OFF'}
+            {visibleAutoStatus?.enabled ? 'ON' : 'OFF'}
           </button>
         </div>
 
         <div className="mt-3 flex items-center gap-2">
           <button
             onClick={previewAutoMemory}
-            disabled={autoBusy}
+            disabled={visibleAutoBusy}
             className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs transition-colors disabled:opacity-50"
             style={{ background: s.bgHover, color: s.textSec }}
           >
-            {autoBusy ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
+            {visibleAutoBusy ? (
+              <Loader2 size={12} className="animate-spin" />
+            ) : (
+              <Search size={12} />
+            )}
             预览
           </button>
           <button
             onClick={extractAutoMemory}
-            disabled={autoBusy || autoStatus?.enabled === false}
+            disabled={visibleAutoBusy || visibleAutoStatus?.enabled === false}
             className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-white transition-colors disabled:opacity-50"
             style={{ background: s.accent }}
           >
-            {autoBusy ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+            {visibleAutoBusy ? (
+              <Loader2 size={12} className="animate-spin" />
+            ) : (
+              <Sparkles size={12} />
+            )}
             送审
           </button>
         </div>
 
-        {autoMessage && (
+        {visibleAutoMessage && (
           <div className="mt-2 text-[11px]" style={{ color: s.textTer }}>
-            {autoMessage}
+            {visibleAutoMessage}
           </div>
         )}
 
-        {autoPreview.length > 0 && (
+        {visibleAutoPreview.length > 0 && (
           <div className="mt-3 max-h-40 space-y-2 overflow-auto">
-            {autoPreview.map((obs, idx) => (
+            {visibleAutoPreview.map((obs, idx) => (
               <div
                 key={`${obs.category}-${obs.source_turn ?? idx}-${idx}`}
                 className="rounded-md border px-2 py-1.5"
@@ -320,7 +526,7 @@ export function MemoryPanel() {
         </div>
       )}
 
-      {entries.map((e) => (
+      {visibleEntries.map((e) => (
         <div
           key={`${e.namespace}/${e.key}`}
           className="rounded-lg border px-3 py-2"
@@ -339,7 +545,11 @@ export function MemoryPanel() {
                 {e.namespace}
               </span>
             </div>
-            <button onClick={() => remove(e.namespace, e.key)} style={{ color: s.textTer }}>
+            <button
+              onClick={() => remove(e.namespace, e.key)}
+              aria-label={`删除 ${e.key}`}
+              style={{ color: s.textTer }}
+            >
               <Trash2 size={12} />
             </button>
           </div>

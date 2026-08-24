@@ -1,7 +1,6 @@
 //! Workspace slash commands — new, list, switch, link, migrate, info.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
-use echo_agent::agent::Agent;
 use echo_agent_app_core::state::AppState;
 use echo_agent_app_core::workspace::WorkspaceKind;
 use echo_agent_app_core::workspace::migration::LegacyMigrator;
@@ -41,12 +40,12 @@ pub async fn execute_workspace_command(
         };
     };
     match args.first().copied() {
-        Some("new") => unchanged(ws_new(state, args.get(1..).unwrap_or(&[]))),
+        Some("new") => unchanged(ws_new(state, args.get(1..).unwrap_or(&[])).await),
         Some("list") | Some("ls") => unchanged(ws_list(state).await),
         Some("switch") | Some("sw") => ws_switch(state, args.get(1).copied()).await,
         Some("exit") => ws_exit(state).await,
         Some("link") => unchanged(ws_link(state, args.get(1).copied()).await),
-        Some("migrate") => unchanged(ws_migrate(state, args.get(1).copied().unwrap_or(""))),
+        Some("migrate") => unchanged(ws_migrate(state, args.get(1).copied().unwrap_or("")).await),
         Some("info") | None => unchanged(ws_info(state).await),
         Some(other) => unchanged(format!(
             "Unknown workspace subcommand: {other}\nUsage: /workspace [new|list|switch|exit|link|migrate|info]"
@@ -62,7 +61,7 @@ fn unchanged(output: String) -> WorkspaceCommandResult {
 }
 
 /// `/workspace new <name> [--kind code|data|research]`
-fn ws_new(state: &AppState, args: &[&str]) -> String {
+async fn ws_new(state: &std::sync::Arc<AppState>, args: &[&str]) -> String {
     let name = match args.first() {
         Some(n) => *n,
         None => {
@@ -79,13 +78,13 @@ fn ws_new(state: &AppState, args: &[&str]) -> String {
         WorkspaceKind::default()
     };
 
-    match state.workspace.registry.create(name, kind) {
-        Ok(ws) => format!(
+    match state.create_workspace_owned(name, kind, None).await {
+        Ok((workspace, _created)) => format!(
             "Created workspace '{}' ({})\n  Root: {}\n  Kind: {}",
-            ws.name,
-            ws.id,
-            ws.root.display(),
-            ws.kind.display_name()
+            workspace.name,
+            workspace.id,
+            workspace.root.display(),
+            workspace.kind.display_name()
         ),
         Err(error) => format!("Failed to create workspace: {error}"),
     }
@@ -137,11 +136,11 @@ async fn ws_switch(state: &std::sync::Arc<AppState>, name: Option<&str>) -> Work
     };
     match state.workspace.registry.open_by_name(name) {
         Ok(ws) => {
-            let transition = match state.switch_workspace(ws.clone()).await {
+            let transition = match state.switch_workspace_registered(ws.id.clone()).await {
                 Ok(transition) => transition,
                 Err(error) => return unchanged(format!("Failed to switch workspace: {error}")),
             };
-            reset_workspace_conversation(state).await;
+            let ws = state.current_workspace().await.unwrap_or(ws);
             WorkspaceCommandResult {
                 output: format!(
                     "Switched to workspace: {} ({})\n  Root: {}\n  Kind: {}{}{}",
@@ -167,7 +166,6 @@ async fn ws_exit(state: &std::sync::Arc<AppState>) -> WorkspaceCommandResult {
         Ok(transition) => transition,
         Err(error) => return unchanged(format!("Failed to exit workspace: {error}")),
     };
-    reset_workspace_conversation(state).await;
     WorkspaceCommandResult {
         output: format!(
             "Exited workspace; using global paths.{}",
@@ -192,22 +190,8 @@ fn transition_warning(
     format!("\n  Warning: workspace committed with degraded subsystems: {details}")
 }
 
-async fn reset_workspace_conversation(state: &AppState) {
-    let conversation_id = uuid::Uuid::new_v4().to_string();
-    state
-        .connection
-        .agent
-        .write_async(|agent| {
-            Box::pin(async move {
-                agent.reset().await;
-                agent.set_conversation_id(conversation_id);
-            })
-        })
-        .await;
-}
-
 /// `/workspace link <path>`
-async fn ws_link(state: &AppState, path: Option<&str>) -> String {
+async fn ws_link(state: &std::sync::Arc<AppState>, path: Option<&str>) -> String {
     let path = match path {
         Some(p) => p,
         None => {
@@ -220,21 +204,11 @@ async fn ws_link(state: &AppState, path: Option<&str>) -> String {
     if !project_path.exists() {
         return format!("Path does not exist: {path}");
     }
-    let Some(current) = state.current_workspace().await else {
-        return "No active workspace. Switch to one before linking a project.".to_string();
-    };
     match state
-        .workspace
-        .registry
-        .link_project(&current.id, project_path)
+        .link_current_workspace_project_owned(project_path)
+        .await
     {
         Ok(ws) => {
-            let ws = match state.refresh_current_workspace_metadata(ws).await {
-                Ok(workspace) => workspace,
-                Err(error) => {
-                    return format!("Failed to refresh linked workspace runtime: {error}");
-                }
-            };
             format!(
                 "Linked project to workspace '{}': {}",
                 ws.name,
@@ -249,7 +223,7 @@ async fn ws_link(state: &AppState, path: Option<&str>) -> String {
 }
 
 /// `/workspace migrate [--dry-run]`
-fn ws_migrate(state: &AppState, sub: &str) -> String {
+async fn ws_migrate(state: &std::sync::Arc<AppState>, sub: &str) -> String {
     let migrator = LegacyMigrator::new();
 
     if !migrator.has_legacy_data() {
@@ -278,7 +252,7 @@ fn ws_migrate(state: &AppState, sub: &str) -> String {
                 output.push_str("\nDry run; no changes made. Run /workspace migrate to execute.");
                 return output;
             }
-            match migrator.execute(&plan, state.workspace.registry.as_ref()) {
+            match state.execute_legacy_migration_owned(migrator, plan).await {
                 Ok(report) => {
                     output.push_str(&format!(
                         "\nMigration complete:\n  Workspaces created: {}\n  Sessions migrated: {}\n  Conversations: {}",
