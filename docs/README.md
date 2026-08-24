@@ -5,16 +5,20 @@
 
 ## 文档导航
 
-| 文档                                         | 内容                                          |
-| -------------------------------------------- | --------------------------------------------- |
-| [快速入门](./getting-started.md)             | 环境准备、TUI/GUI/JSONL 启动与首次配置        |
-| [功能总览](./features.md)                    | 已接入真实主路径的产品能力与代码依据          |
-| [架构说明](./architecture.md)                | 框架/应用边界、运行时所有权、数据流和文件布局 |
-| [配置指南](./configuration.md)               | 模型、MCP、Hooks、Browser、Channel 与环境变量 |
-| [Provider 架构](./architecture/providers.md) | 动态 Provider、模型协议和思考能力解析         |
-| [RuntimeTaskService 决策](./architecture/runtime-task-service.md) | Task DAG 权威、EKO adapter、journal 与 blocking 边界 |
-| [Skill 同步](./skill-sync.md)                | 内置/用户 Skill、启用状态与上游同步           |
-| [项目状态](./MASTER-PLAN.md)                 | 当前权威路径、活跃工作与下一步                |
+| 文档                                                                 | 内容                                          |
+| -------------------------------------------------------------------- | --------------------------------------------- |
+| [快速入门](./getting-started.md)                                     | 环境准备、TUI/GUI/JSONL 启动与首次配置        |
+| [功能总览](./features.md)                                            | 已接入真实主路径的产品能力与代码依据          |
+| [架构说明](./architecture.md)                                        | 框架/应用边界、运行时所有权、数据流和文件布局 |
+| [持久化概念](./persistence.md)                                       | Store、Journal、Checkpoint、Trace 与权威关系  |
+| [配置指南](./configuration.md)                                       | 模型、MCP、Hooks、Browser、Channel 与环境变量 |
+| [Provider 架构](./architecture/providers.md)                         | 动态 Provider、模型协议和思考能力解析         |
+| [RuntimeTaskService 决策](./architecture/runtime-task-service.md)     | Task DAG 权威、EKO adapter、journal 与 blocking 边界 |
+| [Agent 协同 ADR](./adr/0001-agent-collaboration.md)                  | Codex 协同机制与 EKO 功能设计                 |
+| [Codex 工具目录 ADR](./adr/0002-codex-tool-capability-catalog.md)    | Codex 工具能力与 EKO 参考设计                 |
+| [Claude Code 能力目录](./adr/0003-claude-code-capability-catalog.md) | Claude Code 工具、子智能体和 Skills 快照      |
+| [Skill 同步](./skill-sync.md)                                        | 内置/用户 Skill、启用状态与上游同步           |
+| [项目状态](./MASTER-PLAN.md)                                         | 当前权威路径、活跃工作与下一步                |
 
 仓库根 [README](../README.md) 负责产品介绍、构建命令和常用交互；本文档集不再
 复制完整的 slash command 或历史里程碑清单。
@@ -22,13 +26,13 @@
 ## 设计文档边界
 
 尚未完成、仍驱动代码变更的设计与规格放在 [`design/specs/`](../design/specs/)。
+架构决策记录放在 [`docs/adr/`](./adr/)。
 完成验收后删除对应规格，把仍有长期价值的事实合并回 `docs/` 或代码注释。
 
 当前活跃规格：
 
 - [workspace/conversation runtime reliability](../design/specs/runtime-reliability.md)
 - [long-horizon runtime closure](../design/specs/long-horizon-runtime-closure.md)
-- [surface parity cleanup](../design/specs/surface-parity.md)
 
 ## 维护规则
 
