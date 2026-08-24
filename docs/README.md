@@ -20,6 +20,7 @@
 | [Codex 工具目录 ADR](./adr/0002-codex-tool-capability-catalog.md)            | Codex 工具能力与 EKO 参考设计                        |
 | [Claude Code 能力目录](./adr/0003-claude-code-capability-catalog.md)         | Claude Code 工具、子智能体和 Skills 快照             |
 | [应用生命周期 ADR](./adr/0004-application-lifecycle-supervisor.md)           | GUI/headless admission、取消、join 与 rollback       |
+| [Scoped product-data I/O](./adr/0006-scoped-product-data-io.md)              | 文件、研究和分析的 workspace authority 与阻塞边界    |
 | [Skill 同步](./skill-sync.md)                                                | 内置/用户 Skill、启用状态与上游同步                  |
 | [项目状态](./MASTER-PLAN.md)                                                 | 当前权威路径、活跃工作与下一步                       |
 

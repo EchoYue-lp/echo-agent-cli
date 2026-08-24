@@ -142,6 +142,7 @@ pub fn build_tauri_app(
             commands::analysis::save_analysis,
             commands::analysis::run_analysis,
             commands::analysis::cancel_analysis,
+            commands::analysis::delete_analysis,
             // Cross-workspace Agent messaging
             commands::agent_router::list_agent_endpoints,
             commands::agent_router::get_agent_delivery_status,

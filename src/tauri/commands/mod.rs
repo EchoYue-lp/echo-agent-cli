@@ -18,6 +18,7 @@ pub mod mcp;
 pub mod memory;
 pub mod panels;
 pub mod plugins;
+mod product_data;
 pub mod providers;
 pub mod research;
 pub mod scheduler;

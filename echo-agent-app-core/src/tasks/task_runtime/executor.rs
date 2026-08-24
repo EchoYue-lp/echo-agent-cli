@@ -339,6 +339,7 @@ pub async fn launch_planned_run_resume(
     review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     trace_sink: Option<ExecSink>,
     cancel: CancellationToken,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<PlannedRunResumeLaunch, StoreError> {
     let run_id = expected.run_id.clone();
     let admission = store.reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
@@ -415,6 +416,7 @@ pub async fn launch_planned_run_resume(
                         &preparation_run_id,
                         cancel,
                         super::memory_bridge::MemoryPolicy::BestEffortSettled,
+                        workspace_io,
                     )
                     .await
                     .map_err(|error| error.to_string())
@@ -532,6 +534,7 @@ pub async fn execute_run(
     run_id: &str,
     parent_cancel: CancellationToken,
     memory_policy: super::memory_bridge::MemoryPolicy,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<RunOutcome, ExecError> {
     let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
     let initial_run_id = run_id.to_string();
@@ -661,6 +664,7 @@ pub async fn execute_run(
             store.clone(),
             RealTaskDispatcher {
                 primary_agent: primary_agent.clone(),
+                workspace_io: workspace_io.clone(),
             },
             reviewer_llm.clone(),
             run_id,
@@ -1053,6 +1057,7 @@ trait TaskDispatcher: Send + Sync {
 /// dispatcher only needs the Agent and product-specific concurrency primitives.
 struct RealTaskDispatcher {
     primary_agent: crate::agent_handle::AgentHandle,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 }
 
 async fn resolve_task_execution_agent(
@@ -1116,6 +1121,7 @@ impl TaskDispatcher for RealTaskDispatcher {
         trace_sink: Option<ExecSink>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>> {
         let local_agent = self.primary_agent.clone();
+        let workspace_io = self.workspace_io.clone();
         Box::pin(async move {
             let run_id = context.run_id;
             let cancel = context.cancel;
@@ -1130,6 +1136,9 @@ impl TaskDispatcher for RealTaskDispatcher {
                 resolve_task_execution_agent(&store, &blocking, &run_id, &task, local_agent)
                     .await
                     .map_err(|error| TaskDispatchFailure::failed(task_id, error))?;
+            // A cross-workspace target needs its own target-runtime receipt.
+            // Never reuse the leader workspace authority for that Agent.
+            let workspace_io = target_lease.is_none().then_some(workspace_io).flatten();
             // Scope run_id + cancel + trace_sink into task-local so Subagent-internal
             // tools (task_*/task_execute, and their execute_with_context
             // fallback path) and L3 nested Subagents can read them.
@@ -1158,6 +1167,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                         task,
                         cancel,
                         delegation_policy,
+                        workspace_io,
                     )
                     .await
                 },
@@ -3285,6 +3295,7 @@ async fn execute_task(
     task: PlanTask,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> TaskDispatchResult {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
@@ -3724,6 +3735,7 @@ async fn execute_task(
                     "read-only Subagent is missing its attempt identity",
                 )
             })?,
+            workspace_io.clone(),
         )
         .await;
         match dispatch_result {
@@ -3785,6 +3797,7 @@ async fn execute_task(
                     "writer Subagent is missing its attempt identity",
                 )
             })?,
+            workspace_io.clone(),
         )
         .await;
         match dispatch_result {
@@ -3844,6 +3857,7 @@ async fn execute_task(
             &compiled.task_input,
             task_cancel.clone(),
             trace_sink.clone(),
+            workspace_io,
         )
         .await
     };
@@ -4387,6 +4401,7 @@ async fn run_readonly_subagent(
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
     attempt_identity: echo_agent::agent::subagent::SubagentAttemptIdentity,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
     primary_agent
         .read_async(|agent| {
@@ -4398,6 +4413,10 @@ async fn run_readonly_subagent(
             let message_id = message_id.map(|s| s.to_string());
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
             let attempt_identity = attempt_identity.clone();
+            let resource_guards = workspace_io
+                .as_ref()
+                .map(crate::state::WorkspaceIoInvocation::resource_guards)
+                .unwrap_or_default();
             Box::pin(async move {
                 let runtime_context = Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: None,
@@ -4409,6 +4428,7 @@ async fn run_readonly_subagent(
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
                     delegation_policy: Some(delegation_policy),
+                    resource_guards,
                 });
                 agent
                     .delegate_to_agent_attempt_with_prompt_payload(
@@ -4482,6 +4502,7 @@ async fn run_writer_subagent(
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
     attempt_identity: echo_agent::agent::subagent::SubagentAttemptIdentity,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, ExecutionFailure> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer Subagent sees the same images/files as the primary agent would
@@ -4518,6 +4539,10 @@ async fn run_writer_subagent(
             let run_message = run_message.clone();
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
             let attempt_identity = attempt_identity.clone();
+            let resource_guards = workspace_io
+                .as_ref()
+                .map(crate::state::WorkspaceIoInvocation::resource_guards)
+                .unwrap_or_default();
             Box::pin(async move {
                 let runtime_context = Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: conversation_id.clone(),
@@ -4529,6 +4554,7 @@ async fn run_writer_subagent(
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
                     delegation_policy: Some(delegation_policy),
+                    resource_guards,
                 });
                 if let Some(msg) = run_message {
                     agent
@@ -4663,6 +4689,7 @@ async fn run_main_agent_task(
     prompt: &str,
     cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<(SubagentTaskResult, String, TaskExecutionUsage), ExecutionFailure> {
     let run_id = run_id.to_string();
     let execution_id = execution_id.to_string();
@@ -4694,6 +4721,13 @@ async fn run_main_agent_task(
             let blocking = blocking.clone();
             let run_record = run_record.clone();
             let task = task.clone();
+            let working_dir = workspace_io
+                .as_ref()
+                .map(|scope| scope.data_root().to_path_buf());
+            let resource_guards = workspace_io
+                .as_ref()
+                .map(crate::state::WorkspaceIoInvocation::resource_guards)
+                .unwrap_or_default();
             Box::pin(async move {
                 let visible_tools = crate::tool_exposure::initial_visible_tools(
                     InteractionMode::Task,
@@ -4716,14 +4750,16 @@ async fn run_main_agent_task(
                         cancel: Some(Arc::new(cancel.clone())),
                         trace_sink: exec_trace_sink_to_core(trace_sink.clone()),
                         delegation_policy: None,
+                        resource_guards: Vec::new(),
                     }),
-                    working_dir: None,
+                    working_dir,
                     cancel: None,
                     disabled_tools: Some(crate::tool_exposure::disabled_tools_for_mode(
                         InteractionMode::Task,
                     )),
                     visible_tools: Some(visible_tools),
                     run_budget: None,
+                    resource_guards,
                 };
                 let event_identity = echo_agent::agent::EventIdentity::from_invocation(&invocation)
                     .map_err(|error| {
@@ -4916,6 +4952,7 @@ async fn launch_unattended_run(
         prompt,
         parent_cancel,
         write_mode,
+        None,
     )
     .await
 }
@@ -4957,6 +4994,7 @@ pub(crate) async fn drive_unattended_run(
     prompt: &str,
     parent_cancel: CancellationToken,
     write_mode: UnattendedWriteMode,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<String, ExecError> {
     drive_agent_run(
         store,
@@ -4969,6 +5007,7 @@ pub(crate) async fn drive_unattended_run(
         write_mode,
         RunPlanPolicy::AllowDirect,
         None,
+        workspace_io,
     )
     .await
 }
@@ -4983,6 +5022,7 @@ async fn drive_owned_agent_turn(
     cancel: CancellationToken,
     disabled_tools: HashSet<String>,
     trace_sink: Option<ExecSink>,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<(TurnReceipt, EkoAgentTurnObservation), ExecError> {
     let run_id = run.run_id.clone();
     let conversation_id = run.conversation_id.clone();
@@ -4991,6 +5031,13 @@ async fn drive_owned_agent_turn(
     let prompt = prompt.to_string();
     let core_trace_sink = exec_trace_sink_to_core(trace_sink.clone());
     let trace_sink_for_scope = trace_sink.clone();
+    let working_dir = workspace_io
+        .as_ref()
+        .map(|scope| scope.data_root().to_path_buf());
+    let resource_guards = workspace_io
+        .as_ref()
+        .map(crate::state::WorkspaceIoInvocation::resource_guards)
+        .unwrap_or_default();
     super::task_tools::with_run_context(
         run_id.clone(),
         cancel.clone(),
@@ -4998,8 +5045,9 @@ async fn drive_owned_agent_turn(
         async {
             let agent_inner = primary_agent.inner().clone();
             let agent = agent_inner.read().await;
-            let visible_tools = crate::tool_exposure::initial_visible_tools(
+            let visible_tools = crate::tool_exposure::initial_visible_tools_for_profile(
                 InteractionMode::Auto,
+                run.domain_profile,
                 &agent.tool_names(),
             );
             crate::tool_exposure::record_mode_schema_budget(
@@ -5026,12 +5074,14 @@ async fn drive_owned_agent_turn(
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
                     delegation_policy: None,
+                    resource_guards: Vec::new(),
                 }),
-                working_dir: None,
+                working_dir,
                 cancel: None,
                 disabled_tools: Some(disabled_tools),
                 visible_tools: Some(visible_tools),
                 run_budget: None,
+                resource_guards,
             };
             let event_identity = echo_agent::agent::EventIdentity::from_invocation(&invocation)
                 .map_err(|error| {
@@ -5075,6 +5125,7 @@ pub async fn drive_agent_run(
     write_mode: UnattendedWriteMode,
     plan_policy: RunPlanPolicy,
     trace_sink: Option<ExecSink>,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 ) -> Result<String, ExecError> {
     let child_cancel = parent_cancel.child_token();
     let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
@@ -5151,6 +5202,7 @@ pub async fn drive_agent_run(
             child_cancel.clone(),
             disabled_tools.clone(),
             trace_sink.clone(),
+            workspace_io.clone(),
         )
         .await?;
         let mut terminal = turn_receipt.outcome;
@@ -5436,6 +5488,7 @@ pub(crate) async fn drive_existing_cron_run(
         prompt,
         parent_cancel,
         UnattendedWriteMode::default(),
+        None,
     )
     .await?;
     let status_run_id = run_id.clone();
@@ -6919,6 +6972,7 @@ Read the runtime path and found one missing branch.
             UnattendedWriteMode::Disabled,
             RunPlanPolicy::RequirePlan,
             None,
+            None,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -7748,6 +7802,7 @@ Read the runtime path and found one missing branch.
             None,
             None,
             CancellationToken::new(),
+            None,
         )
         .await
         .err()
@@ -7789,6 +7844,7 @@ Read the runtime path and found one missing branch.
             None,
             None,
             CancellationToken::new(),
+            None,
         )
         .await
         .err()
@@ -7871,6 +7927,7 @@ Read the runtime path and found one missing branch.
             store.clone(),
             RealTaskDispatcher {
                 primary_agent: local_agent,
+                workspace_io: None,
             },
             None,
             &run_id,
@@ -8757,6 +8814,7 @@ Read the runtime path and found one missing branch.
             "What is 6 times 7?",
             CancellationToken::new(),
             Some(sink),
+            None,
         )
         .await
         .map_err(|error| format!("main agent task should complete: {error}"))?;

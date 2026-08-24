@@ -10,7 +10,7 @@ const mocks = vi.hoisted(() => ({
   clearMessages: vi.fn(),
   initConversations: vi.fn(),
   detachConversations: vi.fn(),
-  markWorkspaceChanged: vi.fn(),
+  bindScope: vi.fn(),
   loadTree: vi.fn(),
   loadChanges: vi.fn(),
   addToast: vi.fn(),
@@ -50,7 +50,7 @@ vi.mock('./conversationStore', () => ({
 vi.mock('./fileStore', () => ({
   useFileStore: {
     getState: () => ({
-      markWorkspaceChanged: mocks.markWorkspaceChanged,
+      bindScope: mocks.bindScope,
       loadTree: mocks.loadTree,
       loadChanges: mocks.loadChanges,
     }),
@@ -71,6 +71,10 @@ vi.mock('./toastStore', () => ({
 
 import { useWorkspaceStore } from './workspaceStore';
 
+function workspace(id: string, name: string, generation: string) {
+  return { id, name, product_data_generation: generation };
+}
+
 function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
   const promise = new Promise<T>((next) => {
@@ -84,7 +88,7 @@ describe('workspaceStore file identity integration', () => {
     vi.clearAllMocks();
     useWorkspaceStore.setState({ current: null, workspaces: [], isLoading: false });
     mocks.switchWorkspace.mockResolvedValue({
-      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      workspace: workspace('workspace-b', 'Workspace B', 'generation-b'),
       transition: {
         status: 'committed',
         previous_workspace_id: null,
@@ -97,7 +101,7 @@ describe('workspaceStore file identity integration', () => {
       success: true,
       created: true,
       switched: true,
-      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      workspace: workspace('workspace-b', 'Workspace B', 'generation-b'),
       transition: {
         status: 'committed',
         previous_workspace_id: null,
@@ -107,11 +111,11 @@ describe('workspaceStore file identity integration', () => {
       },
     });
     mocks.listWorkspaces.mockResolvedValue({
-      workspaces: [{ id: 'workspace-b', name: 'Workspace B' }],
+      workspaces: [workspace('workspace-b', 'Workspace B', 'generation-b')],
       count: 1,
     });
     mocks.currentWorkspace.mockResolvedValue({
-      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      workspace: workspace('workspace-b', 'Workspace B', 'generation-b'),
       active: true,
     });
     mocks.resetSession.mockResolvedValue(undefined);
@@ -124,7 +128,10 @@ describe('workspaceStore file identity integration', () => {
   it('invalidates open drafts before loading the selected workspace files', async () => {
     await useWorkspaceStore.getState().switchTo('workspace-b');
 
-    expect(mocks.markWorkspaceChanged).toHaveBeenCalledOnce();
+    expect(mocks.bindScope).toHaveBeenCalledWith({
+      workspaceId: 'workspace-b',
+      workspaceGeneration: 'generation-b',
+    });
     expect(mocks.loadTree).toHaveBeenCalledWith(4);
     expect(mocks.loadChanges).toHaveBeenCalledOnce();
     expect(useWorkspaceStore.getState().current?.id).toBe('workspace-b');
@@ -132,7 +139,7 @@ describe('workspaceStore file identity integration', () => {
 
   it('shows a warning without rolling back a degraded target', async () => {
     mocks.switchWorkspace.mockResolvedValueOnce({
-      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      workspace: workspace('workspace-b', 'Workspace B', 'generation-b'),
       transition: {
         status: 'degraded',
         previous_workspace_id: 'workspace-a',
@@ -168,7 +175,10 @@ describe('workspaceStore file identity integration', () => {
       '/workspace-b'
     );
     expect(mocks.switchWorkspace).not.toHaveBeenCalled();
-    expect(mocks.markWorkspaceChanged).toHaveBeenCalledOnce();
+    expect(mocks.bindScope).toHaveBeenCalledWith({
+      workspaceId: 'workspace-b',
+      workspaceGeneration: 'generation-b',
+    });
     expect(useWorkspaceStore.getState().current?.id).toBe('workspace-b');
   });
 
@@ -177,7 +187,7 @@ describe('workspaceStore file identity integration', () => {
       success: false,
       created: true,
       switched: false,
-      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      workspace: workspace('workspace-b', 'Workspace B', 'generation-b'),
       error: 'runtime transition failed',
     });
 
@@ -195,7 +205,7 @@ describe('workspaceStore file identity integration', () => {
     const switchA = useWorkspaceStore.getState().switchTo('workspace-a');
     const switchB = useWorkspaceStore.getState().switchTo('workspace-b');
     second.resolve({
-      workspace: { id: 'workspace-b', name: 'Workspace B' },
+      workspace: workspace('workspace-b', 'Workspace B', 'generation-b'),
       transition: {
         status: 'committed',
         previous_workspace_id: 'workspace-a',
@@ -206,7 +216,7 @@ describe('workspaceStore file identity integration', () => {
     });
     await switchB;
     first.resolve({
-      workspace: { id: 'workspace-a', name: 'Workspace A' },
+      workspace: workspace('workspace-a', 'Workspace A', 'generation-a'),
       transition: {
         status: 'committed',
         previous_workspace_id: null,

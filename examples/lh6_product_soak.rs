@@ -754,6 +754,7 @@ async fn drive_one(
     })?;
     let resources = Arc::new(ChatResources {
         execution_scope: scoped.execution_scope().clone(),
+        workspace_io_receipt: Some(scoped.workspace_io_receipt()),
         pool: scoped.pool(),
         store: scoped.task_runtime(),
         sink,

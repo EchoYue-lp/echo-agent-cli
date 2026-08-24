@@ -74,6 +74,21 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
 收敛到显式 workspace/conversation identity；详见
 [`design/specs/runtime-reliability.md`](../design/specs/runtime-reliability.md)。
 
+### Workspace product data
+
+文件、研究和分析入口都显式携带 `workspace_id` 与由 workspace `created_at`、
+`project_root_revision` 组成的 generation，
+并通过 `ScopedWorkspaceControl` 固定同一个 host incarnation 到操作 settlement。研究和
+分析使用 `execution_scope.root` 作为 EKO data root；文件浏览器使用 control 解析后的
+`project_root`，因此 linked project 不会改变 EKO 自有数据位置。
+
+同步文件 I/O 统一进入 app-core 的有界 `ProductDataIo` adapter，不占用 Tokio worker。
+分析运行由 app-owned supervisor 持有 exact workspace receipt；`run` admission 不阻塞
+CLI/TUI/channel event loop，`wait/cancel` 使用同一 receipt 完成 framework draining 与 join。
+cleanup 失败时 owner 不释放，因此任何 surface 的删除都会一致地返回 busy。
+详细方案与取舍见
+[Workspace-scoped product-data I/O ADR](./adr/0006-scoped-product-data-io.md)。
+
 ## 对话数据流
 
 所有 surface 最终进入 `drive_chat`/`drive_chat_turn`：

@@ -797,6 +797,7 @@ async fn drive_background_run(
             &run_id,
             cancel,
             MemoryPolicy::None,
+            None,
         )
         .await
         .map(|_| run_id.clone()),
@@ -811,6 +812,7 @@ async fn drive_background_run(
                 &prompt,
                 cancel,
                 UnattendedWriteMode::default(),
+                None,
             )
             .await
         }

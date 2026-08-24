@@ -988,6 +988,7 @@ export interface FileTreeNode {
 
 export interface FileContent {
   workspace_id: string;
+  workspace_generation: string;
   path: string;
   content: string;
   size: number;
@@ -1025,39 +1026,43 @@ export interface DiffResult {
   hunks: DiffHunk[];
 }
 
+export interface ProductDataScope {
+  workspaceId: string;
+  workspaceGeneration: string;
+}
+
 export const filesApi = {
-  list: (path?: string) =>
+  list: (scope: ProductDataScope, path?: string) =>
     isTauri()
-      ? apiInvoke<FileEntry[]>('list_files', { path })
+      ? apiInvoke<FileEntry[]>('list_files', { ...scope, path })
       : get<FileEntry[]>(`/files/list${path ? `?path=${encodeURIComponent(path)}` : ''}`),
-  read: (path: string) =>
+  read: (scope: ProductDataScope, path: string) =>
     isTauri()
-      ? apiInvoke<FileContent>('read_file', { path })
+      ? apiInvoke<FileContent>('read_file', { ...scope, path })
       : get<FileContent>(`/files/read?path=${encodeURIComponent(path)}`),
-  write: (path: string, content: string, expectedWorkspaceId: string, expectedRevision: string) =>
+  write: (scope: ProductDataScope, path: string, content: string, expectedRevision: string) =>
     isTauri()
       ? apiInvoke<FileContent>('write_file', {
+          ...scope,
           path,
           content,
-          expectedWorkspaceId,
           expectedRevision,
         })
       : put<FileContent>(`/files/write?path=${encodeURIComponent(path)}`, {
           content,
-          expected_workspace_id: expectedWorkspaceId,
           expected_revision: expectedRevision,
         }),
-  diff: (path: string, gitRef = 'HEAD') =>
+  diff: (scope: ProductDataScope, path: string, gitRef = 'HEAD') =>
     isTauri()
-      ? apiInvoke<DiffResult>('diff_file', { path, git_ref: gitRef })
+      ? apiInvoke<DiffResult>('diff_file', { ...scope, path, git_ref: gitRef })
       : get<DiffResult>(`/files/diff?path=${encodeURIComponent(path)}&git_ref=${gitRef}`),
-  tree: (depth = 3) =>
+  tree: (scope: ProductDataScope, depth = 3) =>
     isTauri()
-      ? apiInvoke<FileTreeNode[]>('file_tree', { depth })
+      ? apiInvoke<FileTreeNode[]>('file_tree', { ...scope, depth })
       : get<FileTreeNode[]>(`/files/tree?depth=${depth}`),
-  changes: () =>
+  changes: (scope: ProductDataScope) =>
     isTauri()
-      ? apiInvoke<WorkspaceChange[]>('workspace_changes')
+      ? apiInvoke<WorkspaceChange[]>('workspace_changes', { ...scope })
       : get<WorkspaceChange[]>('/files/changes'),
 };
 
@@ -1065,6 +1070,19 @@ export const filesApi = {
 
 export type AnalysisLanguage = 'python' | 'r';
 export type AnalysisRunStatus = 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
+
+export type AnalysisCancelReceipt = {
+  status: 'joined' | 'cleanup_timed_out' | 'cleanup_failed';
+  receipt: {
+    workspace_id: string;
+    workspace_generation: string;
+    analysis_id: string;
+    owner_id: string;
+  };
+  execution_error?: string | null;
+  timeout_seconds?: number;
+  error?: string;
+};
 
 export interface AnalysisManifest {
   contract_version: number;
@@ -1152,21 +1170,22 @@ function analysisRequiresDesktop<T>(): Promise<T> {
 }
 
 export const analysisApi = {
-  list: () =>
+  list: (scope: ProductDataScope) =>
     isTauri()
-      ? apiInvoke<AnalysisSummary[]>('list_analyses')
+      ? apiInvoke<AnalysisSummary[]>('list_analyses', { ...scope })
       : analysisRequiresDesktop<AnalysisSummary[]>(),
-  create: (title: string, language: AnalysisLanguage) =>
+  create: (scope: ProductDataScope, title: string, language: AnalysisLanguage) =>
     isTauri()
-      ? apiInvoke<AnalysisDocument>('create_analysis', { title, language })
+      ? apiInvoke<AnalysisDocument>('create_analysis', { ...scope, title, language })
       : analysisRequiresDesktop<AnalysisDocument>(),
-  get: (analysisId: string) =>
+  get: (scope: ProductDataScope, analysisId: string) =>
     isTauri()
-      ? apiInvoke<AnalysisDocument>('get_analysis', { analysisId })
+      ? apiInvoke<AnalysisDocument>('get_analysis', { ...scope, analysisId })
       : analysisRequiresDesktop<AnalysisDocument>(),
-  save: (analysisId: string, input: SaveAnalysisInput) =>
+  save: (scope: ProductDataScope, analysisId: string, input: SaveAnalysisInput) =>
     isTauri()
       ? apiInvoke<AnalysisDocument>('save_analysis', {
+          ...scope,
           analysisId,
           title: input.title,
           script: input.script,
@@ -1176,13 +1195,17 @@ export const analysisApi = {
           randomSeed: input.randomSeed ?? null,
         })
       : analysisRequiresDesktop<AnalysisDocument>(),
-  run: (analysisId: string) =>
+  run: (scope: ProductDataScope, analysisId: string) =>
     isTauri()
-      ? apiInvoke<AnalysisDocument>('run_analysis', { analysisId })
+      ? apiInvoke<AnalysisDocument>('run_analysis', { ...scope, analysisId })
       : analysisRequiresDesktop<AnalysisDocument>(),
-  cancel: (analysisId: string) =>
+  cancel: (scope: ProductDataScope, analysisId: string) =>
     isTauri()
-      ? apiInvoke<boolean>('cancel_analysis', { analysisId })
+      ? apiInvoke<AnalysisCancelReceipt>('cancel_analysis', { ...scope, analysisId })
+      : analysisRequiresDesktop<AnalysisCancelReceipt>(),
+  delete: (scope: ProductDataScope, analysisId: string) =>
+    isTauri()
+      ? apiInvoke<boolean>('delete_analysis', { ...scope, analysisId })
       : analysisRequiresDesktop<boolean>(),
 };
 
@@ -1507,9 +1530,9 @@ function researchRequiresDesktop<T>(): Promise<T> {
 }
 
 export const papersApi = {
-  list: (params?: { tag?: string; search?: string }) =>
+  list: (scope: ProductDataScope, params?: { tag?: string; search?: string }) =>
     isTauri()
-      ? apiInvoke<Paper[]>('list_papers', params)
+      ? apiInvoke<Paper[]>('list_papers', { ...scope, ...params })
       : (() => {
           const q = new URLSearchParams();
           if (params?.tag) q.set('tag', params.tag);
@@ -1517,92 +1540,105 @@ export const papersApi = {
           const qs = q.toString();
           return get<Paper[]>(`/papers${qs ? `?${qs}` : ''}`);
         })(),
-  get: (id: string) =>
-    isTauri() ? apiInvoke<Paper>('get_paper', { id }) : get<Paper>(`/papers/${id}`),
-  create: (req: CreatePaperRequest) =>
-    isTauri() ? apiInvoke<Paper>('create_paper', { request: req }) : post<Paper>('/papers', req),
-  delete: (id: string) =>
+  get: (scope: ProductDataScope, id: string) =>
+    isTauri() ? apiInvoke<Paper>('get_paper', { ...scope, id }) : get<Paper>(`/papers/${id}`),
+  create: (scope: ProductDataScope, req: CreatePaperRequest) =>
     isTauri()
-      ? apiInvoke<{ deleted: string }>('delete_paper', { id })
+      ? apiInvoke<Paper>('create_paper', { ...scope, request: req })
+      : post<Paper>('/papers', req),
+  delete: (scope: ProductDataScope, id: string) =>
+    isTauri()
+      ? apiInvoke<{ deleted: string }>('delete_paper', { ...scope, id })
       : del<{ deleted: string }>(`/papers/${id}`),
-  updateNotes: (id: string, notes: string) =>
+  updateNotes: (scope: ProductDataScope, id: string, notes: string) =>
     isTauri()
-      ? apiInvoke<Paper>('update_paper_notes', { id, notes })
+      ? apiInvoke<Paper>('update_paper_notes', { ...scope, id, notes })
       : put<Paper>(`/papers/${id}/notes`, { notes }),
-  addTags: (id: string, tags: string[]) =>
+  addTags: (scope: ProductDataScope, id: string, tags: string[]) =>
     isTauri()
-      ? apiInvoke<Paper>('add_paper_tags', { id, tags })
+      ? apiInvoke<Paper>('add_paper_tags', { ...scope, id, tags })
       : post<Paper>(`/papers/${id}/tags`, { tags }),
-  search: (request: {
-    provider: ResearchProvider;
-    query: string;
-    limit?: number;
-    mailto?: string;
-  }) =>
+  search: (
+    scope: ProductDataScope,
+    request: {
+      provider: ResearchProvider;
+      query: string;
+      limit?: number;
+      mailto?: string;
+    }
+  ) =>
     isTauri()
-      ? apiInvoke<ScholarlyIngestResult>('search_scholarly_sources', { request })
+      ? apiInvoke<ScholarlyIngestResult>('search_scholarly_sources', { ...scope, request })
       : researchRequiresDesktop<ScholarlyIngestResult>(),
-  importZotero: (request: ZoteroSyncRequest) =>
+  importZotero: (scope: ProductDataScope, request: ZoteroSyncRequest) =>
     isTauri()
-      ? apiInvoke<ZoteroSyncResult>('import_zotero_library', { request })
+      ? apiInvoke<ZoteroSyncResult>('import_zotero_library', { ...scope, request })
       : researchRequiresDesktop<ZoteroSyncResult>(),
-  exportZotero: (request: ZoteroSyncRequest) =>
+  exportZotero: (scope: ProductDataScope, request: ZoteroSyncRequest) =>
     isTauri()
-      ? apiInvoke<ZoteroSyncResult>('export_zotero_library', { request })
+      ? apiInvoke<ZoteroSyncResult>('export_zotero_library', { ...scope, request })
       : researchRequiresDesktop<ZoteroSyncResult>(),
-  enrichEuropePmc: (sourceId: string) =>
+  enrichEuropePmc: (scope: ProductDataScope, sourceId: string) =>
     isTauri()
-      ? apiInvoke<EuropePmcEnrichmentResult>('enrich_paper_europe_pmc', { sourceId })
+      ? apiInvoke<EuropePmcEnrichmentResult>('enrich_paper_europe_pmc', { ...scope, sourceId })
       : researchRequiresDesktop<EuropePmcEnrichmentResult>(),
 };
 
 export const evidenceApi = {
-  list: (params?: { sourceId?: string; reviewId?: string }) =>
+  list: (scope: ProductDataScope, params?: { sourceId?: string; reviewId?: string }) =>
     isTauri()
-      ? apiInvoke<EvidenceRecord[]>('list_research_evidence', params)
+      ? apiInvoke<EvidenceRecord[]>('list_research_evidence', { ...scope, ...params })
       : researchRequiresDesktop<EvidenceRecord[]>(),
-  upsert: (request: UpsertEvidenceRequest) =>
+  upsert: (scope: ProductDataScope, request: UpsertEvidenceRequest) =>
     isTauri()
-      ? apiInvoke<EvidenceRecord>('upsert_research_evidence', { request })
+      ? apiInvoke<EvidenceRecord>('upsert_research_evidence', { ...scope, request })
       : researchRequiresDesktop<EvidenceRecord>(),
-  delete: (evidenceId: string) =>
+  delete: (scope: ProductDataScope, evidenceId: string) =>
     isTauri()
-      ? apiInvoke<boolean>('delete_research_evidence', { evidenceId })
+      ? apiInvoke<boolean>('delete_research_evidence', { ...scope, evidenceId })
       : researchRequiresDesktop<boolean>(),
 };
 
 export const systematicReviewsApi = {
-  list: () =>
+  list: (scope: ProductDataScope) =>
     isTauri()
-      ? apiInvoke<SystematicReviewSummary[]>('list_systematic_reviews')
+      ? apiInvoke<SystematicReviewSummary[]>('list_systematic_reviews', { ...scope })
       : researchRequiresDesktop<SystematicReviewSummary[]>(),
-  create: (request: { title: string; question: string; domain: ReviewDomain }) =>
+  create: (
+    scope: ProductDataScope,
+    request: { title: string; question: string; domain: ReviewDomain }
+  ) =>
     isTauri()
-      ? apiInvoke<SystematicReviewDocument>('create_systematic_review', { request })
+      ? apiInvoke<SystematicReviewDocument>('create_systematic_review', { ...scope, request })
       : researchRequiresDesktop<SystematicReviewDocument>(),
-  get: (reviewId: string) =>
+  get: (scope: ProductDataScope, reviewId: string) =>
     isTauri()
-      ? apiInvoke<SystematicReviewDocument>('get_systematic_review', { reviewId })
+      ? apiInvoke<SystematicReviewDocument>('get_systematic_review', { ...scope, reviewId })
       : researchRequiresDesktop<SystematicReviewDocument>(),
-  save: (document: SystematicReviewDocument) =>
+  save: (scope: ProductDataScope, document: SystematicReviewDocument) =>
     isTauri()
       ? apiInvoke<SystematicReviewDocument>('save_systematic_review', {
+          ...scope,
           reviewId: document.record.id,
           record: document.record,
           expectedRevision: document.revision,
         })
       : researchRequiresDesktop<SystematicReviewDocument>(),
-  delete: (reviewId: string) =>
+  delete: (scope: ProductDataScope, reviewId: string) =>
     isTauri()
-      ? apiInvoke<boolean>('delete_systematic_review', { reviewId })
+      ? apiInvoke<boolean>('delete_systematic_review', { ...scope, reviewId })
       : researchRequiresDesktop<boolean>(),
-  audit: (reviewId: string) =>
+  audit: (scope: ProductDataScope, reviewId: string) =>
     isTauri()
-      ? apiInvoke<CitationAuditReport>('audit_systematic_review', { reviewId })
+      ? apiInvoke<CitationAuditReport>('audit_systematic_review', { ...scope, reviewId })
       : researchRequiresDesktop<CitationAuditReport>(),
-  export: (reviewId: string, format: ReviewExportFormat) =>
+  export: (scope: ProductDataScope, reviewId: string, format: ReviewExportFormat) =>
     isTauri()
-      ? apiInvoke<ReviewExportArtifact[]>('export_systematic_review', { reviewId, format })
+      ? apiInvoke<ReviewExportArtifact[]>('export_systematic_review', {
+          ...scope,
+          reviewId,
+          format,
+        })
       : researchRequiresDesktop<ReviewExportArtifact[]>(),
 };
 
@@ -1617,7 +1653,9 @@ export interface Workspace {
   metadata: {
     description?: string;
     tags: string[];
+    project_root_revision?: number;
   };
+  product_data_generation: string;
   created_at: string;
   last_active: string;
 }

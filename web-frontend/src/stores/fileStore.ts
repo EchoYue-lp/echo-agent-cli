@@ -5,8 +5,11 @@ import {
   type FileContent,
   type FileEntry,
   type FileTreeNode,
+  type ProductDataScope,
   type WorkspaceChange,
 } from '../api/endpoints';
+import { GLOBAL_WORKSPACE_GENERATION, sameProductDataScope } from '../lib/productDataScope';
+import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
 import { errorMessage } from '../lib/tauri-bridge';
 
 export interface FileDocument {
@@ -19,6 +22,7 @@ export interface FileDocument {
 }
 
 interface FileStore {
+  scope: ProductDataScope;
   tree: FileTreeNode[];
   openFiles: string[];
   selectedFile: string | null;
@@ -42,11 +46,16 @@ interface FileStore {
   closeFile: (path: string, force?: boolean) => boolean;
   clearError: () => void;
   markWorkspaceChanged: () => void;
+  bindScope: (scope: ProductDataScope) => void;
 }
 
 export type { FileEntry, FileContent, FileTreeNode, DiffHunk, WorkspaceChange };
 
 export const useFileStore = create<FileStore>((set, get) => ({
+  scope: {
+    workspaceId: GLOBAL_WORKSPACE_ID,
+    workspaceGeneration: GLOBAL_WORKSPACE_GENERATION,
+  },
   tree: [],
   openFiles: [],
   selectedFile: null,
@@ -62,8 +71,9 @@ export const useFileStore = create<FileStore>((set, get) => ({
   loadTree: async (depth = 4) => {
     set({ loading: true, error: null });
     const generation = get().generation;
+    const scope = get().scope;
     try {
-      const tree = await filesApi.tree(depth);
+      const tree = await filesApi.tree(scope, depth);
       if (get().generation !== generation) return;
       set({ tree, loading: false });
     } catch (error) {
@@ -74,8 +84,9 @@ export const useFileStore = create<FileStore>((set, get) => ({
 
   loadChanges: async () => {
     const generation = get().generation;
+    const scope = get().scope;
     try {
-      const changes = await filesApi.changes();
+      const changes = await filesApi.changes(scope);
       if (get().generation !== generation) return;
       set({ changes });
     } catch (error) {
@@ -104,9 +115,15 @@ export const useFileStore = create<FileStore>((set, get) => ({
 
     set({ selectedFile: path, loading: true, error: null, diffHunks: [], viewMode: 'content' });
     const generation = get().generation;
+    const scope = get().scope;
     try {
-      const file = await filesApi.read(path);
+      const file = await filesApi.read(scope, path);
       if (get().generation !== generation) return;
+      if (
+        file.workspace_id !== scope.workspaceId ||
+        file.workspace_generation !== scope.workspaceGeneration
+      )
+        return;
       set((state) => ({
         openFiles: state.openFiles.includes(path) ? state.openFiles : [...state.openFiles, path],
         documents: {
@@ -131,10 +148,13 @@ export const useFileStore = create<FileStore>((set, get) => ({
   loadDiff: async (path, gitRef = 'HEAD') => {
     set({ selectedFile: path, loading: true, error: null, viewMode: 'diff' });
     const generation = get().generation;
+    const scope = get().scope;
     try {
       const [data, file] = await Promise.all([
-        filesApi.diff(path, gitRef),
-        get().documents[path] ? Promise.resolve(null) : filesApi.read(path).catch(() => null),
+        filesApi.diff(scope, path, gitRef),
+        get().documents[path]
+          ? Promise.resolve(null)
+          : filesApi.read(scope, path).catch(() => null),
       ]);
       if (get().generation !== generation) return;
       set((state) => ({
@@ -206,14 +226,20 @@ export const useFileStore = create<FileStore>((set, get) => ({
     }
     set({ saving: true, error: null });
     const generation = get().generation;
+    const scope = get().scope;
     try {
       const file = await filesApi.write(
+        scope,
         selectedFile,
         document.draft,
-        document.file.workspace_id,
         document.file.revision
       );
       if (get().generation !== generation) return false;
+      if (
+        file.workspace_id !== scope.workspaceId ||
+        file.workspace_generation !== scope.workspaceGeneration
+      )
+        return false;
       set((state) => {
         const current = state.documents[selectedFile];
         if (!current) return { saving: false };
@@ -270,15 +296,18 @@ export const useFileStore = create<FileStore>((set, get) => ({
     const document = get().documents[selectedFile];
     if (!document) return;
     const generation = get().generation;
+    const scope = get().scope;
     try {
-      const file = await filesApi.read(selectedFile);
+      const file = await filesApi.read(scope, selectedFile);
       if (get().generation !== generation) return;
       const latest = get().documents[selectedFile];
       if (
         !latest ||
         latest.file.revision !== document.file.revision ||
         latest.file.workspace_id !== document.file.workspace_id ||
-        file.workspace_id !== document.file.workspace_id
+        latest.file.workspace_generation !== document.file.workspace_generation ||
+        file.workspace_id !== document.file.workspace_id ||
+        file.workspace_generation !== document.file.workspace_generation
       )
         return;
       if (file.revision === latest.file.revision) return;
@@ -341,6 +370,27 @@ export const useFileStore = create<FileStore>((set, get) => ({
   },
 
   clearError: () => set({ error: null }),
+
+  bindScope: (scope) => {
+    if (sameProductDataScope(get().scope, scope)) return;
+    set((state) => ({
+      scope,
+      generation: state.generation + 1,
+      tree: [],
+      changes: [],
+      diffHunks: [],
+      loading: false,
+      saving: false,
+      documents: Object.fromEntries(
+        Object.entries(state.documents).map(([path, document]) => [
+          path,
+          { ...document, stale: true, conflict: true },
+        ])
+      ),
+      error:
+        Object.keys(state.documents).length > 0 ? '工作区已变化，已打开的文件需要重新加载' : null,
+    }));
+  },
 
   markWorkspaceChanged: () =>
     set((state) => ({

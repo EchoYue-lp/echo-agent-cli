@@ -22,6 +22,7 @@ pub struct FileEntry {
 #[derive(Debug, Serialize)]
 pub struct FileContent {
     pub workspace_id: String,
+    pub workspace_generation: String,
     pub path: String,
     pub content: String,
     pub size: u64,
@@ -88,16 +89,31 @@ pub struct BrowseEntry {
 #[tauri::command]
 pub async fn list_files(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     path: Option<String>,
 ) -> Result<Vec<FileEntry>, IpcError> {
-    let base = get_workspace_root(&state).await;
-    let target = if let Some(ref p) = path {
+    let control =
+        super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
+    echo_agent_app_core::product_data_io::run("list workspace files", move || {
+        let base = control.project_root();
+        list_workspace_files(&base, path.as_deref())
+    })
+    .await
+    .map_err(super::product_data::blocking_error)?
+}
+
+fn list_workspace_files(
+    base: &std::path::Path,
+    path: Option<&str>,
+) -> Result<Vec<FileEntry>, IpcError> {
+    let target = if let Some(p) = path {
         base.join(p)
     } else {
-        base.clone()
+        base.to_path_buf()
     };
 
-    crate::tauri::path_validator::validate_within_base(&target, &base)
+    crate::tauri::path_validator::validate_within_base(&target, base)
         .map_err(IpcError::Validation)?;
 
     if !target.exists() {
@@ -122,7 +138,7 @@ pub async fn list_files(
             });
             let extension = path.extension().map(|e| e.to_string_lossy().to_string());
             let relative = path
-                .strip_prefix(&base)
+                .strip_prefix(base)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
@@ -145,44 +161,54 @@ pub async fn list_files(
 #[tauri::command]
 pub async fn read_file(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     path: String,
 ) -> Result<FileContent, IpcError> {
-    let scope = get_workspace_scope(&state).await;
-    read_workspace_file(&scope.root, &scope.id, path)
+    let control =
+        super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
+    echo_agent_app_core::product_data_io::run("read workspace file", move || {
+        let base = control.project_root();
+        read_workspace_file(&base, control.workspace_id(), &control.generation(), path)
+    })
+    .await
+    .map_err(super::product_data::blocking_error)?
 }
 
 #[tauri::command]
 pub async fn write_file(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     path: String,
     content: String,
-    expected_workspace_id: String,
     expected_revision: String,
 ) -> Result<FileContent, IpcError> {
-    let scope = get_workspace_scope(&state).await;
-    write_workspace_file(
-        &scope.root,
-        &scope.id,
-        path,
-        content,
-        expected_workspace_id,
-        expected_revision,
-    )
+    let control =
+        super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
+    echo_agent_app_core::product_data_io::run("write workspace file", move || {
+        let base = control.project_root();
+        write_workspace_file(
+            &base,
+            control.workspace_id(),
+            &control.generation(),
+            path,
+            content,
+            expected_revision,
+        )
+    })
+    .await
+    .map_err(super::product_data::blocking_error)?
 }
 
 fn write_workspace_file(
     base: &std::path::Path,
     workspace_id: &str,
+    workspace_generation: &str,
     path: String,
     content: String,
-    expected_workspace_id: String,
     expected_revision: String,
 ) -> Result<FileContent, IpcError> {
-    if workspace_id != expected_workspace_id {
-        return Err(IpcError::Validation(
-            "Workspace changed; reload the file before saving".to_string(),
-        ));
-    }
     let target = base.join(&path);
     crate::tauri::path_validator::validate_within_base(&target, base)
         .map_err(IpcError::Validation)?;
@@ -206,33 +232,36 @@ fn write_workspace_file(
         ));
     }
 
-    read_workspace_file(base, workspace_id, path)
+    read_workspace_file(base, workspace_id, workspace_generation, path)
 }
 
 #[tauri::command]
 pub async fn workspace_changes(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
 ) -> Result<Vec<WorkspaceChange>, IpcError> {
-    let base = get_workspace_root(&state).await;
-    let output = tokio::task::spawn_blocking(move || {
-        std::process::Command::new("git")
+    let control =
+        super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
+    echo_agent_app_core::product_data_io::run("load workspace changes", move || {
+        let base = control.project_root();
+        let output = std::process::Command::new("git")
             .args(["status", "--porcelain=v1", "--untracked-files=all"])
             .current_dir(base)
             .output()
+            .map_err(|error| IpcError::Internal(error.to_string()))?;
+        if !output.status.success() {
+            return Err(IpcError::Internal(format!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(parse_workspace_changes(&String::from_utf8_lossy(
+            &output.stdout,
+        )))
     })
     .await
-    .map_err(|error| IpcError::Internal(format!("git status task failed: {error}")))?
-    .map_err(|error| IpcError::Internal(error.to_string()))?;
-    if !output.status.success() {
-        return Err(IpcError::Internal(format!(
-            "git status failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    Ok(parse_workspace_changes(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    .map_err(super::product_data::blocking_error)?
 }
 
 fn parse_workspace_changes(text: &str) -> Vec<WorkspaceChange> {
@@ -271,16 +300,32 @@ fn parse_workspace_changes(text: &str) -> Vec<WorkspaceChange> {
 #[tauri::command]
 pub async fn diff_file(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     path: String,
     git_ref: Option<String>,
 ) -> Result<DiffResult, IpcError> {
-    let base = get_workspace_root(&state).await;
     let ref_str = git_ref.unwrap_or_else(|| "HEAD".to_string());
 
     if !is_safe_git_ref(&ref_str) {
         return Err(IpcError::Validation("Invalid git reference".to_string()));
     }
 
+    let control =
+        super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
+    echo_agent_app_core::product_data_io::run("diff workspace file", move || {
+        let base = control.project_root();
+        diff_workspace_file(base, path, ref_str)
+    })
+    .await
+    .map_err(super::product_data::blocking_error)?
+}
+
+fn diff_workspace_file(
+    base: std::path::PathBuf,
+    path: String,
+    ref_str: String,
+) -> Result<DiffResult, IpcError> {
     let target = base.join(&path);
     crate::tauri::path_validator::validate_within_base(&target, &base)
         .map_err(IpcError::Validation)?;
@@ -294,48 +339,40 @@ pub async fn diff_file(
         String::new()
     };
 
-    let old_content = {
-        let base = base.clone();
-        let ref_str = ref_str.clone();
-        let path = path.clone();
-        tokio::task::spawn_blocking(move || -> Result<String, IpcError> {
-            let commit = std::process::Command::new("git")
-                .args(["rev-parse", "--verify", &format!("{ref_str}^{{commit}}")])
-                .current_dir(&base)
-                .output()
-                .map_err(|error| IpcError::Internal(format!("git rev-parse failed: {error}")))?;
-            if !commit.status.success() {
-                return Err(IpcError::Validation(format!(
-                    "invalid git reference: {}",
-                    String::from_utf8_lossy(&commit.stderr).trim()
-                )));
-            }
-            let object = format!("{ref_str}:{path}");
-            let exists = std::process::Command::new("git")
-                .args(["cat-file", "-e", &object])
-                .current_dir(&base)
-                .output()
-                .map_err(|error| IpcError::Internal(format!("git cat-file failed: {error}")))?;
-            if !exists.status.success() {
-                return Ok(String::new());
-            }
-            let output = std::process::Command::new("git")
-                .args(["show", &object])
-                .current_dir(&base)
-                .output()
-                .map_err(|error| IpcError::Internal(format!("git show failed: {error}")))?;
-            if !output.status.success() {
-                return Err(IpcError::Internal(format!(
-                    "git show failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                )));
-            }
-            String::from_utf8(output.stdout).map_err(|error| {
-                IpcError::Validation(format!("git object is not UTF-8 text: {error}"))
-            })
-        })
-        .await
-        .map_err(|error| IpcError::Internal(format!("git diff task failed: {error}")))??
+    let commit = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", &format!("{ref_str}^{{commit}}")])
+        .current_dir(&base)
+        .output()
+        .map_err(|error| IpcError::Internal(format!("git rev-parse failed: {error}")))?;
+    if !commit.status.success() {
+        return Err(IpcError::Validation(format!(
+            "invalid git reference: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        )));
+    }
+    let object = format!("{ref_str}:{path}");
+    let exists = std::process::Command::new("git")
+        .args(["cat-file", "-e", &object])
+        .current_dir(&base)
+        .output()
+        .map_err(|error| IpcError::Internal(format!("git cat-file failed: {error}")))?;
+    let old_content = if exists.status.success() {
+        let output = std::process::Command::new("git")
+            .args(["show", &object])
+            .current_dir(&base)
+            .output()
+            .map_err(|error| IpcError::Internal(format!("git show failed: {error}")))?;
+        if !output.status.success() {
+            return Err(IpcError::Internal(format!(
+                "git show failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        String::from_utf8(output.stdout).map_err(|error| {
+            IpcError::Validation(format!("git object is not UTF-8 text: {error}"))
+        })?
+    } else {
+        String::new()
     };
 
     use similar::{ChangeTag, TextDiff};
@@ -401,7 +438,6 @@ pub async fn diff_file(
             lines: current_hunk_lines,
         });
     }
-
     Ok(DiffResult {
         path,
         old_content,
@@ -413,17 +449,39 @@ pub async fn diff_file(
 #[tauri::command]
 pub async fn file_tree(
     state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
     depth: Option<usize>,
 ) -> Result<Vec<TreeNode>, IpcError> {
-    let base = get_workspace_root(&state).await;
+    let control =
+        super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
     let max_depth = depth.unwrap_or(3);
-    tokio::task::spawn_blocking(move || build_tree(&base, &base, 0, max_depth))
-        .await
-        .map_err(|e| IpcError::Internal(format!("spawn_blocking failed: {e}")))
+    echo_agent_app_core::product_data_io::run("build workspace file tree", move || {
+        let base = control.project_root();
+        build_tree(&base, &base, 0, max_depth)
+    })
+    .await
+    .map_err(super::product_data::blocking_error)
 }
 
 #[tauri::command]
-pub async fn browse_directories(path: Option<String>) -> Result<BrowseResult, IpcError> {
+pub async fn browse_directories(
+    state: tauri::State<'_, TauriState>,
+    workspace_id: String,
+    workspace_generation: String,
+    path: Option<String>,
+) -> Result<BrowseResult, IpcError> {
+    let control =
+        super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
+    echo_agent_app_core::product_data_io::run("browse host directories", move || {
+        let _control = control;
+        browse_host_directories(path)
+    })
+    .await
+    .map_err(super::product_data::blocking_error)?
+}
+
+fn browse_host_directories(path: Option<String>) -> Result<BrowseResult, IpcError> {
     let home = dirs_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
 
     let target = if let Some(ref p) = path {
@@ -472,39 +530,6 @@ pub async fn browse_directories(path: Option<String>) -> Result<BrowseResult, Ip
     })
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
-
-async fn get_workspace_root(state: &TauriState) -> std::path::PathBuf {
-    get_workspace_scope(state).await.root
-}
-
-struct WorkspaceScope {
-    id: String,
-    root: std::path::PathBuf,
-}
-
-async fn get_workspace_scope(state: &TauriState) -> WorkspaceScope {
-    let (namespace, root) = if let Some(workspace) = state.app_state.current_workspace().await {
-        let namespace = format!("workspace:{}", workspace.id);
-        let root = workspace.project_root.unwrap_or(workspace.root);
-        (namespace, root)
-    } else {
-        let root = state
-            .app_state
-            .current_execution_scope()
-            .await
-            .root()
-            .to_path_buf();
-        ("global".to_string(), root)
-    };
-    let canonical_root = std::fs::canonicalize(&root).unwrap_or(root);
-    let root_hash = hex::encode(Sha256::digest(canonical_root.to_string_lossy().as_bytes()));
-    WorkspaceScope {
-        id: format!("{namespace}:{root_hash}"),
-        root: canonical_root,
-    }
-}
-
 fn detect_language(path: &str) -> Option<String> {
     let ext = path.rsplit('.').next()?;
     let lang = match ext {
@@ -533,6 +558,7 @@ fn detect_language(path: &str) -> Option<String> {
 fn read_workspace_file(
     base: &std::path::Path,
     workspace_id: &str,
+    workspace_generation: &str,
     path: String,
 ) -> Result<FileContent, IpcError> {
     let target = base.join(&path);
@@ -559,6 +585,7 @@ fn read_workspace_file(
     match preview_type {
         Some((kind, mime_type)) => Ok(FileContent {
             workspace_id: workspace_id.to_string(),
+            workspace_generation: workspace_generation.to_string(),
             path,
             content: String::new(),
             size: metadata.len(),
@@ -574,6 +601,7 @@ fn read_workspace_file(
         None if metadata.len() <= MAX_TEXT_BYTES => match String::from_utf8(bytes) {
             Ok(content) => Ok(FileContent {
                 workspace_id: workspace_id.to_string(),
+                workspace_generation: workspace_generation.to_string(),
                 language: detect_language(&path),
                 path,
                 content,
@@ -585,6 +613,7 @@ fn read_workspace_file(
             }),
             Err(_) => Ok(binary_file_content(
                 workspace_id,
+                workspace_generation,
                 path,
                 metadata.len(),
                 revision,
@@ -592,6 +621,7 @@ fn read_workspace_file(
         },
         None => Ok(binary_file_content(
             workspace_id,
+            workspace_generation,
             path,
             metadata.len(),
             revision,
@@ -601,12 +631,14 @@ fn read_workspace_file(
 
 fn binary_file_content(
     workspace_id: &str,
+    workspace_generation: &str,
     path: String,
     size: u64,
     revision: String,
 ) -> FileContent {
     FileContent {
         workspace_id: workspace_id.to_string(),
+        workspace_generation: workspace_generation.to_string(),
         path,
         content: String::new(),
         size,
@@ -775,14 +807,14 @@ mod tests {
         let target = base.join(&path);
         std::fs::write(&target, "first")?;
 
-        let initial = read_workspace_file(&base, "workspace:a", path.clone())
+        let initial = read_workspace_file(&base, "workspace:a", "generation-a", path.clone())
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         let saved = write_workspace_file(
             &base,
             "workspace:a",
+            "generation-a",
             path.clone(),
             "second".to_string(),
-            initial.workspace_id,
             initial.revision,
         )
         .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -792,9 +824,9 @@ mod tests {
         let stale_save = write_workspace_file(
             &base,
             "workspace:a",
+            "generation-a",
             path,
             "third".to_string(),
-            saved.workspace_id,
             saved.revision,
         );
         assert!(matches!(stale_save, Err(IpcError::Validation(_))));
@@ -805,24 +837,22 @@ mod tests {
     }
 
     #[test]
-    fn refuses_to_write_a_draft_from_another_workspace() -> Result<(), Box<dyn std::error::Error>> {
+    fn file_content_keeps_workspace_identity_separate_from_generation()
+    -> Result<(), Box<dyn std::error::Error>> {
         let base = std::env::temp_dir().join(format!("eko-file-scope-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&base)?;
         let target = base.join("same.txt");
         std::fs::write(&target, "same bytes")?;
-        let revision = file_revision(b"same bytes");
 
-        let result = write_workspace_file(
+        let file = read_workspace_file(
             &base,
-            "workspace:b",
+            "workspace:a",
+            "2026-08-24T12:00:00+08:00",
             "same.txt".to_string(),
-            "wrong workspace".to_string(),
-            "workspace:a".to_string(),
-            revision,
-        );
-
-        assert!(matches!(result, Err(IpcError::Validation(_))));
-        assert_eq!(std::fs::read_to_string(&target)?, "same bytes");
+        )
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(file.workspace_id, "workspace:a");
+        assert_eq!(file.workspace_generation, "2026-08-24T12:00:00+08:00");
         std::fs::remove_dir_all(base)?;
         Ok(())
     }

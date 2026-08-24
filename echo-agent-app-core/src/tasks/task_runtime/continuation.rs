@@ -84,6 +84,7 @@ impl ContinuationLauncher {
             fallback_agent: self.fallback_agent.clone(),
             resources: Arc::new(ChatResources {
                 execution_scope: self.resources.execution_scope.clone(),
+                workspace_io_receipt: self.resources.workspace_io_receipt.clone(),
                 pool: self.resources.pool.clone(),
                 store: None,
                 sink,
@@ -193,6 +194,7 @@ impl TaskContinuationRuntime {
             .unwrap_or_else(|| resources.sink.clone());
         let retained = Arc::new(ChatResources {
             execution_scope: resources.execution_scope.clone(),
+            workspace_io_receipt: resources.workspace_io_receipt.clone(),
             pool: resources.pool.clone(),
             store: None,
             sink: retained_sink,
@@ -853,6 +855,7 @@ async fn drive_continuation_turn(
     let turn_id = binding.turn_id.clone();
     let resources = Arc::new(ChatResources {
         execution_scope: launcher.resources.execution_scope.clone(),
+        workspace_io_receipt: launcher.resources.workspace_io_receipt.clone(),
         pool: launcher.resources.pool.clone(),
         store: Some(store),
         sink: launcher.resources.sink.clone(),
@@ -1352,6 +1355,7 @@ mod tests {
         );
         let resources = Arc::new(ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(DetachedContinuationSink),
@@ -1690,6 +1694,7 @@ mod tests {
         );
         let resources = Arc::new(ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(DetachedContinuationSink),
@@ -1776,6 +1781,7 @@ mod tests {
         let renderer_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let resources = Arc::new(ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(DropTrackingSink(Arc::clone(&renderer_dropped))),
@@ -1963,6 +1969,7 @@ mod tests {
         let (drop_release_tx, drop_release_rx) = std::sync::mpsc::sync_channel(1);
         let resources = Arc::new(ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(DropOrderSink {

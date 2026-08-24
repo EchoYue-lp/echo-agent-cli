@@ -107,6 +107,9 @@ tokio::task_local! {
     /// executor so the frontend can render real-time execution-flow views. Set
     /// alongside `CURRENT_RUN_ID` by [`with_run_context`].
     pub static CURRENT_TRACE_SINK: Option<TraceSink>;
+    /// Exact EKO product-data root plus opaque framework lifetime guards.
+    /// `task_execute` receives this from its value-carried ToolContext.
+    pub static CURRENT_WORKSPACE_IO: Option<crate::state::WorkspaceIoInvocation>;
     /// The unattended write mode for the currently executing run (D7 stage 2).
     /// Set by `ExecuteTaskTool::execute` so CP B preflight in `execute_task`
     /// can read it without threading the mode through `execute_run` →
@@ -161,6 +164,10 @@ pub(crate) fn current_run_id() -> Option<String> {
     CURRENT_RUN_ID.try_with(|cell| cell.clone()).ok()
 }
 
+pub(crate) fn current_workspace_io() -> Option<crate::state::WorkspaceIoInvocation> {
+    CURRENT_WORKSPACE_IO.try_with(Clone::clone).ok().flatten()
+}
+
 /// Read the current unattended write mode from the task-local scope (D7
 /// stage 2). Returns `Disabled` when no scope is active (attended runs,
 /// tests) — matching stage-1 behaviour as the safe default.
@@ -213,6 +220,7 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = R>,
 {
+    let workspace_io = crate::state::WorkspaceIoInvocation::from_task_tool_context(ctx);
     let scoped_run_id = ctx
         .run_id
         .clone()
@@ -225,14 +233,17 @@ where
                 .map(|c| (**c).clone())
                 .unwrap_or_default();
             let trace_sink = trace_sink_from_tool_context(ctx);
-            CURRENT_CANCEL
+            CURRENT_WORKSPACE_IO
                 .scope(
-                    cancel,
-                    CURRENT_RUN_ID.scope(rid, CURRENT_TRACE_SINK.scope(trace_sink, f())),
+                    workspace_io,
+                    CURRENT_CANCEL.scope(
+                        cancel,
+                        CURRENT_RUN_ID.scope(rid, CURRENT_TRACE_SINK.scope(trace_sink, f())),
+                    ),
                 )
                 .await
         }
-        None => f().await,
+        None => CURRENT_WORKSPACE_IO.scope(workspace_io, f()).await,
     }
 }
 
@@ -1068,6 +1079,10 @@ impl CreateComplexTaskTool {
                 prompt: run_prompt,
                 plan_policy,
                 human_loop_provider: res.human_loop_provider.clone(),
+                workspace_io: res
+                    .workspace_io_receipt
+                    .as_ref()
+                    .map(crate::state::ScopedWorkspaceIoReceipt::invocation),
                 receipt_owner,
             })
         });

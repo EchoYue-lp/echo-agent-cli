@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   papersApi,
   systematicReviewsApi,
@@ -6,6 +6,7 @@ import {
   type GradeConcern,
   type Paper,
   type PrismaFlow,
+  type ProductDataScope,
   type ReviewDomain,
   type RiskJudgment,
   type ReviewExportFormat,
@@ -27,6 +28,8 @@ import {
   Trash2,
 } from 'lucide-react';
 import { ReviewMatrix } from './ReviewMatrix';
+import { LatestOperationOwner, LatestRequestFence } from '../../lib/latestRequest';
+import { productDataScopeKey } from '../../lib/productDataScope';
 
 type Section = 'protocol' | 'screening' | 'evidence' | 'quality' | 'prisma' | 'audit';
 
@@ -48,7 +51,14 @@ export function computePrismaFlow(record: SystematicReviewRecord): PrismaFlow {
   };
 }
 
-export function ReviewWorkbench() {
+export function ReviewWorkbench({ scope }: { scope: ProductDataScope }) {
+  const scopeKey = productDataScopeKey(scope);
+  const scopeRef = useRef(scopeKey);
+  scopeRef.current = scopeKey;
+  const selectionFence = useRef(new LatestRequestFence());
+  const indexFence = useRef(new LatestRequestFence());
+  const savingOwner = useRef(new LatestOperationOwner());
+  const exportingOwner = useRef(new LatestOperationOwner());
   const [summaries, setSummaries] = useState<SystematicReviewSummary[]>([]);
   const [sources, setSources] = useState<Paper[]>([]);
   const [document, setDocument] = useState<SystematicReviewDocument | null>(null);
@@ -65,49 +75,59 @@ export function ReviewWorkbench() {
   const [error, setError] = useState<string | null>(null);
 
   const refreshIndex = useCallback(async () => {
+    const request = indexFence.current.begin(scopeKey);
     try {
       const [reviewList, paperList] = await Promise.all([
-        systematicReviewsApi.list(),
-        papersApi.list(),
+        systematicReviewsApi.list(scope),
+        papersApi.list(scope),
       ]);
+      if (!indexFence.current.isCurrent(request, scopeRef.current)) return;
       setSummaries(reviewList);
       setSources(paperList);
       setError(null);
     } catch (reason) {
+      if (!indexFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, []);
+  }, [scope, scopeKey]);
 
   useEffect(() => {
     void refreshIndex();
   }, [refreshIndex]);
 
   const loadReview = async (reviewId: string) => {
+    const request = selectionFence.current.begin(scopeKey);
     try {
-      setDocument(await systematicReviewsApi.get(reviewId));
+      const loaded = await systematicReviewsApi.get(scope, reviewId);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
+      setDocument(loaded);
       setAudit(null);
       setExportResult(null);
       setSection('protocol');
       setError(null);
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
 
   const createReview = async () => {
     if (!newTitle.trim()) return;
+    const request = selectionFence.current.begin(scopeKey);
     try {
-      const created = await systematicReviewsApi.create({
+      const created = await systematicReviewsApi.create(scope, {
         title: newTitle.trim(),
         question: newQuestion.trim(),
         domain: newDomain,
       });
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setDocument(created);
       setShowCreate(false);
       setNewTitle('');
       setNewQuestion('');
       await refreshIndex();
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
@@ -118,52 +138,67 @@ export function ReviewWorkbench() {
 
   const saveReview = async () => {
     if (!document) return;
+    const request = selectionFence.current.begin(scopeKey);
+    const operation = savingOwner.current.begin();
     setSaving(true);
     try {
-      const saved = await systematicReviewsApi.save(document);
+      const saved = await systematicReviewsApi.save(scope, document);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setDocument(saved);
       await refreshIndex();
       setError(null);
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setSaving(false);
+      if (savingOwner.current.isCurrent(operation)) setSaving(false);
     }
   };
 
   const deleteReview = async () => {
     if (!document || !confirm(`Delete review “${document.record.title}”?`)) return;
+    const request = selectionFence.current.begin(scopeKey);
     try {
-      await systematicReviewsApi.delete(document.record.id);
+      await systematicReviewsApi.delete(scope, document.record.id);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setDocument(null);
       await refreshIndex();
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
 
   const auditReview = async () => {
     if (!document) return;
+    const request = selectionFence.current.begin(scopeKey);
     try {
-      setAudit(await systematicReviewsApi.audit(document.record.id));
+      const result = await systematicReviewsApi.audit(scope, document.record.id);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
+      setAudit(result);
       setError(null);
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
 
   const exportReview = async () => {
     if (!document) return;
+    const request = selectionFence.current.begin(scopeKey);
+    const operation = exportingOwner.current.begin();
     setExporting(true);
     try {
-      const artifacts = await systematicReviewsApi.export(document.record.id, exportFormat);
+      const artifacts = await systematicReviewsApi.export(scope, document.record.id, exportFormat);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setExportResult(artifacts.map((artifact) => artifact.path).join(', '));
       setAudit(artifacts[0]?.citation_audit ?? audit);
       setError(null);
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setExporting(false);
+      if (exportingOwner.current.isCurrent(operation)) setExporting(false);
     }
   };
 
@@ -244,6 +279,7 @@ export function ReviewWorkbench() {
           </div>
         ) : (
           <ReviewEditor
+            scope={scope}
             document={document}
             sources={sources}
             section={section}
@@ -267,6 +303,7 @@ export function ReviewWorkbench() {
 }
 
 function ReviewEditor({
+  scope,
   document,
   sources,
   section,
@@ -283,6 +320,7 @@ function ReviewEditor({
   exporting,
   exportResult,
 }: {
+  scope: ProductDataScope;
   document: SystematicReviewDocument;
   sources: Paper[];
   section: Section;
@@ -380,7 +418,7 @@ function ReviewEditor({
         ) : section === 'screening' ? (
           <ScreeningEditor record={record} sources={sources} updateRecord={updateRecord} />
         ) : section === 'evidence' ? (
-          <ReviewMatrix reviewId={record.id} sourceIds={record.source_ids} />
+          <ReviewMatrix scope={scope} reviewId={record.id} sourceIds={record.source_ids} />
         ) : section === 'quality' ? (
           <QualityEditor record={record} sources={sources} updateRecord={updateRecord} />
         ) : section === 'prisma' ? (

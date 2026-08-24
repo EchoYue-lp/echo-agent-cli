@@ -6,15 +6,19 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::Output;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use echo_agent::error::{ReactError, SandboxError};
+use echo_agent::sandbox::{
+    LocalConfig, LocalSandbox, ResourceLimits, SandboxCommand, SandboxExecutor,
+};
 use echo_agent::tools::ScriptExecutionProfile;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 const PYPROJECT: &[u8] = include_bytes!("../resources/analytics-runtime/pyproject.toml");
 const UV_LOCK: &[u8] = include_bytes!("../resources/analytics-runtime/uv.lock");
@@ -22,6 +26,8 @@ const PYTHON_VERSION: &[u8] = include_bytes!("../resources/analytics-runtime/.py
 const READY_FILE: &str = "runtime-ready.json";
 const LOCK_FILE: &str = ".prepare.lock";
 const MAX_COMMAND_OUTPUT_CHARS: usize = 8_000;
+const MAX_COMMAND_OUTPUT_BYTES: u64 = 64 * 1024;
+const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const UV_VERSION_TIMEOUT: Duration = Duration::from_secs(15);
 const UV_SYNC_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const PYTHON_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -34,6 +40,8 @@ const PACKAGE_NAMES: &[&str] = &[
     "seaborn",
     "statsmodels",
 ];
+static ANALYTICS_PROFILE_GATES: LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>> =
+    LazyLock::new(dashmap::DashMap::new);
 
 #[derive(Debug, Error)]
 pub enum AnalyticsRuntimeError {
@@ -49,6 +57,8 @@ pub enum AnalyticsRuntimeError {
     ProbeFailed(String),
     #[error("analytics runtime command timed out: {0}")]
     CommandTimedOut(String),
+    #[error("analytics runtime preparation cancelled: {0}")]
+    Cancelled(String),
     #[error("analytics runtime task failed: {0}")]
     TaskFailed(String),
 }
@@ -106,22 +116,46 @@ impl AnalyticsRuntime {
     }
 
     pub async fn prepare_python(&self) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
+        self.prepare_python_with_cancel(None).await
+    }
+
+    pub async fn prepare_python_with_cancel(
+        &self,
+        cancel: Option<Arc<CancellationToken>>,
+    ) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
+        ensure_not_cancelled(cancel.as_ref(), "before acquiring the runtime lock")?;
+        let profile_hash = runtime_hash();
+        let _profile_guard = acquire_profile_gate(&profile_hash, cancel.as_ref()).await?;
         let cache_root = self.cache_root.clone();
-        let (runtime_dir, profile_id, lock) = tokio::task::spawn_blocking(move || {
-            let profile_hash = runtime_hash();
-            let profile_id = format!("eko-analytics:{profile_hash}");
-            let runtime_dir = cache_root.join(profile_hash);
-            fs::create_dir_all(&runtime_dir)?;
-            let lock = open_prepare_lock(&runtime_dir)?;
-            lock.lock_exclusive()?;
-            Ok::<_, AnalyticsRuntimeError>((runtime_dir, profile_id, lock))
-        })
+        let (runtime_dir, profile_id, lock) = crate::product_data_io::run(
+            "open analytics runtime lock",
+            move || -> AnalyticsRuntimeResult<_> {
+                let profile_id = format!("eko-analytics:{profile_hash}");
+                let runtime_dir = cache_root.join(profile_hash);
+                fs::create_dir_all(&runtime_dir)?;
+                let lock = open_prepare_lock(&runtime_dir)?;
+                Ok((runtime_dir, profile_id, lock))
+            },
+        )
         .await
         .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??;
+        let lock = acquire_prepare_lock(lock, cancel.as_ref()).await?;
 
-        let result = self.prepare_locked(&runtime_dir, &profile_id).await;
-        if let Err(error) = FileExt::unlock(&lock) {
-            tracing::warn!(%error, "failed to unlock analytics runtime preparation file");
+        let result = self
+            .prepare_locked(&runtime_dir, &profile_id, cancel.clone())
+            .await;
+        match crate::product_data_io::run("unlock analytics runtime", move || {
+            FileExt::unlock(&lock)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "failed to unlock analytics runtime preparation file");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "analytics runtime unlock task failed");
+            }
         }
         result
     }
@@ -130,15 +164,26 @@ impl AnalyticsRuntime {
         &self,
         runtime_dir: &Path,
         profile_id: &str,
+        cancel: Option<Arc<CancellationToken>>,
     ) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
-        materialize_runtime_files(runtime_dir)?;
-        let marker_path = runtime_dir.join(READY_FILE);
-        if let Some(marker) = load_ready_marker(&marker_path, profile_id)? {
-            let python = PathBuf::from(&marker.python);
-            if python.is_file() {
-                return Ok(prepared_runtime(runtime_dir, marker));
-            }
+        ensure_not_cancelled(cancel.as_ref(), "before reading runtime metadata")?;
+        let runtime_dir_owned = runtime_dir.to_path_buf();
+        let profile_id_owned = profile_id.to_string();
+        if let Some(marker) = crate::product_data_io::run(
+            "load analytics runtime marker",
+            move || -> AnalyticsRuntimeResult<Option<ReadyMarker>> {
+                materialize_runtime_files(&runtime_dir_owned)?;
+                let marker =
+                    load_ready_marker(&runtime_dir_owned.join(READY_FILE), &profile_id_owned)?;
+                Ok(marker.filter(|marker| PathBuf::from(&marker.python).is_file()))
+            },
+        )
+        .await
+        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??
+        {
+            return Ok(prepared_runtime(runtime_dir, marker));
         }
+        ensure_not_cancelled(cancel.as_ref(), "after reading runtime metadata")?;
 
         let mut version_command = tokio::process::Command::new(&self.uv_program);
         version_command.arg("--version");
@@ -147,6 +192,7 @@ impl AnalyticsRuntime {
             "uv --version",
             UV_VERSION_TIMEOUT,
             AnalyticsRuntimeError::UvUnavailable,
+            cancel.clone(),
         )
         .await?;
         let mut sync_command = tokio::process::Command::new(&self.uv_program);
@@ -165,6 +211,7 @@ impl AnalyticsRuntime {
             "uv sync",
             UV_SYNC_TIMEOUT,
             AnalyticsRuntimeError::SyncFailed,
+            cancel.clone(),
         )
         .await?;
         tracing::info!(
@@ -175,13 +222,19 @@ impl AnalyticsRuntime {
         );
 
         let python = venv_python(runtime_dir);
-        if !python.is_file() {
+        let python_to_check = python.clone();
+        if !crate::product_data_io::run("verify analytics runtime", move || {
+            python_to_check.is_file()
+        })
+        .await
+        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?
+        {
             return Err(AnalyticsRuntimeError::SyncFailed(format!(
                 "uv completed without creating '{}'",
                 python.display()
             )));
         }
-        let probe = probe_python(&python).await?;
+        let probe = probe_python(&python, cancel.clone()).await?;
         let mut environment = BTreeMap::new();
         environment.insert("analytics.profile".to_string(), profile_id.to_string());
         environment.insert("analytics.uv".to_string(), bounded_text(&uv_version, 200));
@@ -197,7 +250,14 @@ impl AnalyticsRuntime {
             base_prefix: probe.base_prefix,
             environment,
         };
-        write_json(&marker_path, &marker)?;
+        let marker_path = runtime_dir.join(READY_FILE);
+        let marker_to_write = marker.clone();
+        crate::product_data_io::run("save analytics runtime marker", move || {
+            write_json(&marker_path, &marker_to_write)
+        })
+        .await
+        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??;
+        ensure_not_cancelled(cancel.as_ref(), "after saving runtime metadata")?;
         Ok(prepared_runtime(runtime_dir, marker))
     }
 }
@@ -244,6 +304,80 @@ fn open_prepare_lock(runtime_dir: &Path) -> std::io::Result<File> {
         .read(true)
         .write(true)
         .open(runtime_dir.join(LOCK_FILE))
+}
+
+async fn acquire_profile_gate(
+    profile_hash: &str,
+    cancel: Option<&Arc<CancellationToken>>,
+) -> AnalyticsRuntimeResult<tokio::sync::OwnedMutexGuard<()>> {
+    let gate = ANALYTICS_PROFILE_GATES
+        .entry(profile_hash.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    match cancel {
+        Some(cancel) => {
+            tokio::select! {
+                guard = gate.lock_owned() => Ok(guard),
+                _ = cancel.cancelled() => Err(AnalyticsRuntimeError::Cancelled(
+                    "while waiting for the in-process runtime owner".to_string(),
+                )),
+            }
+        }
+        None => Ok(gate.lock_owned().await),
+    }
+}
+
+enum PrepareLockAttempt {
+    Acquired(File),
+    Busy(File),
+}
+
+async fn acquire_prepare_lock(
+    mut lock: File,
+    cancel: Option<&Arc<CancellationToken>>,
+) -> AnalyticsRuntimeResult<File> {
+    loop {
+        ensure_not_cancelled(cancel, "while waiting for the runtime lock")?;
+        let attempt = crate::product_data_io::run("try analytics runtime lock", move || match lock
+            .try_lock_exclusive()
+        {
+            Ok(()) => Ok(PrepareLockAttempt::Acquired(lock)),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                Ok(PrepareLockAttempt::Busy(lock))
+            }
+            Err(error) => Err(AnalyticsRuntimeError::Io(error)),
+        })
+        .await
+        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??;
+        match attempt {
+            PrepareLockAttempt::Acquired(lock) => return Ok(lock),
+            PrepareLockAttempt::Busy(returned) => lock = returned,
+        }
+        match cancel {
+            Some(cancel) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Err(AnalyticsRuntimeError::Cancelled(
+                            "while waiting for the runtime lock".to_string(),
+                        ));
+                    }
+                    _ = tokio::time::sleep(LOCK_RETRY_INTERVAL) => {}
+                }
+            }
+            None => tokio::time::sleep(LOCK_RETRY_INTERVAL).await,
+        }
+    }
+}
+
+fn ensure_not_cancelled(
+    cancel: Option<&Arc<CancellationToken>>,
+    phase: &str,
+) -> AnalyticsRuntimeResult<()> {
+    if cancel.is_some_and(|cancel| cancel.is_cancelled()) {
+        Err(AnalyticsRuntimeError::Cancelled(phase.to_string()))
+    } else {
+        Ok(())
+    }
 }
 
 fn materialize_runtime_files(runtime_dir: &Path) -> std::io::Result<()> {
@@ -300,7 +434,10 @@ fn venv_python(runtime_dir: &Path) -> PathBuf {
     }
 }
 
-async fn probe_python(python: &Path) -> AnalyticsRuntimeResult<ProbeOutput> {
+async fn probe_python(
+    python: &Path,
+    cancel: Option<Arc<CancellationToken>>,
+) -> AnalyticsRuntimeResult<ProbeOutput> {
     let packages = serde_json::to_string(PACKAGE_NAMES)?;
     let script = format!(
         "import importlib.metadata as m, json, sys; names={packages}; print(json.dumps({{'python': sys.version.split()[0], 'executable': sys.executable, 'base_prefix': sys.base_prefix, 'packages': {{name: m.version(name) for name in names}}}}))"
@@ -312,9 +449,10 @@ async fn probe_python(python: &Path) -> AnalyticsRuntimeResult<ProbeOutput> {
         "analytics Python probe",
         PYTHON_PROBE_TIMEOUT,
         AnalyticsRuntimeError::ProbeFailed,
+        cancel,
     )
     .await?;
-    serde_json::from_slice(&output.stdout).map_err(AnalyticsRuntimeError::InvalidMetadata)
+    serde_json::from_str(&output.stdout).map_err(AnalyticsRuntimeError::InvalidMetadata)
 }
 
 async fn command_output<F>(
@@ -322,15 +460,14 @@ async fn command_output<F>(
     label: &str,
     timeout: Duration,
     error: F,
+    cancel: Option<Arc<CancellationToken>>,
 ) -> AnalyticsRuntimeResult<String>
 where
     F: Fn(String) -> AnalyticsRuntimeError,
 {
-    let output = command_raw_output(command, label, timeout, error).await?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let output = command_raw_output(command, label, timeout, error, cancel).await?;
     Ok(bounded_text(
-        &format!("{stdout}\n{stderr}"),
+        &format!("{}\n{}", output.stdout, output.stderr),
         MAX_COMMAND_OUTPUT_CHARS,
     ))
 }
@@ -340,33 +477,69 @@ async fn command_raw_output<F>(
     label: &str,
     timeout: Duration,
     error: F,
-) -> AnalyticsRuntimeResult<Output>
+    cancel: Option<Arc<CancellationToken>>,
+) -> AnalyticsRuntimeResult<echo_agent::sandbox::ExecutionResult>
 where
     F: Fn(String) -> AnalyticsRuntimeError,
 {
-    command.kill_on_drop(true);
-    let output = tokio::time::timeout(timeout, command.output())
+    let std_command = command.as_std();
+    let mut sandbox_command = SandboxCommand::program(
+        std_command.get_program().to_string_lossy().to_string(),
+        std_command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().to_string())
+            .collect(),
+    )
+    .with_timeout(timeout);
+    if let Some(directory) = std_command.get_current_dir() {
+        sandbox_command = sandbox_command.with_working_dir(directory.to_path_buf());
+    }
+    for (key, value) in std_command.get_envs() {
+        if let Some(value) = value {
+            sandbox_command = sandbox_command.with_env(
+                key.to_string_lossy().to_string(),
+                value.to_string_lossy().to_string(),
+            );
+        }
+    }
+    let sandbox = LocalSandbox::new(LocalConfig {
+        enable_os_sandbox: false,
+        allowed_read_paths: Vec::new(),
+        allowed_write_paths: Vec::new(),
+        allow_network: true,
+        default_timeout_secs: timeout.as_secs().max(1),
+        max_output_bytes: usize::try_from(MAX_COMMAND_OUTPUT_BYTES).unwrap_or(usize::MAX),
+        max_memory_bytes: None,
+    });
+    let mut limits = ResourceLimits::unrestricted();
+    limits.cpu_time_secs = Some(timeout.as_secs().max(1));
+    limits.max_output_bytes = Some(MAX_COMMAND_OUTPUT_BYTES);
+    let output = sandbox
+        .execute_with_limits_and_cancel(sandbox_command, limits, cancel)
         .await
-        .map_err(|_| {
-            AnalyticsRuntimeError::CommandTimedOut(format!(
-                "{label} exceeded {} seconds",
-                timeout.as_secs()
-            ))
-        })?
-        .map_err(|source| error(source.to_string()))?;
-    if !output.status.success() {
-        return Err(error(output_message(&output)));
+        .map_err(|source| match source {
+            ReactError::Sandbox(sandbox_error) => match *sandbox_error {
+                SandboxError::Cancelled(message) => {
+                    AnalyticsRuntimeError::Cancelled(format!("{label}: {message}"))
+                }
+                SandboxError::Timeout(message) => {
+                    AnalyticsRuntimeError::CommandTimedOut(format!("{label}: {message}"))
+                }
+                other => error(format!("{label}: {other}")),
+            },
+            other => error(format!("{label}: {other}")),
+        })?;
+    if !output.success() {
+        return Err(error(format!("{label}: {}", output_message(&output))));
     }
     Ok(output)
 }
 
-fn output_message(output: &Output) -> String {
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
+fn output_message(output: &echo_agent::sandbox::ExecutionResult) -> String {
     bounded_text(
         &format!(
-            "status={} stdout={} stderr={}",
-            output.status, stdout, stderr
+            "exit_code={} stdout={} stderr={}",
+            output.exit_code, output.stdout, output.stderr
         ),
         MAX_COMMAND_OUTPUT_CHARS,
     )
@@ -450,6 +623,147 @@ mod tests {
             result,
             Err(AnalyticsRuntimeError::UvUnavailable(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_waiting_for_the_shared_prepare_lock() -> AnalyticsRuntimeResult<()>
+    {
+        let root = tempfile::tempdir()?;
+        let runtime = AnalyticsRuntime::with_cache_root(root.path().to_path_buf());
+        let runtime_dir = runtime.cache_root.join(runtime_hash());
+        fs::create_dir_all(&runtime_dir)?;
+        let lock = open_prepare_lock(&runtime_dir)?;
+        lock.lock_exclusive()?;
+        let cancel = Arc::new(CancellationToken::new());
+        let cancel_for_task = Arc::clone(&cancel);
+        let operation = tokio::spawn(async move {
+            runtime
+                .prepare_python_with_cancel(Some(cancel_for_task))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), operation)
+            .await
+            .map_err(|_| AnalyticsRuntimeError::TaskFailed("lock cancel timed out".to_string()))?
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?;
+        assert!(matches!(result, Err(AnalyticsRuntimeError::Cancelled(_))));
+        FileExt::unlock(&lock)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_reaps_a_running_uv_prepare_command() -> AnalyticsRuntimeResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir()?;
+        let uv = root.path().join("slow-uv");
+        fs::write(&uv, "#!/bin/sh\nsleep 30\n")?;
+        let mut permissions = fs::metadata(&uv)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&uv, permissions)?;
+        let runtime = AnalyticsRuntime {
+            cache_root: root.path().join("cache"),
+            uv_program: uv,
+        };
+        let cancel = Arc::new(CancellationToken::new());
+        let cancel_for_task = Arc::clone(&cancel);
+        let operation = tokio::spawn(async move {
+            runtime
+                .prepare_python_with_cancel(Some(cancel_for_task))
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(3), operation)
+            .await
+            .map_err(|_| AnalyticsRuntimeError::TaskFailed("uv cancel timed out".to_string()))?
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?;
+        assert!(matches!(result, Err(AnalyticsRuntimeError::Cancelled(_))));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nine_concurrent_prepares_do_not_starve_product_data_io() -> AnalyticsRuntimeResult<()>
+    {
+        let root = tempfile::tempdir()?;
+        let runtime_dir = root.path().join("cache").join(runtime_hash());
+        fs::create_dir_all(&runtime_dir)?;
+        let external_lock = open_prepare_lock(&runtime_dir)?;
+        external_lock.lock_exclusive()?;
+        let runtime = AnalyticsRuntime {
+            cache_root: root.path().join("cache"),
+            uv_program: root.path().join("missing-uv"),
+        };
+
+        let owner_runtime = runtime.clone();
+        let owner = tokio::spawn(async move { owner_runtime.prepare_python().await });
+        let gate = loop {
+            if let Some(gate) = ANALYTICS_PROFILE_GATES
+                .get(&runtime_hash())
+                .map(|gate| Arc::clone(gate.value()))
+                && gate.try_lock().is_err()
+            {
+                break gate;
+            }
+            tokio::task::yield_now().await;
+        };
+        drop(gate);
+
+        let cancelled_waiter = Arc::new(CancellationToken::new());
+        let mut waiters = Vec::new();
+        for position in 0..8 {
+            let waiter_runtime = runtime.clone();
+            let cancel = (position == 0).then(|| Arc::clone(&cancelled_waiter));
+            waiters.push(tokio::spawn(async move {
+                waiter_runtime.prepare_python_with_cancel(cancel).await
+            }));
+        }
+        let heartbeat = tokio::time::timeout(
+            Duration::from_millis(500),
+            crate::product_data_io::run("analytics contention heartbeat", || 42_u8),
+        )
+        .await
+        .map_err(|_| AnalyticsRuntimeError::TaskFailed("heartbeat timed out".to_string()))?
+        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?;
+        assert_eq!(heartbeat, 42);
+        cancelled_waiter.cancel();
+        FileExt::unlock(&external_lock)?;
+
+        let owner_result = tokio::time::timeout(Duration::from_secs(5), owner)
+            .await
+            .map_err(|_| AnalyticsRuntimeError::TaskFailed("owner timed out".to_string()))?
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?;
+        assert!(matches!(
+            owner_result,
+            Err(AnalyticsRuntimeError::UvUnavailable(_))
+        ));
+        let mut cancelled = 0_usize;
+        for waiter in waiters {
+            let result = tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .map_err(|_| AnalyticsRuntimeError::TaskFailed("waiter timed out".to_string()))?
+                .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?;
+            match result {
+                Err(AnalyticsRuntimeError::Cancelled(_)) => {
+                    cancelled = cancelled.saturating_add(1);
+                }
+                Err(AnalyticsRuntimeError::UvUnavailable(_)) => {}
+                Err(error) => {
+                    return Err(AnalyticsRuntimeError::TaskFailed(format!(
+                        "unexpected waiter error: {error}"
+                    )));
+                }
+                Ok(_) => {
+                    return Err(AnalyticsRuntimeError::TaskFailed(
+                        "unexpected successful waiter".to_string(),
+                    ));
+                }
+            }
+        }
+        assert_eq!(cancelled, 1);
         Ok(())
     }
 

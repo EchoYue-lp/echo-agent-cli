@@ -60,6 +60,9 @@ pub struct RunPayload {
     /// Unattended launchers pass `None`, so they never wait on an interactive
     /// provider that has no owner.
     pub human_loop_provider: Option<Arc<dyn HumanLoopProvider>>,
+    /// Exact EKO product-data root and workspace lifetime authority captured
+    /// by the originating surface. Background drivers never re-read focus.
+    pub workspace_io: Option<crate::state::WorkspaceIoInvocation>,
     pub(crate) receipt_owner: crate::tasks::task_runtime::store::RunDriverReceiptOwner,
 }
 
@@ -72,6 +75,7 @@ struct RunExecutionPayload {
     trace_sink: Option<ExecSink>,
     prompt: String,
     plan_policy: RunPlanPolicy,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 }
 
 fn admitted_human_loop_provider(
@@ -100,6 +104,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         prompt,
         plan_policy,
         human_loop_provider,
+        workspace_io,
         mut receipt_owner,
     } = payload;
     if let Some(generation) = memory_generation.as_ref() {
@@ -140,7 +145,8 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
             .await;
     }
     let execute_plan =
-        crate::tasks::task_runtime::ExecuteTaskTool::new(store.clone(), pool_agent.clone());
+        crate::tasks::task_runtime::ExecuteTaskTool::new(store.clone(), pool_agent.clone())
+            .with_workspace_io(workspace_io.clone());
     pool_agent
         .write(|agent| {
             agent.add_tool(Box::new(execute_plan));
@@ -156,6 +162,7 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
             trace_sink,
             prompt,
             plan_policy,
+            workspace_io,
         },
         pool_agent,
     )
@@ -189,6 +196,7 @@ async fn drive_run_async_inner(
         UnattendedWriteMode::Disabled,
         payload.plan_policy,
         payload.trace_sink.clone(),
+        payload.workspace_io,
     )
     .await;
     drive_result.map_err(|error| {
@@ -317,6 +325,107 @@ mod tests {
             "unattended run retained an interactive HITL provider"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn background_complex_run_keeps_auto_ingest_scope_after_driver_waiter_abort()
+    -> Result<(), String> {
+        use crate::tasks::task_runtime::{AttendedMode, DomainProfile};
+        use echo_agent::testing::MockLlmClient;
+
+        let workspace = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(shadow.path())
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = "background-auto-ingest";
+        store
+            .create_run(
+                run_id,
+                "global",
+                "background-conversation",
+                "background-root",
+                DomainProfile::AcademicResearch,
+                "persist research evidence",
+                "agent_autonomous",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let llm = Arc::new(
+            MockLlmClient::new()
+                .with_model_name("background-auto-ingest")
+                .then_tool_call("research-call", "semantic_scholar_search", "{}")
+                .with_response("Research evidence persisted."),
+        );
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("background-auto-ingest")
+                .llm_client(llm)
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let identity = crate::workspace::WorkspaceIoIdentity::global(workspace.path());
+        let receipt = crate::state::ScopedWorkspaceIoReceipt::global_for_test(workspace.path());
+        let workspace_io = receipt.invocation();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        agent
+            .write(move |agent| {
+                crate::research_connectors::install_auto_ingest_barrier_fixture(
+                    agent, identity, entered_tx, release_rx,
+                );
+            })
+            .await;
+        let mut driver = tokio::spawn(drive_run_async_inner(
+            RunExecutionPayload {
+                run_id: run_id.to_string(),
+                store,
+                cancel: CancellationToken::new(),
+                layer_manager: None,
+                memory_generation: None,
+                trace_sink: None,
+                prompt: "Search for durable Agent research runtimes.".to_string(),
+                plan_policy: RunPlanPolicy::AllowDirect,
+                workspace_io: Some(workspace_io),
+            },
+            agent,
+        ));
+        tokio::select! {
+            entered = entered_rx => {
+                if entered.is_err() {
+                    let outcome = driver.await;
+                    return Err(format!(
+                        "background AutoIngest closure did not start; driver outcome: {outcome:?}"
+                    ));
+                }
+            }
+            outcome = &mut driver => {
+                return Err(format!(
+                    "background driver settled before AutoIngest entered: {outcome:?}"
+                ));
+            }
+        }
+        driver.abort();
+        let _ = driver.await;
+        release_tx
+            .send(())
+            .map_err(|_| "background AutoIngest closure dropped its release barrier".to_string())?;
+        for _ in 0..100 {
+            if crate::research::list_sources(workspace.path(), None, None)
+                .is_ok_and(|sources| !sources.is_empty())
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Err("background AutoIngest did not persist after driver waiter abort".to_string())
     }
 
     /// Run-level cancel token roundtrip: cancellation does not release driver

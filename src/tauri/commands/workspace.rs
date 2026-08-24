@@ -3,11 +3,13 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 #[cfg(test)]
+use echo_agent_app_core::workspace::Workspace;
+#[cfg(test)]
 use echo_agent_app_core::workspace::WorkspaceId;
+use echo_agent_app_core::workspace::WorkspaceKind;
 use echo_agent_app_core::workspace::migration::LegacyMigrator;
 #[cfg(test)]
 use echo_agent_app_core::workspace::registry::WorkspaceRegistry;
-use echo_agent_app_core::workspace::{Workspace, WorkspaceKind};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -51,10 +53,10 @@ fn create_or_open_workspace(
 
 async fn switch_opened_workspace(
     app_state: &Arc<echo_agent_app_core::AppState>,
-    workspace: Workspace,
+    workspace_id: echo_agent_app_core::workspace::WorkspaceId,
 ) -> Result<serde_json::Value, IpcError> {
     let transition = app_state
-        .switch_workspace_registered(workspace.id.clone())
+        .switch_workspace_registered(workspace_id.clone())
         .await
         .map_err(|error| IpcError::Internal(format!("Failed to switch workspace: {error}")))?;
     let conversation_count = match app_state.conversation_store().await {
@@ -74,11 +76,16 @@ async fn switch_opened_workspace(
         }
     };
     tracing::info!(
-        workspace = %workspace.id,
+        workspace = %workspace_id,
         conversation_count,
         "Switched workspace via IPC"
     );
-    let workspace = app_state.current_workspace().await.unwrap_or(workspace);
+    let workspace = app_state.current_workspace().await.ok_or_else(|| {
+        IpcError::Internal(format!(
+            "Workspace transition for '{}' completed without publishing a current workspace",
+            workspace_id
+        ))
+    })?;
     Ok(serde_json::json!({
         "success": true,
         "workspace": workspace,
@@ -153,7 +160,7 @@ pub async fn create_and_switch_workspace(
         .create_workspace_owned(&name, workspace_kind, root.map(std::path::PathBuf::from))
         .await
         .map_err(IpcError::from)?;
-    match switch_opened_workspace(&state.app_state, workspace.clone()).await {
+    match switch_opened_workspace(&state.app_state, workspace.id.clone()).await {
         Ok(mut response) => {
             if let Some(object) = response.as_object_mut() {
                 object.insert("created".to_string(), serde_json::Value::Bool(created));
@@ -204,7 +211,13 @@ pub async fn get_workspace(
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id);
-    match state.app_state.workspace.registry.open(&ws_id) {
+    let registry = Arc::clone(&state.app_state.workspace.registry);
+    match echo_agent_app_core::product_data_io::run("inspect workspace", move || {
+        registry.inspect(&ws_id)
+    })
+    .await
+    .map_err(|error| IpcError::Internal(error.to_string()))?
+    {
         Ok(ws) => Ok(serde_json::json!({ "workspace": ws })),
         Err(e) => Err(IpcError::NotFound(format!("Workspace not found: {e}"))),
     }
@@ -247,10 +260,14 @@ pub async fn switch_workspace(
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id.clone());
-    match state.app_state.workspace.registry.open(&ws_id) {
-        Ok(workspace) => switch_opened_workspace(&state.app_state, workspace).await,
-        Err(e) => Err(IpcError::NotFound(format!("Workspace not found: {e}"))),
-    }
+    switch_opened_workspace(&state.app_state, ws_id)
+        .await
+        .map_err(|error| match error {
+            IpcError::Internal(message) if message.contains("not found") => {
+                IpcError::NotFound(format!("Workspace not found: {message}"))
+            }
+            other => other,
+        })
 }
 
 #[cfg(test)]

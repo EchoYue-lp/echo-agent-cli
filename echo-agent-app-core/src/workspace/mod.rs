@@ -234,6 +234,13 @@ pub struct WorkspaceMetadata {
     /// 标签列表。
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Monotonic incarnation of the linked project root.
+    ///
+    /// This stays in the existing workspace registry authority so product
+    /// surfaces can reject drafts admitted before a project relink without a
+    /// second generation store.
+    #[serde(default)]
+    pub project_root_revision: u64,
 }
 
 // ── Workspace ───────────────────────────────────────────────────────
@@ -258,6 +265,12 @@ pub struct Workspace {
     /// 元数据。
     #[serde(default)]
     pub metadata: WorkspaceMetadata,
+    /// Backend-issued opaque incarnation token for product-data IPC.
+    ///
+    /// This is a derived projection. Consumers must return it verbatim and
+    /// must not reconstruct it from localized timestamp strings.
+    #[serde(default, skip_deserializing)]
+    pub product_data_generation: String,
     /// 创建时间。
     #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub created_at: DateTime<Utc>,
@@ -270,6 +283,62 @@ impl Workspace {
     /// 更新最后活跃时间为当前时间。
     pub fn touch(&mut self) {
         self.last_active = Utc::now();
+        self.refresh_product_data_generation();
+    }
+
+    pub fn refresh_product_data_generation(&mut self) {
+        self.product_data_generation = self.opaque_product_data_generation();
+    }
+
+    pub fn opaque_product_data_generation(&self) -> String {
+        let created_at = self
+            .created_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        serde_json::to_string(&(
+            self.id.as_str(),
+            created_at,
+            self.metadata.project_root_revision,
+        ))
+        .unwrap_or_else(|error| {
+            tracing::error!(%error, "failed to serialize workspace product-data generation");
+            String::new()
+        })
+    }
+}
+
+/// Immutable EKO identity for one workspace host's product-data root.
+///
+/// Project relinking does not change this identity because research and
+/// analysis data stay under the EKO workspace root. Deletion/recreation does:
+/// `created_at` distinguishes a new host even when ID and path are reused.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct WorkspaceIoIdentity {
+    workspace_id: String,
+    host_generation: String,
+    data_root: PathBuf,
+}
+
+impl WorkspaceIoIdentity {
+    pub(crate) fn global(data_root: impl Into<PathBuf>) -> Self {
+        Self {
+            workspace_id: "global".to_string(),
+            host_generation: "global".to_string(),
+            data_root: data_root.into(),
+        }
+    }
+
+    pub(crate) fn workspace(workspace: &Workspace) -> Self {
+        Self {
+            workspace_id: workspace.id.to_string(),
+            host_generation: workspace
+                .created_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            data_root: workspace.root.clone(),
+        }
+    }
+
+    pub(crate) fn data_root(&self) -> &std::path::Path {
+        &self.data_root
     }
 }
 
@@ -340,6 +409,7 @@ mod tests {
             project_root: None,
             kind: WorkspaceKind::General,
             metadata: WorkspaceMetadata::default(),
+            product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),
         };
@@ -347,5 +417,38 @@ mod tests {
         let parsed: Workspace = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, ws.id);
         assert_eq!(parsed.name, ws.name);
+    }
+
+    #[test]
+    fn product_data_generation_is_timezone_independent_and_round_trips()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = |created_at: &str| {
+            serde_json::json!({
+                "id": "timezone",
+                "name": "Timezone",
+                "root": "/tmp/timezone",
+                "kind": { "type": "general" },
+                "metadata": { "tags": [], "project_root_revision": 7 },
+                "product_data_generation": "forged-or-stale-token",
+                "created_at": created_at,
+                "last_active": created_at
+            })
+        };
+        let mut utc: Workspace = serde_json::from_value(fixture("2026-08-24T00:00:00Z"))?;
+        let mut local: Workspace = serde_json::from_value(fixture("2026-08-24T08:00:00+08:00"))?;
+        assert!(utc.product_data_generation.is_empty());
+        assert!(local.product_data_generation.is_empty());
+        utc.refresh_product_data_generation();
+        local.refresh_product_data_generation();
+
+        assert_eq!(utc.product_data_generation, local.product_data_generation);
+        let encoded = serde_json::to_value(&utc)?;
+        assert_eq!(
+            encoded
+                .get("product_data_generation")
+                .and_then(serde_json::Value::as_str),
+            Some(utc.product_data_generation.as_str())
+        );
+        Ok(())
     }
 }

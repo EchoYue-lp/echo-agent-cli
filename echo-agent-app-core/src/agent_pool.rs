@@ -224,6 +224,7 @@ pub(crate) struct WorkspaceAgentPoolResources {
     pub task_runtime_store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
     pub review_integration: Arc<crate::evolution::ReviewIntegration>,
     pub execution_scope: crate::workspace::WorkspaceExecutionScope,
+    pub workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
 }
 
 impl SharedResources {
@@ -952,6 +953,7 @@ impl AgentPool {
             task_runtime_store,
             review_integration,
             execution_scope,
+            workspace_io_identity,
         } = resources;
         let mcp_config_snapshot = self.mcp_config_snapshot.read().await.clone();
         let shared = SharedResources {
@@ -1010,8 +1012,8 @@ impl AgentPool {
         };
         primary
             .handle
-            .write(|agent| {
-                crate::research_connectors::install_auto_ingest_tools(agent);
+            .write(move |agent| {
+                crate::research_connectors::install_auto_ingest_tools(agent, workspace_io_identity);
                 agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
             })
             .await;

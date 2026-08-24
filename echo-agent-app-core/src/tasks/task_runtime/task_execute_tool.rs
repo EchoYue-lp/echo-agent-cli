@@ -146,6 +146,7 @@ pub struct ExecuteTaskTool {
     /// or keeps stage-1 rejection (Disabled). Also scoped into a task-local
     /// so CP B preflight in `execute_task` can read it.
     write_mode: UnattendedWriteMode,
+    workspace_io: Option<crate::state::WorkspaceIoInvocation>,
 }
 
 impl ExecuteTaskTool {
@@ -166,7 +167,16 @@ impl ExecuteTaskTool {
             primary_agent,
             agent_pool: None,
             write_mode,
+            workspace_io: None,
         }
+    }
+
+    pub(crate) fn with_workspace_io(
+        mut self,
+        workspace_io: Option<crate::state::WorkspaceIoInvocation>,
+    ) -> Self {
+        self.workspace_io = workspace_io;
+        self
     }
 
     /// Resolve shared task execution against the AgentHandle that owns the
@@ -488,6 +498,7 @@ impl Tool for ExecuteTaskTool {
                         // memory write is owned by the outer run's caller
                         // (drive_run_async / resume_task_run), not this tool.
                         super::memory_bridge::MemoryPolicy::None,
+                        super::task_tools::current_workspace_io(),
                     )
                     .await
                 })
@@ -587,10 +598,18 @@ impl Tool for ExecuteTaskTool {
         Box::pin(async move {
             let conversation_id = ctx.conversation_id.clone();
             let driver_context = ctx.execution_id.clone();
+            let workspace_io = self
+                .workspace_io
+                .clone()
+                .or_else(|| crate::state::WorkspaceIoInvocation::from_task_tool_context(ctx));
             let result = super::task_tools::scoped_with_ctx_run_id(ctx, || {
-                CURRENT_EXECUTION_CONVERSATION_ID.scope(
-                    conversation_id,
-                    CURRENT_EXECUTION_DRIVER_CONTEXT.scope(driver_context, self.execute(params)),
+                super::task_tools::CURRENT_WORKSPACE_IO.scope(
+                    workspace_io,
+                    CURRENT_EXECUTION_CONVERSATION_ID.scope(
+                        conversation_id,
+                        CURRENT_EXECUTION_DRIVER_CONTEXT
+                            .scope(driver_context, self.execute(params)),
+                    ),
                 )
             })
             .await?;

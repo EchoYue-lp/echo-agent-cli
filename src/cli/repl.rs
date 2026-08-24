@@ -2148,6 +2148,7 @@ fn spawn_prepared_repl_turn(
     let _ = live_output.bind_turn_cancel(cancel.clone());
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         execution_scope: scoped_runtime.execution_scope().clone(),
+        workspace_io_receipt: Some(scoped_runtime.workspace_io_receipt()),
         pool: scoped_runtime.pool(),
         store: scoped_runtime.task_runtime(),
         sink,
@@ -2202,6 +2203,7 @@ fn spawn_prepared_repl_turn(
                             scoped_runtime_guard.review_integration(),
                             Some(trace_sink),
                             lease.cancellation_token(),
+                            Some(scoped_runtime_guard.workspace_io_invocation()),
                         )
                         .await
                         .map_err(|error| error.to_string())
@@ -3055,6 +3057,7 @@ mod tests {
         );
         let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
             execution_scope: echo_agent_app_core::workspace::WorkspaceExecutionScope::global("."),
+            workspace_io_receipt: None,
             pool: None,
             store: None,
             sink,

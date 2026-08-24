@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::tasks::task_runtime::InteractionMode;
+use crate::tasks::task_runtime::{DomainProfile, InteractionMode};
 
 pub(crate) const MAX_MODEL_VISIBLE_TOOL_RESULT_TOKENS: usize = 4_000;
 #[cfg(test)]
@@ -77,6 +77,12 @@ const WEB_SEARCH_TOOLS: &[&str] = &["web_search"];
 const WEB_FETCH_TOOLS: &[&str] = &["web_fetch"];
 const REPOSITORY_INSPECTION_TOOLS: &[&str] = &["diff"];
 const MEMORY_TOOLS: &[&str] = &["recall", "search_memory"];
+const ACADEMIC_RESEARCH_TOOLS: &[&str] = &[
+    "arxiv_search",
+    "semantic_scholar_search",
+    "pubmed_search",
+    "clinical_trials_search",
+];
 
 fn groups_for_mode(interaction_mode: InteractionMode) -> &'static [&'static [&'static str]] {
     const CHAT: &[&[&str]] = &[
@@ -140,6 +146,33 @@ pub(crate) fn initial_visible_tools(
         .filter(|name| registered.contains(**name))
         .map(|name| (*name).to_string())
         .collect()
+}
+
+/// Select the first-turn surface for one canonical TaskRun.
+///
+/// Academic research runs expose their provider search tools immediately so
+/// a background `create_complex_task` driver can retrieve and persist evidence
+/// without a separate foreground `tool_search` turn. Other domain tools remain
+/// deferred and all non-research profiles keep the normal mode budget.
+pub(crate) fn initial_visible_tools_for_profile(
+    interaction_mode: InteractionMode,
+    domain_profile: DomainProfile,
+    registered: &[String],
+) -> HashSet<String> {
+    let mut visible = initial_visible_tools(interaction_mode, registered);
+    if domain_profile == DomainProfile::AcademicResearch {
+        let registered = registered
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        visible.extend(
+            ACADEMIC_RESEARCH_TOOLS
+                .iter()
+                .filter(|name| registered.contains(**name))
+                .map(|name| (*name).to_string()),
+        );
+    }
+    visible
 }
 
 pub(crate) fn disabled_tools_for_mode(interaction_mode: InteractionMode) -> HashSet<String> {
@@ -285,6 +318,30 @@ mod tests {
                 "web_search",
             ]
         );
+    }
+
+    #[test]
+    fn academic_background_profile_exposes_only_registered_research_providers() {
+        let mut registered = policy_tool_names();
+        registered.extend([
+            "semantic_scholar_search".to_string(),
+            "pubmed_search".to_string(),
+        ]);
+        let academic = initial_visible_tools_for_profile(
+            InteractionMode::Auto,
+            DomainProfile::AcademicResearch,
+            &registered,
+        );
+        let general = initial_visible_tools_for_profile(
+            InteractionMode::Auto,
+            DomainProfile::General,
+            &registered,
+        );
+
+        assert!(academic.contains("semantic_scholar_search"));
+        assert!(academic.contains("pubmed_search"));
+        assert!(!academic.contains("arxiv_search"));
+        assert!(!general.contains("semantic_scholar_search"));
     }
 
     #[test]

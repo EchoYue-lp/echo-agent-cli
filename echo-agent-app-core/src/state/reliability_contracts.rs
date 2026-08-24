@@ -318,6 +318,7 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
     let sink: Arc<dyn crate::chat_driver::ChatSink> = Arc::new(NoopChatSink);
     let resources = Arc::new(crate::chat_resources::ChatResources {
         execution_scope: runtime.execution_scope().clone(),
+        workspace_io_receipt: Some(runtime.workspace_io_receipt()),
         pool: runtime.pool(),
         store: runtime.task_runtime(),
         sink: sink.clone(),

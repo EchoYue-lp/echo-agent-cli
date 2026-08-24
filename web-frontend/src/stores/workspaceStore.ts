@@ -9,6 +9,7 @@ import { useToastStore } from './toastStore';
 import { useToolExecutionStore } from './toolExecutionStore';
 import { useBrowserStore } from './browserStore';
 import { GLOBAL_WORKSPACE_ID } from '../lib/viewAddress';
+import { productDataScope } from '../lib/productDataScope';
 
 let workspaceGeneration = 0;
 
@@ -73,6 +74,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         current: currentRes.workspace || null,
         isLoading: false,
       });
+      useFileStore.getState().bindScope(productDataScope(currentRes.workspace));
     } catch (e) {
       console.error('Failed to load workspaces:', e);
       if (generation === workspaceGeneration) set({ isLoading: false });
@@ -99,7 +101,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       set({ current: res.workspace, isLoading: false });
       showTransitionWarning(res.transition);
       const fileStore = useFileStore.getState();
-      fileStore.markWorkspaceChanged();
+      fileStore.bindScope(productDataScope(res.workspace));
       void fileStore.loadTree(4);
       void fileStore.loadChanges();
 
@@ -142,7 +144,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     set({ current: ws, isLoading: false });
     showTransitionWarning(res.transition);
     const fileStore = useFileStore.getState();
-    fileStore.markWorkspaceChanged();
+    fileStore.bindScope(productDataScope(ws));
     void fileStore.loadTree(4);
     void fileStore.loadChanges();
     await useConversationStore.getState().init(ws.id);
@@ -155,7 +157,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     if (current?.id === id) {
       detachVisibleWorkspace(id);
       set({ current: null });
-      useFileStore.getState().markWorkspaceChanged();
+      useFileStore.getState().bindScope(productDataScope(null));
     }
     await get().init();
     if (current?.id === id) {
@@ -171,7 +173,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     if (generation !== workspaceGeneration) return;
     set({ current: null });
     showTransitionWarning(res.transition);
-    useFileStore.getState().markWorkspaceChanged();
+    useFileStore.getState().bindScope(productDataScope(null));
     await useConversationStore.getState().init(GLOBAL_WORKSPACE_ID);
   },
 }));

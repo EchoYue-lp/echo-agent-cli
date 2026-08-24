@@ -733,6 +733,7 @@ impl CommandCellRuntimeService {
                     delegate_depth: 0,
                     max_delegate_depth: 0,
                 }),
+                resource_guards: context.resource_guards.clone(),
             }),
             message: None,
             prompt_payload: None,

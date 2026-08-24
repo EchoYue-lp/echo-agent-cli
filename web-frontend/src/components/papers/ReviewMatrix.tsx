@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { evidenceApi, papersApi, type EvidenceRecord, type Paper } from '../../api/endpoints';
+import {
+  evidenceApi,
+  papersApi,
+  type EvidenceRecord,
+  type Paper,
+  type ProductDataScope,
+} from '../../api/endpoints';
 import { Download, Grid3X3, Plus, Trash2 } from 'lucide-react';
 
 interface Dimension {
@@ -16,11 +22,12 @@ const DEFAULT_DIMENSIONS: Dimension[] = [
 ];
 
 interface ReviewMatrixProps {
+  scope: ProductDataScope;
   reviewId?: string;
   sourceIds?: string[];
 }
 
-export function ReviewMatrix({ reviewId, sourceIds }: ReviewMatrixProps) {
+export function ReviewMatrix({ scope, reviewId, sourceIds }: ReviewMatrixProps) {
   const [papers, setPapers] = useState<Paper[]>([]);
   const [evidence, setEvidence] = useState<EvidenceRecord[]>([]);
   const [loading, setLoading] = useState(true);
@@ -34,8 +41,8 @@ export function ReviewMatrix({ reviewId, sourceIds }: ReviewMatrixProps) {
     setLoading(true);
     try {
       const [allPapers, records] = await Promise.all([
-        papersApi.list(),
-        evidenceApi.list(reviewId ? { reviewId } : undefined),
+        papersApi.list(scope),
+        evidenceApi.list(scope, reviewId ? { reviewId } : undefined),
       ]);
       const selected = sourceIds?.length
         ? allPapers.filter((paper) => sourceIds.includes(paper.id))
@@ -52,7 +59,7 @@ export function ReviewMatrix({ reviewId, sourceIds }: ReviewMatrixProps) {
     } finally {
       setLoading(false);
     }
-  }, [reviewId, sourceIds]);
+  }, [reviewId, scope, sourceIds]);
 
   useEffect(() => {
     void refresh();
@@ -83,7 +90,7 @@ export function ReviewMatrix({ reviewId, sourceIds }: ReviewMatrixProps) {
     const cellKey = `${paperId}:${dimension}`;
     setSavingCell(cellKey);
     try {
-      const saved = await evidenceApi.upsert({
+      const saved = await evidenceApi.upsert(scope, {
         id: existing?.id,
         source_id: paperId,
         review_id: reviewId,
@@ -126,7 +133,7 @@ export function ReviewMatrix({ reviewId, sourceIds }: ReviewMatrixProps) {
   const removeDimension = async (dimension: string) => {
     const records = evidence.filter((record) => record.dimension === dimension);
     try {
-      await Promise.all(records.map((record) => evidenceApi.delete(record.id)));
+      await Promise.all(records.map((record) => evidenceApi.delete(scope, record.id)));
       setEvidence((current) => current.filter((record) => record.dimension !== dimension));
       setCustomDimensions((current) => current.filter((item) => item.id !== dimension));
     } catch (reason) {

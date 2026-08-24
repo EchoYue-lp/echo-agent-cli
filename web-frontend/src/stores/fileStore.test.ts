@@ -16,6 +16,7 @@ import { useFileStore } from './fileStore';
 
 const initialFile = {
   workspace_id: 'workspace:a',
+  workspace_generation: 'generation-a',
   path: 'src/main.ts',
   content: 'const value = 1;\n',
   size: 17,
@@ -30,6 +31,7 @@ describe('fileStore', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     useFileStore.setState({
+      scope: { workspaceId: 'workspace:a', workspaceGeneration: 'generation-a' },
       tree: [],
       openFiles: [],
       selectedFile: null,
@@ -53,7 +55,10 @@ describe('fileStore', () => {
     useFileStore.getState().setViewMode('edit');
     useFileStore.getState().updateDraft('const value = 2;\n');
 
-    expect(mocks.read).toHaveBeenCalledWith(initialFile.path);
+    expect(mocks.read).toHaveBeenCalledWith(
+      { workspaceId: 'workspace:a', workspaceGeneration: 'generation-a' },
+      initialFile.path
+    );
     expect(useFileStore.getState().documents[initialFile.path]?.dirty).toBe(true);
   });
 
@@ -69,9 +74,9 @@ describe('fileStore', () => {
 
     expect(await useFileStore.getState().saveSelected()).toBe(true);
     expect(mocks.write).toHaveBeenCalledWith(
+      { workspaceId: 'workspace:a', workspaceGeneration: 'generation-a' },
       initialFile.path,
       'const value = 2;\n',
-      'workspace:a',
       'revision-1'
     );
     expect(useFileStore.getState().documents[initialFile.path]?.file.revision).toBe('revision-2');
@@ -152,7 +157,9 @@ describe('fileStore', () => {
     useFileStore.getState().setViewMode('edit');
     useFileStore.getState().updateDraft('workspace A draft\n');
 
-    useFileStore.getState().markWorkspaceChanged();
+    useFileStore
+      .getState()
+      .bindScope({ workspaceId: 'workspace:b', workspaceGeneration: 'generation-b' });
 
     expect(await useFileStore.getState().saveSelected()).toBe(false);
     const document = useFileStore.getState().documents[initialFile.path];
@@ -181,10 +188,13 @@ describe('fileStore', () => {
     await useFileStore.getState().selectFile(initialFile.path);
     useFileStore.getState().setViewMode('edit');
     useFileStore.getState().updateDraft('workspace A draft\n');
-    useFileStore.getState().markWorkspaceChanged();
+    useFileStore
+      .getState()
+      .bindScope({ workspaceId: 'workspace:b', workspaceGeneration: 'generation-b' });
     mocks.read.mockResolvedValue({
       ...initialFile,
       workspace_id: 'workspace:b',
+      workspace_generation: 'generation-b',
       content: 'workspace B content\n',
       revision: 'revision-b',
     });
@@ -209,7 +219,9 @@ describe('fileStore', () => {
     useFileStore.getState().updateDraft('workspace A draft\n');
 
     const save = useFileStore.getState().saveSelected();
-    useFileStore.getState().markWorkspaceChanged();
+    useFileStore
+      .getState()
+      .bindScope({ workspaceId: 'workspace:b', workspaceGeneration: 'generation-b' });
     resolveWrite?.({ ...initialFile, content: 'workspace A draft\n', revision: 'revision-2' });
 
     expect(await save).toBe(false);
@@ -230,7 +242,9 @@ describe('fileStore', () => {
     useFileStore.getState().updateDraft('workspace A draft\n');
 
     const save = useFileStore.getState().saveSelected();
-    useFileStore.getState().markWorkspaceChanged();
+    useFileStore
+      .getState()
+      .bindScope({ workspaceId: 'workspace:b', workspaceGeneration: 'generation-b' });
     const workspaceError = useFileStore.getState().error;
     rejectWrite?.(new Error('old workspace save failed'));
 

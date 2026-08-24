@@ -744,6 +744,7 @@ fn prepare_chat_execution(
         .or_else(|| res.layer_manager.clone());
     let res = std::sync::Arc::new(crate::chat_resources::ChatResources {
         execution_scope: res.execution_scope.clone(),
+        workspace_io_receipt: res.workspace_io_receipt.clone(),
         pool: res.pool.clone(),
         store: res.store.clone(),
         sink: res.sink.clone(),
@@ -1551,6 +1552,18 @@ async fn drive_chat_inner(
         );
         let visible_tools = Some(visible_tools);
 
+        let (working_dir, resource_guards) = res.workspace_io_receipt.as_ref().map_or_else(
+            || (Some(res.execution_scope.root().to_path_buf()), Vec::new()),
+            |receipt| {
+                (
+                    Some(receipt.data_root().to_path_buf()),
+                    vec![echo_agent::tools::InvocationResourceGuard::new(
+                        receipt.clone(),
+                    )],
+                )
+            },
+        );
+
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
         // channel that keeps Subagent tools and run_id on this same run. The
@@ -1579,12 +1592,14 @@ async fn drive_chat_inner(
                 cancel: Some(std::sync::Arc::new(cancel.clone())),
                 trace_sink: Some(framework_trace_sink_for(&sink)),
                 delegation_policy: None,
+                resource_guards: Vec::new(),
             }),
-            working_dir: Some(res.execution_scope.root().to_path_buf()),
+            working_dir,
             cancel: None,
             disabled_tools,
             visible_tools,
             run_budget: None,
+            resource_guards,
         };
         let eko_sink = EkoTurnEventSink::new(
             sink,
@@ -1874,6 +1889,7 @@ mod tests {
         let agent = AgentHandle::new(raw_agent);
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2536,6 +2552,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let resources = crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: None,
             sink: std::sync::Arc::new(MockChatSink::default()),
@@ -2588,6 +2605,7 @@ mod tests {
         let configured_for_call = configured.clone();
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: Some(pool.clone()),
             store: Some(store),
             sink: Arc::new(MockChatSink::default()),
@@ -2649,6 +2667,7 @@ mod tests {
         );
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2742,6 +2761,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2860,6 +2880,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -2979,6 +3000,7 @@ mod tests {
         let resources_for = |turn_id: &str| {
             Arc::new(crate::chat_resources::ChatResources {
                 execution_scope: test_execution_scope(),
+                workspace_io_receipt: None,
                 pool: None,
                 store: Some(store.clone()),
                 sink: Arc::new(MockChatSink::default()),
@@ -3087,6 +3109,7 @@ mod tests {
         );
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -3174,6 +3197,7 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -3371,6 +3395,7 @@ mod tests {
         let chat_sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: chat_sink.clone(),
@@ -3539,6 +3564,7 @@ mod tests {
         let sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink,
@@ -3623,6 +3649,7 @@ mod tests {
             &make_turn("continue"),
             Arc::new(crate::chat_resources::ChatResources {
                 execution_scope: test_execution_scope(),
+                workspace_io_receipt: None,
                 pool: None,
                 store: Some(store.clone()),
                 sink: Arc::new(MockChatSink::default()),
@@ -3739,6 +3766,7 @@ mod tests {
         let expected = TaskRunResumeIdentity::capture(&before);
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink: Arc::new(MockChatSink::default()),
@@ -3862,6 +3890,7 @@ mod tests {
         let sink: Arc<dyn ChatSink> = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store.clone()),
             sink,
@@ -4037,6 +4066,7 @@ mod tests {
         });
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: Some(pool.clone()),
             store: Some(store.clone()),
             sink,
@@ -4142,6 +4172,7 @@ mod tests {
             let turn_id = format!("{}-rejected", mode.as_str());
             let resources = Arc::new(crate::chat_resources::ChatResources {
                 execution_scope: test_execution_scope(),
+                workspace_io_receipt: None,
                 pool: None,
                 store: Some(store.clone()),
                 sink: Arc::new(MockChatSink::default()),
@@ -4204,6 +4235,7 @@ mod tests {
         );
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(Arc::clone(&store)),
             sink,
@@ -4281,6 +4313,7 @@ mod tests {
         let chat_sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: None,
             sink: chat_sink.clone(),
@@ -4392,6 +4425,7 @@ mod tests {
         let sink: Arc<dyn ChatSink> = chat_sink;
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(Arc::clone(&store)),
             sink,
@@ -4490,6 +4524,7 @@ mod tests {
         );
         let res = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store),
             sink,
@@ -4574,6 +4609,7 @@ mod tests {
             let sink: Arc<dyn ChatSink> = Arc::new(MockChatSink::default());
             let resources = Arc::new(crate::chat_resources::ChatResources {
                 execution_scope: test_execution_scope(),
+                workspace_io_receipt: None,
                 pool: None,
                 store: None,
                 sink,
@@ -4626,6 +4662,7 @@ mod tests {
                 &crate::workspace::WorkspaceId::from_name("scope-test"),
                 root.clone(),
             ),
+            workspace_io_receipt: None,
             pool: None,
             store: None,
             sink: std::sync::Arc::new(MockChatSink::default()),
@@ -4674,6 +4711,7 @@ mod tests {
         );
         let resources = std::sync::Arc::new(crate::chat_resources::ChatResources {
             execution_scope: crate::workspace::WorkspaceExecutionScope::global("."),
+            workspace_io_receipt: None,
             pool: None,
             store: Some(store),
             sink: std::sync::Arc::new(MockChatSink::default()),

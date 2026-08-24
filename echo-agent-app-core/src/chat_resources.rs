@@ -24,6 +24,10 @@ pub struct ChatResources {
     /// Immutable identity/root for every foreground, pooled, and continuation
     /// operation spawned by this turn.
     pub execution_scope: crate::workspace::WorkspaceExecutionScope,
+    /// Exact workspace lifetime and immutable EKO data root retained by every
+    /// Agent/tool spawn belonging to this turn. Minimal test fixtures may use
+    /// `None`; product surfaces must always provide a receipt.
+    pub workspace_io_receipt: Option<crate::state::ScopedWorkspaceIoReceipt>,
     /// Pool for acquiring an isolated agent per background run. `None` in
     /// contexts without a pool (tests); `create_complex_task` errors then.
     pub pool: Option<Arc<AgentPool>>,

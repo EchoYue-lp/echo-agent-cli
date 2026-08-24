@@ -203,6 +203,7 @@ impl ForegroundTurnProgress {
         });
         let controlled_resources = Arc::new(ChatResources {
             execution_scope: resources.execution_scope.clone(),
+            workspace_io_receipt: resources.workspace_io_receipt.clone(),
             pool: resources.pool.clone(),
             store: resources.store.clone(),
             sink,
@@ -1381,6 +1382,7 @@ where
     // reacquire a generation while decorating the sink.
     let controlled_resources = Arc::new(ChatResources {
         execution_scope: resources.execution_scope.clone(),
+        workspace_io_receipt: resources.workspace_io_receipt.clone(),
         pool: resources.pool.clone(),
         store: resources.store.clone(),
         sink,

@@ -194,6 +194,7 @@ impl WorkspaceRuntimeResources {
         }
 
         workspace.root = root;
+        workspace.refresh_product_data_generation();
         Ok(Self {
             workspace,
             state_dir,
@@ -269,6 +270,10 @@ impl WorkspaceRuntimeHost {
 
     pub(crate) fn execution_scope(&self) -> WorkspaceExecutionScope {
         WorkspaceExecutionScope::workspace(self.id(), self.root())
+    }
+
+    pub(crate) fn workspace_io_identity(&self) -> super::WorkspaceIoIdentity {
+        super::WorkspaceIoIdentity::workspace(self.resources.workspace())
     }
 
     fn acquire_control_lease(self: &Arc<Self>) -> anyhow::Result<WorkspaceControlLease> {
@@ -363,6 +368,7 @@ impl WorkspaceRuntimeHost {
                     self.resources.memory_store(),
                 ));
                 let workspace = self.workspace().await;
+                let workspace_io_identity = self.workspace_io_identity();
                 let (pool, plugin_runtime, mcp_ownership) = seed_pool
                     .fork_for_workspace(WorkspaceAgentPoolResources {
                         root: self.root().to_path_buf(),
@@ -373,6 +379,7 @@ impl WorkspaceRuntimeHost {
                         task_runtime_store: task_runtime.clone(),
                         review_integration: review_integration.clone(),
                         execution_scope: self.execution_scope(),
+                        workspace_io_identity,
                     })
                     .await?;
                 let primary_agent = pool.primary_agent().await?;
@@ -779,6 +786,7 @@ mod tests {
             project_root: None,
             kind: WorkspaceKind::General,
             metadata: WorkspaceMetadata::default(),
+            product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),
         }

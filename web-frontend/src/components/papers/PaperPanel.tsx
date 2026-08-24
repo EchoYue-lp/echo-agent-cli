@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   papersApi,
   type CreatePaperRequest,
   type Paper,
+  type ProductDataScope,
   type ResearchProvider,
 } from '../../api/endpoints';
 import {
@@ -21,10 +22,20 @@ import { PaperDetail } from './PaperDetail';
 import { PaperList } from './PaperList';
 import { ReviewMatrix } from './ReviewMatrix';
 import { ReviewWorkbench } from './ReviewWorkbench';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { productDataScope, productDataScopeKey } from '../../lib/productDataScope';
+import { LatestOperationOwner, LatestRequestFence } from '../../lib/latestRequest';
 
 type ViewMode = 'library' | 'matrix' | 'reviews';
 
 export function PaperPanel() {
+  const workspace = useWorkspaceStore((state) => state.current);
+  const scope = useMemo(() => productDataScope(workspace), [workspace]);
+  const scopeKey = productDataScopeKey(scope);
+  const scopeRef = useRef(scopeKey);
+  scopeRef.current = scopeKey;
+  const selectionFence = useRef(new LatestRequestFence());
+  const savingOwner = useRef(new LatestOperationOwner());
   const [papers, setPapers] = useState<Paper[]>([]);
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('library');
@@ -38,46 +49,55 @@ export function PaperPanel() {
   });
 
   const fetchPapers = useCallback(async () => {
+    const request = selectionFence.current.begin(scopeKey);
     try {
-      const list = await papersApi.list();
+      const list = await papersApi.list(scope);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setPapers(list);
       setSelectedPaper((current) => list.find((paper) => paper.id === current?.id) ?? null);
       setError(null);
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, []);
+  }, [scope, scopeKey]);
 
   useEffect(() => {
     void fetchPapers();
   }, [fetchPapers]);
 
   const handleSelectPaper = async (paper: Paper) => {
+    const request = selectionFence.current.begin(scopeKey);
     try {
-      setSelectedPaper(await papersApi.get(paper.id));
+      const selected = await papersApi.get(scope, paper.id);
+      if (selectionFence.current.isCurrent(request, scopeRef.current)) setSelectedPaper(selected);
     } catch {
-      setSelectedPaper(paper);
+      if (selectionFence.current.isCurrent(request, scopeRef.current)) setSelectedPaper(paper);
     }
   };
 
   const handleAddPaper = async () => {
     if (!draft.title.trim()) return;
     setSaving(true);
+    const request = selectionFence.current.begin(scopeKey);
+    const operation = savingOwner.current.begin();
     try {
-      const created = await papersApi.create({
+      const created = await papersApi.create(scope, {
         ...draft,
         title: draft.title.trim(),
         authors: draft.authors?.filter(Boolean),
         tags: draft.tags?.filter(Boolean),
       });
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setSelectedPaper(created);
       setShowAddForm(false);
       setDraft({ title: '', source_kind: 'journal_article' });
       await fetchPapers();
     } catch (reason) {
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setSaving(false);
+      if (savingOwner.current.isCurrent(operation)) setSaving(false);
     }
   };
 
@@ -141,6 +161,7 @@ export function PaperPanel() {
       )}
       {showConnectors && viewMode === 'library' && (
         <ResearchConnectors
+          scope={scope}
           selectedPaper={selectedPaper}
           refresh={() => void fetchPapers()}
           setError={setError}
@@ -149,9 +170,9 @@ export function PaperPanel() {
 
       <div className="min-h-0 flex-1">
         {viewMode === 'matrix' ? (
-          <ReviewMatrix />
+          <ReviewMatrix scope={scope} />
         ) : viewMode === 'reviews' ? (
-          <ReviewWorkbench />
+          <ReviewWorkbench scope={scope} />
         ) : selectedPaper ? (
           <div className="flex h-full min-h-0 flex-col md:flex-row">
             <div className="h-2/5 min-h-0 w-full border-b border-[var(--border-primary)] md:h-full md:w-2/5 md:border-b-0 md:border-r">
@@ -163,6 +184,7 @@ export function PaperPanel() {
             </div>
             <div className="min-h-0 flex-1">
               <PaperDetail
+                scope={scope}
                 paper={selectedPaper}
                 onClose={() => setSelectedPaper(null)}
                 onUpdated={() => void fetchPapers()}
@@ -182,10 +204,12 @@ export function PaperPanel() {
 }
 
 function ResearchConnectors({
+  scope,
   selectedPaper,
   refresh,
   setError,
 }: {
+  scope: ProductDataScope;
   selectedPaper: Paper | null;
   refresh: () => void;
   setError: (error: string | null) => void;
@@ -243,7 +267,11 @@ function ResearchConnectors({
           disabled={!query.trim() || busy !== null}
           onClick={() =>
             void run('search', async () => {
-              const response = await papersApi.search({ provider, query: query.trim(), limit: 25 });
+              const response = await papersApi.search(scope, {
+                provider,
+                query: query.trim(),
+                limit: 25,
+              });
               return `${response.created} added, ${response.updated} updated`;
             })
           }
@@ -280,7 +308,7 @@ function ResearchConnectors({
           disabled={!libraryId.trim() || !apiKey.trim() || busy !== null}
           onClick={() =>
             void run('import', async () => {
-              const response = await papersApi.importZotero(zoteroRequest());
+              const response = await papersApi.importZotero(scope, zoteroRequest());
               return `${response.imported} imported, ${response.updated} updated`;
             })
           }
@@ -294,7 +322,10 @@ function ResearchConnectors({
           onClick={() =>
             selectedPaper &&
             void run('export', async () => {
-              const response = await papersApi.exportZotero(zoteroRequest([selectedPaper.id]));
+              const response = await papersApi.exportZotero(
+                scope,
+                zoteroRequest([selectedPaper.id])
+              );
               return `${response.exported} exported`;
             })
           }
@@ -310,7 +341,7 @@ function ResearchConnectors({
             disabled={busy !== null}
             onClick={() =>
               void run('europe-pmc', async () => {
-                const response = await papersApi.enrichEuropePmc(selectedPaper.id);
+                const response = await papersApi.enrichEuropePmc(scope, selectedPaper.id);
                 return response.warnings.length
                   ? `Enriched with ${response.warnings.length} warning(s)`
                   : 'Europe PMC enrichment complete';

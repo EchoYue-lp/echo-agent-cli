@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
-use echo_agent::agent::AgentHandle;
 use echo_agent::tools::{ToolContext, ToolResultKind};
 use echo_agent::tools::{ToolFailureCategory, ToolManager, ToolParameters};
 use serde::{Deserialize, Serialize};
@@ -229,13 +228,6 @@ pub struct SaveAnalysisRequest {
     pub random_seed: Option<u64>,
 }
 
-pub async fn workspace_root_for_agent(agent: &AgentHandle) -> PathBuf {
-    match agent.read(|agent| agent.working_dir()).await {
-        Some(path) => path,
-        None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    }
-}
-
 pub fn list_analyses(workspace_root: &Path) -> AnalysisResult<Vec<AnalysisSummary>> {
     let root = workspace_root.join(ANALYSIS_ROOT);
     if !root.is_dir() {
@@ -377,40 +369,56 @@ pub fn save_analysis(
     load_analysis(workspace_root, analysis_id)
 }
 
-pub async fn run_analysis_with_agent(
-    agent: &AgentHandle,
-    workspace_root: &Path,
+pub fn delete_analysis(workspace_root: &Path, analysis_id: &str) -> AnalysisResult<()> {
+    let directory = analysis_dir(workspace_root, analysis_id)?;
+    fs::remove_dir_all(directory)?;
+    Ok(())
+}
+
+pub async fn run_analysis_with_product_data(
+    product_data: &crate::product_data_io::ScopedProductData,
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
 ) -> AnalysisResult<AnalysisDocument> {
+    let conversation_id = format!("analysis:{analysis_id}");
+    let execution = product_data
+        .runtime()
+        .agent_for(&conversation_id)
+        .await
+        .map_err(|error| AnalysisError::Execution(error.to_string()))?;
+    let agent = execution.agent();
     let tool_manager = agent.read(|agent| agent.tool_manager().clone()).await;
-    let document = load_analysis(workspace_root, analysis_id)?;
-    let runtime = match document.manifest.language {
-        AnalysisLanguage::Python => Some(
-            crate::analysis_runtime::AnalyticsRuntime::default()
-                .prepare_python()
-                .await
-                .map_err(|error| AnalysisError::RuntimeUnavailable(error.to_string()))?,
-        ),
-        AnalysisLanguage::R => None,
-    };
-    run_analysis_with_runtime(
+    let result = run_analysis_with_runtime(
         tool_manager.as_ref(),
-        workspace_root,
+        product_data.data_root(),
         analysis_id,
         cancel,
-        runtime.as_ref(),
+        None,
+        true,
+        Some(product_data),
     )
-    .await
+    .await;
+    drop(execution);
+    result
 }
 
-pub async fn run_analysis(
+#[cfg(test)]
+async fn run_analysis(
     tool_manager: &ToolManager,
     workspace_root: &Path,
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
 ) -> AnalysisResult<AnalysisDocument> {
-    run_analysis_with_runtime(tool_manager, workspace_root, analysis_id, cancel, None).await
+    run_analysis_with_runtime(
+        tool_manager,
+        workspace_root,
+        analysis_id,
+        cancel,
+        None,
+        false,
+        None,
+    )
+    .await
 }
 
 async fn run_analysis_with_runtime(
@@ -419,43 +427,84 @@ async fn run_analysis_with_runtime(
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
     runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
+    prepare_managed_runtime: bool,
+    product_data: Option<&crate::product_data_io::ScopedProductData>,
 ) -> AnalysisResult<AnalysisDocument> {
-    let document = load_analysis(workspace_root, analysis_id)?;
-    let analysis_dir = analysis_dir(workspace_root, analysis_id)?;
-    let script = fingerprint_required(
-        &analysis_dir.join(&document.manifest.script_path),
-        &document.manifest.script_path,
-    )?;
-    let inputs = fingerprint_inputs(workspace_root, &document.manifest.input_paths)?;
-    let parameters_sha256 = hash_json(&document.manifest.parameters)?;
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let started_at = Utc::now();
     let timer = Instant::now();
-    clear_generated_outputs(&analysis_dir)?;
+    let root = workspace_root.to_path_buf();
+    let id = analysis_id.to_string();
+    let prepared = run_analysis_io(product_data, "prepare analysis execution", move || {
+        let document = load_analysis(&root, &id)?;
+        let analysis_dir = analysis_dir(&root, &id)?;
+        let script = fingerprint_required(
+            &analysis_dir.join(&document.manifest.script_path),
+            &document.manifest.script_path,
+        )?;
+        let inputs = fingerprint_inputs(&root, &document.manifest.input_paths)?;
+        let parameters_sha256 = hash_json(&document.manifest.parameters)?;
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let started_at = Utc::now();
+        clear_generated_outputs(&analysis_dir)?;
+        Ok(PreparedAnalysisRun {
+            document,
+            analysis_dir,
+            script,
+            inputs,
+            parameters_sha256,
+            run_id,
+            started_at,
+        })
+    })
+    .await?;
+
+    let managed_runtime = if runtime.is_none()
+        && prepare_managed_runtime
+        && prepared.document.manifest.language == AnalysisLanguage::Python
+    {
+        match crate::analysis_runtime::AnalyticsRuntime::default()
+            .prepare_python_with_cancel(cancel.clone())
+            .await
+        {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                let terminal = terminal_from_runtime_error(&error);
+                return settle_analysis_run(
+                    workspace_root,
+                    analysis_id,
+                    prepared,
+                    terminal,
+                    timer,
+                    None,
+                    product_data,
+                )
+                .await;
+            }
+        }
+    } else {
+        None
+    };
+    let runtime = runtime.or(managed_runtime.as_ref());
     let mut parameters = ToolParameters::new();
     parameters.insert(
         "language".to_string(),
-        Value::String(document.manifest.language.as_str().to_string()),
+        Value::String(prepared.document.manifest.language.as_str().to_string()),
     );
     parameters.insert(
         "script_path".to_string(),
-        Value::String(document.manifest.script_path.clone()),
+        Value::String(prepared.document.manifest.script_path.clone()),
     );
     let context = ToolContext {
-        working_dir: Some(analysis_dir.clone()),
-        execution_id: Some(run_id.clone()),
-        call_id: Some(format!("analysis:{run_id}")),
+        working_dir: Some(prepared.analysis_dir.clone()),
+        execution_id: Some(prepared.run_id.clone()),
+        call_id: Some(format!("analysis:{}", prepared.run_id)),
         script_execution_profile: runtime.map(|runtime| runtime.profile.clone()),
         cancel,
         ..ToolContext::default()
     };
     let execution = tool_manager
-        .execute_tool_with_context("run_code", parameters, &context)
+        .execute_tool_with_context_draining_started("run_code", parameters, &context)
         .await;
-    let finished_at = Utc::now();
-    let duration_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-    let (status, exit_code, sandbox_type, output, error, output_truncated) = match execution {
+    let terminal = match execution {
         Ok(result) => {
             let status = run_status(&result);
             let exit_code = match &result.kind {
@@ -465,57 +514,116 @@ async fn run_analysis_with_runtime(
                     .get("exit_code")
                     .and_then(|value| value.parse::<i32>().ok()),
             };
-            (
+            AnalysisTerminal {
                 status,
                 exit_code,
-                result.metadata.get("sandbox_type").cloned(),
-                bounded_text(&result.output, MAX_CAPTURE_CHARS),
-                result.error.map(|value| bounded_text(&value, 8_000)),
-                result.truncated,
-            )
+                sandbox_type: result.metadata.get("sandbox_type").cloned(),
+                output: bounded_text(&result.output, MAX_CAPTURE_CHARS),
+                error: result.error.map(|value| bounded_text(&value, 8_000)),
+                output_truncated: result.truncated,
+            }
         }
-        Err(error) => (
-            AnalysisRunStatus::Failed,
-            None,
-            None,
-            String::new(),
-            Some(bounded_text(&error.to_string(), 8_000)),
-            false,
-        ),
+        Err(error) => terminal_from_react_error(&error),
     };
+    settle_analysis_run(
+        workspace_root,
+        analysis_id,
+        prepared,
+        terminal,
+        timer,
+        runtime,
+        product_data,
+    )
+    .await
+}
 
-    let outputs = archive_outputs(workspace_root, &analysis_dir, &run_id)?;
-    let mut environment = read_environment(&analysis_dir.join("environment.json"))?;
-    if let Some(runtime) = runtime {
-        environment.extend(runtime.environment.clone());
-    }
-    let record = AnalysisRunRecord {
-        contract_version: CONTRACT_VERSION,
-        run_id: run_id.clone(),
-        analysis_id: analysis_id.to_string(),
-        status,
-        started_at,
-        finished_at,
-        duration_ms,
-        script,
-        inputs,
-        parameters: document.manifest.parameters,
-        parameters_sha256,
-        random_seed: document.manifest.random_seed,
-        outputs,
-        environment,
-        exit_code,
-        sandbox_type,
-        runtime_profile: runtime.map(|runtime| runtime.profile.id.clone()),
-        output,
-        error,
-        output_truncated,
-    };
-    let runs_dir = analysis_dir.join(RUNS_DIR);
-    fs::create_dir_all(&runs_dir)?;
-    write_json(&runs_dir.join(format!("{run_id}.json")), &record)?;
-    write_json(&analysis_dir.join(LATEST_RUN_FILE), &record)?;
-    load_analysis(workspace_root, analysis_id)
+struct PreparedAnalysisRun {
+    document: AnalysisDocument,
+    analysis_dir: PathBuf,
+    script: AnalysisFileFingerprint,
+    inputs: Vec<AnalysisFileFingerprint>,
+    parameters_sha256: String,
+    run_id: String,
+    started_at: DateTime<Utc>,
+}
+
+struct AnalysisTerminal {
+    status: AnalysisRunStatus,
+    exit_code: Option<i32>,
+    sandbox_type: Option<String>,
+    output: String,
+    error: Option<String>,
+    output_truncated: bool,
+}
+
+async fn settle_analysis_run(
+    workspace_root: &Path,
+    analysis_id: &str,
+    prepared: PreparedAnalysisRun,
+    terminal: AnalysisTerminal,
+    timer: Instant,
+    runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
+    product_data: Option<&crate::product_data_io::ScopedProductData>,
+) -> AnalysisResult<AnalysisDocument> {
+    let runtime_environment = runtime
+        .map(|runtime| runtime.environment.clone())
+        .unwrap_or_default();
+    let runtime_profile = runtime.map(|runtime| runtime.profile.id.clone());
+    let finished_at = Utc::now();
+    let duration_ms = u64::try_from(timer.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let root = workspace_root.to_path_buf();
+    let id = analysis_id.to_string();
+    run_analysis_io(product_data, "settle analysis execution", move || {
+        let outputs = archive_outputs(&root, &prepared.analysis_dir, &prepared.run_id)?;
+        let mut environment = read_environment(&prepared.analysis_dir.join("environment.json"))?;
+        environment.extend(runtime_environment);
+        let record = AnalysisRunRecord {
+            contract_version: CONTRACT_VERSION,
+            run_id: prepared.run_id.clone(),
+            analysis_id: id.clone(),
+            status: terminal.status,
+            started_at: prepared.started_at,
+            finished_at,
+            duration_ms,
+            script: prepared.script,
+            inputs: prepared.inputs,
+            parameters: prepared.document.manifest.parameters,
+            parameters_sha256: prepared.parameters_sha256,
+            random_seed: prepared.document.manifest.random_seed,
+            outputs,
+            environment,
+            exit_code: terminal.exit_code,
+            sandbox_type: terminal.sandbox_type,
+            runtime_profile,
+            output: terminal.output,
+            error: terminal.error,
+            output_truncated: terminal.output_truncated,
+        };
+        let runs_dir = prepared.analysis_dir.join(RUNS_DIR);
+        fs::create_dir_all(&runs_dir)?;
+        write_json(&runs_dir.join(format!("{}.json", prepared.run_id)), &record)?;
+        write_json(&prepared.analysis_dir.join(LATEST_RUN_FILE), &record)?;
+        load_analysis(&root, &id)
+    })
+    .await
+}
+
+async fn run_analysis_io<T, F>(
+    product_data: Option<&crate::product_data_io::ScopedProductData>,
+    operation: &'static str,
+    function: F,
+) -> AnalysisResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AnalysisResult<T> + Send + 'static,
+{
+    let receipt = product_data.map(crate::product_data_io::ScopedProductData::settlement_receipt);
+    crate::product_data_io::run(operation, move || {
+        let _receipt = receipt;
+        function()
+    })
+    .await
+    .map_err(|error| AnalysisError::Execution(error.to_string()))?
 }
 
 pub fn format_analysis_list(summaries: &[AnalysisSummary]) -> String {
@@ -974,6 +1082,46 @@ fn run_status(result: &echo_agent::tools::ToolResult) -> AnalysisRunStatus {
     }
 }
 
+fn terminal_from_react_error(error: &echo_agent::error::ReactError) -> AnalysisTerminal {
+    let failure = echo_agent::error::AgentFailure::from_react_error(error);
+    let status = match failure.terminal_kind {
+        echo_agent::error::AgentTerminalKind::Cancelled => AnalysisRunStatus::Cancelled,
+        echo_agent::error::AgentTerminalKind::TimedOut => AnalysisRunStatus::TimedOut,
+        echo_agent::error::AgentTerminalKind::Failed
+        | echo_agent::error::AgentTerminalKind::PermissionDenied => AnalysisRunStatus::Failed,
+    };
+    AnalysisTerminal {
+        status,
+        exit_code: None,
+        sandbox_type: None,
+        output: String::new(),
+        error: Some(bounded_text(&failure.message, 8_000)),
+        output_truncated: false,
+    }
+}
+
+fn terminal_from_runtime_error(
+    error: &crate::analysis_runtime::AnalyticsRuntimeError,
+) -> AnalysisTerminal {
+    let status = match error {
+        crate::analysis_runtime::AnalyticsRuntimeError::Cancelled(_) => {
+            AnalysisRunStatus::Cancelled
+        }
+        crate::analysis_runtime::AnalyticsRuntimeError::CommandTimedOut(_) => {
+            AnalysisRunStatus::TimedOut
+        }
+        _ => AnalysisRunStatus::Failed,
+    };
+    AnalysisTerminal {
+        status,
+        exit_code: None,
+        sandbox_type: None,
+        output: String::new(),
+        error: Some(bounded_text(&error.to_string(), 8_000)),
+        output_truncated: false,
+    }
+}
+
 fn hash_file(path: &Path) -> AnalysisResult<String> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
@@ -1040,6 +1188,9 @@ mod tests {
 
     struct ScriptTool;
     struct ArtifactFailureTool;
+    struct CancellationAwareTool {
+        started: Arc<tokio::sync::Notify>,
+    }
 
     struct ProfileScriptTool {
         seen_profile: Arc<std::sync::Mutex<Option<String>>>,
@@ -1119,6 +1270,41 @@ mod tests {
                 Ok(ToolResult::success(
                     "ran but artifact persistence will fail",
                 ))
+            })
+        }
+    }
+
+    impl Tool for CancellationAwareTool {
+        fn name(&self) -> &str {
+            "run_code"
+        }
+
+        fn description(&self) -> &str {
+            "test started analysis cancellation"
+        }
+
+        fn parameters(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn execute_with_context<'a>(
+            &'a self,
+            _parameters: ToolParameters,
+            context: &'a ToolContext,
+        ) -> BoxFuture<'a, AgentResult<ToolResult>> {
+            Box::pin(async move {
+                self.started.notify_one();
+                let cancel = context.cancel.as_ref().ok_or_else(|| {
+                    echo_agent::error::ReactError::Other(
+                        "missing analysis cancellation token".to_string(),
+                    )
+                })?;
+                cancel.cancelled().await;
+                Err(echo_agent::error::ReactError::Sandbox(Box::new(
+                    echo_agent::error::SandboxError::Cancelled(
+                        "started analysis cancelled".to_string(),
+                    ),
+                )))
             })
         }
     }
@@ -1308,6 +1494,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_before_tool_start_is_durably_cancelled() -> AnalysisResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let created = create_analysis(workspace.path(), "Before Start", AnalysisLanguage::R)?;
+        let manager = ToolManager::new();
+        manager.register(Box::new(ScriptTool));
+        let cancel = Arc::new(CancellationToken::new());
+        cancel.cancel();
+
+        let completed = run_analysis(
+            &manager,
+            workspace.path(),
+            &created.manifest.analysis_id,
+            Some(cancel),
+        )
+        .await?;
+        assert_eq!(
+            completed.last_run.as_ref().map(|run| run.status),
+            Some(AnalysisRunStatus::Cancelled)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_tool_start_is_durably_cancelled() -> AnalysisResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let created = create_analysis(workspace.path(), "Started", AnalysisLanguage::R)?;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let manager = Arc::new(ToolManager::new());
+        manager.register(Box::new(CancellationAwareTool {
+            started: Arc::clone(&started),
+        }));
+        let cancel = Arc::new(CancellationToken::new());
+        let manager_for_run = Arc::clone(&manager);
+        let cancel_for_run = Arc::clone(&cancel);
+        let root = workspace.path().to_path_buf();
+        let analysis_id = created.manifest.analysis_id.clone();
+        let operation = tokio::spawn(async move {
+            run_analysis(
+                manager_for_run.as_ref(),
+                &root,
+                &analysis_id,
+                Some(cancel_for_run),
+            )
+            .await
+        });
+        started.notified().await;
+        cancel.cancel();
+        let completed = operation
+            .await
+            .map_err(|error| AnalysisError::Execution(error.to_string()))??;
+        assert_eq!(
+            completed.last_run.as_ref().map(|run| run.status),
+            Some(AnalysisRunStatus::Cancelled)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_prepare_cancellation_creates_a_durable_cancelled_record() -> AnalysisResult<()>
+    {
+        let workspace = tempfile::tempdir()?;
+        let created = create_analysis(workspace.path(), "Prepare", AnalysisLanguage::Python)?;
+        let manager = ToolManager::new();
+        manager.register(Box::new(ScriptTool));
+        let cancel = Arc::new(CancellationToken::new());
+        cancel.cancel();
+
+        let completed = run_analysis_with_runtime(
+            &manager,
+            workspace.path(),
+            &created.manifest.analysis_id,
+            Some(cancel),
+            None,
+            true,
+            None,
+        )
+        .await?;
+        let run = completed
+            .last_run
+            .as_ref()
+            .ok_or_else(|| AnalysisError::Invalid("missing cancelled run record".to_string()))?;
+        assert_eq!(run.status, AnalysisRunStatus::Cancelled);
+        assert!(
+            run.error
+                .as_deref()
+                .is_some_and(|error| error.contains("cancelled"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn managed_runtime_profile_reaches_run_code_and_run_record() -> AnalysisResult<()> {
         let workspace = tempfile::tempdir()?;
         let created = create_analysis(workspace.path(), "Managed", AnalysisLanguage::Python)?;
@@ -1338,6 +1615,8 @@ mod tests {
             &created.manifest.analysis_id,
             None,
             Some(&prepared),
+            false,
+            None,
         )
         .await?;
         let run = completed

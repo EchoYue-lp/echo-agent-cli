@@ -35,6 +35,7 @@ pub mod permission;
 mod plugin_components;
 pub mod plugin_runtime;
 pub mod prepared_turn;
+pub mod product_data_io;
 pub mod profiles;
 pub mod project;
 pub mod prompt_contract;

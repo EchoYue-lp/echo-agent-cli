@@ -518,6 +518,7 @@ pub async fn resume_task_run(
         runtime.review_integration(),
         Some(trace_sink),
         cancel,
+        Some(runtime.workspace_io_invocation()),
     )
     .await
     {
@@ -675,6 +676,7 @@ async fn resume_continuation_run(
     ));
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         execution_scope: runtime.execution_scope().clone(),
+        workspace_io_receipt: Some(runtime.workspace_io_receipt()),
         pool: runtime.pool(),
         store: Some(store.clone()),
         sink: sink.clone(),
@@ -779,6 +781,7 @@ pub async fn retry_blocked_task(
         cancel,
         run_id.clone(),
         task_id.clone(),
+        Some(runtime.workspace_io_invocation()),
     )
     .map_err(|error| match error {
         echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(message) => {
@@ -813,6 +816,7 @@ fn spawn_tauri_task_retry(
     cancel: echo_agent::agent::CancellationToken,
     run_id: String,
     task_id: String,
+    workspace_io: Option<echo_agent_app_core::state::WorkspaceIoInvocation>,
 ) -> Result<
     echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation,
     echo_agent_app_core::tasks::task_runtime::StoreError,
@@ -865,6 +869,7 @@ fn spawn_tauri_task_retry(
                 &driver_run_id,
                 cancel,
                 echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+                workspace_io,
             )
             .await;
             match outcome {
@@ -1212,6 +1217,7 @@ mod tests {
                 echo_agent::agent::CancellationToken::new(),
                 run_id.to_string(),
                 "retry-task".to_string(),
+                None,
             )
             .map_err(|error| error.to_string())?;
             assert_eq!(preparation, expected);
@@ -1244,6 +1250,7 @@ mod tests {
             echo_agent::agent::CancellationToken::new(),
             "gui-closed".to_string(),
             "retry-task".to_string(),
+            None,
         );
         assert!(result.is_err());
         assert_eq!(before, snapshot(&store, "gui-closed")?);
@@ -1278,6 +1285,7 @@ mod tests {
             echo_agent::agent::CancellationToken::new(),
             "gui-registration".to_string(),
             "retry-task".to_string(),
+            None,
         )
         .err()
         .ok_or_else(|| "GUI retry registration unexpectedly succeeded".to_string())?;

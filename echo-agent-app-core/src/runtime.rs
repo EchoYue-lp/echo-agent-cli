@@ -96,6 +96,28 @@ impl ApplicationLifecycleReceipt {
     }
 }
 
+fn record_analysis_cleanup_outcomes(
+    receipt: &mut ApplicationLifecycleReceipt,
+    outcomes: Vec<crate::product_data_io::AnalysisCancelReceipt>,
+) {
+    for outcome in outcomes {
+        match outcome {
+            crate::product_data_io::AnalysisCancelReceipt::Joined { .. } => {}
+            crate::product_data_io::AnalysisCancelReceipt::CleanupTimedOut {
+                receipt: run,
+                timeout_seconds,
+            } => receipt.record(
+                format!("analysis run {}", run.owner_id),
+                format!("cleanup timed out after {timeout_seconds} seconds"),
+            ),
+            crate::product_data_io::AnalysisCancelReceipt::CleanupFailed {
+                receipt: run,
+                error,
+            } => receipt.record(format!("analysis run {}", run.owner_id), error),
+        }
+    }
+}
+
 impl std::fmt::Display for ApplicationLifecycleReceipt {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "application {}", self.reason)?;
@@ -395,6 +417,10 @@ impl ApplicationLifecycleOwner {
             if let Err(error) = state.session.foreground_turns.shutdown().await {
                 receipt.record("foreground turns", error);
             }
+            record_analysis_cleanup_outcomes(
+                &mut receipt,
+                state.join_analysis_run_shutdown().await,
+            );
             if let Err(error) = state.shutdown_model_mutations().await {
                 receipt.record("model mutations", error);
             }
@@ -900,9 +926,16 @@ impl AgentRuntime {
         bootstrap_lifecycle.bind_plugin_runtime(plugin_runtime.clone());
 
         // ── 11. File-backed research library ──
+        let auto_ingest_identity = crate::workspace::WorkspaceIoIdentity::global(
+            params
+                .working_dir
+                .clone()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| std::path::PathBuf::from(".")),
+        );
         agent_handle
-            .write(|agent| {
-                crate::research_connectors::install_auto_ingest_tools(agent);
+            .write(move |agent| {
+                crate::research_connectors::install_auto_ingest_tools(agent, auto_ingest_identity);
                 agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
             })
             .await;
@@ -1283,6 +1316,66 @@ mod tests {
             Some("aborted fixture")
         );
         assert!(receipt.into_result().is_err());
+    }
+
+    #[test]
+    fn lifecycle_receipt_aggregates_analysis_cleanup_failures() {
+        use crate::product_data_io::{AnalysisCancelReceipt, AnalysisRunReceipt};
+
+        let run = |owner_id: &str| AnalysisRunReceipt {
+            workspace_id: "workspace-a".to_string(),
+            workspace_generation: "generation-a".to_string(),
+            analysis_id: "analysis-a".to_string(),
+            owner_id: owner_id.to_string(),
+        };
+        let mut receipt =
+            ApplicationLifecycleReceipt::new(ApplicationLifecycleReason::Shutdown, None);
+        record_analysis_cleanup_outcomes(
+            &mut receipt,
+            vec![
+                AnalysisCancelReceipt::Joined {
+                    receipt: run("joined"),
+                    execution_error: Some("cancelled as requested".to_string()),
+                },
+                AnalysisCancelReceipt::CleanupTimedOut {
+                    receipt: run("timed-out"),
+                    timeout_seconds: 30,
+                },
+                AnalysisCancelReceipt::CleanupFailed {
+                    receipt: run("failed"),
+                    error: "join failed".to_string(),
+                },
+            ],
+        );
+
+        assert_eq!(receipt.failures.len(), 2);
+        assert_eq!(
+            receipt
+                .failures
+                .first()
+                .map(|failure| failure.owner.as_str()),
+            Some("analysis run timed-out")
+        );
+        assert!(
+            receipt
+                .failures
+                .first()
+                .is_some_and(|failure| failure.error.contains("30 seconds"))
+        );
+        assert_eq!(
+            receipt
+                .failures
+                .get(1)
+                .map(|failure| failure.owner.as_str()),
+            Some("analysis run failed")
+        );
+        assert_eq!(
+            receipt
+                .failures
+                .get(1)
+                .map(|failure| failure.error.as_str()),
+            Some("join failed")
+        );
     }
 
     #[tokio::test]

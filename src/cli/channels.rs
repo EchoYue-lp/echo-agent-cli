@@ -1276,11 +1276,16 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             };
             let agent = pool_execution.agent();
             configure_channel_agent(&agent, &cache_id, Arc::clone(&self.hitl)).await;
+            let product_data = self.app_state.product_data_for_runtime(&runtime).await.ok();
             let message = if let Some(message) = channel_trace_response(&agent, &msg.text).await {
                 message
-            } else if let Some(message) = channel_analysis_response(&agent, &msg.text).await {
+            } else if let Some(message) =
+                channel_analysis_response(product_data.as_ref(), &msg.text).await
+            {
                 message
-            } else if let Some(message) = channel_papers_response(&agent, &msg.text).await {
+            } else if let Some(message) =
+                channel_papers_response(product_data.as_ref(), &msg.text).await
+            {
                 message
             } else if let Some(message) = channel_skills_response(&agent, &msg.text).await {
                 message
@@ -1422,6 +1427,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         };
         let store = scoped_runtime.task_runtime();
         let execution_scope = scoped_runtime.execution_scope().clone();
+        let workspace_io_receipt = scoped_runtime.workspace_io_receipt();
         let app_state = self.app_state.clone();
         let webhook_emitter = self.webhook_emitter.clone();
         let review_integration = scoped_runtime.review_integration();
@@ -1464,6 +1470,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     let res =
                         std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
                             execution_scope,
+                            workspace_io_receipt: Some(workspace_io_receipt),
                             pool: Some(pool.clone()),
                             store,
                             sink,
@@ -1524,6 +1531,9 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                     res.review_integration.clone(),
                                     Some(trace_sink),
                                     foreground_lease.cancellation_token(),
+                                    res.workspace_io_receipt
+                                        .as_ref()
+                                        .map(|receipt| receipt.invocation()),
                                 )
                                 .await
                                 .map_err(|error| error.to_string())
@@ -1710,7 +1720,7 @@ async fn channel_trace_response(
 
 #[cfg(feature = "channels")]
 async fn channel_analysis_response(
-    agent: &echo_agent_app_core::agent_handle::AgentHandle,
+    product_data: Option<&echo_agent_app_core::product_data_io::ScopedProductData>,
     message: &str,
 ) -> Option<String> {
     let mut parts = message.split_whitespace();
@@ -1718,12 +1728,17 @@ async fn channel_analysis_response(
         return None;
     }
     let args: Vec<&str> = parts.collect();
-    Some(crate::cli::cmd_impls::analysis::execute_analysis_command(agent, &args).await)
+    Some(match product_data {
+        Some(product_data) => {
+            crate::cli::cmd_impls::analysis::execute_analysis_command(product_data, &args).await
+        }
+        None => "Analysis workspace is unavailable.".to_string(),
+    })
 }
 
 #[cfg(feature = "channels")]
 async fn channel_papers_response(
-    agent: &echo_agent_app_core::agent_handle::AgentHandle,
+    product_data: Option<&echo_agent_app_core::product_data_io::ScopedProductData>,
     message: &str,
 ) -> Option<String> {
     let mut parts = message.split_whitespace();
@@ -1731,7 +1746,12 @@ async fn channel_papers_response(
         return None;
     }
     let args: Vec<&str> = parts.collect();
-    Some(crate::cli::cmd_impls::research::execute_papers_command(agent, &args).await)
+    Some(match product_data {
+        Some(product_data) => {
+            crate::cli::cmd_impls::research::execute_papers_command(product_data, &args).await
+        }
+        None => "Research workspace is unavailable.".to_string(),
+    })
 }
 
 #[cfg(feature = "channels")]

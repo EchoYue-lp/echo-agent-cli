@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { papersApi, type Paper } from '../../api/endpoints';
+import { papersApi, type Paper, type ProductDataScope } from '../../api/endpoints';
 import {
   X,
   Save,
@@ -14,12 +14,13 @@ import {
 } from 'lucide-react';
 
 interface PaperDetailProps {
+  scope: ProductDataScope;
   paper: Paper;
   onClose: () => void;
   onUpdated: () => void;
 }
 
-export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
+export function PaperDetail({ scope, paper, onClose, onUpdated }: PaperDetailProps) {
   const [notes, setNotes] = useState(paper.notes || '');
   const [editingNotes, setEditingNotes] = useState(false);
   const [newTag, setNewTag] = useState('');
@@ -33,7 +34,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
   const handleSaveNotes = async () => {
     setSaving(true);
     try {
-      await papersApi.updateNotes(paper.id, notes);
+      await papersApi.updateNotes(scope, paper.id, notes);
       setEditingNotes(false);
       onUpdated();
     } catch (e) {
@@ -46,7 +47,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
   const handleAddTag = async () => {
     if (!newTag.trim()) return;
     try {
-      await papersApi.addTags(paper.id, [newTag.trim()]);
+      await papersApi.addTags(scope, paper.id, [newTag.trim()]);
       setNewTag('');
       onUpdated();
     } catch (e) {
@@ -57,7 +58,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
   const handleDelete = async () => {
     if (!confirm('Delete this paper?')) return;
     try {
-      await papersApi.delete(paper.id);
+      await papersApi.delete(scope, paper.id);
       onClose();
       onUpdated();
     } catch (e) {

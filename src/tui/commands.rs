@@ -116,6 +116,7 @@ pub enum SlashCommand {
     Edit,
     Browser,
     Analysis,
+    Papers,
     Terminal,
     Lsp,
 
@@ -212,6 +213,7 @@ impl SlashCommand {
             Self::Edit => "Edit a workspace file in $VISUAL/$EDITOR",
             Self::Browser => "Show or switch the browser backend",
             Self::Analysis => "Create, inspect, and run file-backed analyses",
+            Self::Papers => "Manage research sources, evidence, and systematic reviews",
             Self::Terminal => "Manage and attach to interactive terminal sessions",
             Self::Lsp => "Inspect and manage workspace language servers",
 
@@ -300,6 +302,7 @@ impl SlashCommand {
             | Self::Edit
             | Self::Browser
             | Self::Analysis
+            | Self::Papers
             | Self::Terminal
             | Self::Lsp => Category::Coding,
             Self::Git | Self::Worktrees => Category::Git,
@@ -336,7 +339,12 @@ impl SlashCommand {
             Self::Diff => "[file-path]",
             Self::Preview | Self::Edit => "<file-path>",
             Self::Browser => "[status|managed|chrome]",
-            Self::Analysis => "[list|create <python|r> <title>|show <id>|run <id>]",
+            Self::Analysis => {
+                "[list|create <python|r> <title>|show <id>|save <id> <json>|run <id>|wait <id> <owner>|cancel <id>|delete <id>]"
+            }
+            Self::Papers => {
+                "[list|show|add-source|update-notes|add-tags|delete-source|evidence|upsert-evidence|delete-evidence|reviews|review|create-review|save-review|delete-review|search|enrich|audit|export|zotero-import|zotero-export]"
+            }
             Self::Terminal => {
                 "[list|create <id> [cwd] [rows] [cols]|attach <id>|write <id> <data>|resize <id> <rows> <cols>|close <id>]"
             }
@@ -453,6 +461,17 @@ mod tests {
         assert_eq!(retry.usage(), "<task-id> [run-id]");
         assert_eq!(skip.category(), Category::Coding);
         assert_eq!(recovery.usage(), "[run-id]");
+        Ok(())
+    }
+
+    #[test]
+    fn papers_is_a_first_class_tui_product_command() -> Result<(), String> {
+        let papers = "papers"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(papers, SlashCommand::Papers);
+        assert_eq!(papers.category(), Category::Coding);
+        assert!(papers.usage().contains("save-review"));
         Ok(())
     }
 

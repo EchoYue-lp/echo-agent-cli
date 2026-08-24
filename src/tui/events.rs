@@ -1720,6 +1720,7 @@ async fn dispatch_turn(
     };
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         execution_scope: scoped_runtime.execution_scope().clone(),
+        workspace_io_receipt: Some(scoped_runtime.workspace_io_receipt()),
         pool: scoped_runtime.pool(),
         store: scoped_runtime.task_runtime(),
         sink,
@@ -2791,6 +2792,9 @@ async fn send_to_agent(
                 res.review_integration.clone(),
                 Some(trace_sink),
                 lease.cancellation_token(),
+                res.workspace_io_receipt
+                    .as_ref()
+                    .map(|receipt| receipt.invocation()),
             )
             .await
             .map_err(|error| error.to_string()),
@@ -5205,9 +5209,39 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::Analysis) => {
             let command_args: Vec<&str> = args.split_whitespace().collect();
-            let content =
-                crate::cli::cmd_impls::analysis::execute_analysis_command(agent, &command_args)
-                    .await;
+            let content = match app.app_state.as_ref() {
+                Some(state) => match state.current_product_data().await {
+                    Ok(product_data) => {
+                        crate::cli::cmd_impls::analysis::execute_analysis_command(
+                            &product_data,
+                            &command_args,
+                        )
+                        .await
+                    }
+                    Err(error) => format!("Analysis workspace is unavailable: {error}"),
+                },
+                None => "Analysis workspace is unavailable.".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::Papers) => {
+            let command_args: Vec<&str> = args.split_whitespace().collect();
+            let content = match app.app_state.as_ref() {
+                Some(state) => match state.current_product_data().await {
+                    Ok(product_data) => {
+                        crate::cli::cmd_impls::research::execute_papers_command(
+                            &product_data,
+                            &command_args,
+                        )
+                        .await
+                    }
+                    Err(error) => format!("Research workspace is unavailable: {error}"),
+                },
+                None => "Research workspace is unavailable.".to_string(),
+            };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content,
@@ -5924,6 +5958,7 @@ async fn handle_slash_command(
                     run_id.clone(),
                     task_id.to_string(),
                     runtime.review_integration(),
+                    Some(runtime.workspace_io_invocation()),
                 )
                 .await
                 .map_err(|error| error.to_string())
@@ -6186,6 +6221,7 @@ async fn retry_tui_task(
     run_id: String,
     task_id: String,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    workspace_io: Option<echo_agent_app_core::state::WorkspaceIoInvocation>,
 ) -> Result<String, echo_agent_app_core::tasks::task_runtime::StoreError> {
     let preparation = start_tui_task_retry_driver(
         store,
@@ -6194,6 +6230,7 @@ async fn retry_tui_task(
         run_id.clone(),
         task_id.clone(),
         review_integration,
+        workspace_io,
     )
     .await?;
     match preparation {
@@ -6215,6 +6252,7 @@ async fn start_tui_task_retry_driver(
     run_id: String,
     task_id: String,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    workspace_io: Option<echo_agent_app_core::state::WorkspaceIoInvocation>,
 ) -> Result<
     echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation,
     echo_agent_app_core::tasks::task_runtime::StoreError,
@@ -6265,6 +6303,7 @@ async fn start_tui_task_retry_driver(
                 &preparation_run_id,
                 cancel,
                 echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+                workspace_io,
             )
             .await;
             if let Err(error) = result {
@@ -7397,6 +7436,7 @@ mod tests {
             None,
             "tui-retry-closed".to_string(),
             "retry-task".to_string(),
+            None,
             None,
         )
         .await

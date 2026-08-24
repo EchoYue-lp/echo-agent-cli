@@ -155,16 +155,18 @@ impl WorkspaceRegistry {
         WorkspaceLayout::ensure_dirs(&root)?;
 
         let now = Utc::now();
-        let workspace = Workspace {
+        let mut workspace = Workspace {
             id: id.clone(),
             name: name.to_string(),
             root: root.clone(),
             project_root: None,
             kind,
             metadata: WorkspaceMetadata::default(),
+            product_data_generation: String::new(),
             created_at: now,
             last_active: now,
         };
+        workspace.refresh_product_data_generation();
 
         // 写入清单文件
         self.save_manifest(&workspace)?;
@@ -186,6 +188,21 @@ impl WorkspaceRegistry {
     ///
     /// 先从索引查找路径，找不到时回退到默认路径。
     pub fn open(&self, id: &WorkspaceId) -> anyhow::Result<Workspace> {
+        let mut workspace = self.inspect(id)?;
+
+        // Opening is a user-visible lifecycle action, so it advances activity.
+        workspace.touch();
+        self.save_manifest(&workspace)?;
+
+        Ok(workspace)
+    }
+
+    /// Read one workspace without changing activity or writing its manifest.
+    ///
+    /// Product-data and runtime scope resolution use this path. A read may run
+    /// in an owned blocking task after its caller is dropped, so it must remain
+    /// free of side effects and safe to overlap a later lifecycle transition.
+    pub fn inspect(&self, id: &WorkspaceId) -> anyhow::Result<Workspace> {
         let index = self.load_index();
 
         // 优先从索引获取路径
@@ -200,10 +217,7 @@ impl WorkspaceRegistry {
         let manifest_path = WorkspaceLayout::existing_manifest(&root);
         let data = fs::read_to_string(&manifest_path)?;
         let mut workspace: Workspace = serde_json::from_str(&data)?;
-
-        // 更新最后活跃时间
-        workspace.touch();
-        self.save_manifest(&workspace)?;
+        workspace.refresh_product_data_generation();
 
         Ok(workspace)
     }
@@ -228,8 +242,9 @@ impl WorkspaceRegistry {
             let manifest = WorkspaceLayout::existing_manifest(&root);
             if manifest.exists()
                 && let Ok(data) = fs::read_to_string(&manifest)
-                && let Ok(ws) = serde_json::from_str::<Workspace>(&data)
+                && let Ok(mut ws) = serde_json::from_str::<Workspace>(&data)
             {
+                ws.refresh_product_data_generation();
                 seen_ids.insert(id_str.clone());
                 workspaces.push(ws);
                 continue;
@@ -254,9 +269,10 @@ impl WorkspaceRegistry {
                     continue;
                 }
                 if let Ok(data) = fs::read_to_string(&manifest)
-                    && let Ok(ws) = serde_json::from_str::<Workspace>(&data)
+                    && let Ok(mut ws) = serde_json::from_str::<Workspace>(&data)
                     && !seen_ids.contains(ws.id.as_str())
                 {
+                    ws.refresh_product_data_generation();
                     workspaces.push(ws);
                 }
             }
@@ -357,7 +373,15 @@ impl WorkspaceRegistry {
         }
 
         let project_display = canonical.display().to_string();
-        workspace.project_root = Some(canonical);
+        if workspace.project_root.as_ref() != Some(&canonical) {
+            workspace.metadata.project_root_revision = workspace
+                .metadata
+                .project_root_revision
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("Project-root revision overflow"))?;
+            workspace.project_root = Some(canonical);
+        }
+        workspace.refresh_product_data_generation();
         self.save_manifest(&workspace)?;
 
         tracing::info!(
@@ -414,8 +438,8 @@ impl WorkspaceRegistry {
         if let Some(parent) = manifest_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_string_pretty(workspace)?;
-        fs::write(&manifest_path, json)?;
+        let json = serde_json::to_vec_pretty(workspace)?;
+        echo_agent::utils::fs::atomic_write(&manifest_path, &json)?;
         Ok(())
     }
 }
@@ -425,6 +449,47 @@ impl WorkspaceRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspect_is_side_effect_free_and_keeps_manifest_bytes_stable() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().to_path_buf())?;
+        let workspace = registry.create("inspect-only", WorkspaceKind::default())?;
+        let manifest = WorkspaceLayout::manifest(&workspace.root);
+        let before = std::fs::read(&manifest)?;
+
+        let first = registry.inspect(&workspace.id)?;
+        let second = registry.inspect(&workspace.id)?;
+        let after = std::fs::read(&manifest)?;
+
+        assert_eq!(first.last_active, workspace.last_active);
+        assert_eq!(second.last_active, workspace.last_active);
+        assert_eq!(
+            first.product_data_generation,
+            workspace.product_data_generation
+        );
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn inspect_cannot_roll_back_a_newer_project_link_revision() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let registry = WorkspaceRegistry::with_base_dir(temp.path().join("registry"))?;
+        let workspace = registry.create("inspect-relink", WorkspaceKind::default())?;
+        let stale_snapshot = registry.inspect(&workspace.id)?;
+        let project = temp.path().join("linked-project");
+        std::fs::create_dir_all(&project)?;
+
+        let linked = registry.link_project(&workspace.id, project.canonicalize()?)?;
+        let inspected = registry.inspect(&workspace.id)?;
+
+        assert_eq!(stale_snapshot.metadata.project_root_revision, 0);
+        assert_eq!(linked.metadata.project_root_revision, 1);
+        assert_eq!(inspected.metadata.project_root_revision, 1);
+        assert_eq!(inspected.project_root, linked.project_root);
+        Ok(())
+    }
 
     #[test]
     fn test_create_and_open_workspace() {

@@ -20,11 +20,15 @@ import AnalysisPanel from '../analysis/AnalysisPanel';
 import { PaperPanel } from '../papers/PaperPanel';
 import { AutomationPanel } from '../automation/AutomationPanel';
 import { RightRail } from './RightRail';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { productDataScope, productDataScopeKey } from '../../lib/productDataScope';
 
 export function RightWorkspace() {
   const store = useRightWorkspaceStore();
   const setWidth = store.setWidth;
   const leftSidebarOpen = useUiStore((state) => state.leftSidebarOpen);
+  const workspace = useWorkspaceStore((state) => state.current);
+  const productScopeKey = productDataScopeKey(productDataScope(workspace));
   const resizing = useRef(false);
   const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 
@@ -125,15 +129,15 @@ export function RightWorkspace() {
           {store.activeTab === 'tasks' ? (
             <RightRail />
           ) : store.activeTab === 'analysis' ? (
-            <AnalysisPanel />
+            <AnalysisPanel key={productScopeKey} />
           ) : store.activeTab === 'research' ? (
-            <PaperPanel />
+            <PaperPanel key={productScopeKey} />
           ) : store.activeTab === 'browser' ? (
             <BrowserPanel />
           ) : store.activeTab === 'automation' ? (
             <AutomationPanel />
           ) : (
-            <FileBrowser />
+            <FileBrowser key={productScopeKey} />
           )}
         </div>
       </aside>

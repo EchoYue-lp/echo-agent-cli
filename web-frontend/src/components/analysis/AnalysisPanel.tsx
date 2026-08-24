@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   AlertTriangle,
   Braces,
@@ -14,6 +14,7 @@ import {
   Save,
   Square,
   Table2,
+  Trash2,
   X,
 } from 'lucide-react';
 import {
@@ -26,6 +27,8 @@ import {
 import { errorMessage, fileSystem } from '../../lib/tauri-bridge';
 import { useToastStore } from '../../stores/toastStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { productDataScope, productDataScopeKey } from '../../lib/productDataScope';
+import { LatestOperationOwner, LatestRequestFence } from '../../lib/latestRequest';
 
 type WorkbenchTab = 'code' | 'results' | 'lineage';
 
@@ -86,7 +89,15 @@ function statusClass(status?: AnalysisRunStatus | null): string {
 }
 
 export default function AnalysisPanel() {
-  const workspaceId = useWorkspaceStore((state) => state.current?.id ?? null);
+  const workspace = useWorkspaceStore((state) => state.current);
+  const scope = useMemo(() => productDataScope(workspace), [workspace]);
+  const scopeKey = productDataScopeKey(scope);
+  const scopeRef = useRef(scopeKey);
+  scopeRef.current = scopeKey;
+  const selectionFence = useRef(new LatestRequestFence());
+  const loadingOperations = useRef(0);
+  const savingOwner = useRef(new LatestOperationOwner());
+  const runningOwner = useRef(new LatestOperationOwner());
   const addToast = useToastStore((state) => state.addToast);
   const [summaries, setSummaries] = useState<AnalysisSummary[]>([]);
   const [document, setDocument] = useState<AnalysisDocument | null>(null);
@@ -98,32 +109,47 @@ export default function AnalysisPanel() {
   const [creating, setCreating] = useState(false);
   const [newTitle, setNewTitle] = useState('');
   const [newLanguage, setNewLanguage] = useState<AnalysisLanguage>('python');
+  const beginLoading = useCallback(() => {
+    loadingOperations.current += 1;
+    setLoading(true);
+  }, []);
+  const endLoading = useCallback(() => {
+    loadingOperations.current = Math.max(0, loadingOperations.current - 1);
+    if (loadingOperations.current === 0) setLoading(false);
+  }, []);
 
   const loadDocument = useCallback(
     async (analysisId: string) => {
-      setLoading(true);
+      const request = selectionFence.current.begin(scopeKey);
+      beginLoading();
       try {
-        const loaded = await analysisApi.get(analysisId);
+        const loaded = await analysisApi.get(scope, analysisId);
+        if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
         setDocument(loaded);
         setDraft(draftFromDocument(loaded));
       } catch (error) {
-        addToast('error', errorMessage(error));
+        if (selectionFence.current.isCurrent(request, scopeRef.current)) {
+          addToast('error', errorMessage(error));
+        }
       } finally {
-        setLoading(false);
+        endLoading();
       }
     },
-    [addToast]
+    [addToast, beginLoading, endLoading, scope, scopeKey]
   );
 
   const refreshList = useCallback(
     async (preferredId?: string) => {
-      setLoading(true);
+      const request = selectionFence.current.begin(scopeKey);
+      beginLoading();
       try {
-        const list = await analysisApi.list();
+        const list = await analysisApi.list(scope);
+        if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
         setSummaries(list);
         const selectedId = preferredId ?? list[0]?.analysis_id;
         if (selectedId) {
-          const loaded = await analysisApi.get(selectedId);
+          const loaded = await analysisApi.get(scope, selectedId);
+          if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
           setDocument(loaded);
           setDraft(draftFromDocument(loaded));
         } else {
@@ -131,12 +157,14 @@ export default function AnalysisPanel() {
           setDraft(null);
         }
       } catch (error) {
-        addToast('error', errorMessage(error));
+        if (selectionFence.current.isCurrent(request, scopeRef.current)) {
+          addToast('error', errorMessage(error));
+        }
       } finally {
-        setLoading(false);
+        endLoading();
       }
     },
-    [addToast]
+    [addToast, beginLoading, endLoading, scope, scopeKey]
   );
 
   useEffect(() => {
@@ -144,7 +172,7 @@ export default function AnalysisPanel() {
     setDraft(null);
     setSummaries([]);
     void refreshList();
-  }, [workspaceId, refreshList]);
+  }, [scopeKey, refreshList]);
 
   const dirty = useMemo(() => {
     if (!document || !draft) return false;
@@ -173,9 +201,11 @@ export default function AnalysisPanel() {
       return null;
     }
 
+    const request = selectionFence.current.begin(scopeKey);
+    const operation = savingOwner.current.begin();
     setSaving(true);
     try {
-      const saved = await analysisApi.save(document.manifest.analysis_id, {
+      const saved = await analysisApi.save(scope, document.manifest.analysis_id, {
         title: draft.title,
         script: draft.script,
         expectedScriptRevision: document.script_revision,
@@ -186,6 +216,7 @@ export default function AnalysisPanel() {
         parameters,
         randomSeed: seed,
       });
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return null;
       setDocument(saved);
       setDraft(draftFromDocument(saved));
       setSummaries((current) =>
@@ -204,12 +235,14 @@ export default function AnalysisPanel() {
       addToast('success', '分析已保存');
       return saved;
     } catch (error) {
-      addToast('error', errorMessage(error));
+      if (selectionFence.current.isCurrent(request, scopeRef.current)) {
+        addToast('error', errorMessage(error));
+      }
       return null;
     } finally {
-      setSaving(false);
+      if (savingOwner.current.isCurrent(operation)) setSaving(false);
     }
-  }, [addToast, document, draft]);
+  }, [addToast, document, draft, scope, scopeKey]);
 
   const handleRun = async () => {
     if (!document) return;
@@ -221,44 +254,94 @@ export default function AnalysisPanel() {
     }
     setRunning(true);
     setActiveTab('results');
+    const request = selectionFence.current.begin(scopeKey);
+    const operation = runningOwner.current.begin();
     try {
-      const completed = await analysisApi.run(current.manifest.analysis_id);
+      const completed = await analysisApi.run(scope, current.manifest.analysis_id);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setDocument(completed);
       setDraft(draftFromDocument(completed));
       await refreshList(completed.manifest.analysis_id);
       const status = completed.last_run?.status;
       addToast(status === 'succeeded' ? 'success' : 'warning', `分析${statusLabel(status)}`);
     } catch (error) {
-      addToast('error', errorMessage(error));
+      if (selectionFence.current.isCurrent(request, scopeRef.current)) {
+        addToast('error', errorMessage(error));
+      }
     } finally {
-      setRunning(false);
+      if (runningOwner.current.isCurrent(operation)) setRunning(false);
     }
   };
 
   const handleCancel = async () => {
     if (!document) return;
+    const analysisId = document.manifest.analysis_id;
+    const request = selectionFence.current.begin(scopeKey);
     try {
-      const cancelled = await analysisApi.cancel(document.manifest.analysis_id);
-      if (!cancelled) addToast('info', '当前分析没有运行中的进程');
+      const receipt = await analysisApi.cancel(scope, analysisId);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
+      if (receipt.status === 'joined') {
+        const cancelled = await analysisApi.get(scope, analysisId);
+        if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
+        setDocument(cancelled);
+        setDraft(draftFromDocument(cancelled));
+        setSummaries((current) =>
+          current.map((item) =>
+            item.analysis_id === analysisId
+              ? {
+                  ...item,
+                  updated_at: cancelled.manifest.updated_at,
+                  stale: cancelled.stale,
+                  stale_reasons: cancelled.stale_reasons,
+                  last_run_status: cancelled.last_run?.status ?? null,
+                }
+              : item
+          )
+        );
+        addToast('info', '分析运行已取消并完成清理');
+      } else {
+        addToast('warning', '分析清理仍在进行，完成前工作区保持占用');
+      }
     } catch (error) {
-      addToast('error', errorMessage(error));
+      if (selectionFence.current.isCurrent(request, scopeRef.current)) {
+        addToast('error', errorMessage(error));
+      }
     }
   };
 
   const handleCreate = async () => {
     const title = newTitle.trim();
     if (!title) return;
-    setLoading(true);
+    const request = selectionFence.current.begin(scopeKey);
+    beginLoading();
     try {
-      const created = await analysisApi.create(title, newLanguage);
+      const created = await analysisApi.create(scope, title, newLanguage);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
       setNewTitle('');
       setCreating(false);
       setActiveTab('code');
       await refreshList(created.manifest.analysis_id);
     } catch (error) {
-      addToast('error', errorMessage(error));
+      if (selectionFence.current.isCurrent(request, scopeRef.current)) {
+        addToast('error', errorMessage(error));
+      }
     } finally {
-      setLoading(false);
+      endLoading();
+    }
+  };
+
+  const handleDelete = async () => {
+    if (!document || !window.confirm(`删除分析“${document.manifest.title}”？`)) return;
+    const request = selectionFence.current.begin(scopeKey);
+    try {
+      await analysisApi.delete(scope, document.manifest.analysis_id);
+      if (!selectionFence.current.isCurrent(request, scopeRef.current)) return;
+      await refreshList();
+      addToast('success', '分析已删除');
+    } catch (error) {
+      if (selectionFence.current.isCurrent(request, scopeRef.current)) {
+        addToast('error', errorMessage(error));
+      }
     }
   };
 
@@ -399,6 +482,15 @@ export default function AnalysisPanel() {
               title="保存"
             >
               {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleDelete()}
+              disabled={running}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-secondary)] hover:bg-[var(--color-error-bg)] hover:text-[var(--color-error)] disabled:opacity-35"
+              title="删除分析"
+            >
+              <Trash2 size={13} />
             </button>
             {running ? (
               <button

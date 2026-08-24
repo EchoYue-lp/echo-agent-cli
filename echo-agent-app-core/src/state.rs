@@ -5,7 +5,6 @@
 //! - 双模式（Web + CLI）：共享的 Agent 实例
 
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
 use echo_agent::agent::CancellationToken;
 use echo_agent::memory::{Conversation, ConversationStore, NewConversation, StoredMessage};
 use echo_agent::prelude::*;
@@ -480,7 +479,7 @@ struct PreparedModelMutation {
 pub struct SessionState {
     pub tool_states: RwLock<HashMap<String, ToolState>>,
     /// Cancellation registry for non-chat operations such as analysis jobs.
-    pub operation_cancel_tokens: Arc<DashMap<String, CancellationToken>>,
+    pub analysis_runs: Arc<crate::product_data_io::AnalysisRunSupervisor>,
     /// Application authority for foreground chat admission and cancellation.
     pub foreground_turns: crate::foreground_turn::ForegroundTurnControl,
 }
@@ -704,6 +703,7 @@ pub struct WorkspaceState {
 pub struct ScopedChatRuntime {
     _lifetime: ScopedRuntimeLifetime,
     execution_scope: crate::workspace::WorkspaceExecutionScope,
+    workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
     primary_agent: AgentHandle,
     pool: Option<Arc<crate::agent_pool::AgentPool>>,
     task_runtime: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
@@ -713,6 +713,97 @@ pub struct ScopedChatRuntime {
     deletions: Arc<crate::conversation_deletion::ConversationDeletionService>,
 }
 
+/// Cloneable ownership receipt for product-data I/O started by an Agent turn.
+///
+/// The receipt deliberately carries only the exact workspace lifetime and its
+/// immutable EKO data root. Framework code receives it as an opaque invocation
+/// guard; product policy and mutable workspace focus never cross that boundary.
+#[derive(Clone)]
+pub struct ScopedWorkspaceIoReceipt {
+    _lifetime: ScopedRuntimeLifetime,
+    identity: crate::workspace::WorkspaceIoIdentity,
+}
+
+impl ScopedWorkspaceIoReceipt {
+    pub fn data_root(&self) -> &std::path::Path {
+        self.identity.data_root()
+    }
+
+    pub fn invocation(&self) -> WorkspaceIoInvocation {
+        WorkspaceIoInvocation {
+            data_root: self.identity.data_root().to_path_buf(),
+            resource_guards: vec![echo_agent::tools::InvocationResourceGuard::new_identified(
+                self.clone(),
+                self.identity.clone(),
+            )],
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn global_for_test(data_root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            _lifetime: ScopedRuntimeLifetime::Global,
+            identity: crate::workspace::WorkspaceIoIdentity::global(data_root),
+        }
+    }
+}
+
+/// Value-carried product-data scope for TaskRuntime and framework spawns.
+///
+/// The root is readable by EKO while the framework retains only opaque guards.
+/// It is intentionally clone-only and contains no workspace-selection policy.
+#[derive(Clone)]
+pub struct WorkspaceIoInvocation {
+    data_root: std::path::PathBuf,
+    resource_guards: Vec<echo_agent::tools::InvocationResourceGuard>,
+}
+
+impl WorkspaceIoInvocation {
+    /// Rebuild the descriptor at the `task_execute` adapter boundary.
+    /// Formal writer Subagents cannot call task-control tools, so this path
+    /// only accepts the planning Agent's non-isolated product-data root.
+    pub(crate) fn from_task_tool_context(context: &echo_agent::tools::ToolContext) -> Option<Self> {
+        let data_root = context.working_dir.clone()?;
+        let resource_guards = context
+            .resource_guards
+            .iter()
+            .filter(|guard| guard.retains::<ScopedWorkspaceIoReceipt>())
+            .cloned()
+            .collect::<Vec<_>>();
+        (resource_guards.len() == 1).then(|| Self {
+            data_root,
+            resource_guards,
+        })
+    }
+
+    pub(crate) fn from_tool_context_for_identity(
+        context: &echo_agent::tools::ToolContext,
+        expected: &crate::workspace::WorkspaceIoIdentity,
+    ) -> Option<Self> {
+        let resource_guards = context
+            .resource_guards
+            .iter()
+            .filter(|guard| {
+                guard.retains::<ScopedWorkspaceIoReceipt>() && guard.matches_identity(expected)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        (resource_guards.len() == 1).then(|| Self {
+            data_root: expected.data_root().to_path_buf(),
+            resource_guards,
+        })
+    }
+
+    pub fn data_root(&self) -> &std::path::Path {
+        &self.data_root
+    }
+
+    pub fn resource_guards(&self) -> Vec<echo_agent::tools::InvocationResourceGuard> {
+        self.resource_guards.clone()
+    }
+}
+
+#[derive(Clone)]
 pub struct ScopedWorkspaceControl {
     runtime: ScopedChatRuntime,
     workspace: Option<Workspace>,
@@ -728,12 +819,87 @@ impl ScopedWorkspaceControl {
         &self.runtime
     }
 
+    /// Root for EKO-owned workspace data such as research and analyses.
+    pub fn data_root(&self) -> &std::path::Path {
+        self.runtime.execution_scope().root()
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        self.runtime.execution_scope().workspace_id()
+    }
+
     pub fn project_root(&self) -> std::path::PathBuf {
         self.workspace
             .as_ref()
             .and_then(|workspace| workspace.project_root.clone())
             .unwrap_or_else(|| self.runtime.execution_scope().root().to_path_buf())
     }
+
+    /// Stable generation token for one registered workspace identity.
+    ///
+    /// `created_at` plus the registry-owned `project_root_revision` identify
+    /// both workspace and linked-project incarnations without a second
+    /// generation store. Global scope uses its literal process-stable identity.
+    pub fn generation(&self) -> String {
+        workspace_product_data_generation(self.workspace.as_ref())
+    }
+
+    pub fn validate_generation(
+        &self,
+        expected: &str,
+    ) -> Result<(), ScopedWorkspaceGenerationError> {
+        validate_workspace_product_data_generation(self.workspace.as_ref(), expected)
+    }
+}
+
+fn workspace_product_data_generation(workspace: Option<&Workspace>) -> String {
+    workspace.map_or_else(
+        || "global".to_string(),
+        Workspace::opaque_product_data_generation,
+    )
+}
+
+fn validate_workspace_product_data_generation(
+    workspace: Option<&Workspace>,
+    expected: &str,
+) -> Result<(), ScopedWorkspaceGenerationError> {
+    match workspace {
+        None if expected == "global" => Ok(()),
+        None => Err(ScopedWorkspaceGenerationError::Stale {
+            workspace_id: "global".to_string(),
+        }),
+        Some(workspace) => {
+            let (workspace_id, created_at, project_root_revision): (String, String, u64) =
+                serde_json::from_str(expected).map_err(|_| {
+                    ScopedWorkspaceGenerationError::Invalid {
+                        workspace_id: workspace.id.to_string(),
+                    }
+                })?;
+            let parsed = chrono::DateTime::parse_from_rfc3339(&created_at).map_err(|_| {
+                ScopedWorkspaceGenerationError::Invalid {
+                    workspace_id: workspace.id.to_string(),
+                }
+            })?;
+            if workspace_id == workspace.id.as_str()
+                && parsed.with_timezone(&chrono::Utc) == workspace.created_at
+                && project_root_revision == workspace.metadata.project_root_revision
+            {
+                Ok(())
+            } else {
+                Err(ScopedWorkspaceGenerationError::Stale {
+                    workspace_id: workspace.id.to_string(),
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ScopedWorkspaceGenerationError {
+    #[error("workspace '{workspace_id}' generation is invalid")]
+    Invalid { workspace_id: String },
+    #[error("workspace '{workspace_id}' was deleted or recreated; reload before retrying")]
+    Stale { workspace_id: String },
 }
 
 #[derive(Clone)]
@@ -767,6 +933,18 @@ impl ScopedChatRuntime {
 
     pub fn runtime_state_store(&self) -> Option<Arc<dyn echo_agent::state::RuntimeStateStore>> {
         self.runtime_state_store.clone()
+    }
+
+    /// Pin the exact runtime generation for Agent-owned product-data work.
+    pub fn workspace_io_receipt(&self) -> ScopedWorkspaceIoReceipt {
+        ScopedWorkspaceIoReceipt {
+            _lifetime: self._lifetime.clone(),
+            identity: self.workspace_io_identity.clone(),
+        }
+    }
+
+    pub fn workspace_io_invocation(&self) -> WorkspaceIoInvocation {
+        self.workspace_io_receipt().invocation()
     }
 
     pub async fn ensure_conversation(
@@ -1195,7 +1373,7 @@ impl AppState {
             },
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
-                operation_cancel_tokens: Arc::new(DashMap::new()),
+                analysis_runs: Arc::new(crate::product_data_io::AnalysisRunSupervisor::default()),
                 foreground_turns: crate::foreground_turn::ForegroundTurnControl::default(),
             },
             plugins: PluginState {
@@ -2085,6 +2263,7 @@ impl AppState {
             );
             let resources = Arc::new(crate::chat_resources::ChatResources {
                 execution_scope: runtime.execution_scope().clone(),
+                workspace_io_receipt: Some(runtime.workspace_io_receipt()),
                 pool: runtime.pool(),
                 store: Some(store.clone()),
                 sink,
@@ -2430,6 +2609,11 @@ impl AppState {
                 .map(|host| host.id().clone())
                 .ok_or_else(|| anyhow::anyhow!("No active workspace"))?,
         };
+        // Project relink changes the product-data generation and tool root.
+        // It cannot commit while any execution or control still owns the old
+        // incarnation, otherwise exact wait/cancel and file CAS become stale.
+        self.ensure_workspace_idle_for_delete_inner(&workspace_id)
+            .await?;
         let registry = Arc::clone(&self.workspace.registry);
         let link_workspace_id = workspace_id.clone();
         let workspace = tokio::task::spawn_blocking(move || {
@@ -2906,20 +3090,142 @@ impl AppState {
         workspace_id: &str,
     ) -> anyhow::Result<ScopedWorkspaceControl> {
         let _lifecycle = self.workspace.transition.read().await;
-        let runtime = self.chat_runtime_for_scope_locked(workspace_id).await?;
+        if workspace_id == "global" {
+            return Ok(ScopedWorkspaceControl {
+                runtime: self.global_chat_runtime(),
+                workspace: None,
+            });
+        }
+        let registry = Arc::clone(&self.workspace.registry);
+        let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
+        let workspace = crate::product_data_io::run("inspect workspace control scope", move || {
+            registry.inspect(&id).map_err(anyhow::Error::msg)
+        })
+        .await
+        .map_err(anyhow::Error::msg)??;
+        let runtime = self
+            .chat_runtime_for_workspace_locked(workspace.clone())
+            .await?;
+        Ok(ScopedWorkspaceControl {
+            runtime,
+            workspace: Some(workspace),
+        })
+    }
+
+    /// Resolve one exact product-data authority without running synchronous
+    /// registry I/O on a Tokio runtime thread.
+    pub async fn product_data_for_scope(
+        &self,
+        workspace_id: &str,
+        workspace_generation: &str,
+    ) -> anyhow::Result<crate::product_data_io::ScopedProductData> {
+        let _lifecycle = self.workspace.transition.read().await;
+        let control = if workspace_id == "global" {
+            ScopedWorkspaceControl {
+                runtime: self.global_chat_runtime(),
+                workspace: None,
+            }
+        } else {
+            let registry = Arc::clone(&self.workspace.registry);
+            let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
+            let workspace =
+                crate::product_data_io::run("resolve product-data workspace", move || {
+                    registry.inspect(&id).map_err(anyhow::Error::msg)
+                })
+                .await
+                .map_err(anyhow::Error::msg)??;
+            validate_workspace_product_data_generation(Some(&workspace), workspace_generation)
+                .map_err(anyhow::Error::msg)?;
+            let runtime = self
+                .chat_runtime_for_workspace_locked(workspace.clone())
+                .await?;
+            ScopedWorkspaceControl {
+                runtime,
+                workspace: Some(workspace),
+            }
+        };
+        if workspace_id == "global" {
+            control
+                .validate_generation(workspace_generation)
+                .map_err(anyhow::Error::msg)?;
+        }
+        Ok(crate::product_data_io::ScopedProductData::new(
+            control,
+            Arc::clone(&self.session.analysis_runs),
+        ))
+    }
+
+    /// Capture the currently focused product-data authority for an interactive
+    /// CLI/TUI command. The returned value carries explicit immutable scope;
+    /// callers never infer a root from a long-lived Agent.
+    pub async fn current_product_data(
+        &self,
+    ) -> Result<crate::product_data_io::ScopedProductData, ScopedControlError> {
+        if self
+            .workspace
+            .transitioning
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ScopedControlError::WorkspaceTransition);
+        }
+        let _lifecycle = self.workspace.transition.read().await;
+        if self
+            .workspace
+            .transitioning
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ScopedControlError::WorkspaceTransition);
+        }
+        let control = match self.workspace.current.read().await.clone() {
+            Some(host) => {
+                let workspace = host.workspace().await;
+                let runtime = self
+                    .chat_runtime_for_workspace_locked(workspace.clone())
+                    .await
+                    .map_err(|error| ScopedControlError::Runtime(error.to_string()))?;
+                ScopedWorkspaceControl {
+                    runtime,
+                    workspace: Some(workspace),
+                }
+            }
+            None => ScopedWorkspaceControl {
+                runtime: self.global_chat_runtime(),
+                workspace: None,
+            },
+        };
+        Ok(crate::product_data_io::ScopedProductData::new(
+            control,
+            Arc::clone(&self.session.analysis_runs),
+        ))
+    }
+
+    pub async fn product_data_for_runtime(
+        &self,
+        runtime: &ScopedChatRuntime,
+    ) -> anyhow::Result<crate::product_data_io::ScopedProductData> {
+        let _lifecycle = self.workspace.transition.read().await;
+        let workspace_id = runtime.execution_scope().workspace_id();
         let workspace = if workspace_id == "global" {
             None
         } else {
+            let registry = Arc::clone(&self.workspace.registry);
+            let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
             Some(
-                self.workspace
-                    .registry
-                    .open(&crate::workspace::WorkspaceId::from_raw(
-                        workspace_id.to_string(),
-                    ))
-                    .map_err(anyhow::Error::msg)?,
+                crate::product_data_io::run("resolve runtime product-data workspace", move || {
+                    registry.inspect(&id).map_err(anyhow::Error::msg)
+                })
+                .await
+                .map_err(anyhow::Error::msg)??,
             )
         };
-        Ok(ScopedWorkspaceControl { runtime, workspace })
+        let control = ScopedWorkspaceControl {
+            runtime: runtime.clone(),
+            workspace,
+        };
+        Ok(crate::product_data_io::ScopedProductData::new(
+            control,
+            Arc::clone(&self.session.analysis_runs),
+        ))
     }
 
     async fn chat_runtime_for_scope_locked(
@@ -2927,20 +3233,7 @@ impl AppState {
         workspace_id: &str,
     ) -> anyhow::Result<ScopedChatRuntime> {
         if workspace_id == "global" {
-            let binding = &self.workspace.global_conversation;
-            return Ok(ScopedChatRuntime {
-                _lifetime: ScopedRuntimeLifetime::Global,
-                execution_scope: crate::workspace::WorkspaceExecutionScope::global(
-                    self.workspace.global_execution_root.clone(),
-                ),
-                primary_agent: self.connection.primary_agent(),
-                pool: self.connection.pool.clone(),
-                task_runtime: self.tasks.runtime.clone(),
-                review_integration: self.review_integration.clone(),
-                conversation_store: binding.store.clone(),
-                runtime_state_store: binding.runtime_state.clone(),
-                deletions: binding.deletions.clone(),
-            });
+            return Ok(self.global_chat_runtime());
         }
 
         let workspace = self
@@ -2950,6 +3243,33 @@ impl AppState {
             .into_iter()
             .find(|workspace| workspace.id.as_str() == workspace_id)
             .ok_or_else(|| anyhow::anyhow!("workspace '{workspace_id}' is not registered"))?;
+        self.chat_runtime_for_workspace_locked(workspace).await
+    }
+
+    fn global_chat_runtime(&self) -> ScopedChatRuntime {
+        let binding = &self.workspace.global_conversation;
+        ScopedChatRuntime {
+            _lifetime: ScopedRuntimeLifetime::Global,
+            execution_scope: crate::workspace::WorkspaceExecutionScope::global(
+                self.workspace.global_execution_root.clone(),
+            ),
+            workspace_io_identity: crate::workspace::WorkspaceIoIdentity::global(
+                self.workspace.global_execution_root.clone(),
+            ),
+            primary_agent: self.connection.primary_agent(),
+            pool: self.connection.pool.clone(),
+            task_runtime: self.tasks.runtime.clone(),
+            review_integration: self.review_integration.clone(),
+            conversation_store: binding.store.clone(),
+            runtime_state_store: binding.runtime_state.clone(),
+            deletions: binding.deletions.clone(),
+        }
+    }
+
+    async fn chat_runtime_for_workspace_locked(
+        &self,
+        workspace: Workspace,
+    ) -> anyhow::Result<ScopedChatRuntime> {
         let (host, control_lease) = self
             .workspace
             .runtimes
@@ -2968,6 +3288,7 @@ impl AppState {
                 _lease: control_lease,
             },
             execution_scope: host.execution_scope(),
+            workspace_io_identity: host.workspace_io_identity(),
             primary_agent: execution.primary_agent(),
             pool: Some(execution.pool()),
             task_runtime: Some(task_runtime),
@@ -3367,6 +3688,7 @@ impl AppState {
         let sink: Arc<dyn crate::chat_driver::ChatSink> = capture.clone();
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: runtime.execution_scope().clone(),
+            workspace_io_receipt: Some(runtime.workspace_io_receipt()),
             pool: runtime.pool(),
             store: runtime.task_runtime(),
             sink,
@@ -3479,6 +3801,16 @@ impl AppState {
         self.agent_deliveries.shutdown().await.map_err(Into::into)
     }
 
+    pub fn begin_analysis_run_shutdown(&self) {
+        self.session.analysis_runs.begin_shutdown();
+    }
+
+    pub async fn join_analysis_run_shutdown(
+        &self,
+    ) -> Vec<crate::product_data_io::AnalysisCancelReceipt> {
+        self.session.analysis_runs.join_shutdown().await
+    }
+
     /// Phase-one application shutdown broadcast. This method never joins: it
     /// closes durable delivery admission and cancels process-scoped producers so
     /// the lifecycle owner can safely await dependent subsystem receipts later.
@@ -3489,9 +3821,7 @@ impl AppState {
             .store(false, std::sync::atomic::Ordering::Release);
         self.scheduler.cancel_token.cancel();
         self.tasks.cancel_token.cancel();
-        for operation in self.session.operation_cancel_tokens.iter() {
-            operation.value().cancel();
-        }
+        self.begin_analysis_run_shutdown();
         if let Err(error) = self.session.foreground_turns.begin_shutdown() {
             failures.push(format!("foreground turns: {error}"));
         }
@@ -3864,6 +4194,7 @@ impl AppState {
                         _lease: control_lease,
                     },
                     execution_scope: host.execution_scope(),
+                    workspace_io_identity: host.workspace_io_identity(),
                     primary_agent: execution.primary_agent(),
                     pool: Some(execution.pool()),
                     task_runtime: Some(task_runtime),
@@ -3878,6 +4209,9 @@ impl AppState {
                 Ok(ScopedChatRuntime {
                     _lifetime: ScopedRuntimeLifetime::Global,
                     execution_scope: crate::workspace::WorkspaceExecutionScope::global(
+                        self.workspace.global_execution_root.clone(),
+                    ),
+                    workspace_io_identity: crate::workspace::WorkspaceIoIdentity::global(
                         self.workspace.global_execution_root.clone(),
                     ),
                     primary_agent: self.connection.primary_agent(),
@@ -5055,6 +5389,7 @@ mod model_mutation_tests {
                     project_root: None,
                     kind: crate::workspace::WorkspaceKind::General,
                     metadata: crate::workspace::WorkspaceMetadata::default(),
+                    product_data_generation: String::new(),
                     created_at: Utc::now(),
                     last_active: Utc::now(),
                 })
@@ -6571,6 +6906,7 @@ mod workspace_transition_tests {
             Arc::new(AgentDeliveryCaptureSink::default());
         let active_resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: runtime.execution_scope().clone(),
+            workspace_io_receipt: Some(runtime.workspace_io_receipt()),
             pool: runtime.pool(),
             store: runtime.task_runtime(),
             sink: active_sink,
@@ -6806,6 +7142,7 @@ mod workspace_transition_tests {
             project_root: None,
             kind: crate::workspace::WorkspaceKind::General,
             metadata: crate::workspace::WorkspaceMetadata::default(),
+            product_data_generation: String::new(),
             created_at: Utc::now(),
             last_active: Utc::now(),
         }
@@ -7062,8 +7399,19 @@ mod workspace_transition_tests {
             .current_control_runtime()
             .await
             .map_err(|error| error.to_string())?;
+        let prelink_product_b = state
+            .current_product_data()
+            .await
+            .map_err(|error| error.to_string())?;
+        let prelink_generation_b = prelink_product_b.generation();
+        std::fs::write(canonical_b.join("same.txt"), "same bytes")
+            .map_err(|error| error.to_string())?;
+        drop(prelink_product_b);
+        drop(runtime_b);
         let linked_project = temp.path().join("workspace-b-project");
         std::fs::create_dir_all(&linked_project).map_err(|error| error.to_string())?;
+        std::fs::write(linked_project.join("same.txt"), "same bytes")
+            .map_err(|error| error.to_string())?;
         let canonical_linked_project = linked_project
             .canonicalize()
             .map_err(|error| error.to_string())?;
@@ -7074,8 +7422,18 @@ mod workspace_transition_tests {
         assert_eq!(linked_workspace.id.as_str(), "workspace-b");
         assert_eq!(
             linked_workspace.project_root,
-            Some(canonical_linked_project)
+            Some(canonical_linked_project.clone())
         );
+        assert!(
+            state
+                .product_data_for_scope("workspace-b", &prelink_generation_b)
+                .await
+                .is_err()
+        );
+        let runtime_b = state
+            .current_control_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
         let execution_b = runtime_b
             .agent_for("same-conversation")
             .await
@@ -7298,10 +7656,241 @@ mod workspace_transition_tests {
         foreground_a.settle(crate::chat_driver::TurnOutcome::Completed);
         drop(execution_a);
         drop(execution_b);
+        let product_control_b = state
+            .current_product_data()
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(product_control_b.data_root(), canonical_b.as_path());
+        assert_eq!(product_control_b.project_root(), canonical_linked_project);
+        let stale_b_generation = product_control_b.generation();
+        let auto_ingest_identity = product_control_b.runtime().workspace_io_identity.clone();
+        let auto_ingest_scope = product_control_b.runtime().workspace_io_invocation();
+        let auto_ingest_context = echo_agent::tools::ToolContext {
+            working_dir: Some(auto_ingest_scope.data_root().to_path_buf()),
+            resource_guards: auto_ingest_scope.resource_guards(),
+            ..echo_agent::tools::ToolContext::default()
+        };
+        drop(auto_ingest_scope);
+        drop(product_control_b);
+        drop(runtime_b);
+        let (io_entered_tx, io_entered_rx) = tokio::sync::oneshot::channel();
+        let (io_release_tx, io_release_rx) = tokio::sync::oneshot::channel();
+        let product_io = tokio::spawn(crate::research_connectors::run_auto_ingest_barrier_fixture(
+            auto_ingest_context,
+            auto_ingest_identity,
+            io_entered_tx,
+            io_release_rx,
+        ));
+        io_entered_rx
+            .await
+            .map_err(|_| "AutoIngest blocking closure did not park".to_string())?;
+        product_io.abort();
+        let _ = product_io.await;
         state
             .switch_workspace(workspace("workspace-a", canonical_a.clone()))
             .await
             .map_err(|error| error.to_string())?;
+        assert!(
+            state
+                .delete_workspace_owned(&crate::workspace::WorkspaceId::from_name("workspace-b"))
+                .await
+                .is_err_and(|error| error.to_string().contains("controls:"))
+        );
+        let workspace_b_id = crate::workspace::WorkspaceId::from_name("workspace-b");
+        let before_failed_auto_ingest_relink = state
+            .workspace
+            .registry
+            .open(&workspace_b_id)
+            .map_err(|error| error.to_string())?;
+        let auto_ingest_relink = temp.path().join("workspace-b-auto-ingest-relink");
+        std::fs::create_dir_all(&auto_ingest_relink).map_err(|error| error.to_string())?;
+        assert!(
+            state
+                .link_workspace_project_owned(&workspace_b_id, auto_ingest_relink)
+                .await
+                .is_err_and(|error| error.to_string().contains("controls:"))
+        );
+        let after_failed_auto_ingest_relink = state
+            .workspace
+            .registry
+            .open(&workspace_b_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            after_failed_auto_ingest_relink.project_root,
+            before_failed_auto_ingest_relink.project_root
+        );
+        assert_eq!(
+            after_failed_auto_ingest_relink
+                .metadata
+                .project_root_revision,
+            before_failed_auto_ingest_relink
+                .metadata
+                .project_root_revision
+        );
+        io_release_tx
+            .send(())
+            .map_err(|_| "AutoIngest blocking barrier receiver was dropped".to_string())?;
+        for _ in 0..100 {
+            if crate::research::list_sources(&canonical_b, None, None)
+                .is_ok_and(|sources| !sources.is_empty())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            crate::research::list_sources(&canonical_b, None, None)
+                .map_err(|error| error.to_string())?
+                .first()
+                .map(|source| source.title.as_str()),
+            Some("Auto-ingest lifetime barrier")
+        );
+        for _ in 0..100 {
+            if state
+                .ensure_workspace_idle_for_delete(&workspace_b_id)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        state
+            .ensure_workspace_idle_for_delete(&workspace_b_id)
+            .await
+            .map_err(|error| format!("AutoIngest retained workspace after settlement: {error}"))?;
+        let analysis_product_b = state
+            .product_data_for_scope("workspace-b", &stale_b_generation)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (analysis_entered_tx, analysis_entered_rx) = tokio::sync::oneshot::channel();
+        let (analysis_release_tx, analysis_release_rx) = tokio::sync::oneshot::channel();
+        let analysis_receipt = analysis_product_b
+            .start_analysis_fixture("owned-fixture", analysis_entered_tx, analysis_release_rx)
+            .map_err(|error| error.to_string())?;
+        analysis_entered_rx
+            .await
+            .map_err(|_| "owned analysis fixture did not start".to_string())?;
+        drop(analysis_product_b);
+        let relinked_project = temp.path().join("workspace-b-relinked-project");
+        std::fs::create_dir_all(&relinked_project).map_err(|error| error.to_string())?;
+        let before_failed_relink = state
+            .workspace
+            .registry
+            .open(&workspace_b_id)
+            .map_err(|error| error.to_string())?;
+        assert!(
+            state
+                .link_workspace_project_owned(&workspace_b_id, relinked_project.clone())
+                .await
+                .is_err_and(|error| error.to_string().contains("controls:"))
+        );
+        let after_failed_relink = state
+            .workspace
+            .registry
+            .open(&workspace_b_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            after_failed_relink.project_root,
+            before_failed_relink.project_root
+        );
+        assert_eq!(
+            after_failed_relink.metadata.project_root_revision,
+            before_failed_relink.metadata.project_root_revision
+        );
+        assert!(
+            state
+                .delete_workspace_owned(&workspace_b_id)
+                .await
+                .is_err_and(|error| error.to_string().contains("controls:"))
+        );
+        analysis_release_tx
+            .send(())
+            .map_err(|_| "owned analysis fixture release was dropped".to_string())?;
+        for _ in 0..100 {
+            if state
+                .ensure_workspace_idle_for_delete(&workspace_b_id)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        state
+            .ensure_workspace_idle_for_delete(&workspace_b_id)
+            .await
+            .map_err(|error| format!("joined analysis retained active owner: {error}"))?;
+        let analysis_product_b = state
+            .product_data_for_scope("workspace-b", &stale_b_generation)
+            .await
+            .map_err(|error| error.to_string())?;
+        for _ in 0..100 {
+            match analysis_product_b.poll_analysis(&analysis_receipt) {
+                Ok(crate::product_data_io::AnalysisWaitReceipt::Started { .. }) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok(crate::product_data_io::AnalysisWaitReceipt::Joined {
+                    execution_error: Some(_),
+                    ..
+                }) => break,
+                Ok(other) => {
+                    return Err(format!(
+                        "owned analysis fixture returned unexpected status: {other:?}"
+                    ));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        drop(analysis_product_b);
+        let relinked = state
+            .link_workspace_project_owned(&workspace_b_id, relinked_project)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            relinked.metadata.project_root_revision,
+            before_failed_relink
+                .metadata
+                .project_root_revision
+                .checked_add(1)
+                .ok_or_else(|| "project-root revision overflow in test".to_string())?
+        );
+        assert!(
+            state
+                .product_data_for_scope("workspace-b", &stale_b_generation)
+                .await
+                .is_err()
+        );
+        for _ in 0..100 {
+            if state
+                .ensure_workspace_idle_for_delete(&workspace_b_id)
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        state
+            .delete_workspace_owned(&workspace_b_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let recreated_b_root = temp.path().join("workspace-b-recreated");
+        let (recreated_b, created) = state
+            .create_workspace_owned(
+                "workspace-b",
+                crate::workspace::WorkspaceKind::General,
+                Some(recreated_b_root),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(created);
+        assert!(
+            state
+                .product_data_for_scope(recreated_b.id.as_str(), &stale_b_generation)
+                .await
+                .is_err()
+        );
         let reopened_a = state
             .current_control_runtime()
             .await
@@ -7331,7 +7920,6 @@ mod workspace_transition_tests {
         );
         drop(reopened_a);
         drop(runtime_a);
-        drop(runtime_b);
         state
             .delete_workspace_owned(&crate::workspace::WorkspaceId::from_name("workspace-a"))
             .await

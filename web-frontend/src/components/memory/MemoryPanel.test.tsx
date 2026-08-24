@@ -46,6 +46,7 @@ function workspace(id: string): Workspace {
     root: `/${id}`,
     kind: { type: 'general' },
     metadata: { tags: [] },
+    product_data_generation: 'workspace-a-generation',
     created_at: '2026-08-24T00:00:00Z',
     last_active: '2026-08-24T00:00:00Z',
   };

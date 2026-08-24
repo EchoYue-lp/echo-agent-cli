@@ -389,6 +389,7 @@ pub async fn run_jsonl_mode(
     };
     let resources = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         execution_scope: scoped_runtime.execution_scope().clone(),
+        workspace_io_receipt: Some(scoped_runtime.workspace_io_receipt()),
         pool: scoped_runtime.pool(),
         store: scoped_runtime.task_runtime(),
         sink: sink.clone(),

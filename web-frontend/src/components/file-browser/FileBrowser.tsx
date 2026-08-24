@@ -22,12 +22,16 @@ import {
 } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
 import { useFileStore, type FileContent } from '../../stores/fileStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { productDataScope } from '../../lib/productDataScope';
 import { DiffViewer } from './DiffViewer';
 import { FileTree } from './FileTree';
 
 export function FileBrowser() {
   const store = useFileStore();
+  const workspace = useWorkspaceStore((state) => state.current);
   const {
+    bindScope,
     loadChanges,
     loadTree,
     refreshSelectedFromDisk,
@@ -38,9 +42,10 @@ export function FileBrowser() {
   const selectedDocument = store.selectedFile ? store.documents[store.selectedFile] : undefined;
 
   useEffect(() => {
+    bindScope(productDataScope(workspace));
     void loadTree(4);
     void loadChanges();
-  }, [loadChanges, loadTree]);
+  }, [bindScope, loadChanges, loadTree, workspace]);
 
   useEffect(() => {
     const timer = window.setInterval(() => {
