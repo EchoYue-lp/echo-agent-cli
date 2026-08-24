@@ -108,6 +108,9 @@ TaskRun -> PlanTask -> SubagentRun
 可恢复投影。claim、revision、attempt 和 Subagent result 都带稳定 identity；执行前必须
 通过 claim，旧 attempt 不得覆盖新 revision。
 
+Store、Journal、Checkpoint、Trace 的产品边界和完整权威矩阵见
+[EKO 持久化概念](./persistence.md)。
+
 长程任务在同一 TaskRun 上增加 RunTurn continuation、Goal/Requirement/Evidence、budget、
 provider retry 和 boot admission，不建立第二套 task graph。后台 command cell 也只作为
 TaskRun 外部命令的 durable owner，不替代 PlanTask/Subagent。
