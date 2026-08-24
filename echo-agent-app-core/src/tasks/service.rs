@@ -15,7 +15,8 @@ use super::background::BackgroundTaskKind;
 use super::task_runtime::{
     AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanTask,
     RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun, TaskRunBootOutcome,
-    TaskRunBootReconciler, TaskRunStatus, TaskRuntimeStore, TodoStatus, UnattendedWriteMode,
+    TaskRunBootReconciler, TaskRunStatus, TaskRuntimeBlockingAdapter, TaskRuntimeStore, TodoStatus,
+    UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 #[cfg(test)]
@@ -437,7 +438,7 @@ impl BackgroundTaskService {
             .map_err(Into::into)
     }
 
-    pub fn resume(&self, id: &str) -> anyhow::Result<()> {
+    pub async fn resume(&self, id: &str) -> anyhow::Result<()> {
         let cancel = self.cancel.child_token();
         let admission = self
             .task_runtime_store
@@ -445,32 +446,62 @@ impl BackgroundTaskService {
         let generation_lease = self
             .task_runtime_store
             .lease_active_workspace_generation()?;
-        let mut registration = self
+        let registration = self
             .task_runtime_store
             .register_run_driver::<()>(admission, generation_lease)?;
-        let run = self
-            .task_runtime_store
-            .get_run(id)?
-            .ok_or_else(|| anyhow::anyhow!("task run not found: {id}"))?;
-        if !run.conversation_id.starts_with("background:") {
-            return Err(anyhow::anyhow!(
-                "task run is not owned by the background service: {id}"
-            ));
-        }
-        let metadata = trigger_metadata(&self.task_runtime_store, id);
-        let prompt = metadata.prompt.unwrap_or(run.goal);
-        registration.mark_preparation_started();
-        if let Err(error) = self.task_runtime_store.resume_task_run(id) {
-            registration.fail_preparation(error.to_string());
-            return Err(error.into());
-        }
-        self.start_run_driver(
-            id.to_string(),
-            prompt,
-            metadata.dependencies,
-            registration,
-            cancel,
-        )?;
+        let run_id = id.to_string();
+        let store = self.task_runtime_store.clone();
+        let agent_provider = self.agent_provider.clone();
+        let review_integration = self.review_integration.clone();
+        let run_semaphore = self.run_semaphore.clone();
+        TaskRuntimeBlockingAdapter::new(store.clone())
+            .run_owned("prepare exact background resume", move || {
+                let mut registration = registration;
+                let snapshot = store
+                    .get_run_state(&run_id)?
+                    .ok_or_else(|| super::task_runtime::StoreError::RunNotFound(run_id.clone()))?;
+                if !snapshot.run.conversation_id.starts_with("background:") {
+                    let error = super::task_runtime::StoreError::InvalidPlan(format!(
+                        "task run is not owned by the background service: {run_id}"
+                    ));
+                    registration.reject(error.to_string());
+                    return Err(error);
+                }
+                let metadata = trigger_metadata(&store, &run_id);
+                let prompt = metadata.prompt.unwrap_or_else(|| snapshot.run.goal.clone());
+                let expected =
+                    crate::tasks::task_runtime::TaskRunResumeIdentity::capture(&snapshot);
+                if let Err(error) = store.resume_task_run_expected(&expected) {
+                    let detail = error.to_string();
+                    if matches!(
+                        error,
+                        super::task_runtime::StoreError::ResumeOutcomeUnknown { .. }
+                    ) {
+                        registration.fail_preparation(detail);
+                    } else {
+                        registration.reject(detail);
+                    }
+                    return Err(error);
+                }
+                registration.mark_preparation_started();
+                let dependencies = metadata.dependencies;
+                let result_waiter = registration.start(move |receipt_owner| {
+                    drive_background_run(
+                        store,
+                        agent_provider,
+                        review_integration,
+                        run_semaphore,
+                        run_id,
+                        prompt,
+                        dependencies,
+                        cancel,
+                        receipt_owner,
+                    )
+                });
+                drop(result_waiter);
+                Ok(())
+            })
+            .await?;
         Ok(())
     }
 
@@ -1408,8 +1439,21 @@ mod tests {
             .ok_or_else(|| "recovery plan missing".to_string())?;
         assert_eq!(
             plan.tasks.first().map(|task| task.retry_count),
-            Some(0),
-            "recovery retry must not run the acceptance retry mutation"
+            Some(1),
+            "recovery retry must apply the canonical framework retry exactly once"
+        );
+        assert_eq!(
+            store
+                .list_events("recovery-run", 0)
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .filter(|event| {
+                    event.event_type
+                        == crate::tasks::task_runtime::RuntimeEventKind::RecoveryResolved
+                })
+                .count(),
+            1,
+            "recovery retry must publish one resolution fact"
         );
         store
             .shutdown_run_drivers()

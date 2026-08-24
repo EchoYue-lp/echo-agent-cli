@@ -36,9 +36,23 @@ model，绝不写 descendant `Blocked` 事实。
 framework Paused 在文件 adapter 投影为 unclaimed Pending，Run 保持 Paused；resume 不增加
 retry。取消先持久化 Run/Task Cancelled，再触发 driver token。
 
-所有 app-core async TaskRuntime 文件 I/O 通过进程共享、固定上限的
-`TaskRuntimeBlockingAdapter` 进入 `spawn_blocking`。Drop 只释放内存 registration；终态文件
-写入由可 await 的 driver/supervisor 路径负责。
+Resume 只有两个权威 intent，二者都携带从 journal projection 捕获的
+`TaskRunResumeIdentity`：
+
+- 已有 Plan 的普通 run 通过共享 `launch_planned_run_resume` 恢复同一
+  `RuntimeTaskService` executor；GUI/TUI/CLI/channel 不自建 launcher。
+- long-horizon chat 通过 `resume_and_claim_run_turn_expected` 在同一物理 batch
+  提交 resume 事实与 `RunTurnStarted`。
+
+identity 包含已 fold 的 journal sequence，因此 pause ABA、附件或 continuation 变化都会使
+旧操作失效。CAS 未提交时只拒绝 driver registration，不得把当前 run 改写为
+Failed/Cancelled；append 结果不确定时必须重开 journal 并对账。
+
+RuntimeTaskService executor 和共享 planned-resume adapter 的异步文件 I/O 通过进程共享、
+固定上限的 `TaskRuntimeBlockingAdapter` 进入 `spawn_blocking`。Drop 只释放内存
+registration；终态文件写入由可 await 的 driver/supervisor 路径负责。
+其余 chat admission 和 surface query/mutation 仍由 `taskruntime-blocking-surfaces` 迭代迁移，
+在完成前不得宣称整个 app-core 已无 blocking file I/O。
 
 ## 取舍与影响
 

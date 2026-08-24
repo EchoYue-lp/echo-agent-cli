@@ -75,6 +75,8 @@ pub enum StoreError {
     Shadow(#[from] super::file_shadow::ShadowError),
     #[error("run {run_id} has unresolved recovery barriers: {details}")]
     RecoveryBlocked { run_id: String, details: String },
+    #[error("exact resume outcome is unknown for run {run_id}: {details}")]
+    ResumeOutcomeUnknown { run_id: String, details: String },
     #[error("conversation {conversation_id} still has active task runs: {run_ids:?}")]
     ConversationHasActiveRuns {
         conversation_id: String,
@@ -473,8 +475,10 @@ pub struct TaskRuntimeStore {
     >,
     /// Active TaskRun driver tokens. Every entry point registers here so pause
     /// and cancel target the real executor instead of a surface-local map.
-    run_cancel_tokens:
-        std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
+    run_cancel_tokens: std::sync::Mutex<
+        std::collections::HashMap<String, Vec<(u64, echo_agent::agent::CancellationToken)>>,
+    >,
+    next_run_cancel_registration: std::sync::atomic::AtomicU64,
     /// Accepted TaskRun driver tasks. The store is the existing runtime owner,
     /// so dropping an individual surface waiter never drops the actual driver.
     run_driver_supervisor: std::sync::Mutex<RunDriverSupervisor>,
@@ -971,14 +975,12 @@ impl Drop for WorkspaceGenerationLease {
     }
 }
 
-/// RAII registration for one active TaskRun driver. Nested drivers for the
-/// same run restore the previous token when they finish (for example an
-/// unattended ReAct driver invoking `task_execute`).
+/// RAII registration for one active TaskRun driver. Each guard removes only
+/// its own token, so overlapping drivers can finish in either order.
 pub struct RunCancellationRegistration {
     store: std::sync::Arc<TaskRuntimeStore>,
     run_id: String,
-    token: echo_agent::agent::CancellationToken,
-    previous: Option<echo_agent::agent::CancellationToken>,
+    registration_id: u64,
 }
 
 #[cfg(test)]
@@ -1181,18 +1183,22 @@ pub(crate) struct RuntimeTaskProductSettlement {
     pub diagnostic_note: Option<String>,
 }
 
+enum RunTurnClaimPreparation {
+    Start(RuntimeJournalEvent),
+    NotSubmitted(ContinuationNotSubmittedReason),
+}
+
 impl Drop for RunCancellationRegistration {
     fn drop(&mut self) {
         if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
-            let is_current = map
-                .get(&self.run_id)
-                .is_some_and(|current| current == &self.token);
-            if is_current {
-                if let Some(previous) = self.previous.take() {
-                    map.insert(self.run_id.clone(), previous);
-                } else {
-                    map.remove(&self.run_id);
-                }
+            let remove_run = if let Some(tokens) = map.get_mut(&self.run_id) {
+                tokens.retain(|(registration_id, _)| registration_id != &self.registration_id);
+                tokens.is_empty()
+            } else {
+                false
+            };
+            if remove_run {
+                map.remove(&self.run_id);
             }
         }
         self.store.run_driver_idle.notify_waiters();
@@ -1250,6 +1256,7 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             active_subagent_controls: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            next_run_cancel_registration: std::sync::atomic::AtomicU64::new(0),
             run_driver_supervisor: std::sync::Mutex::new(RunDriverSupervisor::default()),
             run_driver_admission_idle: tokio::sync::Notify::new(),
             run_driver_idle: tokio::sync::Notify::new(),
@@ -2187,6 +2194,12 @@ impl TaskRuntimeStore {
                     let _ = result_sender.send(Err(error.clone()));
                 }
             }
+            settlement_store
+                .run_driver_supervisor
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .driver_cancels
+                .remove(&driver_token);
             // A terminal write failure is owned by settlement_debts together
             // with the exact generation and execution receipts. Shutdown and
             // workspace transition retry that canonical debt and report only
@@ -3197,67 +3210,135 @@ impl TaskRuntimeStore {
 
     /// Resume a paused run: `Paused → Running`.
     ///
-    /// The caller (IPC layer) is responsible for re-launching the executor
-    /// after this succeeds — the store only handles the state transition.
+    /// Test-only convenience for state-machine fixtures. Production callers
+    /// must carry a journal-bound [`TaskRunResumeIdentity`].
+    #[cfg(test)]
     pub fn resume_task_run(&self, run_id: &str) -> Result<TaskRun, StoreError> {
         self.with_run_lock(run_id, || {
-            let blockers = self.list_recovery_blockers(run_id)?;
-            if !blockers.is_empty() {
-                let details = blockers
-                    .iter()
-                    .map(|blocker| format!("{}: {}", blocker.task_id, blocker.reason))
-                    .collect::<Vec<_>>()
-                    .join("; ");
-                return Err(StoreError::RecoveryBlocked {
-                    run_id: run_id.to_string(),
-                    details,
-                });
-            }
-            let mut run = self
-                .get_run(run_id)?
-                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
-            validate_plan_goal_binding(&run, &plan)?;
-            if let Some(continuation) = self
-                .get_run_state(run_id)?
-                .and_then(|snapshot| snapshot.continuation)
-            {
-                if continuation.active_turn.is_some() {
-                    return Err(StoreError::InvalidPlan(format!(
-                        "run {run_id} still has an active RunTurn; wait for exact driver settlement before resume"
-                    )));
-                }
-                if continuation
-                    .token_budget
-                    .is_some_and(|budget| continuation.tokens_used >= budget)
-                {
-                    return Err(StoreError::InvalidPlan(format!(
-                        "run {run_id} exhausted its continuation token budget"
-                    )));
-                }
-                if continuation
-                    .time_budget_seconds
-                    .is_some_and(|budget| continuation.time_used_seconds >= budget)
-                {
-                    return Err(StoreError::InvalidPlan(format!(
-                        "run {run_id} exhausted its continuation time budget"
-                    )));
-                }
-            }
-            if !run.status.can_transition_to(TaskRunStatus::Running) {
-                return Err(StoreError::IllegalTransition {
-                    run_id: run_id.to_string(),
-                    from: run.status.as_str().to_string(),
-                    to: TaskRunStatus::Running.as_str().to_string(),
-                });
-            }
+            let mut run = self.validate_resume_locked(run_id, None)?;
             self.append_resume_events(run_id, &run, true)?;
             run.status = TaskRunStatus::Running;
             run.updated_at = Utc::now();
             Ok(run)
         })
+    }
+
+    /// Resume one exact paused TaskRun epoch without claiming a continuation
+    /// turn. Ordinary planned-run executors use this path; long-horizon chat
+    /// uses [`Self::resume_and_claim_run_turn_expected`].
+    pub fn resume_task_run_expected(
+        &self,
+        expected: &TaskRunResumeIdentity,
+    ) -> Result<TaskRun, StoreError> {
+        let run_id = expected.run_id.as_str();
+        self.with_run_lock(run_id, || {
+            let mut run = self.validate_resume_locked(run_id, Some(expected))?;
+            if let Err(error) = self.append_resume_events(run_id, &run, true) {
+                let reconciled = self.get_run_state(run_id).map_err(|reconcile_error| {
+                    StoreError::ResumeOutcomeUnknown {
+                        run_id: run_id.to_string(),
+                        details: format!(
+                            "resume failed and journal reconciliation also failed: {error}; {reconcile_error}"
+                        ),
+                    }
+                })?;
+                match reconciled {
+                    Some(snapshot)
+                        if snapshot.run.status == TaskRunStatus::Running
+                            && snapshot.journal_sequence > expected.journal_sequence =>
+                    {
+                        return Ok(snapshot.run);
+                    }
+                    Some(snapshot) if expected.validate_resumable(&snapshot).is_ok() => {
+                        return Err(error);
+                    }
+                    Some(snapshot) => {
+                        return Err(StoreError::ResumeOutcomeUnknown {
+                            run_id: run_id.to_string(),
+                            details: format!(
+                                "resume could not be reconciled safely after {error}; current status is {} at journal sequence {}",
+                                snapshot.run.status.as_str(),
+                                snapshot.journal_sequence
+                            ),
+                        });
+                    }
+                    None => {
+                        return Err(StoreError::ResumeOutcomeUnknown {
+                            run_id: run_id.to_string(),
+                            details: format!(
+                                "resume could not be reconciled after {error}; TaskRun disappeared"
+                            ),
+                        });
+                    }
+                }
+            }
+            run.status = TaskRunStatus::Running;
+            run.updated_at = Utc::now();
+            Ok(run)
+        })
+    }
+
+    fn validate_resume_locked(
+        &self,
+        run_id: &str,
+        expected: Option<&TaskRunResumeIdentity>,
+    ) -> Result<TaskRun, StoreError> {
+        let blockers = self.list_recovery_blockers(run_id)?;
+        if !blockers.is_empty() {
+            let details = blockers
+                .iter()
+                .map(|blocker| format!("{}: {}", blocker.task_id, blocker.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(StoreError::RecoveryBlocked {
+                run_id: run_id.to_string(),
+                details,
+            });
+        }
+        let snapshot = self
+            .get_run_state(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+        let run = snapshot.run.clone();
+        if let Some(expected) = expected {
+            expected
+                .validate_resumable(&snapshot)
+                .map_err(StoreError::InvalidPlan)?;
+        }
+        let plan = self
+            .get_plan(run_id)?
+            .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+        validate_plan_goal_binding(&run, &plan)?;
+        if let Some(continuation) = snapshot.continuation {
+            if continuation.active_turn.is_some() {
+                return Err(StoreError::InvalidPlan(format!(
+                    "run {run_id} still has an active RunTurn; wait for exact driver settlement before resume"
+                )));
+            }
+            if continuation
+                .token_budget
+                .is_some_and(|budget| continuation.tokens_used >= budget)
+            {
+                return Err(StoreError::InvalidPlan(format!(
+                    "run {run_id} exhausted its continuation token budget"
+                )));
+            }
+            if continuation
+                .time_budget_seconds
+                .is_some_and(|budget| continuation.time_used_seconds >= budget)
+            {
+                return Err(StoreError::InvalidPlan(format!(
+                    "run {run_id} exhausted its continuation time budget"
+                )));
+            }
+        }
+        if !run.status.can_transition_to(TaskRunStatus::Running) {
+            return Err(StoreError::IllegalTransition {
+                run_id: run_id.to_string(),
+                from: run.status.as_str().to_string(),
+                to: TaskRunStatus::Running.as_str().to_string(),
+            });
+        }
+        Ok(run)
     }
 
     /// Evaluate cold-start admission without changing state. The actual
@@ -3318,6 +3399,18 @@ impl TaskRuntimeStore {
         run: &TaskRun,
         reset_provider_retry: bool,
     ) -> Result<(), StoreError> {
+        let events = self.prepare_resume_events(run_id, run, reset_provider_retry)?;
+        self.shadow.append_event_batch(run_id, events)?;
+        self.shadow.rewrite_plan(run_id)?;
+        Ok(())
+    }
+
+    fn prepare_resume_events(
+        &self,
+        run_id: &str,
+        run: &TaskRun,
+        reset_provider_retry: bool,
+    ) -> Result<Vec<RuntimeJournalEvent>, StoreError> {
         let mut events = if let Some(graph) = self.load_revisioned_task_graph(run_id)? {
             let before = graph.snapshot;
             let mut after = before.clone();
@@ -3383,9 +3476,7 @@ impl TaskRuntimeStore {
                 }),
             ),
         ]);
-        self.shadow.append_event_batch(run_id, events)?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+        Ok(events)
     }
 
     fn boot_auto_resume_decision_at(
@@ -3573,16 +3664,29 @@ impl TaskRuntimeStore {
         run_id: &str,
         token: echo_agent::agent::CancellationToken,
     ) -> Result<RunCancellationRegistration, StoreError> {
-        let previous = self
-            .run_cancel_tokens
+        let registration_id = self
+            .next_run_cancel_registration
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |current| current.checked_add(1),
+            )
+            .map(|previous| previous.saturating_add(1))
+            .map_err(|_| {
+                StoreError::InvalidPlan(
+                    "TaskRun cancellation registration capacity exhausted".to_string(),
+                )
+            })?;
+        self.run_cancel_tokens
             .lock()
             .map_err(|_| StoreError::LockPoisoned)?
-            .insert(run_id.to_string(), token.clone());
+            .entry(run_id.to_string())
+            .or_default()
+            .push((registration_id, token));
         Ok(RunCancellationRegistration {
             store: self.clone(),
             run_id: run_id.to_string(),
-            token,
-            previous,
+            registration_id,
         })
     }
 
@@ -3609,14 +3713,13 @@ impl TaskRuntimeStore {
         }
     }
 
-    fn active_run_cancel_token(
-        &self,
-        run_id: &str,
-    ) -> Option<echo_agent::agent::CancellationToken> {
+    fn active_run_cancel_tokens(&self, run_id: &str) -> Vec<echo_agent::agent::CancellationToken> {
         self.run_cancel_tokens
             .lock()
             .ok()
             .and_then(|map| map.get(run_id).cloned())
+            .map(|entries| entries.into_iter().map(|(_, token)| token).collect())
+            .unwrap_or_default()
     }
 
     /// Request cancellation through the single TaskRuntime control path.
@@ -3625,11 +3728,14 @@ impl TaskRuntimeStore {
     /// directly when they are not executing.
     pub fn request_cancel(&self, run_id: &str) -> Result<bool, StoreError> {
         let _operation = self.shadow_operation()?;
-        if let Some(token) = self.active_run_cancel_token(run_id) {
+        let tokens = self.active_run_cancel_tokens(run_id);
+        if !tokens.is_empty() {
             // Durable Cancelled is committed before signalling the driver. It
             // therefore wins a concurrent Paused intent at the controller cut.
             self.finalize_cancelled_tasks_and_run(run_id)?;
-            token.cancel();
+            for token in tokens {
+                token.cancel();
+            }
             super::continuation::clear_launcher(self, run_id);
             self.stop_owned_command_cells(run_id)?;
             return Ok(true);
@@ -3667,12 +3773,7 @@ impl TaskRuntimeStore {
         reason: RunPauseReason,
         detail: Option<&str>,
     ) -> Result<bool, StoreError> {
-        let token = self
-            .run_cancel_tokens
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?
-            .get(run_id)
-            .cloned();
+        let tokens = self.active_run_cancel_tokens(run_id);
         let transition = self.with_run_lock(run_id, || {
             let run = self
                 .get_run(run_id)?
@@ -3712,7 +3813,7 @@ impl TaskRuntimeStore {
         if !transitioned {
             return Ok(false);
         }
-        if let Some(token) = token {
+        for token in tokens {
             token.cancel();
         }
         super::continuation::clear_launcher(self, run_id);
@@ -5249,12 +5350,7 @@ impl TaskRuntimeStore {
                 "provider retry fingerprint must not be empty".to_string(),
             ));
         }
-        let token = self
-            .run_cancel_tokens
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?
-            .get(run_id)
-            .cloned();
+        let tokens = self.active_run_cancel_tokens(run_id);
         let disposition = self.with_run_lock(run_id, || {
             let run = self
                 .get_run(run_id)?
@@ -5360,7 +5456,7 @@ impl TaskRuntimeStore {
             })
         })?;
         if matches!(disposition, ProviderRetryDisposition::Exhausted(_)) {
-            if let Some(token) = token {
+            for token in tokens {
                 token.cancel();
             }
             super::continuation::clear_launcher(self, run_id);
@@ -5382,12 +5478,7 @@ impl TaskRuntimeStore {
                 "continuation budgets must be positive or omitted".to_string(),
             ));
         }
-        let token = self
-            .run_cancel_tokens
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?
-            .get(run_id)
-            .cloned();
+        let tokens = self.active_run_cancel_tokens(run_id);
         let (updated, paused) = self.with_run_lock(run_id, || {
             let run = self
                 .get_run(run_id)?
@@ -5447,7 +5538,7 @@ impl TaskRuntimeStore {
             Ok((updated, pause_reason.is_some()))
         })?;
         if paused {
-            if let Some(token) = token {
+            for token in tokens {
                 token.cancel();
             }
             super::continuation::clear_launcher(self, run_id);
@@ -5464,73 +5555,132 @@ impl TaskRuntimeStore {
         transcript_visibility: TurnVisibility,
     ) -> Result<RunTurnClaimOutcome, StoreError> {
         self.with_run_lock(run_id, || {
-            if turn_id.trim().is_empty() {
-                return Err(StoreError::InvalidPlan(
-                    "RunTurn id must not be empty".to_string(),
-                ));
-            }
             let run = self
                 .get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            if run.status != TaskRunStatus::Running {
-                return Ok(RunTurnClaimOutcome::NotSubmitted(
-                    ContinuationNotSubmittedReason::RunNotRunning,
-                ));
-            }
-            let state = self
+            let snapshot = self
                 .get_run_state(run_id)?
-                .and_then(|snapshot| snapshot.continuation)
-                .unwrap_or_default();
-            if !state.enabled {
-                return Ok(RunTurnClaimOutcome::NotSubmitted(
-                    ContinuationNotSubmittedReason::Disabled,
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let event = match self.prepare_run_turn_start(
+                run_id,
+                turn_id,
+                origin,
+                transcript_visibility,
+                run.status,
+                &snapshot,
+            )? {
+                RunTurnClaimPreparation::Start(event) => event,
+                RunTurnClaimPreparation::NotSubmitted(reason) => {
+                    return Ok(RunTurnClaimOutcome::NotSubmitted(reason));
+                }
+            };
+            self.shadow.append_event_batch(run_id, vec![event])?;
+            self.shadow.rewrite_plan(run_id)?;
+            self.read_claimed_run_turn(run_id, turn_id)
+        })
+    }
+
+    /// Atomically validate one queued resume identity, resume the exact paused
+    /// run, and claim its first resumed RunTurn in one journal batch.
+    pub fn resume_and_claim_run_turn_expected(
+        &self,
+        expected: &TaskRunResumeIdentity,
+        turn_id: &str,
+        origin: RunTurnOrigin,
+        transcript_visibility: TurnVisibility,
+    ) -> Result<RunTurnClaimOutcome, StoreError> {
+        let run_id = expected.run_id.as_str();
+        self.with_run_lock(run_id, || {
+            if origin != RunTurnOrigin::Resume {
+                return Err(StoreError::InvalidPlan(
+                    "expected TaskRun resume identity requires RunTurn origin resume".to_string(),
                 ));
             }
-            if state.deferred {
-                return Ok(RunTurnClaimOutcome::NotSubmitted(
-                    ContinuationNotSubmittedReason::Deferred,
-                ));
-            }
-            if state
-                .provider_retry
-                .as_ref()
-                .is_some_and(|retry| retry.exhausted || retry.next_retry_at > Utc::now())
-            {
-                return Ok(RunTurnClaimOutcome::NotSubmitted(
-                    ContinuationNotSubmittedReason::ProviderRetryBackoff,
-                ));
-            }
-            if state.active_turn.is_some() {
-                return Ok(RunTurnClaimOutcome::NotSubmitted(
-                    ContinuationNotSubmittedReason::AlreadyRunning,
-                ));
-            }
-            if self
+            let run = self.validate_resume_locked(run_id, Some(expected))?;
+            let mut snapshot = self
                 .get_run_state(run_id)?
-                .is_some_and(|state| state.event_index.started_turns.contains(turn_id))
-            {
-                return Err(StoreError::InvalidPlan(format!(
-                    "RunTurn id {turn_id} was already used by {run_id}"
-                )));
-            }
-            if state
-                .token_budget
-                .is_some_and(|budget| state.tokens_used >= budget)
-            {
-                return Ok(RunTurnClaimOutcome::NotSubmitted(
-                    ContinuationNotSubmittedReason::TokenBudgetExhausted,
-                ));
-            }
-            if state
-                .time_budget_seconds
-                .is_some_and(|budget| state.time_used_seconds >= budget)
-            {
-                return Ok(RunTurnClaimOutcome::NotSubmitted(
-                    ContinuationNotSubmittedReason::TimeBudgetExhausted,
-                ));
-            }
-            let ordinal = state.next_turn_ordinal.max(1);
-            self.shadow.append_event_line(
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let continuation = snapshot.continuation.get_or_insert_with(Default::default);
+            continuation.deferred = false;
+            continuation.deferred_reason = None;
+            continuation.provider_retry = None;
+            continuation.blocker_audit = None;
+            let start = match self.prepare_run_turn_start(
+                run_id,
+                turn_id,
+                origin,
+                transcript_visibility,
+                TaskRunStatus::Running,
+                &snapshot,
+            )? {
+                RunTurnClaimPreparation::Start(event) => event,
+                RunTurnClaimPreparation::NotSubmitted(reason) => {
+                    return Ok(RunTurnClaimOutcome::NotSubmitted(reason));
+                }
+            };
+            let mut events = self.prepare_resume_events(run_id, &run, true)?;
+            events.push(start);
+            self.shadow.append_event_batch(run_id, events)?;
+            self.shadow.rewrite_plan(run_id)?;
+            self.read_claimed_run_turn(run_id, turn_id)
+        })
+    }
+
+    fn prepare_run_turn_start(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+        origin: RunTurnOrigin,
+        transcript_visibility: TurnVisibility,
+        run_status: TaskRunStatus,
+        snapshot: &RunStateSnapshot,
+    ) -> Result<RunTurnClaimPreparation, StoreError> {
+        if turn_id.trim().is_empty() {
+            return Err(StoreError::InvalidPlan(
+                "RunTurn id must not be empty".to_string(),
+            ));
+        }
+        if run_status != TaskRunStatus::Running {
+            return Ok(RunTurnClaimPreparation::NotSubmitted(
+                ContinuationNotSubmittedReason::RunNotRunning,
+            ));
+        }
+        let state = snapshot.continuation.clone().unwrap_or_default();
+        let rejected = if !state.enabled {
+            Some(ContinuationNotSubmittedReason::Disabled)
+        } else if state.deferred {
+            Some(ContinuationNotSubmittedReason::Deferred)
+        } else if state
+            .provider_retry
+            .as_ref()
+            .is_some_and(|retry| retry.exhausted || retry.next_retry_at > Utc::now())
+        {
+            Some(ContinuationNotSubmittedReason::ProviderRetryBackoff)
+        } else if state.active_turn.is_some() {
+            Some(ContinuationNotSubmittedReason::AlreadyRunning)
+        } else if state
+            .token_budget
+            .is_some_and(|budget| state.tokens_used >= budget)
+        {
+            Some(ContinuationNotSubmittedReason::TokenBudgetExhausted)
+        } else if state
+            .time_budget_seconds
+            .is_some_and(|budget| state.time_used_seconds >= budget)
+        {
+            Some(ContinuationNotSubmittedReason::TimeBudgetExhausted)
+        } else {
+            None
+        };
+        if let Some(reason) = rejected {
+            return Ok(RunTurnClaimPreparation::NotSubmitted(reason));
+        }
+        if snapshot.event_index.started_turns.contains(turn_id) {
+            return Err(StoreError::InvalidPlan(format!(
+                "RunTurn id {turn_id} was already used by {run_id}"
+            )));
+        }
+        Ok(RunTurnClaimPreparation::Start(
+            RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
@@ -5538,23 +5688,28 @@ impl TaskRuntimeStore {
                 serde_json::json!({
                     "event_id": format!("{run_id}:{turn_id}:started"),
                     "turn_id": turn_id,
-                    "ordinal": ordinal,
+                    "ordinal": state.next_turn_ordinal.max(1),
                     "origin": origin.as_str(),
                     "transcript_visibility": transcript_visibility.as_str(),
                 }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
-            let summary = self
-                .get_run_state(run_id)?
-                .and_then(|snapshot| snapshot.continuation)
-                .and_then(|state| state.active_turn)
-                .ok_or_else(|| {
-                    StoreError::InvalidPlan(format!(
-                        "active RunTurn missing after claim for {run_id}:{turn_id}"
-                    ))
-                })?;
-            Ok(RunTurnClaimOutcome::Started(summary))
-        })
+            ),
+        ))
+    }
+
+    fn read_claimed_run_turn(
+        &self,
+        run_id: &str,
+        turn_id: &str,
+    ) -> Result<RunTurnClaimOutcome, StoreError> {
+        self.get_run_state(run_id)?
+            .and_then(|snapshot| snapshot.continuation)
+            .and_then(|state| state.active_turn)
+            .map(RunTurnClaimOutcome::Started)
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(format!(
+                    "active RunTurn missing after claim for {run_id}:{turn_id}"
+                ))
+            })
     }
 
     /// Account a provider usage envelope exactly once. Returns true once the
@@ -5567,12 +5722,7 @@ impl TaskRuntimeStore {
         input_tokens: u64,
         output_tokens: u64,
     ) -> Result<bool, StoreError> {
-        let token = self
-            .run_cancel_tokens
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?
-            .get(run_id)
-            .cloned();
+        let tokens = self.active_run_cancel_tokens(run_id);
         let exhausted = self.with_run_lock(run_id, || {
             let active_turn_id = self
                 .get_run_state(run_id)?
@@ -5625,7 +5775,7 @@ impl TaskRuntimeStore {
                 .is_some_and(|budget| state.tokens_used >= budget))
         })?;
         if exhausted {
-            if let Some(token) = token {
+            for token in tokens {
                 token.cancel();
             }
             super::continuation::clear_launcher(self, run_id);
@@ -5646,12 +5796,7 @@ impl TaskRuntimeStore {
         output_tokens: u64,
         duration_ms: u64,
     ) -> Result<bool, StoreError> {
-        let token = self
-            .run_cancel_tokens
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?
-            .get(run_id)
-            .cloned();
+        let tokens = self.active_run_cancel_tokens(run_id);
         let exhausted = self.with_run_lock(run_id, || {
             let Some(current) = self
                 .get_run_state(run_id)?
@@ -5738,7 +5883,7 @@ impl TaskRuntimeStore {
                     .is_some_and(|budget| state.time_used_seconds >= budget))
         })?;
         if exhausted {
-            if let Some(token) = token {
+            for token in tokens {
                 token.cancel();
             }
             super::continuation::clear_launcher(self, run_id);
@@ -7696,10 +7841,68 @@ mod tests {
             .map_err(|_| "second driver receiver closed".to_string())?;
         second_waiter.await.map_err(|error| error.to_string())??;
         assert!(second_dropped.load(std::sync::atomic::Ordering::SeqCst));
+        store.wait_for_run_driver_idle("overlap").await;
+        assert!(!store.is_run_active("overlap"));
         store
             .shutdown_run_drivers()
             .await
             .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn overlapping_run_cancellation_tokens_release_in_any_order_and_cancel_together()
+    -> Result<(), String> {
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                "cancel-overlap",
+                "workspace-a",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "cancel every active driver",
+                "",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("cancel-overlap", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let first = echo_agent::agent::CancellationToken::new();
+        let second = echo_agent::agent::CancellationToken::new();
+        let first_guard = store
+            .register_run_cancellation("cancel-overlap", first.clone())
+            .map_err(|error| error.to_string())?;
+        let second_guard = store
+            .register_run_cancellation("cancel-overlap", second.clone())
+            .map_err(|error| error.to_string())?;
+        assert!(
+            store
+                .request_pause("cancel-overlap")
+                .map_err(|error| error.to_string())?
+        );
+        assert!(first.is_cancelled());
+        assert!(second.is_cancelled());
+
+        drop(first_guard);
+        assert!(store.is_run_active("cancel-overlap"));
+        drop(second_guard);
+        assert!(!store.is_run_active("cancel-overlap"));
+
+        let shared = echo_agent::agent::CancellationToken::new();
+        let third_guard = store
+            .register_run_cancellation("cancel-overlap", shared.clone())
+            .map_err(|error| error.to_string())?;
+        let fourth_guard = store
+            .register_run_cancellation("cancel-overlap", shared)
+            .map_err(|error| error.to_string())?;
+        drop(fourth_guard);
+        assert!(store.is_run_active("cancel-overlap"));
+        drop(third_guard);
+        assert!(!store.is_run_active("cancel-overlap"));
+        Ok(())
     }
 
     #[tokio::test]
@@ -9213,9 +9416,13 @@ mod tests {
         }
 
         let events = store.list_events("r1", 0)?;
+        let journal_sequence = events
+            .last()
+            .and_then(|event| u64::try_from(event.seq).ok())
+            .ok_or_else(|| StoreError::InvalidPlan("replay sequence is unavailable".to_string()))?;
         let replayed = super::super::event_rebuild::fold_fixture_for_test(&events)
             .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
-            .run_state()
+            .run_state_with_sequence(journal_sequence)
             .continuation
             .ok_or_else(|| StoreError::InvalidPlan("soak continuation missing".to_string()))?;
         assert_eq!(replayed.tokens_used, 300);
@@ -9274,9 +9481,13 @@ mod tests {
         }
 
         let events = store.list_events("r1", 0)?;
+        let journal_sequence = events
+            .last()
+            .and_then(|event| u64::try_from(event.seq).ok())
+            .ok_or_else(|| StoreError::InvalidPlan("replay sequence is unavailable".to_string()))?;
         let replayed = super::super::event_rebuild::fold_fixture_for_test(&events)
             .map_err(|error| StoreError::InvalidPlan(error.to_string()))?
-            .run_state()
+            .run_state_with_sequence(journal_sequence)
             .continuation
             .and_then(|state| state.provider_retry)
             .ok_or_else(|| StoreError::InvalidPlan("provider retry did not rebuild".to_string()))?;
@@ -9604,6 +9815,153 @@ mod tests {
                 "run_pause_reason_changed",
                 "run_continuation_resumed",
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expected_resume_and_run_turn_claim_commit_in_one_frame() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        store.request_pause("r1")?;
+        let expected = TaskRunResumeIdentity::capture(
+            &store
+                .get_run_state("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?,
+        );
+        let before_events = store.list_events("r1", 0)?.len();
+        assert!(
+            store
+                .resume_and_claim_run_turn_expected(
+                    &expected,
+                    "invalid-origin-turn",
+                    RunTurnOrigin::Continuation,
+                    TurnVisibility::Internal,
+                )
+                .is_err()
+        );
+        assert_eq!(store.list_events("r1", 0)?.len(), before_events);
+
+        assert!(matches!(
+            store.resume_and_claim_run_turn_expected(
+                &expected,
+                "resume-turn",
+                RunTurnOrigin::Resume,
+                TurnVisibility::Visible,
+            )?,
+            RunTurnClaimOutcome::Started(ref turn) if turn.turn_id == "resume-turn"
+        ));
+        assert_eq!(
+            last_frame_event_types(&store, "r1").map_err(StoreError::InvalidPlan)?,
+            [
+                "run_status_changed",
+                "run_pause_reason_changed",
+                "run_continuation_resumed",
+                "run_turn_started",
+            ]
+        );
+        assert_eq!(
+            store
+                .get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Running
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn expected_resume_sequence_rejects_status_attachment_and_continuation_aba()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        store.request_pause("r1")?;
+        let first = store
+            .get_run_state("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        let status_epoch = TaskRunResumeIdentity::capture(&first);
+        store.resume_task_run_expected(&status_epoch)?;
+        store.request_pause("r1")?;
+        let before_status_retry = store.list_events("r1", 0)?.len();
+        assert!(store.resume_task_run_expected(&status_epoch).is_err());
+        assert_eq!(store.list_events("r1", 0)?.len(), before_status_retry);
+
+        let attachment_epoch = TaskRunResumeIdentity::capture(
+            &store
+                .get_run_state("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?,
+        );
+        store.set_run_attachments(
+            "r1",
+            &[crate::attachments::AttachmentRef {
+                path: std::path::PathBuf::from("/tmp/resume-epoch.txt"),
+                name: "resume-epoch.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                source: crate::types::AttachmentSource::default(),
+            }],
+        )?;
+        let before_attachment_retry = store.list_events("r1", 0)?.len();
+        assert!(store.resume_task_run_expected(&attachment_epoch).is_err());
+        assert_eq!(store.list_events("r1", 0)?.len(), before_attachment_retry);
+
+        let continuation_epoch = TaskRunResumeIdentity::capture(
+            &store
+                .get_run_state("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?,
+        );
+        store.configure_run_continuation("r1", true, false, Some(100), None)?;
+        let before_continuation_retry = store.list_events("r1", 0)?.len();
+        assert!(store.resume_task_run_expected(&continuation_epoch).is_err());
+        assert_eq!(store.list_events("r1", 0)?.len(), before_continuation_retry);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_expected_resume_cannot_mutate_recreated_run() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        store.request_pause("r1")?;
+        let stale = TaskRunResumeIdentity::capture(
+            &store
+                .get_run_state("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?,
+        );
+
+        store.shadow.remove_runs(&["r1".to_string()])?;
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        store.request_pause("r1")?;
+        let before_events = store.list_events("r1", 0)?.len();
+        let before = store
+            .get_run_state("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+
+        let error = store
+            .resume_and_claim_run_turn_expected(
+                &stale,
+                "stale-resume-turn",
+                RunTurnOrigin::Resume,
+                TurnVisibility::Visible,
+            )
+            .err()
+            .ok_or_else(|| StoreError::InvalidPlan("stale resume unexpectedly won".to_string()))?;
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(store.list_events("r1", 0)?.len(), before_events);
+        let after = store
+            .get_run_state("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        assert_eq!(after.run.status, TaskRunStatus::Paused);
+        assert!(before.run.attachments.is_empty());
+        assert!(after.run.attachments.is_empty());
+        assert_eq!(after.continuation, before.continuation);
+        assert!(
+            after
+                .continuation
+                .as_ref()
+                .is_none_or(|continuation| continuation.active_turn.is_none())
         );
         Ok(())
     }
@@ -11946,9 +12304,13 @@ mod tests {
         let events = store
             .list_events(&run_id, 0)
             .map_err(|error| error.to_string())?;
+        let journal_sequence = events
+            .last()
+            .and_then(|event| u64::try_from(event.seq).ok())
+            .ok_or_else(|| "full replay sequence is unavailable".to_string())?;
         let full = super::super::event_rebuild::fold_fixture_for_test(&events)
             .map_err(|error| error.to_string())?
-            .run_state();
+            .run_state_with_sequence(journal_sequence);
         let warm = store
             .get_run_state(&run_id)
             .map_err(|error| error.to_string())?

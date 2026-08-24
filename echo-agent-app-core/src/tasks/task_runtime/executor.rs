@@ -315,6 +315,114 @@ pub enum RunOutcome {
     },
 }
 
+pub struct PlannedRunResumeLaunch {
+    pub run_id: String,
+    completion: tokio::sync::oneshot::Receiver<Result<RunOutcome, String>>,
+}
+
+impl PlannedRunResumeLaunch {
+    pub async fn wait(self) -> Result<RunOutcome, String> {
+        self.completion
+            .await
+            .map_err(|error| format!("planned resume completion channel closed: {error}"))?
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn launch_planned_run_resume(
+    store: Arc<TaskRuntimeStore>,
+    expected: TaskRunResumeIdentity,
+    primary_agent: crate::agent_handle::AgentHandle,
+    pool_execution: Option<crate::agent_pool::AgentPoolExecutionLease>,
+    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    trace_sink: Option<ExecSink>,
+    cancel: CancellationToken,
+) -> Result<PlannedRunResumeLaunch, StoreError> {
+    let run_id = expected.run_id.clone();
+    let admission = store.reserve_run_driver_admission(run_id.clone(), cancel.clone())?;
+    let generation_lease = store.lease_active_workspace_generation()?;
+    let registration = store.register_run_driver::<RunOutcome>(admission, generation_lease)?;
+    TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_owned("prepare exact planned resume", move || {
+            let mut registration = registration;
+            let memory_generation = match review_integration
+                .as_ref()
+                .map(|integration| integration.lease_generation())
+                .transpose()
+            {
+                Ok(generation) => generation,
+                Err(error) => {
+                    let error =
+                        StoreError::InvalidPlan(format!("memory generation unavailable: {error}"));
+                    registration.reject(error.to_string());
+                    return Err(error);
+                }
+            };
+            let layer_manager = match memory_generation
+                .as_ref()
+                .map(|generation| generation.create_layer_manager().map(Arc::new))
+                .transpose()
+            {
+                Ok(manager) => manager,
+                Err(error) => {
+                    let error =
+                        StoreError::InvalidPlan(format!("layered memory unavailable: {error}"));
+                    registration.reject(error.to_string());
+                    return Err(error);
+                }
+            };
+            if store.get_plan(&run_id)?.is_none() {
+                let error = StoreError::InvalidPlan(format!(
+                    "run {run_id} has no persisted plan to resume"
+                ));
+                registration.reject(error.to_string());
+                return Err(error);
+            }
+            if let Err(error) = store.resume_task_run_expected(&expected) {
+                let detail = error.to_string();
+                if matches!(error, StoreError::ResumeOutcomeUnknown { .. }) {
+                    registration.fail_preparation(detail);
+                } else {
+                    registration.reject(detail);
+                }
+                return Err(error);
+            }
+            registration.mark_preparation_started();
+            let preparation_store = store.clone();
+            let preparation_run_id = run_id.clone();
+            let completion = registration.start(
+                move |mut receipt_owner: super::store::RunDriverReceiptOwner| async move {
+                    if let Some(generation) = memory_generation.as_ref() {
+                        receipt_owner.retain(generation.clone());
+                    }
+                    if let Some(execution) = pool_execution {
+                        receipt_owner.retain(execution);
+                    }
+                    let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
+                    let reviewer_llm = primary_agent
+                        .read(|agent| agent.llm_client().cloned())
+                        .await;
+                    execute_run(
+                        preparation_store,
+                        Some(primary_agent),
+                        reviewer_llm,
+                        layer_manager,
+                        memory_generation,
+                        run_store,
+                        trace_sink,
+                        &preparation_run_id,
+                        cancel,
+                        super::memory_bridge::MemoryPolicy::BestEffortSettled,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                },
+            );
+            Ok(PlannedRunResumeLaunch { run_id, completion })
+        })
+        .await
+}
+
 /// Whether an Agent-driven Run must materialize a formal plan before it may
 /// complete. This is prompt/execution policy, not a TaskRun lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1556,6 +1664,49 @@ impl TaskRuntimeBlockingAdapter {
                 "TaskRuntime blocking operation {operation} failed: {error}"
             ))
         })
+    }
+
+    pub async fn run_store<T, F>(
+        &self,
+        operation: &'static str,
+        function: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<TaskRuntimeStore>) -> Result<T, StoreError> + Send + 'static,
+    {
+        let store = self.store.clone();
+        self.run_owned(operation, move || function(store)).await
+    }
+
+    pub async fn run_owned<T, F>(
+        &self,
+        operation: &'static str,
+        function: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, StoreError> + Send + 'static,
+    {
+        let permit = PROCESS_TASK_RUNTIME_FILE_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| {
+                StoreError::InvalidPlan(format!(
+                    "TaskRuntime blocking adapter closed during {operation}: {error}"
+                ))
+            })?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            function()
+        })
+        .await
+        .map_err(|error| {
+            StoreError::InvalidPlan(format!(
+                "TaskRuntime blocking operation {operation} failed to join: {error}"
+            ))
+        })?
     }
 }
 
@@ -6482,6 +6633,102 @@ Read the runtime path and found one missing branch.
             .transition_run(&run_id, TaskRunStatus::Running)
             .map_err(|error| error.to_string())?;
         Ok(run_id)
+    }
+
+    #[tokio::test]
+    async fn planned_resume_launcher_rejects_stale_journal_epoch_before_driver_start()
+    -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![solo_readonly_task("resume")])?;
+        store
+            .transition_run(&run_id, TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        let snapshot = store
+            .get_run_state(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "planned resume snapshot missing".to_string())?;
+        let expected = TaskRunResumeIdentity::capture(&snapshot);
+        store
+            .configure_run_continuation(&run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("planned-resume-test")
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+
+        let error = launch_planned_run_resume(
+            store.clone(),
+            expected.clone(),
+            agent,
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| "stale planned resume unexpectedly launched".to_string())?;
+        assert!(
+            error.to_string().contains("identity changed"),
+            "stale planned resume failed for the wrong reason: {error}"
+        );
+        store.wait_for_run_driver_idle(&run_id).await;
+        assert_eq!(store.active_run_driver_count()?, 0);
+        assert_eq!(store.active_run_driver_receipt_count()?, 0);
+        assert_eq!(
+            store
+                .get_run(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "planned resume run disappeared".to_string())?
+                .status,
+            TaskRunStatus::Paused
+        );
+
+        store
+            .resume_task_run(&run_id)
+            .map_err(|error| error.to_string())?;
+        let running_event_count = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .len();
+        let running_agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("planned-resume-running-test")
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let running_error = launch_planned_run_resume(
+            store.clone(),
+            expected,
+            running_agent,
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .err()
+        .ok_or_else(|| "stale identity unexpectedly relaunched a Running run".to_string())?;
+        assert!(running_error.to_string().contains("identity changed"));
+        store.wait_for_run_driver_idle(&run_id).await;
+        assert_eq!(
+            store
+                .list_events(&run_id, 0)
+                .map_err(|error| error.to_string())?
+                .len(),
+            running_event_count
+        );
+        assert_eq!(
+            store
+                .get_run(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "Running planned resume run disappeared".to_string())?
+                .status,
+            TaskRunStatus::Running
+        );
+        Ok(())
     }
 
     #[tokio::test]

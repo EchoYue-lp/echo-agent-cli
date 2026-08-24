@@ -220,6 +220,7 @@ pub struct TaskProgressEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedRunResume {
     pub identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+    pub is_continuation: bool,
 }
 
 /// A user turn submitted while the foreground agent is still busy.

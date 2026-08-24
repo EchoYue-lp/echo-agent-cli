@@ -38,7 +38,9 @@ enum ChannelTaskRunControl {
     Resume {
         run_id: String,
         root_message_id: String,
-        runtime: echo_agent_app_core::state::ScopedChatRuntime,
+        expected_resume: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+        continuation_enabled: bool,
+        runtime: Box<echo_agent_app_core::state::ScopedChatRuntime>,
     },
 }
 
@@ -546,7 +548,15 @@ impl AppChannelMessageHandler {
                     return Some(ChannelTaskRunControl::Resume {
                         run_id,
                         root_message_id: snapshot.run.root_message_id.clone(),
-                        runtime,
+                        expected_resume:
+                            echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
+                                &snapshot,
+                            ),
+                        continuation_enabled: snapshot
+                            .continuation
+                            .as_ref()
+                            .is_some_and(|continuation| continuation.enabled),
+                        runtime: Box::new(runtime),
                     });
                 }
             }
@@ -1121,8 +1131,18 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 ChannelTaskRunControl::Resume {
                     run_id,
                     root_message_id,
+                    expected_resume,
+                    continuation_enabled,
                     runtime,
-                } => resume_task_run = Some((run_id, root_message_id, runtime)),
+                } => {
+                    resume_task_run = Some((
+                        run_id,
+                        root_message_id,
+                        expected_resume,
+                        continuation_enabled,
+                        runtime,
+                    ));
+                }
             }
         }
         // Product control commands always outrank HITL parsing. `/stop` owns
@@ -1274,9 +1294,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             return Ok(immediate_channel_response(&msg, message));
         }
 
+        if resume_task_run.is_some() && !msg.attachments.is_empty() {
+            return Ok(immediate_channel_response(
+                &msg,
+                "TaskRun resume does not accept new attachments; send them in a separate turn.",
+            ));
+        }
         let turn_id = uuid::Uuid::new_v4().to_string();
         let admission = match resume_task_run.as_ref() {
-            Some((_, _, runtime)) => runtime
+            Some((_, _, _, _, runtime)) => runtime
                 .begin_turn(
                     &self.foreground_turns,
                     ForegroundTurnSurface::Channel,
@@ -1284,7 +1310,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     turn_id.clone(),
                 )
                 .await
-                .map(|lease| (runtime.clone(), lease))
+                .map(|lease| (runtime.as_ref().clone(), lease))
                 .map_err(echo_agent_app_core::state::ScopedChatTurnError::from),
             None => {
                 self.app_state
@@ -1320,7 +1346,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let stream_cancel = foreground_lease.cancellation_token();
         let text = resume_task_run.as_ref().map_or_else(
             || msg.text.clone(),
-            |(run_id, _, _)| {
+            |(run_id, _, _, _, _)| {
                 format!(
                     "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection and continue the next useful work."
                 )
@@ -1403,16 +1429,20 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let hitl = Arc::clone(&self.hitl);
         let prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
-        let explicit_binding = resume_task_run.map(|(run_id, root_message_id, _)| {
-            echo_agent_app_core::tasks::task_runtime::RunTurnBinding {
-                run_id: Some(run_id),
-                turn_id: turn_id.clone(),
-                root_message_id,
-                origin: echo_agent_app_core::tasks::task_runtime::RunTurnOrigin::Resume,
-                transcript_visibility:
-                    echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible,
-            }
-        });
+        let planned_resume = resume_task_run.as_ref().and_then(
+            |(_, _, expected_resume, continuation_enabled, _)| {
+                (!continuation_enabled).then(|| expected_resume.clone())
+            },
+        );
+        let explicit_binding =
+            resume_task_run.and_then(|(_, _, expected_resume, continuation_enabled, _)| {
+                continuation_enabled.then(|| {
+                    echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume_expected(
+                        expected_resume,
+                        turn_id.clone(),
+                    )
+                })
+            });
         let supervision =
             self.foreground_turns
                 .supervise(foreground_lease, move |foreground_lease| async move {
@@ -1455,29 +1485,107 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         configure_channel_agent(&agent, &configure_cache_id, configure_hitl).await;
                         Ok(())
                     };
-                    let outcome = match explicit_binding {
-                        Some(binding) => {
-                            drive_foreground_pooled_chat_turn(
-                                foreground_lease,
-                                pool,
-                                conv_owned,
-                                configure,
-                                &turn,
-                                res,
-                                binding,
-                            )
-                            .await
+                    let outcome = if let Some(expected) = planned_resume {
+                        let execution = match pool.acquire(&conv_owned).await {
+                            Ok(execution) => execution,
+                            Err(error) => {
+                                let outcome = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                    echo_agent::error::AgentFailure::message(
+                                        "agent_pool",
+                                        error.to_string(),
+                                    ),
+                                );
+                                foreground_lease.settle(outcome.clone());
+                                let _delivered = terminal_tx.send(outcome);
+                                return;
+                            }
+                        };
+                        let agent = execution.agent();
+                        if let Err(error) = configure(agent.clone()).await {
+                            let outcome = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message(
+                                    "agent_configuration",
+                                    error,
+                                ),
+                            );
+                            foreground_lease.settle(outcome.clone());
+                            outcome
+                        } else {
+                            let trace_sink =
+                                echo_agent_app_core::chat_driver::subagent_trace_sink_for(
+                                    &res.sink,
+                                );
+                            let launch = match res.store.clone() {
+                            Some(store) => {
+                                echo_agent_app_core::tasks::task_runtime::launch_planned_run_resume(
+                                    store,
+                                    expected,
+                                    agent,
+                                    Some(execution),
+                                    res.review_integration.clone(),
+                                    Some(trace_sink),
+                                    foreground_lease.cancellation_token(),
+                                )
+                                .await
+                                .map_err(|error| error.to_string())
+                            }
+                            None => Err("TaskRuntime store is unavailable".to_string()),
+                        };
+                            let outcome = match launch {
+                            Ok(launch) => match launch.wait().await {
+                                Ok(
+                                    echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed,
+                                ) => echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                                Ok(
+                                    echo_agent_app_core::tasks::task_runtime::RunOutcome::Cancelled,
+                                ) => echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                                Ok(other) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                    echo_agent::error::AgentFailure::message(
+                                        "planned_resume",
+                                        format!("planned resume ended with {other:?}"),
+                                    ),
+                                ),
+                                Err(error) => {
+                                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                        echo_agent::error::AgentFailure::message(
+                                            "planned_resume",
+                                            error,
+                                        ),
+                                    )
+                                }
+                            },
+                            Err(error) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message("planned_resume", error),
+                            ),
+                        };
+                            foreground_lease.settle(outcome.clone());
+                            outcome
                         }
-                        None => {
-                            drive_foreground_pooled_chat(
-                                foreground_lease,
-                                pool,
-                                conv_owned,
-                                configure,
-                                &turn,
-                                res,
-                            )
-                            .await
+                    } else {
+                        match explicit_binding {
+                            Some(binding) => {
+                                drive_foreground_pooled_chat_turn(
+                                    foreground_lease,
+                                    pool,
+                                    conv_owned,
+                                    configure,
+                                    &turn,
+                                    res,
+                                    binding,
+                                )
+                                .await
+                            }
+                            None => {
+                                drive_foreground_pooled_chat(
+                                    foreground_lease,
+                                    pool,
+                                    conv_owned,
+                                    configure,
+                                    &turn,
+                                    res,
+                                )
+                                .await
+                            }
                         }
                     };
                     let _delivered = terminal_tx.send(outcome);

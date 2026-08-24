@@ -1568,6 +1568,11 @@ async fn dispatch_turn(
 ) -> TurnDispatchResult {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let run_turn_binding = run_turn_binding_for_queued_turn(&turn, &turn_id);
+    let planned_resume = turn
+        .run_resume
+        .as_ref()
+        .filter(|resume| !resume.is_continuation)
+        .map(|resume| resume.identity.clone());
     let app_state = match app.app_state.as_ref() {
         Some(state) => state.clone(),
         None => {
@@ -1599,11 +1604,11 @@ async fn dispatch_turn(
             .ok_or_else(|| "TaskRuntime store is unavailable".to_string())
             .and_then(|store| {
                 store
-                    .get_run(&identity.run_id)
+                    .get_run_state(&identity.run_id)
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("TaskRun '{}' no longer exists", identity.run_id))
             })
-            .and_then(|run| identity.validate_resumable(&run))
+            .and_then(|snapshot| identity.validate_resumable(&snapshot))
             .and_then(|()| {
                 if identity.workspace_id != scoped_runtime.execution_scope().workspace_id() {
                     Err(format!(
@@ -1743,13 +1748,14 @@ async fn dispatch_turn(
     let settled_turn_id = turn_id.clone();
     if let Err(error) = foreground_turns.supervise(lease, move |lease| async move {
         let _scoped_runtime_guard = scoped_runtime_guard;
-        let _pool_execution = pool_execution;
         let outcome = match std::panic::AssertUnwindSafe(send_to_agent(
             &agent_owned,
             prepared,
             res,
             lease,
             run_turn_binding,
+            planned_resume,
+            pool_execution,
         ))
         .catch_unwind()
         .await
@@ -1875,10 +1881,10 @@ fn active_tui_turn(app: &TuiApp) -> Result<ForegroundTurnSnapshot, String> {
         .foreground_turns
         .snapshot_scoped(workspace_id, ForegroundTurnSurface::Tui, conversation_id)
         .ok_or_else(|| "No active TUI foreground turn".to_string())?;
-    if snapshot.active_turn_id != expected_turn_id {
+    if snapshot.root_turn_id != expected_turn_id {
         return Err(format!(
-            "TUI foreground turn mismatch: expected {expected_turn_id}, actual {}",
-            snapshot.active_turn_id
+            "TUI foreground root mismatch: expected {expected_turn_id}, actual {}",
+            snapshot.root_turn_id
         ));
     }
     Ok(snapshot)
@@ -2766,12 +2772,56 @@ async fn send_to_agent(
     res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
     lease: ForegroundTurnLease,
     run_turn_binding: Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding>,
+    planned_resume: Option<echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity>,
+    pool_execution: echo_agent_app_core::agent_pool::AgentPoolExecutionLease,
 ) -> TurnOutcome {
     use echo_agent_app_core::foreground_turn::{drive_foreground_chat, drive_foreground_chat_turn};
 
     // TUI does not classify chat versus task locally. The shared foreground
     // driver owns TaskRuntime, memory-generation, and pool admission, while
     // PreparedUserTurn preserves the same staged attachment path as GUI.
+    if let Some(expected) = planned_resume {
+        let trace_sink = echo_agent_app_core::chat_driver::subagent_trace_sink_for(&res.sink);
+        let result = match res.store.clone() {
+            Some(store) => echo_agent_app_core::tasks::task_runtime::launch_planned_run_resume(
+                store,
+                expected,
+                agent.clone(),
+                Some(pool_execution),
+                res.review_integration.clone(),
+                Some(trace_sink),
+                lease.cancellation_token(),
+            )
+            .await
+            .map_err(|error| error.to_string()),
+            None => Err("TaskRuntime store is unavailable".to_string()),
+        };
+        let outcome = match result {
+            Ok(launch) => match launch.wait().await {
+                Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                    TurnOutcome::Completed
+                }
+                Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Cancelled) => {
+                    TurnOutcome::Cancelled
+                }
+                Ok(other) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                    "planned_resume",
+                    format!("planned resume ended with {other:?}"),
+                )),
+                Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                    "planned_resume",
+                    error,
+                )),
+            },
+            Err(error) => TurnOutcome::Failed(echo_agent::error::AgentFailure::message(
+                "planned_resume",
+                error,
+            )),
+        };
+        lease.settle(outcome.clone());
+        return outcome;
+    }
+    let _pool_execution = pool_execution;
     let result = if let Some(binding) = run_turn_binding {
         drive_foreground_chat_turn(lease, agent, &turn, res, binding).await
     } else {
@@ -2790,12 +2840,16 @@ fn run_turn_binding_for_queued_turn(
     turn: &QueuedTurn,
     turn_id: &str,
 ) -> Option<echo_agent_app_core::tasks::task_runtime::RunTurnBinding> {
-    turn.run_resume.as_ref().map(|resume| {
+    turn.run_resume.as_ref().and_then(|resume| {
+        if !resume.is_continuation {
+            return None;
+        }
         let identity = &resume.identity;
-        echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume(
-            identity.run_id.clone(),
-            turn_id.to_string(),
-            identity.root_message_id.clone(),
+        Some(
+            echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume_expected(
+                identity.clone(),
+                turn_id.to_string(),
+            ),
         )
     })
 }
@@ -5448,18 +5502,23 @@ async fn handle_slash_command(
                             .ok_or_else(|| "run is not actively pausable".to_string())
                     }),
                 SlashCommand::TaskResume => {
-                    let continuation_run = store
-                        .get_run_state(&run_id)
-                        .ok()
-                        .flatten()
-                        .filter(|state| {
-                            state
-                                .continuation
-                                .as_ref()
-                                .is_some_and(|continuation| continuation.enabled)
-                        })
-                        .map(|state| state.run);
-                    if let Some(continuation_run) = continuation_run {
+                    let resume_state = match store.get_run_state(&run_id) {
+                        Ok(Some(state)) => state,
+                        Ok(None) => {
+                            return push_system_message(app, "TaskRun not found".to_string());
+                        }
+                        Err(error) => {
+                            return push_system_message(
+                                app,
+                                format!("TaskRun resume state unavailable: {error}"),
+                            );
+                        }
+                    };
+                    if resume_state
+                        .continuation
+                        .as_ref()
+                        .is_some_and(|continuation| continuation.enabled)
+                    {
                         match dispatch_turn(
                             app,
                             agent,
@@ -5472,8 +5531,9 @@ async fn handle_slash_command(
                                 interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
                                 run_resume: Some(crate::tui::QueuedRunResume {
                                     identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
-                                        &continuation_run,
+                                        &resume_state,
                                     ),
+                                    is_continuation: true,
                                 }),
                             },
                         )
@@ -5483,18 +5543,26 @@ async fn handle_slash_command(
                             TurnDispatchResult::Rejected { error, .. } => Err(error),
                         }
                     } else {
-                        match runtime.agent_for(&run.conversation_id).await {
-                            Ok(pool_execution) => {
-                                resume_tui_task_run(
-                                    store.clone(),
-                                    pool_execution.agent(),
-                                    Some(pool_execution),
-                                    run_id.clone(),
-                                    runtime.review_integration(),
-                                )
-                                .await
-                            }
-                            Err(error) => Err(error.to_string()),
+                        match dispatch_turn(
+                            app,
+                            agent,
+                            agent_tx.clone(),
+                            QueuedTurn {
+                                text: format!(
+                                    "Resume the existing TaskRun {run_id} toward its unchanged Goal."
+                                ),
+                                attachments: Vec::new(),
+                                interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Task,
+                                run_resume: Some(crate::tui::QueuedRunResume {
+                                    identity: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(&resume_state),
+                                    is_continuation: false,
+                                }),
+                            },
+                        )
+                        .await
+                        {
+                            TurnDispatchResult::Started => Ok("planned resume submitted"),
+                            TurnDispatchResult::Rejected { error, .. } => Err(error),
                         }
                     }
                 }
@@ -6111,28 +6179,6 @@ async fn handle_slash_command(
     }
 }
 
-async fn resume_tui_task_run(
-    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-    agent: AgentHandle,
-    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
-    run_id: String,
-    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
-) -> Result<&'static str, String> {
-    let preparation_store = store.clone();
-    let preparation_run_id = run_id.clone();
-    start_tui_task_run_driver(
-        store,
-        agent,
-        pool_execution,
-        run_id,
-        review_integration,
-        move || preparation_store.resume_task_run(&preparation_run_id),
-    )
-    .await
-    .map_err(|error| error.to_string())?;
-    Ok("resumed")
-}
-
 async fn retry_tui_task(
     store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     agent: AgentHandle,
@@ -6229,83 +6275,6 @@ async fn start_tui_task_retry_driver(
         },
     )?;
     Ok(preparation)
-}
-
-async fn start_tui_task_run_driver<Prepared, Prepare>(
-    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-    agent: AgentHandle,
-    pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
-    run_id: String,
-    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
-    prepare: Prepare,
-) -> Result<Prepared, echo_agent_app_core::tasks::task_runtime::StoreError>
-where
-    Prepare: FnOnce() -> Result<Prepared, echo_agent_app_core::tasks::task_runtime::StoreError>,
-{
-    let cancel = echo_agent::agent::CancellationToken::new();
-    let supervisor_cancel = cancel.clone();
-    let validation_store = store.clone();
-    let validation_run_id = run_id.clone();
-    let preparation_store = store.clone();
-    let preparation_run_id = run_id.clone();
-    let (prepared, _) = store
-        .spawn_supervised_run_driver(run_id, supervisor_cancel, move || {
-            let memory_generation = review_integration
-                .as_ref()
-                .map(|integration| integration.lease_generation())
-                .transpose()
-                .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "memory generation unavailable: {error}"
-                    ))
-                })?;
-            let layer_manager = memory_generation
-                .as_ref()
-                .map(|generation| generation.create_layer_manager().map(Arc::new))
-                .transpose()
-                .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "layered memory unavailable: {error}"
-                    ))
-                })?;
-            if validation_store.get_plan(&validation_run_id)?.is_none() {
-                return Err(
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
-                        "run has no persisted plan to resume".to_string(),
-                    ),
-                );
-            }
-            Ok((memory_generation, layer_manager))
-        }, move |(memory_generation, layer_manager)| {
-            let prepared = prepare()?;
-            Ok((prepared, move |mut receipt_owner: echo_agent_app_core::tasks::task_runtime::RunDriverReceiptOwner| async move {
-                let _pool_execution = pool_execution;
-                if let Some(generation) = memory_generation.as_ref() {
-                    receipt_owner.retain(generation.clone());
-                }
-                let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
-                let run_store = agent.read(|value| value.run_store().cloned()).await;
-                let result = echo_agent_app_core::tasks::task_runtime::execute_run(
-                    preparation_store,
-                    Some(agent),
-                    reviewer_llm,
-                    layer_manager,
-                    memory_generation,
-                    run_store,
-                    None,
-                    &preparation_run_id,
-                    cancel,
-                    echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
-                )
-                .await;
-                if let Err(error) = result {
-                    tracing::error!(run_id = %preparation_run_id, %error, "TUI task run driver failed");
-                    return Err(error.to_string());
-                }
-                Ok(())
-            }))
-        })?;
-    Ok(prepared)
 }
 
 fn resolve_tui_workspace_file(
@@ -7539,7 +7508,9 @@ mod tests {
                     root_message_id: "exact-root-message".to_string(),
                     created_at: chrono::Utc::now(),
                     goal_revision: 1,
+                    journal_sequence: 7,
                 },
+                is_continuation: true,
             }),
         };
 

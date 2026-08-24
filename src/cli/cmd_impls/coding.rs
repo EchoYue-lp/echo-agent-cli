@@ -160,7 +160,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /tasks resume <id>");
                 return CommandOutcome::Continue;
             }
-            match service.resume(id) {
+            match service.resume(id).await {
                 Ok(()) => println!("Task resumed: {id}"),
                 Err(error) => println!("Failed to resume task: {error}"),
             }

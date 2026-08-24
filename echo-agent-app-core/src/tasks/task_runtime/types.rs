@@ -899,7 +899,7 @@ pub struct TaskRun {
 /// A later lookup must match every field and remain paused. This prevents a
 /// delayed command from driving a deleted-and-recreated run that reused the
 /// same external run id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskRunResumeIdentity {
     pub run_id: String,
     pub workspace_id: String,
@@ -907,10 +907,12 @@ pub struct TaskRunResumeIdentity {
     pub root_message_id: String,
     pub created_at: DateTime<Utc>,
     pub goal_revision: u64,
+    pub journal_sequence: u64,
 }
 
 impl TaskRunResumeIdentity {
-    pub fn capture(run: &TaskRun) -> Self {
+    pub fn capture(snapshot: &RunStateSnapshot) -> Self {
+        let run = &snapshot.run;
         Self {
             run_id: run.run_id.clone(),
             workspace_id: run.workspace_id.clone(),
@@ -918,16 +920,19 @@ impl TaskRunResumeIdentity {
             root_message_id: run.root_message_id.clone(),
             created_at: run.created_at,
             goal_revision: run.goal_revision,
+            journal_sequence: snapshot.journal_sequence,
         }
     }
 
-    pub fn validate_resumable(&self, run: &TaskRun) -> Result<(), String> {
+    pub fn validate_resumable(&self, snapshot: &RunStateSnapshot) -> Result<(), String> {
+        let run = &snapshot.run;
         if run.run_id != self.run_id
             || run.workspace_id != self.workspace_id
             || run.conversation_id != self.conversation_id
             || run.root_message_id != self.root_message_id
             || run.created_at != self.created_at
             || run.goal_revision != self.goal_revision
+            || snapshot.journal_sequence != self.journal_sequence
         {
             return Err(format!(
                 "TaskRun '{}' identity changed after resume was queued",
@@ -1331,6 +1336,10 @@ pub struct RunStateSnapshot {
     /// Event-folded background command cells owned by this run.
     #[serde(default)]
     pub background_cells: Vec<BackgroundCellState>,
+    /// Last authoritative journal sequence folded into this snapshot. This is
+    /// the optimistic-concurrency epoch for queued resume actions.
+    #[serde(default)]
+    pub(crate) journal_sequence: u64,
     /// Internal operational/idempotency index carried by the same checkpoint
     /// fold. It is not a second authority and is intentionally not a UI wire.
     #[serde(default)]
@@ -1431,20 +1440,28 @@ pub struct RunTurnBinding {
     pub root_message_id: String,
     pub origin: RunTurnOrigin,
     pub transcript_visibility: TurnVisibility,
+    #[serde(default)]
+    pub expected_resume: Option<TaskRunResumeIdentity>,
 }
 
 impl RunTurnBinding {
-    pub fn resume(
-        run_id: impl Into<String>,
+    pub fn resume_expected(identity: TaskRunResumeIdentity, turn_id: impl Into<String>) -> Self {
+        Self::resume_expected_with_visibility(identity, turn_id, TurnVisibility::Visible)
+    }
+
+    pub fn resume_expected_with_visibility(
+        identity: TaskRunResumeIdentity,
         turn_id: impl Into<String>,
-        root_message_id: impl Into<String>,
+        transcript_visibility: TurnVisibility,
     ) -> Self {
+        let root_message_id = identity.root_message_id.clone();
         Self {
-            run_id: Some(run_id.into()),
+            run_id: Some(identity.run_id.clone()),
             turn_id: turn_id.into(),
-            root_message_id: root_message_id.into(),
+            root_message_id,
             origin: RunTurnOrigin::Resume,
-            transcript_visibility: TurnVisibility::Visible,
+            transcript_visibility,
+            expected_resume: Some(identity),
         }
     }
 }
@@ -3283,7 +3300,7 @@ mod tests {
     #[test]
     fn delayed_resume_rejects_deleted_and_recreated_run_identity() {
         let now = Utc::now();
-        let mut run = TaskRun {
+        let run = TaskRun {
             run_id: "same-run".to_string(),
             workspace_id: "workspace-a".to_string(),
             conversation_id: "conversation-a".to_string(),
@@ -3300,13 +3317,21 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let identity = TaskRunResumeIdentity::capture(&run);
-        assert!(identity.validate_resumable(&run).is_ok());
+        let mut snapshot = RunStateSnapshot {
+            run,
+            tasks: Vec::new(),
+            continuation: None,
+            background_cells: Vec::new(),
+            journal_sequence: 7,
+            event_index: RunStateEventIndex::default(),
+        };
+        let identity = TaskRunResumeIdentity::capture(&snapshot);
+        assert!(identity.validate_resumable(&snapshot).is_ok());
 
-        run.created_at = now + chrono::Duration::milliseconds(1);
+        snapshot.run.created_at = now + chrono::Duration::milliseconds(1);
         assert!(
             identity
-                .validate_resumable(&run)
+                .validate_resumable(&snapshot)
                 .is_err_and(|error| error.contains("identity changed"))
         );
     }

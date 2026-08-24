@@ -476,14 +476,32 @@ pub async fn resume_task_run(
         .as_ref()
         .map(|snapshot| snapshot.run.conversation_id.clone())
         .ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?;
-    let pool_execution = runtime
-        .agent_for(&conversation_id)
+    let expected_resume = echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
+        run_state
+            .as_ref()
+            .ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?,
+    );
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let lease = runtime
+        .begin_turn(
+            &state.app_state.session.foreground_turns,
+            echo_agent_app_core::foreground_turn::ForegroundTurnSurface::Gui,
+            &conversation_id,
+            turn_id,
+        )
         .await
         .map_err(|error| IpcError::Validation(error.to_string()))?;
+    let pool_execution = match runtime.agent_for(&conversation_id).await {
+        Ok(execution) => execution,
+        Err(error) => {
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("agent_pool", error.to_string()),
+            ));
+            return Err(IpcError::Validation(error.to_string()));
+        }
+    };
     let primary_agent = pool_execution.agent();
-    let review_integration = runtime.review_integration();
-    let cancel = echo_agent::agent::CancellationToken::new();
-    let supervisor_cancel = cancel.clone();
+    let cancel = lease.cancellation_token();
     let execution_projector = Arc::new(TauriExecutionProjector::new(
         app,
         state.app_state.storage.tool_executions.clone(),
@@ -492,78 +510,53 @@ pub async fn resume_task_run(
     let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         execution_projector.emit(ev);
     });
-    let validation_store = store.clone();
-    let validation_run_id = run_id.clone();
-    let preparation_store = store.clone();
-    let preparation_run_id = run_id.clone();
-    store
-        .spawn_supervised_run_driver(run_id.clone(), supervisor_cancel, move || {
-            let memory_generation = review_integration
-                .as_ref()
-                .map(|integration| integration.lease_generation())
-                .transpose()
-                .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "memory generation unavailable: {error}"
-                    ))
-                })?;
-            let layer_manager = memory_generation
-                .as_ref()
-                .map(|generation| generation.create_layer_manager().map(Arc::new))
-                .transpose()
-                .map_err(|error| {
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "layered memory unavailable: {error}"
-                    ))
-                })?;
-            if validation_store.get_plan(&validation_run_id)?.is_none() {
-                return Err(
-                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
-                        "run {validation_run_id} has no persisted plan to resume"
-                    )),
-                );
+    let launch = match echo_agent_app_core::tasks::task_runtime::launch_planned_run_resume(
+        store,
+        expected_resume,
+        primary_agent,
+        Some(pool_execution),
+        runtime.review_integration(),
+        Some(trace_sink),
+        cancel,
+    )
+    .await
+    {
+        Ok(launch) => launch,
+        Err(error) => {
+            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message("planned_resume", error.to_string()),
+            ));
+            return Err(internal(error));
+        }
+    };
+    tokio::spawn(async move {
+        let launched_run_id = launch.run_id.clone();
+        let outcome = match launch.wait().await {
+            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                tracing::info!(run_id = %launched_run_id, "resumed run completed");
+                echo_agent_app_core::chat_driver::TurnOutcome::Completed
             }
-            Ok((memory_generation, layer_manager))
-        }, move |(memory_generation, layer_manager)| {
-            preparation_store.resume_task_run(&preparation_run_id)?;
-            Ok(((), move |mut receipt_owner: echo_agent_app_core::tasks::task_runtime::RunDriverReceiptOwner| async move {
-                let _pool_execution = pool_execution;
-                if let Some(generation) = memory_generation.as_ref() {
-                    receipt_owner.retain(generation.clone());
-                }
-                let run_store = primary_agent.read(|agent| agent.run_store().cloned()).await;
-                let reviewer_llm = primary_agent
-                    .read(|agent| agent.llm_client().cloned())
-                    .await;
-                let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
-                    preparation_store.clone(),
-                    Some(primary_agent),
-                    reviewer_llm,
-                    layer_manager,
-                    memory_generation,
-                    run_store,
-                    Some(trace_sink),
-                    &preparation_run_id,
-                    cancel,
-                    echo_agent_app_core::tasks::task_runtime::MemoryPolicy::BestEffortSettled,
+            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Cancelled) => {
+                echo_agent_app_core::chat_driver::TurnOutcome::Cancelled
+            }
+            Ok(other) => {
+                tracing::warn!(run_id = %launched_run_id, ?other, "resumed run ended non-completed");
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "planned_resume",
+                        format!("planned resume ended with {other:?}"),
+                    ),
                 )
-                .await;
-                match outcome {
-                    Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
-                        tracing::info!(run_id = %preparation_run_id, "resumed run completed");
-                    }
-                    Ok(other) => {
-                        tracing::warn!(run_id = %preparation_run_id, ?other, "resumed run ended non-completed");
-                    }
-                    Err(error) => {
-                        tracing::error!(run_id = %preparation_run_id, %error, "resumed run executor error");
-                        return Err(error.to_string());
-                    }
-                }
-                Ok(())
-            }))
-        })
-        .map_err(internal)?;
+            }
+            Err(error) => {
+                tracing::error!(run_id = %launched_run_id, %error, "resumed run executor error");
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("planned_resume", error),
+                )
+            }
+        };
+        lease.settle(outcome);
+    });
     tracing::info!(run_id = %run_id, "task run resumed -> Running");
 
     Ok(serde_json::json!({
@@ -644,7 +637,8 @@ async fn resume_continuation_run(
 
     let turn_id = uuid::Uuid::new_v4().to_string();
     let conversation_id = snapshot.run.conversation_id.clone();
-    let root_message_id = snapshot.run.root_message_id.clone();
+    let expected_resume =
+        echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(&snapshot);
     let lease = runtime
         .begin_turn(
             &state.app_state.session.foreground_turns,
@@ -697,13 +691,11 @@ async fn resume_continuation_run(
             crate::tauri::commands::chat::TauriHumanLoopHandler::new(sink.clone(), turn_id.clone()),
         )),
     });
-    let binding = RunTurnBinding {
-        run_id: Some(run_id.clone()),
-        turn_id: turn_id.clone(),
-        root_message_id,
-        origin: RunTurnOrigin::Resume,
-        transcript_visibility: TurnVisibility::Internal,
-    };
+    let binding = RunTurnBinding::resume_expected_with_visibility(
+        expected_resume,
+        turn_id.clone(),
+        TurnVisibility::Internal,
+    );
     let agent = pool_execution.agent();
     let spawned_run_id = run_id.clone();
     let status_store = store;

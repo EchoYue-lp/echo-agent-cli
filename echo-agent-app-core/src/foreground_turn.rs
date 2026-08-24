@@ -157,20 +157,30 @@ tokio::task_local! {
     static CURRENT_FOREGROUND_TURN: Arc<ActiveForegroundTurn>;
 }
 
-/// Update only the steerable Agent turn identity for the currently owned
-/// foreground operation. The root UI message and settlement identity do not
-/// change across internal continuation turns.
-pub(crate) fn advance_current_agent_turn(turn_id: &str) {
-    if turn_id.trim().is_empty() {
-        return;
-    }
-    let _ = CURRENT_FOREGROUND_TURN.try_with(|entry| {
-        let mut current = entry
+/// Cloneable reference to the existing foreground turn authority. It carries
+/// the exact admitted entry across supervisor task boundaries without creating
+/// a second lookup or lifecycle owner.
+#[derive(Clone)]
+pub(crate) struct ForegroundTurnProgress(Arc<ActiveForegroundTurn>);
+
+impl ForegroundTurnProgress {
+    pub(crate) fn advance(&self, turn_id: &str) {
+        if turn_id.trim().is_empty() {
+            return;
+        }
+        let mut current = self
+            .0
             .active_agent_turn_id
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *current = turn_id.to_string();
-    });
+    }
+}
+
+pub(crate) fn current_foreground_progress() -> Option<ForegroundTurnProgress> {
+    CURRENT_FOREGROUND_TURN
+        .try_with(|entry| ForegroundTurnProgress(Arc::clone(entry)))
+        .ok()
 }
 
 type ForegroundShutdownResult = Result<(), ForegroundTurnError>;
@@ -1665,7 +1675,9 @@ mod tests {
         let lease = control.begin(ForegroundTurnSurface::Gui, "conversation", "root-turn")?;
         CURRENT_FOREGROUND_TURN
             .scope(Arc::clone(&lease.entry), async {
-                advance_current_agent_turn("continuation-turn");
+                current_foreground_progress()
+                    .ok_or(ForegroundTurnError::StateUnavailable)?
+                    .advance("continuation-turn");
                 let snapshot = control
                     .snapshot(ForegroundTurnSurface::Gui, "conversation")
                     .ok_or(ForegroundTurnError::StateUnavailable)?;
@@ -1690,13 +1702,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn foreground_progress_handle_survives_supervisor_spawn()
+    -> Result<(), ForegroundTurnError> {
+        let control = ForegroundTurnControl::default();
+        let lease = control.begin(ForegroundTurnSurface::Channel, "conversation", "root-turn")?;
+        let progress = CURRENT_FOREGROUND_TURN
+            .scope(Arc::clone(&lease.entry), async {
+                current_foreground_progress().ok_or(ForegroundTurnError::StateUnavailable)
+            })
+            .await?;
+
+        tokio::spawn(async move {
+            progress.advance("continuation-turn");
+        })
+        .await
+        .map_err(|error| ForegroundTurnError::DriverSettlement(error.to_string()))?;
+        let snapshot = control
+            .snapshot(ForegroundTurnSurface::Channel, "conversation")
+            .ok_or(ForegroundTurnError::StateUnavailable)?;
+        assert_eq!(snapshot.root_turn_id, "root-turn");
+        assert_eq!(snapshot.active_turn_id, "continuation-turn");
+        lease.settle(TurnOutcome::Completed);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn root_cancel_survives_a_continuation_identity_change() -> Result<(), ForegroundTurnError>
     {
         let control = ForegroundTurnControl::default();
         let lease = control.begin(ForegroundTurnSurface::Gui, "conversation", "root-turn")?;
         CURRENT_FOREGROUND_TURN
             .scope(Arc::clone(&lease.entry), async {
-                advance_current_agent_turn("continuation-turn");
+                current_foreground_progress()
+                    .ok_or(ForegroundTurnError::StateUnavailable)?
+                    .advance("continuation-turn");
                 assert!(matches!(
                     control.request_root_cancel(
                         ForegroundTurnSurface::Gui,

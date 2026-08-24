@@ -56,12 +56,13 @@ impl RebuiltPlan {
         }
     }
 
-    pub fn run_state(&self) -> RunStateSnapshot {
+    pub fn run_state_with_sequence(&self, journal_sequence: u64) -> RunStateSnapshot {
         RunStateSnapshot {
             run: self.run.clone(),
             tasks: self.tasks.iter().map(PlanTask::execution).collect(),
             continuation: self.continuation.clone(),
             background_cells: self.background_cells.clone(),
+            journal_sequence,
             event_index: self.event_index.clone(),
         }
     }

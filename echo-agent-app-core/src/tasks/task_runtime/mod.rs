@@ -64,9 +64,10 @@ pub use completion_gate::requirements_for_plan;
 pub use execution_target::TaskExecutionTargetResolver;
 pub(crate) use executor::drive_unattended_run;
 pub use executor::{
-    EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, ProcessExecutionResourceSnapshot,
-    RunOutcome, TaskRuntimeBlockingAdapter, execute_run, preflight_unattended_plan,
-    preflight_unattended_task, process_execution_resource_snapshot,
+    EkoExecutionLimits, ExecError, ExecSink, PlannedRunResumeLaunch, PreflightRejection,
+    ProcessExecutionResourceSnapshot, RunOutcome, TaskRuntimeBlockingAdapter, execute_run,
+    launch_planned_run_resume, preflight_unattended_plan, preflight_unattended_task,
+    process_execution_resource_snapshot,
 };
 pub use ledger::{export_path, render_progress, write_progress};
 pub use memory_bridge::{

@@ -141,6 +141,7 @@ struct PreparedReplTurnStart {
     turn: echo_agent_app_core::prepared_turn::PreparedUserTurn,
     control: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
     lease: echo_agent_app_core::foreground_turn::ForegroundTurnLease,
+    resume_is_continuation: bool,
 }
 
 struct ActiveReplTurn {
@@ -2008,41 +2009,54 @@ async fn prepare_repl_turn_start(
         )
         .await
         .map_err(ReplTurnStartError::from_conversation_admission)?;
-    if let Some(resume) = input.task_run_resume.as_ref() {
-        let validation = scoped_runtime
+    let resume_is_continuation = if let Some(resume) = input.task_run_resume.as_ref() {
+        let snapshot = match scoped_runtime
             .task_runtime()
             .ok_or_else(|| "TaskRuntime store is unavailable".to_string())
             .and_then(|store| {
                 store
-                    .get_run(&resume.run_id)
+                    .get_run_state(&resume.run_id)
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| format!("TaskRun '{}' no longer exists", resume.run_id))
-            })
-            .and_then(|run| resume.validate_resumable(&run))
-            .and_then(|()| {
-                if resume.workspace_id != scoped_runtime.execution_scope().workspace_id() {
-                    Err(format!(
-                        "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
-                        resume.run_id,
-                        resume.workspace_id,
-                        scoped_runtime.execution_scope().workspace_id()
-                    ))
-                } else if resume.conversation_id != conversation_id {
-                    Err(format!(
-                        "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
-                        resume.run_id, resume.conversation_id, conversation_id
-                    ))
-                } else {
-                    Ok(())
-                }
-            });
+            }) {
+            Ok(snapshot) => snapshot,
+            Err(detail) => {
+                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
+                ));
+                return Err(ReplTurnStartError::Permanent(detail));
+            }
+        };
+        let validation = resume.validate_resumable(&snapshot).and_then(|()| {
+            if resume.workspace_id != scoped_runtime.execution_scope().workspace_id() {
+                Err(format!(
+                    "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
+                    resume.run_id,
+                    resume.workspace_id,
+                    scoped_runtime.execution_scope().workspace_id()
+                ))
+            } else if resume.conversation_id != conversation_id {
+                Err(format!(
+                    "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
+                    resume.run_id, resume.conversation_id, conversation_id
+                ))
+            } else {
+                Ok(())
+            }
+        });
         if let Err(detail) = validation {
             lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                 echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
             ));
             return Err(ReplTurnStartError::Permanent(detail));
         }
-    }
+        snapshot
+            .continuation
+            .as_ref()
+            .is_some_and(|continuation| continuation.enabled)
+    } else {
+        false
+    };
     let pool_execution = match scoped_runtime.agent_for(&conversation_id).await {
         Ok(execution) => execution,
         Err(error) => {
@@ -2084,6 +2098,7 @@ async fn prepare_repl_turn_start(
         turn,
         control,
         lease,
+        resume_is_continuation,
     })
 }
 
@@ -2103,6 +2118,7 @@ fn spawn_prepared_repl_turn(
         turn,
         control,
         lease,
+        resume_is_continuation,
     } = prepared;
     let cancel = lease.cancellation_token();
     let renderer = Arc::new(ReplChatSink::new(live_output.clone(), output.config()));
@@ -2148,29 +2164,69 @@ fn spawn_prepared_repl_turn(
     let bound_turn_id = turn_id.clone();
     let (completion_tx, completion) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let _scoped_runtime_guard = scoped_runtime_guard;
-        let _pool_execution = pool_execution;
         let _ = live_output.print_user_message(&input.message);
         let _ = live_output.emit("Connecting to model...");
         let result = match input.task_run_resume {
-            Some(resume) => {
+            Some(resume) if resume_is_continuation => {
+                let _pool_execution = pool_execution;
                 echo_agent_app_core::foreground_turn::drive_foreground_chat_turn(
                     lease,
                     &agent_owned,
                     &turn,
                     resources,
-                    echo_agent_app_core::tasks::task_runtime::RunTurnBinding {
-                        run_id: Some(resume.run_id),
-                        turn_id: bound_turn_id,
-                        root_message_id: resume.root_message_id,
-                        origin: echo_agent_app_core::tasks::task_runtime::RunTurnOrigin::Resume,
-                        transcript_visibility:
-                            echo_agent_app_core::tasks::task_runtime::TurnVisibility::Visible,
-                    },
+                    echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume_expected(
+                        resume,
+                        bound_turn_id,
+                    ),
                 )
                 .await
             }
+            Some(resume) => {
+                let trace_sink =
+                    echo_agent_app_core::chat_driver::subagent_trace_sink_for(&resources.sink);
+                let launch = match resources.store.clone() {
+                    Some(store) => {
+                        echo_agent_app_core::tasks::task_runtime::launch_planned_run_resume(
+                            store,
+                            resume,
+                            agent_owned,
+                            Some(pool_execution),
+                            scoped_runtime_guard.review_integration(),
+                            Some(trace_sink),
+                            lease.cancellation_token(),
+                        )
+                        .await
+                        .map_err(|error| error.to_string())
+                    }
+                    None => Err("TaskRuntime store is unavailable".to_string()),
+                };
+                let turn_outcome = match launch {
+                    Ok(launch) => match launch.wait().await {
+                        Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                            echo_agent_app_core::chat_driver::TurnOutcome::Completed
+                        }
+                        Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Cancelled) => {
+                            echo_agent_app_core::chat_driver::TurnOutcome::Cancelled
+                        }
+                        Ok(other) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message(
+                                "planned_resume",
+                                format!("planned resume ended with {other:?}"),
+                            ),
+                        ),
+                        Err(error) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message("planned_resume", error),
+                        ),
+                    },
+                    Err(error) => echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                        echo_agent::error::AgentFailure::message("planned_resume", error),
+                    ),
+                };
+                lease.settle(turn_outcome.clone());
+                Ok(turn_outcome)
+            }
             None => {
+                let _pool_execution = pool_execution;
                 echo_agent_app_core::foreground_turn::drive_foreground_chat(
                     lease,
                     &agent_owned,
@@ -2427,6 +2483,7 @@ mod tests {
                 root_message_id: "root-a".to_string(),
                 created_at: chrono::Utc::now(),
                 goal_revision: 1,
+                journal_sequence: 7,
             },
         );
         queue.enqueue(stale_resume);

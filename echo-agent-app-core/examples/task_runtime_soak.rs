@@ -13,8 +13,9 @@ use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
 use echo_agent_app_core::tasks::task_runtime::store::{RunTurnClaimOutcome, RunTurnCompletion};
 use echo_agent_app_core::tasks::task_runtime::{
     Artifact, ArtifactKind, AttendedMode, BootAutoResumeOutcome, DomainProfile, ExecutionMode,
-    PlanTask, PlanTaskKind, RunPauseReason, RunTurnOrigin, RunTurnStatus, TaskPlan, TaskRunStatus,
-    TaskRuntimeStore, TodoStatus, TurnVisibility, commit_eko_task_plan, task_goal_sha256,
+    PlanTask, PlanTaskKind, RunPauseReason, RunTurnOrigin, RunTurnStatus, TaskPlan,
+    TaskRunResumeIdentity, TaskRunStatus, TaskRuntimeStore, TodoStatus, TurnVisibility,
+    commit_eko_task_plan, task_goal_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -439,7 +440,11 @@ async fn open_runtime(task_root: &Path, ledger: &mut SoakLedger) -> Result<Arc<T
                 }
             }
             Some(RunPauseReason::User) => {
-                store.resume_task_run(&ledger.run_id)?;
+                let snapshot = store
+                    .get_run_state(&ledger.run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("resume snapshot missing"))?;
+                let expected = TaskRunResumeIdentity::capture(&snapshot);
+                store.resume_task_run_expected(&expected)?;
             }
             other => bail!("soak cannot resume from pause reason {other:?}"),
         },

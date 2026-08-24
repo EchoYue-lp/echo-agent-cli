@@ -193,6 +193,7 @@ impl TaskContinuationRuntime {
                 root_message_id: launcher.root_message_id.clone(),
                 origin,
                 transcript_visibility: TurnVisibility::Internal,
+                expected_resume: None,
             };
             let resources = Arc::new(ChatResources {
                 execution_scope: launcher.resources.execution_scope.clone(),

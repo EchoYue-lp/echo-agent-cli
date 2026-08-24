@@ -256,7 +256,23 @@ mod tests {
     #[test]
     fn run_cancel_token_roundtrip() -> Result<(), String> {
         use crate::tasks::task_runtime::store::TaskRuntimeStore;
+        use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        store
+            .create_run(
+                "r1",
+                "default",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "cancel roundtrip",
+                "test",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("r1", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
         let tok = CancellationToken::new();
         let registration = store
             .register_run_cancellation("r1", tok.clone())
@@ -280,10 +296,26 @@ mod tests {
     }
 
     #[test]
-    fn nested_run_cancel_registration_restores_outer_driver() -> Result<(), String> {
+    fn nested_run_cancel_registration_keeps_outer_driver() -> Result<(), String> {
         use crate::tasks::task_runtime::store::TaskRuntimeStore;
+        use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        store
+            .create_run(
+                "r1",
+                "default",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "nested cancel",
+                "test",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("r1", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
         let outer = CancellationToken::new();
         let inner = CancellationToken::new();
         let _outer_registration = store

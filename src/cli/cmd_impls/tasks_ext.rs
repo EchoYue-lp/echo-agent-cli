@@ -197,7 +197,7 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     ),
                     identity:
                         echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
-                            &snapshot.run,
+                            &snapshot,
                         ),
                 };
             }

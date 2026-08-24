@@ -742,11 +742,12 @@ impl RunAuthority {
         reducer
             .recover()
             .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+        let sequence = reducer.last_applied_sequence();
         reducer.with_state(|projection| {
             validate_projection_health(projection)?;
             projection
                 .rebuilt_plan()
-                .map(|rebuilt| rebuilt.run_state())
+                .map(|rebuilt| rebuilt.run_state_with_sequence(sequence))
                 .map_err(|error| ShadowError::Rebuild(error.to_string()))
         })
     }
@@ -781,7 +782,7 @@ impl RunAuthority {
                 atomic_write(&run_directory.join("plan.json"), &plan)
                     .map_err(|error| projection_degraded(current, error))?;
             }
-            let run_state = serde_json::to_vec_pretty(&rebuilt.run_state())
+            let run_state = serde_json::to_vec_pretty(&rebuilt.run_state_with_sequence(current))
                 .map_err(|error| projection_degraded(current, error))?;
             atomic_write(&run_directory.join("run-state.json"), &run_state)
                 .map_err(|error| projection_degraded(current, error))?;
