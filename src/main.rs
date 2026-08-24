@@ -178,13 +178,27 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let runtime =
         echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params, mcp_config_path)
             .await?;
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let mut lifecycle = runtime.lifecycle_owner(cancel_token.clone());
     let agent_handle = runtime.agent_handle.clone();
     echo_agent_app_core::infra::inject_conversation_store(&agent_handle, &conversation_store);
 
     // Every headless surface is a full Agent surface. Build one TaskRuntime
     // store, register the same task tools on the primary agent, and inject the
     // store into the shared pool before any pooled agent is created.
-    let task_runtime_store = build_task_runtime_store_for_headless()?;
+    let task_runtime_store = match build_task_runtime_store_for_headless() {
+        Ok(store) => store,
+        Err(error) => {
+            let receipt = lifecycle
+                .settle(
+                    echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                    Some(error),
+                )
+                .await;
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
+    };
+    lifecycle.bind_task_runtime(task_runtime_store.clone());
     echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
         &agent_handle,
         task_runtime_store.clone(),
@@ -192,12 +206,25 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     .await;
     let task_runtime_store = Some(task_runtime_store);
     let pool = {
-        let pool = echo_agent_app_core::agent_pool::AgentPool::from_runtime(
+        let pool = match echo_agent_app_core::agent_pool::AgentPool::from_runtime(
             &runtime,
             echo_agent_app_core::agent_pool::PoolConfig::default(),
             task_runtime_store.clone(),
         )
-        .await?;
+        .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                let receipt = lifecycle
+                    .settle(
+                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                        Some(error),
+                    )
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
+        };
+        lifecycle.bind_pool(pool.clone());
         if let Some(store) = task_runtime_store.clone() {
             echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
                 &agent_handle,
@@ -211,15 +238,31 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let foreground_turns = echo_agent_app_core::foreground_turn::ForegroundTurnControl::default();
 
     if requested_conversation_id.is_some() {
-        let store = conversation_store
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Conversation store is unavailable"))?;
-        let conversation = store
-            .get_conversation(&conversation_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Conversation '{conversation_id}' was not found"))?;
-        let stored = store.get_messages(&conversation_id).await?;
-        let messages = echo_agent::memory::restore_messages(&stored)?;
+        let restore_result = async {
+            let store = conversation_store
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Conversation store is unavailable"))?;
+            let conversation = store
+                .get_conversation(&conversation_id)
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("Conversation '{conversation_id}' was not found"))?;
+            let stored = store.get_messages(&conversation_id).await?;
+            let messages = echo_agent::memory::restore_messages(&stored)?;
+            Ok::<_, anyhow::Error>((conversation, messages))
+        }
+        .await;
+        let (conversation, messages) = match restore_result {
+            Ok(restored) => restored,
+            Err(error) => {
+                let receipt = lifecycle
+                    .settle(
+                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                        Some(error),
+                    )
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
+        };
         let message_count = messages.len();
         agent_handle
             .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
@@ -237,7 +280,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     }
 
     // Spawn config watcher (reloads hooks + webhook endpoints on change).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
     let config_path = echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref());
     let config_watcher = std::sync::Arc::new(echo_agent_cli::config_watcher::spawn_config_watcher(
         config_path,
@@ -245,6 +287,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         Some(webhook_emitter.clone()),
         cancel_token.clone(),
     ));
+    lifecycle.bind_config_watcher(config_watcher.clone());
 
     // ── User-facing TUI mode (default) ─────────────────────────────────
     #[cfg(feature = "tui")]
@@ -287,6 +330,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 foreground_turns: foreground_turns.clone(),
                 command_cell_runtime: runtime.command_cell_runtime.clone(),
                 browser_runtime: runtime.browser_runtime.clone(),
+                lifecycle,
             },
         )
         .await;
@@ -295,16 +339,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             Err(error) => {
                 tui_provider.close_now("TUI bootstrap failed");
                 drop(tui_hitl_registration);
-                let error = infra::settle_service_bootstrap_failure(
-                    anyhow::anyhow!(error),
-                    task_runtime_store.as_ref(),
-                    Some(&pool),
-                    &runtime.plugin_runtime,
-                    &config_watcher,
-                    &runtime.mcp_config_runtime,
-                    &runtime.browser_runtime,
-                )
-                .await;
                 cancel_token.cancel();
                 return Err(error);
             }
@@ -368,11 +402,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tui_services,
             tui_dreaming_owner,
             Some(agent_handle.clone()),
-            runtime.plugin_runtime.clone(),
-            config_watcher.clone(),
-            runtime.mcp_config_runtime.clone(),
-            runtime.browser_runtime.clone(),
-            cancel_token.clone(),
         )
         .await;
         drop(runtime);
@@ -394,7 +423,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
     // CLI-only, channel-only, and combined mode share one application service
     // bootstrap. Surface composition below only owns input/output lifetimes.
-    let headless_services = match cli::start_headless_services(
+    let mut headless_services = match cli::start_headless_services(
         agent_handle.clone(),
         runtime.hitl_dispatcher.clone(),
         &app_config,
@@ -417,6 +446,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             foreground_turns: foreground_turns.clone(),
             command_cell_runtime: runtime.command_cell_runtime.clone(),
             browser_runtime: runtime.browser_runtime.clone(),
+            lifecycle,
         },
     )
     .await
@@ -427,16 +457,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 Some(session) => session.shutdown("CLI bootstrap failed").await.err(),
                 None => None,
             };
-            let error = infra::settle_service_bootstrap_failure(
-                anyhow::anyhow!(error),
-                task_runtime_store.as_ref(),
-                Some(&pool),
-                &runtime.plugin_runtime,
-                &config_watcher,
-                &runtime.mcp_config_runtime,
-                &runtime.browser_runtime,
-            )
-            .await;
             cancel_token.cancel();
             return match hitl_shutdown_error {
                 Some(hitl_error) => Err(anyhow::anyhow!(
@@ -503,10 +523,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 foreground_turns: foreground_turns.clone(),
                 shutdown: channels_cancel.clone(),
             }));
+            let channel_observer = headless_services.bind_companion(
+                cli::CompanionModeShutdown::new("channels", channels_cancel, channels_handle),
+            )?;
 
             if run_cli {
-                let companion_shutdown =
-                    cli::CompanionModeShutdown::new("channels", channels_cancel, channels_handle);
                 let cli_result = match repl_hitl_session.take() {
                     Some(session) => {
                         cli::run_cli_mode(
@@ -521,7 +542,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                             runtime.plugin_runtime.clone(),
                             &headless_services,
                             session,
-                            Some(companion_shutdown),
                         )
                         .await
                     }
@@ -531,14 +551,13 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     mode_error = Some(error);
                 }
             } else {
-                match channels_handle.await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => mode_error = Some(error),
-                    Err(error) => {
-                        mode_error = Some(anyhow::anyhow!(
-                            "channel lifecycle owner failed to join: {error}"
-                        ));
+                tokio::select! {
+                    result = channel_observer.wait() => {
+                        if let Err(error) = result {
+                            mode_error = Some(error);
+                        }
                     }
+                    _ = echo_agent_cli::infra::shutdown_signal() => {}
                 }
             }
         }
@@ -564,7 +583,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     runtime.plugin_runtime.clone(),
                     &headless_services,
                     session,
-                    None,
                 )
                 .await
             }
@@ -594,11 +612,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         headless_services,
         dreaming_owner,
         (run_cli || run_jsonl).then_some(agent_handle.clone()),
-        runtime.plugin_runtime.clone(),
-        config_watcher.clone(),
-        runtime.mcp_config_runtime.clone(),
-        runtime.browser_runtime.clone(),
-        cancel_token.clone(),
     )
     .await;
     drop(runtime);

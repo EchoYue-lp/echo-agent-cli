@@ -89,34 +89,36 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
         );
     }
 
-    if let Err(e) = run_desktop().await {
-        let log_path = crash_log_path();
-        let message = format!(
-            "EKO failed to start at {}\n\nError: {:?}\n",
-            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
-            e
-        );
-        let _ = std::fs::write(&log_path, &message);
-        eprintln!("{}", message);
+    match run_desktop().await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let log_path = crash_log_path();
+            let message = format!(
+                "EKO failed to start at {}\n\nError: {:?}\n",
+                chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
+                error
+            );
+            let _ = std::fs::write(&log_path, &message);
+            eprintln!("{}", message);
 
-        #[cfg(target_os = "macos")]
-        {
-            use std::process::Command;
-            let _ = Command::new("osascript")
-                .arg("-e")
-                .arg(format!(
-                    "display dialog \"EKO failed to start.\\n\\n\
-                     Error: {}\\n\\n\
-                     Crash log: {}\" \
-                     with title \"EKO\" buttons {{\"OK\"}} default button \"OK\"",
-                    format!("{:?}", e).replace('"', "\\\""),
-                    log_path.display()
-                ))
-                .output();
+            #[cfg(target_os = "macos")]
+            {
+                use std::process::Command;
+                let _ = Command::new("osascript")
+                    .arg("-e")
+                    .arg(format!(
+                        "display dialog \"EKO failed to start.\\n\\n\
+                         Error: {}\\n\\n\
+                         Crash log: {}\" \
+                         with title \"EKO\" buttons {{\"OK\"}} default button \"OK\"",
+                        format!("{:?}", error).replace('"', "\\\""),
+                        log_path.display()
+                    ))
+                    .output();
+            }
+            Err(error)
         }
     }
-
-    Ok(())
 }
 
 async fn run_desktop() -> anyhow::Result<()> {
@@ -170,10 +172,11 @@ async fn run_desktop() -> anyhow::Result<()> {
     let runtime =
         echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params, mcp_config_path)
             .await?;
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    let mut lifecycle = runtime.lifecycle_owner(cancel_token.clone());
     let agent_handle = runtime.agent_handle.clone();
 
     // ── Config watcher ──
-    let cancel_token = tokio_util::sync::CancellationToken::new();
     let config_path = config_watcher::resolve_config_path(args.config.as_deref());
     let config_save_path = config_watcher::resolve_config_save_path(args.config.as_deref());
     let config_watcher = Arc::new(config_watcher::spawn_config_watcher(
@@ -182,6 +185,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         Some(webhook_emitter.clone()),
         cancel_token.clone(),
     ));
+    lifecycle.bind_config_watcher(config_watcher.clone());
 
     // Cron definitions are independent of TaskRun lifecycle state.
     let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
@@ -196,7 +200,7 @@ async fn run_desktop() -> anyhow::Result<()> {
     let conversation_store = infra::create_conversation_store();
     infra::inject_conversation_store(&agent_handle, &conversation_store);
 
-    let mut state_inner = AppState::from_shared(
+    let mut state_inner = match AppState::from_shared(
         agent_handle.clone(),
         Some(runtime.model_consumers.clone()),
         runtime.hitl_dispatcher.clone(),
@@ -204,9 +208,23 @@ async fn run_desktop() -> anyhow::Result<()> {
         runtime.state_store.clone(),
         app_config.clone(),
         runtime.mcp_config_runtime.clone(),
-    )?;
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            let receipt = lifecycle
+                .settle(
+                    echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                    Some(error),
+                )
+                .await;
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
+    };
     if let Some(active_model) = runtime.active_runtime_model.as_ref() {
         state_inner = state_inner.with_active_model_id(active_model.id.clone());
+    }
+    if let Some(store) = state_inner.tasks.runtime.as_ref() {
+        lifecycle.bind_task_runtime(store.clone());
     }
     state_inner = state_inner
         .with_config_path(config_save_path)
@@ -240,12 +258,29 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
 
     // ── Initialize agent pool for multi-conversation parallel execution ──
-    let pool = runtime
+    let pool = match runtime
         .init_pool(
             echo_agent_app_core::agent_pool::PoolConfig::default(),
             state_inner.tasks.runtime.clone(),
         )
-        .await?;
+        .await
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            if let Some(store) = state_inner.tasks.runtime.as_ref() {
+                lifecycle.bind_task_runtime(store.clone());
+            }
+            lifecycle.bind_app_state(Arc::new(state_inner));
+            let receipt = lifecycle
+                .settle(
+                    echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                    Some(error),
+                )
+                .await;
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
+    };
+    lifecycle.bind_pool(pool.clone());
     if let Some(task_store) = state_inner.tasks.runtime.clone() {
         echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
             &agent_handle,
@@ -265,18 +300,17 @@ async fn run_desktop() -> anyhow::Result<()> {
         .start_scheduler_and_task_service(Some(scheduler_store))
         .await;
     if let Err(error) = service_result {
-        let error = infra::settle_service_bootstrap_failure(
-            anyhow::anyhow!(error),
-            state_inner.tasks.runtime.as_ref(),
-            state_inner.connection.pool.as_ref(),
-            &runtime.plugin_runtime,
-            &config_watcher,
-            &runtime.mcp_config_runtime,
-            &runtime.browser_runtime,
-        )
-        .await;
-        cancel_token.cancel();
-        return Err(error);
+        if let Some(store) = state_inner.tasks.runtime.as_ref() {
+            lifecycle.bind_task_runtime(store.clone());
+        }
+        lifecycle.bind_app_state(Arc::new(state_inner));
+        let receipt = lifecycle
+            .settle(
+                echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                Some(anyhow::Error::new(error)),
+            )
+            .await;
+        return Err(anyhow::Error::new(receipt.into_error()));
     }
     if let Some(scheduler) = state_inner.scheduler.runner.as_ref()
         && let Err(error) = runtime
@@ -287,11 +321,16 @@ async fn run_desktop() -> anyhow::Result<()> {
         tracing::warn!(%error, "failed to bind plugin monitors to GUI scheduler");
     }
     let state = Arc::new(state_inner);
+    lifecycle.bind_app_state(state.clone());
+    if let Some(store) = state.tasks.runtime.as_ref() {
+        lifecycle.bind_task_runtime(store.clone());
+    }
     if let Err(error) = state.recover_agent_deliveries().await {
         tracing::warn!(%error, "failed to resume durable Agent deliveries during GUI startup");
     }
 
     let health_task = infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
+    lifecycle.track_background_task("MCP health check", health_task);
 
     // (stage4 F1) Dreaming runs once after boot and then daily in every mode.
     let dreaming_task = state.review_integration.clone().map(|ri| {
@@ -302,9 +341,22 @@ async fn run_desktop() -> anyhow::Result<()> {
             cancel_token.clone(),
         )
     });
+    if let Some(task) = dreaming_task {
+        lifecycle.track_background_task("Dreaming", task);
+    }
 
     // ── Launch Tauri window ──
     let bridge_supervisor = Arc::new(crate::tauri::state::TauriBridgeSupervisor::new());
+    let bridge_begin = bridge_supervisor.clone();
+    let bridge_join = bridge_supervisor.clone();
+    lifecycle.track_external_owner(
+        "Tauri event bridges",
+        move || {
+            bridge_begin.begin_shutdown();
+            Ok(())
+        },
+        async move { bridge_join.join().await },
+    );
     let tauri_result = crate::tauri::build_tauri_app(
         state.clone(),
         runtime.browser_runtime.clone(),
@@ -312,69 +364,16 @@ async fn run_desktop() -> anyhow::Result<()> {
     )
     .run(tauri::generate_context!());
 
-    // Tauri window closed → cancel background tasks
-    cancel_token.cancel();
-    if let Err(error) = state.shutdown_agent_deliveries().await {
-        tracing::warn!(%error, "failed to settle GUI Agent deliveries");
-    }
-    if let Err(error) = state.session.foreground_turns.shutdown().await {
-        tracing::warn!(%error, "failed to settle GUI foreground turns");
-    }
-    if let Err(error) = state.shutdown_model_mutations().await {
-        tracing::warn!(%error, "failed to settle GUI model mutations");
-    }
-    if let Some(task) = dreaming_task
-        && let Err(error) = task.await
-    {
-        tracing::warn!(%error, "failed to join GUI Dreaming task");
-    }
-    if let Some(integration) = runtime.review_integration.as_ref()
-        && let Err(error) = integration.shutdown_background_reviews().await
-    {
-        tracing::warn!(%error, "failed to settle GUI background reviews");
-    }
-    if let Err(error) = state.shutdown_workspace_transition().await {
-        tracing::warn!(%error, "failed to settle GUI workspace transition");
-    }
-    if let Err(error) = state.shutdown_scheduler().await {
-        tracing::warn!(%error, "failed to shut down GUI scheduler");
-    }
-    if let Some(store) = state.tasks.runtime.as_ref()
-        && let Err(error) = store.shutdown_run_drivers().await
-    {
-        tracing::warn!(%error, "failed to settle GUI TaskRun drivers");
-    }
-    if let Some(pool) = state.connection.pool.as_ref()
-        && let Err(error) = pool.shutdown().await
-    {
-        tracing::warn!(%error, "failed to shut down GUI agent pool");
-    }
-    if let Err(error) = state.shutdown_command_cells().await {
-        tracing::warn!(%error, "failed to settle GUI command cells");
-    }
-    if let Err(error) = runtime.plugin_runtime.shutdown().await {
-        tracing::warn!(%error, "failed to shut down GUI plugin runtime");
-    }
-    if let Err(error) = config_watcher.shutdown().await {
-        tracing::warn!(%error, "failed to shut down GUI config watcher");
-    }
-    if let Err(error) = health_task.await {
-        tracing::warn!(%error, "failed to join GUI MCP health check task");
-    }
-    runtime.mcp_config_runtime.shutdown().await;
-    runtime.browser_runtime.shutdown().await;
-    bridge_supervisor.shutdown().await;
-    if let Err(error) = state.terminal.close_all().await {
-        tracing::warn!(%error, "failed to close terminal sessions");
-    }
-    if let Some(store) = state.tasks.runtime.as_ref()
-        && let Err(error) = store.shutdown_hook_events().await
-    {
-        tracing::warn!(%error, "failed to shut down task hook dispatcher");
-    }
-    tauri_result.map_err(|e| anyhow::anyhow!("error while running Tauri application: {e}"))?;
-
-    Ok(())
+    let primary_error = tauri_result
+        .err()
+        .map(|error| anyhow::anyhow!("error while running Tauri application: {error}"));
+    let receipt = lifecycle
+        .settle(
+            echo_agent_app_core::runtime::ApplicationLifecycleReason::Shutdown,
+            primary_error,
+        )
+        .await;
+    receipt.into_result().map_err(anyhow::Error::new)
 }
 
 fn parse_desktop_args(args: impl IntoIterator<Item = OsString>) -> Result<cli::Args, clap::Error> {

@@ -24,10 +24,481 @@ use crate::evolution::ReviewIntegration;
 use crate::hitl::HitlDispatcher;
 use crate::infra::{self, AgentCreateParams};
 use crate::state::AppState;
+use echo_agent::agent::Agent;
 use echo_agent::evolution::ReviewConfig;
 use echo_agent::intent::{
     KeywordClassifier, LlmIntentClassifier, SkillDescription, TriggerSupervisor,
 };
+
+/// Why the application lifecycle owner was asked to settle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationLifecycleReason {
+    Shutdown,
+    BootstrapRollback,
+}
+
+impl std::fmt::Display for ApplicationLifecycleReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shutdown => formatter.write_str("shutdown"),
+            Self::BootstrapRollback => formatter.write_str("bootstrap rollback"),
+        }
+    }
+}
+
+/// One failed owner in an otherwise best-effort lifecycle drain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationLifecycleFailure {
+    pub owner: String,
+    pub error: String,
+}
+
+/// Typed aggregate returned by every EKO root (GUI, TUI, CLI/JSONL, channel).
+/// A primary surface/bootstrap error is kept separate from teardown failures so
+/// launchers never mistake a failed application for a successful cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationLifecycleReceipt {
+    pub reason: ApplicationLifecycleReason,
+    pub primary_error: Option<String>,
+    pub failures: Vec<ApplicationLifecycleFailure>,
+}
+
+impl ApplicationLifecycleReceipt {
+    fn new(reason: ApplicationLifecycleReason, primary_error: Option<anyhow::Error>) -> Self {
+        Self {
+            reason,
+            primary_error: primary_error.map(|error| error.to_string()),
+            failures: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, owner: impl Into<String>, error: impl std::fmt::Display) {
+        self.failures.push(ApplicationLifecycleFailure {
+            owner: owner.into(),
+            error: error.to_string(),
+        });
+    }
+
+    pub fn is_clean(&self) -> bool {
+        self.primary_error.is_none() && self.failures.is_empty()
+    }
+
+    pub fn into_result(self) -> Result<(), ApplicationLifecycleError> {
+        if self.is_clean() {
+            Ok(())
+        } else {
+            Err(ApplicationLifecycleError { receipt: self })
+        }
+    }
+
+    pub fn into_error(self) -> ApplicationLifecycleError {
+        ApplicationLifecycleError { receipt: self }
+    }
+}
+
+impl std::fmt::Display for ApplicationLifecycleReceipt {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "application {}", self.reason)?;
+        if let Some(error) = self.primary_error.as_deref() {
+            write!(formatter, " failed: {error}")?;
+        }
+        for failure in &self.failures {
+            write!(formatter, "; {}: {}", failure.owner, failure.error)?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{receipt}")]
+pub struct ApplicationLifecycleError {
+    pub receipt: ApplicationLifecycleReceipt,
+}
+
+struct ApplicationBackgroundTask {
+    name: String,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+type ApplicationLifecycleBegin = Box<dyn FnOnce() -> Result<(), String> + Send>;
+type ApplicationLifecycleJoin =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'static>>;
+
+struct ApplicationExternalOwner {
+    name: String,
+    begin: Option<ApplicationLifecycleBegin>,
+    join: ApplicationLifecycleJoin,
+}
+
+#[derive(Clone)]
+pub struct ApplicationLifecycleSettlement {
+    result: tokio::sync::watch::Receiver<Option<ApplicationLifecycleReceipt>>,
+    fallback: ApplicationLifecycleReceipt,
+}
+
+impl ApplicationLifecycleSettlement {
+    pub async fn wait(mut self) -> ApplicationLifecycleReceipt {
+        loop {
+            if let Some(receipt) = self.result.borrow().clone() {
+                return receipt;
+            }
+            if self.result.changed().await.is_err() {
+                let mut fallback = self.fallback;
+                fallback.record(
+                    "application lifecycle",
+                    "settlement owner ended before publishing its receipt",
+                );
+                return fallback;
+            }
+        }
+    }
+}
+
+/// One-shot EKO process lifecycle owner.
+///
+/// The owner is deliberately application-side: it composes existing subsystem
+/// shutdown APIs but does not replace their internal authority. Shutdown has a
+/// strict two-phase boundary: first close admission/broadcast cancellation,
+/// then await every accepted owner and aggregate all failures.
+pub struct ApplicationLifecycleOwner {
+    root_cancel: tokio_util::sync::CancellationToken,
+    app_state: Option<Arc<AppState>>,
+    primary_agent: Option<AgentHandle>,
+    pool: Option<Arc<crate::agent_pool::AgentPool>>,
+    task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    command_cell_runtime:
+        Option<Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>>,
+    review_integration: Option<Arc<ReviewIntegration>>,
+    plugin_runtime: Option<Arc<crate::plugin_runtime::PluginRuntimeService>>,
+    config_watcher: Option<Arc<crate::config_watcher::ConfigWatcherHandle>>,
+    mcp_config_runtime: Option<Arc<crate::mcp_config_runtime::McpConfigRuntime>>,
+    browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    background_tasks: Vec<ApplicationBackgroundTask>,
+    external_owners: Vec<ApplicationExternalOwner>,
+    shutdown_begun: bool,
+    armed: bool,
+}
+
+impl ApplicationLifecycleOwner {
+    pub fn new(root_cancel: tokio_util::sync::CancellationToken) -> Self {
+        Self {
+            root_cancel,
+            app_state: None,
+            primary_agent: None,
+            pool: None,
+            task_runtime_store: None,
+            command_cell_runtime: None,
+            review_integration: None,
+            plugin_runtime: None,
+            config_watcher: None,
+            mcp_config_runtime: None,
+            browser_runtime: None,
+            background_tasks: Vec::new(),
+            external_owners: Vec::new(),
+            shutdown_begun: false,
+            armed: true,
+        }
+    }
+
+    pub fn bind_app_state(&mut self, state: Arc<AppState>) {
+        self.app_state = Some(state);
+    }
+
+    pub fn bind_primary_agent(&mut self, agent: AgentHandle) {
+        self.primary_agent = Some(agent);
+    }
+
+    pub fn bind_pool(&mut self, pool: Arc<crate::agent_pool::AgentPool>) {
+        self.pool = Some(pool);
+    }
+
+    pub fn bind_task_runtime(&mut self, store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>) {
+        self.task_runtime_store = Some(store);
+    }
+
+    pub fn bind_command_cell_runtime(
+        &mut self,
+        runtime: Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
+    ) {
+        self.command_cell_runtime = Some(runtime);
+    }
+
+    pub fn bind_review_integration(&mut self, integration: Arc<ReviewIntegration>) {
+        self.review_integration = Some(integration);
+    }
+
+    pub fn bind_plugin_runtime(
+        &mut self,
+        runtime: Arc<crate::plugin_runtime::PluginRuntimeService>,
+    ) {
+        self.plugin_runtime = Some(runtime);
+    }
+
+    pub fn bind_config_watcher(
+        &mut self,
+        watcher: Arc<crate::config_watcher::ConfigWatcherHandle>,
+    ) {
+        self.config_watcher = Some(watcher);
+    }
+
+    pub fn bind_mcp_config_runtime(
+        &mut self,
+        runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
+    ) {
+        self.mcp_config_runtime = Some(runtime);
+    }
+
+    pub fn bind_browser_runtime(&mut self, runtime: Arc<crate::browser::BrowserRuntime>) {
+        self.browser_runtime = Some(runtime);
+    }
+
+    pub fn track_background_task(
+        &mut self,
+        name: impl Into<String>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        self.background_tasks.push(ApplicationBackgroundTask {
+            name: name.into(),
+            handle,
+        });
+    }
+
+    /// Register a surface-specific owner without moving its policy into
+    /// app-core. The synchronous callback participates in phase-one admission
+    /// close; its join future participates in the typed phase-two receipt.
+    pub fn track_external_owner<Begin, Join>(
+        &mut self,
+        name: impl Into<String>,
+        begin: Begin,
+        join: Join,
+    ) where
+        Begin: FnOnce() -> Result<(), String> + Send + 'static,
+        Join: std::future::Future<Output = Result<(), String>> + Send + 'static,
+    {
+        self.external_owners.push(ApplicationExternalOwner {
+            name: name.into(),
+            begin: Some(Box::new(begin)),
+            join: Box::pin(join),
+        });
+    }
+
+    /// Disarm a bootstrap rollback owner after all fallible construction has
+    /// committed. Normal process shutdown is owned by a fresh root-bound owner.
+    pub fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    /// Synchronously close every application-level admission path and broadcast
+    /// cancellation. No task is awaited in this phase.
+    pub fn begin_shutdown(
+        &mut self,
+        reason: ApplicationLifecycleReason,
+        primary_error: Option<anyhow::Error>,
+    ) -> ApplicationLifecycleReceipt {
+        let mut receipt = ApplicationLifecycleReceipt::new(reason, primary_error);
+        if self.shutdown_begun {
+            receipt.record(
+                "application lifecycle",
+                "shutdown admission was already closed",
+            );
+            return receipt;
+        }
+        self.shutdown_begun = true;
+
+        // Phase one: no joins. Every producer sees admission close or a shared
+        // cancellation broadcast before teardown waits on a dependent owner.
+        self.root_cancel.cancel();
+        if let Some(state) = self.app_state.as_ref()
+            && let Err(error) = state.broadcast_application_shutdown()
+        {
+            receipt.record("application admission", error);
+        } else if self.app_state.is_none() {
+            if let Some(store) = self.task_runtime_store.as_ref()
+                && let Err(error) = store.begin_run_driver_shutdown()
+            {
+                receipt.record("TaskRun driver admission", error);
+            }
+            if let Some(pool) = self.pool.as_ref() {
+                pool.begin_shutdown();
+            }
+            if let Some(integration) = self.review_integration.as_ref() {
+                integration.begin_background_review_shutdown();
+            }
+            if let Some(runtime) = self.command_cell_runtime.as_ref() {
+                runtime.begin_shutdown();
+            }
+        }
+        for owner in &mut self.external_owners {
+            if let Some(begin) = owner.begin.take()
+                && let Err(error) = begin()
+            {
+                receipt.record(owner.name.clone(), error);
+            }
+        }
+        receipt
+    }
+
+    /// Start the state-owned settlement task. The task owns every resource and
+    /// publishes through a shared receiver, so dropping one caller's wait future
+    /// cannot abandon shutdown or its typed receipt.
+    pub fn start_join(
+        mut self,
+        receipt: ApplicationLifecycleReceipt,
+    ) -> ApplicationLifecycleSettlement {
+        self.armed = false;
+        let fallback = receipt.clone();
+        let (result_tx, result) = tokio::sync::watch::channel(None);
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let receipt = self.join_owned(receipt).await;
+                    result_tx.send_replace(Some(receipt));
+                });
+            }
+            Err(error) => {
+                let mut receipt = receipt;
+                receipt.record(
+                    "application lifecycle",
+                    format!("settlement requires a Tokio runtime: {error}"),
+                );
+                result_tx.send_replace(Some(receipt));
+            }
+        }
+        ApplicationLifecycleSettlement { result, fallback }
+    }
+
+    /// Await all work accepted before [`Self::begin_shutdown`]. Earlier failures
+    /// never suppress later joins; all of them are appended to one typed receipt.
+    pub async fn join(self, receipt: ApplicationLifecycleReceipt) -> ApplicationLifecycleReceipt {
+        self.start_join(receipt).wait().await
+    }
+
+    async fn join_owned(
+        mut self,
+        mut receipt: ApplicationLifecycleReceipt,
+    ) -> ApplicationLifecycleReceipt {
+        if !self.shutdown_begun {
+            receipt.record(
+                "application lifecycle",
+                "join requested before shutdown admission closed",
+            );
+            let begin_receipt = self.begin_shutdown(receipt.reason, None);
+            receipt.failures.extend(begin_receipt.failures);
+        }
+
+        // Phase two: settle accepted work. Continue after every failure so one
+        // broken owner cannot suppress cleanup of later process resources.
+        if let Some(state) = self.app_state.as_ref() {
+            if let Err(error) = state.shutdown_agent_deliveries().await {
+                receipt.record("Agent deliveries", error);
+            }
+            if let Err(error) = state.session.foreground_turns.shutdown().await {
+                receipt.record("foreground turns", error);
+            }
+            if let Err(error) = state.shutdown_model_mutations().await {
+                receipt.record("model mutations", error);
+            }
+        }
+
+        for task in std::mem::take(&mut self.background_tasks) {
+            if let Err(error) = task.handle.await {
+                receipt.record(task.name, error);
+            }
+        }
+        for owner in std::mem::take(&mut self.external_owners) {
+            if let Err(error) = owner.join.await {
+                receipt.record(owner.name, error);
+            }
+        }
+
+        if let Some(integration) = self.review_integration.as_ref()
+            && let Err(error) = integration.shutdown_background_reviews().await
+        {
+            receipt.record("background reviews", error);
+        }
+        if let Some(state) = self.app_state.as_ref() {
+            if let Err(error) = state.shutdown_workspace_transition().await {
+                receipt.record("workspace transition", error);
+            }
+            if let Err(error) = state.shutdown_scheduler().await {
+                receipt.record("scheduler", error);
+            }
+        }
+
+        if let Some(store) = self.task_runtime_store.as_ref() {
+            if let Err(error) = store.shutdown_run_drivers().await {
+                receipt.record("TaskRun drivers", error);
+            }
+            if let Err(error) = store.shutdown_hook_events().await {
+                receipt.record("task hook dispatcher", error);
+            }
+        }
+        if let Some(pool) = self.pool.as_ref()
+            && let Err(error) = pool.shutdown().await
+        {
+            receipt.record("agent pool", error);
+        }
+        if let Some(state) = self.app_state.as_ref() {
+            if let Err(error) = state.shutdown_command_cells().await {
+                receipt.record("command cells", error);
+            }
+            if let Err(error) = state.terminal.close_all().await {
+                receipt.record("terminal sessions", error);
+            }
+        } else if let Some(runtime) = self.command_cell_runtime.as_ref()
+            && let Err(error) = runtime.shutdown().await
+        {
+            receipt.record("command cells", error);
+        }
+
+        if let Some(runtime) = self.plugin_runtime.as_ref()
+            && let Err(error) = runtime.shutdown().await
+        {
+            receipt.record("plugin runtime", error);
+        }
+        if let Some(watcher) = self.config_watcher.as_ref()
+            && let Err(error) = watcher.shutdown().await
+        {
+            receipt.record("config watcher", error);
+        }
+        if let Some(runtime) = self.mcp_config_runtime.as_ref() {
+            runtime.shutdown().await;
+        }
+        if let Some(runtime) = self.browser_runtime.as_ref() {
+            runtime.shutdown().await;
+        }
+        if let Some(agent) = self.primary_agent.as_ref()
+            && let Err(error) = agent
+                .read_async(|agent| Box::pin(async move { agent.close().await }))
+                .await
+        {
+            receipt.record("primary Agent", error);
+        }
+        receipt
+    }
+
+    pub async fn settle(
+        mut self,
+        reason: ApplicationLifecycleReason,
+        primary_error: Option<anyhow::Error>,
+    ) -> ApplicationLifecycleReceipt {
+        let receipt = self.begin_shutdown(reason, primary_error);
+        self.join(receipt).await
+    }
+}
+
+impl Drop for ApplicationLifecycleOwner {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.root_cancel.cancel();
+        for task in self.background_tasks.drain(..) {
+            task.handle.abort();
+        }
+        self.external_owners.clear();
+    }
+}
 
 /// Shared agent runtime context.
 ///
@@ -68,6 +539,26 @@ pub struct AgentRuntime {
 }
 
 impl AgentRuntime {
+    /// Establish the process root owner immediately after bootstrap commits.
+    /// Later construction binds TaskRuntime, AgentPool, AppState and surface
+    /// owners progressively; any intermediate failure can therefore rollback
+    /// every resource already accepted by the process.
+    pub fn lifecycle_owner(
+        &self,
+        root_cancel: tokio_util::sync::CancellationToken,
+    ) -> ApplicationLifecycleOwner {
+        let mut owner = ApplicationLifecycleOwner::new(root_cancel);
+        owner.bind_primary_agent(self.agent_handle.clone());
+        owner.bind_plugin_runtime(self.plugin_runtime.clone());
+        owner.bind_mcp_config_runtime(self.mcp_config_runtime.clone());
+        owner.bind_browser_runtime(self.browser_runtime.clone());
+        owner.bind_command_cell_runtime(self.command_cell_runtime.clone());
+        if let Some(integration) = self.review_integration.as_ref() {
+            owner.bind_review_integration(integration.clone());
+        }
+        owner
+    }
+
     /// Bootstrap the agent runtime.
     ///
     /// This is the single source of truth for agent initialization. Both TUI and
@@ -124,6 +615,8 @@ impl AgentRuntime {
             mcp_config_snapshot.clone(),
         ));
 
+        let browser_runtime_injected = params.browser_runtime.is_some();
+        let command_cell_runtime_injected = params.command_cell_runtime.is_some();
         let browser_runtime = match params.browser_runtime.clone() {
             Some(runtime) => runtime,
             None => {
@@ -133,18 +626,51 @@ impl AgentRuntime {
         };
         params.browser_runtime = Some(browser_runtime.clone());
 
+        let mut bootstrap_lifecycle =
+            ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        bootstrap_lifecycle.bind_mcp_config_runtime(mcp_config_runtime.clone());
+        if !browser_runtime_injected {
+            bootstrap_lifecycle.bind_browser_runtime(browser_runtime.clone());
+        }
+
         // ── 1. Create Agent ──
-        let created = infra::create_agent_with_diagnostics(&params, app_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let created = match infra::create_agent_with_diagnostics(&params, app_config).await {
+            Ok(created) => created,
+            Err(error) => {
+                let receipt = bootstrap_lifecycle
+                    .settle(
+                        ApplicationLifecycleReason::BootstrapRollback,
+                        Some(anyhow::anyhow!(error.to_string())),
+                    )
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
+        };
         let mut agent = created.agent;
         let prompt_assembly = created.prompt_assembly;
         let model_consumers = created.model_consumers;
         let active_runtime_model = created.runtime_model;
         let command_cell_runtime = created.command_cell_runtime;
         let session_app_config = match active_runtime_model.as_ref() {
-            Some(runtime) => crate::model_config::session_config_for_runtime(app_config, runtime)
-                .map_err(anyhow::Error::msg)?,
+            Some(runtime) => {
+                match crate::model_config::session_config_for_runtime(app_config, runtime) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        bootstrap_lifecycle.bind_primary_agent(AgentHandle::new(agent));
+                        if !command_cell_runtime_injected {
+                            bootstrap_lifecycle
+                                .bind_command_cell_runtime(command_cell_runtime.clone());
+                        }
+                        let receipt = bootstrap_lifecycle
+                            .settle(
+                                ApplicationLifecycleReason::BootstrapRollback,
+                                Some(anyhow::Error::msg(error)),
+                            )
+                            .await;
+                        return Err(anyhow::Error::new(receipt.into_error()));
+                    }
+                }
+            }
             None => app_config.clone(),
         };
 
@@ -162,6 +688,10 @@ impl AgentRuntime {
         }
 
         let agent_handle = AgentHandle::new(agent);
+        bootstrap_lifecycle.bind_primary_agent(agent_handle.clone());
+        if !command_cell_runtime_injected {
+            bootstrap_lifecycle.bind_command_cell_runtime(command_cell_runtime.clone());
+        }
         if let Some(conversation_id) = params.conversation_id.as_deref() {
             let execution_scope = params.execution_scope.clone().unwrap_or_else(|| {
                 crate::workspace::WorkspaceExecutionScope::global(
@@ -303,14 +833,33 @@ impl AgentRuntime {
             tracing::info!("ReviewIntegration created for session");
         }
         if let Some(review_integration) = &review_integration {
+            bootstrap_lifecycle.bind_review_integration(review_integration.clone());
             review_integration.bind_rule_projection_primary(agent_handle.clone());
-            review_integration.initialize_rule_promotions().await?;
+            if let Err(error) = review_integration.initialize_rule_promotions().await {
+                let receipt = bootstrap_lifecycle
+                    .settle(
+                        ApplicationLifecycleReason::BootstrapRollback,
+                        Some(error.into()),
+                    )
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
             let evolution_observer = crate::evolution::evolution_hook_observer(&agent_handle).await;
             review_integration.set_evolution_observer(evolution_observer);
-            let layer_manager =
-                Arc::new(review_integration.create_layer_manager().map_err(|error| {
-                    anyhow::anyhow!("Failed to initialize memory layer: {error}")
-                })?);
+            let layer_manager = match review_integration.create_layer_manager() {
+                Ok(layer_manager) => Arc::new(layer_manager),
+                Err(error) => {
+                    let receipt = bootstrap_lifecycle
+                        .settle(
+                            ApplicationLifecycleReason::BootstrapRollback,
+                            Some(anyhow::anyhow!(
+                                "Failed to initialize memory layer: {error}"
+                            )),
+                        )
+                        .await;
+                    return Err(anyhow::Error::new(receipt.into_error()));
+                }
+            };
             let trigger_sink = review_integration.clone();
             let skill_policy = review_integration.clone();
             let skill_curator = review_integration.curator();
@@ -348,6 +897,7 @@ impl AgentRuntime {
             mcp_config_runtime.ownership(),
         )
         .await;
+        bootstrap_lifecycle.bind_plugin_runtime(plugin_runtime.clone());
 
         // ── 11. File-backed research library ──
         agent_handle
@@ -363,6 +913,8 @@ impl AgentRuntime {
         // Intent routing is a projection of the live skill catalog. Dynamic
         // plugin publications reuse this exact builder for primary and pool.
         let keyword_classifier = agent_handle.write(configure_intent_router).await;
+
+        bootstrap_lifecycle.disarm();
 
         Ok(Self {
             agent_handle,
@@ -682,6 +1234,119 @@ mod tests {
     use super::*;
     use echo_agent::intent::IntentClassifier;
     use echo_agent::skills::external::{SkillLoader, tool_matcher};
+
+    #[tokio::test]
+    async fn lifecycle_broadcasts_root_cancel_before_joining_background_tasks() {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_observed = Arc::clone(&observed);
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            task_observed.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let mut owner = ApplicationLifecycleOwner::new(cancel);
+        owner.track_background_task("cancellation observer", task);
+
+        let receipt = owner
+            .settle(ApplicationLifecycleReason::Shutdown, None)
+            .await;
+
+        assert!(receipt.is_clean(), "unexpected receipt: {receipt}");
+        assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_receipt_aggregates_primary_and_join_failures() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.track_background_task("aborted fixture", task);
+
+        let receipt = owner
+            .settle(
+                ApplicationLifecycleReason::BootstrapRollback,
+                Some(anyhow::anyhow!("injected bootstrap failure")),
+            )
+            .await;
+
+        assert_eq!(
+            receipt.primary_error.as_deref(),
+            Some("injected bootstrap failure")
+        );
+        assert_eq!(receipt.failures.len(), 1);
+        assert_eq!(
+            receipt
+                .failures
+                .first()
+                .map(|failure| failure.owner.as_str()),
+            Some("aborted fixture")
+        );
+        assert!(receipt.into_result().is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_begin_closes_external_admission_before_join() {
+        let begun = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let begin_observed = Arc::clone(&begun);
+        let join_observed = Arc::clone(&begun);
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.track_external_owner(
+            "surface fixture",
+            move || {
+                begin_observed.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            },
+            async move {
+                if join_observed.load(std::sync::atomic::Ordering::Acquire) {
+                    Ok(())
+                } else {
+                    Err("join started before admission closed".to_string())
+                }
+            },
+        );
+
+        let receipt = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        assert!(begun.load(std::sync::atomic::Ordering::Acquire));
+        let receipt = owner.join(receipt).await;
+        assert!(receipt.is_clean(), "unexpected receipt: {receipt}");
+    }
+
+    #[tokio::test]
+    async fn dropping_join_waiter_does_not_abandon_owned_settlement() {
+        let join_started = Arc::new(tokio::sync::Notify::new());
+        let release_join = Arc::new(tokio::sync::Notify::new());
+        let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let join_started_task = Arc::clone(&join_started);
+        let release_join_task = Arc::clone(&release_join);
+        let settled_task = Arc::clone(&settled);
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.track_external_owner("parked settlement", || Ok(()), async move {
+            join_started_task.notify_one();
+            release_join_task.notified().await;
+            settled_task.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        let receipt = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let settlement = owner.start_join(receipt);
+        let observer = settlement.clone();
+        let waiter = tokio::spawn(settlement.wait());
+        join_started.notified().await;
+        waiter.abort();
+        let _ = waiter.await;
+        release_join.notify_one();
+
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(1), observer.wait())
+            .await
+            .unwrap_or_else(|_| {
+                ApplicationLifecycleReceipt::new(
+                    ApplicationLifecycleReason::Shutdown,
+                    Some(anyhow::anyhow!("owned settlement timed out")),
+                )
+            });
+        assert!(receipt.is_clean(), "unexpected receipt: {receipt}");
+        assert!(settled.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     fn make_test_classifier() -> KeywordClassifier {
         let mut c = KeywordClassifier::new();

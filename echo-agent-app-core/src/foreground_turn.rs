@@ -865,6 +865,20 @@ impl ForegroundTurnControl {
     /// The first caller starts the state-owned settlement task. Every caller
     /// observes the same typed result, and dropping any caller future cannot
     /// drop the accepted driver `JoinSet` or its receipts.
+    pub fn begin_shutdown(&self) -> Result<(), ForegroundTurnError> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ForegroundTurnError::StateUnavailable)?;
+        state.shutting_down = true;
+        state.admission_suspended = true;
+        for entry in state.active.values() {
+            entry.cancel.cancel();
+        }
+        Ok(())
+    }
+
     pub async fn shutdown(&self) -> Result<(), ForegroundTurnError> {
         let result_rx = {
             let mut state = self

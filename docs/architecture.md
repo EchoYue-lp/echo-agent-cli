@@ -39,6 +39,12 @@ GUI / TUI / CLI / JSONL / Channel
 Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI、CLI 和 channel
 使用同一 app-core 类型与 shutdown 顺序。
 
+`ApplicationLifecycleOwner` 在 runtime bootstrap 成功后立即接管进程资源。关闭先同步停止
+所有 admission 并广播取消，再等待已接受的 foreground、TaskRun、Agent delivery、pool 和后台
+服务。GUI/headless 的失败统一返回 typed aggregate receipt；bootstrap 中途失败使用同一 owner
+回滚，不依赖入口维护第二份资源清单。详细取舍见
+[ADR 0004](./adr/0004-application-lifecycle-supervisor.md)。
+
 进程级唯一服务包括：
 
 - `ForegroundTurnControl`：前台 turn admission、exact cancel 和 typed settlement。

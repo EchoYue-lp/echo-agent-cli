@@ -387,6 +387,7 @@ pub struct ConfigState {
     pub permission_mode: RwLock<echo_agent::tools::permission::PermissionMode>,
     pub permission_rules: RwLock<Vec<PermissionRuleConfig>>,
     model_mutations: Mutex<ModelMutationOwnerState>,
+    model_mutation_admission_open: std::sync::atomic::AtomicBool,
 }
 
 type ModelMutationSettlement =
@@ -1190,6 +1191,7 @@ impl AppState {
                 ),
                 permission_rules: RwLock::new(Vec::new()),
                 model_mutations: Mutex::new(ModelMutationOwnerState::default()),
+                model_mutation_admission_open: std::sync::atomic::AtomicBool::new(true),
             },
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
@@ -1391,7 +1393,21 @@ impl AppState {
         self: &Arc<Self>,
         request: ModelMutationRequest,
     ) -> Result<ModelMutationReceipt, ModelMutationError> {
+        if !self
+            .config
+            .model_mutation_admission_open
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ModelMutationError::ShuttingDown);
+        }
         let mut owner = self.config.model_mutations.lock().await;
+        if !self
+            .config
+            .model_mutation_admission_open
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ModelMutationError::ShuttingDown);
+        }
         if let ModelMutationOwnerLifecycle::Closed(_) = &owner.lifecycle {
             return Err(ModelMutationError::ShuttingDown);
         }
@@ -2969,16 +2985,23 @@ impl AppState {
         let state = Arc::clone(self);
         let supervisor = Arc::clone(&self.agent_deliveries);
         let operation_target = target.clone();
-        let operation_supervisor = Arc::clone(&supervisor);
-        supervisor.supervise(target, async move {
+        let delivery_cancel = supervisor.cancellation_token();
+        let recovery_state = Arc::downgrade(self);
+        let recover: Arc<dyn Fn(crate::agent_router::AgentAddress) + Send + Sync> = Arc::new(
+            move |target: crate::agent_router::AgentAddress| {
+                if let Some(state) = recovery_state.upgrade()
+                    && let Err(error) = state.kick_agent_delivery(target.clone())
+                {
+                    tracing::error!(conversation = %target.conversation_id, %error, "Agent delivery recovery wake failed");
+                }
+            },
+        );
+        supervisor.supervise(target, recover, move |cycle| async move {
             loop {
                 state
-                    .drain_agent_target(
-                        &operation_target,
-                        operation_supervisor.cancellation_token(),
-                    )
+                    .drain_agent_target(&operation_target, delivery_cancel.clone())
                     .await;
-                match operation_supervisor.complete_cycle(&operation_target) {
+                match cycle.complete() {
                     Ok(true) => continue,
                     Ok(false) => return,
                     Err(error) => {
@@ -3054,7 +3077,8 @@ impl AppState {
             let delivered = if active.is_empty() {
                 self.deliver_agent_message_cold(target, &shutdown).await
             } else {
-                self.deliver_agent_message_live(target, &active).await
+                self.deliver_agent_message_live(target, &active, &shutdown)
+                    .await
             };
             match delivered {
                 Ok(true) => {}
@@ -3103,6 +3127,7 @@ impl AppState {
         self: &Arc<Self>,
         target: &crate::agent_router::AgentAddress,
         active: &[crate::foreground_turn::ForegroundTurnSnapshot],
+        shutdown: &CancellationToken,
     ) -> Result<bool, AgentMessageSendError> {
         let runtime = self.chat_runtime_for_agent(target).await?;
         let pool = runtime.pool().ok_or_else(|| {
@@ -3144,9 +3169,15 @@ impl AppState {
             match steer {
                 Ok(turn_id) => {
                     self.agent_router.injected(&claim, turn_id.clone()).await?;
-                    let settlement = waiter
-                        .wait()
-                        .await
+                    let Some(settlement) =
+                        wait_for_live_delivery_or_shutdown(shutdown, waiter.wait()).await
+                    else {
+                        // Injected is deliberately non-terminal. Shutdown
+                        // leaves the durable claim recoverable instead of
+                        // fabricating Delivered before the target safe point.
+                        return Ok(true);
+                    };
+                    let settlement = settlement
                         .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
                     match settlement.outcome {
                         crate::chat_driver::TurnOutcome::Completed => {
@@ -3446,6 +3477,54 @@ impl AppState {
 
     pub async fn shutdown_agent_deliveries(&self) -> Result<(), AgentMessageSendError> {
         self.agent_deliveries.shutdown().await.map_err(Into::into)
+    }
+
+    /// Phase-one application shutdown broadcast. This method never joins: it
+    /// closes durable delivery admission and cancels process-scoped producers so
+    /// the lifecycle owner can safely await dependent subsystem receipts later.
+    pub fn broadcast_application_shutdown(&self) -> Result<(), AgentMessageSendError> {
+        let mut failures = Vec::new();
+        self.config
+            .model_mutation_admission_open
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.scheduler.cancel_token.cancel();
+        self.tasks.cancel_token.cancel();
+        for operation in self.session.operation_cancel_tokens.iter() {
+            operation.value().cancel();
+        }
+        if let Err(error) = self.session.foreground_turns.begin_shutdown() {
+            failures.push(format!("foreground turns: {error}"));
+        }
+        if let Some(store) = self.tasks.runtime.as_ref()
+            && let Err(error) = store.begin_run_driver_shutdown()
+        {
+            failures.push(format!("TaskRun drivers: {error}"));
+        }
+        if let Some(pool) = self.connection.pool.as_ref() {
+            pool.begin_shutdown();
+        }
+        if let Some(integration) = self.review_integration.as_ref() {
+            integration.begin_background_review_shutdown();
+        }
+        if let Some(runtime) = self.command_cell_runtime.as_ref() {
+            runtime.begin_shutdown();
+        }
+        if let Err(error) = self.close_agent_delivery_admission() {
+            failures.push(format!("Agent deliveries: {error}"));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(AgentMessageSendError::Workspace(failures.join("; ")))
+        }
+    }
+
+    /// First phase of process shutdown: stop accepting Agent deliveries and
+    /// broadcast cancellation before any subsystem join is awaited.
+    pub fn close_agent_delivery_admission(&self) -> Result<(), AgentMessageSendError> {
+        self.agent_deliveries
+            .close_admission_and_cancel()
+            .map_err(Into::into)
     }
 
     /// Resume every durable inbox that was accepted or left in-flight before
@@ -4195,6 +4274,21 @@ impl AppState {
         *self.workspace.last_transition.write().await = Some(receipt.clone());
         tracing::info!("Exited workspace focus; loaded hosts remain available");
         Ok(receipt)
+    }
+}
+
+async fn wait_for_live_delivery_or_shutdown<F>(
+    shutdown: &CancellationToken,
+    settlement: F,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::pin!(settlement);
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        settlement = &mut settlement => Some(settlement),
     }
 }
 

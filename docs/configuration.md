@@ -263,7 +263,7 @@ FEISHU_APP_SECRET=...
 | 变量                         | 用途                               |
 | ---------------------------- | ---------------------------------- |
 | `EKO_DATA_DIR`               | 覆盖 `~/.eko` 数据根               |
-| `EKO_CONFIG`          | 主配置文件                         |
+| `EKO_CONFIG`                 | 主配置文件                         |
 | `MODEL_NAME`                 | CLI `--model` 默认值               |
 | `MCP_CONFIG_PATH`            | MCP 配置文件                       |
 | `EKO_UV_PATH`                | analytics runtime 使用的 `uv` 路径 |

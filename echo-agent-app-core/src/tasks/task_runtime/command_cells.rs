@@ -1048,7 +1048,7 @@ impl CommandCellRuntimeService {
             .count()
     }
 
-    pub async fn shutdown(&self) -> Result<(), String> {
+    pub fn begin_shutdown(&self) {
         self.shutdown.cancel();
         self.observers.close();
         let active_awaiters = self
@@ -1065,6 +1065,10 @@ impl CommandCellRuntimeService {
                 handle.cancel();
             }
         }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), String> {
+        self.begin_shutdown();
         let shutdown_result = self
             .inner
             .shutdown()

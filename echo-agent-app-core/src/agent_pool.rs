@@ -283,17 +283,30 @@ struct PooledAgent {
     last_used: Instant,
 }
 
-#[derive(Default)]
 struct AgentPoolAdmission {
     active: Mutex<AgentPoolAdmissionState>,
     idle: Notify,
 }
 
-#[derive(Default)]
 struct AgentPoolAdmissionState {
+    accepting: bool,
     total: usize,
     by_key: HashMap<String, usize>,
     process_permits: HashMap<String, tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl Default for AgentPoolAdmission {
+    fn default() -> Self {
+        Self {
+            active: Mutex::new(AgentPoolAdmissionState {
+                accepting: true,
+                total: 0,
+                by_key: HashMap::new(),
+                process_permits: HashMap::new(),
+            }),
+            idle: Notify::new(),
+        }
+    }
 }
 
 impl AgentPoolAdmission {
@@ -307,6 +320,9 @@ impl AgentPoolAdmission {
             .active
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.accepting {
+            return Err(PoolError::ShuttingDown);
+        }
         let total = active
             .total
             .checked_add(1)
@@ -364,6 +380,13 @@ impl AgentPoolAdmission {
             .by_key
             .get(key)
             .is_some_and(|count| *count != 0)
+    }
+
+    fn close(&self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .accepting = false;
     }
 
     async fn wait_until_idle(&self) {
@@ -1189,12 +1212,13 @@ impl AgentPool {
                 }
             });
             let handle = existing.handle.clone();
-            drop(agents);
-            return self.admission.issue_process_scoped(
+            let lease = self.admission.issue_process_scoped(
                 conversation_id,
                 handle,
                 &self.process_agent_execution,
-            );
+            )?;
+            drop(agents);
+            return Ok(lease);
         }
 
         // Enforce the requested class limit and evict only from that class.
@@ -1253,6 +1277,11 @@ impl AgentPool {
             .map_err(|e| PoolError::AgentCreation(e.to_string()))?;
         let handle = pooled.handle.clone();
 
+        let lease = self.admission.issue_process_scoped(
+            conversation_id,
+            handle,
+            &self.process_agent_execution,
+        )?;
         agents.insert(conversation_id.to_string(), pooled);
 
         tracing::info!(
@@ -1261,8 +1290,7 @@ impl AgentPool {
             "AgentPool: new agent created"
         );
         drop(agents);
-        self.admission
-            .issue_process_scoped(conversation_id, handle, &self.process_agent_execution)
+        Ok(lease)
     }
 
     /// Lease an existing agent without creating a new one.
@@ -1279,17 +1307,18 @@ impl AgentPool {
         if self.workspace_transitioning.load(Ordering::Acquire) {
             return Err(PoolError::WorkspaceTransition);
         }
-        let handle = agents
+        let lease = agents
             .get(conversation_id)
-            .map(|pooled| pooled.handle.clone());
+            .map(|pooled| {
+                self.admission.issue_process_scoped(
+                    conversation_id,
+                    pooled.handle.clone(),
+                    &self.process_agent_execution,
+                )
+            })
+            .transpose()?;
         drop(agents);
-        match handle {
-            Some(handle) => self
-                .admission
-                .issue_process_scoped(conversation_id, handle, &self.process_agent_execution)
-                .map(Some),
-            None => Ok(None),
-        }
+        Ok(lease)
     }
 
     /// Retire one cached agent using the exact execution receipt that owns it.
@@ -1882,11 +1911,16 @@ impl AgentPool {
     }
 
     /// Stop the cleanup monitor and release all pool agents.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.admission.close();
+        self.cleanup_cancel.cancel();
+    }
+
     pub async fn shutdown(&self) -> Result<(), String> {
         let agents = self.agents.write().await;
-        self.shutting_down.store(true, Ordering::Release);
+        self.begin_shutdown();
         drop(agents);
-        self.cleanup_cancel.cancel();
         let cleanup_handle = self
             .cleanup_handle
             .lock()
@@ -2528,6 +2562,41 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .is_some()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_admission_linearizes_with_pool_lock_before_lease_publication() -> TestResult {
+        let pool = Arc::new(create_test_pool(5, false).await?);
+        let initial = pool.acquire("reserved").await.map_err(|e| e.to_string())?;
+        drop(initial);
+
+        let agents = pool.agents.write().await;
+        let handle = agents
+            .get("reserved")
+            .map(|pooled| pooled.handle.clone())
+            .ok_or_else(|| "reserved pooled Agent is missing".to_string())?;
+        let accepted = pool
+            .admission
+            .issue_process_scoped("reserved", handle.clone(), &pool.process_agent_execution)
+            .map_err(|error| error.to_string())?;
+        pool.begin_shutdown();
+        assert!(matches!(
+            pool.admission
+                .issue_process_scoped("reserved", handle, &pool.process_agent_execution,),
+            Err(PoolError::ShuttingDown)
+        ));
+        drop(agents);
+
+        let shutdown_pool = Arc::clone(&pool);
+        let shutdown = tokio::spawn(async move { shutdown_pool.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        drop(accepted);
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown)
+            .await
+            .map_err(|_| "pool shutdown did not wait for the accepted reservation".to_string())?
+            .map_err(|error| error.to_string())??;
         Ok(())
     }
 

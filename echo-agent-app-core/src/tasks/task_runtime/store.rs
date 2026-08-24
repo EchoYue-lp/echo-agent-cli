@@ -1206,6 +1206,21 @@ impl Drop for RunCancellationRegistration {
 }
 
 impl TaskRuntimeStore {
+    /// Phase-one process shutdown: close driver admission and broadcast every
+    /// accepted driver cancellation without awaiting settlement.
+    pub fn begin_run_driver_shutdown(&self) -> Result<(), String> {
+        let mut supervisor = self
+            .run_driver_supervisor
+            .lock()
+            .map_err(|_| "TaskRun driver supervisor lock is poisoned".to_string())?;
+        supervisor.accepting = false;
+        for cancel in supervisor.driver_cancels.values() {
+            cancel.cancel();
+        }
+        super::continuation::shutdown(self);
+        Ok(())
+    }
+
     /// Whether the process runtime still accepts new finite TaskRun drivers.
     /// Long-horizon coordinators use this to stop cleanly during application
     /// shutdown and leave durable recovery to the next process.
@@ -1401,6 +1416,11 @@ impl TaskRuntimeStore {
     pub async fn shutdown_run_drivers(
         self: &std::sync::Arc<Self>,
     ) -> Result<(), TaskRunDriverShutdownError> {
+        self.begin_run_driver_shutdown()
+            .map_err(|error| TaskRunDriverShutdownError {
+                driver_errors: vec![error],
+                abandoned_settlements: Vec::new(),
+            })?;
         let (mut shutdown_result, shutdown_sender, shutdown_reporter) = {
             let mut supervisor =
                 self.run_driver_supervisor

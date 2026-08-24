@@ -955,14 +955,27 @@ impl ReviewIntegration {
     /// Close background-review admission, cancel every accepted inner task,
     /// and await the owned supervisors that retain generation leases until the
     /// inner framework JoinHandle and evidence settlement have both ended.
+    pub fn begin_background_review_shutdown(&self) {
+        let mut registry = self
+            .binding
+            .background_reviews
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        registry.accepting = false;
+        for task in &registry.tasks {
+            task.abort_handle.abort();
+            task.release.cancel();
+        }
+    }
+
     pub async fn shutdown_background_reviews(&self) -> Result<(), String> {
+        self.begin_background_review_shutdown();
         let tasks = {
             let mut registry = self
                 .binding
                 .background_reviews
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            registry.accepting = false;
             std::mem::take(&mut registry.tasks)
         };
         for task in &tasks {

@@ -398,12 +398,13 @@ pub fn build_tauri_app(
             }
 
             let terminal_state = app.state::<TauriState>();
+            let terminal_reservation = terminal_state.bridge_supervisor.reserve()?;
             let terminal_bridge = terminal::spawn_event_bridge(
                 app.handle().clone(),
                 terminal_state.app_state.terminal.clone(),
                 terminal_state.bridge_supervisor.cancellation_token(),
             );
-            terminal_state.bridge_supervisor.track(terminal_bridge);
+            terminal_reservation.track(terminal_bridge);
 
             let browser_app_handle = app.handle().clone();
             let mut browser_events = app.state::<TauriState>().browser_runtime.subscribe();
@@ -411,6 +412,10 @@ pub fn build_tauri_app(
                 .state::<TauriState>()
                 .bridge_supervisor
                 .cancellation_token();
+            let browser_reservation = app
+                .state::<TauriState>()
+                .bridge_supervisor
+                .reserve()?;
             let browser_bridge = tokio::spawn(async move {
                 loop {
                     let event = tokio::select! {
@@ -428,9 +433,7 @@ pub fn build_tauri_app(
                     }
                 }
             });
-            app.state::<TauriState>()
-                .bridge_supervisor
-                .track(browser_bridge);
+            browser_reservation.track(browser_bridge);
 
             let handle = app.handle().clone();
             app.global_shortcut()
@@ -477,6 +480,7 @@ pub fn build_tauri_app(
                 );
                 let foreground_turns = state.app_state.session.foreground_turns.clone();
                 let supervisor = state.bridge_supervisor.clone();
+                let reservation = supervisor.reserve()?;
                 let cancel = supervisor.cancellation_token();
                 let bridge = tokio::spawn(async move {
                     let subscription = agent.read_async(|a| {
@@ -969,7 +973,7 @@ pub fn build_tauri_app(
                         }
                     }
                 });
-                supervisor.track(bridge);
+                reservation.track(bridge);
             }
 
             Ok(())

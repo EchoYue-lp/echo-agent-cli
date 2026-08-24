@@ -4,24 +4,28 @@
 //! Web 模式已移除 — GUI 通过 Tauri IPC 通信。
 
 use anyhow::Result;
+use futures::FutureExt;
 
 use crate::agent_handle::AgentHandle;
 use crate::cli::args::{Args, JsonlApprovalPolicy, JsonlInteractionMode, JsonlPermissionMode};
 use echo_agent_app_core::config::EkoConfig;
-
-type CliShutdownFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>>;
-
-struct CliShutdownStep<'a> {
-    name: &'static str,
-    future: CliShutdownFuture<'a>,
-}
 
 /// Owned settlement for a concurrently running product surface that must stop
 /// before CLI tears down shared foreground, pool, and plugin resources.
 pub struct CompanionModeShutdown {
     name: &'static str,
     cancel: echo_agent::agent::CancellationToken,
-    settlement: Option<tokio::task::JoinHandle<Result<()>>>,
+    settlement: futures::future::Shared<
+        futures::future::BoxFuture<'static, std::result::Result<(), String>>,
+    >,
+    cancel_on_drop: bool,
+}
+
+#[derive(Clone)]
+pub struct CompanionModeObserver {
+    settlement: futures::future::Shared<
+        futures::future::BoxFuture<'static, std::result::Result<(), String>>,
+    >,
 }
 
 impl CompanionModeShutdown {
@@ -30,31 +34,56 @@ impl CompanionModeShutdown {
         cancel: echo_agent::agent::CancellationToken,
         settlement: tokio::task::JoinHandle<Result<()>>,
     ) -> Self {
+        let settlement = async move {
+            match settlement.await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(format!("{name} settlement task failed: {error}")),
+            }
+        }
+        .boxed()
+        .shared();
         Self {
             name,
             cancel,
-            settlement: Some(settlement),
+            settlement,
+            cancel_on_drop: true,
         }
     }
 
-    async fn shutdown(mut self) -> Result<()> {
-        self.cancel.cancel();
-        let settlement = self
-            .settlement
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("{} settlement handle is unavailable", self.name))?;
-        settlement
-            .await
-            .map_err(|error| anyhow::anyhow!("{} settlement task failed: {error}", self.name))?
+    fn bind(
+        mut self,
+        lifecycle: &mut echo_agent_app_core::runtime::ApplicationLifecycleOwner,
+    ) -> CompanionModeObserver {
+        let cancel = self.cancel.clone();
+        let settlement = self.settlement.clone();
+        let observer = CompanionModeObserver {
+            settlement: self.settlement.clone(),
+        };
+        lifecycle.track_external_owner(
+            self.name,
+            move || {
+                cancel.cancel();
+                Ok(())
+            },
+            settlement,
+        );
+        self.cancel_on_drop = false;
+        observer
     }
 }
 
 impl Drop for CompanionModeShutdown {
     fn drop(&mut self) {
-        self.cancel.cancel();
-        if let Some(settlement) = self.settlement.take() {
-            settlement.abort();
+        if self.cancel_on_drop {
+            self.cancel.cancel();
         }
+    }
+}
+
+impl CompanionModeObserver {
+    pub async fn wait(self) -> Result<()> {
+        self.settlement.await.map_err(anyhow::Error::msg)
     }
 }
 
@@ -84,6 +113,13 @@ impl HeadlessDreamingOwner {
             .await
             .map_err(|error| anyhow::anyhow!("Dreaming settlement task failed: {error}"))
     }
+
+    fn into_lifecycle_task(mut self) -> Result<tokio::task::JoinHandle<()>> {
+        self.cancel.cancel();
+        self.settlement
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Dreaming settlement handle is unavailable"))
+    }
 }
 
 impl Drop for HeadlessDreamingOwner {
@@ -92,33 +128,6 @@ impl Drop for HeadlessDreamingOwner {
         if let Some(settlement) = self.settlement.take() {
             settlement.abort();
         }
-    }
-}
-
-async fn drain_cli_shutdown(
-    mode_result: Result<()>,
-    steps: Vec<CliShutdownStep<'_>>,
-) -> Result<()> {
-    let mut failures = mode_result
-        .err()
-        .map(|error| format!("surface: {error}"))
-        .into_iter()
-        .collect::<Vec<_>>();
-
-    for step in steps {
-        if let Err(error) = step.future.await {
-            tracing::warn!(step = step.name, %error, "application shutdown step failed");
-            failures.push(format!("{}: {error}", step.name));
-        }
-    }
-
-    if failures.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!(
-            "application mode failed: {}",
-            failures.join("; ")
-        ))
     }
 }
 
@@ -163,15 +172,29 @@ pub struct HeadlessServiceResources {
         echo_agent_app_core::tasks::task_runtime::command_cells::CommandCellRuntimeService,
     >,
     pub browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
+    pub lifecycle: echo_agent_app_core::runtime::ApplicationLifecycleOwner,
 }
 
 /// Composition receipt for the single headless bootstrap shared by CLI and
-/// channel surfaces. It contains no independent lifecycle state; shutdown is
-/// delegated to the existing AppState subsystem owners.
+/// channel surfaces. It retains the app-core root owner that composes existing
+/// subsystem authorities without duplicating their internal state machines.
 pub struct HeadlessServices {
     pub task_service: Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     pub scheduler_runner: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     pub app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
+    lifecycle: Option<echo_agent_app_core::runtime::ApplicationLifecycleOwner>,
+}
+
+impl HeadlessServices {
+    pub fn bind_companion(
+        &mut self,
+        companion: CompanionModeShutdown,
+    ) -> Result<CompanionModeObserver> {
+        let lifecycle = self.lifecycle.as_mut().ok_or_else(|| {
+            anyhow::anyhow!("headless application lifecycle owner is unavailable")
+        })?;
+        Ok(companion.bind(lifecycle))
+    }
 }
 
 async fn await_jsonl_driver_or_cancel<Driver, Signal, Output>(
@@ -429,6 +452,7 @@ pub async fn start_headless_services(
     app_config: &EkoConfig,
     resources: HeadlessServiceResources,
 ) -> Result<HeadlessServices> {
+    let mut lifecycle = resources.lifecycle;
     let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
         let file_path = echo_agent_app_core::data_root::user_data_path("scheduler_store");
         match echo_agent::memory::FileStore::new(&file_path) {
@@ -440,26 +464,37 @@ pub async fn start_headless_services(
         }
     };
     use crate::state::AppState;
-    let mut state = AppState::from_shared(
+    let mut state = match AppState::from_shared(
         agent,
-        Some(resources.model_consumers),
+        Some(resources.model_consumers.clone()),
         hitl_dispatcher,
-        resources.conversation_store,
-        resources.runtime_state_store,
+        resources.conversation_store.clone(),
+        resources.runtime_state_store.clone(),
         app_config.clone(),
-        resources.mcp_config_runtime,
-    )?
-    .with_active_model_id(resources.active_model_id)
-    .with_review_integration(resources.review_integration)
-    .with_plugin_runtime(Some(resources.plugin_runtime))
-    .with_config_watcher(Some(resources.config_watcher))
-    .with_foreground_turns(resources.foreground_turns);
+        resources.mcp_config_runtime.clone(),
+    ) {
+        Ok(state) => state,
+        Err(error) => {
+            let receipt = lifecycle
+                .settle(
+                    echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                    Some(error),
+                )
+                .await;
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
+    }
+    .with_active_model_id(resources.active_model_id.clone())
+    .with_review_integration(resources.review_integration.clone())
+    .with_plugin_runtime(Some(resources.plugin_runtime.clone()))
+    .with_config_watcher(Some(resources.config_watcher.clone()))
+    .with_foreground_turns(resources.foreground_turns.clone());
     state.webhook.emitter = resources.webhook_emitter;
-    state.connection.pool = Some(resources.pool);
-    state.tasks.runtime = resources.task_runtime_store;
+    state.connection.pool = Some(resources.pool.clone());
+    state.tasks.runtime = resources.task_runtime_store.clone();
     state = state
-        .with_command_cell_runtime(resources.command_cell_runtime)
-        .with_workspace_delete_hook(resources.browser_runtime);
+        .with_command_cell_runtime(resources.command_cell_runtime.clone())
+        .with_workspace_delete_hook(resources.browser_runtime.clone());
     match state.recover_committed_conversation_deletions().await {
         Ok(receipts) if !receipts.is_empty() => tracing::info!(
             count = receipts.len(),
@@ -471,12 +506,24 @@ pub async fn start_headless_services(
             "Some committed conversation deletion finalizers remain pending"
         ),
     }
-    state
+    if let Err(error) = state
         .start_scheduler_and_task_service(Some(scheduler_store))
-        .await?;
+        .await
+    {
+        let state = std::sync::Arc::new(state);
+        lifecycle.bind_app_state(state);
+        let receipt = lifecycle
+            .settle(
+                echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                Some(anyhow::Error::new(error)),
+            )
+            .await;
+        return Err(anyhow::Error::new(receipt.into_error()));
+    }
     let task_service = state.tasks.service.clone();
     let scheduler = state.scheduler.runner.clone();
     let app_state = std::sync::Arc::new(state);
+    lifecycle.bind_app_state(app_state.clone());
     if let Err(error) = app_state.recover_agent_deliveries().await {
         tracing::warn!(%error, "failed to resume durable Agent deliveries during headless startup");
     }
@@ -484,6 +531,7 @@ pub async fn start_headless_services(
         task_service,
         scheduler_runner: scheduler,
         app_state,
+        lifecycle: Some(lifecycle),
     })
 }
 
@@ -503,9 +551,7 @@ pub async fn run_cli_mode(
     plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
     services: &HeadlessServices,
     repl_hitl_session: crate::cli::ReplHumanLoopSession,
-    companion_shutdown: Option<CompanionModeShutdown>,
 ) -> Result<()> {
-    let mut companion_shutdown = companion_shutdown;
     let mut repl_config = repl_config_for(args);
     repl_config.task_service = services.task_service.clone();
     repl_config.scheduler_runner = services.scheduler_runner.clone();
@@ -518,188 +564,41 @@ pub async fn run_cli_mode(
     repl_config.plugin_runtime = Some(plugin_runtime.clone());
     repl_config.app_state = Some(services.app_state.clone());
 
-    let repl_result = crate::cli::run_repl(agent, repl_config, repl_hitl_session).await;
-    let mut steps = Vec::new();
-    if let Some(companion) = companion_shutdown.take() {
-        steps.push(CliShutdownStep {
-            name: companion.name,
-            future: Box::pin(companion.shutdown()),
-        });
-    }
-    drain_cli_shutdown(repl_result, steps).await
+    crate::cli::run_repl(agent, repl_config, repl_hitl_session).await
 }
 
 /// Settle every shared headless owner exactly once after all product surfaces
 /// have stopped accepting work. Failures are aggregated without skipping later
 /// teardown steps.
-#[allow(clippy::too_many_arguments)]
 pub async fn shutdown_headless_services(
     mode_result: Result<()>,
     services: HeadlessServices,
     dreaming_owner: Option<HeadlessDreamingOwner>,
     session_exit_agent: Option<AgentHandle>,
-    plugin_runtime: std::sync::Arc<echo_agent_app_core::plugin_runtime::PluginRuntimeService>,
-    config_watcher: std::sync::Arc<echo_agent_app_core::config_watcher::ConfigWatcherHandle>,
-    mcp_config_runtime: std::sync::Arc<echo_agent_app_core::mcp_config_runtime::McpConfigRuntime>,
-    browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
-    root_cancel: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let app_state = services.app_state;
+    let mut lifecycle = services
+        .lifecycle
+        .ok_or_else(|| anyhow::anyhow!("headless application lifecycle owner is unavailable"))?;
+    if let Some(owner) = dreaming_owner {
+        lifecycle.track_background_task("Dreaming", owner.into_lifecycle_task()?);
+    }
+    let receipt = lifecycle.begin_shutdown(
+        echo_agent_app_core::runtime::ApplicationLifecycleReason::Shutdown,
+        mode_result.err(),
+    );
     let review_integration = app_state.review_integration.clone();
     let auto_memory_integration = review_integration.clone();
     let session_review_integration = review_integration.clone();
-    let background_review_integration = review_integration;
     let run_session_review = session_exit_agent.is_some();
-    let steps = vec![
-        CliShutdownStep {
-            name: "Agent deliveries",
-            future: Box::pin(async {
-                app_state
-                    .shutdown_agent_deliveries()
-                    .await
-                    .map_err(anyhow::Error::from)
-            }),
-        },
-        CliShutdownStep {
-            name: "foreground turns",
-            future: Box::pin(async {
-                app_state
-                    .session
-                    .foreground_turns
-                    .shutdown()
-                    .await
-                    .map_err(anyhow::Error::from)
-            }),
-        },
-        CliShutdownStep {
-            name: "model mutations",
-            future: Box::pin(async {
-                app_state
-                    .shutdown_model_mutations()
-                    .await
-                    .map_err(anyhow::Error::from)
-            }),
-        },
-        CliShutdownStep {
-            name: "Dreaming",
-            future: Box::pin(async move {
-                if let Some(owner) = dreaming_owner {
-                    owner.shutdown().await?;
-                }
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "auto-memory",
-            future: Box::pin(async move {
-                if let Some(agent) = session_exit_agent.as_ref() {
-                    crate::cli::repl::run_auto_memory_on_exit(agent, &auto_memory_integration)
-                        .await;
-                }
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "memory review",
-            future: Box::pin(async move {
-                if run_session_review {
-                    crate::cli::repl::run_memory_review_on_exit(&session_review_integration).await;
-                }
-                if let Some(integration) = background_review_integration.as_ref() {
-                    integration
-                        .shutdown_background_reviews()
-                        .await
-                        .map_err(anyhow::Error::msg)?;
-                }
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "workspace transition",
-            future: Box::pin(async { app_state.shutdown_workspace_transition().await }),
-        },
-        CliShutdownStep {
-            name: "scheduler",
-            future: Box::pin(async {
-                app_state
-                    .shutdown_scheduler()
-                    .await
-                    .map_err(anyhow::Error::from)
-            }),
-        },
-        CliShutdownStep {
-            name: "TaskRun drivers",
-            future: Box::pin(async {
-                if let Some(store) = app_state.tasks.runtime.as_ref() {
-                    store
-                        .shutdown_run_drivers()
-                        .await
-                        .map_err(anyhow::Error::msg)?;
-                }
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "agent pool",
-            future: Box::pin(async {
-                if let Some(pool) = app_state.connection.pool.as_ref() {
-                    pool.shutdown().await.map_err(anyhow::Error::msg)?;
-                }
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "command cells",
-            future: Box::pin(async {
-                app_state
-                    .shutdown_command_cells()
-                    .await
-                    .map_err(anyhow::Error::msg)
-            }),
-        },
-        CliShutdownStep {
-            name: "plugin runtime",
-            future: Box::pin(async { plugin_runtime.shutdown().await }),
-        },
-        CliShutdownStep {
-            name: "config watcher",
-            future: Box::pin(async { config_watcher.shutdown().await }),
-        },
-        CliShutdownStep {
-            name: "MCP runtime",
-            future: Box::pin(async {
-                mcp_config_runtime.shutdown().await;
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "browser runtime",
-            future: Box::pin(async {
-                browser_runtime.shutdown().await;
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "task hook dispatcher",
-            future: Box::pin(async {
-                if let Some(store) = app_state.tasks.runtime.as_ref() {
-                    store
-                        .shutdown_hook_events()
-                        .await
-                        .map_err(anyhow::Error::msg)?;
-                }
-                Ok(())
-            }),
-        },
-        CliShutdownStep {
-            name: "root cancellation",
-            future: Box::pin(async {
-                root_cancel.cancel();
-                Ok(())
-            }),
-        },
-    ];
-    drain_cli_shutdown(mode_result, steps).await
+    if let Some(agent) = session_exit_agent.as_ref() {
+        crate::cli::repl::run_auto_memory_on_exit(agent, &auto_memory_integration).await;
+    }
+    if run_session_review {
+        crate::cli::repl::run_memory_review_on_exit(&session_review_integration).await;
+    }
+    let receipt = lifecycle.join(receipt).await;
+    receipt.into_result().map_err(anyhow::Error::new)
 }
 
 /// 运行 IM 通道模式（QQ Bot、飞书等）
@@ -868,10 +767,7 @@ pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
     }
     tracing::info!(started_count, "IM channels started");
 
-    tokio::select! {
-        _ = crate::infra::shutdown_signal() => {}
-        _ = shutdown.cancelled() => {}
-    }
+    shutdown.cancelled().await;
 
     tracing::info!("正在关闭 IM 通道...");
     let stop_result = manager.stop_all().await.map_err(anyhow::Error::from);
@@ -906,73 +802,9 @@ fn channel_session_config(timeout_minutes: u64) -> echo_agent::channels::Session
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     #[cfg(feature = "channels")]
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
-
-    fn recorded_shutdown_step(
-        calls: Arc<Mutex<Vec<&'static str>>>,
-        name: &'static str,
-        fail: bool,
-    ) -> CliShutdownStep<'static> {
-        CliShutdownStep {
-            name,
-            future: Box::pin(async move {
-                calls
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("shutdown call log is unavailable"))?
-                    .push(name);
-                if fail {
-                    Err(anyhow::anyhow!("{name} injected failure"))
-                } else {
-                    Ok(())
-                }
-            }),
-        }
-    }
-
-    #[tokio::test]
-    async fn earlier_shutdown_failures_do_not_skip_later_owners() -> Result<()> {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let steps = vec![
-            recorded_shutdown_step(Arc::clone(&calls), "foreground", true),
-            recorded_shutdown_step(Arc::clone(&calls), "model", false),
-            recorded_shutdown_step(Arc::clone(&calls), "Dreaming", false),
-            recorded_shutdown_step(Arc::clone(&calls), "memory", false),
-            recorded_shutdown_step(Arc::clone(&calls), "workspace", true),
-            recorded_shutdown_step(Arc::clone(&calls), "scheduler", false),
-            recorded_shutdown_step(Arc::clone(&calls), "drivers", false),
-            recorded_shutdown_step(Arc::clone(&calls), "pool", false),
-            recorded_shutdown_step(Arc::clone(&calls), "plugin", false),
-        ];
-
-        let error = drain_cli_shutdown(Ok(()), steps)
-            .await
-            .err()
-            .ok_or_else(|| anyhow::anyhow!("injected shutdown failures were not reported"))?;
-        let observed = calls
-            .lock()
-            .map_err(|_| anyhow::anyhow!("shutdown call log is unavailable"))?
-            .clone();
-
-        assert_eq!(
-            observed,
-            [
-                "foreground",
-                "model",
-                "Dreaming",
-                "memory",
-                "workspace",
-                "scheduler",
-                "drivers",
-                "pool",
-                "plugin"
-            ]
-        );
-        assert!(error.to_string().contains("foreground injected failure"));
-        assert!(error.to_string().contains("workspace injected failure"));
-        Ok(())
-    }
 
     #[tokio::test]
     async fn headless_dreaming_owner_cancels_and_joins_its_task() -> Result<()> {
@@ -987,6 +819,34 @@ mod tests {
 
         HeadlessDreamingOwner::new(cancel, task).shutdown().await?;
         assert!(observed.load(std::sync::atomic::Ordering::Acquire));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn companion_surface_closes_in_application_phase_one_before_join() -> Result<()> {
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_settled = Arc::clone(&settled);
+        let handle = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            task_settled.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        });
+        let companion = CompanionModeShutdown::new("channels", cancel, handle);
+        let mut lifecycle = echo_agent_app_core::runtime::ApplicationLifecycleOwner::new(
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let observer = companion.bind(&mut lifecycle);
+
+        let receipt = lifecycle.begin_shutdown(
+            echo_agent_app_core::runtime::ApplicationLifecycleReason::Shutdown,
+            None,
+        );
+        observer.wait().await?;
+        let receipt = lifecycle.join(receipt).await;
+        receipt.into_result().map_err(anyhow::Error::new)?;
+        assert!(settled.load(std::sync::atomic::Ordering::Acquire));
         Ok(())
     }
 

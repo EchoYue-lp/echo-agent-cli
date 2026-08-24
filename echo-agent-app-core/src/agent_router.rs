@@ -398,23 +398,81 @@ pub struct AgentRouter {
 
 #[derive(Default)]
 struct AgentDeliverySupervisorState {
-    active: HashSet<AgentAddress>,
-    dirty: HashSet<AgentAddress>,
-    drivers: tokio::task::JoinSet<AgentAddress>,
+    active: HashMap<AgentAddress, u64>,
+    dirty: HashMap<AgentAddress, u64>,
+    next_driver_generation: u64,
+    drivers: tokio::task::JoinSet<()>,
+    driver_targets: HashMap<tokio::task::Id, AgentAddress>,
+    driver_failures: Vec<String>,
     shutting_down: bool,
+}
+
+struct AgentDeliveryDriverGuard {
+    state: Arc<StdMutex<AgentDeliverySupervisorState>>,
+    target: AgentAddress,
+    generation: u64,
+    recover: Arc<dyn Fn(AgentAddress) + Send + Sync>,
+}
+
+pub(crate) struct AgentDeliveryDriverCycle {
+    state: Arc<StdMutex<AgentDeliverySupervisorState>>,
+    target: AgentAddress,
+    generation: u64,
+}
+
+impl AgentDeliveryDriverCycle {
+    /// Complete one drain cycle for this exact driver generation. `true` means
+    /// an enqueue raced the cycle and the same owner must inspect the target
+    /// again before releasing it.
+    pub(crate) fn complete(&self) -> Result<bool, AgentRouterError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AgentRouterError::StateUnavailable)?;
+        if state.active.get(&self.target) != Some(&self.generation) {
+            return Ok(false);
+        }
+        if state.dirty.get(&self.target) == Some(&self.generation) && !state.shutting_down {
+            state.dirty.remove(&self.target);
+            return Ok(true);
+        }
+        state.active.remove(&self.target);
+        if state.dirty.get(&self.target) == Some(&self.generation) {
+            state.dirty.remove(&self.target);
+        }
+        Ok(false)
+    }
+}
+
+impl Drop for AgentDeliveryDriverGuard {
+    fn drop(&mut self) {
+        let mut recover = false;
+        if let Ok(mut state) = self.state.lock()
+            && state.active.get(&self.target) == Some(&self.generation)
+        {
+            state.active.remove(&self.target);
+            if state.dirty.get(&self.target) == Some(&self.generation) {
+                state.dirty.remove(&self.target);
+                recover = !state.shutting_down;
+            }
+        }
+        if recover {
+            (self.recover)(self.target.clone());
+        }
+    }
 }
 
 /// Application-owned lifetime manager for asynchronous inbox delivery.
 /// It owns task lifetimes only; Agent execution remains in `drive_chat`.
 pub struct AgentDeliverySupervisor {
-    state: StdMutex<AgentDeliverySupervisorState>,
+    state: Arc<StdMutex<AgentDeliverySupervisorState>>,
     cancel: echo_agent::agent::CancellationToken,
 }
 
 impl Default for AgentDeliverySupervisor {
     fn default() -> Self {
         Self {
-            state: StdMutex::new(AgentDeliverySupervisorState::default()),
+            state: Arc::new(StdMutex::new(AgentDeliverySupervisorState::default())),
             cancel: echo_agent::agent::CancellationToken::new(),
         }
     }
@@ -431,7 +489,7 @@ impl AgentDeliverySupervisor {
             .map(|state| {
                 state
                     .active
-                    .iter()
+                    .keys()
                     .any(|target| &target.workspace_id == workspace_id)
             })
             .unwrap_or(true)
@@ -439,9 +497,15 @@ impl AgentDeliverySupervisor {
 
     /// Start one target-owned delivery task or mark the already-running task
     /// dirty so it performs another empty-inbox check before exit.
-    pub fn supervise<F>(&self, target: AgentAddress, operation: F) -> Result<bool, AgentRouterError>
+    pub(crate) fn supervise<Factory, Operation>(
+        &self,
+        target: AgentAddress,
+        recover: Arc<dyn Fn(AgentAddress) + Send + Sync>,
+        operation: Factory,
+    ) -> Result<bool, AgentRouterError>
     where
-        F: std::future::Future<Output = ()> + Send + 'static,
+        Factory: FnOnce(AgentDeliveryDriverCycle) -> Operation + Send + 'static,
+        Operation: std::future::Future<Output = ()> + Send + 'static,
     {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|error| AgentRouterError::RuntimeUnavailable(error.to_string()))?;
@@ -453,49 +517,77 @@ impl AgentDeliverySupervisor {
         if state.shutting_down {
             return Err(AgentRouterError::ShuttingDown);
         }
-        if state.active.contains(&target) {
-            state.dirty.insert(target);
+        if let Some(generation) = state.active.get(&target).copied() {
+            state.dirty.insert(target, generation);
             return Ok(false);
         }
-        state.active.insert(target.clone());
-        state.drivers.spawn_on(
+        let generation = state
+            .next_driver_generation
+            .checked_add(1)
+            .ok_or_else(|| AgentRouterError::Task("delivery driver generation exhausted".into()))?;
+        state.next_driver_generation = generation;
+        state.active.insert(target.clone(), generation);
+        let guard = AgentDeliveryDriverGuard {
+            state: Arc::clone(&self.state),
+            target: target.clone(),
+            generation,
+            recover,
+        };
+        let cycle = AgentDeliveryDriverCycle {
+            state: Arc::clone(&self.state),
+            target: target.clone(),
+            generation,
+        };
+        let abort = state.drivers.spawn_on(
             async move {
-                operation.await;
-                target
+                let _guard = guard;
+                operation(cycle).await;
             },
             &runtime,
         );
+        state.driver_targets.insert(abort.id(), target);
         Ok(true)
     }
 
-    /// Complete one drain cycle. `true` means an enqueue raced the cycle and
-    /// the same owned task must inspect the target again before exiting.
-    pub fn complete_cycle(&self, target: &AgentAddress) -> Result<bool, AgentRouterError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| AgentRouterError::StateUnavailable)?;
-        if state.dirty.remove(target) && !state.shutting_down {
-            return Ok(true);
-        }
-        state.active.remove(target);
-        Ok(false)
-    }
-
     fn collect_finished(state: &mut AgentDeliverySupervisorState) {
-        while let Some(result) = state.drivers.try_join_next() {
+        while let Some(result) = state.drivers.try_join_next_with_id() {
             match result {
-                Ok(_) => {}
+                Ok((driver_id, ())) => {
+                    state.driver_targets.remove(&driver_id);
+                }
                 Err(error) => {
-                    tracing::error!(%error, "Agent delivery task failed to join");
+                    let target = state.driver_targets.remove(&error.id());
+                    let failure = target.map_or_else(
+                        || format!("Agent delivery task failed to join: {error}"),
+                        |target| {
+                            format!("Agent delivery task for {target:?} failed to join: {error}")
+                        },
+                    );
+                    tracing::error!(error = %failure, "Agent delivery task failed to join");
+                    state.driver_failures.push(failure);
                 }
             }
         }
     }
 
-    pub async fn shutdown(&self) -> Result<(), AgentRouterError> {
+    /// Permanently close delivery admission and broadcast cancellation without
+    /// waiting for any driver. Application shutdown calls this in its first
+    /// phase so dependent foreground owners can observe cancellation before any
+    /// lifecycle join begins.
+    pub fn close_admission_and_cancel(&self) -> Result<(), AgentRouterError> {
         self.cancel.cancel();
-        let mut drivers = {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| AgentRouterError::StateUnavailable)?;
+        state.shutting_down = true;
+        state.dirty.clear();
+        Ok(())
+    }
+
+    /// Join every delivery driver accepted before admission closed.
+    pub async fn join(&self) -> Result<(), AgentRouterError> {
+        let (mut drivers, mut driver_targets, mut failures) = {
             let mut state = self
                 .state
                 .lock()
@@ -503,12 +595,26 @@ impl AgentDeliverySupervisor {
             state.shutting_down = true;
             state.active.clear();
             state.dirty.clear();
-            std::mem::take(&mut state.drivers)
+            (
+                std::mem::take(&mut state.drivers),
+                std::mem::take(&mut state.driver_targets),
+                std::mem::take(&mut state.driver_failures),
+            )
         };
-        let mut failures = Vec::new();
-        while let Some(result) = drivers.join_next().await {
-            if let Err(error) = result {
-                failures.push(error.to_string());
+        while let Some(result) = drivers.join_next_with_id().await {
+            match result {
+                Ok((driver_id, ())) => {
+                    driver_targets.remove(&driver_id);
+                }
+                Err(error) => {
+                    let target = driver_targets.remove(&error.id());
+                    failures.push(target.map_or_else(
+                        || format!("Agent delivery task failed to join: {error}"),
+                        |target| {
+                            format!("Agent delivery task for {target:?} failed to join: {error}")
+                        },
+                    ));
+                }
             }
         }
         if failures.is_empty() {
@@ -516,6 +622,11 @@ impl AgentDeliverySupervisor {
         } else {
             Err(AgentRouterError::Task(failures.join("; ")))
         }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), AgentRouterError> {
+        self.close_admission_and_cancel()?;
+        self.join().await
     }
 }
 
@@ -1424,6 +1535,244 @@ mod tests {
             subagent_role: role.to_string(),
             label: Some("Remote specialist".to_string()),
         }
+    }
+
+    fn no_delivery_recovery() -> Arc<dyn Fn(AgentAddress) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    #[tokio::test]
+    async fn delivery_supervisor_closes_admission_before_join() -> Result<(), String> {
+        let supervisor = AgentDeliverySupervisor::default();
+        let cancel = supervisor.cancellation_token();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_started = Arc::clone(&started);
+        supervisor
+            .supervise(
+                address(),
+                no_delivery_recovery(),
+                move |_cycle| async move {
+                    task_started.notify_one();
+                    cancel.cancelled().await;
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        started.notified().await;
+
+        supervisor
+            .close_admission_and_cancel()
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            supervisor.supervise(address(), no_delivery_recovery(), |_cycle| {
+                std::future::pending()
+            },),
+            Err(AgentRouterError::ShuttingDown)
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), supervisor.join())
+            .await
+            .map_err(|_| "delivery supervisor join ignored cancellation".to_string())?
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delivery_driver_panic_clears_active_and_reaches_shutdown_receipt() -> Result<(), String>
+    {
+        let supervisor = AgentDeliverySupervisor::default();
+        let target = address();
+        let workspace = target.workspace_id.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_started = Arc::clone(&started);
+        let task_release = Arc::clone(&release);
+        supervisor
+            .supervise(
+                target.clone(),
+                no_delivery_recovery(),
+                move |_cycle| async move {
+                    task_started.notify_one();
+                    task_release.notified().await;
+                    let should_complete = std::hint::black_box(false);
+                    assert!(should_complete, "injected delivery driver panic");
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        started.notified().await;
+        release.notify_one();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while supervisor.has_active_workspace(&workspace) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "panicked delivery driver retained active target".to_string())?;
+        assert!(!supervisor.has_active_workspace(&workspace));
+
+        let error = supervisor
+            .join()
+            .await
+            .err()
+            .ok_or_else(|| "delivery driver panic was not reported".to_string())?;
+        assert!(error.to_string().contains(target.conversation_id.as_str()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dirty_delivery_is_restarted_after_driver_panic() -> Result<(), String> {
+        let supervisor = Arc::new(AgentDeliverySupervisor::default());
+        let target = address();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let recovered = Arc::new(tokio::sync::Notify::new());
+        let weak_supervisor = Arc::downgrade(&supervisor);
+        let recovered_callback = Arc::clone(&recovered);
+        let recover: Arc<dyn Fn(AgentAddress) + Send + Sync> = Arc::new(move |target| {
+            let Some(supervisor) = weak_supervisor.upgrade() else {
+                return;
+            };
+            let recovered = Arc::clone(&recovered_callback);
+            let _ = supervisor.supervise(target, no_delivery_recovery(), move |cycle| async move {
+                let _ = cycle.complete();
+                recovered.notify_one();
+            });
+        });
+        let task_started = Arc::clone(&started);
+        let task_release = Arc::clone(&release);
+        supervisor
+            .supervise(target.clone(), recover, move |_cycle| async move {
+                task_started.notify_one();
+                task_release.notified().await;
+                let should_complete = std::hint::black_box(false);
+                assert!(should_complete, "injected dirty delivery panic");
+            })
+            .map_err(|error| error.to_string())?;
+        started.notified().await;
+        assert!(
+            !supervisor
+                .supervise(target, no_delivery_recovery(), |_cycle| {
+                    std::future::pending()
+                },)
+                .map_err(|error| error.to_string())?,
+            "dirty wake created a duplicate delivery owner"
+        );
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), recovered.notified())
+            .await
+            .map_err(|_| "dirty delivery was not restarted after panic".to_string())?;
+
+        let error = supervisor
+            .shutdown()
+            .await
+            .err()
+            .ok_or_else(|| "recovered driver panic was not retained in receipt".to_string())?;
+        assert!(error.to_string().contains("panicked"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delayed_old_driver_drop_cannot_clear_replacement_generation() -> Result<(), String> {
+        let supervisor = Arc::new(AgentDeliverySupervisor::default());
+        let target = address();
+        let a_removed = Arc::new(tokio::sync::Notify::new());
+        let allow_a_drop = Arc::new(tokio::sync::Notify::new());
+        let a_removed_task = Arc::clone(&a_removed);
+        let allow_a_drop_task = Arc::clone(&allow_a_drop);
+        supervisor
+            .supervise(
+                target.clone(),
+                no_delivery_recovery(),
+                move |cycle| async move {
+                    let repeated = cycle.complete().unwrap_or(false);
+                    assert!(!repeated, "driver A unexpectedly retained its generation");
+                    a_removed_task.notify_one();
+                    allow_a_drop_task.notified().await;
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        a_removed.notified().await;
+
+        let allow_b_cycles = Arc::new(tokio::sync::Notify::new());
+        let b_completed = Arc::new(tokio::sync::Notify::new());
+        let allow_b_cycles_task = Arc::clone(&allow_b_cycles);
+        let b_completed_task = Arc::clone(&b_completed);
+        let inserted = supervisor
+            .supervise(
+                target.clone(),
+                no_delivery_recovery(),
+                move |cycle| async move {
+                    allow_b_cycles_task.notified().await;
+                    let repeated = cycle.complete().unwrap_or(false);
+                    assert!(repeated, "driver B lost its dirty notification");
+                    let repeated = cycle.complete().unwrap_or(true);
+                    assert!(!repeated, "driver B did not release its generation");
+                    b_completed_task.notify_one();
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(inserted, "driver B did not acquire the released target");
+        assert!(
+            !supervisor
+                .supervise(target.clone(), no_delivery_recovery(), |_cycle| {
+                    std::future::pending()
+                },)
+                .map_err(|error| error.to_string())?,
+            "a second B wake created a duplicate owner"
+        );
+
+        allow_a_drop.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let _ = supervisor.supervise(target.clone(), no_delivery_recovery(), |_cycle| {
+                    std::future::pending()
+                });
+                let old_driver_collected = supervisor
+                    .state
+                    .lock()
+                    .map(|state| state.driver_targets.len() == 1)
+                    .unwrap_or(false);
+                if old_driver_collected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "driver A did not reach its delayed Drop barrier".to_string())?;
+
+        {
+            let state = supervisor
+                .state
+                .lock()
+                .map_err(|_| "delivery supervisor state is unavailable".to_string())?;
+            let b_generation = state
+                .active
+                .get(&target)
+                .copied()
+                .ok_or_else(|| "driver A Drop cleared driver B active owner".to_string())?;
+            assert_eq!(
+                state.dirty.get(&target),
+                Some(&b_generation),
+                "driver A Drop cleared driver B dirty notification"
+            );
+        }
+
+        allow_b_cycles.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), b_completed.notified())
+            .await
+            .map_err(|_| "driver B did not complete both owned cycles".to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while supervisor.has_active_workspace(&target.workspace_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "driver B retained its active generation".to_string())?;
+        supervisor
+            .shutdown()
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     async fn drain_inbox(root: PathBuf, target: AgentAddress) -> Result<usize, String> {

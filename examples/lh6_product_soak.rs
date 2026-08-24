@@ -250,8 +250,6 @@ impl ChatSink for MetricsSink {
 struct ProductContext {
     runtime: AgentRuntime,
     services: HeadlessServices,
-    config_watcher: Arc<echo_agent_app_core::config_watcher::ConfigWatcherHandle>,
-    root_cancel: tokio_util::sync::CancellationToken,
     hitl_registration: Option<echo_agent_app_core::hitl::HitlProviderRegistration>,
 }
 
@@ -487,18 +485,46 @@ async fn bootstrap(
     let mcp_path =
         echo_agent_app_core::mcp_config_runtime::resolve_mcp_config_path(None, app_config);
     let runtime = AgentRuntime::bootstrap(app_config, params, mcp_path).await?;
+    let root_cancel = tokio_util::sync::CancellationToken::new();
+    let mut lifecycle = runtime.lifecycle_owner(root_cancel.clone());
     echo_agent_app_core::infra::inject_conversation_store(
         &runtime.agent_handle,
         &conversation_store,
     );
-    let task_runtime = Arc::new(TaskRuntimeStore::new()?);
+    let task_runtime = match TaskRuntimeStore::new() {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            let receipt = lifecycle
+                .settle(
+                    echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                    Some(error),
+                )
+                .await;
+            return Err(anyhow::Error::new(receipt.into_error()));
+        }
+    };
+    lifecycle.bind_task_runtime(task_runtime.clone());
     echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
         &runtime.agent_handle,
         task_runtime.clone(),
     )
     .await;
-    let pool = AgentPool::from_runtime(&runtime, PoolConfig::default(), Some(task_runtime.clone()))
-        .await?;
+    let pool =
+        match AgentPool::from_runtime(&runtime, PoolConfig::default(), Some(task_runtime.clone()))
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                let receipt = lifecycle
+                    .settle(
+                        echo_agent_app_core::runtime::ApplicationLifecycleReason::BootstrapRollback,
+                        Some(error),
+                    )
+                    .await;
+                return Err(anyhow::Error::new(receipt.into_error()));
+            }
+        };
+    lifecycle.bind_pool(pool.clone());
     pool.apply_permission_mode(echo_agent::tools::permission::PermissionMode::BypassPermissions)
         .await;
     echo_agent_app_core::tasks::task_runtime::bind_task_execute_to_pool(
@@ -508,13 +534,13 @@ async fn bootstrap(
     )
     .await;
     let foreground_turns = ForegroundTurnControl::default();
-    let root_cancel = tokio_util::sync::CancellationToken::new();
     let config_watcher = Arc::new(echo_agent_app_core::config_watcher::spawn_config_watcher(
         Some(args.config.clone()),
         runtime.agent_handle.clone(),
         None,
         root_cancel.clone(),
     ));
+    lifecycle.bind_config_watcher(config_watcher.clone());
     let hitl_registration = runtime
         .hitl_dispatcher
         .register_owned("lh6-soak", hitl)
@@ -544,14 +570,14 @@ async fn bootstrap(
             foreground_turns,
             command_cell_runtime: runtime.command_cell_runtime.clone(),
             browser_runtime: runtime.browser_runtime.clone(),
+            lifecycle,
         },
     )
-    .await?;
+    .await
+    .map_err(|error| anyhow::anyhow!("LH6 headless bootstrap rolled back: {error}"))?;
     Ok(ProductContext {
         runtime,
         services,
-        config_watcher,
-        root_cancel,
         hitl_registration: Some(hitl_registration),
     })
 }
@@ -559,18 +585,7 @@ async fn bootstrap(
 impl ProductContext {
     async fn shutdown(mut self) -> Result<()> {
         self.hitl_registration.take();
-        echo_agent_cli::cli::shutdown_headless_services(
-            Ok(()),
-            self.services,
-            None,
-            None,
-            self.runtime.plugin_runtime.clone(),
-            self.config_watcher,
-            self.runtime.mcp_config_runtime.clone(),
-            self.runtime.browser_runtime.clone(),
-            self.root_cancel,
-        )
-        .await
+        echo_agent_cli::cli::shutdown_headless_services(Ok(()), self.services, None, None).await
     }
 }
 

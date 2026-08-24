@@ -410,6 +410,58 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
     }
 }
 
+#[tokio::test]
+async fn delivery_shutdown_interrupts_pending_live_wait_and_preserves_injected()
+-> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    let target = crate::agent_router::AgentAddress::new(
+        crate::workspace::WorkspaceId::from_name("target"),
+        "conversation",
+    );
+    let mut message =
+        crate::agent_router::AgentMessage::user_text(None, target.clone(), "pending live delivery");
+    message.message_id = "pending-live".to_string();
+    router.enqueue(message).await?;
+    let claim = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("delivery claim is missing"))?;
+    router.injected(&claim, "live-turn").await?;
+
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    shutdown.cancel();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        super::wait_for_live_delivery_or_shutdown(
+            &shutdown,
+            std::future::pending::<Result<(), String>>(),
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("live delivery wait ignored supervisor cancellation"))?;
+    assert!(outcome.is_none());
+
+    let record = router
+        .records(&target)
+        .await?
+        .into_iter()
+        .find(|record| record.message_id == "pending-live")
+        .ok_or_else(|| anyhow::anyhow!("injected record is missing"))?;
+    assert_eq!(
+        record.status,
+        crate::agent_router::AgentDeliveryStatus::Injected
+    );
+    assert!(
+        router
+            .pending(&target)
+            .await?
+            .iter()
+            .any(|message| message.message_id == "pending-live")
+    );
+    Ok(())
+}
+
 struct NoopChatSink;
 
 impl crate::chat_driver::ChatSink for NoopChatSink {

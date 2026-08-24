@@ -21,7 +21,7 @@
 | ----------------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------------------- |
 | 统一任务关系      | `task_create/task_update/task_list/task_execute` 使用同一个 revisioned TaskRun graph | `echo-agent-app-core/src/tasks/task_runtime/register.rs`         |
 | 动态 DAG          | 原子 plan、revision patch、claim、重试、取消、safe-point reload                      | `echo-agent-app-core/src/tasks/task_runtime/store.rs`            |
-| 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint-backed hot state    | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
+| 长程继续          | Goal、RunTurn、budget、provider retry、boot admission、checkpoint-backed hot state   | `echo-agent-app-core/src/tasks/task_runtime/continuation.rs`     |
 | Subagent 执行     | direct、planned、fork、teammate、team 共用 prompt compiler 和结果合同                | `echo-agent-app-core/src/subagent_prompt.rs`                     |
 | Subagent 控制     | message、follow-up、interrupt、attempt identity 与 durable result                    | `echo-agent-app-core/src/tasks/task_runtime/subagent_control.rs` |
 | 后台 command cell | bounded async admission、typed cursor wait、owner cancel、boot orphan closure        | framework cell runtime + app-core `command_cells.rs`             |
@@ -41,7 +41,7 @@ EKO 拥有文件投影、workspace、review、worktree、资源策略和各 surf
 | Terminal       | 用户交互 terminal session 和 Agent shell 路径分离                                        | `echo-agent-app-core/src/terminal.rs`                  |
 | Browser/Chrome | 托管 Chromium、Chrome extension backend、tab/session/observation 投影                    | `echo-agent-app-core/src/browser/`                     |
 | 工作流         | 一份 file-backed catalog 与 framework Graph executor；GUI/TUI/CLI/channel 共用服务       | `echo-agent-app-core/src/workflow_service.rs`          |
-| 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome          | `echo-agent-app-core/src/structured_extraction.rs`     |
+| 结构化抽取     | pooled Agent `extract_json`、JSON Schema 输入/输出验证、typed 多 surface outcome         | `echo-agent-app-core/src/structured_extraction.rs`     |
 | MCP            | 一份用户 `mcp.json`、动态连接、plugin name ownership、resource tools                     | `echo-agent-app-core/src/mcp_config_runtime.rs`        |
 | LSP            | 自动发现、诊断、定义、引用、hover 与 repo map                                            | framework LSP tools + app bootstrap                    |
 | Tool output    | summary/detail 分离、opaque detail ref、cursor page、文件/JSONL 恢复                     | `echo-agent-app-core/src/tool_execution_projection.rs` |
