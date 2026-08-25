@@ -18,13 +18,157 @@ use echo_agent::state::journal::{EventReducer, JournalRecord};
 use super::run_authority::RuntimeJournalEvent;
 
 use super::types::{
-    ActiveSubagentBoundary, ActiveToolBoundary, AttendedMode, BackgroundCellArtifactStatus,
-    BackgroundCellPhase, BackgroundCellState, BackgroundCellTerminalCause, BlockerAudit,
-    DomainProfile, EkoTaskExecution, ExecutionMode, PlanRevision, PlanTask, ProviderRetryState,
-    RecoveryBlocker, RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex,
-    RunStateSnapshot, RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind,
-    RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus, TurnVisibility,
+    ActiveSubagentBoundary, ActiveToolBoundary, Artifact, ArtifactKind, AttendedMode,
+    BackgroundCellArtifactStatus, BackgroundCellPhase, BackgroundCellState,
+    BackgroundCellTerminalCause, BlockerAudit, DomainProfile, EkoTaskExecution, ExecutionMode,
+    PlanRevision, PlanTask, ProviderRetryState, RecoveryBlocker, ReviewOutcome, ReviewResult,
+    RunContinuationState, RunPause, RunPauseReason, RunStateEventIndex, RunStateSnapshot,
+    RunTurnOrigin, RunTurnStatus, RunTurnSummary, RuntimeEventKind, RuntimeTaskEvent,
+    TaskExecutionSummary, TaskPlan, TaskRun, TaskRunStatus, TodoStatus, TurnVisibility,
 };
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct TodoRuntimeProjection {
+    pub(crate) owner_agent: Option<String>,
+    pub(crate) started_at: Option<chrono::DateTime<Utc>>,
+    pub(crate) completed_at: Option<chrono::DateTime<Utc>>,
+    pub(crate) summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct BoundCompletionEvent {
+    event: RuntimeTaskEvent,
+    source_goal_revision: u64,
+    source_plan_revision: u64,
+}
+
+impl BoundCompletionEvent {
+    pub(crate) fn event(&self) -> &RuntimeTaskEvent {
+        &self.event
+    }
+
+    pub(crate) fn source_binding(&self) -> (u64, u64) {
+        (self.source_goal_revision, self.source_plan_revision)
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct CompletionQueryProjection {
+    summaries: std::collections::BTreeMap<String, BoundCompletionEvent>,
+    reviews: std::collections::BTreeMap<String, BoundCompletionEvent>,
+    requirement_skips: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, RuntimeTaskEvent>>,
+    >,
+    revalidations: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, RuntimeTaskEvent>>,
+    >,
+}
+
+impl CompletionQueryProjection {
+    fn retain_tasks(&mut self, task_ids: &std::collections::HashSet<&str>) {
+        self.summaries
+            .retain(|task_id, _| task_ids.contains(task_id.as_str()));
+        self.reviews
+            .retain(|task_id, _| task_ids.contains(task_id.as_str()));
+    }
+
+    fn retain_requirements(&mut self, requirements: &[super::types::GoalRequirement]) {
+        let identities = requirements
+            .iter()
+            .map(|requirement| {
+                (
+                    requirement.requirement_id.as_str(),
+                    requirement.requirement_sha256.as_str(),
+                    requirement.goal_revision,
+                )
+            })
+            .collect::<std::collections::HashSet<_>>();
+        retain_requirement_index(&mut self.requirement_skips, &identities);
+        retain_requirement_index(&mut self.revalidations, &identities);
+    }
+
+    fn for_tasks(&self, task_ids: &std::collections::HashSet<&str>) -> Self {
+        Self {
+            summaries: self
+                .summaries
+                .iter()
+                .filter(|(task_id, _)| task_ids.contains(task_id.as_str()))
+                .map(|(task_id, event)| (task_id.clone(), event.clone()))
+                .collect(),
+            reviews: self
+                .reviews
+                .iter()
+                .filter(|(task_id, _)| task_ids.contains(task_id.as_str()))
+                .map(|(task_id, event)| (task_id.clone(), event.clone()))
+                .collect(),
+            requirement_skips: self.requirement_skips.clone(),
+            revalidations: self.revalidations.clone(),
+        }
+    }
+
+    pub(crate) fn summary(&self, task_id: &str) -> Option<&BoundCompletionEvent> {
+        self.summaries.get(task_id)
+    }
+
+    pub(crate) fn review_after(
+        &self,
+        task_id: &str,
+        sequence: i64,
+    ) -> Option<&BoundCompletionEvent> {
+        self.reviews
+            .get(task_id)
+            .filter(|review| review.event.seq > sequence)
+    }
+
+    pub(crate) fn requirement_skip(
+        &self,
+        requirement_id: &str,
+        requirement_sha256: &str,
+        goal_revision: u64,
+    ) -> Option<&RuntimeTaskEvent> {
+        self.requirement_skips
+            .get(requirement_id)?
+            .get(requirement_sha256)?
+            .get(&goal_revision)
+    }
+
+    pub(crate) fn has_revalidation(
+        &self,
+        source_sequence: i64,
+        requirement_id: &str,
+        requirement_sha256: &str,
+        goal_revision: u64,
+    ) -> bool {
+        self.revalidations
+            .get(requirement_id)
+            .and_then(|by_sha| by_sha.get(requirement_sha256))
+            .and_then(|by_goal| by_goal.get(&goal_revision))
+            .is_some_and(|event| event.seq > source_sequence)
+    }
+}
+
+/// One coherent EKO read model cloned from the framework-backed reducer state.
+///
+/// It is not another authority: every field is rebuilt from `events.jsonl` and
+/// stored in the same discardable `checkpoint.json` as the operational fold.
+#[derive(Debug, Clone)]
+pub(crate) struct TodoQueryProjection {
+    pub(crate) run: TaskRun,
+    pub(crate) plan: Option<TaskPlan>,
+    pub(crate) todo_runtime: std::collections::BTreeMap<String, TodoRuntimeProjection>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CompletionGateProjection {
+    pub(crate) run: TaskRun,
+    pub(crate) plan: Option<TaskPlan>,
+    pub(crate) completion: CompletionQueryProjection,
+    pub(crate) active_subagents: Vec<ActiveSubagentBoundary>,
+    pub(crate) background_cells: Vec<BackgroundCellState>,
+    pub(crate) recovery_blockers: Vec<RecoveryBlocker>,
+}
 
 /// Rebuilt plan snapshot — the shape `plan.json` will take.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +219,11 @@ impl RebuiltPlan {
 /// arriving after the checkpoint cannot double-account usage or compaction.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct EventFoldState {
+    /// Missing in checkpoints written before the bounded query projection was
+    /// introduced. Such checkpoints must be discarded before suffix recovery;
+    /// otherwise their empty default indexes would look current at journal head.
+    #[serde(default)]
+    query_projection_schema: Option<u8>,
     #[serde(default)]
     run: Option<TaskRun>,
     #[serde(default)]
@@ -102,6 +251,12 @@ pub(crate) struct EventFoldState {
     #[serde(default)]
     recovery_blockers: std::collections::BTreeMap<String, RecoveryBlocker>,
     #[serde(default)]
+    todo_runtime: std::collections::BTreeMap<String, TodoRuntimeProjection>,
+    #[serde(default)]
+    summaries: std::collections::BTreeMap<String, TaskExecutionSummary>,
+    #[serde(default)]
+    completion: CompletionQueryProjection,
+    #[serde(default)]
     seen_run_ids: std::collections::BTreeSet<String>,
     #[serde(skip)]
     sequence_overflow: Option<u64>,
@@ -126,6 +281,15 @@ impl EventFoldState {
         self.missing_record_sequence
     }
 
+    pub(crate) fn has_current_query_projection_schema(&self) -> bool {
+        self.query_projection_schema == Some(1)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_query_projection_schema_for_test(&mut self) {
+        self.query_projection_schema = None;
+    }
+
     fn apply_projected_event(&mut self, event: RuntimeTaskEvent) {
         self.apply_runtime_event(&event);
         self.sequence_overflow = None;
@@ -134,6 +298,7 @@ impl EventFoldState {
 
     fn apply_runtime_event(&mut self, event: &RuntimeTaskEvent) {
         let Self {
+            query_projection_schema,
             run,
             plan,
             tasks,
@@ -147,10 +312,14 @@ impl EventFoldState {
             active_subagents,
             active_tools,
             recovery_blockers,
+            todo_runtime,
+            summaries,
+            completion,
             seen_run_ids,
             sequence_overflow: _,
             missing_record_sequence: _,
         } = self;
+        *query_projection_schema = Some(1);
         use RuntimeEventKind as K;
         for ev in std::slice::from_ref(event) {
             seen_run_ids.insert(ev.run_id.clone());
@@ -233,6 +402,8 @@ impl EventFoldState {
                     state.deferred = true;
                     state.deferred_reason =
                         json_string(&ev.payload, "continuation_deferred_reason");
+                    completion.requirement_skips.clear();
+                    completion.revalidations.clear();
                 }
                 K::RunStatusChanged => {
                     if let Some(r) = run.as_mut() {
@@ -255,6 +426,7 @@ impl EventFoldState {
                             continuation,
                             finished_turns,
                         );
+                        apply_boot_recovery_todo_runtime(ev, todo_runtime);
                         if let Some(recovery) = ev.payload.get("recovery") {
                             if let Some(subagents) = recovery
                                 .get("subagents")
@@ -332,6 +504,8 @@ impl EventFoldState {
                     if let Some(committed) = p.get("plan").and_then(|value| {
                         serde_json::from_value::<PlanRevision>(value.clone()).ok()
                     }) {
+                        let requirements =
+                            super::completion_gate::requirements_for_revision(&committed);
                         if let Some(r) = run.as_mut() {
                             r.plan_id = Some(committed.plan_id.clone());
                         }
@@ -380,6 +554,7 @@ impl EventFoldState {
                                 task.status = TodoStatus::Pending;
                                 task.status_detail = None;
                                 task.claim = None;
+                                todo_runtime.remove(&task.id);
                             }
                         }
                         *plan = Some(TaskPlan {
@@ -394,6 +569,14 @@ impl EventFoldState {
                             execution_mode: committed.execution_mode,
                             tasks: Vec::new(),
                         });
+                        let task_ids = tasks
+                            .iter()
+                            .map(|task| task.id.as_str())
+                            .collect::<std::collections::HashSet<_>>();
+                        todo_runtime.retain(|task_id, _| task_ids.contains(task_id.as_str()));
+                        summaries.retain(|task_id, _| task_ids.contains(task_id.as_str()));
+                        completion.retain_tasks(&task_ids);
+                        completion.retain_requirements(&requirements);
                     }
                 }
                 K::TaskStarted
@@ -437,9 +620,72 @@ impl EventFoldState {
                         {
                             task.failure_fingerprint = value.as_str().map(str::to_string);
                         }
-                        // started_at/completed_at/owner_agent/summary live in tr_todos (not PlanTask).
-                        // They are not rebuilt onto PlanTask in 0a; the parity test compares them
-                        // separately via list_todos. They land on plan.json tasks[] in 0b.
+                        apply_todo_runtime_event(
+                            todo_runtime.entry(task_id.clone()).or_default(),
+                            ev,
+                        );
+                    }
+                }
+                K::ArtifactProduced => {}
+                K::ReviewPassed | K::ReviewNeedsFix | K::ReviewBlocked => {
+                    if let Some(task_id) = ev.task_id.as_ref() {
+                        completion
+                            .reviews
+                            .insert(task_id.clone(), bind_completion_event(ev, plan.as_ref()));
+                    }
+                }
+                K::RequirementSkipped => {
+                    if let (Some(requirement_id), Some(requirement_sha256), Some(goal_revision)) = (
+                        json_string(&ev.payload, "requirement_id"),
+                        json_string(&ev.payload, "requirement_sha256"),
+                        ev.payload
+                            .get("goal_revision")
+                            .and_then(serde_json::Value::as_u64),
+                    ) {
+                        completion
+                            .requirement_skips
+                            .entry(requirement_id)
+                            .or_default()
+                            .entry(requirement_sha256)
+                            .or_default()
+                            .insert(goal_revision, ev.clone());
+                    }
+                }
+                K::RequirementEvidenceRevalidated => {
+                    if let (Some(requirement_id), Some(requirement_sha256), Some(goal_revision)) = (
+                        json_string(&ev.payload, "requirement_id"),
+                        json_string(&ev.payload, "requirement_sha256"),
+                        ev.payload
+                            .get("new_goal_revision")
+                            .and_then(serde_json::Value::as_u64),
+                    ) {
+                        completion
+                            .revalidations
+                            .entry(requirement_id)
+                            .or_default()
+                            .entry(requirement_sha256)
+                            .or_default()
+                            .insert(goal_revision, ev.clone());
+                    }
+                }
+                K::Note
+                    if ev.payload.get("kind").and_then(serde_json::Value::as_str)
+                        == Some("summary_persisted") =>
+                {
+                    if let Some(task_id) = ev.task_id.as_ref() {
+                        match ev.payload.get("summary").cloned().and_then(|value| {
+                            serde_json::from_value::<TaskExecutionSummary>(value).ok()
+                        }) {
+                            Some(summary) => {
+                                summaries.insert(task_id.clone(), summary);
+                            }
+                            None => {
+                                summaries.remove(task_id);
+                            }
+                        }
+                        completion
+                            .summaries
+                            .insert(task_id.clone(), bind_completion_event(ev, plan.as_ref()));
                     }
                 }
                 K::BackgroundCellStarted => {
@@ -937,6 +1183,87 @@ impl EventFoldState {
             },
         })
     }
+
+    fn current_plan(&self, rebuilt: &RebuiltPlan) -> Option<TaskPlan> {
+        self.plan.as_ref().map(|_| TaskPlan {
+            plan_id: rebuilt.plan.plan_id.clone(),
+            run_id: rebuilt.plan.run_id.clone(),
+            revision: rebuilt.plan.revision,
+            domain_profile: rebuilt.plan.domain_profile,
+            goal_revision: rebuilt.plan.goal_revision,
+            goal_sha256: rebuilt.plan.goal_sha256.clone(),
+            assumptions: rebuilt.plan.assumptions.clone(),
+            risks: rebuilt.plan.risks.clone(),
+            execution_mode: rebuilt.plan.execution_mode,
+            tasks: rebuilt.tasks.clone(),
+        })
+    }
+
+    pub(crate) fn todo_query_projection(&self) -> Result<TodoQueryProjection, RebuildError> {
+        let rebuilt = self.rebuilt_plan()?;
+        let plan = self.current_plan(&rebuilt);
+        let task_ids = rebuilt
+            .tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        Ok(TodoQueryProjection {
+            run: rebuilt.run,
+            plan,
+            todo_runtime: self
+                .todo_runtime
+                .iter()
+                .filter(|(task_id, _)| task_ids.contains(task_id.as_str()))
+                .map(|(task_id, runtime)| (task_id.clone(), runtime.clone()))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn completion_gate_projection(
+        &self,
+    ) -> Result<CompletionGateProjection, RebuildError> {
+        let rebuilt = self.rebuilt_plan()?;
+        let plan = self.current_plan(&rebuilt);
+        let task_ids = rebuilt
+            .tasks
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        Ok(CompletionGateProjection {
+            run: rebuilt.run,
+            plan,
+            completion: self.completion.for_tasks(&task_ids),
+            active_subagents: self.active_subagents.values().cloned().collect(),
+            background_cells: self.background_cells.values().cloned().collect(),
+            recovery_blockers: self.recovery_blockers.values().cloned().collect(),
+        })
+    }
+
+    pub(crate) fn summary_projection(&self, task_id: &str) -> Option<TaskExecutionSummary> {
+        self.summaries.get(task_id).cloned()
+    }
+}
+
+fn retain_requirement_index(
+    index: &mut std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, std::collections::BTreeMap<u64, RuntimeTaskEvent>>,
+    >,
+    identities: &std::collections::HashSet<(&str, &str, u64)>,
+) {
+    index.retain(|requirement_id, by_sha| {
+        by_sha.retain(|requirement_sha256, by_goal| {
+            by_goal.retain(|goal_revision, _| {
+                identities.contains(&(
+                    requirement_id.as_str(),
+                    requirement_sha256.as_str(),
+                    *goal_revision,
+                ))
+            });
+            !by_goal.is_empty()
+        });
+        !by_sha.is_empty()
+    });
 }
 
 impl EventReducer for EventFoldState {
@@ -974,6 +1301,126 @@ fn json_enum<T: serde::de::DeserializeOwned>(payload: &serde_json::Value, key: &
         .get(key)
         .cloned()
         .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn bind_completion_event(
+    event: &RuntimeTaskEvent,
+    plan: Option<&TaskPlan>,
+) -> BoundCompletionEvent {
+    BoundCompletionEvent {
+        event: event.clone(),
+        source_goal_revision: plan.map_or(0, |plan| plan.goal_revision),
+        source_plan_revision: plan.map_or(0, |plan| plan.revision),
+    }
+}
+
+fn apply_todo_runtime_event(runtime: &mut TodoRuntimeProjection, event: &RuntimeTaskEvent) {
+    let status = event
+        .payload
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .and_then(TodoStatus::from_str);
+    if status == Some(TodoStatus::Pending)
+        || event.event_type == RuntimeEventKind::TaskStarted
+        || status == Some(TodoStatus::Running)
+    {
+        *runtime = TodoRuntimeProjection::default();
+    }
+    if let Some(owner) =
+        json_string(&event.payload, "owner_agent").filter(|value| !value.is_empty())
+    {
+        runtime.owner_agent = Some(owner);
+    }
+    if let Some(started_at) = event
+        .payload
+        .get("started_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_rfc3339)
+    {
+        runtime.started_at = Some(started_at);
+    }
+    if let Some(completed_at) = event
+        .payload
+        .get("completed_at")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_rfc3339)
+    {
+        runtime.completed_at = Some(completed_at);
+    }
+    if let Some(summary) = json_string(&event.payload, "summary").filter(|value| !value.is_empty())
+    {
+        runtime.summary = Some(summary);
+    }
+}
+
+fn apply_boot_recovery_todo_runtime(
+    event: &RuntimeTaskEvent,
+    todo_runtime: &mut std::collections::BTreeMap<String, TodoRuntimeProjection>,
+) {
+    let Some(tasks) = event
+        .payload
+        .get("recovery")
+        .and_then(|recovery| recovery.get("tasks"))
+        .and_then(serde_json::Value::as_array)
+    else {
+        return;
+    };
+    for task in tasks {
+        let (Some(task_id), Some(summary)) = (
+            task.get("task_id").and_then(serde_json::Value::as_str),
+            task.get("summary").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        todo_runtime.entry(task_id.to_string()).or_default().summary = Some(summary.to_string());
+    }
+}
+
+pub(crate) fn artifact_from_event(event: &RuntimeTaskEvent) -> Option<Artifact> {
+    let payload = &event.payload;
+    Some(Artifact {
+        id: json_string(payload, "artifact_id")?,
+        run_id: event.run_id.clone(),
+        task_id: event.task_id.clone(),
+        kind: json_string(payload, "kind")
+            .as_deref()
+            .and_then(ArtifactKind::from_str)
+            .unwrap_or(ArtifactKind::File),
+        title: json_string(payload, "title")?,
+        path: json_string(payload, "path"),
+        metadata: payload
+            .get("metadata")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    })
+}
+
+pub(crate) fn review_from_event(event: &RuntimeTaskEvent) -> Option<ReviewResult> {
+    let payload = &event.payload;
+    Some(ReviewResult {
+        id: json_string(payload, "review_id")?,
+        run_id: event.run_id.clone(),
+        reviewer_agent: json_string(payload, "reviewer")?,
+        outcome: match event.event_type {
+            RuntimeEventKind::ReviewPassed => ReviewOutcome::Pass,
+            RuntimeEventKind::ReviewNeedsFix => ReviewOutcome::NeedsFix,
+            RuntimeEventKind::ReviewBlocked => ReviewOutcome::Blocked,
+            _ => return None,
+        },
+        issues: payload
+            .get("issues")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default(),
+        failure_fingerprint: json_string(payload, "failure_fingerprint"),
+        created_fix_task_id: json_string(payload, "created_fix_task_id"),
+        created_at: payload
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_rfc3339)
+            .unwrap_or(event.timestamp),
+        task_id: event.task_id.clone().unwrap_or_default(),
+    })
 }
 
 fn apply_boot_recovery(

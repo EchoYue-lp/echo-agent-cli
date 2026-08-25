@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::root_authority::RootTransactionAuthority;
-use super::run_authority::{RunAuthority, RuntimeJournalEvent};
+use super::run_authority::{RunAuthority, RunBatchAppendReceipt, RuntimeJournalEvent};
 use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
 
 const MAX_CACHED_RUN_AUTHORITIES: usize = 128;
@@ -33,7 +33,7 @@ struct ShadowGenerationState {
 
 /// EKO product storage rooted at one workspace's TaskRuntime directory.
 #[derive(Clone)]
-pub struct FileTaskShadow {
+pub(crate) struct FileTaskShadow {
     state: Arc<Mutex<ShadowGenerationState>>,
     #[allow(clippy::type_complexity)]
     event_hook: Arc<OnceLock<Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>>>,
@@ -50,7 +50,7 @@ pub struct FileTaskShadow {
 }
 
 impl FileTaskShadow {
-    pub fn try_new(root: impl Into<PathBuf>) -> Result<Self, ShadowError> {
+    pub(crate) fn try_new(root: impl Into<PathBuf>) -> Result<Self, ShadowError> {
         let root = root.into();
         let root_authority = RootTransactionAuthority::open(&root)?;
         let root = root_authority.root().to_path_buf();
@@ -79,7 +79,8 @@ impl FileTaskShadow {
         Ok(shadow)
     }
 
-    pub fn new(root: impl Into<PathBuf>) -> Result<Self, ShadowError> {
+    #[cfg(test)]
+    pub(crate) fn new(root: impl Into<PathBuf>) -> Result<Self, ShadowError> {
         Self::try_new(root)
     }
 
@@ -103,14 +104,14 @@ impl FileTaskShadow {
         }
     }
 
-    pub fn try_attach_event_hook(
+    pub(crate) fn try_attach_event_hook(
         &self,
         hook: Arc<dyn Fn(&RuntimeTaskEvent) + Send + Sync>,
     ) -> bool {
         self.event_hook.set(hook).is_ok()
     }
 
-    pub fn default_root() -> PathBuf {
+    pub(crate) fn default_root() -> PathBuf {
         crate::data_root::user_data_path("tasks")
     }
 
@@ -565,6 +566,110 @@ impl FileTaskShadow {
     }
 
     #[cfg(test)]
+    pub(crate) fn fail_next_append_durability_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<(), ShadowError> {
+        let authority = self
+            .authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))?;
+        authority.fail_next_durability_settlement_for_test();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconcile_next_append_unconfirmed_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<(), ShadowError> {
+        let authority = self
+            .authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))?;
+        authority.reconcile_next_append_unconfirmed_for_test();
+        Ok(())
+    }
+
+    pub(crate) fn settle_event_state(
+        &self,
+        run_id: &str,
+    ) -> Result<
+        (
+            echo_agent::state::journal::JournalDurabilityStatus,
+            super::history_projection::HistoryProjectionApplyStatus,
+        ),
+        ShadowError,
+    > {
+        self.authority(run_id, false)?
+            .map(|authority| authority.settle_durability_and_history())
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_durability_probe_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<(), ShadowError> {
+        let authority = self
+            .authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))?;
+        authority.fail_next_durability_probe_for_test();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_review_history_append_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<(), ShadowError> {
+        let authority = self
+            .authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))?;
+        authority.fail_next_review_history_append_for_test();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_history_cursor_writes_for_test(
+        &self,
+        run_id: &str,
+        count: usize,
+    ) -> Result<(), ShadowError> {
+        let authority = self
+            .authority(run_id, false)?
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))?;
+        authority.fail_history_cursor_writes_for_test(count);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_paths_for_test(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<(PathBuf, PathBuf, PathBuf), ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.history_paths_for_test(task_id))
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_stats_for_test(&self, run_id: &str) -> Result<(usize, u64), ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.history_stats_for_test())
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_fallback_replay_count_for_test(
+        &self,
+        run_id: &str,
+    ) -> Result<usize, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.history_fallback_replay_count_for_test())
+            .ok_or_else(|| ShadowError::Io(format!("TaskRuntime run not found: {run_id}")))
+    }
+
+    #[cfg(test)]
     fn cached_authority_count_for_test(&self) -> usize {
         self.state
             .lock()
@@ -582,7 +687,8 @@ impl FileTaskShadow {
             .contains_key(run_id)
     }
 
-    pub fn append_event_line(
+    #[cfg(test)]
+    pub(crate) fn append_event_line(
         &self,
         run_id: &str,
         task_id: Option<&str>,
@@ -590,6 +696,25 @@ impl FileTaskShadow {
         event_type: RuntimeEventKind,
         payload: serde_json::Value,
     ) -> Result<Arc<RuntimeTaskEvent>, ShadowError> {
+        self.append_event_line_with_receipt(run_id, task_id, step_id, event_type, payload)
+            .map(|(event, _, _)| event)
+    }
+
+    pub(crate) fn append_event_line_with_receipt(
+        &self,
+        run_id: &str,
+        task_id: Option<&str>,
+        step_id: Option<&str>,
+        event_type: RuntimeEventKind,
+        payload: serde_json::Value,
+    ) -> Result<
+        (
+            Arc<RuntimeTaskEvent>,
+            echo_agent::state::journal::ApplyReceipt,
+            super::history_projection::HistoryProjectionApplyStatus,
+        ),
+        ShadowError,
+    > {
         let authority = self
             .authority(run_id, true)?
             .ok_or_else(|| ShadowError::Io("TaskRuntime authority unavailable".to_string()))?;
@@ -600,7 +725,7 @@ impl FileTaskShadow {
                 hook(persisted);
             }
         }) {
-            Ok((persisted, _receipt)) => Ok(persisted),
+            Ok(receipt) => Ok(receipt),
             Err(error) => {
                 self.clear_cached_authority(run_id, &authority);
                 Err(error)
@@ -612,7 +737,7 @@ impl FileTaskShadow {
         &self,
         run_id: &str,
         events: Vec<RuntimeJournalEvent>,
-    ) -> Result<Vec<Arc<RuntimeTaskEvent>>, ShadowError> {
+    ) -> Result<RunBatchAppendReceipt, ShadowError> {
         if events.is_empty() {
             return Err(ShadowError::Encode(
                 "TaskRuntime batch must contain at least one event".to_string(),
@@ -627,21 +752,20 @@ impl FileTaskShadow {
             .authority(run_id, true)?
             .ok_or_else(|| ShadowError::Io("TaskRuntime authority unavailable".to_string()))?;
         let hook = self.event_hook.get().cloned();
-        let persisted = match authority.append_batch_with_observer(events, |persisted| {
+        match authority.append_batch_with_observer(events, |persisted| {
             if let Some(hook) = hook.as_ref() {
                 hook(persisted);
             }
         }) {
-            Ok(receipt) => receipt.events,
+            Ok(receipt) => Ok(receipt),
             Err(error) => {
                 self.clear_cached_authority(run_id, &authority);
-                return Err(error);
+                Err(error)
             }
-        };
-        Ok(persisted)
+        }
     }
 
-    pub fn rewrite_plan(&self, run_id: &str) -> Result<(), ShadowError> {
+    pub(crate) fn rewrite_plan(&self, run_id: &str) -> Result<(), ShadowError> {
         if self.root().is_file() {
             return Ok(());
         }
@@ -676,7 +800,7 @@ impl FileTaskShadow {
         Ok(())
     }
 
-    pub fn list_run_ids(&self) -> Result<Vec<String>, ShadowError> {
+    pub(crate) fn list_run_ids(&self) -> Result<Vec<String>, ShadowError> {
         self.with_root_read(|root| {
             let entries = match std::fs::read_dir(root) {
                 Ok(entries) => entries,
@@ -807,21 +931,77 @@ impl FileTaskShadow {
         })
     }
 
-    pub fn read_plan(&self, run_id: &str) -> Result<Option<PlanRevision>, ShadowError> {
+    pub(crate) fn read_plan(&self, run_id: &str) -> Result<Option<PlanRevision>, ShadowError> {
         self.authority(run_id, false)?
             .map(|authority| authority.read_plan_projection())
             .transpose()
             .map(Option::flatten)
     }
 
-    pub fn read_run_state(&self, run_id: &str) -> Result<Option<RunStateSnapshot>, ShadowError> {
+    pub(crate) fn read_run_state(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunStateSnapshot>, ShadowError> {
         self.authority(run_id, false)?
             .map(|authority| authority.read_run_state_projection())
             .transpose()
             .map(Option::flatten)
     }
 
-    pub fn read_events(&self, run_id: &str) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
+    pub(crate) fn read_todo_query_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<super::event_rebuild::TodoQueryProjection>, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.read_todo_query_projection())
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn read_completion_gate_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<super::event_rebuild::CompletionGateProjection>, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.read_completion_gate_projection())
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub(crate) fn read_artifacts_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<super::types::Artifact>, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.read_artifacts_projection())
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub(crate) fn read_reviews_projection(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<super::types::ReviewResult>, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.read_reviews_projection(task_id))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub(crate) fn read_summary_projection(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Option<super::types::TaskExecutionSummary>, ShadowError> {
+        self.authority(run_id, false)?
+            .map(|authority| authority.read_summary_projection(task_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn read_events(&self, run_id: &str) -> Result<Vec<RuntimeTaskEvent>, ShadowError> {
         self.read_events_after(run_id, 0)
     }
 

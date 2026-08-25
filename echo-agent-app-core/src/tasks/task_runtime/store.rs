@@ -12,8 +12,10 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use echo_agent::state::journal::{CheckpointApplyStatus, JournalDurabilityStatus};
 use sha2::{Digest, Sha256};
 
+use super::history_projection::HistoryProjectionApplyStatus;
 use super::run_authority::RuntimeJournalEvent;
 use super::types::*;
 
@@ -85,9 +87,9 @@ pub enum StoreError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BackgroundCellStartCommit {
-    Durable,
-    CommittedProjectionDegraded { detail: String },
+pub enum ProjectionCommitReceipt {
+    Durable { seq: i64 },
+    CommittedProjectionDegraded { seq: i64, detail: String },
 }
 
 /// Canonical result of preparing a user-requested task retry while one
@@ -2791,6 +2793,16 @@ impl TaskRuntimeStore {
         })
     }
 
+    pub(crate) fn completion_gate_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<super::event_rebuild::CompletionGateProjection>, StoreError> {
+        let _operation = self.shadow_operation()?;
+        self.shadow
+            .read_completion_gate_projection(run_id)
+            .map_err(StoreError::Shadow)
+    }
+
     // ── Runs ────────────────────────────────────────────────────────────
 
     /// Create a new run in `Pending` and emit `RunCreated`. Returns the
@@ -2837,7 +2849,7 @@ impl TaskRuntimeStore {
             // U1c phase-0/0bc step-2: file is the write authority. Append the
             // RunCreated event to events.jsonl and rebuild plan.json — no SQL
             // write.
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run.run_id.as_str(),
                 None,
                 None,
@@ -2854,8 +2866,7 @@ impl TaskRuntimeStore {
                     "attended_mode": attended_mode.as_str(),
                     "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
                 }),
-            )?;
-            self.shadow.rewrite_plan(&run.run_id)?;
+            ))?;
             Ok(run)
         })
     }
@@ -3002,8 +3013,7 @@ impl TaskRuntimeStore {
                     }),
                 ));
             }
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, events)?;
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))
         })
@@ -3084,7 +3094,7 @@ impl TaskRuntimeStore {
                         == Some(run.goal_revision)
             });
             if !duplicate {
-                self.shadow.append_event_line(
+                self.commit_runtime_event(RuntimeJournalEvent::for_append(
                     run_id,
                     Some(task.id.as_str()),
                     None,
@@ -3098,8 +3108,7 @@ impl TaskRuntimeStore {
                         "actor_source": actor_source.as_str(),
                         "actor_user_id": actor_user_id,
                     }),
-                )?;
-                self.shadow.rewrite_plan(run_id)?;
+                ))?;
             }
             self.completion_gate_report(run_id)
         })
@@ -3119,14 +3128,13 @@ impl TaskRuntimeStore {
             // Validate the run exists (mirrors set_task_status / transition_run).
             self.get_run(run_id)?
                 .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
                 RuntimeEventKind::RunAttachmentsUpdated,
                 serde_json::json!({ "attachments": attachments }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            ))?;
             Ok(())
         })
     }
@@ -3169,8 +3177,7 @@ impl TaskRuntimeStore {
                     serde_json::json!({}),
                 ));
             }
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, events)?;
             let mut run = run;
             run.status = next;
             run.updated_at = now;
@@ -3226,7 +3233,7 @@ impl TaskRuntimeStore {
             ) || current.status == target
             {
                 if !events.is_empty() {
-                    self.shadow.append_event_batch(run_id, events)?;
+                    self.commit_runtime_events(run_id, events)?;
                 }
                 return Ok(current);
             }
@@ -3274,8 +3281,7 @@ impl TaskRuntimeStore {
                     serde_json::json!({}),
                 ));
             }
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, events)?;
 
             let settled = self
                 .get_run(run_id)?
@@ -3350,8 +3356,7 @@ impl TaskRuntimeStore {
                 ));
             }
             if !events.is_empty() {
-                self.shadow.append_event_batch(run_id, events)?;
-                self.shadow.rewrite_plan(run_id)?;
+                self.commit_runtime_events(run_id, events)?;
             }
             Ok(())
         })
@@ -3455,10 +3460,10 @@ impl TaskRuntimeStore {
             // suffix. Execution-path Notes are diagnostic and can be
             // published just after driver idle; every other fact remains
             // identity-changing and is rejected.
-            let suffix = self.list_events(
-                run_id,
-                i64::try_from(expected.journal_sequence).unwrap_or(i64::MAX),
-            )?;
+            let after_sequence = i64::try_from(expected.journal_sequence).map_err(|_| {
+                StoreError::InvalidPlan("TaskRuntime sequence exceeds EKO cursor".to_string())
+            })?;
+            let suffix = self.list_events(run_id, after_sequence)?;
             let diagnostic_only = !suffix.is_empty()
                 && suffix.iter().all(|event| {
                     event.event_type == RuntimeEventKind::Note
@@ -3580,9 +3585,7 @@ impl TaskRuntimeStore {
         reset_provider_retry: bool,
     ) -> Result<(), StoreError> {
         let events = self.prepare_resume_events(run_id, run, reset_provider_retry)?;
-        self.shadow.append_event_batch(run_id, events)?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+        self.commit_runtime_events(run_id, events)
     }
 
     fn prepare_resume_events(
@@ -3782,7 +3785,7 @@ impl TaskRuntimeStore {
                 // Completed + active-turn crash window.
                 return Ok(true);
             }
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
@@ -3794,8 +3797,7 @@ impl TaskRuntimeStore {
                     "goal_revision": report.goal_revision,
                     "requirement_count": report.requirements.len(),
                 }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            ))?;
             Ok(true)
         })
     }
@@ -3974,7 +3976,7 @@ impl TaskRuntimeStore {
             if run.status != TaskRunStatus::Running {
                 return Ok(false);
             }
-            self.shadow.append_event_batch(
+            self.commit_runtime_events(
                 run_id,
                 vec![
                     RuntimeJournalEvent::for_append(
@@ -3999,7 +4001,6 @@ impl TaskRuntimeStore {
                     ),
                 ],
             )?;
-            self.shadow.rewrite_plan(run_id)?;
             Ok(true)
         });
         let transitioned = transition?;
@@ -4048,7 +4049,7 @@ impl TaskRuntimeStore {
             committed.revision = 1;
             committed.goal_revision = run.goal_revision;
             committed.goal_sha256 = run.goal_sha256;
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 plan.run_id.as_str(),
                 None,
                 None,
@@ -4059,8 +4060,7 @@ impl TaskRuntimeStore {
                     "created_task_ids": committed.tasks.iter().map(|task| task.id.clone()).collect::<Vec<_>>(),
                     "plan": committed.specification(),
                 }),
-            )?;
-            self.shadow.rewrite_plan(&plan.run_id)?;
+            ))?;
             Ok(())
         })
     }
@@ -4203,8 +4203,7 @@ impl TaskRuntimeStore {
                     }),
                 ));
             }
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, events)?;
             Ok(prepared.next)
         })
     }
@@ -4312,8 +4311,7 @@ impl TaskRuntimeStore {
                     claim: None,
                 }),
             ];
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, events)?;
             Ok(prepared.next)
         })
     }
@@ -4541,30 +4539,116 @@ impl TaskRuntimeStore {
         if events.is_empty() {
             return Ok(());
         }
-        self.shadow.append_event_batch(run_id, events)?;
+        self.commit_runtime_events(run_id, events)
+    }
+
+    fn commit_runtime_event(&self, event: RuntimeJournalEvent) -> Result<(), StoreError> {
+        let run_id = event.run_id().to_string();
+        self.commit_runtime_events(&run_id, vec![event])
+    }
+
+    pub(super) fn commit_runtime_events(
+        &self,
+        run_id: &str,
+        events: Vec<RuntimeJournalEvent>,
+    ) -> Result<(), StoreError> {
+        let receipt = self.commit_runtime_events_with_receipt(run_id, events)?;
+        self.observe_projection_receipt(run_id, &receipt);
+        Ok(())
+    }
+
+    fn commit_runtime_events_with_receipt(
+        &self,
+        run_id: &str,
+        events: Vec<RuntimeJournalEvent>,
+    ) -> Result<ProjectionCommitReceipt, StoreError> {
+        let committed = self.shadow.append_event_batch(run_id, events)?;
+        let sequence = i64::try_from(committed.apply.last_sequence).map_err(|_| {
+            StoreError::InvalidPlan("TaskRuntime sequence exceeds EKO cursor".to_string())
+        })?;
+        let projection = self.refresh_committed_projection(run_id, sequence);
+        Ok(Self::classify_committed_projection(
+            sequence,
+            committed.apply.journal,
+            committed.apply.checkpoint,
+            committed.history,
+            projection,
+        ))
+    }
+
+    fn observe_projection_receipt(&self, run_id: &str, receipt: &ProjectionCommitReceipt) {
+        if let ProjectionCommitReceipt::CommittedProjectionDegraded { seq, detail } = receipt {
+            tracing::warn!(
+                run_id,
+                seq,
+                %detail,
+                "TaskRuntime event committed; derived projection will self-heal on read"
+            );
+        }
+    }
+
+    fn refresh_committed_projection(
+        &self,
+        run_id: &str,
+        last_committed_seq: i64,
+    ) -> ProjectionCommitReceipt {
         #[cfg(test)]
         if self
             .fail_next_runtime_mutation_projection
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
-            tracing::warn!(
-                run_id,
-                "runtime mutation committed with injected projection degradation"
-            );
-            return Ok(());
+            return ProjectionCommitReceipt::CommittedProjectionDegraded {
+                seq: last_committed_seq,
+                detail: "injected runtime mutation projection degradation".to_string(),
+            };
         }
         match self.shadow.rewrite_plan(run_id) {
-            Ok(()) => Ok(()),
+            Ok(()) => ProjectionCommitReceipt::Durable {
+                seq: last_committed_seq,
+            },
             Err(super::file_shadow::ShadowError::CommittedProjectionDegraded { seq, detail }) => {
-                tracing::warn!(
-                    run_id,
-                    seq,
-                    %detail,
-                    "runtime mutation committed; derived projection will self-heal on read"
-                );
-                Ok(())
+                ProjectionCommitReceipt::CommittedProjectionDegraded { seq, detail }
             }
-            Err(error) => Err(StoreError::Shadow(error)),
+            Err(error) => ProjectionCommitReceipt::CommittedProjectionDegraded {
+                seq: last_committed_seq,
+                detail: error.to_string(),
+            },
+        }
+    }
+
+    fn classify_committed_projection(
+        sequence: i64,
+        journal: JournalDurabilityStatus,
+        checkpoint: CheckpointApplyStatus,
+        history: HistoryProjectionApplyStatus,
+        projection: ProjectionCommitReceipt,
+    ) -> ProjectionCommitReceipt {
+        let mut degraded = Vec::new();
+        match journal {
+            JournalDurabilityStatus::Confirmed => {}
+            JournalDurabilityStatus::Unconfirmed => {
+                degraded.push("journal durability unconfirmed".to_string());
+            }
+            JournalDurabilityStatus::Degraded { error } => {
+                degraded.push(format!("journal durability degraded: {error}"));
+            }
+        }
+        if let CheckpointApplyStatus::Degraded { error } = checkpoint {
+            degraded.push(format!("checkpoint durability degraded: {error}"));
+        }
+        if let HistoryProjectionApplyStatus::Degraded { error } = history {
+            degraded.push(format!("history projection degraded: {error}"));
+        }
+        if let ProjectionCommitReceipt::CommittedProjectionDegraded { detail, .. } = projection {
+            degraded.push(format!("projection refresh degraded: {detail}"));
+        }
+        if degraded.is_empty() {
+            ProjectionCommitReceipt::Durable { seq: sequence }
+        } else {
+            ProjectionCommitReceipt::CommittedProjectionDegraded {
+                seq: sequence,
+                detail: degraded.join("; "),
+            }
         }
     }
 
@@ -4811,10 +4895,7 @@ impl TaskRuntimeStore {
     #[cfg(any(test, feature = "test-utils"))]
     fn append_task_status_event(&self, event: TaskStatusEvent<'_>) -> Result<(), StoreError> {
         let run_id = event.run_id;
-        self.shadow
-            .append_event_batch(run_id, vec![task_status_runtime_event(event)])?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+        self.commit_runtime_events(run_id, vec![task_status_runtime_event(event)])
     }
 
     /// Atomically retry a Blocked/Failed task in a Paused/Failed run.
@@ -4908,10 +4989,7 @@ impl TaskRuntimeStore {
     #[cfg(test)]
     pub(crate) fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
         self.with_run_lock(&r.run_id, || {
-            self.shadow
-                .append_event_batch(&r.run_id, vec![review_runtime_event(r, None)])?;
-            self.shadow.rewrite_plan(&r.run_id)?;
-            Ok(())
+            self.commit_runtime_events(&r.run_id, vec![review_runtime_event(r, None)])
         })
     }
 
@@ -4919,7 +4997,7 @@ impl TaskRuntimeStore {
         self.with_run_lock(&a.run_id, || {
             // U1c phase-0/0bc step-2: file authority. ArtifactProduced carries the
             // full artifact so FileTaskStore.list_artifacts can derive it. No SQL.
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 a.run_id.as_str(),
                 a.task_id.as_deref(),
                 None,
@@ -4932,9 +5010,7 @@ impl TaskRuntimeStore {
                     "path": a.path,
                     "metadata": a.metadata,
                 }),
-            )?;
-            self.shadow.rewrite_plan(&a.run_id)?;
-            Ok(())
+            ))
         })
     }
 
@@ -4947,7 +5023,7 @@ impl TaskRuntimeStore {
         self.with_run_lock(&s.run_id, || {
             // U1c phase-0/0bc step-2: file authority. Note{summary_persisted}
             // carries the full summary so FileTaskStore.get_summary can derive it.
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 s.run_id.as_str(),
                 Some(s.task_id.as_str()),
                 None,
@@ -4957,9 +5033,7 @@ impl TaskRuntimeStore {
                     // Full summary so events.jsonl can rebuild plan.json task summaries.
                     "summary": s,
                 }),
-            )?;
-            self.shadow.rewrite_plan(&s.run_id)?;
-            Ok(())
+            ))
         })
     }
 
@@ -5223,7 +5297,7 @@ impl TaskRuntimeStore {
         reason: &str,
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             Some(task_id),
             execution_id,
@@ -5234,8 +5308,7 @@ impl TaskRuntimeStore {
                 "tool_name": tool_name,
                 "reason": reason,
             }),
-        )?;
-        Ok(())
+        ))
     }
 
     /// Recover every run whose process-scoped driver disappeared at restart.
@@ -5408,7 +5481,7 @@ impl TaskRuntimeStore {
                     "injected recovery commit failure".to_string(),
                 ));
             }
-            self.shadow.append_event_line(
+            let recovery_event = RuntimeJournalEvent::for_append(
                 &run.run_id,
                 None,
                 None,
@@ -5430,17 +5503,34 @@ impl TaskRuntimeStore {
                         "tools": recovered_tools,
                     },
                 }),
-            )?;
+            );
             #[cfg(test)]
-            if self
+            let inject_projection_degradation = self
                 .fail_next_recovery_projection
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(StoreError::InvalidPlan(
-                    "injected recovery projection failure".to_string(),
-                ));
-            }
-            self.shadow.rewrite_plan(&run.run_id)?;
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let inject_projection_degradation = false;
+            let receipt = if inject_projection_degradation {
+                let committed = self
+                    .shadow
+                    .append_event_batch(&run.run_id, vec![recovery_event])?;
+                let sequence = i64::try_from(committed.apply.last_sequence).map_err(|_| {
+                    StoreError::InvalidPlan("TaskRuntime sequence exceeds EKO cursor".to_string())
+                })?;
+                Self::classify_committed_projection(
+                    sequence,
+                    committed.apply.journal,
+                    committed.apply.checkpoint,
+                    committed.history,
+                    ProjectionCommitReceipt::CommittedProjectionDegraded {
+                        seq: sequence,
+                        detail: "injected recovery projection degradation".to_string(),
+                    },
+                )
+            } else {
+                self.commit_runtime_events_with_receipt(&run.run_id, vec![recovery_event])?
+            };
+            self.observe_projection_receipt(&run.run_id, &receipt);
             tracing::info!(
                 run_id = %run.run_id,
                 from = %run.status.as_str(),
@@ -5513,7 +5603,7 @@ impl TaskRuntimeStore {
                     && state.time_budget_seconds == time_budget_seconds
             });
             if !unchanged {
-                self.shadow.append_event_line(
+                self.commit_runtime_event(RuntimeJournalEvent::for_append(
                     run_id,
                     None,
                     None,
@@ -5524,8 +5614,7 @@ impl TaskRuntimeStore {
                         "token_budget": token_budget,
                         "time_budget_seconds": time_budget_seconds,
                     }),
-                )?;
-                self.shadow.rewrite_plan(run_id)?;
+                ))?;
             }
             self.get_run_state(run_id)?
                 .and_then(|state| state.continuation)
@@ -5643,7 +5732,7 @@ impl TaskRuntimeStore {
                         .to_string()
                 }
             });
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
@@ -5658,8 +5747,7 @@ impl TaskRuntimeStore {
                     "pause_reason": exhausted.then(|| RunPauseReason::ProviderUnavailable.as_str()),
                     "pause_detail": pause_detail,
                 }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            ))?;
             let state = self
                 .get_run_state(run_id)?
                 .and_then(|snapshot| snapshot.continuation)
@@ -5733,7 +5821,7 @@ impl TaskRuntimeStore {
                 }
                 _ => "the lowered continuation budget is already exhausted",
             });
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
@@ -5746,8 +5834,7 @@ impl TaskRuntimeStore {
                     "pause_reason": pause_reason.map(RunPauseReason::as_str),
                     "pause_detail": pause_detail,
                 }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            ))?;
             let updated = self
                 .get_run_state(run_id)?
                 .and_then(|state| state.continuation)
@@ -5795,8 +5882,7 @@ impl TaskRuntimeStore {
                     return Ok(RunTurnClaimOutcome::NotSubmitted(reason));
                 }
             };
-            self.shadow.append_event_batch(run_id, vec![event])?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, vec![event])?;
             self.read_claimed_run_turn(run_id, turn_id)
         })
     }
@@ -5841,8 +5927,7 @@ impl TaskRuntimeStore {
             };
             let mut events = self.prepare_resume_events(run_id, &run, true)?;
             events.push(start);
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, events)?;
             self.read_claimed_run_turn(run_id, turn_id)
         })
     }
@@ -5970,7 +6055,7 @@ impl TaskRuntimeStore {
                     current.tokens_used.saturating_add(added_tokens) >= budget
                 });
             if !already_recorded {
-                self.shadow.append_event_line(
+                self.commit_runtime_event(RuntimeJournalEvent::for_append(
                     run_id,
                     None,
                     None,
@@ -5985,8 +6070,7 @@ impl TaskRuntimeStore {
                         "pause_reason": will_exhaust.then_some(RunPauseReason::TokenBudget.as_str()),
                         "pause_detail": will_exhaust.then_some("the configured token budget was reached at a provider usage boundary"),
                     }),
-                )?;
-                self.shadow.rewrite_plan(run_id)?;
+                ))?;
             }
             let state = self
                 .get_run_state(run_id)?
@@ -6069,7 +6153,7 @@ impl TaskRuntimeStore {
                 None
             };
             if !already_recorded {
-                self.shadow.append_event_line(
+                self.commit_runtime_event(RuntimeJournalEvent::for_append(
                     run_id,
                     None,
                     Some(execution_id),
@@ -6091,8 +6175,7 @@ impl TaskRuntimeStore {
                             _ => "a PlanTask Subagent reached a configured budget",
                         }),
                     }),
-                )?;
-                self.shadow.rewrite_plan(run_id)?;
+                ))?;
             }
             let state = self
                 .get_run_state(run_id)?
@@ -6138,7 +6221,7 @@ impl TaskRuntimeStore {
             if already_recorded {
                 return Ok(());
             }
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
@@ -6147,8 +6230,7 @@ impl TaskRuntimeStore {
                     "event_id": event_id,
                     "turn_id": turn_id,
                 }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            ))?;
             Ok(())
         })
     }
@@ -6249,8 +6331,7 @@ impl TaskRuntimeStore {
                         ));
                     }
                 }
-                self.shadow.append_event_batch(run_id, terminal_events)?;
-                self.shadow.rewrite_plan(run_id)?;
+                self.commit_runtime_events(run_id, terminal_events)?;
             }
             self.get_run_state(run_id)?
                 .and_then(|snapshot| snapshot.continuation)
@@ -6278,7 +6359,7 @@ impl TaskRuntimeStore {
             if current == deferred {
                 return Ok(());
             }
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
@@ -6288,8 +6369,7 @@ impl TaskRuntimeStore {
                     RuntimeEventKind::RunContinuationResumed
                 },
                 serde_json::json!({ "deferred": deferred }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            ))?;
             Ok(())
         })
     }
@@ -6313,7 +6393,7 @@ impl TaskRuntimeStore {
                 .and_then(|snapshot| snapshot.continuation)
                 .is_some_and(|state| state.deferred);
             if !deferred {
-                self.shadow.append_event_line(
+                self.commit_runtime_event(RuntimeJournalEvent::for_append(
                     run_id,
                     None,
                     None,
@@ -6322,8 +6402,7 @@ impl TaskRuntimeStore {
                         "deferred": true,
                         "reason": "background_cells_active",
                     }),
-                )?;
-                self.shadow.rewrite_plan(run_id)?;
+                ))?;
             }
             Ok(active_cells)
         })
@@ -6338,7 +6417,7 @@ impl TaskRuntimeStore {
         self.with_run_lock(run_id, || {
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            self.shadow.append_event_line(
+            self.commit_runtime_event(RuntimeJournalEvent::for_append(
                 run_id,
                 None,
                 None,
@@ -6347,8 +6426,7 @@ impl TaskRuntimeStore {
                     "reason": reason.as_str(),
                     "detail": detail.map(|text| text.chars().take(600).collect::<String>()),
                 }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
+            ))?;
             Ok(())
         })
     }
@@ -6376,7 +6454,7 @@ impl TaskRuntimeStore {
         turn_id: Option<&str>,
         execution_id: Option<&str>,
         call_id: Option<&str>,
-    ) -> Result<BackgroundCellStartCommit, StoreError> {
+    ) -> Result<ProjectionCommitReceipt, StoreError> {
         self.with_run_lock(run_id, || {
             self.get_run(run_id)?
                 .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
@@ -6403,10 +6481,17 @@ impl TaskRuntimeStore {
                 "phase": BackgroundCellPhase::Prepared,
                 "artifact_status": BackgroundCellArtifactStatus::NotRequested,
             });
-            let existing = self
-                .list_background_cells(run_id)?
+            let current = self
+                .get_run_state(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            let existing = current
+                .background_cells
                 .into_iter()
                 .find(|cell| cell.cell_id == cell_id);
+            let current_seq = i64::try_from(current.journal_sequence).map_err(|_| {
+                StoreError::InvalidPlan("TaskRuntime sequence exceeds EKO cursor".to_string())
+            })?;
+            let append_receipt;
             if let Some(existing) = existing {
                 if existing.name != retention.sanitize_text(name)
                     || existing.command_hash != command_hash
@@ -6418,30 +6503,50 @@ impl TaskRuntimeStore {
                         "conflicting BackgroundCellStarted fact for cell {cell_id}"
                     )));
                 }
+                append_receipt = None;
             } else {
-                self.shadow.append_event_line(
+                append_receipt = Some(self.shadow.append_event_line_with_receipt(
                     run_id,
                     None,
                     call_id,
                     RuntimeEventKind::BackgroundCellStarted,
                     payload,
-                )?;
+                )?);
             }
+            let committed_seq = append_receipt
+                .as_ref()
+                .map_or(current_seq, |(event, _, _)| event.seq);
             #[cfg(test)]
-            if self
+            let inject_projection_degradation = self
                 .fail_next_cell_started_projection
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Ok(BackgroundCellStartCommit::CommittedProjectionDegraded {
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(not(test))]
+            let inject_projection_degradation = false;
+            let projection = if inject_projection_degradation {
+                ProjectionCommitReceipt::CommittedProjectionDegraded {
+                    seq: committed_seq,
                     detail: "injected BackgroundCellStarted projection failure".to_string(),
-                });
-            }
-            match self.shadow.rewrite_plan(run_id) {
-                Ok(()) => Ok(BackgroundCellStartCommit::Durable),
-                Err(error) => Ok(BackgroundCellStartCommit::CommittedProjectionDegraded {
-                    detail: error.to_string(),
-                }),
-            }
+                }
+            } else {
+                self.refresh_committed_projection(run_id, committed_seq)
+            };
+            let Some((_, apply, history)) = append_receipt else {
+                let (journal, history) = self.shadow.settle_event_state(run_id)?;
+                return Ok(Self::classify_committed_projection(
+                    committed_seq,
+                    journal,
+                    CheckpointApplyStatus::NotDue,
+                    history,
+                    projection,
+                ));
+            };
+            Ok(Self::classify_committed_projection(
+                committed_seq,
+                apply.journal,
+                apply.checkpoint,
+                history,
+                projection,
+            ))
         })
     }
 
@@ -6535,15 +6640,14 @@ impl TaskRuntimeStore {
                     )));
                 }
             } else {
-                self.shadow.append_event_line(
+                self.commit_runtime_event(RuntimeJournalEvent::for_append(
                     run_id,
                     None,
                     call_id,
                     RuntimeEventKind::BackgroundCellFinished,
                     payload,
-                )?;
+                ))?;
             }
-            self.shadow.rewrite_plan(run_id)?;
             Ok(())
         })
     }
@@ -6559,12 +6663,9 @@ impl TaskRuntimeStore {
         run_id: &str,
         task_id: &str,
     ) -> Result<Vec<ReviewResult>, StoreError> {
-        // FileTaskStore.list_reviews returns all reviews for a run; filter
-        // by task_id to match the SQL signature.
         self.file_store()?
-            .list_reviews(run_id)
+            .list_reviews(run_id, task_id)
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
-            .map(|rs| rs.into_iter().filter(|r| r.task_id == task_id).collect())
     }
 
     pub fn get_summary(
@@ -6585,18 +6686,13 @@ impl TaskRuntimeStore {
         message: &str,
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
-        // U1c phase-0/0bc step-2: file authority. A plain Note{message} does
-        // not affect plan.json (the rebuilder only mutates the plan for
-        // Note{kind: fix_task_persisted | summary_persisted}), so we skip the
-        // rewrite — appending the event is enough.
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             task_id,
             None,
             RuntimeEventKind::Note,
             serde_json::json!({ "message": message }),
-        )?;
-        Ok(())
+        ))
     }
 
     /// Persist trigger/scheduling metadata without expanding the TaskRun state
@@ -6611,7 +6707,7 @@ impl TaskRuntimeStore {
         dependencies: &[String],
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             None,
             None,
@@ -6624,8 +6720,7 @@ impl TaskRuntimeStore {
                 "priority": priority.min(10),
                 "dependencies": dependencies,
             }),
-        )?;
-        Ok(())
+        ))
     }
 
     pub fn record_execution_path(
@@ -6635,7 +6730,7 @@ impl TaskRuntimeStore {
         observed_path: &str,
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             None,
             None,
@@ -6645,8 +6740,7 @@ impl TaskRuntimeStore {
                 "requested_mode": requested_mode,
                 "observed_path": observed_path,
             }),
-        )?;
-        Ok(())
+        ))
     }
 
     /// Persist the boundary immediately before a task Subagent starts model/tool
@@ -6666,7 +6760,7 @@ impl TaskRuntimeStore {
         dispatch_hook: bool,
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             Some(task_id),
             Some(execution_id),
@@ -6680,8 +6774,7 @@ impl TaskRuntimeStore {
                 "replay_safe": replay_safe,
                 "dispatch_hook": dispatch_hook,
             }),
-        )?;
-        Ok(())
+        ))
     }
 
     /// Persist a Subagent terminal fact with the structured result needed for resume.
@@ -6705,7 +6798,7 @@ impl TaskRuntimeStore {
             dispatch_hook,
         } = record;
         let summary = result.map(|value| bounded_event_text(&value.summary, 2_000));
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             Some(task_id),
             Some(execution_id),
@@ -6723,8 +6816,7 @@ impl TaskRuntimeStore {
                 "usage": usage,
                 "dispatch_hook": dispatch_hook,
             }),
-        )?;
-        Ok(())
+        ))
     }
 
     /// Persist a tool dispatch before execution. Raw arguments are deliberately
@@ -6740,7 +6832,7 @@ impl TaskRuntimeStore {
         replay_safe: bool,
     ) -> Result<(), StoreError> {
         let _operation = self.shadow_operation()?;
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             Some(task_id),
             Some(call_id),
@@ -6751,8 +6843,7 @@ impl TaskRuntimeStore {
                 "tool_name": tool_name,
                 "replay_safe": replay_safe,
             }),
-        )?;
-        Ok(())
+        ))
     }
 
     /// Persist a tool terminal fact. The result preview is diagnostic only;
@@ -6775,7 +6866,7 @@ impl TaskRuntimeStore {
         } else {
             RuntimeEventKind::ToolFailed
         };
-        self.shadow.append_event_line(
+        self.commit_runtime_event(RuntimeJournalEvent::for_append(
             run_id,
             Some(task_id),
             Some(call_id),
@@ -6789,8 +6880,7 @@ impl TaskRuntimeStore {
                 "result_chars": result.chars().count(),
                 "failure": failure,
             }),
-        )?;
-        Ok(())
+        ))
     }
 
     /// Return a completed Subagent result for a stable logical attempt.
@@ -7040,8 +7130,7 @@ impl TaskRuntimeStore {
                     events
                 }
             };
-            self.shadow.append_event_batch(run_id, events)?;
-            self.shadow.rewrite_plan(run_id)?;
+            self.commit_runtime_events(run_id, events)?;
             Ok(())
         })
     }
@@ -7313,6 +7402,7 @@ mod tests {
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
             .map_err(|error| error.to_string())?;
         let run_id = format!("public-state-{event_count}");
+        let mut pending = Vec::with_capacity(512);
         for index in 0..event_count {
             let (task_id, step_id, event_type, payload) = match index {
                 0 => (
@@ -7489,16 +7579,19 @@ mod tests {
                     }),
                 ),
             };
-            store
-                .shadow
-                .append_event_line(
-                    &run_id,
-                    task_id.as_deref(),
-                    step_id.as_deref(),
-                    event_type,
-                    payload,
-                )
-                .map_err(|error| error.to_string())?;
+            pending.push(RuntimeJournalEvent::for_append(
+                &run_id,
+                task_id.as_deref(),
+                step_id.as_deref(),
+                event_type,
+                payload,
+            ));
+            if pending.len() == 512 || index.saturating_add(1) == event_count {
+                store
+                    .shadow
+                    .append_event_batch(&run_id, std::mem::take(&mut pending))
+                    .map_err(|error| error.to_string())?;
+            }
         }
         store
             .shadow
@@ -7510,6 +7603,420 @@ mod tests {
     fn median_duration(samples: &mut [std::time::Duration]) -> Option<std::time::Duration> {
         samples.sort_unstable();
         samples.get(samples.len() / 2).copied()
+    }
+
+    fn seed_public_query_fixture(
+        event_count: usize,
+    ) -> Result<(tempfile::TempDir, TaskRuntimeStore, String), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        let run_id = format!("public-query-{event_count}");
+        store
+            .create_run(
+                &run_id,
+                "test",
+                "conversation",
+                "root-message",
+                DomainProfile::General,
+                "bounded public query",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let plan = TaskPlan {
+            plan_id: format!("plan-{event_count}"),
+            run_id: run_id.clone(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("bounded public query"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "task-a".to_string(),
+                title: "Project bounded state".to_string(),
+                description: "Exercise the production Todo and completion queries".to_string(),
+                kind: PlanTaskKind::Investigation,
+                agent_role: "subagent".to_string(),
+                domain_profile: DomainProfile::General,
+                sort_order: 1,
+                ..Default::default()
+            }],
+        };
+        store
+            .attach_plan_for_test(&plan)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_task_status(
+                &run_id,
+                "task-a",
+                TodoStatus::Completed,
+                Some("subagent"),
+                Some("projected"),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .put_summary(&TaskExecutionSummary {
+                run_id: run_id.clone(),
+                task_id: "task-a".to_string(),
+                subagent_name: "subagent".to_string(),
+                result: SubagentTaskResult::terminal(
+                    SubagentRunStatus::Completed,
+                    "bounded query complete",
+                    Vec::new(),
+                ),
+                decisions: Vec::new(),
+                next_implications: Vec::new(),
+                suggested_tasks: Vec::new(),
+                created_at: Utc::now(),
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .add_artifact(&Artifact {
+                id: "artifact-a".to_string(),
+                run_id: run_id.clone(),
+                task_id: Some("task-a".to_string()),
+                kind: ArtifactKind::Report,
+                title: "Bounded report".to_string(),
+                path: None,
+                metadata: serde_json::json!({"source": "fixture"}),
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .add_review(&ReviewResult {
+                id: "review-a".to_string(),
+                run_id: run_id.clone(),
+                task_id: "task-a".to_string(),
+                reviewer_agent: "reviewer".to_string(),
+                outcome: ReviewOutcome::Pass,
+                issues: Vec::new(),
+                failure_fingerprint: None,
+                created_fix_task_id: None,
+                created_at: Utc::now(),
+            })
+            .map_err(|error| error.to_string())?;
+        let current = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .len();
+        if current > event_count {
+            return Err(format!(
+                "query fixture needs {current} semantic events, target was {event_count}"
+            ));
+        }
+        let mut pending = Vec::with_capacity(512);
+        for ordinal in current..event_count {
+            pending.push(RuntimeJournalEvent::for_append(
+                &run_id,
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({"kind": "bounded_query_fixture", "ordinal": ordinal}),
+            ));
+            if pending.len() == 512 || ordinal.saturating_add(1) == event_count {
+                store
+                    .shadow
+                    .append_event_batch(&run_id, std::mem::take(&mut pending))
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        store
+            .shadow
+            .rewrite_plan(&run_id)
+            .map_err(|error| error.to_string())?;
+        Ok((temp, store, run_id))
+    }
+
+    fn seed_history_plan(store: &TaskRuntimeStore, run_id: &str) -> Result<(), String> {
+        store
+            .create_run(
+                run_id,
+                "test",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "history projection",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: format!("plan-{run_id}"),
+                run_id: run_id.to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: task_goal_sha256("history projection"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: ["other-task", "target-task"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, task_id)| PlanTask {
+                        id: task_id.to_string(),
+                        title: task_id.to_string(),
+                        description: "history scale".to_string(),
+                        kind: PlanTaskKind::Investigation,
+                        agent_role: "subagent".to_string(),
+                        domain_profile: DomainProfile::General,
+                        sort_order: i64::try_from(index).unwrap_or_default(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    fn history_artifact(run_id: &str, id: &str) -> Artifact {
+        Artifact {
+            id: id.to_string(),
+            run_id: run_id.to_string(),
+            task_id: Some("target-task".to_string()),
+            kind: ArtifactKind::Report,
+            title: id.to_string(),
+            path: None,
+            metadata: serde_json::json!({"fixture": true}),
+        }
+    }
+
+    fn history_review(run_id: &str, task_id: &str, id: &str) -> ReviewResult {
+        ReviewResult {
+            id: id.to_string(),
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            reviewer_agent: "reviewer".to_string(),
+            outcome: ReviewOutcome::Pass,
+            issues: Vec::new(),
+            failure_fingerprint: None,
+            created_fix_task_id: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    fn artifact_history_event(run_id: &str, id: &str) -> RuntimeJournalEvent {
+        let artifact = history_artifact(run_id, id);
+        RuntimeJournalEvent::for_append(
+            run_id,
+            artifact.task_id.as_deref(),
+            None,
+            RuntimeEventKind::ArtifactProduced,
+            serde_json::json!({
+                "artifact_id": artifact.id,
+                "kind": artifact.kind.as_str(),
+                "title": artifact.title,
+                "task_id": artifact.task_id,
+                "path": artifact.path,
+                "metadata": artifact.metadata,
+            }),
+        )
+    }
+
+    fn review_history_event(run_id: &str, task_id: &str, id: &str) -> RuntimeJournalEvent {
+        review_runtime_event(&history_review(run_id, task_id, id), None)
+    }
+
+    fn line_count(path: &std::path::Path) -> Result<usize, String> {
+        Ok(std::fs::read(path)
+            .map_err(|error| error.to_string())?
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .count())
+    }
+
+    fn retain_first_jsonl_record(path: &std::path::Path) -> Result<(), String> {
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let first = bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .next()
+            .ok_or_else(|| "history segment has no first record".to_string())?;
+        std::fs::write(path, first).map_err(|error| error.to_string())
+    }
+
+    fn history_cursor_sequence(path: &std::path::Path) -> Result<u64, String> {
+        serde_json::from_slice::<serde_json::Value>(
+            &std::fs::read(path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?
+        .get("through_sequence")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "history cursor has no through_sequence".to_string())
+    }
+
+    fn flush_history_batch(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+        pending: &mut Vec<RuntimeJournalEvent>,
+        samples: &mut Vec<std::time::Duration>,
+    ) -> Result<(), String> {
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        store
+            .commit_runtime_events(run_id, std::mem::take(pending))
+            .map_err(|error| error.to_string())?;
+        samples.push(started.elapsed());
+        Ok(())
+    }
+
+    type HistoryScaleFixture = (
+        tempfile::TempDir,
+        TaskRuntimeStore,
+        String,
+        std::time::Duration,
+        std::time::Duration,
+    );
+
+    fn seed_history_scale_fixture(review_count: usize) -> Result<HistoryScaleFixture, String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        let run_id = format!("history-scale-{review_count}");
+        seed_history_plan(&store, &run_id)?;
+
+        let split = review_count / 2;
+        let mut pending = vec![
+            artifact_history_event(&run_id, "only-artifact"),
+            review_history_event(&run_id, "target-task", "only-target-review"),
+        ];
+        let mut first_half = Vec::new();
+        let mut second_half = Vec::new();
+        for ordinal in 0..review_count {
+            pending.push(review_history_event(
+                &run_id,
+                "other-task",
+                &format!("other-review-{ordinal}"),
+            ));
+            if pending.len() == 512 {
+                let samples = if ordinal < split {
+                    &mut first_half
+                } else {
+                    &mut second_half
+                };
+                flush_history_batch(&store, &run_id, &mut pending, samples)?;
+            }
+        }
+        flush_history_batch(&store, &run_id, &mut pending, &mut second_half)?;
+        let first_median = median_duration(&mut first_half)
+            .ok_or_else(|| "history first-half append samples are empty".to_string())?;
+        let second_median = median_duration(&mut second_half)
+            .ok_or_else(|| "history second-half append samples are empty".to_string())?;
+        Ok((temp, store, run_id, first_median, second_median))
+    }
+
+    type ArtifactScaleFixture = (
+        tempfile::TempDir,
+        TaskRuntimeStore,
+        String,
+        std::time::Duration,
+        std::time::Duration,
+        usize,
+        u64,
+    );
+
+    fn seed_artifact_scale_fixture(artifact_count: usize) -> Result<ArtifactScaleFixture, String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        let run_id = format!("artifact-scale-{artifact_count}");
+        seed_history_plan(&store, &run_id)?;
+        let (scans_before, bytes_before) = store
+            .shadow
+            .history_stats_for_test(&run_id)
+            .map_err(|error| error.to_string())?;
+        let split = artifact_count / 2;
+        let mut pending = Vec::with_capacity(512);
+        let mut first_half = Vec::new();
+        let mut second_half = Vec::new();
+        for ordinal in 0..artifact_count {
+            pending.push(artifact_history_event(
+                &run_id,
+                &format!("artifact-{ordinal}"),
+            ));
+            if pending.len() == 512 {
+                let samples = if ordinal < split {
+                    &mut first_half
+                } else {
+                    &mut second_half
+                };
+                flush_history_batch(&store, &run_id, &mut pending, samples)?;
+            }
+        }
+        flush_history_batch(&store, &run_id, &mut pending, &mut second_half)?;
+        let first_median = median_duration(&mut first_half)
+            .ok_or_else(|| "artifact first-half append samples are empty".to_string())?;
+        let second_median = median_duration(&mut second_half)
+            .ok_or_else(|| "artifact second-half append samples are empty".to_string())?;
+        let (scans_after, bytes_after) = store
+            .shadow
+            .history_stats_for_test(&run_id)
+            .map_err(|error| error.to_string())?;
+        let scan_delta = scans_after.saturating_sub(scans_before);
+        let byte_delta = bytes_after.saturating_sub(bytes_before);
+        Ok((
+            temp,
+            store,
+            run_id,
+            first_median,
+            second_median,
+            scan_delta,
+            byte_delta,
+        ))
+    }
+
+    fn time_history_target_queries(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<std::time::Duration, String> {
+        let started = std::time::Instant::now();
+        let artifacts = store
+            .list_artifacts(run_id)
+            .map_err(|error| error.to_string())?;
+        let reviews = store
+            .list_reviews(run_id, "target-task")
+            .map_err(|error| error.to_string())?;
+        if artifacts.len() != 1 || reviews.len() != 1 {
+            return Err("targeted history projection returned incomplete facts".to_string());
+        }
+        Ok(started.elapsed())
+    }
+
+    fn time_public_queries(
+        store: &TaskRuntimeStore,
+        run_id: &str,
+    ) -> Result<std::time::Duration, String> {
+        let started = std::time::Instant::now();
+        let todos = store
+            .list_todos(run_id)
+            .map_err(|error| error.to_string())?;
+        let artifacts = store
+            .list_artifacts(run_id)
+            .map_err(|error| error.to_string())?;
+        let completion = store
+            .completion_gate_report(run_id)
+            .map_err(|error| error.to_string())?;
+        let reviews = store
+            .list_reviews(run_id, "task-a")
+            .map_err(|error| error.to_string())?;
+        let summary = store
+            .get_summary(run_id, "task-a")
+            .map_err(|error| error.to_string())?;
+        if todos.len() != 1
+            || artifacts.len() != 1
+            || reviews.len() != 1
+            || summary.is_none()
+            || !completion.ready
+        {
+            return Err("production TaskRuntime query projection is incomplete".to_string());
+        }
+        Ok(started.elapsed())
     }
 
     fn boot_recovery_event_count(store: &TaskRuntimeStore) -> Result<usize, StoreError> {
@@ -10641,11 +11148,7 @@ mod tests {
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
         store.fail_next_recovery_projection_for_test();
 
-        assert!(matches!(
-            store.recover_incomplete(),
-            Err(StoreError::InvalidPlan(message))
-                if message == "injected recovery projection failure"
-        ));
+        assert_eq!(store.recover_incomplete()?, 1);
         let stale_projection = store
             .shadow
             .read_run_state("r1")
@@ -12743,6 +13246,1397 @@ mod tests {
         assert!(repaired_warm <= std::time::Duration::from_millis(2));
         assert!(checkpoint_bytes <= 256 * 1024);
         assert!(checkpoint_bytes.saturating_mul(20) < event_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn production_todo_artifact_review_summary_completion_queries_are_bounded_at_10k_and_100k()
+    -> Result<(), String> {
+        let (_ten_temp, ten_store, ten_run) = seed_public_query_fixture(10_000)?;
+        let (_hundred_temp, hundred_store, hundred_run) = seed_public_query_fixture(100_000)?;
+        let mut ten_samples = Vec::with_capacity(5);
+        let mut hundred_samples = Vec::with_capacity(5);
+        for _ in 0..5 {
+            ten_samples.push(time_public_queries(&ten_store, &ten_run)?);
+            hundred_samples.push(time_public_queries(&hundred_store, &hundred_run)?);
+        }
+        let ten_median = median_duration(&mut ten_samples)
+            .ok_or_else(|| "10k query sample set is empty".to_string())?;
+        let hundred_median = median_duration(&mut hundred_samples)
+            .ok_or_else(|| "100k query sample set is empty".to_string())?;
+        let ratio_budget = ten_median
+            .saturating_mul(4)
+            .max(std::time::Duration::from_millis(25));
+        assert!(hundred_median <= std::time::Duration::from_millis(200));
+        assert!(hundred_median <= ratio_budget);
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_and_per_task_review_history_scale_at_10k_and_100k() -> Result<(), String> {
+        let (_ten_temp, ten_store, ten_run, ten_first, ten_second) =
+            seed_history_scale_fixture(10_000)?;
+        let (hundred_temp, hundred_store, hundred_run, hundred_first, hundred_second) =
+            seed_history_scale_fixture(100_000)?;
+        let (
+            _ten_artifact_temp,
+            _ten_artifact_store,
+            _ten_artifact_run,
+            ten_artifact_first,
+            ten_artifact_second,
+            ten_artifact_scans,
+            _,
+        ) = seed_artifact_scale_fixture(10_000)?;
+        let (
+            hundred_artifact_temp,
+            hundred_artifact_store,
+            hundred_artifact_run,
+            hundred_artifact_first,
+            hundred_artifact_second,
+            hundred_artifact_scans,
+            hundred_artifact_appended_bytes,
+        ) = seed_artifact_scale_fixture(100_000)?;
+
+        let mut ten_queries = Vec::with_capacity(5);
+        let mut hundred_queries = Vec::with_capacity(5);
+        for _ in 0..5 {
+            ten_queries.push(time_history_target_queries(&ten_store, &ten_run)?);
+            hundred_queries.push(time_history_target_queries(&hundred_store, &hundred_run)?);
+        }
+        let ten_query = median_duration(&mut ten_queries)
+            .ok_or_else(|| "10k history query samples are empty".to_string())?;
+        let hundred_query = median_duration(&mut hundred_queries)
+            .ok_or_else(|| "100k history query samples are empty".to_string())?;
+        assert_eq!(
+            hundred_store
+                .list_reviews(&hundred_run, "other-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            100_000
+        );
+        let artifact_query_started = std::time::Instant::now();
+        assert_eq!(
+            hundred_artifact_store
+                .list_artifacts(&hundred_artifact_run)
+                .map_err(|error| error.to_string())?
+                .len(),
+            100_000
+        );
+        let hundred_artifact_query = artifact_query_started.elapsed();
+
+        let (artifact_path, target_review_path, _) = hundred_store
+            .shadow
+            .history_paths_for_test(&hundred_run, "target-task")
+            .map_err(|error| error.to_string())?;
+        let (_, other_review_path, _) = hundred_store
+            .shadow
+            .history_paths_for_test(&hundred_run, "other-task")
+            .map_err(|error| error.to_string())?;
+        let checkpoint_path = hundred_temp
+            .path()
+            .join("tasks")
+            .join(&hundred_run)
+            .join("checkpoint.json");
+        let artifact_bytes = std::fs::metadata(&artifact_path)
+            .map_err(|error| error.to_string())?
+            .len();
+        let target_review_bytes = std::fs::metadata(&target_review_path)
+            .map_err(|error| error.to_string())?
+            .len();
+        let other_review_bytes = std::fs::metadata(&other_review_path)
+            .map_err(|error| error.to_string())?
+            .len();
+        let checkpoint_bytes = std::fs::metadata(&checkpoint_path)
+            .map_err(|error| error.to_string())?
+            .len();
+        let (hundred_artifact_path, _, _) = hundred_artifact_store
+            .shadow
+            .history_paths_for_test(&hundred_artifact_run, "target-task")
+            .map_err(|error| error.to_string())?;
+        let hundred_artifact_segment_bytes = std::fs::metadata(&hundred_artifact_path)
+            .map_err(|error| error.to_string())?
+            .len();
+        println!(
+            "{}",
+            serde_json::json!({
+                "ten_k_append_first_half_median_ms": ten_first.as_secs_f64() * 1_000.0,
+                "ten_k_append_second_half_median_ms": ten_second.as_secs_f64() * 1_000.0,
+                "hundred_k_append_first_half_median_ms": hundred_first.as_secs_f64() * 1_000.0,
+                "hundred_k_append_second_half_median_ms": hundred_second.as_secs_f64() * 1_000.0,
+                "ten_k_artifact_append_first_half_median_ms": ten_artifact_first.as_secs_f64() * 1_000.0,
+                "ten_k_artifact_append_second_half_median_ms": ten_artifact_second.as_secs_f64() * 1_000.0,
+                "hundred_k_artifact_append_first_half_median_ms": hundred_artifact_first.as_secs_f64() * 1_000.0,
+                "hundred_k_artifact_append_second_half_median_ms": hundred_artifact_second.as_secs_f64() * 1_000.0,
+                "ten_k_target_query_median_ms": ten_query.as_secs_f64() * 1_000.0,
+                "hundred_k_target_query_median_ms": hundred_query.as_secs_f64() * 1_000.0,
+                "hundred_k_artifact_query_ms": hundred_artifact_query.as_secs_f64() * 1_000.0,
+                "ten_k_artifact_segment_scans": ten_artifact_scans,
+                "hundred_k_artifact_segment_scans": hundred_artifact_scans,
+                "artifact_segment_bytes": artifact_bytes,
+                "hundred_k_artifact_segment_bytes": hundred_artifact_segment_bytes,
+                "hundred_k_artifact_appended_bytes": hundred_artifact_appended_bytes,
+                "target_review_segment_bytes": target_review_bytes,
+                "other_review_segment_bytes": other_review_bytes,
+                "hot_checkpoint_bytes": checkpoint_bytes,
+            })
+        );
+        assert!(artifact_bytes <= 64 * 1024);
+        assert!(target_review_bytes <= 64 * 1024);
+        assert!(other_review_bytes > target_review_bytes);
+        assert!(checkpoint_bytes <= 256 * 1024);
+        assert!(ten_artifact_scans <= 1);
+        assert!(hundred_artifact_scans <= 1);
+        assert_eq!(
+            hundred_artifact_segment_bytes,
+            hundred_artifact_appended_bytes
+        );
+        assert!(
+            ten_second
+                <= ten_first
+                    .saturating_mul(4)
+                    .max(std::time::Duration::from_millis(250))
+        );
+        assert!(
+            hundred_second
+                <= hundred_first
+                    .saturating_mul(4)
+                    .max(std::time::Duration::from_millis(250))
+        );
+        assert!(hundred_second <= std::time::Duration::from_secs(2));
+        assert!(
+            hundred_second
+                <= ten_second
+                    .saturating_mul(4)
+                    .max(std::time::Duration::from_millis(250))
+        );
+        assert!(
+            hundred_artifact_second
+                <= hundred_artifact_first
+                    .saturating_mul(4)
+                    .max(std::time::Duration::from_millis(250))
+        );
+        assert!(
+            hundred_artifact_second
+                <= ten_artifact_second
+                    .saturating_mul(4)
+                    .max(std::time::Duration::from_millis(250))
+        );
+        assert!(hundred_artifact_second <= std::time::Duration::from_secs(2));
+        assert!(hundred_artifact_query <= std::time::Duration::from_secs(2));
+        assert!(hundred_query <= std::time::Duration::from_millis(250));
+        assert!(
+            hundred_query
+                <= ten_query
+                    .saturating_mul(4)
+                    .max(std::time::Duration::from_millis(50))
+        );
+
+        drop(hundred_store);
+        let reopened =
+            TaskRuntimeStore::new_in_memory_with_shadow_root(hundred_temp.path().join("tasks"))
+                .map_err(|error| error.to_string())?;
+        time_history_target_queries(&reopened, &hundred_run)?;
+        assert_eq!(
+            reopened
+                .list_reviews(&hundred_run, "other-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            100_000
+        );
+        drop(hundred_artifact_store);
+        let reopened_artifacts = TaskRuntimeStore::new_in_memory_with_shadow_root(
+            hundred_artifact_temp.path().join("tasks"),
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            reopened_artifacts
+                .list_artifacts(&hundred_artifact_run)
+                .map_err(|error| error.to_string())?
+                .len(),
+            100_000
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn query_checkpoint_corruption_self_heals_and_restart_preserves_results() -> Result<(), String>
+    {
+        let (temp, store, run_id) = seed_public_query_fixture(10_000)?;
+        time_public_queries(&store, &run_id)?;
+        let checkpoint_path = temp
+            .path()
+            .join("tasks")
+            .join(&run_id)
+            .join("checkpoint.json");
+        drop(store);
+        std::fs::write(&checkpoint_path, b"{corrupt checkpoint")
+            .map_err(|error| error.to_string())?;
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        time_public_queries(&reopened, &run_id)?;
+        let repaired: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&checkpoint_path).map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(
+            repaired
+                .get("state")
+                .and_then(|state| state.get("query_projection_schema"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        drop(reopened);
+        let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        time_public_queries(&restarted, &run_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn behind_checkpoint_is_repaired_once_on_query_only_restart() -> Result<(), String> {
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+
+        let (temp, store, run_id) = seed_public_query_fixture(1_000)?;
+        let checkpoint_path = temp
+            .path()
+            .join("tasks")
+            .join(&run_id)
+            .join("checkpoint.json");
+        let receipt = store
+            .shadow
+            .append_event_batch(
+                &run_id,
+                vec![RuntimeJournalEvent::for_append(
+                    &run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"kind": "checkpoint_suffix"}),
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        let head = receipt.apply.last_sequence;
+        let checkpoints = FileCheckpointStore::<super::super::event_rebuild::EventFoldState>::open(
+            &checkpoint_path,
+        );
+        let before = checkpoints
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "checkpoint before restart is missing".to_string())?;
+        assert!(before.sequence < head);
+        drop(store);
+
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        time_public_queries(&reopened, &run_id)?;
+        drop(reopened);
+        let repaired = checkpoints
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "repaired checkpoint is missing".to_string())?;
+        assert_eq!(repaired.sequence, head);
+
+        let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        let stats = restarted
+            .shadow
+            .rewrite_plan_with_stats(&run_id)
+            .map_err(|error| error.to_string())?;
+        assert!(stats.used_checkpoint);
+        assert_eq!(stats.folded_events, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn full_history_rebuild_removes_stale_review_segments() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        seed_history_plan(&store, "stale-history")?;
+        store
+            .add_review(&history_review("stale-history", "target-task", "review-1"))
+            .map_err(|error| error.to_string())?;
+        let (_, review_path, cursor_path) = store
+            .shadow
+            .history_paths_for_test("stale-history", "target-task")
+            .map_err(|error| error.to_string())?;
+        let review_directory = review_path
+            .parent()
+            .ok_or_else(|| "review history has no directory".to_string())?
+            .to_path_buf();
+        drop(store);
+        let stale_path = review_directory.join("stale-valid-segment.jsonl");
+        std::fs::write(&stale_path, b"{}\n").map_err(|error| error.to_string())?;
+        std::fs::remove_file(cursor_path).map_err(|error| error.to_string())?;
+
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            reopened
+                .list_reviews("stale-history", "target-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        assert!(!stale_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_query_checkpoint_schema_rebuilds_before_production_read() -> Result<(), String> {
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+
+        let (temp, store, run_id) = seed_public_query_fixture(1_000)?;
+        let checkpoint_path = temp
+            .path()
+            .join("tasks")
+            .join(&run_id)
+            .join("checkpoint.json");
+        drop(store);
+        let checkpoints = FileCheckpointStore::<super::super::event_rebuild::EventFoldState>::open(
+            &checkpoint_path,
+        );
+        let mut legacy = checkpoints
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "query checkpoint is missing".to_string())?;
+        legacy.state.clear_query_projection_schema_for_test();
+        checkpoints
+            .save(&legacy.state, legacy.sequence)
+            .map_err(|error| error.to_string())?;
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+            .map_err(|error| error.to_string())?;
+        time_public_queries(&reopened, &run_id)?;
+        drop(reopened);
+        let repaired = checkpoints
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "repaired query checkpoint is missing".to_string())?;
+        assert!(repaired.state.has_current_query_projection_schema());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_legacy_checkpoint_does_not_block_journal_derived_queries() -> Result<(), String> {
+        use echo_agent::state::journal::{CheckpointStore, FileCheckpointStore};
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, store, run_id) = seed_public_query_fixture(1_000)?;
+        let run_directory = temp.path().join("tasks").join(&run_id);
+        let checkpoint_path = run_directory.join("checkpoint.json");
+        let (artifact_history, review_history, _) = store
+            .shadow
+            .history_paths_for_test(&run_id, "task-a")
+            .map_err(|error| error.to_string())?;
+        drop(store);
+        let checkpoints = FileCheckpointStore::<super::super::event_rebuild::EventFoldState>::open(
+            &checkpoint_path,
+        );
+        let mut legacy = checkpoints
+            .load()
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "query checkpoint is missing".to_string())?;
+        legacy.state.clear_query_projection_schema_for_test();
+        checkpoints
+            .save(&legacy.state, legacy.sequence)
+            .map_err(|error| error.to_string())?;
+        std::fs::remove_file(artifact_history).map_err(|error| error.to_string())?;
+        std::fs::remove_file(review_history).map_err(|error| error.to_string())?;
+        let original_permissions = std::fs::metadata(&run_directory)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(&run_directory, readonly).map_err(|error| error.to_string())?;
+        let query = (|| {
+            let reopened =
+                TaskRuntimeStore::new_in_memory_with_shadow_root(temp.path().join("tasks"))
+                    .map_err(|error| error.to_string())?;
+            time_public_queries(&reopened, &run_id)?;
+            let first_replays = reopened
+                .shadow
+                .history_fallback_replay_count_for_test(&run_id)
+                .map_err(|error| error.to_string())?;
+            time_public_queries(&reopened, &run_id)?;
+            let second_replays = reopened
+                .shadow
+                .history_fallback_replay_count_for_test(&run_id)
+                .map_err(|error| error.to_string())?;
+            if first_replays != second_replays {
+                return Err("readonly history fallback was replayed on every query".to_string());
+            }
+            Ok(())
+        })();
+        std::fs::set_permissions(&run_directory, original_permissions)
+            .map_err(|error| error.to_string())?;
+        query?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_review_fallback_lru_avoids_aba_full_replay() -> Result<(), String> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        seed_history_plan(&store, "readonly-lru")?;
+        store
+            .add_review(&history_review(
+                "readonly-lru",
+                "target-task",
+                "target-review",
+            ))
+            .map_err(|error| error.to_string())?;
+        store
+            .add_review(&history_review(
+                "readonly-lru",
+                "other-task",
+                "other-review",
+            ))
+            .map_err(|error| error.to_string())?;
+        let (_, target_path, _) = store
+            .shadow
+            .history_paths_for_test("readonly-lru", "target-task")
+            .map_err(|error| error.to_string())?;
+        let (_, other_path, _) = store
+            .shadow
+            .history_paths_for_test("readonly-lru", "other-task")
+            .map_err(|error| error.to_string())?;
+        let review_directory = target_path
+            .parent()
+            .ok_or_else(|| "review segment has no directory".to_string())?
+            .to_path_buf();
+        drop(store);
+        std::fs::remove_file(target_path).map_err(|error| error.to_string())?;
+        std::fs::remove_file(other_path).map_err(|error| error.to_string())?;
+        let original_permissions = std::fs::metadata(&review_directory)
+            .map_err(|error| error.to_string())?
+            .permissions();
+        let mut readonly = original_permissions.clone();
+        readonly.set_mode(0o555);
+        std::fs::set_permissions(&review_directory, readonly).map_err(|error| error.to_string())?;
+        let query = (|| {
+            let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+                .map_err(|error| error.to_string())?;
+            for task_id in ["target-task", "other-task", "target-task"] {
+                if reopened
+                    .list_reviews("readonly-lru", task_id)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    != 1
+                {
+                    return Err(format!("readonly review fallback lost task {task_id}"));
+                }
+            }
+            let replays = reopened
+                .shadow
+                .history_fallback_replay_count_for_test("readonly-lru")
+                .map_err(|error| error.to_string())?;
+            if replays != 2 {
+                return Err(format!(
+                    "readonly A/B/A review fallback replayed {replays} times"
+                ));
+            }
+            Ok(())
+        })();
+        std::fs::set_permissions(&review_directory, original_permissions)
+            .map_err(|error| error.to_string())?;
+        query
+    }
+
+    #[test]
+    fn todo_metadata_clears_across_revision_reset_running_and_restart() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        store
+            .create_run(
+                "reset-run",
+                "test",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "reset metadata",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let mut plan = TaskPlan {
+            plan_id: "reset-plan".to_string(),
+            run_id: "reset-run".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("reset metadata"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: "reset-task".to_string(),
+                title: "Reset task".to_string(),
+                description: "Verify metadata reset".to_string(),
+                kind: PlanTaskKind::Investigation,
+                agent_role: "old-owner".to_string(),
+                domain_profile: DomainProfile::General,
+                ..Default::default()
+            }],
+        };
+        store
+            .attach_plan_for_test(&plan)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_task_status(
+                "reset-run",
+                "reset-task",
+                TodoStatus::Completed,
+                Some("old-owner"),
+                Some("old-summary"),
+            )
+            .map_err(|error| error.to_string())?;
+        plan.revision = 2;
+        store
+            .commit_runtime_event(RuntimeJournalEvent::for_append(
+                "reset-run",
+                None,
+                None,
+                RuntimeEventKind::PlanRevisionCommitted,
+                serde_json::json!({
+                    "base_revision": 1,
+                    "reason": "reset completed task",
+                    "reset_task_ids": ["reset-task"],
+                    "plan": plan.specification(),
+                }),
+            ))
+            .map_err(|error| error.to_string())?;
+        let pending = store
+            .list_todos("reset-run")
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "reset Todo is missing".to_string())?;
+        assert_eq!(pending.status, TodoStatus::Pending);
+        assert!(pending.owner_agent.is_none());
+        assert!(pending.started_at.is_none());
+        assert!(pending.completed_at.is_none());
+        assert!(pending.summary.is_none());
+        store
+            .set_task_status(
+                "reset-run",
+                "reset-task",
+                TodoStatus::Running,
+                Some("new-owner"),
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let running = store
+            .list_todos("reset-run")
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "running Todo is missing".to_string())?;
+        assert_eq!(running.status, TodoStatus::Running);
+        assert_eq!(running.owner_agent.as_deref(), Some("new-owner"));
+        assert!(running.started_at.is_some());
+        assert!(running.completed_at.is_none());
+        assert!(running.summary.is_none());
+        drop(store);
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        let restarted = reopened
+            .list_todos("reset-run")
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .next()
+            .ok_or_else(|| "restarted Todo is missing".to_string())?;
+        assert_eq!(restarted.status, TodoStatus::Running);
+        assert_eq!(restarted.owner_agent.as_deref(), Some("new-owner"));
+        assert!(restarted.completed_at.is_none());
+        assert!(restarted.summary.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_public_queries_remain_coherent_with_incremental_appends() -> Result<(), String> {
+        let (_temp, store, run_id) = seed_public_query_fixture(10_000)?;
+        let store = std::sync::Arc::new(store);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(5));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let reader_store = std::sync::Arc::clone(&store);
+            let reader_run = run_id.clone();
+            let reader_barrier = std::sync::Arc::clone(&barrier);
+            readers.push(std::thread::spawn(move || -> Result<(), String> {
+                reader_barrier.wait();
+                for _ in 0..25 {
+                    time_public_queries(&reader_store, &reader_run)?;
+                }
+                Ok(())
+            }));
+        }
+        barrier.wait();
+        for ordinal in 0..25 {
+            store
+                .note(&run_id, None, &format!("concurrent append {ordinal}"))
+                .map_err(|error| error.to_string())?;
+        }
+        for reader in readers {
+            reader
+                .join()
+                .map_err(|_| "public query reader panicked".to_string())??;
+        }
+        time_public_queries(&store, &run_id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn projection_receipt_distinguishes_uncommitted_and_committed_degradation() -> Result<(), String>
+    {
+        let store = fresh();
+        store
+            .create_run(
+                "receipt-run",
+                "test",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "receipt",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let before = store
+            .list_events("receipt-run", 0)
+            .map_err(|error| error.to_string())?
+            .len();
+        store.fail_next_cell_started_for_test();
+        let uncommitted = store.record_background_cell_started(
+            "receipt-run",
+            "cell-uncommitted",
+            "false",
+            "hash-a",
+            None,
+            None,
+            None,
+        );
+        assert!(uncommitted.is_err());
+        assert_eq!(
+            store
+                .list_events("receipt-run", 0)
+                .map_err(|error| error.to_string())?
+                .len(),
+            before
+        );
+        store.fail_next_cell_started_projection_for_test();
+        let committed = store
+            .record_background_cell_started(
+                "receipt-run",
+                "cell-committed",
+                "true",
+                "hash-b",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        let ProjectionCommitReceipt::CommittedProjectionDegraded { seq, .. } = committed else {
+            return Err("committed projection degradation lost its typed receipt".to_string());
+        };
+        assert!(seq > 0);
+        assert_eq!(
+            store
+                .list_events("receipt-run", 0)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::BackgroundCellStarted)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn durability_receipt_preserves_batch_cell_and_reconciled_degradation() -> Result<(), String> {
+        let store = fresh();
+        store
+            .create_run(
+                "durability-run",
+                "test",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "durability",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+
+        store
+            .shadow
+            .fail_next_append_durability_for_test("durability-run")
+            .map_err(|error| error.to_string())?;
+        let degraded = store
+            .commit_runtime_events_with_receipt(
+                "durability-run",
+                vec![RuntimeJournalEvent::for_append(
+                    "durability-run",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"kind": "durability-batch"}),
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        let ProjectionCommitReceipt::CommittedProjectionDegraded { seq, detail } = degraded else {
+            return Err("degraded journal batch was reported durable".to_string());
+        };
+        assert!(seq > 0);
+        assert!(detail.contains("journal durability degraded"));
+
+        store
+            .shadow
+            .reconcile_next_append_unconfirmed_for_test("durability-run")
+            .map_err(|error| error.to_string())?;
+        let reconciled = store
+            .commit_runtime_events_with_receipt(
+                "durability-run",
+                vec![RuntimeJournalEvent::for_append(
+                    "durability-run",
+                    None,
+                    None,
+                    RuntimeEventKind::Note,
+                    serde_json::json!({"kind": "reconciled-batch"}),
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            reconciled,
+            ProjectionCommitReceipt::CommittedProjectionDegraded { detail, .. }
+                if detail.contains("journal durability unconfirmed")
+        ));
+
+        store
+            .shadow
+            .fail_next_append_durability_for_test("durability-run")
+            .map_err(|error| error.to_string())?;
+        let first = store
+            .record_background_cell_started(
+                "durability-run",
+                "cell-durable",
+                "command",
+                "hash",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            first,
+            ProjectionCommitReceipt::CommittedProjectionDegraded { detail, .. }
+                if detail.contains("journal durability degraded")
+        ));
+        store
+            .shadow
+            .fail_next_durability_probe_for_test("durability-run")
+            .map_err(|error| error.to_string())?;
+        let still_degraded = store
+            .record_background_cell_started(
+                "durability-run",
+                "cell-durable",
+                "command",
+                "hash",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            still_degraded,
+            ProjectionCommitReceipt::CommittedProjectionDegraded { detail, .. }
+                if detail.contains("journal durability degraded")
+        ));
+        let settled = store
+            .record_background_cell_started(
+                "durability-run",
+                "cell-durable",
+                "command",
+                "hash",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(settled, ProjectionCommitReceipt::Durable { .. }));
+
+        store
+            .shadow
+            .fail_next_append_durability_for_test("durability-run")
+            .map_err(|error| error.to_string())?;
+        store
+            .note("durability-run", None, "committed diagnostic boundary")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            store
+                .list_events("durability-run", 0)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .filter(|event| {
+                    event.event_type == RuntimeEventKind::Note
+                        && event
+                            .payload
+                            .get("message")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("committed diagnostic boundary")
+                })
+                .count(),
+            1
+        );
+
+        store
+            .shadow
+            .fail_history_cursor_writes_for_test("durability-run", 3)
+            .map_err(|error| error.to_string())?;
+        let history_degraded = store
+            .record_background_cell_started(
+                "durability-run",
+                "cell-history",
+                "command",
+                "history-hash",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            history_degraded,
+            ProjectionCommitReceipt::CommittedProjectionDegraded { detail, .. }
+                if detail.contains("history projection degraded")
+        ));
+        let duplicate_degraded = store
+            .record_background_cell_started(
+                "durability-run",
+                "cell-history",
+                "command",
+                "history-hash",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            duplicate_degraded,
+            ProjectionCommitReceipt::CommittedProjectionDegraded { detail, .. }
+                if detail.contains("history projection degraded")
+        ));
+        let duplicate_repaired = store
+            .record_background_cell_started(
+                "durability-run",
+                "cell-history",
+                "command",
+                "history-hash",
+                None,
+                None,
+                None,
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            duplicate_repaired,
+            ProjectionCommitReceipt::Durable { .. }
+        ));
+
+        let checkpoint = TaskRuntimeStore::classify_committed_projection(
+            42,
+            JournalDurabilityStatus::Confirmed,
+            CheckpointApplyStatus::Degraded {
+                error: "checkpoint-write".to_string(),
+            },
+            HistoryProjectionApplyStatus::Current,
+            ProjectionCommitReceipt::Durable { seq: 42 },
+        );
+        assert!(matches!(
+            checkpoint,
+            ProjectionCommitReceipt::CommittedProjectionDegraded { seq: 42, detail }
+                if detail.contains("checkpoint durability degraded")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn partial_history_failure_replays_without_duplicates_before_advancing_cursor()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        seed_history_plan(&store, "partial-history")?;
+        let (artifact_path, review_path, cursor_path) = store
+            .shadow
+            .history_paths_for_test("partial-history", "target-task")
+            .map_err(|error| error.to_string())?;
+        let cursor_before = std::fs::read(&cursor_path).map_err(|error| error.to_string())?;
+        store
+            .shadow
+            .fail_next_review_history_append_for_test("partial-history")
+            .map_err(|error| error.to_string())?;
+        let receipt = store
+            .commit_runtime_events_with_receipt(
+                "partial-history",
+                vec![
+                    artifact_history_event("partial-history", "artifact-1"),
+                    review_history_event("partial-history", "target-task", "review-1"),
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            receipt,
+            ProjectionCommitReceipt::CommittedProjectionDegraded { detail, .. }
+                if detail.contains("history projection degraded")
+        ));
+        assert_eq!(
+            std::fs::read(&cursor_path).map_err(|error| error.to_string())?,
+            cursor_before
+        );
+        assert_eq!(line_count(&artifact_path)?, 1);
+        assert!(!review_path.exists());
+        drop(store);
+
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            reopened
+                .list_artifacts("partial-history")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .list_reviews("partial-history", "target-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        assert_eq!(line_count(&artifact_path)?, 1);
+        assert_eq!(line_count(&review_path)?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_history_segments_recover_old_and_new_facts_from_journal() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        seed_history_plan(&store, "missing-history")?;
+        store
+            .add_artifact(&history_artifact("missing-history", "artifact-old"))
+            .map_err(|error| error.to_string())?;
+        store
+            .add_review(&history_review(
+                "missing-history",
+                "target-task",
+                "review-old",
+            ))
+            .map_err(|error| error.to_string())?;
+        let (artifact_path, review_path, cursor_path) = store
+            .shadow
+            .history_paths_for_test("missing-history", "target-task")
+            .map_err(|error| error.to_string())?;
+        std::fs::remove_file(&artifact_path).map_err(|error| error.to_string())?;
+        assert_eq!(
+            store
+                .list_artifacts("missing-history")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        let repaired_artifact_cursor = history_cursor_sequence(&cursor_path)?;
+        store
+            .add_artifact(&history_artifact("missing-history", "artifact-new"))
+            .map_err(|error| error.to_string())?;
+        let artifacts = store
+            .list_artifacts("missing-history")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(line_count(&artifact_path)?, 2);
+        assert!(history_cursor_sequence(&cursor_path)? > repaired_artifact_cursor);
+        std::fs::remove_file(&artifact_path).map_err(|error| error.to_string())?;
+        let append_repair = store
+            .commit_runtime_events_with_receipt(
+                "missing-history",
+                vec![artifact_history_event(
+                    "missing-history",
+                    "artifact-after-unlink",
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            append_repair,
+            ProjectionCommitReceipt::Durable { .. }
+        ));
+        assert_eq!(line_count(&artifact_path)?, 3);
+
+        std::fs::remove_file(&review_path).map_err(|error| error.to_string())?;
+        assert_eq!(
+            store
+                .list_reviews("missing-history", "target-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        let repaired_review_cursor = history_cursor_sequence(&cursor_path)?;
+        store
+            .add_review(&history_review(
+                "missing-history",
+                "target-task",
+                "review-new",
+            ))
+            .map_err(|error| error.to_string())?;
+        let reviews = store
+            .list_reviews("missing-history", "target-task")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(line_count(&review_path)?, 2);
+        assert!(history_cursor_sequence(&cursor_path)? > repaired_review_cursor);
+        std::fs::remove_file(&review_path).map_err(|error| error.to_string())?;
+        let append_repair = store
+            .commit_runtime_events_with_receipt(
+                "missing-history",
+                vec![review_history_event(
+                    "missing-history",
+                    "target-task",
+                    "review-after-unlink",
+                )],
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            append_repair,
+            ProjectionCommitReceipt::Durable { .. }
+        ));
+        assert_eq!(line_count(&review_path)?, 3);
+
+        std::fs::write(&artifact_path, b"{corrupt artifact segment\n")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            store
+                .list_artifacts("missing-history")
+                .map_err(|error| error.to_string())?
+                .len(),
+            3
+        );
+        assert_eq!(line_count(&artifact_path)?, 3);
+        std::fs::write(&review_path, b"{corrupt review segment\n")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            store
+                .list_reviews("missing-history", "target-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            3
+        );
+        assert_eq!(line_count(&review_path)?, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn valid_jsonl_prefix_and_empty_segment_self_heal_after_restart() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        seed_history_plan(&store, "truncated-history")?;
+        for id in ["artifact-1", "artifact-2"] {
+            store
+                .add_artifact(&history_artifact("truncated-history", id))
+                .map_err(|error| error.to_string())?;
+        }
+        for id in ["review-1", "review-2"] {
+            store
+                .add_review(&history_review("truncated-history", "target-task", id))
+                .map_err(|error| error.to_string())?;
+        }
+        let (artifact_path, review_path, _) = store
+            .shadow
+            .history_paths_for_test("truncated-history", "target-task")
+            .map_err(|error| error.to_string())?;
+        drop(store);
+
+        retain_first_jsonl_record(&artifact_path)?;
+        let reopened = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            reopened
+                .list_artifacts("truncated-history")
+                .map_err(|error| error.to_string())?
+                .len(),
+            2
+        );
+        assert_eq!(line_count(&artifact_path)?, 2);
+        drop(reopened);
+
+        std::fs::write(&review_path, b"").map_err(|error| error.to_string())?;
+        let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            restarted
+                .list_reviews("truncated-history", "target-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            2
+        );
+        assert_eq!(line_count(&review_path)?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn committed_projection_degradation_preserves_all_mutation_outcomes() -> Result<(), String> {
+        let store = fresh();
+        store
+            .create_run(
+                "transition-run",
+                "test",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "transition",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store.fail_next_runtime_mutation_projection_for_test();
+        assert_eq!(
+            store
+                .transition_run("transition-run", TaskRunStatus::Running)
+                .map_err(|error| error.to_string())?
+                .status,
+            TaskRunStatus::Running
+        );
+        store.fail_next_runtime_mutation_projection_for_test();
+        assert_eq!(
+            store
+                .finalize_run("transition-run", TaskRunStatus::Failed, Some("terminal"))
+                .map_err(|error| error.to_string())?
+                .status,
+            TaskRunStatus::Failed
+        );
+
+        store
+            .create_run(
+                "pause-goal-run",
+                "test",
+                "conversation",
+                "root-2",
+                DomainProfile::General,
+                "old goal",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("pause-goal-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store.fail_next_runtime_mutation_projection_for_test();
+        assert!(
+            store
+                .request_pause("pause-goal-run")
+                .map_err(|error| error.to_string())?
+        );
+        store.fail_next_runtime_mutation_projection_for_test();
+        let updated = store
+            .update_run_goal(
+                "pause-goal-run",
+                1,
+                "new goal",
+                "user revised goal",
+                RunGoalActorSource::Gui,
+            )
+            .map_err(|error| error.to_string())?;
+        assert_eq!(updated.goal, "new goal");
+        assert_eq!(updated.goal_revision, 2);
+
+        store
+            .create_run(
+                "plan-run",
+                "test",
+                "conversation",
+                "root-3",
+                DomainProfile::General,
+                "plan",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store.fail_next_runtime_mutation_projection_for_test();
+        store
+            .attach_plan_for_test(&TaskPlan {
+                plan_id: "plan-id".to_string(),
+                run_id: "plan-run".to_string(),
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal_revision: 1,
+                goal_sha256: task_goal_sha256("plan"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "task-a".to_string(),
+                    title: "Task A".to_string(),
+                    description: "Do A".to_string(),
+                    kind: PlanTaskKind::Investigation,
+                    agent_role: "subagent".to_string(),
+                    domain_profile: DomainProfile::General,
+                    ..Default::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        assert!(
+            store
+                .get_plan("plan-run")
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+
+        store
+            .create_run(
+                "turn-run",
+                "test",
+                "conversation",
+                "root-4",
+                DomainProfile::General,
+                "turn",
+                "task",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("turn-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation("turn-run", true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        store.fail_next_runtime_mutation_projection_for_test();
+        assert!(matches!(
+            store
+                .claim_run_turn(
+                    "turn-run",
+                    "turn-1",
+                    RunTurnOrigin::User,
+                    TurnVisibility::Visible,
+                )
+                .map_err(|error| error.to_string())?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        assert_eq!(
+            store
+                .list_events("turn-run", 0)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::RunTurnStarted)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_completion_survives_committed_projection_degradation() -> Result<(), String> {
+        let store = std::sync::Arc::new(fresh());
+        let run_id = "direct-degraded";
+        store
+            .create_run(
+                run_id,
+                "test",
+                "conversation",
+                "root",
+                DomainProfile::General,
+                "direct answer",
+                "agent_autonomous",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .configure_run_continuation(run_id, true, false, None, None)
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(
+            store
+                .claim_run_turn(
+                    run_id,
+                    "turn-direct",
+                    RunTurnOrigin::User,
+                    TurnVisibility::Visible,
+                )
+                .map_err(|error| error.to_string())?,
+            RunTurnClaimOutcome::Started(_)
+        ));
+        let task_id = "direct-answer";
+        let plan = TaskPlan {
+            plan_id: format!("plan:{run_id}"),
+            run_id: run_id.to_string(),
+            revision: 0,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("direct answer"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![PlanTask {
+                id: task_id.to_string(),
+                title: "Direct answer".to_string(),
+                description: "direct answer".to_string(),
+                kind: PlanTaskKind::Summary,
+                agent_role: "primary-agent".to_string(),
+                domain_profile: DomainProfile::General,
+                ..Default::default()
+            }],
+        };
+        let summary = TaskExecutionSummary {
+            run_id: run_id.to_string(),
+            task_id: task_id.to_string(),
+            subagent_name: "primary-agent".to_string(),
+            result: SubagentTaskResult::terminal(
+                SubagentRunStatus::Completed,
+                "complete answer",
+                Vec::new(),
+            ),
+            decisions: Vec::new(),
+            next_implications: Vec::new(),
+            suggested_tasks: Vec::new(),
+            created_at: Utc::now(),
+        };
+        store.fail_next_runtime_mutation_projection_for_test();
+        super::super::revisioned_adapter::commit_eko_direct_completion(
+            store.clone(),
+            plan,
+            summary,
+            "complete answer".to_string(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let todos = store
+            .list_todos(run_id)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(todos.len(), 1);
+        assert_eq!(
+            todos.first().map(|todo| todo.status),
+            Some(TodoStatus::Completed)
+        );
+        assert_eq!(
+            store
+                .list_events(run_id, 0)
+                .map_err(|error| error.to_string())?
+                .iter()
+                .filter(|event| event.event_type == RuntimeEventKind::PlanRevisionCommitted)
+                .count(),
+            1
+        );
         Ok(())
     }
 

@@ -9,39 +9,37 @@
 //! the `Task*` event payloads rather than stored on `PlanTask`, to avoid
 //! touching the ts-rs contract.
 
-use chrono::{DateTime, Utc};
-
 use super::file_shadow::FileTaskShadow;
 use super::types::{
     Artifact, EkoTaskExecution, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot,
-    RuntimeEventKind, RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun, TodoItem,
-    TodoStatus,
+    RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun, TodoItem, TodoStatus,
 };
 
 /// File-backed read store. Cheap to clone (wraps a `FileTaskShadow`).
 #[derive(Clone)]
-pub struct FileTaskStore {
+pub(crate) struct FileTaskStore {
     shadow: FileTaskShadow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskRunLoadIssue {
+pub(crate) struct TaskRunLoadIssue {
     pub run_id: String,
     pub error: String,
 }
 
 #[derive(Debug, Default)]
-pub struct TaskRunScan {
+pub(crate) struct TaskRunScan {
     pub runs: Vec<TaskRun>,
     pub issues: Vec<TaskRunLoadIssue>,
 }
 
 impl FileTaskStore {
-    pub fn new(shadow: FileTaskShadow) -> Self {
+    pub(crate) fn new(shadow: FileTaskShadow) -> Self {
         Self { shadow }
     }
 
-    pub fn from_root(root: impl Into<std::path::PathBuf>) -> Result<Self, FileReadError> {
+    #[cfg(test)]
+    pub(crate) fn from_root(root: impl Into<std::path::PathBuf>) -> Result<Self, FileReadError> {
         Ok(Self::new(FileTaskShadow::try_new(root)?))
     }
 
@@ -72,24 +70,16 @@ impl FileTaskStore {
         }
     }
 
-    fn load(&self, run_id: &str) -> Result<Option<Loaded>, FileReadError> {
-        let state = self.read_run_state_resilient(run_id)?;
-        let plan = match state.as_ref().and_then(|state| state.run.plan_id.as_ref()) {
-            Some(_) => self.read_plan_resilient(run_id)?,
-            None => None,
-        };
-        let events = self
-            .shadow
-            .read_events(run_id)
-            .map_err(FileReadError::Shadow)?;
-        Ok(state.map(|state| Loaded {
-            plan,
-            state,
-            events,
-        }))
+    pub(crate) fn todo_query_projection(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<super::event_rebuild::TodoQueryProjection>, FileReadError> {
+        self.shadow
+            .read_todo_query_projection(run_id)
+            .map_err(FileReadError::Shadow)
     }
 
-    pub fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, FileReadError> {
+    pub(crate) fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, FileReadError> {
         Ok(self
             .read_run_state_resilient(run_id)?
             .map(|state| state.run))
@@ -97,7 +87,10 @@ impl FileTaskStore {
 
     /// Read the checkpoint-backed runtime projection after validating and
     /// repairing its event suffix through the one shadow authority.
-    pub fn get_run_state(&self, run_id: &str) -> Result<Option<RunStateSnapshot>, FileReadError> {
+    pub(crate) fn get_run_state(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunStateSnapshot>, FileReadError> {
         self.read_run_state_resilient(run_id)
     }
 
@@ -109,7 +102,7 @@ impl FileTaskStore {
     /// recovered and only a missing journal tail is replayed. Cost is
     /// O(runs + missing tails), while the shadow LRU bounds retained journal
     /// handles and fold state after the scan.
-    pub fn scan_runs(&self) -> Result<TaskRunScan, FileReadError> {
+    pub(crate) fn scan_runs(&self) -> Result<TaskRunScan, FileReadError> {
         let mut runs = Vec::new();
         let mut issues = Vec::new();
         for run_id in self.shadow.list_run_ids()? {
@@ -128,7 +121,7 @@ impl FileTaskStore {
         Ok(TaskRunScan { runs, issues })
     }
 
-    pub fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
+    pub(crate) fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
         let scan = self.scan_runs()?;
         for issue in scan.issues {
             tracing::warn!(
@@ -142,7 +135,7 @@ impl FileTaskStore {
 
     /// Most recent run for a conversation (replaces
     /// `SELECT ... WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1`).
-    pub fn latest_run_for_conversation(
+    pub(crate) fn latest_run_for_conversation(
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, FileReadError> {
@@ -154,7 +147,7 @@ impl FileTaskStore {
 
     /// Find an in-progress (Running or Paused) run for a conversation, if any.
     /// Replaces `WHERE conversation_id = ? AND status IN ('running','paused')`.
-    pub fn find_in_progress_run_by_conversation(
+    pub(crate) fn find_in_progress_run_by_conversation(
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, FileReadError> {
@@ -169,7 +162,7 @@ impl FileTaskStore {
 
     /// Runs whose status is in `statuses` (replaces
     /// `WHERE status IN (...)`). Empty `statuses` → empty result.
-    pub fn list_runs_in(
+    pub(crate) fn list_runs_in(
         &self,
         statuses: &[super::types::TaskRunStatus],
     ) -> Result<Vec<TaskRun>, FileReadError> {
@@ -183,7 +176,7 @@ impl FileTaskStore {
             .collect())
     }
 
-    pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, FileReadError> {
+    pub(crate) fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, FileReadError> {
         let Some(state) = self.read_run_state_resilient(run_id)? else {
             return Ok(None);
         };
@@ -225,45 +218,33 @@ impl FileTaskStore {
 
     /// Derive the todo projection from the rebuilt plan + the runtime fields
     /// carried on `Task*` events (owner_agent/started_at/completed_at/summary).
-    pub fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, FileReadError> {
-        let Some(loaded) = self.load(run_id)? else {
+    pub(crate) fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, FileReadError> {
+        let Some(projected) = self.todo_query_projection(run_id)? else {
             return Ok(Vec::new());
         };
-        let Some(plan) = loaded.plan else {
+        let Some(plan) = projected.plan else {
             return Ok(Vec::new());
         };
-        let execution = loaded
-            .state
+        let execution = plan
             .tasks
             .iter()
-            .map(|task| (task.task_id.as_str(), task))
+            .map(|task| (task.id.as_str(), task))
             .collect::<std::collections::HashMap<_, _>>();
         let runtime_tasks = plan
             .tasks
             .iter()
-            .map(|spec| {
-                let state = execution
-                    .get(spec.id.as_str())
-                    .cloned()
-                    .cloned()
-                    .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
-                PlanTask::from_parts(spec.clone(), state)
-                    .to_task()
-                    .map_err(FileReadError::InvalidPlan)
-            })
+            .map(|task| task.to_task().map_err(FileReadError::InvalidPlan))
             .collect::<Result<Vec<_>, _>>()?;
         let dependency_states = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks)
             .dependency_states(&runtime_tasks);
         let mut todos = Vec::with_capacity(plan.tasks.len());
-        for spec in &plan.tasks {
+        for task in &plan.tasks {
             let default_status = execution
-                .get(spec.id.as_str())
-                .map(|task| TodoStatus::project_task_status(&task.status))
+                .get(task.id.as_str())
+                .map(|task| task.status)
                 .unwrap_or(TodoStatus::Pending);
-            // Fold this task's Task* events to recover non-authoritative display metadata.
-            let runtime = fold_task_runtime(&loaded.events, &spec.id);
             let dependency_block = dependency_states
-                .get(&spec.id)
+                .get(&task.id)
                 .and_then(|state| match state {
                     echo_agent::tasks::DagDependencyState::BlockedByFailure {
                         failed_ancestor_ids,
@@ -275,6 +256,11 @@ impl FileTaskStore {
             } else {
                 default_status
             };
+            let runtime = projected
+                .todo_runtime
+                .get(&task.id)
+                .cloned()
+                .unwrap_or_default();
             let summary = if default_status == TodoStatus::Pending {
                 dependency_block.map_or(runtime.summary, |ancestor_ids| {
                     Some(format!(
@@ -286,10 +272,10 @@ impl FileTaskStore {
                 runtime.summary
             };
             todos.push(TodoItem {
-                id: spec.id.clone(),
-                run_id: loaded.state.run.run_id.clone(),
-                task_id: spec.id.clone(),
-                title: spec.title.clone(),
+                id: task.id.clone(),
+                run_id: projected.run.run_id.clone(),
+                task_id: task.id.clone(),
+                title: task.title.clone(),
                 // run-state.json is the authoritative execution projection.
                 // Historical Task* events only supply fields that are not
                 // stored in EkoTaskExecution; otherwise an earlier Blocked event
@@ -301,18 +287,21 @@ impl FileTaskStore {
                 summary,
             });
         }
-        // Sort by sort_order to match SQL's display ordering.
-        todos.sort_by_key(|t| {
-            plan.tasks
-                .iter()
-                .find(|task| task.id == t.task_id)
-                .map(|task| task.sort_order)
+        let sort_order = plan
+            .tasks
+            .iter()
+            .map(|task| (task.id.as_str(), task.sort_order))
+            .collect::<std::collections::HashMap<_, _>>();
+        todos.sort_by_key(|todo| {
+            sort_order
+                .get(todo.task_id.as_str())
+                .copied()
                 .unwrap_or(i64::MAX)
         });
         Ok(todos)
     }
 
-    pub fn list_events(
+    pub(crate) fn list_events(
         &self,
         run_id: &str,
         since_seq: i64,
@@ -323,206 +312,36 @@ impl FileTaskStore {
             .map_err(FileReadError::Shadow)
     }
 
-    /// Artifacts: derive from `ArtifactProduced` events. (0c audit may revise.)
-    pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, FileReadError> {
-        let events = self
-            .shadow
-            .read_events(run_id)
-            .map_err(FileReadError::Shadow)?;
-        Ok(events
-            .iter()
-            .filter(|e| e.event_type == RuntimeEventKind::ArtifactProduced)
-            .filter_map(|e| {
-                let p = &e.payload;
-                Some(Artifact {
-                    id: p.get("artifact_id")?.as_str()?.to_string(),
-                    run_id: e.run_id.clone(),
-                    task_id: e.task_id.clone(),
-                    kind: super::types::ArtifactKind::from_str(
-                        p.get("kind").and_then(|v| v.as_str())?,
-                    )
-                    .unwrap_or(super::types::ArtifactKind::File),
-                    title: p.get("title")?.as_str()?.to_string(),
-                    path: p
-                        .get("path")
-                        .and_then(|value| value.as_str())
-                        .map(str::to_string),
-                    metadata: p
-                        .get("metadata")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null),
-                })
-            })
-            .collect())
+    /// Artifacts come from the journal-derived incremental history segment.
+    /// Query cost is proportional to returned artifacts plus an uncheckpointed
+    /// journal suffix, not the full journal length.
+    pub(crate) fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, FileReadError> {
+        self.shadow
+            .read_artifacts_projection(run_id)
+            .map_err(FileReadError::Shadow)
     }
 
-    /// Reviews: derive from ReviewPassed/NeedsFix/Blocked events. (0c audit may revise.)
-    pub fn list_reviews(&self, run_id: &str) -> Result<Vec<ReviewResult>, FileReadError> {
-        let events = self
-            .shadow
-            .read_events(run_id)
-            .map_err(FileReadError::Shadow)?;
-        Ok(events
-            .iter()
-            .filter(|e| {
-                matches!(
-                    e.event_type,
-                    RuntimeEventKind::ReviewPassed
-                        | RuntimeEventKind::ReviewNeedsFix
-                        | RuntimeEventKind::ReviewBlocked
-                )
-            })
-            .filter_map(|e| {
-                let p = &e.payload;
-                Some(ReviewResult {
-                    id: p.get("review_id")?.as_str()?.to_string(),
-                    run_id: e.run_id.clone(),
-                    reviewer_agent: p.get("reviewer")?.as_str()?.to_string(),
-                    outcome: match e.event_type {
-                        RuntimeEventKind::ReviewPassed => super::types::ReviewOutcome::Pass,
-                        RuntimeEventKind::ReviewNeedsFix => super::types::ReviewOutcome::NeedsFix,
-                        _ => super::types::ReviewOutcome::Blocked,
-                    },
-                    issues: p
-                        .get("issues")
-                        .and_then(|v| serde_json::from_value(v.clone()).ok())
-                        .unwrap_or_default(),
-                    failure_fingerprint: p
-                        .get("failure_fingerprint")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    created_fix_task_id: p
-                        .get("created_fix_task_id")
-                        .and_then(|v| v.as_str())
-                        .map(str::to_string),
-                    created_at: p
-                        .get("created_at")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_rfc3339)
-                        .unwrap_or(e.timestamp),
-                    task_id: e.task_id.clone().unwrap_or_default(),
-                })
-            })
-            .collect())
+    /// Reviews come from the journal-derived segment for this stable task ID.
+    pub(crate) fn list_reviews(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<ReviewResult>, FileReadError> {
+        self.shadow
+            .read_reviews_projection(run_id, task_id)
+            .map_err(FileReadError::Shadow)
     }
 
     /// Summary: derive from Note{summary_persisted} events.
-    pub fn get_summary(
+    pub(crate) fn get_summary(
         &self,
         run_id: &str,
         task_id: &str,
     ) -> Result<Option<TaskExecutionSummary>, FileReadError> {
-        let events = self
-            .shadow
-            .read_events(run_id)
-            .map_err(FileReadError::Shadow)?;
-        Ok(events
-            .iter()
-            .rfind(|e| {
-                e.event_type == RuntimeEventKind::Note
-                    && e.task_id.as_deref() == Some(task_id)
-                    && e.payload.get("kind").and_then(|v| v.as_str()) == Some("summary_persisted")
-            })
-            .and_then(|e| e.payload.get("summary"))
-            .and_then(|v| serde_json::from_value::<TaskExecutionSummary>(v.clone()).ok()))
+        self.shadow
+            .read_summary_projection(run_id, task_id)
+            .map_err(FileReadError::Shadow)
     }
-}
-
-struct Loaded {
-    plan: Option<PlanRevision>,
-    state: RunStateSnapshot,
-    events: Vec<RuntimeTaskEvent>,
-}
-
-#[derive(Debug, Default)]
-struct TaskRuntimeMetadata {
-    owner_agent: Option<String>,
-    started_at: Option<DateTime<Utc>>,
-    completed_at: Option<DateTime<Utc>>,
-    summary: Option<String>,
-}
-
-/// Fold a task's `Task*`/`TodoUpdated` events to recover display metadata,
-/// carrying forward the last non-None value of each field.
-fn fold_task_runtime(events: &[RuntimeTaskEvent], task_id: &str) -> TaskRuntimeMetadata {
-    let mut owner = None;
-    let mut started = None;
-    let mut completed = None;
-    let mut summary = None;
-    for e in events {
-        if let Some(recovery_summary) = e
-            .payload
-            .get("recovery")
-            .filter(|recovery| {
-                recovery.get("kind").and_then(serde_json::Value::as_str) == Some("boot_recovery")
-            })
-            .and_then(|recovery| recovery.get("tasks"))
-            .and_then(serde_json::Value::as_array)
-            .and_then(|tasks| {
-                tasks.iter().find(|task| {
-                    task.get("task_id").and_then(serde_json::Value::as_str) == Some(task_id)
-                })
-            })
-            .and_then(|task| task.get("summary"))
-            .and_then(serde_json::Value::as_str)
-        {
-            summary = Some(recovery_summary.to_string());
-        }
-        if e.task_id.as_deref() != Some(task_id) {
-            continue;
-        }
-        if !matches!(
-            e.event_type,
-            RuntimeEventKind::TaskStarted
-                | RuntimeEventKind::TaskCompleted
-                | RuntimeEventKind::TaskFailed
-                | RuntimeEventKind::TaskCancelled
-                | RuntimeEventKind::TaskTimedOut
-                | RuntimeEventKind::TaskSkipped
-                | RuntimeEventKind::TaskBlocked
-                | RuntimeEventKind::TodoUpdated
-        ) {
-            continue;
-        }
-        if let Some(o) = e.payload.get("owner_agent").and_then(|v| v.as_str())
-            && !o.is_empty()
-        {
-            owner = Some(o.to_string());
-        }
-        if let Some(s) = e
-            .payload
-            .get("started_at")
-            .and_then(|v| v.as_str())
-            .and_then(parse_rfc3339)
-        {
-            started = Some(s);
-        }
-        if let Some(c) = e
-            .payload
-            .get("completed_at")
-            .and_then(|v| v.as_str())
-            .and_then(parse_rfc3339)
-        {
-            completed = Some(c);
-        }
-        if let Some(s) = e.payload.get("summary").and_then(|v| v.as_str())
-            && !s.is_empty()
-        {
-            summary = Some(s.to_string());
-        }
-    }
-    TaskRuntimeMetadata {
-        owner_agent: owner,
-        started_at: started,
-        completed_at: completed,
-        summary,
-    }
-}
-
-fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|d| d.with_timezone(&Utc))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -538,8 +357,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan,
-        TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest,
+        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind,
+        TaskPlan, TaskRunStatus, TaskUpdateOperation, TaskUpdateRequest,
     };
     use std::sync::Arc;
 

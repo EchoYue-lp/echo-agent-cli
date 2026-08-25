@@ -221,7 +221,7 @@ impl SubagentControlService {
                         }
                         Err(error) => {
                             let detail = error.to_string();
-                            store.shadow.append_event_batch(
+                            store.commit_runtime_events(
                                 &begin_identity.run_id,
                                 vec![
                                     guidance_event(
@@ -384,7 +384,7 @@ impl SubagentControlService {
                         }
                         Err(error) => {
                             let detail = error.to_string();
-                            store.shadow.append_event_batch(
+                            store.commit_runtime_events(
                                 &begin_identity.run_id,
                                 vec![
                                     interrupt_event(
@@ -879,7 +879,7 @@ fn append_guidance_event(
     instruction: Option<&str>,
     extra: serde_json::Value,
 ) -> Result<(), StoreError> {
-    store.shadow.append_event_batch(
+    store.commit_runtime_events(
         &identity.run_id,
         vec![guidance_event(
             identity,
@@ -929,7 +929,7 @@ fn append_interrupt_event(
     actor_source: SubagentControlActorSource,
     extra: serde_json::Value,
 ) -> Result<(), StoreError> {
-    store.shadow.append_event_batch(
+    store.commit_runtime_events(
         &identity.run_id,
         vec![interrupt_event(identity, event_type, actor_source, extra)],
     )?;

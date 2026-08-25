@@ -130,6 +130,9 @@ TaskRun -> PlanTask -> SubagentRun
 
 `TaskRuntimeStore` 以 `events.jsonl` 为权威事件账本，run/plan/todo/result/checkpoint 是
 可恢复投影。claim、revision、attempt 和 Subagent result 都带稳定 identity。所有 async 文件
+Todo/latest summary/completion 等有界热状态进入 checkpoint；无限增长的 Artifact/Review 历史
+由同一 `RunAuthority` 增量投影到 Artifact segment 和安全编码的 per-task Review segment，segment
+与 cursor 均可删除后从 journal 重建，不形成第二 authority。
 操作必须通过 store-owned operation supervisor 进入 bounded async/blocking 边界；Application
 shutdown 与 workspace eviction 都会等待已接受 operation，不由 surface caller future 决定其
 寿命。operation admission seal 与 reservation 注册线性化，command manager 在 phase one 先关闭

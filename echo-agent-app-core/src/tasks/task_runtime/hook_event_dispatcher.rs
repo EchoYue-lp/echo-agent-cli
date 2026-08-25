@@ -4,8 +4,8 @@
 //! ## Architecture
 //!
 //! `TaskRuntimeStore` writes every state transition to `events.jsonl` via
-//! `FileTaskShadow::append_event_line` (the single chokepoint). After each
-//! successful append, `FileTaskShadow` fires the attached event hook with the
+//! `TaskRuntimeStore` commit helper (the product mutation chokepoint). After
+//! each successful append, `FileTaskShadow` fires the attached event hook with the
 //! persisted `RuntimeTaskEvent`. This module's dispatcher is that hook: it
 //! maps `RuntimeEventKind` → framework `HookEvent` and fires it through the
 //! agent's `TaskHookBridge` / `SubagentHookBridge`.

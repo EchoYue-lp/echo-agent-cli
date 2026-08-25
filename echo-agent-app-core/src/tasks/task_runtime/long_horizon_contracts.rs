@@ -17,6 +17,8 @@ const APP_RUNTIME: &str = include_str!("../../runtime.rs");
 const APP_WORKSPACE_RUNTIME: &str = include_str!("../../workspace/runtime.rs");
 const APP_EXECUTOR: &str = include_str!("executor.rs");
 const APP_BOOT_RECONCILER: &str = include_str!("boot_reconciler.rs");
+const APP_TASK_RUNTIME_MOD: &str = include_str!("mod.rs");
+const APP_FILE_SHADOW: &str = include_str!("file_shadow.rs");
 const APP_FILE_STORE: &str = include_str!("file_store.rs");
 const APP_COMPLETION_GATE: &str = include_str!("completion_gate.rs");
 const APP_INFRA: &str = include_str!("../../infra.rs");
@@ -228,7 +230,7 @@ fn lh_f06_hot_state_uses_the_existing_checkpoint_read_authority() -> Result<(), 
     )?;
     require(
         APP_FILE_STORE,
-        "pub fn get_run_state",
+        "pub(crate) fn get_run_state",
         "LH-F06 repair regressed: FileTaskStore wrapper is missing",
     )?;
     require(
@@ -250,6 +252,30 @@ fn lh_f06_hot_state_uses_the_existing_checkpoint_read_authority() -> Result<(), 
 }
 
 #[test]
+fn lh_f06_raw_file_authority_is_not_a_public_bypass() -> Result<(), String> {
+    require(
+        APP_TASK_RUNTIME_MOD,
+        "pub(crate) mod file_shadow;",
+        "LH-F06 raw shadow module became externally public",
+    )?;
+    require(
+        APP_TASK_RUNTIME_MOD,
+        "pub(crate) mod file_store;",
+        "LH-F06 raw file store module became externally public",
+    )?;
+    require(
+        APP_FILE_SHADOW,
+        "pub(crate) struct FileTaskShadow",
+        "LH-F06 FileTaskShadow visibility widened",
+    )?;
+    require(
+        APP_FILE_SHADOW,
+        "pub(crate) fn append_event_line",
+        "LH-F06 raw append bypass visibility widened",
+    )
+}
+
+#[test]
 fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
     let production_store = APP_STORE
         .split("// The compile-time test that proves the transaction invariant:")
@@ -259,7 +285,7 @@ fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
     let production_completion = before_test_module(APP_COMPLETION_GATE);
     let scans = production_store.matches("list_events(run_id, 0)").count()
         + production_store
-            .matches("i64::try_from(expected.journal_sequence).unwrap_or(i64::MAX)")
+            .matches("let after_sequence = i64::try_from(expected.journal_sequence)")
             .count()
         + production_control
             .matches("list_events(&target.run_id, 0)")
@@ -270,9 +296,9 @@ fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
         + production_completion
             .matches("list_events(run_id, 0)")
             .count();
-    if scans != 8 {
+    if scans != 7 {
         return Err(format!(
-            "LH5 full-scan allowlist changed without review: expected 8, found {scans}"
+            "LH5 full-scan allowlist changed without review: expected 7, found {scans}"
         ));
     }
     let comments = production_store.matches("Audit allowlist:").count()
@@ -281,6 +307,34 @@ fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
     if comments != scans {
         return Err(format!(
             "LH5 full-scan comments do not cover the allowlist: {comments}/{scans}"
+        ));
+    }
+    Ok(())
+}
+
+#[test]
+fn taskruntime_mutation_projection_refresh_has_one_typed_owner() -> Result<(), String> {
+    let production_store = APP_STORE
+        .split("// The compile-time test that proves the transaction invariant:")
+        .next()
+        .ok_or_else(|| "store production section missing".to_string())?;
+    for required in [
+        "fn commit_runtime_event",
+        "fn commit_runtime_events",
+        "fn commit_runtime_events_with_receipt",
+        "fn refresh_committed_projection",
+        "ProjectionCommitReceipt::CommittedProjectionDegraded",
+    ] {
+        require(
+            production_store,
+            required,
+            "TaskRuntime lost its typed mutation projection owner",
+        )?;
+    }
+    let refreshes = production_store.matches("rewrite_plan(").count();
+    if refreshes != 2 {
+        return Err(format!(
+            "TaskRuntime production rewrite_plan ownership changed: expected typed owner + boot repair, found {refreshes}"
         ));
     }
     Ok(())
@@ -833,7 +887,7 @@ fn lh6_fault_matrix_has_automated_evidence_for_every_row() -> Result<(), String>
         (
             "committed projection degradation",
             APP_COMMAND_CELLS,
-            "cell start committed but projection degraded",
+            "committed but projection degraded",
         ),
     ];
     if cases.len() != 18 {

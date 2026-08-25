@@ -10,6 +10,7 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use super::event_rebuild::CompletionGateProjection;
 use super::review::requires_review;
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::*;
@@ -94,10 +95,11 @@ impl TaskRuntimeStore {
     /// Fold the current event stream into the one completion report consumed by
     /// executor, GUI, TUI, CLI, and channel adapters.
     pub fn completion_gate_report(&self, run_id: &str) -> Result<CompletionGateReport, StoreError> {
-        let run = self
-            .get_run(run_id)?
+        let projection = self
+            .completion_gate_projection(run_id)?
             .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-        let Some(plan) = self.get_plan(run_id)? else {
+        let run = projection.run.clone();
+        let Some(plan) = projection.plan.clone() else {
             return Ok(CompletionGateReport {
                 run_id: run_id.to_string(),
                 goal_revision: run.goal_revision,
@@ -112,9 +114,6 @@ impl TaskRuntimeStore {
                 )],
             });
         };
-        // Audit allowlist: completion reviews all Requirement/Evidence and
-        // artifact history; the hot runtime snapshot intentionally omits it.
-        let events = self.list_events(run_id, 0)?;
         let requirements = requirements_for_plan(&plan);
         let mut blockers = Vec::new();
         let mut assessments = Vec::with_capacity(requirements.len());
@@ -163,70 +162,44 @@ impl TaskRuntimeStore {
                 &plan,
                 task,
                 requirement,
-                &events,
+                &projection,
                 &mut blockers,
             ));
         }
 
-        match self.active_subagent_boundaries(run_id) {
-            Ok(active) => {
-                for boundary in active {
-                    blockers.push(blocker(
-                        CompletionBlockerCode::ActiveSubagent,
-                        None,
-                        Some(&boundary.task_id),
-                        format!(
-                            "Subagent execution '{}' is still active",
-                            boundary.execution_id
-                        ),
-                    ));
-                }
-            }
-            Err(error) => blockers.push(blocker(
-                CompletionBlockerCode::StoreReadFailed,
+        for boundary in &projection.active_subagents {
+            blockers.push(blocker(
+                CompletionBlockerCode::ActiveSubagent,
                 None,
-                None,
-                format!("active Subagent boundaries could not be read: {error}"),
-            )),
+                Some(&boundary.task_id),
+                format!(
+                    "Subagent execution '{}' is still active",
+                    boundary.execution_id
+                ),
+            ));
         }
-        match self.list_background_cells(run_id) {
-            Ok(cells) => {
-                for cell in cells.into_iter().filter(BackgroundCellState::is_active) {
-                    blockers.push(blocker(
-                        CompletionBlockerCode::ActiveCommandCell,
-                        None,
-                        None,
-                        format!(
-                            "command cell '{}' ({}) is still active",
-                            cell.name, cell.cell_id
-                        ),
-                    ));
-                }
-            }
-            Err(error) => blockers.push(blocker(
-                CompletionBlockerCode::StoreReadFailed,
+        for cell in projection
+            .background_cells
+            .iter()
+            .filter(|cell| cell.is_active())
+        {
+            blockers.push(blocker(
+                CompletionBlockerCode::ActiveCommandCell,
                 None,
                 None,
-                format!("command cells could not be read: {error}"),
-            )),
+                format!(
+                    "command cell '{}' ({}) is still active",
+                    cell.name, cell.cell_id
+                ),
+            ));
         }
-        match self.list_recovery_blockers(run_id) {
-            Ok(recovery) => {
-                for item in recovery {
-                    blockers.push(blocker(
-                        CompletionBlockerCode::RecoveryBlocker,
-                        None,
-                        Some(&item.task_id),
-                        item.reason,
-                    ));
-                }
-            }
-            Err(error) => blockers.push(blocker(
-                CompletionBlockerCode::StoreReadFailed,
+        for item in &projection.recovery_blockers {
+            blockers.push(blocker(
+                CompletionBlockerCode::RecoveryBlocker,
                 None,
-                None,
-                format!("recovery blockers could not be read: {error}"),
-            )),
+                Some(&item.task_id),
+                item.reason.clone(),
+            ));
         }
 
         Ok(CompletionGateReport {
@@ -245,28 +218,15 @@ fn assess_requirement(
     plan: &TaskPlan,
     task: &PlanTask,
     requirement: GoalRequirement,
-    events: &[RuntimeTaskEvent],
+    projection: &CompletionGateProjection,
     blockers: &mut Vec<RunCompletionBlocker>,
 ) -> RequirementAssessment {
     let mut evidence = Vec::new();
-    if let Some(skip) = events.iter().rev().find(|event| {
-        event.event_type == RuntimeEventKind::RequirementSkipped
-            && event
-                .payload
-                .get("requirement_id")
-                .and_then(|value| value.as_str())
-                == Some(requirement.requirement_id.as_str())
-            && event
-                .payload
-                .get("requirement_sha256")
-                .and_then(|value| value.as_str())
-                == Some(requirement.requirement_sha256.as_str())
-            && event
-                .payload
-                .get("goal_revision")
-                .and_then(serde_json::Value::as_u64)
-                == Some(run.goal_revision)
-    }) {
+    if let Some(skip) = projection.completion.requirement_skip(
+        &requirement.requirement_id,
+        &requirement.requirement_sha256,
+        run.goal_revision,
+    ) {
         evidence.push(evidence_from_event(
             &requirement,
             RequirementEvidenceKind::UserSkip,
@@ -315,7 +275,7 @@ fn assess_requirement(
         status = RequirementStatus::Pending;
     }
 
-    let Some(summary_event) = latest_summary_event(events, &task.id) else {
+    let Some(bound_summary) = projection.completion.summary(&task.id) else {
         blockers.push(blocker(
             CompletionBlockerCode::RequirementEvidenceMissing,
             Some(&requirement),
@@ -328,6 +288,7 @@ fn assess_requirement(
             evidence,
         };
     };
+    let summary_event = bound_summary.event();
     let Some(summary) = summary_event
         .payload
         .get("summary")
@@ -346,10 +307,14 @@ fn assess_requirement(
             evidence,
         };
     };
-    let (source_goal_revision, source_plan_revision) =
-        event_binding(events, summary_event.seq).unwrap_or_default();
+    let (source_goal_revision, source_plan_revision) = bound_summary.source_binding();
     let fresh = source_goal_revision == run.goal_revision
-        || has_revalidation(events, summary_event.seq, &requirement, run.goal_revision);
+        || projection.completion.has_revalidation(
+            summary_event.seq,
+            &requirement.requirement_id,
+            &requirement.requirement_sha256,
+            run.goal_revision,
+        );
     let execution_passed = summary.result.status == SubagentRunStatus::Completed
         && !summary.result.summary.trim().is_empty()
         && summary.result.remaining_work.is_empty();
@@ -503,20 +468,18 @@ fn assess_requirement(
     }
 
     if requires_review(task) {
-        let review = events.iter().rev().find(|event| {
-            event.seq > summary_event.seq
-                && event.task_id.as_deref() == Some(task.id.as_str())
-                && matches!(
-                    event.event_type,
-                    RuntimeEventKind::ReviewPassed
-                        | RuntimeEventKind::ReviewNeedsFix
-                        | RuntimeEventKind::ReviewBlocked
-                )
-        });
-        if let Some(review) = review {
-            let review_fresh = event_binding(events, review.seq)
-                .is_some_and(|binding| binding.0 == run.goal_revision)
-                || has_revalidation(events, review.seq, &requirement, run.goal_revision);
+        if let Some(bound_review) = projection
+            .completion
+            .review_after(&task.id, summary_event.seq)
+        {
+            let review = bound_review.event();
+            let review_fresh = bound_review.source_binding().0 == run.goal_revision
+                || projection.completion.has_revalidation(
+                    review.seq,
+                    &requirement.requirement_id,
+                    &requirement.requirement_sha256,
+                    run.goal_revision,
+                );
             let passed = review.event_type == RuntimeEventKind::ReviewPassed;
             evidence.push(evidence_from_event(
                 &requirement,
@@ -587,63 +550,6 @@ fn assess_requirement(
         status,
         evidence,
     }
-}
-
-fn latest_summary_event<'a>(
-    events: &'a [RuntimeTaskEvent],
-    task_id: &str,
-) -> Option<&'a RuntimeTaskEvent> {
-    events.iter().rev().find(|event| {
-        event.event_type == RuntimeEventKind::Note
-            && event.task_id.as_deref() == Some(task_id)
-            && event.payload.get("kind").and_then(|value| value.as_str())
-                == Some("summary_persisted")
-    })
-}
-
-fn event_binding(events: &[RuntimeTaskEvent], through_seq: i64) -> Option<(u64, u64)> {
-    events
-        .iter()
-        .rev()
-        .filter(|event| event.seq <= through_seq)
-        .find_map(|event| {
-            if event.event_type != RuntimeEventKind::PlanRevisionCommitted {
-                return None;
-            }
-            event
-                .payload
-                .get("plan")
-                .cloned()
-                .and_then(|value| serde_json::from_value::<PlanRevision>(value).ok())
-                .map(|plan| (plan.goal_revision, plan.revision))
-        })
-}
-
-fn has_revalidation(
-    events: &[RuntimeTaskEvent],
-    source_seq: i64,
-    requirement: &GoalRequirement,
-    current_goal_revision: u64,
-) -> bool {
-    events.iter().any(|event| {
-        event.seq > source_seq
-            && event.event_type == RuntimeEventKind::RequirementEvidenceRevalidated
-            && event
-                .payload
-                .get("requirement_id")
-                .and_then(|value| value.as_str())
-                == Some(requirement.requirement_id.as_str())
-            && event
-                .payload
-                .get("requirement_sha256")
-                .and_then(|value| value.as_str())
-                == Some(requirement.requirement_sha256.as_str())
-            && event
-                .payload
-                .get("new_goal_revision")
-                .and_then(serde_json::Value::as_u64)
-                == Some(current_goal_revision)
-    })
 }
 
 struct EvidencePayload {

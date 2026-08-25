@@ -6,16 +6,21 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 
 use chrono::{DateTime, Utc};
 use echo_agent::state::journal::{
-    ApplyBatchReceipt, ApplyReceipt, CheckpointStore, CheckpointedApplyError, CheckpointedReducer,
-    EventJournal, FileCheckpointStore, FileEventJournal, JournalBatchAppendError,
-    JournalBatchCommitStatus, JournalBatchLookup, JournalDurabilityStatus, MemoryCheckpointStore,
-    PreparedJournalBatch,
+    ApplyBatchReceipt, ApplyReceipt, CheckpointFrame, CheckpointStore, CheckpointedApplyError,
+    CheckpointedReducer, EventJournal, FileCheckpointStore, FileEventJournal,
+    JournalBatchAppendError, JournalBatchCommitStatus, JournalBatchLookup, JournalDurabilityStatus,
+    MemoryCheckpointStore, PreparedJournalBatch,
 };
 use echo_agent::utils::fs::{FileDurability, atomic_write, create_dir_all_durable};
 use serde::{Deserialize, Serialize};
 
-use super::event_rebuild::{EventFoldState, RebuildError};
+use super::event_rebuild::{
+    CompletionGateProjection, EventFoldState, RebuildError, TodoQueryProjection,
+};
 use super::file_shadow::{ProjectionRefreshStats, ShadowError};
+use super::history_projection::{
+    HistoryProjection, HistoryProjectionApplyStatus, artifacts_from_events, reviews_from_events,
+};
 use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
 
 const REPLAY_BATCH: usize = 512;
@@ -92,15 +97,46 @@ impl RuntimeJournalEvent {
 
 type RuntimeReducer = CheckpointedReducer<FileEventJournal<RuntimeJournalEvent>, EventFoldState>;
 
+struct RuntimeCheckpointStore {
+    file: FileCheckpointStore<EventFoldState>,
+    ignore_next_load: std::sync::atomic::AtomicBool,
+}
+
+impl RuntimeCheckpointStore {
+    fn new(path: &Path, ignore_next_load: bool) -> Self {
+        Self {
+            file: FileCheckpointStore::open(path),
+            ignore_next_load: std::sync::atomic::AtomicBool::new(ignore_next_load),
+        }
+    }
+}
+
+impl CheckpointStore<EventFoldState> for RuntimeCheckpointStore {
+    fn save(&self, state: &EventFoldState, through_sequence: u64) -> echo_agent::error::Result<()> {
+        self.file.save(state, through_sequence)
+    }
+
+    fn load(&self) -> echo_agent::error::Result<Option<CheckpointFrame<EventFoldState>>> {
+        if self
+            .ignore_next_load
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Ok(None);
+        }
+        self.file.load()
+    }
+}
+
 pub(crate) struct RunAuthorityState {
     journal: Arc<FileEventJournal<RuntimeJournalEvent>>,
-    checkpoints: Arc<FileCheckpointStore<EventFoldState>>,
+    checkpoints: Arc<RuntimeCheckpointStore>,
     reducer: RuntimeReducer,
     recovered_from_checkpoint: bool,
     recovery_last_sequence: u64,
     recovery_folded_events: u64,
     projection_sequence: u64,
     durability_debt: Option<String>,
+    history: HistoryProjection,
 }
 
 pub(crate) struct RunAuthority {
@@ -110,11 +146,18 @@ pub(crate) struct RunAuthority {
     state: Mutex<Option<RunAuthorityState>>,
     #[cfg(test)]
     fail_next_post_commit_validation: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_durability_settlement: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    reconcile_next_append_unconfirmed: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_next_durability_probe: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) struct RunBatchAppendReceipt {
     pub(crate) events: Vec<Arc<RuntimeTaskEvent>>,
     pub(crate) apply: ApplyBatchReceipt,
+    pub(crate) history: HistoryProjectionApplyStatus,
 }
 
 enum RegistryStatus {
@@ -276,18 +319,31 @@ impl RunAuthority {
         };
         loop {
             if opener {
-                let opened = Self::open_state(&event_path, checkpoint_path).and_then(|state| {
-                    let authority = Arc::new(Self {
-                        event_path: event_path.clone(),
-                        checkpoint_path: checkpoint_path.to_path_buf(),
-                        expected_run_id: expected_run_id.to_string(),
-                        state: Mutex::new(Some(state)),
-                        #[cfg(test)]
-                        fail_next_post_commit_validation: std::sync::atomic::AtomicBool::new(false),
+                let opened = Self::open_state(&event_path, checkpoint_path, expected_run_id)
+                    .and_then(|state| {
+                        let authority = Arc::new(Self {
+                            event_path: event_path.clone(),
+                            checkpoint_path: checkpoint_path.to_path_buf(),
+                            expected_run_id: expected_run_id.to_string(),
+                            state: Mutex::new(Some(state)),
+                            #[cfg(test)]
+                            fail_next_post_commit_validation: std::sync::atomic::AtomicBool::new(
+                                false,
+                            ),
+                            #[cfg(test)]
+                            fail_next_durability_settlement: std::sync::atomic::AtomicBool::new(
+                                false,
+                            ),
+                            #[cfg(test)]
+                            reconcile_next_append_unconfirmed: std::sync::atomic::AtomicBool::new(
+                                false,
+                            ),
+                            #[cfg(test)]
+                            fail_next_durability_probe: std::sync::atomic::AtomicBool::new(false),
+                        });
+                        authority.validate_run_id(expected_run_id)?;
+                        Ok(authority)
                     });
-                    authority.validate_run_id(expected_run_id)?;
-                    Ok(authority)
-                });
                 let mut status = slot
                     .status
                     .lock()
@@ -348,6 +404,7 @@ impl RunAuthority {
     fn open_state(
         event_path: &Path,
         checkpoint_path: &Path,
+        expected_run_id: &str,
     ) -> Result<RunAuthorityState, ShadowError> {
         #[cfg(test)]
         let pause = open_pauses()
@@ -363,14 +420,33 @@ impl RunAuthority {
             FileEventJournal::open(event_path, FileDurability::SyncData)
                 .map_err(|error| ShadowError::Rebuild(error.to_string()))?,
         );
-        let checkpoints = Arc::new(FileCheckpointStore::open(checkpoint_path));
+        let checkpoint_file = FileCheckpointStore::<EventFoldState>::open(checkpoint_path);
         let journal_last = journal.last_sequence();
-        let valid_checkpoint_sequence = checkpoints
-            .load()
-            .ok()
-            .flatten()
-            .map(|frame| frame.sequence)
-            .filter(|sequence| *sequence <= journal_last);
+        let loaded_checkpoint = checkpoint_file.load().ok().flatten();
+        let checkpoint_schema_current = loaded_checkpoint
+            .as_ref()
+            .is_none_or(|frame| frame.state.has_current_query_projection_schema());
+        if !checkpoint_schema_current {
+            match std::fs::remove_file(checkpoint_path) {
+                Ok(()) => tracing::info!(
+                    path = %checkpoint_path.display(),
+                    "discarded legacy TaskRuntime checkpoint before rebuilding query projection"
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %checkpoint_path.display(),
+                    %error,
+                    "legacy TaskRuntime checkpoint could not be removed; ignoring it for recovery"
+                ),
+            }
+        }
+        let checkpoints = Arc::new(RuntimeCheckpointStore::new(
+            checkpoint_path,
+            !checkpoint_schema_current,
+        ));
+        let valid_checkpoint_sequence = loaded_checkpoint
+            .filter(|frame| checkpoint_schema_current && frame.sequence <= journal_last)
+            .map(|frame| frame.sequence);
         let reducer = CheckpointedReducer::new(
             Arc::clone(&journal),
             Arc::clone(&checkpoints) as Arc<dyn CheckpointStore<EventFoldState>>,
@@ -379,6 +455,17 @@ impl RunAuthority {
         let recovery = reducer
             .recover()
             .map_err(|error| ShadowError::Rebuild(error.to_string()))?;
+        let checkpoint_behind = valid_checkpoint_sequence
+            .is_some_and(|sequence| sequence < recovery.last_applied_sequence);
+        if (!checkpoint_schema_current || checkpoint_behind)
+            && let Err(error) = reducer.checkpoint()
+        {
+            tracing::warn!(
+                path = %checkpoint_path.display(),
+                %error,
+                "TaskRuntime checkpoint recovered in memory but atomic repair degraded"
+            );
+        }
         let recovered_from_checkpoint = valid_checkpoint_sequence.is_some()
             && matches!(
                 recovery.checkpoint,
@@ -392,6 +479,22 @@ impl RunAuthority {
         {
             tracing::warn!(path = %event_path.display(), %reason, %error, "TaskRuntime checkpoint repair is degraded");
         }
+        let run_directory = event_path.parent().ok_or_else(|| {
+            ShadowError::Io("TaskRuntime journal has no run directory".to_string())
+        })?;
+        let mut history = HistoryProjection::open(
+            expected_run_id,
+            run_directory,
+            recovery.last_applied_sequence,
+        );
+        let history_status = reconcile_history_projection(
+            &mut history,
+            journal.as_ref(),
+            recovery.last_applied_sequence,
+        );
+        if let HistoryProjectionApplyStatus::Degraded { error } = &history_status {
+            tracing::warn!(path = %event_path.display(), %error, "TaskRuntime history projection recovery degraded");
+        }
         Ok(RunAuthorityState {
             journal,
             checkpoints,
@@ -401,6 +504,7 @@ impl RunAuthority {
             recovery_folded_events,
             projection_sequence: 0,
             durability_debt: None,
+            history,
         })
     }
 
@@ -408,7 +512,14 @@ impl RunAuthority {
     pub(crate) fn append(
         &self,
         event: RuntimeJournalEvent,
-    ) -> Result<(Arc<RuntimeTaskEvent>, ApplyReceipt), ShadowError> {
+    ) -> Result<
+        (
+            Arc<RuntimeTaskEvent>,
+            ApplyReceipt,
+            HistoryProjectionApplyStatus,
+        ),
+        ShadowError,
+    > {
         self.append_with_observer(event, |_| {})
     }
 
@@ -416,7 +527,14 @@ impl RunAuthority {
         &self,
         event: RuntimeJournalEvent,
         observer: impl FnOnce(&RuntimeTaskEvent),
-    ) -> Result<(Arc<RuntimeTaskEvent>, ApplyReceipt), ShadowError> {
+    ) -> Result<
+        (
+            Arc<RuntimeTaskEvent>,
+            ApplyReceipt,
+            HistoryProjectionApplyStatus,
+        ),
+        ShadowError,
+    > {
         let mut observer = Some(observer);
         let batch = self.append_batch_with_observer(vec![event], |event| {
             if let Some(observer) = observer.take() {
@@ -435,6 +553,7 @@ impl RunAuthority {
                 commit: batch.apply.commit,
                 checkpoint: batch.apply.checkpoint,
             },
+            batch.history,
         ))
     }
 
@@ -473,119 +592,125 @@ impl RunAuthority {
                 None => project_prepared_batch(&batch, state.journal.next_sequence())?,
             };
 
-            let mut receipt =
-                match state.reducer.apply_batch(batch) {
-                    Ok(receipt) => receipt,
-                    Err(CheckpointedApplyError::Journal(
-                        JournalBatchAppendError::NotCommitted { batch, error },
-                    )) if attempts < MAX_BATCH_COMMIT_ATTEMPTS => {
-                        prepared = Some(batch);
-                        tracing::warn!(
-                            path = %self.event_path.display(),
-                            batch_id = %batch_id,
-                            attempt = attempts,
-                            %error,
-                            "retrying an uncommitted TaskRuntime batch"
-                        );
-                        continue;
-                    }
-                    Err(CheckpointedApplyError::Journal(
-                        JournalBatchAppendError::NotCommitted { error, .. },
-                    )) => {
-                        let stale = guard.take();
-                        drop(stale);
-                        return Err(ShadowError::BatchNotCommitted {
-                            batch_id,
-                            attempts,
-                            detail: error,
-                        });
-                    }
-                    Err(CheckpointedApplyError::Journal(error))
-                        if matches!(
-                            error,
-                            JournalBatchAppendError::OutcomeUnknown { .. }
-                                | JournalBatchAppendError::AuthorityPoisoned { .. }
-                        ) =>
-                    {
-                        let detail = error.to_string();
-                        let batch = error.into_prepared().ok_or_else(|| {
-                            ShadowError::BatchOutcomeUnknown {
+            let mut receipt = match state.reducer.apply_batch(batch) {
+                Ok(receipt) => receipt,
+                Err(CheckpointedApplyError::Journal(JournalBatchAppendError::NotCommitted {
+                    batch,
+                    error,
+                })) if attempts < MAX_BATCH_COMMIT_ATTEMPTS => {
+                    prepared = Some(batch);
+                    tracing::warn!(
+                        path = %self.event_path.display(),
+                        batch_id = %batch_id,
+                        attempt = attempts,
+                        %error,
+                        "retrying an uncommitted TaskRuntime batch"
+                    );
+                    continue;
+                }
+                Err(CheckpointedApplyError::Journal(JournalBatchAppendError::NotCommitted {
+                    error,
+                    ..
+                })) => {
+                    let stale = guard.take();
+                    drop(stale);
+                    return Err(ShadowError::BatchNotCommitted {
+                        batch_id,
+                        attempts,
+                        detail: error,
+                    });
+                }
+                Err(CheckpointedApplyError::Journal(error))
+                    if matches!(
+                        error,
+                        JournalBatchAppendError::OutcomeUnknown { .. }
+                            | JournalBatchAppendError::AuthorityPoisoned { .. }
+                    ) =>
+                {
+                    let detail = error.to_string();
+                    let batch =
+                        error
+                            .into_prepared()
+                            .ok_or_else(|| ShadowError::BatchOutcomeUnknown {
                                 batch_id: batch_id.clone(),
                                 payload_digest: payload_digest.clone(),
                                 detail: "journal did not return prepared batch ownership"
                                     .to_string(),
-                            }
-                        })?;
-                        let stale = guard.take();
-                        drop(stale);
-                        let reopened = Self::open_state(&self.event_path, &self.checkpoint_path)
-                            .map_err(|error| ShadowError::BatchOutcomeUnknown {
-                                batch_id: batch_id.clone(),
-                                payload_digest: payload_digest.clone(),
-                                detail: format!("{detail}; verified reopen failed: {error}"),
                             })?;
-                        validate_state_run_id(&reopened, &self.expected_run_id)?;
-                        match reopened.journal.lookup_batch(&batch).map_err(|error| {
-                            ShadowError::BatchOutcomeUnknown {
-                                batch_id: batch_id.clone(),
-                                payload_digest: payload_digest.clone(),
-                                detail: format!("{detail}; batch lookup failed: {error}"),
-                            }
-                        })? {
-                            JournalBatchLookup::AlreadyCommitted(committed) => {
-                                reconciled_projection =
-                                    Some(project_journal_records(committed.records())?);
-                                *guard = Some(reopened);
-                                prepared = Some(batch);
-                                continue;
-                            }
-                            JournalBatchLookup::Absent if attempts < MAX_BATCH_COMMIT_ATTEMPTS => {
-                                *guard = Some(reopened);
-                                prepared = Some(batch);
-                                continue;
-                            }
-                            JournalBatchLookup::Absent => {
-                                return Err(ShadowError::BatchOutcomeUnknown {
-                                    batch_id,
-                                    payload_digest,
-                                    detail: format!(
-                                        "{detail}; batch remained absent after {attempts} attempts"
-                                    ),
-                                });
-                            }
-                            JournalBatchLookup::Conflict { error } => {
-                                drop(reopened);
-                                return Err(ShadowError::BatchIdentityConflict {
-                                    batch_id,
-                                    payload_digest,
-                                    detail: error,
-                                });
-                            }
+                    let stale = guard.take();
+                    drop(stale);
+                    let reopened = Self::open_state(
+                        &self.event_path,
+                        &self.checkpoint_path,
+                        &self.expected_run_id,
+                    )
+                    .map_err(|error| ShadowError::BatchOutcomeUnknown {
+                        batch_id: batch_id.clone(),
+                        payload_digest: payload_digest.clone(),
+                        detail: format!("{detail}; verified reopen failed: {error}"),
+                    })?;
+                    validate_state_run_id(&reopened, &self.expected_run_id)?;
+                    match reopened.journal.lookup_batch(&batch).map_err(|error| {
+                        ShadowError::BatchOutcomeUnknown {
+                            batch_id: batch_id.clone(),
+                            payload_digest: payload_digest.clone(),
+                            detail: format!("{detail}; batch lookup failed: {error}"),
+                        }
+                    })? {
+                        JournalBatchLookup::AlreadyCommitted(committed) => {
+                            reconciled_projection =
+                                Some(project_journal_records(committed.records())?);
+                            *guard = Some(reopened);
+                            prepared = Some(batch);
+                            continue;
+                        }
+                        JournalBatchLookup::Absent if attempts < MAX_BATCH_COMMIT_ATTEMPTS => {
+                            *guard = Some(reopened);
+                            prepared = Some(batch);
+                            continue;
+                        }
+                        JournalBatchLookup::Absent => {
+                            return Err(ShadowError::BatchOutcomeUnknown {
+                                batch_id,
+                                payload_digest,
+                                detail: format!(
+                                    "{detail}; batch remained absent after {attempts} attempts"
+                                ),
+                            });
+                        }
+                        JournalBatchLookup::Conflict { error } => {
+                            drop(reopened);
+                            return Err(ShadowError::BatchIdentityConflict {
+                                batch_id,
+                                payload_digest,
+                                detail: error,
+                            });
                         }
                     }
-                    Err(CheckpointedApplyError::Journal(error)) => {
-                        let detail = error.to_string();
-                        let stale = guard.take();
-                        drop(stale);
-                        return Err(ShadowError::BatchIdentityConflict {
-                            batch_id,
-                            payload_digest,
-                            detail,
-                        });
-                    }
-                    Err(CheckpointedApplyError::CommittedInvariant { error, .. }) => {
-                        let stale = guard.take();
-                        drop(stale);
-                        return Err(ShadowError::BatchOutcomeUnknown {
-                            batch_id,
-                            payload_digest,
-                            detail: error,
-                        });
-                    }
-                    Err(CheckpointedApplyError::Prepare(error)) => {
-                        return Err(ShadowError::Encode(error.to_string()));
-                    }
-                };
+                }
+                Err(CheckpointedApplyError::Journal(error)) => {
+                    let detail = error.to_string();
+                    let stale = guard.take();
+                    drop(stale);
+                    return Err(ShadowError::BatchIdentityConflict {
+                        batch_id,
+                        payload_digest,
+                        detail,
+                    });
+                }
+                Err(CheckpointedApplyError::CommittedInvariant { error, .. }) => {
+                    let stale = guard.take();
+                    drop(stale);
+                    return Err(ShadowError::BatchOutcomeUnknown {
+                        batch_id,
+                        payload_digest,
+                        detail: error,
+                    });
+                }
+                Err(CheckpointedApplyError::Prepare(error)) => {
+                    return Err(ShadowError::Encode(error.to_string()));
+                }
+            };
             #[cfg(test)]
             if self
                 .fail_next_post_commit_validation
@@ -635,6 +760,27 @@ impl RunAuthority {
                     };
                 }
             }
+            #[cfg(test)]
+            if self
+                .fail_next_durability_settlement
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                let detail = "injected persistent TaskRuntime journal durability debt".to_string();
+                state.durability_debt = Some(detail.clone());
+                receipt.journal = JournalDurabilityStatus::Degraded { error: detail };
+            }
+            #[cfg(test)]
+            if self
+                .reconcile_next_append_unconfirmed
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                state.durability_debt = Some(format!(
+                    "reconciled TaskRuntime batch {} has unconfirmed durability",
+                    receipt.batch_id
+                ));
+                receipt.commit = JournalBatchCommitStatus::AlreadyCommitted;
+                receipt.journal = JournalDurabilityStatus::Unconfirmed;
+            }
             if let Err(error) = state.reducer.with_state(validate_projection_health) {
                 let detail = error.to_string();
                 let stale = guard.take();
@@ -645,12 +791,17 @@ impl RunAuthority {
                     detail,
                 });
             }
+            let journal = Arc::clone(&state.journal);
+            let journal_head = state.reducer.last_applied_sequence();
+            let history =
+                reconcile_history_projection(&mut state.history, journal.as_ref(), journal_head);
             for event in &projected {
                 observer(event.as_ref());
             }
             return Ok(RunBatchAppendReceipt {
                 events: projected,
                 apply: receipt,
+                history,
             });
         }
     }
@@ -666,6 +817,55 @@ impl RunAuthority {
                 tracing::warn!(%error, path = %path.display(), "TaskRuntime durability barrier remains pending");
             }
         }
+    }
+
+    pub(crate) fn settle_durability_and_history(
+        &self,
+    ) -> (JournalDurabilityStatus, HistoryProjectionApplyStatus) {
+        let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(state) = guard.as_mut() else {
+            let error = format!(
+                "TaskRuntime authority is closed: {}",
+                self.event_path.display()
+            );
+            return (
+                JournalDurabilityStatus::Degraded {
+                    error: error.clone(),
+                },
+                HistoryProjectionApplyStatus::Degraded { error },
+            );
+        };
+        let journal =
+            if state.durability_debt.is_none() {
+                JournalDurabilityStatus::Confirmed
+            } else {
+                #[cfg(test)]
+                let fail_probe = self
+                    .fail_next_durability_probe
+                    .swap(false, std::sync::atomic::Ordering::SeqCst);
+                #[cfg(not(test))]
+                let fail_probe = false;
+                if fail_probe {
+                    JournalDurabilityStatus::Degraded {
+                        error: state.durability_debt.clone().unwrap_or_else(|| {
+                            "injected TaskRuntime durability probe failure".to_string()
+                        }),
+                    }
+                } else {
+                    Self::retry_durability_debt(state, &self.event_path);
+                    state.durability_debt.as_ref().map_or(
+                        JournalDurabilityStatus::Confirmed,
+                        |error| JournalDurabilityStatus::Degraded {
+                            error: error.clone(),
+                        },
+                    )
+                }
+            };
+        let journal_handle = Arc::clone(&state.journal);
+        let journal_head = state.reducer.last_applied_sequence();
+        let history =
+            reconcile_history_projection(&mut state.history, journal_handle.as_ref(), journal_head);
+        (journal, history)
     }
 
     fn validate_run_id(&self, expected_run_id: &str) -> Result<(), ShadowError> {
@@ -695,6 +895,163 @@ impl RunAuthority {
         &self,
     ) -> Result<Option<RunStateSnapshot>, ShadowError> {
         self.read_projection("run-state.json")
+    }
+
+    pub(crate) fn read_todo_query_projection(
+        &self,
+    ) -> Result<Option<TodoQueryProjection>, ShadowError> {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        state.reducer.with_state(|projection| {
+            validate_projection_health(projection)?;
+            match projection.todo_query_projection() {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(RebuildError::NoRunCreated) => Ok(None),
+            }
+        })
+    }
+
+    pub(crate) fn read_completion_gate_projection(
+        &self,
+    ) -> Result<Option<CompletionGateProjection>, ShadowError> {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        state.reducer.with_state(|projection| {
+            validate_projection_health(projection)?;
+            match projection.completion_gate_projection() {
+                Ok(snapshot) => Ok(Some(snapshot)),
+                Err(RebuildError::NoRunCreated) => Ok(None),
+            }
+        })
+    }
+
+    pub(crate) fn read_artifacts_projection(
+        &self,
+    ) -> Result<Vec<super::types::Artifact>, ShadowError> {
+        let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        let journal = Arc::clone(&state.journal);
+        let journal_head = state.reducer.last_applied_sequence();
+        if let Some(artifacts) = state.history.cached_artifacts(journal_head) {
+            return Ok(artifacts);
+        }
+        if let HistoryProjectionApplyStatus::Degraded { error } =
+            reconcile_history_projection(&mut state.history, journal.as_ref(), journal_head)
+        {
+            tracing::warn!(path = %self.event_path.display(), %error, "artifact history repair degraded");
+        }
+        let suffix = replay_journal(journal.as_ref(), state.history.through_sequence())?;
+        match state.history.artifacts_with_suffix(&suffix) {
+            Ok(artifacts) => Ok(artifacts),
+            Err(error) => {
+                #[cfg(test)]
+                state.history.record_fallback_replay_for_test();
+                let all = replay_journal(journal.as_ref(), 0)?;
+                let artifacts = artifacts_from_events(&all);
+                let repaired = match state.history.replace_artifacts(&all) {
+                    Ok(_) => {
+                        if let HistoryProjectionApplyStatus::Degraded { error: repair } =
+                            reconcile_history_projection(
+                                &mut state.history,
+                                journal.as_ref(),
+                                journal_head,
+                            )
+                        {
+                            tracing::warn!(path = %self.event_path.display(), %error, %repair, "artifact history cursor repair degraded");
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(repair) => {
+                        tracing::warn!(path = %self.event_path.display(), %error, %repair, "artifact history fallback repair degraded");
+                        false
+                    }
+                };
+                if !repaired {
+                    state
+                        .history
+                        .cache_artifacts(journal_head, artifacts.clone());
+                }
+                Ok(artifacts)
+            }
+        }
+    }
+
+    pub(crate) fn read_reviews_projection(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<super::types::ReviewResult>, ShadowError> {
+        let mut guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        let journal = Arc::clone(&state.journal);
+        let journal_head = state.reducer.last_applied_sequence();
+        if let Some(reviews) = state.history.cached_reviews(task_id, journal_head) {
+            return Ok(reviews);
+        }
+        if let HistoryProjectionApplyStatus::Degraded { error } =
+            reconcile_history_projection(&mut state.history, journal.as_ref(), journal_head)
+        {
+            tracing::warn!(path = %self.event_path.display(), task_id, %error, "review history repair degraded");
+        }
+        let suffix = replay_journal(journal.as_ref(), state.history.through_sequence())?;
+        match state.history.reviews_with_suffix(task_id, &suffix) {
+            Ok(reviews) => Ok(reviews),
+            Err(error) => {
+                #[cfg(test)]
+                state.history.record_fallback_replay_for_test();
+                let all = replay_journal(journal.as_ref(), 0)?;
+                let reviews = reviews_from_events(task_id, &all);
+                let repaired = match state.history.replace_reviews(task_id, &all) {
+                    Ok(_) => {
+                        if let HistoryProjectionApplyStatus::Degraded { error: repair } =
+                            reconcile_history_projection(
+                                &mut state.history,
+                                journal.as_ref(),
+                                journal_head,
+                            )
+                        {
+                            tracing::warn!(path = %self.event_path.display(), task_id, %error, %repair, "review history cursor repair degraded");
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(repair) => {
+                        tracing::warn!(path = %self.event_path.display(), task_id, %error, %repair, "review history fallback repair degraded");
+                        false
+                    }
+                };
+                if !repaired {
+                    state
+                        .history
+                        .cache_reviews(task_id, journal_head, reviews.clone());
+                }
+                Ok(reviews)
+            }
+        }
+    }
+
+    pub(crate) fn read_summary_projection(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<super::types::TaskExecutionSummary>, ShadowError> {
+        let guard = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let state = guard
+            .as_ref()
+            .ok_or_else(|| ShadowError::AuthorityClosed(self.event_path.display().to_string()))?;
+        state.reducer.with_state(|projection| {
+            validate_projection_health(projection)?;
+            Ok(projection.summary_projection(task_id))
+        })
     }
 
     fn read_projection<T: serde::de::DeserializeOwned>(
@@ -828,6 +1185,77 @@ impl RunAuthority {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    #[cfg(test)]
+    pub(crate) fn fail_next_durability_settlement_for_test(&self) {
+        self.fail_next_durability_settlement
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconcile_next_append_unconfirmed_for_test(&self) {
+        self.reconcile_next_append_unconfirmed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_durability_probe_for_test(&self) {
+        self.fail_next_durability_probe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_review_history_append_for_test(&self) {
+        if let Ok(mut guard) = self.state.lock()
+            && let Some(state) = guard.as_mut()
+        {
+            state.history.fail_next_review_append_for_test();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_history_cursor_writes_for_test(&self, count: usize) {
+        if let Ok(mut guard) = self.state.lock()
+            && let Some(state) = guard.as_mut()
+        {
+            state.history.fail_cursor_writes_for_test(count);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_paths_for_test(&self, task_id: &str) -> (PathBuf, PathBuf, PathBuf) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|state| state.history.paths_for_test(task_id))
+            .unwrap_or_else(|| {
+                let directory = self.event_path.parent().unwrap_or_else(|| Path::new("."));
+                (
+                    directory.join("artifact-history.jsonl"),
+                    directory.join("review-history/closed.jsonl"),
+                    directory.join("history-cursor.json"),
+                )
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_stats_for_test(&self) -> (usize, u64) {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map_or((0, 0), |state| state.history.stats_for_test())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn history_fallback_replay_count_for_test(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map_or(0, |state| state.history.fallback_replay_count_for_test())
+    }
+
     pub(crate) fn begin_invalidate(path: &Path) -> Result<RunInvalidationGuard, ShadowError> {
         let path = canonical_event_path(path, false)?;
         Self::begin_invalidate_paths(vec![path])
@@ -923,6 +1351,43 @@ impl RunAuthority {
             drop(state);
         }
         Ok(RunInvalidationGuard { slots })
+    }
+}
+
+fn reconcile_history_projection(
+    history: &mut HistoryProjection,
+    journal: &FileEventJournal<RuntimeJournalEvent>,
+    journal_head: u64,
+) -> HistoryProjectionApplyStatus {
+    let after_sequence = if history.needs_full_rebuild() {
+        0
+    } else {
+        history.through_sequence()
+    };
+    let events = match replay_journal(journal, after_sequence) {
+        Ok(events) => events,
+        Err(error) => {
+            return HistoryProjectionApplyStatus::Degraded {
+                error: error.to_string(),
+            };
+        }
+    };
+    if history.needs_full_rebuild() {
+        history.rebuild_all(&events, journal_head)
+    } else {
+        let status = history.apply_events(&events, journal_head);
+        if !history.needs_full_rebuild() {
+            return status;
+        }
+        let all = match replay_journal(journal, 0) {
+            Ok(events) => events,
+            Err(error) => {
+                return HistoryProjectionApplyStatus::Degraded {
+                    error: error.to_string(),
+                };
+            }
+        };
+        history.rebuild_all(&all, journal_head)
     }
 }
 

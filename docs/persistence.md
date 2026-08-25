@@ -25,6 +25,11 @@ RunAuthority
         │
         ├─> events.jsonl       事实历史
         ├─> checkpoint.json   可重建 checkpoint
+        ├─> artifact-history.jsonl          可重建 Artifact read model
+        ├─> artifact-history.meta.jsonl     append-batch count/sequence/hash-chain frames
+        ├─> review-history/<safe-key>.jsonl 可重建 per-task Review read model
+        ├─> review-history/<safe-key>.meta.jsonl per-task append-batch 完整性 frames
+        ├─> history-cursor.json             read-model source cursor
         ├─> plan.json         确定性读投影
         └─> run-state.json    确定性读投影
 ```
@@ -36,17 +41,32 @@ RunAuthority
 3. `EventFoldState` 从事件生成任务、plan、todo、usage、continuation 和恢复相关投影。
 4. `checkpoint.json` 保存已 fold sequence 和 `EventFoldState`，损坏或落后时从 Journal 重建。
 5. `plan.json`、`run-state.json` 是 read projection，不建立第二套状态机或 mutation owner。
-6. Trace 不能用于判断 PlanTask 或 TaskRun 是否已经提交。
+6. Todo、latest Summary 和 Completion Gate 与运行态共享有界的
+   `EventFoldState/checkpoint.json`。Artifact/Review 全历史不进入每事件重写的 checkpoint；它们
+   分别进入增量 Artifact segment 和按 stable task key 安全编码的 Review segment。生产查询只
+   扫描返回结果对应 segment 加未投影 suffix，不从 sequence 0 重扫 `events.jsonl`。
+7. history segment 与 cursor 都没有独立 mutation/sequence authority；共享 cursor 只在所有相关
+   segment 及其 companion metadata durable 后推进。metadata 保存 count、最后 relevant source
+   sequence 和增量 SHA-256 hash-chain，查询全量扫描返回结果时重算校验，能识别语法合法的前缀
+   截断或空文件。segment 缺失、损坏或 partial crash 时，`RunAuthority` 从 Journal 去重重放或
+   重建；完整重建会替换 review 目录，清除 stale segment。
+8. Trace 不能用于判断 PlanTask 或 TaskRun 是否已经提交。
 
 ### 为什么 checkpoint 不是第二份权威
 
 恢复过程先验证 checkpoint 是否不超过 Journal 尾部，再加载 checkpoint 并重放缺失后缀。checkpoint 缺失、损坏或过期时，`CheckpointedReducer` 从 `events.jsonl` 重建并修复它。
+
+TaskRuntime checkpoint 还带 EKO query projection schema。旧 schema 即使 sequence 位于 journal
+head 也不能当作新鲜投影，因为新增索引会缺失；运行时会在 recovery 中逻辑忽略旧 frame、
+重放完整 journal，再 best-effort 原子发布新 checkpoint。删除或写入因只读权限失败时只记录
+degraded observability，不阻断正确查询；该迁移不改变事件格式，也不会产生第二份事实权威。
 
 因此：
 
 ```text
 可以删除 checkpoint 后从 events.jsonl 恢复；
 不能删除 events.jsonl 后把 checkpoint 当成完整事实历史。
+artifact/review history segment 和 history cursor 同样可以删除重建；它们不能替代 events.jsonl。
 ```
 
 ## 普通聊天：独立的 Chat Journal
@@ -130,6 +150,7 @@ Trace 写入失败当前不会回滚 TaskRuntime 已提交事件，因此 Trace 
 - TaskRuntime facade：`echo-agent-app-core/src/tasks/task_runtime/store.rs`
 - Task Journal/checkpoint authority：`echo-agent-app-core/src/tasks/task_runtime/run_authority.rs`
 - Task projection/read side：`echo-agent-app-core/src/tasks/task_runtime/file_store.rs`
+- 有界查询投影决策：`docs/adr/0008-taskruntime-bounded-query-projections.md`
 - Task recovery/shadow path：`echo-agent-app-core/src/tasks/task_runtime/file_shadow.rs`
 - 普通 Chat Journal：`echo-agent-app-core/src/chat_event_log.rs`
 - Observability projection：`echo-agent-app-core/src/observability/`

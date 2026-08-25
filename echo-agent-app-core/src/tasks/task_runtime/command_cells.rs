@@ -1742,16 +1742,17 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 })
                 .await;
             match start_commit {
-                Ok(super::store::BackgroundCellStartCommit::Durable) => {
+                Ok(super::store::ProjectionCommitReceipt::Durable { .. }) => {
                     self.service.track(&scope, &cell_id, receipt.deadline);
                 }
-                Ok(super::store::BackgroundCellStartCommit::CommittedProjectionDegraded {
+                Ok(super::store::ProjectionCommitReceipt::CommittedProjectionDegraded {
+                    seq,
                     detail,
                 }) => {
                     self.service.track(&scope, &cell_id, receipt.deadline);
                     let _ = self.service.inner.abort_prepared(
                         reservation,
-                        format!("Started projection degraded: {detail}"),
+                        format!("Started event {seq} projection degraded: {detail}"),
                     );
                     self.spawn_observer(
                         observation,
@@ -1764,7 +1765,9 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                         operation_reservation,
                     )?;
                     return Err(CommandCellError::Runtime {
-                        message: format!("cell start committed but projection degraded: {detail}"),
+                        message: format!(
+                            "cell start event {seq} committed but projection degraded: {detail}"
+                        ),
                     });
                 }
                 Err(error) => {
