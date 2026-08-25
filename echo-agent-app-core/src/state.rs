@@ -344,7 +344,11 @@ impl ConnectionState {
     ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
     {
         let binding = self.conversation_binding.read().await;
-        if let Err(error) = binding.deletions.ensure_admission_allowed(conversation_id) {
+        if let Err(error) = binding
+            .deletions
+            .ensure_admission_allowed(conversation_id, None)
+            .await
+        {
             return Err(crate::agent_pool::PoolError::ConversationDeletionPending {
                 conversation_id: conversation_id.to_string(),
                 reason: error.to_string(),
@@ -480,6 +484,7 @@ pub struct SessionState {
     pub tool_states: RwLock<HashMap<String, ToolState>>,
     /// Cancellation registry for non-chat operations such as analysis jobs.
     pub analysis_runs: Arc<crate::product_data_io::AnalysisRunSupervisor>,
+    pub product_data_io: crate::product_data_io::ProductDataIoService,
     /// Application authority for foreground chat admission and cancellation.
     pub foreground_turns: crate::foreground_turn::ForegroundTurnControl,
 }
@@ -729,6 +734,14 @@ impl ScopedWorkspaceIoReceipt {
         self.identity.data_root()
     }
 
+    pub fn workspace_id(&self) -> &str {
+        self.identity.workspace_id()
+    }
+
+    pub fn host_generation(&self) -> &str {
+        self.identity.host_generation()
+    }
+
     pub fn invocation(&self) -> WorkspaceIoInvocation {
         WorkspaceIoInvocation {
             data_root: self.identity.data_root().to_path_buf(),
@@ -739,8 +752,8 @@ impl ScopedWorkspaceIoReceipt {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn global_for_test(data_root: impl Into<std::path::PathBuf>) -> Self {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn global_for_test(data_root: impl Into<std::path::PathBuf>) -> Self {
         Self {
             _lifetime: ScopedRuntimeLifetime::Global,
             identity: crate::workspace::WorkspaceIoIdentity::global(data_root),
@@ -957,7 +970,11 @@ impl ScopedChatRuntime {
             .as_ref()
             .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
         self.deletions
-            .ensure_conversation(store.as_ref(), conversation)
+            .ensure_conversation(
+                store.as_ref(),
+                conversation,
+                Some(self.workspace_io_receipt()),
+            )
             .await
     }
 
@@ -978,6 +995,7 @@ impl ScopedChatRuntime {
                 surface,
                 conversation_id,
                 turn_id,
+                Some(self.workspace_io_receipt()),
             )
             .await
     }
@@ -987,7 +1005,11 @@ impl ScopedChatRuntime {
         conversation_id: &str,
     ) -> std::result::Result<crate::agent_pool::AgentPoolExecutionLease, crate::agent_pool::PoolError>
     {
-        if let Err(error) = self.deletions.ensure_admission_allowed(conversation_id) {
+        if let Err(error) = self
+            .deletions
+            .ensure_admission_allowed(conversation_id, Some(self.workspace_io_receipt()))
+            .await
+        {
             return Err(crate::agent_pool::PoolError::ConversationDeletionPending {
                 conversation_id: conversation_id.to_string(),
                 reason: error.to_string(),
@@ -1300,6 +1322,7 @@ impl AppState {
     }
 
     /// 从共享的 Agent 和 HITL Dispatcher 创建状态（用于双模式）
+    #[allow(clippy::too_many_arguments)]
     pub fn from_shared(
         agent: AgentHandle,
         model_consumers: Option<crate::infra::AgentModelConsumers>,
@@ -1308,6 +1331,7 @@ impl AppState {
         runtime_state_store: Option<Arc<dyn RuntimeStateStore>>,
         app_config: crate::config::EkoConfig,
         mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
+        product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> anyhow::Result<Self> {
         let config = agent
             .try_write(|guard| WebConfig {
@@ -1345,7 +1369,9 @@ impl AppState {
             store: conversation_store,
             runtime_state: runtime_state_store,
             deletions: Arc::new(
-                crate::conversation_deletion::ConversationDeletionService::at_default_root(),
+                crate::conversation_deletion::ConversationDeletionService::at_default_root_with_product_data_io(
+                    product_data_io.clone(),
+                ),
             ),
         };
         let conversation_binding = Arc::new(RwLock::new(global_conversation.clone()));
@@ -1374,6 +1400,7 @@ impl AppState {
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
                 analysis_runs: Arc::new(crate::product_data_io::AnalysisRunSupervisor::default()),
+                product_data_io: product_data_io.clone(),
                 foreground_turns: crate::foreground_turn::ForegroundTurnControl::default(),
             },
             plugins: PluginState {
@@ -1441,7 +1468,11 @@ impl AppState {
             },
             workspace: WorkspaceState {
                 current: RwLock::new(None),
-                runtimes: Arc::new(crate::workspace::runtime::WorkspaceRuntimeRegistry::new()),
+                runtimes: Arc::new(
+                    crate::workspace::runtime::WorkspaceRuntimeRegistry::new_with_product_data_io(
+                        product_data_io,
+                    ),
+                ),
                 global_conversation,
                 transition: Arc::new(RwLock::new(())),
                 transitioning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1914,14 +1945,21 @@ impl AppState {
     ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
     {
         let _workspace = self.workspace.transition.read().await;
-        let binding = self.storage.conversation.read().await;
-        let store = binding
-            .store
-            .as_ref()
+        let runtime = self.current_chat_runtime_inner().await.map_err(|error| {
+            crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                error.to_string(),
+            )
+        })?;
+        let store = runtime
+            .conversation_store()
             .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
-        binding
+        runtime
             .deletions
-            .create_conversation(store.as_ref(), conversation)
+            .create_conversation(
+                store.as_ref(),
+                conversation,
+                Some(runtime.workspace_io_receipt()),
+            )
             .await
     }
 
@@ -1932,14 +1970,21 @@ impl AppState {
     ) -> std::result::Result<Conversation, crate::conversation_deletion::ConversationDeletionError>
     {
         let _workspace = self.workspace.transition.read().await;
-        let binding = self.storage.conversation.read().await;
-        let store = binding
-            .store
-            .as_ref()
+        let runtime = self.current_chat_runtime_inner().await.map_err(|error| {
+            crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                error.to_string(),
+            )
+        })?;
+        let store = runtime
+            .conversation_store()
             .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
-        binding
+        runtime
             .deletions
-            .ensure_conversation(store.as_ref(), conversation)
+            .ensure_conversation(
+                store.as_ref(),
+                conversation,
+                Some(runtime.workspace_io_receipt()),
+            )
             .await
     }
 
@@ -1954,16 +1999,20 @@ impl AppState {
         crate::conversation_deletion::ConversationDeletionError,
     > {
         let _workspace = self.workspace.transition.read().await;
-        let execution_scope = self.current_execution_scope().await;
-        let binding = self.storage.conversation.read().await;
-        binding
+        let runtime = self.current_chat_runtime_inner().await.map_err(|error| {
+            crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                error.to_string(),
+            )
+        })?;
+        runtime
             .deletions
             .begin_foreground_turn_scoped(
                 &self.session.foreground_turns,
-                execution_scope.workspace_id(),
+                runtime.execution_scope().workspace_id(),
                 surface,
                 conversation_id,
                 turn_id,
+                Some(runtime.workspace_io_receipt()),
             )
             .await
     }
@@ -2032,6 +2081,7 @@ impl AppState {
                 runtime.runtime_state_store(),
                 &self.session.foreground_turns,
                 artifact_config,
+                runtime.workspace_io_receipt(),
             )
             .await
     }
@@ -2044,14 +2094,22 @@ impl AppState {
         crate::conversation_deletion::ConversationDeletionError,
     > {
         let _workspace = self.workspace.transition.read().await;
-        let binding = self.storage.conversation.read().await;
-        let store = binding
-            .store
-            .as_ref()
+        let runtime = self.current_chat_runtime_inner().await.map_err(|error| {
+            crate::conversation_deletion::ConversationDeletionError::ConversationStore(
+                error.to_string(),
+            )
+        })?;
+        let store = runtime
+            .conversation_store()
             .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
-        binding
+        runtime
             .deletions
-            .recover_committed_deletions(store.as_ref())
+            .recover_committed_deletions(
+                store,
+                runtime.runtime_state_store(),
+                runtime.pool(),
+                Some(runtime.workspace_io_receipt()),
+            )
             .await
     }
 
@@ -3098,11 +3156,14 @@ impl AppState {
         }
         let registry = Arc::clone(&self.workspace.registry);
         let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
-        let workspace = crate::product_data_io::run("inspect workspace control scope", move || {
-            registry.inspect(&id).map_err(anyhow::Error::msg)
-        })
-        .await
-        .map_err(anyhow::Error::msg)??;
+        let workspace = self
+            .session
+            .product_data_io
+            .run("inspect workspace control scope", move || {
+                registry.inspect(&id).map_err(anyhow::Error::msg)
+            })
+            .await
+            .map_err(anyhow::Error::msg)??;
         let runtime = self
             .chat_runtime_for_workspace_locked(workspace.clone())
             .await?;
@@ -3128,8 +3189,10 @@ impl AppState {
         } else {
             let registry = Arc::clone(&self.workspace.registry);
             let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
-            let workspace =
-                crate::product_data_io::run("resolve product-data workspace", move || {
+            let workspace = self
+                .session
+                .product_data_io
+                .run("resolve product-data workspace", move || {
                     registry.inspect(&id).map_err(anyhow::Error::msg)
                 })
                 .await
@@ -3152,6 +3215,7 @@ impl AppState {
         Ok(crate::product_data_io::ScopedProductData::new(
             control,
             Arc::clone(&self.session.analysis_runs),
+            self.session.product_data_io.clone(),
         ))
     }
 
@@ -3196,6 +3260,7 @@ impl AppState {
         Ok(crate::product_data_io::ScopedProductData::new(
             control,
             Arc::clone(&self.session.analysis_runs),
+            self.session.product_data_io.clone(),
         ))
     }
 
@@ -3211,11 +3276,13 @@ impl AppState {
             let registry = Arc::clone(&self.workspace.registry);
             let id = crate::workspace::WorkspaceId::from_raw(workspace_id.to_string());
             Some(
-                crate::product_data_io::run("resolve runtime product-data workspace", move || {
-                    registry.inspect(&id).map_err(anyhow::Error::msg)
-                })
-                .await
-                .map_err(anyhow::Error::msg)??,
+                self.session
+                    .product_data_io
+                    .run("resolve runtime product-data workspace", move || {
+                        registry.inspect(&id).map_err(anyhow::Error::msg)
+                    })
+                    .await
+                    .map_err(anyhow::Error::msg)??,
             )
         };
         let control = ScopedWorkspaceControl {
@@ -3225,6 +3292,7 @@ impl AppState {
         Ok(crate::product_data_io::ScopedProductData::new(
             control,
             Arc::clone(&self.session.analysis_runs),
+            self.session.product_data_io.clone(),
         ))
     }
 
@@ -3822,6 +3890,9 @@ impl AppState {
         self.scheduler.cancel_token.cancel();
         self.tasks.cancel_token.cancel();
         self.begin_analysis_run_shutdown();
+        if let Err(error) = self.session.product_data_io.begin_shutdown() {
+            failures.push(format!("product-data I/O: {error}"));
+        }
         if let Err(error) = self.session.foreground_turns.begin_shutdown() {
             failures.push(format!("foreground turns: {error}"));
         }
@@ -5135,6 +5206,7 @@ mod model_mutation_tests {
             None,
             config,
             mcp_runtime,
+            crate::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?
         .with_active_model_id(active_runtime.id)
@@ -6129,6 +6201,7 @@ mod workspace_transition_tests {
             None,
             Default::default(),
             mcp,
+            crate::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?
         .with_workspace_delete_hook(hook.clone());
@@ -6425,6 +6498,7 @@ mod workspace_transition_tests {
             None,
             Default::default(),
             mcp,
+            crate::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?
         .with_agent_router(Arc::new(crate::agent_router::AgentRouter::new(
@@ -6632,6 +6706,7 @@ mod workspace_transition_tests {
             None,
             Default::default(),
             mcp,
+            crate::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?
         .with_agent_router(Arc::new(crate::agent_router::AgentRouter::new(
@@ -7237,6 +7312,7 @@ mod workspace_transition_tests {
             None,
             Default::default(),
             mcp_runtime,
+            crate::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?;
         state.tasks.runtime = Some(Arc::new(
@@ -8076,6 +8152,7 @@ mod service_bootstrap_tests {
             None,
             Default::default(),
             mcp_runtime,
+            crate::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?;
         let runtime_store = Arc::new(
@@ -8116,6 +8193,7 @@ mod service_bootstrap_tests {
             None,
             Default::default(),
             mcp_runtime,
+            crate::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?;
         let global = Arc::new(

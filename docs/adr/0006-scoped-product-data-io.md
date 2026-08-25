@@ -35,6 +35,14 @@ Relevant mature-runtime guidance:
 - [Tokio `spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html)
   requires blocking work to leave async workers, notes that started blocking
   tasks cannot be aborted, and recommends limiting parallel work where needed.
+- [Tokio graceful shutdown](https://tokio.rs/tokio/topics/shutdown) combines an
+  explicit cancellation/admission signal with a tracker that waits for owned
+  tasks to finish. A process-global task owner is therefore not equivalent to
+  an application-generation owner when several AppState instances overlap or
+  restart in one process.
+- [`TaskTracker::close` and `wait`](https://docs.rs/tokio-util/latest/tokio_util/task/task_tracker/struct.TaskTracker.html)
+  model the same two-phase contract used here: close one owner's admission,
+  then wait until every task admitted by that owner has exited.
 - [React `useEffect`](https://react.dev/reference/react/useEffect#fetching-data-with-effects)
   documents ignoring obsolete network responses to avoid request races.
 - [Tauri commands](https://v2.tauri.app/develop/calling-rust/) support explicit
@@ -81,12 +89,26 @@ project relinking busy after an outer waiter is cancelled.
 2. Project files use `ScopedWorkspaceControl::project_root()`. A linked
    project changes the file-browser root without moving EKO-owned research or
    analysis data.
-3. Synchronous file, research, and analysis I/O enters the application-owned,
-   process-wide bounded `ProductDataIo` adapter. The adapter owns no data and
-   does not replace domain stores.
-4. Tauri closures capture the scoped control value, so workspace deletion is
+3. Synchronous file, research, and analysis I/O enters one cloneable
+   `ProductDataIoService` created by `AgentRuntime` for the current application
+   generation. `AppState`, CommandCell, analytics, workspace recovery and
+   Agent-owned research tools receive that same service. The process-wide
+   semaphore limits aggregate blocking concurrency, but it owns no lifecycle.
+   `ApplicationLifecycleOwner` seals this generation's product-data admission
+   in phase one together with top-level producer admission. New standalone I/O
+   and new flows are rejected immediately. There is no production free-run
+   adapter or static operation owner.
+4. Every accepted multi-stage producer obtains one cloneable async-flow receipt
+   before its first provider/transform await. Manual compression, aggregate
+   deletion/recovery, analysis/analytics, research/AutoIngest, CommandCell,
+   workspace preparation and channel attachment preparation use only that
+   receipt's nested-I/O token afterward. Nested I/O stays legal after phase-one
+   seal until the flow publishes stable settlement. Dropping the surface waiter
+   cannot cancel the existing subsystem owner; durable failure remains typed
+   shutdown debt (and deletion also retains its retryable tombstone).
+5. Tauri closures capture the scoped control value, so workspace deletion is
    busy until non-abortable blocking work settles.
-5. Analysis execution acquires its Agent from the scoped runtime. Cancellation
+6. Analysis execution acquires its Agent from the scoped runtime. Cancellation
    identity is the pair `(workspace_id, analysis_id)`. An app-owned
    `AnalysisRunSupervisor` retains the exact control receipt and JoinHandle;
    `run` returns immediately, while `wait` reports Started/Joined for the same
@@ -94,40 +116,40 @@ project relinking busy after an outer waiter is cancelled.
    joining cleanup. Successful join removes active ownership immediately and
    places only the result in a bounded completed-receipt cache, so abandoned
    callers cannot keep a workspace busy.
-6. CLI, TUI, GUI, and channel commands use the same `ScopedProductData` and
+7. CLI, TUI, GUI, and channel commands use the same `ScopedProductData` and
    shared analysis/research command catalogs; they never infer roots from a
    long-lived Agent. Analysis save accepts the full typed request (title,
    script, expected revision, inputs, parameters, and random seed), and run,
    edit, and delete acquire one atomic cross-surface owner.
-7. Frontend requests carry both scope fields. File state rejects mismatched
+8. Frontend requests carry both scope fields. File state rejects mismatched
    responses; workspace-incarnation keys remount research/analysis/file panels,
    and long-lived panel requests check the captured scope before publishing.
-8. Agent-owned product-data work uses a cloneable `ScopedWorkspaceIoReceipt`
+9. Agent-owned product-data work uses a cloneable `ScopedWorkspaceIoReceipt`
    containing only the exact runtime lifetime and immutable EKO host identity
    (`workspace_id`, host creation generation, and data root).
    `ChatResources`, foreground wrappers, and continuations copy that receipt
    without reacquiring focus. EKO places the root in the invocation value and
    wraps the receipt and identity in the framework's opaque, identified
    `InvocationResourceGuard`.
-9. Each workspace Agent pool owns its own ToolManager and installs AutoIngest
-   with the same immutable host identity, without retaining a control lease.
-   AutoIngest requires exactly one invocation guard that both satisfies
-   `retains::<ScopedWorkspaceIoReceipt>()` and matches that identity. Its root
-   comes from the workspace-local descriptor, never `ToolContext.working_dir`,
-   which writer isolation may replace with a worktree. EKO discards unrelated,
-   mismatched, and ambiguous guards, clones only the exact receipt guard into
-   its non-abortable blocking
-   closure, and reports a typed persistence failure without writing when the
-   root or typed receipt is absent. Local
-   TaskRuntime main-Agent and Subagent paths propagate the same authority.
-   Background recovery and cross-workspace targets that cannot produce the
-   exact target receipt fail closed instead of borrowing another workspace's
-   authority.
-10. `create_complex_task` captures `WorkspaceIoInvocation` in its fully owned
+10. Each workspace Agent pool owns its own ToolManager and installs AutoIngest
+    with the same immutable host identity, without retaining a control lease.
+    AutoIngest requires exactly one invocation guard that both satisfies
+    `retains::<ScopedWorkspaceIoReceipt>()` and matches that identity. Its root
+    comes from the workspace-local descriptor, never `ToolContext.working_dir`,
+    which writer isolation may replace with a worktree. EKO discards unrelated,
+    mismatched, and ambiguous guards, clones only the exact receipt guard into
+    its non-abortable blocking
+    closure, and reports a typed persistence failure without writing when the
+    root or typed receipt is absent. Local
+    TaskRuntime main-Agent and Subagent paths propagate the same authority.
+    Background recovery and cross-workspace targets that cannot produce the
+    exact target receipt fail closed instead of borrowing another workspace's
+    authority.
+11. `create_complex_task` captures `WorkspaceIoInvocation` in its fully owned
     `RunPayload`. The canonical background driver carries it through planning,
     `task_execute`, main-Agent, and Subagent invocations; dropping the surface
     waiter therefore cannot strip authority from already-started persistence.
-11. Read-only workspace IPC uses bounded `WorkspaceRegistry::inspect`.
+12. Read-only workspace IPC uses bounded `WorkspaceRegistry::inspect`.
     Switching enters the owned transition directly and performs its single
     activity update there; no stale pre-opened workspace record can overwrite
     a concurrent project-link revision.
@@ -143,6 +165,11 @@ project relinking busy after an outer waiter is cancelled.
   pass generation validation against the new root.
 - Blocking filesystem concurrency is bounded and Tokio heartbeat remains
   responsive.
+- Dropping one async waiter does not detach accepted I/O: the service-owned task
+  retains the semaphore permit, closure inputs and workspace receipt until
+  stable settlement. Shutting down one AppState cannot close another live
+  AppState, and a fully joined generation does not poison a later in-process
+  restart.
 - Analysis cleanup timeout or task failure is returned as a typed receipt and
   deliberately retains the workspace control owner. Analysis/workspace delete
   remains busy until a successful join proves the backend terminal safe point.

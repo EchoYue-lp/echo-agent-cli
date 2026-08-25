@@ -1619,6 +1619,11 @@ async fn drive_chat_inner(
             &visible_tools,
         );
         let visible_tools = Some(visible_tools);
+        let runtime_state_id = guard.conversation_id().map(str::to_string);
+        let transcript_generation_id = runtime_state_id
+            .as_ref()
+            .filter(|runtime_state_id| conversation_id.as_ref() != Some(runtime_state_id))
+            .cloned();
 
         let (working_dir, resource_guards) = res.workspace_io_receipt.as_ref().map_or_else(
             || (Some(res.execution_scope.root().to_path_buf()), Vec::new()),
@@ -1647,10 +1652,8 @@ async fn drive_chat_inner(
         .map_err(|error| error.to_string())?;
         let invocation = echo_agent::agent::AgentInvocationContext {
             history: None,
-            // Product conversation remains the legacy runtime-state identity.
-            // Channel session incarnations override these fields at their adapter.
-            runtime_state_id: None,
-            transcript_generation_id: None,
+            runtime_state_id,
+            transcript_generation_id,
             runtime: Some(echo_agent::tools::ExternalRunContext {
                 conversation_id,
                 // A real pre-created Task-mode run is value-carried across

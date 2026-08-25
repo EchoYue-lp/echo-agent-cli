@@ -377,6 +377,7 @@ pub fn delete_analysis(workspace_root: &Path, analysis_id: &str) -> AnalysisResu
 
 pub async fn run_analysis_with_product_data(
     product_data: &crate::product_data_io::ScopedProductData,
+    flow: &crate::product_data_io::ProductDataIoFlow,
     analysis_id: &str,
     cancel: Option<Arc<CancellationToken>>,
 ) -> AnalysisResult<AnalysisDocument> {
@@ -395,7 +396,7 @@ pub async fn run_analysis_with_product_data(
         cancel,
         None,
         true,
-        Some(product_data),
+        Some(flow),
     )
     .await;
     drop(execution);
@@ -428,7 +429,7 @@ async fn run_analysis_with_runtime(
     cancel: Option<Arc<CancellationToken>>,
     runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
     prepare_managed_runtime: bool,
-    product_data: Option<&crate::product_data_io::ScopedProductData>,
+    product_data: Option<&crate::product_data_io::ProductDataIoFlow>,
 ) -> AnalysisResult<AnalysisDocument> {
     let timer = Instant::now();
     let root = workspace_root.to_path_buf();
@@ -461,10 +462,29 @@ async fn run_analysis_with_runtime(
         && prepare_managed_runtime
         && prepared.document.manifest.language == AnalysisLanguage::Python
     {
-        match crate::analysis_runtime::AnalyticsRuntime::default()
-            .prepare_python_with_cancel(cancel.clone())
-            .await
-        {
+        let prepared_runtime = match product_data {
+            Some(product_data) => {
+                crate::analysis_runtime::AnalyticsRuntime::with_product_data_io(
+                    product_data.service(),
+                )
+                .prepare_python_with_product_flow(product_data, cancel.clone())
+                .await
+            }
+            #[cfg(test)]
+            None => {
+                crate::analysis_runtime::AnalyticsRuntime::default()
+                    .prepare_python_with_cancel(cancel.clone())
+                    .await
+            }
+            #[cfg(not(test))]
+            None => {
+                return Err(AnalysisError::Execution(
+                    "analysis runtime preparation requires an application-owned product-data scope"
+                        .to_string(),
+                ));
+            }
+        };
+        match prepared_runtime {
             Ok(runtime) => Some(runtime),
             Err(error) => {
                 let terminal = terminal_from_runtime_error(&error);
@@ -563,7 +583,7 @@ async fn settle_analysis_run(
     terminal: AnalysisTerminal,
     timer: Instant,
     runtime: Option<&crate::analysis_runtime::PreparedAnalyticsRuntime>,
-    product_data: Option<&crate::product_data_io::ScopedProductData>,
+    product_data: Option<&crate::product_data_io::ProductDataIoFlow>,
 ) -> AnalysisResult<AnalysisDocument> {
     let runtime_environment = runtime
         .map(|runtime| runtime.environment.clone())
@@ -609,7 +629,7 @@ async fn settle_analysis_run(
 }
 
 async fn run_analysis_io<T, F>(
-    product_data: Option<&crate::product_data_io::ScopedProductData>,
+    product_data: Option<&crate::product_data_io::ProductDataIoFlow>,
     operation: &'static str,
     function: F,
 ) -> AnalysisResult<T>
@@ -617,13 +637,21 @@ where
     T: Send + 'static,
     F: FnOnce() -> AnalysisResult<T> + Send + 'static,
 {
-    let receipt = product_data.map(crate::product_data_io::ScopedProductData::settlement_receipt);
-    crate::product_data_io::run(operation, move || {
-        let _receipt = receipt;
-        function()
-    })
-    .await
-    .map_err(|error| AnalysisError::Execution(error.to_string()))?
+    match product_data {
+        Some(product_data) => product_data
+            .run(operation, function)
+            .await
+            .map_err(|error| AnalysisError::Execution(error.to_string()))?,
+        #[cfg(test)]
+        None => crate::product_data_io::ProductDataIoService::new()
+            .run(operation, function)
+            .await
+            .map_err(|error| AnalysisError::Execution(error.to_string()))?,
+        #[cfg(not(test))]
+        None => Err(AnalysisError::Execution(
+            "analysis product-data I/O requires an application-owned scope".to_string(),
+        )),
+    }
 }
 
 pub fn format_analysis_list(summaries: &[AnalysisSummary]) -> String {

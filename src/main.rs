@@ -172,6 +172,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         task_runtime_store: None,
         browser_runtime: None,
         command_cell_runtime: None,
+        product_data_io: None,
         execution_scope: None,
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
@@ -329,6 +330,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 config_watcher: config_watcher.clone(),
                 foreground_turns: foreground_turns.clone(),
                 command_cell_runtime: runtime.command_cell_runtime.clone(),
+                product_data_io: runtime.product_data_io.clone(),
                 browser_runtime: runtime.browser_runtime.clone(),
                 lifecycle,
             },
@@ -446,6 +448,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             config_watcher: config_watcher.clone(),
             foreground_turns: foreground_turns.clone(),
             command_cell_runtime: runtime.command_cell_runtime.clone(),
+            product_data_io: runtime.product_data_io.clone(),
             browser_runtime: runtime.browser_runtime.clone(),
             lifecycle,
         },
@@ -516,10 +519,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             let channels_cancel = echo_agent::agent::CancellationToken::new();
             let channels_handle = tokio::spawn(cli::run_channels_mode(cli::ChannelsModeArgs {
                 app_state: headless_services.app_state.clone(),
-                pool: pool.clone(),
                 app_config: app_config.clone(),
-                task_runtime_store: task_runtime_store.clone(),
-                review_integration: runtime.review_integration.clone(),
                 webhook_emitter: webhook_emitter.clone(),
                 foreground_turns: foreground_turns.clone(),
                 shutdown: channels_cancel.clone(),
@@ -677,6 +677,9 @@ mod tests {
             task_runtime_store: None,
             browser_runtime: None,
             command_cell_runtime: None,
+            product_data_io: Some(
+                echo_agent_app_core::product_data_io::ProductDataIoService::new(),
+            ),
             execution_scope: None,
         };
         let mut app_config = config::EkoConfig::default();

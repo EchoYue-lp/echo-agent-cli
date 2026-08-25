@@ -13,6 +13,11 @@ const APP_AGENT_POOL: &str = include_str!("../../agent_pool.rs");
 const APP_CHAT_DRIVER: &str = include_str!("../../chat_driver.rs");
 const APP_TURN_CONTEXT: &str = include_str!("../../turn_context.rs");
 const APP_MANUAL_COMPRESSION: &str = include_str!("../../manual_compression.rs");
+const APP_PRODUCT_DATA_IO: &str = include_str!("../../product_data_io.rs");
+const APP_ANALYSIS_RUNTIME: &str = include_str!("../../analysis_runtime.rs");
+const APP_ANALYSIS: &str = include_str!("../../analysis.rs");
+const APP_RESEARCH_CONNECTORS: &str = include_str!("../../research_connectors.rs");
+const APP_RESEARCH_TOOL: &str = include_str!("../../research_tool.rs");
 const APP_RUNTIME: &str = include_str!("../../runtime.rs");
 const APP_WORKSPACE_RUNTIME: &str = include_str!("../../workspace/runtime.rs");
 const APP_EXECUTOR: &str = include_str!("executor.rs");
@@ -32,6 +37,9 @@ const APP_TAURI: &str = include_str!("../../../../src/tauri/mod.rs");
 const APP_TAURI_TASK_RUNTIME: &str = include_str!("../../../../src/tauri/commands/task_runtime.rs");
 const APP_TAURI_TASKS: &str = include_str!("../../../../src/tauri/commands/tasks.rs");
 const APP_TAURI_CHAT: &str = include_str!("../../../../src/tauri/commands/chat.rs");
+const APP_TAURI_FILES: &str = include_str!("../../../../src/tauri/commands/files.rs");
+const APP_TAURI_RESEARCH: &str = include_str!("../../../../src/tauri/commands/research.rs");
+const APP_TAURI_WORKSPACE: &str = include_str!("../../../../src/tauri/commands/workspace.rs");
 const APP_TUI_EVENTS: &str = include_str!("../../../../src/tui/events.rs");
 const APP_CLI_TASKS: &str = include_str!("../../../../src/cli/cmd_impls/tasks_ext.rs");
 const APP_CLI_REPL: &str = include_str!("../../../../src/cli/repl.rs");
@@ -506,7 +514,7 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
     )?;
     require(
         awaiter_publish,
-        "product_data_io::run(\"persist Awaiter Ready fact\"",
+        ".run(\"persist Awaiter Ready fact\"",
         "Awaiter Ready fact bypasses bounded product-data I/O",
     )?;
     require_absent(
@@ -576,7 +584,7 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
     )?;
     require(
         tauri_append,
-        "product_data_io::run(\"append GUI chat projection\"",
+        ".run(\"append GUI chat projection\"",
         "Tauri chat projection bypasses bounded product-data I/O",
     )?;
     require(
@@ -592,7 +600,7 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
     )?;
     require(
         manual_compression,
-        "product_data_io::run(",
+        "let appended = flow",
         "manual compression safe point bypasses bounded product-data I/O",
     )?;
     require(
@@ -646,6 +654,94 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
         "Result<u8, IpcError>",
         "TaskRuntime interaction-mode IPC regressed to a numeric contract",
     )
+}
+
+#[test]
+fn async_product_data_io_requires_an_application_owned_service() -> Result<(), String> {
+    for (name, source) in [
+        ("product_data_io", APP_PRODUCT_DATA_IO),
+        ("analysis_runtime", APP_ANALYSIS_RUNTIME),
+        ("analysis", APP_ANALYSIS),
+        ("research_connectors", APP_RESEARCH_CONNECTORS),
+        ("research_tool", APP_RESEARCH_TOOL),
+        ("command_cells", APP_COMMAND_CELLS),
+        ("manual_compression", APP_MANUAL_COMPRESSION),
+        ("runtime", APP_RUNTIME),
+        ("state", APP_STATE),
+        ("workspace_runtime", APP_WORKSPACE_RUNTIME),
+        ("infra", APP_INFRA),
+        ("channels", APP_CHANNELS),
+        ("tauri_chat", APP_TAURI_CHAT),
+        ("tauri_files", APP_TAURI_FILES),
+        ("tauri_research", APP_TAURI_RESEARCH),
+        ("tauri_workspace", APP_TAURI_WORKSPACE),
+    ] {
+        require_absent(
+            before_test_module(source),
+            "product_data_io::run(",
+            &format!("{name} uses process-global product-data I/O without lifecycle settlement"),
+        )?;
+    }
+    require(
+        APP_CONVERSATION_DELETION,
+        "begin_owned_flow(\"delete conversation aggregate\")",
+        "conversation deletion is not owned across surface caller drop",
+    )?;
+    require(
+        APP_CONVERSATION_DELETION,
+        "DeletionIo::Flow(flow)",
+        "conversation deletion cannot continue nested I/O after service seal",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn accepted_multi_stage_product_data_uses_flow_scoped_nested_io() -> Result<(), String> {
+    for (name, source, marker) in [
+        (
+            "manual compression",
+            APP_MANUAL_COMPRESSION,
+            "begin_owned_flow(\"manual context compression\")",
+        ),
+        (
+            "analytics runtime",
+            APP_ANALYSIS_RUNTIME,
+            "begin_owned_flow(\"prepare analytics runtime\")",
+        ),
+        (
+            "research connectors",
+            APP_RESEARCH_CONNECTORS,
+            "begin_owned_flow(\"automatic research ingest\")",
+        ),
+        ("command cells", APP_COMMAND_CELLS, "product_data_flow"),
+        (
+            "workspace runtime",
+            APP_WORKSPACE_RUNTIME,
+            "begin_owned_flow(\"prepare workspace runtime resources\")",
+        ),
+        (
+            "channel turn preparation",
+            APP_CHANNELS,
+            "begin_owned_flow(\"prepare channel user turn\")",
+        ),
+    ] {
+        require(
+            before_test_module(source),
+            marker,
+            &format!("{name} does not admit product-data before its awaited producer phase"),
+        )?;
+    }
+    require(
+        APP_ANALYSIS,
+        "Option<&crate::product_data_io::ProductDataIoFlow>",
+        "analysis late persistence does not reuse the supervisor-owned flow",
+    )?;
+    require(
+        APP_RUNTIME,
+        "product_data_io.begin_shutdown()",
+        "application phase one does not seal new product-data admission",
+    )?;
+    Ok(())
 }
 
 #[test]

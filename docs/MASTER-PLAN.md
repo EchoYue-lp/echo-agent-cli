@@ -1,6 +1,6 @@
 # EKO 当前项目状态
 
-Last updated: 2026-08-23
+Last updated: 2026-08-25
 
 本文是跨会话恢复工作的简短事实源，只记录当前权威路径、未完成工作和下一步。
 已完成里程碑不在这里保留实施日志；长期有效能力见 [功能总览](./features.md)。
@@ -88,6 +88,22 @@ interrupt、process Subagent permit、Ready/Acknowledged replay、完整 Provide
 surface projector、global/workspace 普通 conversation boot resume，以及 checkpoint-backed hot
 state、运行边界索引、10k/100k 性能门、真实 Agent/Awaiter/surface 故障矩阵和 bounded smoke。
 长时间集成测试不再阻塞功能阶段，统一归项目 Final Integration Gate。
+
+### Channel session incarnation and product-data settlement
+
+状态：projection authority 已合入，channel focused compile/fault matrix 全绿；等待正式提交集成与
+full workspace/GUI 门禁。
+
+- framework sender-scoped session incarnation 是 channel model context 的唯一 identity；稳定 product
+  conversation 继续拥有 ChatEventLog、TaskRun 与 UI 历史。
+- timeout/reset 通过 exact workspace generation + runtime-state key obligation 关闭 pool admission、等待
+  foreground/lease、回收 checkpoint/transcript，并只在全部成功后 rotate；产品删除最终枚举并回收该
+  stable scope 的全部 live/durable incarnation。
+- `ProductDataIoService` 按 application generation 拥有附件、压缩、删除、CommandCell、analytics 与
+  research blocking I/O。process semaphore 只限流；phase one seal 新 direct/flow admission，已接纳
+  producer 通过 nested token 完成 safe point，phase two join 全部 settlement；caller drop 不会分离写入。
+- 本阶段不建立第二套 TaskRuntime、session、conversation store 或 deletion authority。最终验收仍需
+  正式提交集成、full workspace/GUI/TUI/CLI/channel 门禁和 website 镜像同步。
 
 ## 下一步
 

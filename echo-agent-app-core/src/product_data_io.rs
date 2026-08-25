@@ -4,7 +4,7 @@
 //! filesystem-backed domain modules. Async surfaces must enter them through
 //! this adapter so blocking filesystem work cannot occupy Tokio workers.
 
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -14,8 +14,337 @@ use tokio_util::sync::CancellationToken;
 use crate::state::ScopedWorkspaceControl;
 
 const PROCESS_PRODUCT_DATA_IO_LIMIT: usize = 8;
+const MAX_PRODUCT_DATA_FAILURES: usize = 64;
 static PROCESS_PRODUCT_DATA_IO: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(PROCESS_PRODUCT_DATA_IO_LIMIT)));
+
+struct ProductDataOperationState {
+    admission_open: bool,
+    active: usize,
+    failures: Vec<String>,
+    failure_overflow: usize,
+}
+
+impl ProductDataOperationState {
+    fn record_failure(&mut self, failure: String) {
+        if self.failures.len() < MAX_PRODUCT_DATA_FAILURES {
+            self.failures.push(failure);
+        } else {
+            self.failure_overflow = self.failure_overflow.saturating_add(1);
+        }
+    }
+
+    fn failure_receipt(&self) -> Vec<String> {
+        let mut failures = self.failures.clone();
+        if self.failure_overflow > 0 {
+            failures.push(format!(
+                "{} additional product-data failures were omitted",
+                self.failure_overflow
+            ));
+        }
+        failures
+    }
+}
+
+struct ProductDataOperationSupervisor {
+    state: Mutex<ProductDataOperationState>,
+    settled: tokio::sync::watch::Sender<u64>,
+    #[cfg(test)]
+    barrier: Mutex<Option<ProductDataIoTestBarrier>>,
+}
+
+#[cfg(test)]
+struct ProductDataIoTestBarrier {
+    operation: &'static str,
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+impl ProductDataOperationSupervisor {
+    fn new() -> Self {
+        let (settled, _initial_receiver) = tokio::sync::watch::channel(0);
+        Self {
+            state: Mutex::new(ProductDataOperationState {
+                admission_open: true,
+                active: 0,
+                failures: Vec::new(),
+                failure_overflow: 0,
+            }),
+            settled,
+            #[cfg(test)]
+            barrier: Mutex::new(None),
+        }
+    }
+
+    fn admit(
+        self: &Arc<Self>,
+        operation: &'static str,
+    ) -> Result<ProductDataOperation, ProductDataIoError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| ProductDataIoError::Admission {
+                operation,
+                error: format!("product-data operation registry is poisoned: {error}"),
+            })?;
+        if !state.admission_open {
+            return Err(ProductDataIoError::Admission {
+                operation,
+                error: "application shutdown has closed product-data admission".to_string(),
+            });
+        }
+        state.active =
+            state
+                .active
+                .checked_add(1)
+                .ok_or_else(|| ProductDataIoError::Admission {
+                    operation,
+                    error: "product-data active operation capacity is exhausted".to_string(),
+                })?;
+        Ok(ProductDataOperation {
+            supervisor: Arc::clone(self),
+            operation,
+            settled: false,
+        })
+    }
+
+    fn admit_nested(
+        self: &Arc<Self>,
+        operation: &'static str,
+    ) -> Result<ProductDataOperation, ProductDataIoError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|error| ProductDataIoError::Admission {
+                operation,
+                error: format!("product-data operation registry is poisoned: {error}"),
+            })?;
+        state.active =
+            state
+                .active
+                .checked_add(1)
+                .ok_or_else(|| ProductDataIoError::Admission {
+                    operation,
+                    error: "product-data active operation capacity is exhausted".to_string(),
+                })?;
+        Ok(ProductDataOperation {
+            supervisor: Arc::clone(self),
+            operation,
+            settled: false,
+        })
+    }
+
+    fn begin_shutdown(&self) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|error| error.to_string())?;
+        state.admission_open = false;
+        Ok(())
+    }
+
+    async fn join_shutdown(&self) -> Result<(), String> {
+        let mut settled = self.settled.subscribe();
+        loop {
+            let outcome = {
+                let state = self.state.lock().map_err(|error| error.to_string())?;
+                (state.active == 0).then(|| state.failure_receipt())
+            };
+            if let Some(failures) = outcome {
+                return if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(failures.join("; "))
+                };
+            }
+            settled.changed().await.map_err(|_| {
+                "product-data settlement signal closed before active work completed".to_string()
+            })?;
+        }
+    }
+
+    #[cfg(test)]
+    fn take_barrier(&self, operation: &'static str) -> Option<ProductDataIoTestBarrier> {
+        let mut barrier = self
+            .barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let matches = barrier
+            .as_ref()
+            .is_some_and(|candidate| candidate.operation == operation);
+        if matches { barrier.take() } else { None }
+    }
+}
+
+#[derive(Clone)]
+pub struct ProductDataIoService {
+    supervisor: Arc<ProductDataOperationSupervisor>,
+}
+
+impl ProductDataIoService {
+    pub fn new() -> Self {
+        Self {
+            supervisor: Arc::new(ProductDataOperationSupervisor::new()),
+        }
+    }
+
+    pub async fn run<T, F>(
+        &self,
+        operation: &'static str,
+        function: F,
+    ) -> Result<T, ProductDataIoError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        run_with(Arc::clone(&self.supervisor), operation, function).await
+    }
+
+    pub fn begin_shutdown(&self) -> Result<(), String> {
+        self.supervisor.begin_shutdown()
+    }
+
+    pub async fn join_shutdown(&self) -> Result<(), String> {
+        self.begin_shutdown()?;
+        self.supervisor.join_shutdown().await
+    }
+
+    pub fn begin_owned_flow(
+        &self,
+        operation: &'static str,
+    ) -> Result<ProductDataIoFlow, ProductDataIoError> {
+        let owner = self.supervisor.admit(operation)?;
+        Ok(ProductDataIoFlow {
+            inner: Arc::new(ProductDataIoFlowInner {
+                supervisor: Arc::clone(&self.supervisor),
+                owner: Mutex::new(Some(owner)),
+            }),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_barrier(
+        &self,
+        operation: &'static str,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self
+            .supervisor
+            .barrier
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ProductDataIoTestBarrier {
+            operation,
+            entered,
+            release,
+        });
+    }
+}
+
+#[must_use = "owned product-data flows must be settled so shutdown can report their outcome"]
+#[derive(Clone)]
+pub struct ProductDataIoFlow {
+    inner: Arc<ProductDataIoFlowInner>,
+}
+
+struct ProductDataIoFlowInner {
+    supervisor: Arc<ProductDataOperationSupervisor>,
+    owner: Mutex<Option<ProductDataOperation>>,
+}
+
+impl ProductDataIoFlow {
+    pub(crate) fn service(&self) -> ProductDataIoService {
+        ProductDataIoService {
+            supervisor: Arc::clone(&self.inner.supervisor),
+        }
+    }
+
+    pub async fn run<T, F>(
+        &self,
+        operation: &'static str,
+        function: F,
+    ) -> Result<T, ProductDataIoError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let nested_owner = {
+            let owner = self
+                .inner
+                .owner
+                .lock()
+                .map_err(|error| ProductDataIoError::Admission {
+                    operation,
+                    error: format!("product-data flow owner is poisoned: {error}"),
+                })?;
+            if owner.is_none() {
+                return Err(ProductDataIoError::Admission {
+                    operation,
+                    error: "product-data flow has already settled".to_string(),
+                });
+            }
+            self.inner.supervisor.admit_nested(operation)?
+        };
+        run_nested_with(
+            Arc::clone(&self.inner.supervisor),
+            nested_owner,
+            operation,
+            function,
+        )
+        .await
+    }
+
+    pub fn settle(&self, failure: Option<String>) {
+        let owner = self
+            .inner
+            .owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(owner) = owner {
+            owner.settle(failure);
+        }
+    }
+}
+
+impl Default for ProductDataIoService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct ProductDataOperation {
+    supervisor: Arc<ProductDataOperationSupervisor>,
+    operation: &'static str,
+    settled: bool,
+}
+
+impl ProductDataOperation {
+    fn settle(mut self, failure: Option<String>) {
+        if let Ok(mut state) = self.supervisor.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            if let Some(failure) = failure {
+                state.record_failure(format!("{}: {failure}", self.operation));
+            }
+        }
+        self.settled = true;
+        self.supervisor
+            .settled
+            .send_modify(|version| *version = version.saturating_add(1));
+    }
+}
+
+impl Drop for ProductDataOperation {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Ok(mut state) = self.supervisor.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            state.record_failure(format!("{}: operation owner dropped", self.operation));
+        }
+        self.supervisor
+            .settled
+            .send_modify(|version| *version = version.saturating_add(1));
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ProductDataIoError {
@@ -29,13 +358,15 @@ pub enum ProductDataIoError {
         operation: &'static str,
         error: String,
     },
+    #[error("product-data I/O owner closed during {operation}")]
+    OwnerClosed { operation: &'static str },
 }
 
-/// Run one synchronous product-data operation on the bounded blocking pool.
-///
-/// The closure may itself return a domain `Result`; keeping that result nested
-/// preserves typed errors for the surface adapter instead of erasing them.
-pub async fn run<T, F>(operation: &'static str, function: F) -> Result<T, ProductDataIoError>
+async fn run_with<T, F>(
+    supervisor: Arc<ProductDataOperationSupervisor>,
+    operation: &'static str,
+    function: F,
+) -> Result<T, ProductDataIoError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -48,15 +379,77 @@ where
             operation,
             error: error.to_string(),
         })?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        function()
-    })
-    .await
-    .map_err(|error| ProductDataIoError::Join {
-        operation,
-        error: error.to_string(),
-    })
+    let owner = supervisor.admit(operation)?;
+    #[cfg(test)]
+    let barrier = supervisor.take_barrier(operation);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some(barrier) = barrier {
+            let _entered = barrier.entered.send(());
+            let _released = barrier.release.await;
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            function()
+        })
+        .await
+        .map_err(|error| ProductDataIoError::Join {
+            operation,
+            error: error.to_string(),
+        });
+        let failure = result.as_ref().err().map(ToString::to_string);
+        owner.settle(failure);
+        let _delivered = result_tx.send(result);
+    });
+    result_rx
+        .await
+        .map_err(|_| ProductDataIoError::OwnerClosed { operation })?
+}
+
+async fn run_nested_with<T, F>(
+    _supervisor: Arc<ProductDataOperationSupervisor>,
+    owner: ProductDataOperation,
+    operation: &'static str,
+    function: F,
+) -> Result<T, ProductDataIoError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let permit = PROCESS_PRODUCT_DATA_IO
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|error| ProductDataIoError::Admission {
+            operation,
+            error: error.to_string(),
+        })?;
+    #[cfg(test)]
+    let barrier = _supervisor.take_barrier(operation);
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        #[cfg(test)]
+        if let Some(barrier) = barrier {
+            let _entered = barrier.entered.send(());
+            let _released = barrier.release.await;
+        }
+        let result = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            function()
+        })
+        .await
+        .map_err(|error| ProductDataIoError::Join {
+            operation,
+            error: error.to_string(),
+        });
+        let failure = result.as_ref().err().map(ToString::to_string);
+        owner.settle(failure);
+        let _delivered = result_tx.send(result);
+    });
+    result_rx
+        .await
+        .map_err(|_| ProductDataIoError::OwnerClosed { operation })?
 }
 
 /// Exact workspace authority shared by GUI, TUI, CLI, and channel product
@@ -69,16 +462,49 @@ where
 pub struct ScopedProductData {
     control: ScopedWorkspaceControl,
     analysis_runs: Arc<AnalysisRunSupervisor>,
+    io: ProductDataIoService,
+}
+
+#[must_use = "scoped product-data flows must settle before releasing their workspace owner"]
+pub(crate) struct ScopedProductDataFlow {
+    control: ScopedWorkspaceControl,
+    io: ProductDataIoFlow,
+}
+
+impl ScopedProductDataFlow {
+    pub(crate) async fn run<T, F>(
+        &self,
+        operation: &'static str,
+        function: F,
+    ) -> Result<T, ProductDataIoError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let control = self.control.clone();
+        self.io
+            .run(operation, move || {
+                let _control = control;
+                function()
+            })
+            .await
+    }
+
+    pub(crate) fn settle(self, failure: Option<String>) {
+        self.io.settle(failure);
+    }
 }
 
 impl ScopedProductData {
     pub(crate) fn new(
         control: ScopedWorkspaceControl,
         analysis_runs: Arc<AnalysisRunSupervisor>,
+        io: ProductDataIoService,
     ) -> Self {
         Self {
             control,
             analysis_runs,
+            io,
         }
     }
 
@@ -102,6 +528,23 @@ impl ScopedProductData {
         self.control.runtime()
     }
 
+    pub(crate) fn begin_owned_flow(
+        &self,
+        operation: &'static str,
+    ) -> Result<ScopedProductDataFlow, ProductDataIoError> {
+        Ok(ScopedProductDataFlow {
+            control: self.control.clone(),
+            io: self.io.begin_owned_flow(operation)?,
+        })
+    }
+
+    fn begin_runtime_flow(
+        &self,
+        operation: &'static str,
+    ) -> Result<ProductDataIoFlow, ProductDataIoError> {
+        self.io.begin_owned_flow(operation)
+    }
+
     pub async fn data<T, F>(
         &self,
         operation: &'static str,
@@ -112,7 +555,9 @@ impl ScopedProductData {
         F: FnOnce(&std::path::Path) -> T + Send + 'static,
     {
         let control = self.control.clone();
-        run(operation, move || function(control.data_root())).await
+        self.io
+            .run(operation, move || function(control.data_root()))
+            .await
     }
 
     pub async fn project<T, F>(
@@ -125,17 +570,36 @@ impl ScopedProductData {
         F: FnOnce(&std::path::Path) -> T + Send + 'static,
     {
         let control = self.control.clone();
-        run(operation, move || {
-            let root = control.project_root();
-            function(&root)
-        })
-        .await
+        self.io
+            .run(operation, move || {
+                let root = control.project_root();
+                function(&root)
+            })
+            .await
     }
 
     /// Cloneable receipt for domain async flows that start blocking phases
     /// after an awaited provider or tool call.
     pub fn settlement_receipt(&self) -> ScopedWorkspaceControl {
         self.control.clone()
+    }
+
+    pub async fn run<T, F>(
+        &self,
+        operation: &'static str,
+        function: F,
+    ) -> Result<T, ProductDataIoError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let control = self.control.clone();
+        self.io
+            .run(operation, move || {
+                let _control = control;
+                function()
+            })
+            .await
     }
 
     pub fn start_analysis(
@@ -207,7 +671,7 @@ impl ScopedProductData {
     ) -> Result<AnalysisRunReceipt, AnalysisRunControlError> {
         let cancel = Arc::new(CancellationToken::new());
         self.analysis_runs
-            .start_owned(self.clone(), analysis_id, cancel, async move {
+            .start_owned(self.clone(), analysis_id, cancel, None, async move {
                 let _ = entered.send(());
                 release
                     .await
@@ -467,19 +931,33 @@ impl AnalysisRunSupervisor {
         product_data: ScopedProductData,
         analysis_id: &str,
     ) -> Result<AnalysisRunReceipt, AnalysisRunControlError> {
+        let product_data_flow = product_data
+            .begin_runtime_flow("run file-backed analysis")
+            .map_err(|error| AnalysisRunControlError::Execution(error.to_string()))?;
+        let runner_flow = product_data_flow.clone();
         let runner_product_data = product_data.clone();
         let runner_analysis_id = analysis_id.to_string();
         let cancel = Arc::new(CancellationToken::new());
         let runner_cancel = Arc::clone(&cancel);
-        self.start_owned(product_data, analysis_id, cancel, async move {
+        let future = async move {
             crate::analysis::run_analysis_with_product_data(
                 &runner_product_data,
+                &runner_flow,
                 &runner_analysis_id,
                 Some(runner_cancel),
             )
             .await
             .map_err(|error| error.to_string())
-        })
+            .inspect(|_| runner_flow.settle(None))
+            .inspect_err(|error| runner_flow.settle(Some(error.clone())))
+        };
+        self.start_owned(
+            product_data,
+            analysis_id,
+            cancel,
+            Some(product_data_flow),
+            future,
+        )
     }
 
     fn start_owned<F>(
@@ -487,6 +965,7 @@ impl AnalysisRunSupervisor {
         product_data: ScopedProductData,
         analysis_id: &str,
         cancel: Arc<CancellationToken>,
+        product_data_flow: Option<ProductDataIoFlow>,
         future: F,
     ) -> Result<AnalysisRunReceipt, AnalysisRunControlError>
     where
@@ -516,10 +995,16 @@ impl AnalysisRunSupervisor {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            if let Some(flow) = product_data_flow.as_ref() {
+                flow.settle(None);
+            }
             return Err(AnalysisRunControlError::SupervisorClosed);
         }
         match self.entries.entry(key.clone()) {
             dashmap::mapref::entry::Entry::Occupied(existing) => {
+                if let Some(flow) = product_data_flow.as_ref() {
+                    flow.settle(None);
+                }
                 return Err(AnalysisRunControlError::AlreadyRunning {
                     analysis_id: analysis_id.to_string(),
                     owner_id: existing.get().receipt.owner_id.clone(),
@@ -531,12 +1016,18 @@ impl AnalysisRunSupervisor {
         }
         drop(admission);
 
-        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
-            remove_analysis_owner(&self.entries, &key, &entry);
-            AnalysisRunControlError::Execution(format!(
-                "analysis supervisor requires a Tokio runtime: {error}"
-            ))
-        })?;
+        let runtime = match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                remove_analysis_owner(&self.entries, &key, &entry);
+                if let Some(flow) = product_data_flow.as_ref() {
+                    flow.settle(None);
+                }
+                return Err(AnalysisRunControlError::Execution(format!(
+                    "analysis supervisor requires a Tokio runtime: {error}"
+                )));
+            }
+        };
         let runner = runtime.spawn(future);
         let monitored_entry = Arc::clone(&entry);
         let monitor_supervisor = Arc::clone(self);
@@ -901,12 +1392,18 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_product_data_io_keeps_async_heartbeat_responsive() -> Result<(), String> {
+        let service = super::ProductDataIoService::new();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
-        let operation = tokio::spawn(super::run("heartbeat fixture", move || {
-            release_rx
-                .recv()
-                .map_err(|error| format!("blocking fixture release failed: {error}"))
-        }));
+        let operation_service = service.clone();
+        let operation = tokio::spawn(async move {
+            operation_service
+                .run("heartbeat fixture", move || {
+                    release_rx
+                        .recv()
+                        .map_err(|error| format!("blocking fixture release failed: {error}"))
+                })
+                .await
+        });
 
         tokio::time::timeout(Duration::from_millis(250), async {
             for _ in 0..8 {
@@ -923,6 +1420,161 @@ mod tests {
             .map_err(|error| format!("product-data I/O test task failed: {error}"))?
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
+        service.join_shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_drop_does_not_detach_owned_product_data_operation() -> Result<(), String> {
+        let service = super::ProductDataIoService::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let operation_service = service.clone();
+        let caller = tokio::spawn(async move {
+            operation_service
+                .run("caller-drop fixture", move || {
+                    let _entered = entered_tx.send(());
+                    release_rx.recv().map_err(|error| error.to_string())
+                })
+                .await
+        });
+        entered_rx.await.map_err(|error| error.to_string())?;
+        caller.abort();
+        let _cancelled = caller.await;
+        service.begin_shutdown()?;
+        let join = tokio::spawn(async move { service.join_shutdown().await });
+        tokio::task::yield_now().await;
+        if join.is_finished() {
+            return Err("product-data shutdown ignored the detached operation".to_string());
+        }
+        release_tx.send(()).map_err(|error| error.to_string())?;
+        join.await.map_err(|error| error.to_string())??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn application_services_do_not_close_each_other_or_poison_restart() -> Result<(), String>
+    {
+        let first = super::ProductDataIoService::new();
+        let second = super::ProductDataIoService::new();
+        first.begin_shutdown()?;
+        first.join_shutdown().await?;
+        second
+            .run("second application", || 7_u8)
+            .await
+            .map_err(|error| error.to_string())?;
+        second.begin_shutdown()?;
+        second.join_shutdown().await?;
+
+        let restarted = super::ProductDataIoService::new();
+        let value = restarted
+            .run("restarted application", || 11_u8)
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(value, 11);
+        restarted.begin_shutdown()?;
+        restarted.join_shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn application_shutdown_joins_only_its_own_active_operations() -> Result<(), String> {
+        let first = super::ProductDataIoService::new();
+        let second = super::ProductDataIoService::new();
+        let (first_entered_tx, first_entered_rx) = tokio::sync::oneshot::channel();
+        let (first_release_tx, first_release_rx) = std::sync::mpsc::sync_channel(0);
+        let first_operation_service = first.clone();
+        let first_operation = tokio::spawn(async move {
+            first_operation_service
+                .run("first application operation", move || {
+                    let _entered = first_entered_tx.send(());
+                    first_release_rx.recv().map_err(|error| error.to_string())
+                })
+                .await
+        });
+        let (second_entered_tx, second_entered_rx) = tokio::sync::oneshot::channel();
+        let (second_release_tx, second_release_rx) = std::sync::mpsc::sync_channel(0);
+        let second_operation_service = second.clone();
+        let second_operation = tokio::spawn(async move {
+            second_operation_service
+                .run("second application operation", move || {
+                    let _entered = second_entered_tx.send(());
+                    second_release_rx.recv().map_err(|error| error.to_string())
+                })
+                .await
+        });
+        first_entered_rx.await.map_err(|error| error.to_string())?;
+        second_entered_rx.await.map_err(|error| error.to_string())?;
+
+        first.begin_shutdown()?;
+        let first_join_service = first.clone();
+        let first_join = tokio::spawn(async move { first_join_service.join_shutdown().await });
+        tokio::task::yield_now().await;
+        if first_join.is_finished() {
+            return Err("first application ignored its accepted operation".to_string());
+        }
+        first_release_tx
+            .send(())
+            .map_err(|error| error.to_string())?;
+        first_join.await.map_err(|error| error.to_string())??;
+        first_operation
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+
+        let second_probe = second
+            .run("second application remains open", || 17_u8)
+            .await
+            .map_err(|error| error.to_string())?;
+        if second_probe != 17 {
+            return Err("second application returned an unexpected probe".to_string());
+        }
+        second_release_tx
+            .send(())
+            .map_err(|error| error.to_string())?;
+        second_operation
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        second.join_shutdown().await?;
+
+        let restarted = super::ProductDataIoService::new();
+        restarted
+            .run("later application generation", || ())
+            .await
+            .map_err(|error| error.to_string())?;
+        restarted.join_shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sealed_service_allows_owned_flow_nested_io_and_reports_debt() -> Result<(), String> {
+        let service = super::ProductDataIoService::new();
+        let flow = service
+            .begin_owned_flow("owned deletion flow")
+            .map_err(|error| error.to_string())?;
+        service.begin_shutdown()?;
+        let value = flow
+            .run("nested deletion I/O", || 23_u8)
+            .await
+            .map_err(|error| error.to_string())?;
+        if value != 23 {
+            return Err("owned flow nested I/O returned an unexpected value".to_string());
+        }
+        if service.run("new standalone operation", || ()).await.is_ok() {
+            return Err("sealed service admitted a new standalone operation".to_string());
+        }
+        flow.settle(Some("injected typed deletion debt".to_string()));
+        let debt = service
+            .join_shutdown()
+            .await
+            .err()
+            .ok_or_else(|| "owned flow debt was not reported at shutdown".to_string())?;
+        if !debt.contains("injected typed deletion debt") {
+            return Err(format!("shutdown reported the wrong debt: {debt}"));
+        }
         Ok(())
     }
 

@@ -71,10 +71,11 @@ pub struct PreparedAnalyticsRuntime {
     pub environment: BTreeMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnalyticsRuntime {
     cache_root: PathBuf,
     uv_program: PathBuf,
+    product_data_io: crate::product_data_io::ProductDataIoService,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +95,7 @@ struct ProbeOutput {
     packages: BTreeMap<String, String>,
 }
 
+#[cfg(test)]
 impl Default for AnalyticsRuntime {
     fn default() -> Self {
         let uv_program = std::env::var_os("EKO_UV_PATH")
@@ -102,6 +104,7 @@ impl Default for AnalyticsRuntime {
         Self {
             cache_root: crate::data_root::user_data_path("runtimes").join("analytics"),
             uv_program,
+            product_data_io: crate::product_data_io::ProductDataIoService::new(),
         }
     }
 }
@@ -112,6 +115,20 @@ impl AnalyticsRuntime {
         Self {
             cache_root,
             uv_program: PathBuf::from("uv"),
+            product_data_io: crate::product_data_io::ProductDataIoService::new(),
+        }
+    }
+
+    pub fn with_product_data_io(
+        product_data_io: crate::product_data_io::ProductDataIoService,
+    ) -> Self {
+        let uv_program = std::env::var_os("EKO_UV_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("uv"));
+        Self {
+            cache_root: crate::data_root::user_data_path("runtimes").join("analytics"),
+            uv_program,
+            product_data_io,
         }
     }
 
@@ -123,31 +140,46 @@ impl AnalyticsRuntime {
         &self,
         cancel: Option<Arc<CancellationToken>>,
     ) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
+        let flow = self
+            .product_data_io
+            .begin_owned_flow("prepare analytics runtime")
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?;
+        let result = self.prepare_python_with_product_flow(&flow, cancel).await;
+        let failure = result.as_ref().err().map(ToString::to_string);
+        flow.settle(failure);
+        result
+    }
+
+    pub(crate) async fn prepare_python_with_product_flow(
+        &self,
+        flow: &crate::product_data_io::ProductDataIoFlow,
+        cancel: Option<Arc<CancellationToken>>,
+    ) -> AnalyticsRuntimeResult<PreparedAnalyticsRuntime> {
         ensure_not_cancelled(cancel.as_ref(), "before acquiring the runtime lock")?;
         let profile_hash = runtime_hash();
         let _profile_guard = acquire_profile_gate(&profile_hash, cancel.as_ref()).await?;
         let cache_root = self.cache_root.clone();
-        let (runtime_dir, profile_id, lock) = crate::product_data_io::run(
-            "open analytics runtime lock",
-            move || -> AnalyticsRuntimeResult<_> {
-                let profile_id = format!("eko-analytics:{profile_hash}");
-                let runtime_dir = cache_root.join(profile_hash);
-                fs::create_dir_all(&runtime_dir)?;
-                let lock = open_prepare_lock(&runtime_dir)?;
-                Ok((runtime_dir, profile_id, lock))
-            },
-        )
-        .await
-        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??;
-        let lock = acquire_prepare_lock(lock, cancel.as_ref()).await?;
+        let (runtime_dir, profile_id, lock) = flow
+            .run(
+                "open analytics runtime lock",
+                move || -> AnalyticsRuntimeResult<_> {
+                    let profile_id = format!("eko-analytics:{profile_hash}");
+                    let runtime_dir = cache_root.join(profile_hash);
+                    fs::create_dir_all(&runtime_dir)?;
+                    let lock = open_prepare_lock(&runtime_dir)?;
+                    Ok((runtime_dir, profile_id, lock))
+                },
+            )
+            .await
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??;
+        let lock = acquire_prepare_lock(lock, cancel.as_ref(), flow).await?;
 
         let result = self
-            .prepare_locked(&runtime_dir, &profile_id, cancel.clone())
+            .prepare_locked(flow, &runtime_dir, &profile_id, cancel.clone())
             .await;
-        match crate::product_data_io::run("unlock analytics runtime", move || {
-            FileExt::unlock(&lock)
-        })
-        .await
+        match flow
+            .run("unlock analytics runtime", move || FileExt::unlock(&lock))
+            .await
         {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
@@ -162,6 +194,7 @@ impl AnalyticsRuntime {
 
     async fn prepare_locked(
         &self,
+        flow: &crate::product_data_io::ProductDataIoFlow,
         runtime_dir: &Path,
         profile_id: &str,
         cancel: Option<Arc<CancellationToken>>,
@@ -169,17 +202,18 @@ impl AnalyticsRuntime {
         ensure_not_cancelled(cancel.as_ref(), "before reading runtime metadata")?;
         let runtime_dir_owned = runtime_dir.to_path_buf();
         let profile_id_owned = profile_id.to_string();
-        if let Some(marker) = crate::product_data_io::run(
-            "load analytics runtime marker",
-            move || -> AnalyticsRuntimeResult<Option<ReadyMarker>> {
-                materialize_runtime_files(&runtime_dir_owned)?;
-                let marker =
-                    load_ready_marker(&runtime_dir_owned.join(READY_FILE), &profile_id_owned)?;
-                Ok(marker.filter(|marker| PathBuf::from(&marker.python).is_file()))
-            },
-        )
-        .await
-        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??
+        if let Some(marker) = flow
+            .run(
+                "load analytics runtime marker",
+                move || -> AnalyticsRuntimeResult<Option<ReadyMarker>> {
+                    materialize_runtime_files(&runtime_dir_owned)?;
+                    let marker =
+                        load_ready_marker(&runtime_dir_owned.join(READY_FILE), &profile_id_owned)?;
+                    Ok(marker.filter(|marker| PathBuf::from(&marker.python).is_file()))
+                },
+            )
+            .await
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??
         {
             return Ok(prepared_runtime(runtime_dir, marker));
         }
@@ -223,11 +257,12 @@ impl AnalyticsRuntime {
 
         let python = venv_python(runtime_dir);
         let python_to_check = python.clone();
-        if !crate::product_data_io::run("verify analytics runtime", move || {
-            python_to_check.is_file()
-        })
-        .await
-        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?
+        if !flow
+            .run("verify analytics runtime", move || {
+                python_to_check.is_file()
+            })
+            .await
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?
         {
             return Err(AnalyticsRuntimeError::SyncFailed(format!(
                 "uv completed without creating '{}'",
@@ -252,7 +287,7 @@ impl AnalyticsRuntime {
         };
         let marker_path = runtime_dir.join(READY_FILE);
         let marker_to_write = marker.clone();
-        crate::product_data_io::run("save analytics runtime marker", move || {
+        flow.run("save analytics runtime marker", move || {
             write_json(&marker_path, &marker_to_write)
         })
         .await
@@ -335,20 +370,22 @@ enum PrepareLockAttempt {
 async fn acquire_prepare_lock(
     mut lock: File,
     cancel: Option<&Arc<CancellationToken>>,
+    flow: &crate::product_data_io::ProductDataIoFlow,
 ) -> AnalyticsRuntimeResult<File> {
     loop {
         ensure_not_cancelled(cancel, "while waiting for the runtime lock")?;
-        let attempt = crate::product_data_io::run("try analytics runtime lock", move || match lock
-            .try_lock_exclusive()
-        {
-            Ok(()) => Ok(PrepareLockAttempt::Acquired(lock)),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                Ok(PrepareLockAttempt::Busy(lock))
-            }
-            Err(error) => Err(AnalyticsRuntimeError::Io(error)),
-        })
-        .await
-        .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??;
+        let attempt = flow
+            .run("try analytics runtime lock", move || {
+                match lock.try_lock_exclusive() {
+                    Ok(()) => Ok(PrepareLockAttempt::Acquired(lock)),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        Ok(PrepareLockAttempt::Busy(lock))
+                    }
+                    Err(error) => Err(AnalyticsRuntimeError::Io(error)),
+                }
+            })
+            .await
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))??;
         match attempt {
             PrepareLockAttempt::Acquired(lock) => return Ok(lock),
             PrepareLockAttempt::Busy(returned) => lock = returned,
@@ -617,12 +654,43 @@ mod tests {
         let runtime = AnalyticsRuntime {
             cache_root: root.path().to_path_buf(),
             uv_program: root.path().join("missing-uv"),
+            product_data_io: crate::product_data_io::ProductDataIoService::new(),
         };
         let result = runtime.prepare_python().await;
         assert!(matches!(
             result,
             Err(AnalyticsRuntimeError::UvUnavailable(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn preaccepted_analytics_flow_can_write_after_phase_one_seal()
+    -> AnalyticsRuntimeResult<()> {
+        let root = tempfile::tempdir()?;
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let runtime = AnalyticsRuntime {
+            cache_root: root.path().join("cache"),
+            uv_program: root.path().join("missing-uv"),
+            product_data_io: product_data_io.clone(),
+        };
+        let flow = product_data_io
+            .begin_owned_flow("analytics phase-one fixture")
+            .map_err(|error| AnalyticsRuntimeError::TaskFailed(error.to_string()))?;
+        product_data_io
+            .begin_shutdown()
+            .map_err(AnalyticsRuntimeError::TaskFailed)?;
+        let result = runtime.prepare_python_with_product_flow(&flow, None).await;
+        assert!(matches!(
+            result,
+            Err(AnalyticsRuntimeError::UvUnavailable(_))
+        ));
+        assert!(runtime.cache_root.join(runtime_hash()).is_dir());
+        flow.settle(None);
+        product_data_io
+            .join_shutdown()
+            .await
+            .map_err(AnalyticsRuntimeError::TaskFailed)?;
         Ok(())
     }
 
@@ -667,6 +735,7 @@ mod tests {
         let runtime = AnalyticsRuntime {
             cache_root: root.path().join("cache"),
             uv_program: uv,
+            product_data_io: crate::product_data_io::ProductDataIoService::new(),
         };
         let cancel = Arc::new(CancellationToken::new());
         let cancel_for_task = Arc::clone(&cancel);
@@ -696,6 +765,7 @@ mod tests {
         let runtime = AnalyticsRuntime {
             cache_root: root.path().join("cache"),
             uv_program: root.path().join("missing-uv"),
+            product_data_io: crate::product_data_io::ProductDataIoService::new(),
         };
 
         let owner_runtime = runtime.clone();
@@ -723,7 +793,9 @@ mod tests {
         }
         let heartbeat = tokio::time::timeout(
             Duration::from_millis(500),
-            crate::product_data_io::run("analytics contention heartbeat", || 42_u8),
+            runtime
+                .product_data_io
+                .run("analytics contention heartbeat", || 42_u8),
         )
         .await
         .map_err(|_| AnalyticsRuntimeError::TaskFailed("heartbeat timed out".to_string()))?

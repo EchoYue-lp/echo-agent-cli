@@ -208,6 +208,7 @@ pub struct CommandCellRuntimeService {
     observers: TaskTracker,
     shutdown: CancellationToken,
     chat_events: Arc<crate::chat_event_log::ChatEventLog>,
+    product_data_flow: crate::product_data_io::ProductDataIoFlow,
     awaiters: Mutex<AwaiterRuntimeState>,
     awaiter_agents: RwLock<
         HashMap<
@@ -223,8 +224,12 @@ impl CommandCellRuntimeService {
     pub fn new(
         sandbox: Arc<SandboxManager>,
         chat_events: Arc<crate::chat_event_log::ChatEventLog>,
+        product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> Result<Arc<Self>, String> {
         let executor: Arc<dyn SandboxExecutor> = sandbox;
+        let product_data_flow = product_data_io
+            .begin_owned_flow("command-cell product-data projection")
+            .map_err(|error| error.to_string())?;
         Ok(Arc::new(Self {
             inner: Arc::new(BackgroundCommandManager::new_with_sandbox(
                 BackgroundCommandManagerConfig::default(),
@@ -239,6 +244,7 @@ impl CommandCellRuntimeService {
             observers: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             chat_events,
+            product_data_flow,
             awaiters: Mutex::new(AwaiterRuntimeState::default()),
             awaiter_agents: RwLock::new(HashMap::new()),
             foreground_turns: RwLock::new(None),
@@ -516,11 +522,12 @@ impl CommandCellRuntimeService {
         let chat_events = self.chat_events.clone();
         let scope = scope.clone();
         let cell = cell.clone();
-        crate::product_data_io::run("persist ordinary-chat command cell", move || {
-            Self::append_chat_cell_fact_sync(&chat_events, &scope, &cell, settled)
-        })
-        .await
-        .map_err(|error| error.to_string())?
+        self.product_data_flow
+            .run("persist ordinary-chat command cell", move || {
+                Self::append_chat_cell_fact_sync(&chat_events, &scope, &cell, settled)
+            })
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     async fn cell_state_for_watch(
@@ -551,29 +558,30 @@ impl CommandCellRuntimeService {
         }
         let chat_events = self.chat_events.clone();
         let key = key.clone();
-        crate::product_data_io::run("load Awaiter ordinary-chat cell", move || {
-            let replay = chat_events.replay(
-                &key.workspace_id,
-                Some(&key.conversation_id),
-                &key.root_turn_id,
-                0,
-            )?;
-            Ok::<Option<BackgroundCellState>, crate::chat_event_log::ChatEventLogError>(
-                find_chat_cell_fact(&replay.events, &key.cell_id, false)
-                    .or_else(|| find_chat_cell_fact(&replay.events, &key.cell_id, true))
-                    .cloned(),
-            )
-        })
-        .await
-        .map_err(|error| CommandCellError::Runtime {
-            message: error.to_string(),
-        })?
-        .map_err(|error| CommandCellError::Runtime {
-            message: error.to_string(),
-        })?
-        .ok_or_else(|| CommandCellError::Validation {
-            message: "cell does not belong to the exact ordinary Chat scope".to_string(),
-        })
+        self.product_data_flow
+            .run("load Awaiter ordinary-chat cell", move || {
+                let replay = chat_events.replay(
+                    &key.workspace_id,
+                    Some(&key.conversation_id),
+                    &key.root_turn_id,
+                    0,
+                )?;
+                Ok::<Option<BackgroundCellState>, crate::chat_event_log::ChatEventLogError>(
+                    find_chat_cell_fact(&replay.events, &key.cell_id, false)
+                        .or_else(|| find_chat_cell_fact(&replay.events, &key.cell_id, true))
+                        .cloned(),
+                )
+            })
+            .await
+            .map_err(|error| CommandCellError::Runtime {
+                message: error.to_string(),
+            })?
+            .map_err(|error| CommandCellError::Runtime {
+                message: error.to_string(),
+            })?
+            .ok_or_else(|| CommandCellError::Validation {
+                message: "cell does not belong to the exact ordinary Chat scope".to_string(),
+            })
     }
 
     fn owns_active_cell(&self, key: &AwaiterWatchKey) -> bool {
@@ -962,19 +970,21 @@ impl CommandCellRuntimeService {
             attempt = attempt.saturating_add(1);
             let chat_events = self.chat_events.clone();
             let append_result = result.clone();
-            let persisted = crate::product_data_io::run("persist Awaiter Ready fact", move || {
-                chat_events.append(
-                    &append_result.receipt.workspace_id,
-                    Some(&append_result.receipt.conversation_id),
-                    &append_result.receipt.root_turn_id,
-                    crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
-                        result: Box::new(append_result.clone()),
-                    },
-                )
-            })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
+            let persisted = self
+                .product_data_flow
+                .run("persist Awaiter Ready fact", move || {
+                    chat_events.append(
+                        &append_result.receipt.workspace_id,
+                        Some(&append_result.receipt.conversation_id),
+                        &append_result.receipt.root_turn_id,
+                        crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+                            result: Box::new(append_result.clone()),
+                        },
+                    )
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
             match persisted {
                 Ok(()) => {
                     self.clear_projection_degraded(&result.receipt.execution_id);
@@ -1073,10 +1083,12 @@ impl CommandCellRuntimeService {
     ) {
         let chat_events = self.chat_events.clone();
         let result = result.clone();
-        if let Err(error) = crate::product_data_io::run("acknowledge Awaiter result", move || {
-            Self::acknowledge_awaiter_result_sync(&chat_events, &result, acknowledged_turn_id);
-        })
-        .await
+        if let Err(error) = self
+            .product_data_flow
+            .run("acknowledge Awaiter result", move || {
+                Self::acknowledge_awaiter_result_sync(&chat_events, &result, acknowledged_turn_id);
+            })
+            .await
         {
             tracing::warn!(%error, "Awaiter acknowledgement task failed");
         }
@@ -1092,24 +1104,25 @@ impl CommandCellRuntimeService {
         let workspace_id = workspace_id.to_string();
         let conversation_id = conversation_id.to_string();
         let turn_id = turn_id.to_string();
-        crate::product_data_io::run("project pending Awaiter results", move || {
-            let pending = chat_events
-                .pending_awaiter_results_for_conversation(&workspace_id, &conversation_id)
-                .map_err(|error| error.to_string())?;
-            if pending.is_empty() {
-                return Ok(None);
-            }
-            let mut rendered = String::from("[pending_awaiter_results]\n");
-            for result in &pending {
-                rendered.push_str(&render_awaiter_handoff(result));
-                rendered.push('\n');
-                Self::acknowledge_awaiter_result_sync(&chat_events, result, turn_id.clone());
-            }
-            rendered.push_str("[/pending_awaiter_results]");
-            Ok(Some(rendered))
-        })
-        .await
-        .map_err(|error| error.to_string())?
+        self.product_data_flow
+            .run("project pending Awaiter results", move || {
+                let pending = chat_events
+                    .pending_awaiter_results_for_conversation(&workspace_id, &conversation_id)
+                    .map_err(|error| error.to_string())?;
+                if pending.is_empty() {
+                    return Ok(None);
+                }
+                let mut rendered = String::from("[pending_awaiter_results]\n");
+                for result in &pending {
+                    rendered.push_str(&render_awaiter_handoff(result));
+                    rendered.push('\n');
+                    Self::acknowledge_awaiter_result_sync(&chat_events, result, turn_id.clone());
+                }
+                rendered.push_str("[/pending_awaiter_results]");
+                Ok(Some(rendered))
+            })
+            .await
+            .map_err(|error| error.to_string())?
     }
 
     pub(crate) fn stop_run(&self, workspace_id: &str, run_id: &str) -> usize {
@@ -1230,6 +1243,8 @@ impl CommandCellRuntimeService {
                 degraded.join("; ")
             ));
         }
+        let product_data_debt = (!failures.is_empty()).then(|| failures.join("; "));
+        self.product_data_flow.settle(product_data_debt);
         if failures.is_empty() {
             Ok(())
         } else {
@@ -2329,6 +2344,9 @@ mod tests {
         let chat_events =
             crate::chat_event_log::ChatEventLog::open(root.join("chat-events"), retention)
                 .map_err(|error| error.to_string())?;
+        let product_data_flow = crate::product_data_io::ProductDataIoService::new()
+            .begin_owned_flow("command-cell test projection")
+            .map_err(|error| error.to_string())?;
         Ok(Arc::new(CommandCellRuntimeService {
             inner: Arc::new(BackgroundCommandManager::default()),
             run_cells: RwLock::new(HashMap::new()),
@@ -2340,6 +2358,7 @@ mod tests {
             observers: TaskTracker::new(),
             shutdown: CancellationToken::new(),
             chat_events: Arc::new(chat_events),
+            product_data_flow,
             awaiters: Mutex::new(AwaiterRuntimeState::default()),
             awaiter_agents: RwLock::new(HashMap::new()),
             foreground_turns: RwLock::new(None),

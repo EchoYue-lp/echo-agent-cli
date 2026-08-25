@@ -195,6 +195,7 @@ pub struct ApplicationLifecycleOwner {
     config_watcher: Option<Arc<crate::config_watcher::ConfigWatcherHandle>>,
     mcp_config_runtime: Option<Arc<crate::mcp_config_runtime::McpConfigRuntime>>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    product_data_io: Option<crate::product_data_io::ProductDataIoService>,
     background_tasks: Vec<ApplicationBackgroundTask>,
     external_owners: Vec<ApplicationExternalOwner>,
     shutdown_begun: bool,
@@ -215,6 +216,7 @@ impl ApplicationLifecycleOwner {
             config_watcher: None,
             mcp_config_runtime: None,
             browser_runtime: None,
+            product_data_io: None,
             background_tasks: Vec::new(),
             external_owners: Vec::new(),
             shutdown_begun: false,
@@ -274,6 +276,13 @@ impl ApplicationLifecycleOwner {
         self.browser_runtime = Some(runtime);
     }
 
+    pub fn bind_product_data_io(
+        &mut self,
+        product_data_io: crate::product_data_io::ProductDataIoService,
+    ) {
+        self.product_data_io = Some(product_data_io);
+    }
+
     pub fn track_background_task(
         &mut self,
         name: impl Into<String>,
@@ -330,6 +339,11 @@ impl ApplicationLifecycleOwner {
         // Phase one: no joins. Every producer sees admission close or a shared
         // cancellation broadcast before teardown waits on a dependent owner.
         self.root_cancel.cancel();
+        if let Some(product_data_io) = self.product_data_io.as_ref()
+            && let Err(error) = product_data_io.begin_shutdown()
+        {
+            receipt.record("product-data I/O", error);
+        }
         if let Some(state) = self.app_state.as_ref()
             && let Err(error) = state.broadcast_application_shutdown()
         {
@@ -443,7 +457,6 @@ impl ApplicationLifecycleOwner {
                 receipt.record(owner.name, error);
             }
         }
-
         if let Some(integration) = self.review_integration.as_ref()
             && let Err(error) = integration.shutdown_background_reviews().await
         {
@@ -510,6 +523,14 @@ impl ApplicationLifecycleOwner {
         {
             receipt.record("primary Agent", error);
         }
+        // Product-data top-level admission was sealed in phase one. Join it
+        // only after accepted producers have crossed their nested persistence
+        // safe points, including caller-dropped operations.
+        if let Some(product_data_io) = self.product_data_io.as_ref()
+            && let Err(error) = product_data_io.join_shutdown().await
+        {
+            receipt.record("product-data I/O", error);
+        }
         receipt
     }
 
@@ -572,6 +593,8 @@ pub struct AgentRuntime {
     pub mcp_config_runtime: Arc<crate::mcp_config_runtime::McpConfigRuntime>,
     pub command_cell_runtime:
         Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>,
+    /// Single application-generation owner for blocking product-data work.
+    pub product_data_io: crate::product_data_io::ProductDataIoService,
 }
 
 impl AgentRuntime {
@@ -588,6 +611,7 @@ impl AgentRuntime {
         owner.bind_plugin_runtime(self.plugin_runtime.clone());
         owner.bind_mcp_config_runtime(self.mcp_config_runtime.clone());
         owner.bind_browser_runtime(self.browser_runtime.clone());
+        owner.bind_product_data_io(self.product_data_io.clone());
         owner.bind_command_cell_runtime(self.command_cell_runtime.clone());
         if let Some(integration) = self.review_integration.as_ref() {
             owner.bind_review_integration(integration.clone());
@@ -618,6 +642,8 @@ impl AgentRuntime {
         mut params: AgentCreateParams,
         mcp_config_path: PathBuf,
     ) -> anyhow::Result<Self> {
+        let product_data_io = params.product_data_io.clone().unwrap_or_default();
+        params.product_data_io = Some(product_data_io.clone());
         // ── 0a. Runtime state store (must be ready before agent is built so that
         //       conversation_id + state_store land on the AgentConfig together;
         //       otherwise `save_runtime_checkpoint` silently no-ops). ──
@@ -664,6 +690,7 @@ impl AgentRuntime {
 
         let mut bootstrap_lifecycle =
             ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        bootstrap_lifecycle.bind_product_data_io(product_data_io.clone());
         bootstrap_lifecycle.bind_mcp_config_runtime(mcp_config_runtime.clone());
         if !browser_runtime_injected {
             bootstrap_lifecycle.bind_browser_runtime(browser_runtime.clone());
@@ -943,10 +970,19 @@ impl AgentRuntime {
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| std::path::PathBuf::from(".")),
         );
+        let research_workspace_identity = auto_ingest_identity.clone();
+        let research_product_data_io = product_data_io.clone();
         agent_handle
             .write(move |agent| {
-                crate::research_connectors::install_auto_ingest_tools(agent, auto_ingest_identity);
-                agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
+                crate::research_connectors::install_auto_ingest_tools(
+                    agent,
+                    auto_ingest_identity,
+                    research_product_data_io.clone(),
+                );
+                agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool::new(
+                    research_product_data_io,
+                    research_workspace_identity,
+                )));
             })
             .await;
 
@@ -974,6 +1010,7 @@ impl AgentRuntime {
             plugin_runtime,
             mcp_config_runtime,
             command_cell_runtime,
+            product_data_io,
         })
     }
 
@@ -992,6 +1029,7 @@ impl AgentRuntime {
             self.state_store.clone(),
             self.app_config.clone(),
             self.mcp_config_runtime.clone(),
+            self.product_data_io.clone(),
         )?;
         if let Some(runtime) = self.active_runtime_model.as_ref() {
             state = state.with_active_model_id(runtime.id.clone());

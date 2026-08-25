@@ -372,6 +372,9 @@ pub struct AgentCreateParams {
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     pub command_cell_runtime:
         Option<Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>>,
+    /// Application-generation owner for every blocking product-data phase
+    /// reachable from this Agent and its tools.
+    pub product_data_io: Option<crate::product_data_io::ProductDataIoService>,
     pub execution_scope: Option<crate::workspace::WorkspaceExecutionScope>,
     /// Shared application-owned managed browser runtime. The same instance is
     /// installed on the primary agent and all built-in subagents so one
@@ -509,14 +512,28 @@ pub async fn create_agent_with_diagnostics(
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
+    let product_data_io = match params.product_data_io.clone() {
+        Some(product_data_io) => product_data_io,
+        #[cfg(test)]
+        None => crate::product_data_io::ProductDataIoService::new(),
+        #[cfg(not(test))]
+        None => {
+            return Err(
+                "Agent creation requires an application-owned product-data I/O service".to_string(),
+            );
+        }
+    };
     let script_execution_profile_resolver: Arc<
         dyn echo_agent::tools::ScriptExecutionProfileResolver,
-    > = Arc::new(crate::analysis_runtime::AnalyticsRuntime::default());
+    > = Arc::new(
+        crate::analysis_runtime::AnalyticsRuntime::with_product_data_io(product_data_io.clone()),
+    );
     let command_cell_runtime = match params.command_cell_runtime.clone() {
         Some(runtime) => runtime,
         None => crate::tasks::task_runtime::command_cells::CommandCellRuntimeService::new(
             sandbox_manager.clone(),
             Arc::new(crate::chat_event_log::ChatEventLog::at_default_root()),
+            product_data_io,
         )?,
     };
     let execution_scope = params.execution_scope.clone().unwrap_or_else(|| {

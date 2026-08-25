@@ -79,6 +79,7 @@ async fn create_agent_threads_state_store_and_conversation_id() {
         task_runtime_store: None,
         browser_runtime: None,
         command_cell_runtime: None,
+        product_data_io: Some(echo_agent_app_core::product_data_io::ProductDataIoService::new()),
         execution_scope: None,
     };
     let app_config = make_app_config();
@@ -112,6 +113,7 @@ async fn create_agent_without_explicit_state_store_uses_product_default() {
         task_runtime_store: None,
         browser_runtime: None,
         command_cell_runtime: None,
+        product_data_io: Some(echo_agent_app_core::product_data_io::ProductDataIoService::new()),
         execution_scope: None,
     };
     let app_config = make_app_config();
@@ -147,6 +149,7 @@ async fn memory_context_suffix_lands_in_system_prompt() {
         task_runtime_store: None,
         browser_runtime: None,
         command_cell_runtime: None,
+        product_data_io: Some(echo_agent_app_core::product_data_io::ProductDataIoService::new()),
         execution_scope: None,
     };
     let app_config = make_app_config();
@@ -177,6 +180,7 @@ async fn create_agent_exposes_prompt_assembly_diagnostics() -> Result<(), String
         task_runtime_store: None,
         browser_runtime: None,
         command_cell_runtime: None,
+        product_data_io: Some(echo_agent_app_core::product_data_io::ProductDataIoService::new()),
         execution_scope: None,
     };
     let created = infra::create_agent_with_diagnostics(&params, &make_app_config()).await?;

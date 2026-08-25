@@ -39,6 +39,12 @@ pub enum ResearchError {
     External(String),
 }
 
+impl ResearchError {
+    pub(crate) fn is_durable_settlement_debt(&self) -> bool {
+        matches!(self, Self::Io(_) | Self::Json(_) | Self::External(_))
+    }
+}
+
 pub type ResearchResult<T> = Result<T, ResearchError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

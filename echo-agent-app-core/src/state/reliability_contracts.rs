@@ -49,6 +49,7 @@ async fn isolated_app_state() -> anyhow::Result<Fixture> {
         None,
         Default::default(),
         mcp,
+        crate::product_data_io::ProductDataIoService::new(),
     )?;
     state.storage.chat_events = Arc::new(crate::chat_event_log::ChatEventLog::open(
         temp.path().join("chat-events"),

@@ -59,6 +59,7 @@ impl TerminalSession {
         cwd: Option<PathBuf>,
         rows: u16,
         cols: u16,
+        shell: Option<String>,
     ) -> Result<PreparedTerminal, String> {
         validate_dimensions(rows, cols)?;
         let pair: PtyPair = portable_pty::native_pty_system()
@@ -74,7 +75,7 @@ impl TerminalSession {
             .try_clone_reader()
             .map_err(|error| format!("failed to clone PTY reader: {error}"))?;
 
-        let mut command = CommandBuilder::new(default_shell());
+        let mut command = CommandBuilder::new(shell.unwrap_or_else(default_shell));
         if let Some(cwd) = cwd {
             command.cwd(cwd);
         }
@@ -178,6 +179,29 @@ impl TerminalService {
         rows: u16,
         cols: u16,
     ) -> Result<TerminalSessionInfo, String> {
+        self.create_inner(id, cwd, rows, cols, None).await
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn create_with_shell_for_test(
+        self: &Arc<Self>,
+        id: String,
+        cwd: Option<PathBuf>,
+        rows: u16,
+        cols: u16,
+        shell: String,
+    ) -> Result<TerminalSessionInfo, String> {
+        self.create_inner(id, cwd, rows, cols, Some(shell)).await
+    }
+
+    async fn create_inner(
+        self: &Arc<Self>,
+        id: String,
+        cwd: Option<PathBuf>,
+        rows: u16,
+        cols: u16,
+        shell: Option<String>,
+    ) -> Result<TerminalSessionInfo, String> {
         let id = id.trim().to_string();
         if id.is_empty() {
             return Err("terminal id cannot be empty".to_string());
@@ -188,7 +212,8 @@ impl TerminalService {
         }
         #[cfg(test)]
         self.spawn_attempts.fetch_add(1, Ordering::Relaxed);
-        let (session, reader, child) = TerminalSession::prepare(id.clone(), cwd, rows, cols)?;
+        let (session, reader, child) =
+            TerminalSession::prepare(id.clone(), cwd, rows, cols, shell)?;
         let info = session.info.clone();
         self.sessions.insert(id.clone(), Arc::clone(&session));
         if let Err(error) = spawn_reader(Arc::downgrade(self), Arc::clone(&session), reader, child)

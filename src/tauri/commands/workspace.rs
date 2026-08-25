@@ -212,11 +212,13 @@ pub async fn get_workspace(
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id);
     let registry = Arc::clone(&state.app_state.workspace.registry);
-    match echo_agent_app_core::product_data_io::run("inspect workspace", move || {
-        registry.inspect(&ws_id)
-    })
-    .await
-    .map_err(|error| IpcError::Internal(error.to_string()))?
+    match state
+        .app_state
+        .session
+        .product_data_io
+        .run("inspect workspace", move || registry.inspect(&ws_id))
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
     {
         Ok(ws) => Ok(serde_json::json!({ "workspace": ws })),
         Err(e) => Err(IpcError::NotFound(format!("Workspace not found: {e}"))),

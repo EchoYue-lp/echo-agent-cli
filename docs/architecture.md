@@ -82,7 +82,11 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
 分析使用 `execution_scope.root` 作为 EKO data root；文件浏览器使用 control 解析后的
 `project_root`，因此 linked project 不会改变 EKO 自有数据位置。
 
-同步文件 I/O 统一进入 app-core 的有界 `ProductDataIo` adapter，不占用 Tokio async executor thread。
+同步文件 I/O 统一进入 `AgentRuntime` 创建并由 `ApplicationLifecycleOwner` 关闭/等待的
+per-application `ProductDataIoService`，不占用 Tokio async executor thread。进程级 semaphore
+只提供总容量限制，不拥有 operation 生命周期。phase one 拒绝新的直接 I/O 与 flow；已接纳的
+多阶段 producer 通过 shared flow receipt 继续 nested safe-point I/O。caller drop 后既有 owner 仍由
+对应 AppState generation 等待到稳定 settlement。
 分析运行由 app-owned supervisor 持有 exact workspace receipt；`run` admission 不阻塞
 CLI/TUI/channel event loop，`wait/cancel` 使用同一 receipt 完成 framework draining 与 join。
 cleanup 失败时 owner 不释放，因此任何 surface 的删除都会一致地返回 busy。
@@ -110,11 +114,19 @@ input
 1. 同一 workspace conversation 同时最多一个用户 foreground turn。
 2. surface 是来源和渲染元数据，不是并发隔离维度。
 3. accepted turn 使用一次解析得到的 workspace runtime，不能在执行中再次读取 UI focus。
-4. framework conversation/checkpoint 内容是权威；前端 store 只维护可重建投影。
+4. framework `ConversationStore` transcript 与 incarnation-scoped runtime checkpoint 各自权威；
+   前端 store 只维护可重建投影。
 5. terminal settlement 由 app-core 产生，文本事件或组件卸载不能提前释放 busy 状态。
 6. 长程 TaskRun 的多个有限 RunTurn 共享一个 foreground root owner；active turn id 可推进，
    root id、cancel token 和最终 settlement authority 保持不变。完整决策见
    [Foreground continuation ADR](./adr/0005-foreground-continuation-owner.md)。
+7. Channel 以 `(channel, conversation, sender)` 生成稳定 product conversation，供 ChatEventLog、
+   TaskRun、UI 和 foreground 使用；framework session incarnation 再派生 AgentPool、checkpoint 与
+   cache key。timeout/reset 先关闭旧 key admission、等待 foreground/lease settlement 并精确 retire，
+   再精确删除旧 runtime lineage 并允许新模型上下文。稳定 transcript 通过 generation ordinal 幂等
+   追加，不会注入新模型；产品删除通过 framework lineage helper 回收全部 incarnation 后删除稳定
+   transcript。
+   完整决策见 [Channel scope parity ADR](./adr/0010-channel-scope-parity.md)。
 
 ## TaskRun 数据流
 

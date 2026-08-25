@@ -166,6 +166,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         task_runtime_store: None,
         browser_runtime: None,
         command_cell_runtime: None,
+        product_data_io: None,
         execution_scope: None,
     };
 
@@ -208,6 +209,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         runtime.state_store.clone(),
         app_config.clone(),
         runtime.mcp_config_runtime.clone(),
+        runtime.product_data_io.clone(),
     ) {
         Ok(state) => state,
         Err(error) => {

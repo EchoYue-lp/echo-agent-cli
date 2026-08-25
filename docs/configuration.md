@@ -256,7 +256,12 @@ FEISHU_APP_SECRET=...
 ```
 
 飞书支持 `long_poll` 与 `webhook`。Channel 是完整 Agent surface，使用与 GUI/TUI/CLI
-相同的 chat driver、TaskRuntime、HITL 和 memory 权威。
+相同的 chat driver、TaskRuntime、HITL 和 memory 权威。framework 与 EKO 都按
+`channel_id + conversation_id + sender_id` 隔离会话；同一群聊的不同 sender 不共享 Agent
+上下文、TaskRun、cache 或 foreground control。timeout/reset 会轮换 Agent runtime/checkpoint/cache
+identity，但保留稳定产品 transcript 与 TaskRun；旧 incarnation 在 foreground/lease 与 pool
+retirement barrier 后被精确回收。reset 不是产品历史擦除；删除产品 conversation 时才会清理该
+scope 的全部 incarnation checkpoint/transcript 和稳定 transcript。
 
 ## 常用环境变量
 

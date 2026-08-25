@@ -4940,10 +4940,17 @@ async fn run_main_agent_task(
                     &agent.tool_definitions(),
                     &visible_tools,
                 );
+                let runtime_state_id = agent.conversation_id().map(str::to_string);
+                let transcript_generation_id = runtime_state_id
+                    .as_ref()
+                    .filter(|runtime_state_id| {
+                        Some(*runtime_state_id) != Some(&run_record.conversation_id)
+                    })
+                    .cloned();
                 let invocation = echo_agent::agent::AgentInvocationContext {
                     history: None,
-                    runtime_state_id: None,
-                    transcript_generation_id: None,
+                    runtime_state_id,
+                    transcript_generation_id,
                     runtime: Some(echo_agent::tools::ExternalRunContext {
                         conversation_id: Some(run_record.conversation_id.clone()),
                         run_id: Some(run_id.clone()),
@@ -5266,10 +5273,15 @@ async fn drive_owned_agent_turn(
                 .collect();
             let mut disabled_tools = disabled_tools;
             disabled_tools.extend(mutating_tools.iter().cloned());
+            let runtime_state_id = agent.conversation_id().map(str::to_string);
+            let transcript_generation_id = runtime_state_id
+                .as_ref()
+                .filter(|runtime_state_id| Some(*runtime_state_id) != Some(&conversation_id))
+                .cloned();
             let invocation = echo_agent::agent::AgentInvocationContext {
                 history: None,
-                runtime_state_id: None,
-                transcript_generation_id: None,
+                runtime_state_id,
+                transcript_generation_id,
                 runtime: Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: Some(conversation_id),
                     run_id: Some(run_id.clone()),

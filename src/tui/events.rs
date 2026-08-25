@@ -7826,6 +7826,7 @@ mod tests {
             None,
             Default::default(),
             mcp_runtime,
+            echo_agent_app_core::product_data_io::ProductDataIoService::new(),
         )
         .map_err(|error| error.to_string())?;
         state.tasks.runtime = Some(Arc::new(

@@ -480,6 +480,7 @@ async fn bootstrap(
         task_runtime_store: None,
         browser_runtime: None,
         command_cell_runtime: None,
+        product_data_io: None,
         execution_scope: None,
     };
     let mcp_path =
@@ -569,6 +570,7 @@ async fn bootstrap(
             config_watcher: config_watcher.clone(),
             foreground_turns,
             command_cell_runtime: runtime.command_cell_runtime.clone(),
+            product_data_io: runtime.product_data_io.clone(),
             browser_runtime: runtime.browser_runtime.clone(),
             lifecycle,
         },

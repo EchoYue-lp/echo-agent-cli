@@ -138,9 +138,9 @@ impl WorkspaceRuntimeActivity {
 /// cannot build two independent in-process store owners. Loaded hosts remain
 /// resident until application shutdown; eviction requires an explicit idle
 /// proof and is intentionally deferred.
-#[derive(Default)]
 pub(crate) struct WorkspaceRuntimeRegistry {
     hosts: Mutex<HashMap<WorkspaceId, Arc<WorkspaceRuntimeHost>>>,
+    product_data_io: crate::product_data_io::ProductDataIoService,
     operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
     operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
@@ -158,65 +158,87 @@ struct WorkspaceControlAcquireTestBarrier {
 impl WorkspaceRuntimeResources {
     /// Validate a workspace root and open every file-backed store needed by a
     /// focused workspace generation before any live Agent binding is changed.
-    pub(crate) async fn prepare(mut workspace: Workspace) -> anyhow::Result<Self> {
-        let root = validated_workspace_root(&workspace.root)?;
-        WorkspaceLayout::ensure_dirs(&root).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to prepare workspace layout at {}: {error}",
-                root.display()
-            )
-        })?;
-
-        let state_dir = WorkspaceLayout::state_dir(&root);
-        let sessions_dir = WorkspaceLayout::sessions(&root);
-        let tasks_dir = WorkspaceLayout::tasks(&root);
-        let conversation_store: Arc<dyn ConversationStore> =
-            Arc::new(FileConversationStore::new(&state_dir).map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to prepare workspace conversation store at {}: {error}",
-                    state_dir.display()
-                )
-            })?);
-        let runtime_state_store: Arc<dyn RuntimeStateStore> =
-            Arc::new(FileRuntimeStateStore::new(&sessions_dir).map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to prepare workspace runtime state store at {}: {error}",
-                    sessions_dir.display()
-                )
-            })?);
-        let memory_path = WorkspaceLayout::memory_store(&root);
-        let memory_store: Arc<dyn Store> =
-            Arc::new(FileStore::new(&memory_path).map_err(|error| {
-                anyhow::anyhow!(
-                    "Failed to prepare workspace memory store at {}: {error}",
-                    memory_path.display()
-                )
-            })?);
-        let deletion_service = Arc::new(ConversationDeletionService::new(
-            state_dir.join("conversation-deletions"),
-        ));
-        if let Err(error) = deletion_service
-            .recover_committed_deletions(conversation_store.as_ref())
+    pub(crate) async fn prepare(
+        workspace: Workspace,
+        product_data_io: crate::product_data_io::ProductDataIoService,
+    ) -> anyhow::Result<Self> {
+        let flow = product_data_io
+            .begin_owned_flow("prepare workspace runtime resources")
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let prepare_product_data_io = flow.service();
+        let resources = flow
+            .run("prepare workspace runtime file stores", move || {
+                let mut workspace = workspace;
+                let root = validated_workspace_root(&workspace.root)?;
+                WorkspaceLayout::ensure_dirs(&root).map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to prepare workspace layout at {}: {error}",
+                        root.display()
+                    )
+                })?;
+                let state_dir = WorkspaceLayout::state_dir(&root);
+                let sessions_dir = WorkspaceLayout::sessions(&root);
+                let tasks_dir = WorkspaceLayout::tasks(&root);
+                let conversation_store: Arc<dyn ConversationStore> =
+                    Arc::new(FileConversationStore::new(&state_dir).map_err(|error| {
+                        anyhow::anyhow!(
+                            "Failed to prepare workspace conversation store at {}: {error}",
+                            state_dir.display()
+                        )
+                    })?);
+                let runtime_state_store: Arc<dyn RuntimeStateStore> =
+                    Arc::new(FileRuntimeStateStore::new(&sessions_dir).map_err(|error| {
+                        anyhow::anyhow!(
+                            "Failed to prepare workspace runtime state store at {}: {error}",
+                            sessions_dir.display()
+                        )
+                    })?);
+                let memory_path = WorkspaceLayout::memory_store(&root);
+                let memory_store: Arc<dyn Store> =
+                    Arc::new(FileStore::new(&memory_path).map_err(|error| {
+                        anyhow::anyhow!(
+                            "Failed to prepare workspace memory store at {}: {error}",
+                            memory_path.display()
+                        )
+                    })?);
+                let deletion_service =
+                    Arc::new(ConversationDeletionService::new_with_product_data_io(
+                        state_dir.join("conversation-deletions"),
+                        prepare_product_data_io,
+                    ));
+                workspace.root = root;
+                workspace.refresh_product_data_generation();
+                Ok::<Self, anyhow::Error>(Self {
+                    workspace,
+                    state_dir,
+                    tasks_dir,
+                    conversation_store,
+                    runtime_state_store,
+                    memory_store,
+                    deletion_service,
+                })
+            })
             .await
-        {
+            .map_err(|error| anyhow::anyhow!(error.to_string()))??;
+        let recovery = resources
+            .deletion_service
+            .recover_committed_deletions_in_flow(
+                &flow,
+                resources.conversation_store.clone(),
+                Some(resources.runtime_state_store.clone()),
+                None,
+                None,
+            )
+            .await;
+        if let Err(error) = &recovery {
             tracing::warn!(
-                workspace = %workspace.id,
+                workspace = %resources.workspace.id,
                 %error,
                 "workspace conversation deletion recovery remains pending"
             );
         }
-
-        workspace.root = root;
-        workspace.refresh_product_data_generation();
-        Ok(Self {
-            workspace,
-            state_dir,
-            tasks_dir,
-            conversation_store,
-            runtime_state_store,
-            memory_store,
-            deletion_service,
-        })
+        flow.settle(recovery.err().map(|error| error.to_string()));
+        Ok(resources)
     }
 
     pub(crate) fn workspace(&self) -> &Workspace {
@@ -257,8 +279,9 @@ impl WorkspaceRuntimeHost {
         workspace: Workspace,
         operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
         operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
+        product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> anyhow::Result<Arc<Self>> {
-        let resources = WorkspaceRuntimeResources::prepare(workspace).await?;
+        let resources = WorkspaceRuntimeResources::prepare(workspace, product_data_io).await?;
         let workspace = resources.workspace().clone();
         Ok(Arc::new(Self {
             workspace: RwLock::new(workspace),
@@ -656,9 +679,17 @@ impl WorkspaceExecutionRuntime {
 }
 
 impl WorkspaceRuntimeRegistry {
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
+        Self::new_with_product_data_io(crate::product_data_io::ProductDataIoService::new())
+    }
+
+    pub(crate) fn new_with_product_data_io(
+        product_data_io: crate::product_data_io::ProductDataIoService,
+    ) -> Self {
         Self {
             hosts: Mutex::new(HashMap::new()),
+            product_data_io,
             operation_stores: Arc::new(std::sync::Mutex::new(Vec::new())),
             operation_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             #[cfg(test)]
@@ -666,6 +697,10 @@ impl WorkspaceRuntimeRegistry {
             #[cfg(test)]
             close_barrier: std::sync::Mutex::new(None),
         }
+    }
+
+    fn product_data_io(&self) -> crate::product_data_io::ProductDataIoService {
+        self.product_data_io.clone()
     }
 
     /// Return the one loaded host for a workspace, opening it on first use.
@@ -685,6 +720,7 @@ impl WorkspaceRuntimeRegistry {
             workspace,
             Arc::clone(&self.operation_stores),
             Arc::clone(&self.operation_admission_open),
+            self.product_data_io(),
         )
         .await?;
         hosts.insert(workspace_id, Arc::clone(&host));
@@ -710,6 +746,7 @@ impl WorkspaceRuntimeRegistry {
                     workspace,
                     Arc::clone(&self.operation_stores),
                     Arc::clone(&self.operation_admission_open),
+                    self.product_data_io(),
                 )
                 .await?;
                 hosts.insert(workspace_id, Arc::clone(&host));
@@ -1006,14 +1043,20 @@ mod tests {
         std::fs::write(&file, "not a directory").map_err(|error| error.to_string())?;
 
         assert!(
-            WorkspaceRuntimeResources::prepare(workspace("missing", temp.path().join("missing")))
-                .await
-                .is_err()
+            WorkspaceRuntimeResources::prepare(
+                workspace("missing", temp.path().join("missing")),
+                crate::product_data_io::ProductDataIoService::new(),
+            )
+            .await
+            .is_err()
         );
         assert!(
-            WorkspaceRuntimeResources::prepare(workspace("file", file))
-                .await
-                .is_err()
+            WorkspaceRuntimeResources::prepare(
+                workspace("file", file),
+                crate::product_data_io::ProductDataIoService::new(),
+            )
+            .await
+            .is_err()
         );
         Ok(())
     }
@@ -1024,9 +1067,12 @@ mod tests {
         let root = temp.path().join("workspace");
         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
 
-        let resources = WorkspaceRuntimeResources::prepare(workspace("alpha", root.clone()))
-            .await
-            .map_err(|error| error.to_string())?;
+        let resources = WorkspaceRuntimeResources::prepare(
+            workspace("alpha", root.clone()),
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let canonical_root = root.canonicalize().map_err(|error| error.to_string())?;
 
         assert_eq!(resources.root(), canonical_root);
@@ -1144,12 +1190,18 @@ mod tests {
         std::fs::create_dir_all(&root_a).map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&root_b).map_err(|error| error.to_string())?;
 
-        let resources_a = WorkspaceRuntimeResources::prepare(workspace("a", root_a))
-            .await
-            .map_err(|error| error.to_string())?;
-        let resources_b = WorkspaceRuntimeResources::prepare(workspace("b", root_b))
-            .await
-            .map_err(|error| error.to_string())?;
+        let resources_a = WorkspaceRuntimeResources::prepare(
+            workspace("a", root_a),
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let resources_b = WorkspaceRuntimeResources::prepare(
+            workspace("b", root_b),
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let conversation_id = "shared-conversation-id";
         resources_a
             .conversation_store()

@@ -340,6 +340,14 @@ impl WorkspaceIoIdentity {
     pub(crate) fn data_root(&self) -> &std::path::Path {
         &self.data_root
     }
+
+    pub(crate) fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub(crate) fn host_generation(&self) -> &str {
+        &self.host_generation
+    }
 }
 
 // ── ts-rs bindings ──────────────────────────────────────────────────

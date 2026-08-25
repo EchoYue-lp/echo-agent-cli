@@ -36,6 +36,10 @@ pub enum ToolExecutionError {
     InvalidTerminalStatus(ToolExecutionStatus),
     #[error("tool artifact root is not registered: {0}")]
     ArtifactRootUnavailable(String),
+    #[error(
+        "tool artifact retention does not match its registered root: expected {expected}, got {actual}"
+    )]
+    ArtifactRetentionMismatch { expected: String, actual: String },
     #[error("conversation still has active tool executions: {0}")]
     ActiveConversation(String),
     #[error(transparent)]
@@ -200,6 +204,15 @@ pub struct ToolExecutionRepository {
     state: Mutex<RepositoryState>,
     projection_lock: Mutex<()>,
     artifact_configs: Mutex<Vec<echo_agent::tools::artifact::ToolOutputArtifactConfig>>,
+    #[cfg(test)]
+    artifact_validation_pause: Mutex<Option<ArtifactValidationPause>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ArtifactValidationPause {
+    indexed: std::sync::Arc<std::sync::Barrier>,
+    resume: std::sync::Arc<std::sync::Barrier>,
 }
 
 impl ToolExecutionRepository {
@@ -212,6 +225,8 @@ impl ToolExecutionRepository {
             state: Mutex::new(RepositoryState::default()),
             projection_lock: Mutex::new(()),
             artifact_configs: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            artifact_validation_pause: Mutex::new(None),
         };
         repository.rebuild_index_and_recover()?;
         Ok(repository)
@@ -223,6 +238,8 @@ impl ToolExecutionRepository {
             state: Mutex::new(RepositoryState::default()),
             projection_lock: Mutex::new(()),
             artifact_configs: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            artifact_validation_pause: Mutex::new(None),
         }
     }
 
@@ -475,6 +492,122 @@ impl ToolExecutionRepository {
             result: manifest.result,
             output_bytes: stream_output_bytes(&location.stream)?.unwrap_or(manifest.output_bytes),
         })
+    }
+
+    /// Validate the terminal artifact recorded by one canonical tool detail.
+    ///
+    /// This uses the repository's registered artifact roots and the framework
+    /// canonical reader, so callers cannot display an unscoped, missing,
+    /// resized, or SHA-mismatched path supplied only through metadata.
+    pub fn verified_artifact_reference(
+        &self,
+        workspace_id: &str,
+        detail_ref: &str,
+    ) -> ToolExecutionResult<Option<echo_agent::tools::artifact::ToolOutputArtifactRef>> {
+        let manifest = self.verified_manifest_snapshot(workspace_id, detail_ref)?;
+        let Some(result) = manifest.result.as_ref() else {
+            return Ok(None);
+        };
+        let Some(artifact) =
+            echo_agent::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata)
+        else {
+            return Ok(None);
+        };
+        let config = self.artifact_config_for(&artifact.path).ok_or_else(|| {
+            ToolExecutionError::ArtifactRootUnavailable(artifact.path.display().to_string())
+        })?;
+        if artifact.retention != config.retention {
+            return Err(ToolExecutionError::ArtifactRetentionMismatch {
+                expected: config.retention,
+                actual: artifact.retention,
+            });
+        }
+        let _verified = echo_agent::tools::files::artifact::read_artifact_page(
+            &config,
+            &artifact,
+            None,
+            echo_agent::tools::files::artifact::ArtifactPageLimit::Bytes(4),
+        )?;
+        Ok(Some(artifact))
+    }
+
+    fn verified_manifest_snapshot(
+        &self,
+        workspace_id: &str,
+        detail_ref: &str,
+    ) -> ToolExecutionResult<StoredManifest> {
+        const MAX_IDENTITY_RETRIES: usize = 3;
+        for attempt in 0..MAX_IDENTITY_RETRIES {
+            let (location, indexed_summary) = {
+                let state = self.lock_state();
+                let location = state
+                    .details
+                    .get(detail_ref)
+                    .cloned()
+                    .ok_or_else(|| ToolExecutionError::NotFound(detail_ref.to_string()))?;
+                let summary = state
+                    .summaries
+                    .values()
+                    .find(|summary| {
+                        summary.workspace_id == workspace_id && summary.detail_ref == detail_ref
+                    })
+                    .cloned()
+                    .ok_or_else(|| ToolExecutionError::NotFound(detail_ref.to_string()))?;
+                (location, summary)
+            };
+            #[cfg(test)]
+            if attempt == 0 {
+                let pause =
+                    lock_recover(&self.artifact_validation_pause, "artifact validation pause")
+                        .clone();
+                if let Some(pause) = pause {
+                    pause.indexed.wait();
+                    pause.resume.wait();
+                }
+            }
+            let guard = match echo_agent::utils::fs::open_existing_regular_guard(&location.manifest)
+            {
+                Ok(guard) => guard,
+                Err(error) if attempt.saturating_add(1) < MAX_IDENTITY_RETRIES => {
+                    tracing::warn!(%error, %detail_ref, "tool detail identity changed before validation; retrying");
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let bytes = match echo_agent::utils::fs::read_existing_matching(
+                &location.manifest,
+                &guard,
+            ) {
+                Ok(bytes) => bytes,
+                Err(error) if attempt.saturating_add(1) < MAX_IDENTITY_RETRIES => {
+                    tracing::warn!(%error, %detail_ref, "tool detail identity changed during validation; retrying");
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let manifest: StoredManifest = serde_json::from_slice(&bytes)?;
+            if manifest.summary != indexed_summary
+                || manifest.summary.workspace_id != workspace_id
+                || manifest.summary.detail_ref != detail_ref
+                || execution_key(
+                    &manifest.summary.workspace_id,
+                    &manifest.summary.owner,
+                    &manifest.summary.call_id,
+                ) != execution_key(
+                    &indexed_summary.workspace_id,
+                    &indexed_summary.owner,
+                    &indexed_summary.call_id,
+                )
+            {
+                return Err(ToolExecutionError::ProjectionConflict(format!(
+                    "tool detail {detail_ref} no longer matches its indexed execution identity"
+                )));
+            }
+            return Ok(manifest);
+        }
+        Err(ToolExecutionError::ProjectionConflict(format!(
+            "tool detail {detail_ref} did not retain a stable file identity"
+        )))
     }
 
     pub fn read_output(
@@ -1623,6 +1756,69 @@ mod tests {
                 .and_then(|entry| entry.file_name().to_str().map(str::to_string))
                 .is_some_and(|name| name.starts_with("broken.json.corrupt-"))
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_validation_rejects_atomic_manifest_identity_replacement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let repository = std::sync::Arc::new(ToolExecutionRepository::open(temp.path())?);
+        let owner = chat_owner();
+        let invocation = invocation("shell", serde_json::json!({"command": "true"}));
+        let result = ToolResult::success("done");
+        let first = repository
+            .project_start(
+                "workspace-a",
+                owner.clone(),
+                Some("conversation-a"),
+                Some("run-a"),
+                "call-a",
+                &invocation,
+            )?
+            .summary;
+        repository.project_finish("workspace-a", &owner, "call-a", &result)?;
+        let second = repository
+            .project_start(
+                "workspace-b",
+                owner.clone(),
+                Some("conversation-b"),
+                Some("run-b"),
+                "call-b",
+                &invocation,
+            )?
+            .summary;
+        repository.project_finish("workspace-b", &owner, "call-b", &result)?;
+        let first_path = repository
+            .detail_location("workspace-a", &first.detail_ref)?
+            .manifest;
+        let second_path = repository
+            .detail_location("workspace-b", &second.detail_ref)?
+            .manifest;
+        let indexed = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(std::sync::Barrier::new(2));
+        *lock_recover(
+            &repository.artifact_validation_pause,
+            "artifact validation test pause",
+        ) = Some(ArtifactValidationPause {
+            indexed: indexed.clone(),
+            resume: resume.clone(),
+        });
+        let validation_repository = repository.clone();
+        let detail_ref = first.detail_ref.clone();
+        let validation = std::thread::spawn(move || {
+            validation_repository.verified_artifact_reference("workspace-a", &detail_ref)
+        });
+        indexed.wait();
+        let replacement = echo_agent::utils::fs::read_existing(&second_path)?;
+        echo_agent::utils::fs::atomic_write(&first_path, &replacement)?;
+        resume.wait();
+        let error = validation
+            .join()
+            .map_err(|_| "artifact validation thread panicked")?
+            .err()
+            .ok_or("wrong execution manifest was accepted")?;
+        assert!(matches!(error, ToolExecutionError::ProjectionConflict(_)));
         Ok(())
     }
 

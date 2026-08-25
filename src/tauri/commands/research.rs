@@ -399,27 +399,32 @@ pub async fn export_systematic_review(
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
     if format == "all" {
-        return echo_agent_app_core::product_data_io::run(
-            "export all systematic review formats",
-            move || {
+        return state
+            .app_state
+            .session
+            .product_data_io
+            .run("export all systematic review formats", move || {
                 echo_agent_app_core::research::export_all_review_formats(
                     control.data_root(),
                     &review_id,
                 )
-            },
-        )
-        .await
-        .map_err(super::product_data::blocking_error)?
-        .map_err(ipc_error);
+            })
+            .await
+            .map_err(super::product_data::blocking_error)?
+            .map_err(ipc_error);
     }
     let format = parse_export_format(&format)?;
-    echo_agent_app_core::product_data_io::run("export systematic review", move || {
-        echo_agent_app_core::research::export_review(control.data_root(), &review_id, format)
-            .map(|artifact| vec![artifact])
-    })
-    .await
-    .map_err(super::product_data::blocking_error)?
-    .map_err(ipc_error)
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("export systematic review", move || {
+            echo_agent_app_core::research::export_review(control.data_root(), &review_id, format)
+                .map(|artifact| vec![artifact])
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
+        .map_err(ipc_error)
 }
 
 fn parse_export_format(value: &str) -> Result<ReviewExportFormat, IpcError> {

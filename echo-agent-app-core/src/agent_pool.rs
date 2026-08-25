@@ -31,7 +31,7 @@
 //! agent.chat_stream("Hello").await;  // Keep `lease` until execution settles.
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -146,11 +146,15 @@ pub enum PoolError {
     ExecutionLeaseCapacity,
     /// The caller attempted to retire a pool entry with another key/pool's receipt.
     ExecutionLeaseMismatch,
+    /// The caller completed a retirement receipt against another pool.
+    RetirementReceiptMismatch,
     /// Durable conversation deletion owns this identity until its finalizer retires.
     ConversationDeletionPending {
         conversation_id: String,
         reason: String,
     },
+    /// An exact cached generation is settling before the key can be reused.
+    ConversationRetirementPending { conversation_id: String },
 }
 
 impl std::fmt::Display for PoolError {
@@ -177,12 +181,19 @@ impl std::fmt::Display for PoolError {
             PoolError::ExecutionLeaseMismatch => {
                 write!(f, "Agent pool execution lease does not own this pool entry")
             }
+            PoolError::RetirementReceiptMismatch => {
+                write!(f, "Agent pool retirement receipt belongs to another pool")
+            }
             PoolError::ConversationDeletionPending {
                 conversation_id,
                 reason,
             } => write!(
                 f,
                 "Conversation {conversation_id} cannot acquire an agent: {reason}"
+            ),
+            PoolError::ConversationRetirementPending { conversation_id } => write!(
+                f,
+                "Conversation {conversation_id} is retiring its cached agent generation"
             ),
         }
     }
@@ -212,6 +223,7 @@ pub struct SharedResources {
     pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     pub command_cell_runtime:
         Option<Arc<crate::tasks::task_runtime::command_cells::CommandCellRuntimeService>>,
+    pub product_data_io: Option<crate::product_data_io::ProductDataIoService>,
     pub execution_scope: Option<crate::workspace::WorkspaceExecutionScope>,
 }
 
@@ -268,6 +280,7 @@ impl SharedResources {
                     task_runtime_store: None,
                     browser_runtime: None,
                     command_cell_runtime: None,
+                    product_data_io: None,
                     execution_scope: None,
                 }
             })
@@ -294,6 +307,7 @@ struct AgentPoolAdmissionState {
     total: usize,
     by_key: HashMap<String, usize>,
     process_permits: HashMap<String, tokio::sync::OwnedSemaphorePermit>,
+    retiring: HashSet<String>,
 }
 
 impl Default for AgentPoolAdmission {
@@ -304,6 +318,7 @@ impl Default for AgentPoolAdmission {
                 total: 0,
                 by_key: HashMap::new(),
                 process_permits: HashMap::new(),
+                retiring: HashSet::new(),
             }),
             idle: Notify::new(),
         }
@@ -323,6 +338,11 @@ impl AgentPoolAdmission {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !active.accepting {
             return Err(PoolError::ShuttingDown);
+        }
+        if active.retiring.contains(key) {
+            return Err(PoolError::ConversationRetirementPending {
+                conversation_id: key.to_string(),
+            });
         }
         let total = active
             .total
@@ -383,6 +403,48 @@ impl AgentPoolAdmission {
             .is_some_and(|count| *count != 0)
     }
 
+    fn is_retiring(&self, key: &str) -> bool {
+        self.active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retiring
+            .contains(key)
+    }
+
+    fn begin_retirement(
+        self: &Arc<Self>,
+        key: &str,
+    ) -> Result<AgentPoolRetirementAdmission, PoolError> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !active.accepting {
+            return Err(PoolError::ShuttingDown);
+        }
+        if !active.retiring.insert(key.to_string()) {
+            return Err(PoolError::ConversationRetirementPending {
+                conversation_id: key.to_string(),
+            });
+        }
+        drop(active);
+        Ok(AgentPoolRetirementAdmission {
+            admission: Arc::clone(self),
+            key: key.to_string(),
+            active: true,
+        })
+    }
+
+    async fn wait_key_idle(&self, key: &str) {
+        loop {
+            let notified = self.idle.notified();
+            if !self.is_active(key) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     fn close(&self) {
         self.active
             .lock()
@@ -404,6 +466,39 @@ impl AgentPoolAdmission {
             }
             notified.await;
         }
+    }
+}
+
+struct AgentPoolRetirementAdmission {
+    admission: Arc<AgentPoolAdmission>,
+    key: String,
+    active: bool,
+}
+
+/// Exclusive admission receipt for retiring one exact conversation key.
+///
+/// While this value is alive, new leases for the key fail closed. Dropping it
+/// before completion reopens admission without claiming that the old Agent was
+/// removed, so callers can safely cancel and retry a higher-level barrier.
+#[must_use]
+pub struct AgentPoolConversationRetirement {
+    key: String,
+    admission: AgentPoolRetirementAdmission,
+}
+
+impl Drop for AgentPoolRetirementAdmission {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.admission
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retiring
+            .remove(&self.key);
+        self.admission.idle.notify_waiters();
+        self.active = false;
     }
 }
 
@@ -460,10 +555,11 @@ impl Drop for AgentPoolExecutionLease {
         let process_permit = release_process_permit
             .then(|| active.process_permits.remove(&key))
             .flatten();
+        let released_key = !active.by_key.contains_key(&key);
         let released_last = active.total == 0;
         drop(active);
         drop(process_permit);
-        if released_last {
+        if released_key || released_last {
             admission.idle.notify_waiters();
         }
     }
@@ -857,6 +953,7 @@ impl AgentPool {
         shared.browser_runtime = Some(runtime.browser_runtime.clone());
         shared.task_runtime_store = task_runtime_store;
         shared.command_cell_runtime = Some(runtime.command_cell_runtime.clone());
+        shared.product_data_io = Some(runtime.product_data_io.clone());
 
         // Extract skill descriptors from primary agent (avoids re-reading from disk)
         let skill_descriptors = runtime.agent_handle.read(|a| a.skill_descriptors()).await;
@@ -971,8 +1068,10 @@ impl AgentPool {
             task_runtime_store: Some(task_runtime_store.clone()),
             browser_runtime: self.shared.browser_runtime.clone(),
             command_cell_runtime: self.shared.command_cell_runtime.clone(),
+            product_data_io: self.shared.product_data_io.clone(),
             execution_scope: Some(execution_scope),
         };
+        let workspace_product_data_io = shared.product_data_io.clone();
         let mut pool = Arc::new(Self {
             shared,
             agents: RwLock::new(HashMap::new()),
@@ -1013,8 +1112,17 @@ impl AgentPool {
         primary
             .handle
             .write(move |agent| {
-                crate::research_connectors::install_auto_ingest_tools(agent, workspace_io_identity);
-                agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
+                if let Some(product_data_io) = workspace_product_data_io {
+                    crate::research_connectors::install_auto_ingest_tools(
+                        agent,
+                        workspace_io_identity.clone(),
+                        product_data_io.clone(),
+                    );
+                    agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool::new(
+                        product_data_io,
+                        workspace_io_identity,
+                    )));
+                }
             })
             .await;
         let primary_tool_manager = primary
@@ -1203,6 +1311,11 @@ impl AgentPool {
         if self.workspace_transitioning.load(Ordering::Acquire) {
             return Err(PoolError::WorkspaceTransition);
         }
+        if self.admission.is_retiring(conversation_id) {
+            return Err(PoolError::ConversationRetirementPending {
+                conversation_id: conversation_id.to_string(),
+            });
+        }
 
         // Fast path: reuse existing agent
         if let Some(existing) = agents.get_mut(conversation_id) {
@@ -1309,6 +1422,11 @@ impl AgentPool {
         if self.workspace_transitioning.load(Ordering::Acquire) {
             return Err(PoolError::WorkspaceTransition);
         }
+        if self.admission.is_retiring(conversation_id) {
+            return Err(PoolError::ConversationRetirementPending {
+                conversation_id: conversation_id.to_string(),
+            });
+        }
         let lease = agents
             .get(conversation_id)
             .map(|pooled| {
@@ -1337,6 +1455,78 @@ impl AgentPool {
         Ok(self
             .release_supervised_execution(conversation_id, execution)
             .await)
+    }
+
+    /// Close admission for one conversation key, await every previously issued
+    /// execution receipt, and remove that exact cached generation.
+    ///
+    /// New acquisitions fail with [`PoolError::ConversationRetirementPending`]
+    /// until the operation settles. The admission guard is cancellation-safe:
+    /// dropping the waiter reopens the key without claiming retirement, so a
+    /// caller can retry rather than consuming a false terminal receipt.
+    pub async fn retire_conversation_and_wait(
+        &self,
+        conversation_id: &str,
+    ) -> Result<bool, PoolError> {
+        let retirement = self.begin_conversation_retirement(conversation_id)?;
+        self.complete_conversation_retirement(retirement).await
+    }
+
+    /// Close new admission for one exact conversation key before a caller
+    /// settles its foreground owner and previously issued execution leases.
+    pub fn begin_conversation_retirement(
+        &self,
+        conversation_id: &str,
+    ) -> Result<AgentPoolConversationRetirement, PoolError> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(PoolError::ShuttingDown);
+        }
+        if self.workspace_transitioning.load(Ordering::Acquire) {
+            return Err(PoolError::WorkspaceTransition);
+        }
+        let admission = self.admission.begin_retirement(conversation_id)?;
+        Ok(AgentPoolConversationRetirement {
+            key: conversation_id.to_string(),
+            admission,
+        })
+    }
+
+    /// Await old leases and remove the exact cached Agent protected by a
+    /// receipt from [`Self::begin_conversation_retirement`].
+    pub async fn complete_conversation_retirement(
+        &self,
+        retirement: AgentPoolConversationRetirement,
+    ) -> Result<bool, PoolError> {
+        let removed = self.drain_conversation_retirement(&retirement).await?;
+        drop(retirement);
+        Ok(removed)
+    }
+
+    /// Drain and remove one cached generation while retaining its closed
+    /// admission receipt in the caller.
+    ///
+    /// Aggregate reset/delete owners use this form to keep the exact key closed
+    /// through persisted runtime cleanup. Dropping `retirement` reopens the key
+    /// only after their commit boundary.
+    pub async fn drain_conversation_retirement(
+        &self,
+        retirement: &AgentPoolConversationRetirement,
+    ) -> Result<bool, PoolError> {
+        if !Arc::ptr_eq(&self.admission, &retirement.admission.admission) {
+            return Err(PoolError::RetirementReceiptMismatch);
+        }
+        let conversation_id = retirement.key.clone();
+        self.admission.wait_key_idle(&conversation_id).await;
+        let mut agents = self.agents.write().await;
+        let removed = agents.remove(&conversation_id).is_some();
+        drop(agents);
+        if removed {
+            tracing::info!(
+                conv_id = %conversation_id,
+                "AgentPool: exact conversation generation retired after settlement"
+            );
+        }
+        Ok(removed)
     }
 
     /// Release one exact supervised execution receipt. Dropping the receipt
@@ -2040,6 +2230,11 @@ impl AgentPool {
     }
 
     #[cfg(test)]
+    fn conversation_retiring_for_test(&self, conversation_id: &str) -> bool {
+        self.admission.is_retiring(conversation_id)
+    }
+
+    #[cfg(test)]
     pub(crate) async fn instruction_projection_revision_for_test(&self) -> Option<String> {
         self.instruction_projection
             .read()
@@ -2087,6 +2282,7 @@ impl AgentPool {
             task_runtime_store: self.shared.task_runtime_store.clone(),
             browser_runtime: self.shared.browser_runtime.clone(),
             command_cell_runtime: self.shared.command_cell_runtime.clone(),
+            product_data_io: self.shared.product_data_io.clone(),
             execution_scope: self.shared.execution_scope.clone(),
         };
         let created = infra::create_agent_with_diagnostics(&params, &app_config)
@@ -2539,6 +2735,194 @@ mod tests {
                 .map_err(|error| error.to_string())?
         );
         assert_eq!(pool.pool_size().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn awaited_conversation_retirement_blocks_aba_and_replaces_exact_generation() -> TestResult
+    {
+        let pool = Arc::new(create_test_pool(5, false).await?);
+        let old_execution = pool.acquire("shared").await.map_err(|e| e.to_string())?;
+        let old_agent = old_execution.agent();
+        let retirement_pool = Arc::clone(&pool);
+        let mut retirement =
+            tokio::spawn(
+                async move { retirement_pool.retire_conversation_and_wait("shared").await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.conversation_retiring_for_test("shared") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "conversation retirement admission did not close".to_string())?;
+        assert!(matches!(
+            pool.acquire("shared").await,
+            Err(PoolError::ConversationRetirementPending { .. })
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut retirement)
+                .await
+                .is_err(),
+            "retirement completed before the old execution receipt settled"
+        );
+
+        drop(old_execution);
+        assert!(
+            retirement
+                .await
+                .map_err(|error| error.to_string())?
+                .map_err(|error| error.to_string())?
+        );
+        assert!(!pool.conversation_retiring_for_test("shared"));
+        let replacement = pool.acquire("shared").await.map_err(|e| e.to_string())?;
+        assert!(!Arc::ptr_eq(old_agent.inner(), replacement.agent().inner()));
+        drop(replacement);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_conversation_retirement_reopens_without_claiming_settlement() -> TestResult {
+        let pool = Arc::new(create_test_pool(5, false).await?);
+        let old_execution = pool.acquire("shared").await.map_err(|e| e.to_string())?;
+        let retirement_pool = Arc::clone(&pool);
+        let retirement =
+            tokio::spawn(
+                async move { retirement_pool.retire_conversation_and_wait("shared").await },
+            );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.conversation_retiring_for_test("shared") {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "conversation retirement admission did not close".to_string())?;
+        retirement.abort();
+        let _join = retirement.await;
+        assert!(!pool.conversation_retiring_for_test("shared"));
+        let overlapping = pool.acquire("shared").await.map_err(|e| e.to_string())?;
+        drop(overlapping);
+        drop(old_execution);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn drained_retirement_keeps_admission_closed_until_aggregate_commit() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
+        let cached = pool
+            .acquire("shared")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(cached);
+        let retirement = pool
+            .begin_conversation_retirement("shared")
+            .map_err(|error| error.to_string())?;
+        assert!(
+            pool.drain_conversation_retirement(&retirement)
+                .await
+                .map_err(|error| error.to_string())?
+        );
+        assert!(matches!(
+            pool.acquire("shared").await,
+            Err(PoolError::ConversationRetirementPending { .. })
+        ));
+        drop(retirement);
+        let replacement = pool
+            .acquire("shared")
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(replacement);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retirement_receipt_cannot_complete_against_another_pool() -> TestResult {
+        let pool_a = create_test_pool(5, false).await?;
+        let pool_b = create_test_pool(5, false).await?;
+        let cached_b = pool_b.acquire("shared").await.map_err(|e| e.to_string())?;
+        drop(cached_b);
+
+        let retirement = pool_a
+            .begin_conversation_retirement("shared")
+            .map_err(|error| error.to_string())?;
+        let result = pool_b.complete_conversation_retirement(retirement).await;
+        assert!(matches!(result, Err(PoolError::RetirementReceiptMismatch)));
+        assert_eq!(pool_b.pool_size().await, 1);
+        assert!(!pool_a.conversation_retiring_for_test("shared"));
+        let still_cached = pool_b.acquire("shared").await.map_err(|e| e.to_string())?;
+        drop(still_cached);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn runtime_checkpoint_restores_same_incarnation_but_not_rotated_key() -> TestResult {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let state_store = Arc::new(
+            echo_agent::state::FileRuntimeStateStore::new(temp.path())
+                .map_err(|error| error.to_string())?,
+        );
+        let pool = create_test_pool(5, false).await?;
+        pool.apply_state_store(state_store).await;
+
+        let first = pool
+            .acquire("runtime-incarnation-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        let first_agent = first.agent();
+        first_agent
+            .read_async(|agent| {
+                Box::pin(async move {
+                    agent
+                        .load_messages(vec![echo_agent::llm::types::Message::user(
+                            "incarnation-a history".to_string(),
+                        )])
+                        .await;
+                    agent.force_checkpoint().await
+                })
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        drop(first);
+        pool.retire_conversation_and_wait("runtime-incarnation-a")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let same_incarnation = pool
+            .acquire("runtime-incarnation-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        let restored = same_incarnation
+            .agent()
+            .read_async(|agent| Box::pin(async move { agent.resume_from_state_store().await }))
+            .await
+            .map_err(|error| error.to_string())?;
+        if restored.is_none() {
+            return Err("same incarnation did not restore its checkpoint".into());
+        }
+        drop(same_incarnation);
+
+        let rotated = pool
+            .acquire("runtime-incarnation-b")
+            .await
+            .map_err(|error| error.to_string())?;
+        let rotated_agent = rotated.agent();
+        let rotated_restore = rotated_agent
+            .read_async(|agent| Box::pin(async move { agent.resume_from_state_store().await }))
+            .await
+            .map_err(|error| error.to_string())?;
+        let rotated_messages = rotated_agent
+            .read_async(|agent| Box::pin(async move { agent.get_messages().await }))
+            .await;
+        if rotated_restore.is_some()
+            || rotated_messages.iter().any(|message| {
+                message
+                    .text_content()
+                    .is_some_and(|text| text.contains("incarnation-a history"))
+            })
+        {
+            return Err("rotated incarnation restored the previous model context".into());
+        }
+        drop(rotated);
         Ok(())
     }
 

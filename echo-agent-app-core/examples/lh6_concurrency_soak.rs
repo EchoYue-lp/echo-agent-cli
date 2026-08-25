@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
         ChatEventLog::open(&journal_root, ChatEventRetention::default())
             .map_err(|error| anyhow!(error.to_string()))?,
     );
-    let mut service = new_service(chat_events.clone())?;
+    let (mut service, mut product_data_io) = new_service(chat_events.clone())?;
     let mut addresses = build_addresses(&service);
     let started = std::time::Instant::now();
     let required_active_millis = args.duration_seconds.saturating_mul(1_000);
@@ -176,7 +176,11 @@ async fn main() -> Result<()> {
 
         if ledger.cycles.is_multiple_of(25) {
             service.shutdown().await.map_err(anyhow::Error::msg)?;
-            service = new_service(chat_events.clone())?;
+            product_data_io
+                .join_shutdown()
+                .await
+                .map_err(anyhow::Error::msg)?;
+            (service, product_data_io) = new_service(chat_events.clone())?;
             addresses = build_addresses(&service);
             ledger.runtime_restarts = ledger.runtime_restarts.saturating_add(1);
         }
@@ -184,6 +188,10 @@ async fn main() -> Result<()> {
     }
 
     service.shutdown().await.map_err(anyhow::Error::msg)?;
+    product_data_io
+        .join_shutdown()
+        .await
+        .map_err(anyhow::Error::msg)?;
     ledger.active_elapsed_millis = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     ensure!(
         ledger.routing_failures == 0,
@@ -207,9 +215,20 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn new_service(chat_events: Arc<ChatEventLog>) -> Result<Arc<CommandCellRuntimeService>> {
-    CommandCellRuntimeService::new(Arc::new(SandboxManager::local_only()), chat_events)
-        .map_err(anyhow::Error::msg)
+fn new_service(
+    chat_events: Arc<ChatEventLog>,
+) -> Result<(
+    Arc<CommandCellRuntimeService>,
+    echo_agent_app_core::product_data_io::ProductDataIoService,
+)> {
+    let product_data_io = echo_agent_app_core::product_data_io::ProductDataIoService::new();
+    let service = CommandCellRuntimeService::new(
+        Arc::new(SandboxManager::local_only()),
+        chat_events,
+        product_data_io.clone(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    Ok((service, product_data_io))
 }
 
 fn build_addresses(service: &Arc<CommandCellRuntimeService>) -> Vec<Address> {

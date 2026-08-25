@@ -1,6 +1,6 @@
 //! Agent-facing access to the file-backed research library.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use echo_agent::error::Result;
 use echo_agent::tools::permission::ToolPermission;
@@ -21,7 +21,22 @@ use crate::research_connectors::{
     import_zotero, search_and_ingest,
 };
 
-pub struct ResearchLibraryTool;
+pub struct ResearchLibraryTool {
+    product_data_io: crate::product_data_io::ProductDataIoService,
+    workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
+}
+
+impl ResearchLibraryTool {
+    pub(crate) fn new(
+        product_data_io: crate::product_data_io::ProductDataIoService,
+        workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
+    ) -> Self {
+        Self {
+            product_data_io,
+            workspace_io_identity,
+        }
+    }
+}
 
 impl Tool for ResearchLibraryTool {
     fn name(&self) -> &str {
@@ -77,65 +92,44 @@ impl Tool for ResearchLibraryTool {
     ) -> BoxFuture<'a, Result<ToolResult>> {
         Box::pin(async move {
             let action = match parameters.get("action").and_then(Value::as_str) {
-                Some(action) => action,
+                Some(action) => action.to_string(),
                 None => return Ok(ToolResult::invalid_arguments("action is required")),
             };
-            let workspace_root = workspace_root(context);
-            let result = match action {
-                "list_sources" => list_sources(
-                    &workspace_root,
-                    parameters.get("tag").and_then(Value::as_str),
-                    parameters.get("search").and_then(Value::as_str),
+            let Some(workspace_io) =
+                crate::state::WorkspaceIoInvocation::from_tool_context_for_identity(
+                    context,
+                    &self.workspace_io_identity,
                 )
-                .and_then(success_json),
-                "get_source" => required_string(&parameters, "source_id")
-                    .and_then(|source_id| get_source(&workspace_root, source_id))
-                    .and_then(success_json),
-                "create_source" => parse_object::<CreateSourceRequest>(&parameters, "source")
-                    .and_then(|request| create_source(&workspace_root, request))
-                    .and_then(success_json),
-                "list_evidence" => list_evidence(
-                    &workspace_root,
-                    parameters.get("source_id").and_then(Value::as_str),
-                    parameters.get("review_id").and_then(Value::as_str),
-                )
-                .and_then(success_json),
-                "upsert_evidence" => parse_object::<UpsertEvidenceRequest>(&parameters, "evidence")
-                    .and_then(|request| upsert_evidence(&workspace_root, request))
-                    .and_then(success_json),
-                "list_reviews" => list_reviews(&workspace_root).and_then(success_json),
-                "get_review" => required_string(&parameters, "review_id")
-                    .and_then(|review_id| get_review(&workspace_root, review_id))
-                    .and_then(success_json),
-                "create_review" => parse_object::<CreateReviewRequest>(&parameters, "review")
-                    .and_then(|request| create_review(&workspace_root, request))
-                    .and_then(success_json),
-                "save_review" => {
-                    let request = parse_object::<ReviewRecord>(&parameters, "review");
-                    let review_id = required_string(&parameters, "review_id");
-                    let revision = required_string(&parameters, "expected_revision");
-                    match (request, review_id, revision) {
-                        (Ok(record), Ok(review_id), Ok(revision)) => {
-                            save_review(&workspace_root, review_id, record, revision)
-                                .and_then(success_json)
-                        }
-                        (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
-                    }
-                }
+            else {
+                return Ok(ToolResult::error(
+                    "research_library requires the exact EKO workspace lifetime receipt",
+                ));
+            };
+            let workspace_root = workspace_io.data_root().to_path_buf();
+            let resource_guards = workspace_io.resource_guards();
+            let flow = self
+                .product_data_io
+                .begin_owned_flow("execute research library operation")
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+            let result = match action.as_str() {
                 "search_sources" => {
                     match parse_object::<ScholarlySearchRequest>(&parameters, "search_request") {
-                        Ok(request) => search_and_ingest(&workspace_root, request)
-                            .await
-                            .and_then(success_json),
+                        Ok(request) => {
+                            search_and_ingest(&flow, &resource_guards, &workspace_root, request)
+                                .await
+                                .and_then(success_json)
+                        }
                         Err(error) => Err(error),
                     }
                 }
                 "import_zotero" => {
                     match parse_object::<ZoteroToolRequest>(&parameters, "zotero_request") {
                         Ok(request) => match request.into_sync_request() {
-                            Ok(request) => import_zotero(&workspace_root, request)
-                                .await
-                                .and_then(success_json),
+                            Ok(request) => {
+                                import_zotero(&flow, &resource_guards, &workspace_root, request)
+                                    .await
+                                    .and_then(success_json)
+                            }
                             Err(error) => Err(error),
                         },
                         Err(error) => Err(error),
@@ -144,50 +138,120 @@ impl Tool for ResearchLibraryTool {
                 "export_zotero" => {
                     match parse_object::<ZoteroToolRequest>(&parameters, "zotero_request") {
                         Ok(request) => match request.into_sync_request() {
-                            Ok(request) => export_zotero(&workspace_root, request)
-                                .await
-                                .and_then(success_json),
+                            Ok(request) => {
+                                export_zotero(&flow, &resource_guards, &workspace_root, request)
+                                    .await
+                                    .and_then(success_json)
+                            }
                             Err(error) => Err(error),
                         },
                         Err(error) => Err(error),
                     }
                 }
                 "enrich_europe_pmc" => match required_string(&parameters, "source_id") {
-                    Ok(source_id) => enrich_from_europe_pmc(&workspace_root, source_id)
-                        .await
-                        .and_then(success_json),
+                    Ok(source_id) => {
+                        enrich_from_europe_pmc(&flow, &resource_guards, &workspace_root, source_id)
+                            .await
+                            .and_then(success_json)
+                    }
                     Err(error) => Err(error),
                 },
-                "audit_review" => required_string(&parameters, "review_id")
-                    .and_then(|review_id| audit_review(&workspace_root, review_id))
-                    .and_then(success_json),
-                "export_review" => {
-                    let review_id = required_string(&parameters, "review_id");
-                    let format = parameters
-                        .get("format")
-                        .and_then(Value::as_str)
-                        .unwrap_or("markdown");
-                    review_id.and_then(|review_id| {
-                        if format == "all" {
-                            export_all_review_formats(&workspace_root, review_id)
-                                .and_then(success_json)
-                        } else {
-                            parse_export_format(format)
-                                .and_then(|format| {
-                                    export_review(&workspace_root, review_id, format)
-                                })
-                                .and_then(success_json)
-                        }
-                    })
-                }
                 _ => {
-                    return Ok(ToolResult::invalid_arguments(format!(
-                        "unsupported research_library action: {action}"
-                    )));
+                    let action = action.clone();
+                    let resource_guards = resource_guards.clone();
+                    match flow
+                        .run("execute research library file action", move || {
+                            let _resource_guards = resource_guards;
+                            execute_file_action(&workspace_root, &action, &parameters)
+                        })
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(error) => {
+                            Err(crate::research::ResearchError::External(error.to_string()))
+                        }
+                    }
                 }
             };
-            Ok(result.unwrap_or_else(|error| ToolResult::error(error.to_string())))
+            let failure = result
+                .as_ref()
+                .err()
+                .filter(|error| error.is_durable_settlement_debt())
+                .map(ToString::to_string);
+            let result = result.unwrap_or_else(|error| ToolResult::error(error.to_string()));
+            flow.settle(failure);
+            Ok(result)
         })
+    }
+}
+
+fn execute_file_action(
+    workspace_root: &Path,
+    action: &str,
+    parameters: &ToolParameters,
+) -> crate::research::ResearchResult<ToolResult> {
+    match action {
+        "list_sources" => list_sources(
+            workspace_root,
+            parameters.get("tag").and_then(Value::as_str),
+            parameters.get("search").and_then(Value::as_str),
+        )
+        .and_then(success_json),
+        "get_source" => required_string(parameters, "source_id")
+            .and_then(|source_id| get_source(workspace_root, source_id))
+            .and_then(success_json),
+        "create_source" => parse_object::<CreateSourceRequest>(parameters, "source")
+            .and_then(|request| create_source(workspace_root, request))
+            .and_then(success_json),
+        "list_evidence" => list_evidence(
+            workspace_root,
+            parameters.get("source_id").and_then(Value::as_str),
+            parameters.get("review_id").and_then(Value::as_str),
+        )
+        .and_then(success_json),
+        "upsert_evidence" => parse_object::<UpsertEvidenceRequest>(parameters, "evidence")
+            .and_then(|request| upsert_evidence(workspace_root, request))
+            .and_then(success_json),
+        "list_reviews" => list_reviews(workspace_root).and_then(success_json),
+        "get_review" => required_string(parameters, "review_id")
+            .and_then(|review_id| get_review(workspace_root, review_id))
+            .and_then(success_json),
+        "create_review" => parse_object::<CreateReviewRequest>(parameters, "review")
+            .and_then(|request| create_review(workspace_root, request))
+            .and_then(success_json),
+        "save_review" => {
+            let request = parse_object::<ReviewRecord>(parameters, "review");
+            let review_id = required_string(parameters, "review_id");
+            let revision = required_string(parameters, "expected_revision");
+            match (request, review_id, revision) {
+                (Ok(record), Ok(review_id), Ok(revision)) => {
+                    save_review(workspace_root, review_id, record, revision).and_then(success_json)
+                }
+                (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
+            }
+        }
+        "audit_review" => required_string(parameters, "review_id")
+            .and_then(|review_id| audit_review(workspace_root, review_id))
+            .and_then(success_json),
+        "export_review" => {
+            let review_id = required_string(parameters, "review_id");
+            let format = parameters
+                .get("format")
+                .and_then(Value::as_str)
+                .unwrap_or("markdown");
+            review_id.and_then(|review_id| {
+                if format == "all" {
+                    export_all_review_formats(workspace_root, review_id).and_then(success_json)
+                } else {
+                    parse_export_format(format)
+                        .and_then(|format| export_review(workspace_root, review_id, format))
+                        .and_then(success_json)
+                }
+            })
+        }
+        _ => Ok(ToolResult::invalid_arguments(format!(
+            "unsupported research_library action: {action}"
+        ))),
     }
 }
 
@@ -230,15 +294,6 @@ fn parse_export_format(value: &str) -> crate::research::ResearchResult<ReviewExp
             "unsupported review export format: {value}"
         ))),
     }
-}
-
-fn workspace_root(context: &echo_agent::tools::ToolContext) -> PathBuf {
-    context
-        .working_dir
-        .as_ref()
-        .map(|path| path.to_path_buf())
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| Path::new(".").to_path_buf())
 }
 
 fn required_string<'a>(

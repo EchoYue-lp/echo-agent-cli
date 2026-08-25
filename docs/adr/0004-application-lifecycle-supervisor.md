@@ -40,6 +40,14 @@ wait future 只会停止等待，不会丢失实际 shutdown。`AgentPool` 在�
 authority 的 execution receipt；Tauri bridge 在 spawn 前取得 reservation。phase one 关闭 admission
 后不能产生未被 phase two join 的新任务。
 
+同步 product-data I/O 的生命周期按应用代际拥有：`AgentRuntime` 创建一个
+`ProductDataIoService`，并无损注入 AppState、workspace host、CommandCell、analytics 与 Agent
+research tools。进程级 semaphore 只负责容量。phase one 同时关闭 foreground/TaskRun/tool 等顶层
+producer admission 与 ProductData 顶层 admission；新的 flow 和直接 I/O 都会 fail closed。已经接纳的
+manual/delete/analysis/research/CommandCell/workspace flow 持 cloneable shared receipt，并只用其 nested
+token 完成 provider/transform 后的 blocking safe point。phase two 等这些 flow 与 nested I/O 全部归零，
+并聚合 caller 不再等待时留下的 durable failure debt。
+
 Agent delivery 的 live settlement wait 必须同时监听 supervisor cancel。取消后 `Injected` 保持
 非终态并留给下次启动恢复，不能伪造 `Delivered`。delivery driver 使用 RAII 清理 active target；
 panic/cancel 的 join failure 通过 Tokio task ID 关联 target 后进入聚合回执。active/dirty owner 带

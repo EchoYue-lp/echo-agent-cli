@@ -171,6 +171,7 @@ pub struct HeadlessServiceResources {
     pub command_cell_runtime: std::sync::Arc<
         echo_agent_app_core::tasks::task_runtime::command_cells::CommandCellRuntimeService,
     >,
+    pub product_data_io: echo_agent_app_core::product_data_io::ProductDataIoService,
     pub browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
     pub lifecycle: echo_agent_app_core::runtime::ApplicationLifecycleOwner,
 }
@@ -473,6 +474,7 @@ pub async fn start_headless_services(
         resources.runtime_state_store.clone(),
         app_config.clone(),
         resources.mcp_config_runtime.clone(),
+        resources.product_data_io.clone(),
     ) {
         Ok(state) => state,
         Err(error) => {
@@ -606,16 +608,11 @@ pub async fn shutdown_headless_services(
 ///
 /// Channel agent 经 `AgentPool` 全套接通(bootstrap 等价:state_store/store/compressor/
 /// MemoryLayerManager/permission_service/per-sender cache_user_id+conversation_id),
-/// per-sender 隔离由 pool key `channel:{channel_id}:{sender_id}` 承载。
+/// per-sender 隔离由 framework SessionHandler 与 EKO 的三元身份哈希共同承载。
 #[cfg(feature = "channels")]
 pub struct ChannelsModeArgs {
     pub app_state: std::sync::Arc<echo_agent_app_core::state::AppState>,
-    pub pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
     pub app_config: EkoConfig,
-    pub task_runtime_store:
-        Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-    pub review_integration:
-        Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     pub webhook_emitter: std::sync::Arc<echo_agent_app_core::webhook::WebhookEmitter>,
     pub foreground_turns: echo_agent_app_core::foreground_turn::ForegroundTurnControl,
     pub shutdown: echo_agent::agent::CancellationToken,
@@ -630,14 +627,11 @@ pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
         SessionHandler,
     };
 
-    use crate::cli::channels::AppChannelMessageHandler;
+    use crate::cli::channels::{AppChannelMessageHandler, ChannelSessionCoordinator};
 
     let ChannelsModeArgs {
         app_state,
-        pool,
         app_config,
-        task_runtime_store,
-        review_integration,
         webhook_emitter,
         foreground_turns,
         shutdown,
@@ -709,31 +703,31 @@ pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
     // at composition; `/reset` is handled by AppChannelMessageHandler.
     let session_config = channel_session_config(app_config.channels.session.timeout_minutes);
 
-    // pool create_agent 用 app_config 默认 model(system_prompt/agent_name 来自
-    // app_config),无需在此解析 runtime_model 或裸建 agent —— bootstrap 全套已由
-    // pool 注入。handler_factory 每 channel 产出一个 SessionHandler,其内层工厂
-    // 每 (channel,sender) 产出 AppChannelMessageHandler(持 pool clone)。
+    // handler_factory 每 channel 产出一个 SessionHandler,其内层工厂每
+    // (channel,conversation,sender) 产出 AppChannelMessageHandler；handler
+    // 从 AppState 解析消息所属 workspace generation 的 exact runtime。
     let handler_factory = move |_channel_id: &str| -> Arc<dyn MessageHandler> {
         let session_config = session_config.clone();
         let app_state = app_state.clone();
-        let pool = pool.clone();
-        let store = task_runtime_store.clone();
-        let review_integration = review_integration.clone();
         let webhook_emitter = webhook_emitter.clone();
         let foreground_turns = foreground_turns.clone();
-        Arc::new(SessionHandler::new(
-            session_config,
-            move |_instance: &echo_agent::channels::ChannelSessionInstance| -> Box<dyn MessageHandler> {
+        let session_coordinator = Arc::new(ChannelSessionCoordinator::new());
+        let end_coordinator = Arc::clone(&session_coordinator);
+        Arc::new(
+            SessionHandler::new(
+                session_config,
+                move |instance: &echo_agent::channels::ChannelSessionInstance| -> Box<dyn MessageHandler> {
                 Box::new(AppChannelMessageHandler::new(
                     app_state.clone(),
-                    pool.clone(),
-                    store.clone(),
-                    review_integration.clone(),
                     webhook_emitter.clone(),
                     foreground_turns.clone(),
+                    instance.clone(),
+                    Arc::clone(&session_coordinator),
                 ))
-            },
-        ))
+                },
+            )
+            .with_on_session_end(move |info| end_coordinator.record_session_end(info)),
+        )
     };
 
     tracing::info!("启动 {} 个 IM 通道...", manager.len());
@@ -857,6 +851,11 @@ mod tests {
     }
 
     #[cfg(feature = "channels")]
+    struct SenderSessionProbe {
+        generation: usize,
+    }
+
+    #[cfg(feature = "channels")]
     #[async_trait::async_trait]
     impl echo_agent::channels::MessageHandler for ResetProbe {
         async fn handle(
@@ -869,6 +868,29 @@ mod tests {
                 message.chat_id,
                 message.chat_type,
                 "app-owned-reset",
+            ))
+        }
+
+        async fn reply(
+            &self,
+            _message: echo_agent::channels::OutboundMessage,
+        ) -> echo_agent::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    #[async_trait::async_trait]
+    impl echo_agent::channels::MessageHandler for SenderSessionProbe {
+        async fn handle(
+            &self,
+            message: echo_agent::channels::InboundMessage,
+        ) -> echo_agent::error::Result<echo_agent::channels::OutboundMessage> {
+            Ok(echo_agent::channels::OutboundMessage::new(
+                &message.channel_id,
+                message.reply_target(),
+                message.chat_type,
+                self.generation.to_string(),
             ))
         }
 
@@ -913,6 +935,45 @@ mod tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(response.text, "app-owned-reset");
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn production_session_config_isolates_group_senders_and_reuses_each_sender() -> Result<()>
+    {
+        use echo_agent::channels::{ChatType, InboundMessage, MessageHandler, SessionHandler};
+
+        let created = Arc::new(AtomicUsize::new(0));
+        let factory_created = Arc::clone(&created);
+        let handler = SessionHandler::new(
+            channel_session_config(30),
+            move |_instance: &echo_agent::channels::ChannelSessionInstance| {
+                let generation = factory_created
+                    .fetch_add(1, Ordering::SeqCst)
+                    .saturating_add(1);
+                Box::new(SenderSessionProbe { generation }) as Box<dyn MessageHandler>
+            },
+        );
+        let message = |sender_id: &str, message_id: &str| {
+            InboundMessage::new(
+                "test-channel",
+                sender_id,
+                "shared-group",
+                ChatType::Group,
+                "hello",
+                message_id,
+            )
+        };
+
+        let alice_first = handler.handle(message("alice", "m1")).await?;
+        let bob = handler.handle(message("bob", "m2")).await?;
+        let alice_second = handler.handle(message("alice", "m3")).await?;
+        assert_eq!(alice_first.text, "1");
+        assert_eq!(bob.text, "2");
+        assert_eq!(alice_second.text, "1");
+        assert_eq!(handler.active_sessions(), 2);
+        assert_eq!(created.load(Ordering::SeqCst), 2);
         Ok(())
     }
 

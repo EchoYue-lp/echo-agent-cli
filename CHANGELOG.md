@@ -32,6 +32,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Channel now carries framework sender-scoped sessions through EKO AgentPool,
+  TaskRun, cache, foreground control, exact resume, bounded outbound rendering,
+  and bidirectional canonical tool identity quarantine. Framework session
+  timeout/reset now close old key admission, await exact foreground/lease
+  settlement, retire the old cached Agent, reclaim its exact persisted runtime,
+  and rotate model/checkpoint/cache identity while preserving stable product
+  history and TaskRun state. Channel TaskRuntime and attachment/compression file
+  work now use the bounded store/product-data owners; aggregate product deletion
+  clears every runtime incarnation before retiring the stable transcript.
+  Product-data blocking work is now owned by one per-application service that
+  survives caller drop and is sealed/joined by application shutdown; the
+  process-global primitive only limits concurrency.
 - `SkillInfo` TypeScript 类型新增 category / is_baseline / is_builtin /
   upstream_version / has_updates / missing_dependencies 字段。
 - SkillsPanel 重构为分组折叠 UI。

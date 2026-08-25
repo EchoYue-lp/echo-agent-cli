@@ -81,28 +81,44 @@ pub struct EuropePmcEnrichmentResult {
 }
 
 pub async fn search_and_ingest(
+    flow: &crate::product_data_io::ProductDataIoFlow,
+    resource_guards: &[echo_agent::tools::InvocationResourceGuard],
     workspace_root: &Path,
     request: ScholarlySearchRequest,
 ) -> ResearchResult<ScholarlyIngestResult> {
-    search_and_ingest_inner(workspace_root, request, None).await
+    search_and_ingest_inner(
+        workspace_root,
+        request,
+        ResearchIo::Application {
+            flow,
+            resource_guards,
+        },
+    )
+    .await
 }
 
 pub async fn search_and_ingest_scoped(
     product_data: &crate::product_data_io::ScopedProductData,
     request: ScholarlySearchRequest,
 ) -> ResearchResult<ScholarlyIngestResult> {
-    search_and_ingest_inner(
-        product_data.data_root(),
-        request,
-        Some(product_data.settlement_receipt()),
-    )
-    .await
+    let flow = product_data
+        .begin_owned_flow("search and ingest research sources")
+        .map_err(|error| ResearchError::External(error.to_string()))?;
+    let result =
+        search_and_ingest_inner(product_data.data_root(), request, ResearchIo::Scoped(&flow)).await;
+    let failure = result
+        .as_ref()
+        .err()
+        .filter(|error| error.is_durable_settlement_debt())
+        .map(ToString::to_string);
+    flow.settle(failure);
+    result
 }
 
 async fn search_and_ingest_inner(
     workspace_root: &Path,
     request: ScholarlySearchRequest,
-    receipt: Option<crate::state::ScopedWorkspaceControl>,
+    product_data: ResearchIo<'_>,
 ) -> ResearchResult<ScholarlyIngestResult> {
     let query = request.query.trim().to_string();
     if query.is_empty() {
@@ -129,35 +145,51 @@ async fn search_and_ingest_inner(
             .map_err(external)?,
     };
     let root = workspace_root.to_path_buf();
-    research_io(receipt, "ingest scholarly search page", move || {
+    research_io(product_data, "ingest scholarly search page", move || {
         ingest_page(&root, request.provider, &query, page)
     })
     .await
 }
 
 pub async fn import_zotero(
+    flow: &crate::product_data_io::ProductDataIoFlow,
+    resource_guards: &[echo_agent::tools::InvocationResourceGuard],
     workspace_root: &Path,
     request: ZoteroSyncRequest,
 ) -> ResearchResult<ZoteroSyncResult> {
-    import_zotero_inner(workspace_root, request, None).await
+    import_zotero_inner(
+        workspace_root,
+        request,
+        ResearchIo::Application {
+            flow,
+            resource_guards,
+        },
+    )
+    .await
 }
 
 pub async fn import_zotero_scoped(
     product_data: &crate::product_data_io::ScopedProductData,
     request: ZoteroSyncRequest,
 ) -> ResearchResult<ZoteroSyncResult> {
-    import_zotero_inner(
-        product_data.data_root(),
-        request,
-        Some(product_data.settlement_receipt()),
-    )
-    .await
+    let flow = product_data
+        .begin_owned_flow("import Zotero research library")
+        .map_err(|error| ResearchError::External(error.to_string()))?;
+    let result =
+        import_zotero_inner(product_data.data_root(), request, ResearchIo::Scoped(&flow)).await;
+    let failure = result
+        .as_ref()
+        .err()
+        .filter(|error| error.is_durable_settlement_debt())
+        .map(ToString::to_string);
+    flow.settle(failure);
+    result
 }
 
 async fn import_zotero_inner(
     workspace_root: &Path,
     request: ZoteroSyncRequest,
-    receipt: Option<crate::state::ScopedWorkspaceControl>,
+    product_data: ResearchIo<'_>,
 ) -> ResearchResult<ZoteroSyncResult> {
     let client = zotero_client(&request)?;
     let items = client
@@ -165,7 +197,7 @@ async fn import_zotero_inner(
         .await
         .map_err(external)?;
     let root = workspace_root.to_path_buf();
-    research_io(receipt, "ingest Zotero library", move || {
+    research_io(product_data, "ingest Zotero library", move || {
         let mut imported = 0usize;
         let mut updated = 0usize;
         let mut sources = Vec::new();
@@ -201,28 +233,44 @@ async fn import_zotero_inner(
 }
 
 pub async fn export_zotero(
+    flow: &crate::product_data_io::ProductDataIoFlow,
+    resource_guards: &[echo_agent::tools::InvocationResourceGuard],
     workspace_root: &Path,
     request: ZoteroSyncRequest,
 ) -> ResearchResult<ZoteroSyncResult> {
-    export_zotero_inner(workspace_root, request, None).await
+    export_zotero_inner(
+        workspace_root,
+        request,
+        ResearchIo::Application {
+            flow,
+            resource_guards,
+        },
+    )
+    .await
 }
 
 pub async fn export_zotero_scoped(
     product_data: &crate::product_data_io::ScopedProductData,
     request: ZoteroSyncRequest,
 ) -> ResearchResult<ZoteroSyncResult> {
-    export_zotero_inner(
-        product_data.data_root(),
-        request,
-        Some(product_data.settlement_receipt()),
-    )
-    .await
+    let flow = product_data
+        .begin_owned_flow("export Zotero research library")
+        .map_err(|error| ResearchError::External(error.to_string()))?;
+    let result =
+        export_zotero_inner(product_data.data_root(), request, ResearchIo::Scoped(&flow)).await;
+    let failure = result
+        .as_ref()
+        .err()
+        .filter(|error| error.is_durable_settlement_debt())
+        .map(ToString::to_string);
+    flow.settle(failure);
+    result
 }
 
 async fn export_zotero_inner(
     workspace_root: &Path,
     request: ZoteroSyncRequest,
-    receipt: Option<crate::state::ScopedWorkspaceControl>,
+    product_data: ResearchIo<'_>,
 ) -> ResearchResult<ZoteroSyncResult> {
     if request.source_ids.is_empty() {
         return Err(ResearchError::Invalid(
@@ -231,7 +279,7 @@ async fn export_zotero_inner(
     }
     let root = workspace_root.to_path_buf();
     let source_ids = request.source_ids.clone();
-    let sources = research_io(receipt, "load Zotero export sources", move || {
+    let sources = research_io(product_data, "load Zotero export sources", move || {
         let mut sources = Vec::new();
         for source_id in &source_ids {
             sources.push(get_source(&root, source_id)?);
@@ -261,32 +309,52 @@ async fn export_zotero_inner(
 }
 
 pub async fn enrich_from_europe_pmc(
+    flow: &crate::product_data_io::ProductDataIoFlow,
+    resource_guards: &[echo_agent::tools::InvocationResourceGuard],
     workspace_root: &Path,
     source_id: &str,
 ) -> ResearchResult<EuropePmcEnrichmentResult> {
-    enrich_from_europe_pmc_inner(workspace_root, source_id, None).await
+    enrich_from_europe_pmc_inner(
+        workspace_root,
+        source_id,
+        ResearchIo::Application {
+            flow,
+            resource_guards,
+        },
+    )
+    .await
 }
 
 pub async fn enrich_from_europe_pmc_scoped(
     product_data: &crate::product_data_io::ScopedProductData,
     source_id: &str,
 ) -> ResearchResult<EuropePmcEnrichmentResult> {
-    enrich_from_europe_pmc_inner(
+    let flow = product_data
+        .begin_owned_flow("enrich research source from Europe PMC")
+        .map_err(|error| ResearchError::External(error.to_string()))?;
+    let result = enrich_from_europe_pmc_inner(
         product_data.data_root(),
         source_id,
-        Some(product_data.settlement_receipt()),
+        ResearchIo::Scoped(&flow),
     )
-    .await
+    .await;
+    let failure = result
+        .as_ref()
+        .err()
+        .filter(|error| error.is_durable_settlement_debt())
+        .map(ToString::to_string);
+    flow.settle(failure);
+    result
 }
 
 async fn enrich_from_europe_pmc_inner(
     workspace_root: &Path,
     source_id: &str,
-    receipt: Option<crate::state::ScopedWorkspaceControl>,
+    product_data: ResearchIo<'_>,
 ) -> ResearchResult<EuropePmcEnrichmentResult> {
     let root = workspace_root.to_path_buf();
     let id = source_id.to_string();
-    let source = research_io(receipt.clone(), "load Europe PMC source", move || {
+    let source = research_io(product_data, "load Europe PMC source", move || {
         get_source(&root, &id)
     })
     .await?;
@@ -337,7 +405,7 @@ async fn enrich_from_europe_pmc_inner(
             Ok(xml) => {
                 let root = workspace_root.to_path_buf();
                 let id = source_id.to_string();
-                match research_io(receipt.clone(), "write Europe PMC full text", move || {
+                match research_io(product_data, "write Europe PMC full text", move || {
                     write_full_text_xml(&root, &id, &xml)
                 })
                 .await
@@ -371,7 +439,7 @@ async fn enrich_from_europe_pmc_inner(
     );
     let root = workspace_root.to_path_buf();
     let id = source_id.to_string();
-    let source = research_io(receipt, "save Europe PMC supplement", move || {
+    let source = research_io(product_data, "save Europe PMC supplement", move || {
         save_europe_pmc_supplement(
             &root,
             &id,
@@ -394,8 +462,17 @@ async fn enrich_from_europe_pmc_inner(
     Ok(EuropePmcEnrichmentResult { source, warnings })
 }
 
+#[derive(Clone, Copy)]
+enum ResearchIo<'a> {
+    Scoped(&'a crate::product_data_io::ScopedProductDataFlow),
+    Application {
+        flow: &'a crate::product_data_io::ProductDataIoFlow,
+        resource_guards: &'a [echo_agent::tools::InvocationResourceGuard],
+    },
+}
+
 async fn research_io<T, F>(
-    receipt: Option<crate::state::ScopedWorkspaceControl>,
+    product_data: ResearchIo<'_>,
     operation: &'static str,
     function: F,
 ) -> ResearchResult<T>
@@ -403,12 +480,24 @@ where
     T: Send + 'static,
     F: FnOnce() -> ResearchResult<T> + Send + 'static,
 {
-    crate::product_data_io::run(operation, move || {
-        let _receipt = receipt;
-        function()
-    })
-    .await
-    .map_err(|error| ResearchError::External(error.to_string()))?
+    match product_data {
+        ResearchIo::Scoped(product_data) => product_data
+            .run(operation, function)
+            .await
+            .map_err(|error| ResearchError::External(error.to_string()))?,
+        ResearchIo::Application {
+            flow,
+            resource_guards,
+        } => {
+            let resource_guards = resource_guards.to_vec();
+            flow.run(operation, move || {
+                let _resource_guards = resource_guards;
+                function()
+            })
+            .await
+            .map_err(|error| ResearchError::External(error.to_string()))?
+        }
+    }
 }
 
 pub fn ingest_tool_output(
@@ -477,6 +566,7 @@ fn ingest_tool_output_with_status(
 struct AutoIngestResearchTool {
     inner: Box<dyn Tool>,
     workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
+    product_data_io: crate::product_data_io::ProductDataIoService,
     #[cfg(test)]
     barrier: std::sync::Mutex<Option<AutoIngestTestBarrier>>,
 }
@@ -485,10 +575,12 @@ impl AutoIngestResearchTool {
     fn new(
         inner: Box<dyn Tool>,
         workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
+        product_data_io: crate::product_data_io::ProductDataIoService,
     ) -> Self {
         Self {
             inner,
             workspace_io_identity,
+            product_data_io,
             #[cfg(test)]
             barrier: std::sync::Mutex::new(None),
         }
@@ -498,11 +590,13 @@ impl AutoIngestResearchTool {
     fn with_barrier(
         inner: Box<dyn Tool>,
         workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
+        product_data_io: crate::product_data_io::ProductDataIoService,
         barrier: AutoIngestTestBarrier,
     ) -> Self {
         Self {
             inner,
             workspace_io_identity,
+            product_data_io,
             barrier: std::sync::Mutex::new(Some(barrier)),
         }
     }
@@ -603,7 +697,6 @@ impl Tool for AutoIngestResearchTool {
         context: &'a ToolContext,
     ) -> BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
-            let result = self.inner.execute_with_context(parameters, context).await?;
             // Execution working_dir may be a writer worktree. Product-data
             // root comes only from this workspace-local tool descriptor.
             let Some(workspace_io) =
@@ -612,11 +705,21 @@ impl Tool for AutoIngestResearchTool {
                     &self.workspace_io_identity,
                 )
             else {
-                return Ok(auto_ingest_scope_failure(
+                return Ok(auto_ingest_preflight_failure(
                     self.name(),
-                    result,
                     "the invocation did not retain an EKO workspace lifetime receipt",
                 ));
+            };
+            let flow = self
+                .product_data_io
+                .begin_owned_flow("automatic research ingest")
+                .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+            let result = match self.inner.execute_with_context(parameters, context).await {
+                Ok(result) => result,
+                Err(error) => {
+                    flow.settle(None);
+                    return Err(error);
+                }
             };
             let workspace_root = workspace_io.data_root().to_path_buf();
             let resource_guards = workspace_io.resource_guards();
@@ -627,17 +730,34 @@ impl Tool for AutoIngestResearchTool {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take();
-            crate::product_data_io::run("persist automatic research ingest", move || {
-                let _resource_guards = resource_guards;
-                #[cfg(test)]
-                if let Some(barrier) = barrier {
-                    let _ = barrier.entered.send(());
-                    let _ = barrier.release.blocking_recv();
+            let persisted = flow
+                .run("persist automatic research ingest", move || {
+                    let _resource_guards = resource_guards;
+                    #[cfg(test)]
+                    if let Some(barrier) = barrier {
+                        let _ = barrier.entered.send(());
+                        let _ = barrier.release.blocking_recv();
+                    }
+                    apply_auto_ingest(&workspace_root, &tool_name, result)
+                })
+                .await;
+            match persisted {
+                Ok(result) => {
+                    let failure = (!result.success).then(|| {
+                        result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "automatic research persistence failed".to_string())
+                    });
+                    flow.settle(failure);
+                    Ok(result)
                 }
-                apply_auto_ingest(&workspace_root, &tool_name, result)
-            })
-            .await
-            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+                Err(error) => {
+                    let detail = error.to_string();
+                    flow.settle(Some(detail.clone()));
+                    Err(echo_agent::error::ReactError::Other(detail))
+                }
+            }
         })
     }
 
@@ -661,23 +781,21 @@ impl Tool for AutoIngestResearchTool {
     }
 }
 
-fn auto_ingest_scope_failure(tool_name: &str, result: ToolResult, detail: &str) -> ToolResult {
+fn auto_ingest_preflight_failure(tool_name: &str, detail: &str) -> ToolResult {
     let mut failed = ToolResult::failure(
-        ToolFailureCategory::PartialSideEffect,
-        format!("{tool_name} completed, but EKO research persistence was refused: {detail}"),
-    )
-    .with_output(result.output);
-    failed.metadata = result.metadata;
+        ToolFailureCategory::InvalidArguments,
+        format!("{tool_name} was refused before provider execution: {detail}"),
+    );
     failed
         .metadata
-        .insert("provider_call".to_string(), "completed".to_string());
+        .insert("provider_call".to_string(), "not_started".to_string());
     failed.metadata.insert(
         "research_retrieval_status".to_string(),
-        "succeeded".to_string(),
+        "not_started".to_string(),
     );
     failed.metadata.insert(
         "research_persistence_status".to_string(),
-        "failed".to_string(),
+        "refused".to_string(),
     );
     failed
         .metadata
@@ -706,12 +824,14 @@ fn enrichment_fields(
 pub(crate) fn install_auto_ingest_tools(
     agent: &mut ReactAgent,
     workspace_io_identity: crate::workspace::WorkspaceIoIdentity,
+    product_data_io: crate::product_data_io::ProductDataIoService,
 ) {
     for tool_name in AUTO_INGEST_TOOLS {
         if let Some(tool) = agent.remove_tool(tool_name) {
             agent.add_tool(Box::new(AutoIngestResearchTool::new(
                 tool,
                 workspace_io_identity.clone(),
+                product_data_io.clone(),
             )));
         }
     }
@@ -990,6 +1110,7 @@ pub(crate) async fn run_auto_ingest_barrier_fixture(
     AutoIngestResearchTool::with_barrier(
         Box::new(AutoIngestBarrierFixtureTool),
         workspace_io_identity,
+        crate::product_data_io::ProductDataIoService::new(),
         AutoIngestTestBarrier { entered, release },
     )
     .execute_with_context(ToolParameters::new(), &context)
@@ -1006,6 +1127,7 @@ pub(crate) fn install_auto_ingest_barrier_fixture(
     agent.add_tool(Box::new(AutoIngestResearchTool::with_barrier(
         Box::new(AutoIngestBarrierFixtureTool),
         workspace_io_identity,
+        crate::product_data_io::ProductDataIoService::new(),
         AutoIngestTestBarrier { entered, release },
     )));
 }
@@ -1104,6 +1226,7 @@ mod tests {
                 output: "not json".to_string(),
             }),
             crate::workspace::WorkspaceIoIdentity::global(workspace.path()),
+            crate::product_data_io::ProductDataIoService::new(),
         );
         let context = guarded_context(workspace.path());
 
@@ -1125,6 +1248,10 @@ mod tests {
                 .get("research_persistence_status")
                 .map(String::as_str),
             Some("failed")
+        );
+        assert_eq!(
+            result.metadata.get("provider_call").map(String::as_str),
+            Some("completed")
         );
         assert_eq!(
             result.failure.as_ref().map(|failure| failure.category),
@@ -1156,6 +1283,7 @@ mod tests {
                 .to_string(),
             }),
             crate::workspace::WorkspaceIoIdentity::global(workspace.path()),
+            crate::product_data_io::ProductDataIoService::new(),
         );
         let context = guarded_context(workspace.path());
 
@@ -1195,6 +1323,7 @@ mod tests {
                 .to_string(),
             }),
             crate::workspace::WorkspaceIoIdentity::global(workspace.path()),
+            crate::product_data_io::ProductDataIoService::new(),
         );
         let context = guarded_context(workspace.path());
 
@@ -1239,6 +1368,7 @@ mod tests {
                 .to_string(),
             }),
             crate::workspace::WorkspaceIoIdentity::global(workspace.path()),
+            crate::product_data_io::ProductDataIoService::new(),
         );
         let context = ToolContext {
             working_dir: Some(workspace.path().to_path_buf()),
@@ -1258,7 +1388,11 @@ mod tests {
                 .metadata
                 .get("research_persistence_status")
                 .map(String::as_str),
-            Some("failed")
+            Some("refused")
+        );
+        assert_eq!(
+            result.metadata.get("provider_call").map(String::as_str),
+            Some("not_started")
         );
         assert_eq!(
             result
@@ -1285,6 +1419,7 @@ mod tests {
                 .to_string(),
             }),
             crate::workspace::WorkspaceIoIdentity::global(workspace.path()),
+            crate::product_data_io::ProductDataIoService::new(),
         );
         let mut context = guarded_context(workspace.path());
         context.working_dir = Some(writer.path().to_path_buf());
@@ -1305,6 +1440,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn preaccepted_auto_ingest_completes_after_phase_one_seal() -> AgentResult<()> {
+        let workspace = tempfile::tempdir()?;
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let tool = AutoIngestResearchTool::with_barrier(
+            Box::new(AutoIngestBarrierFixtureTool),
+            crate::workspace::WorkspaceIoIdentity::global(workspace.path()),
+            product_data_io.clone(),
+            AutoIngestTestBarrier {
+                entered: entered_tx,
+                release: release_rx,
+            },
+        );
+        let context = guarded_context(workspace.path());
+        let operation = tokio::spawn(async move {
+            tool.execute_with_context(ToolParameters::new(), &context)
+                .await
+        });
+        entered_rx
+            .await
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+        product_data_io
+            .begin_shutdown()
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+        let shutdown_service = product_data_io.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.join_shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release_tx.send(()).map_err(|_| {
+            echo_agent::error::ReactError::Other("auto-ingest release receiver closed".to_string())
+        })?;
+        let result = operation
+            .await
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))??;
+        assert!(result.success);
+        shutdown
+            .await
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+            .map_err(echo_agent::error::ReactError::Other)?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn auto_ingest_rejects_wrong_or_ambiguous_workspace_identity() -> AgentResult<()> {
         let workspace = tempfile::tempdir()?;
         let other = tempfile::tempdir()?;
@@ -1319,6 +1498,7 @@ mod tests {
                 output: output.clone(),
             }),
             expected_identity.clone(),
+            crate::product_data_io::ProductDataIoService::new(),
         );
         let wrong_context = guarded_context(other.path());
         let wrong = wrong_tool
@@ -1329,6 +1509,7 @@ mod tests {
         let ambiguous_tool = AutoIngestResearchTool::new(
             Box::new(SuccessfulResearchTool { output }),
             expected_identity,
+            crate::product_data_io::ProductDataIoService::new(),
         );
         let mut ambiguous_context = guarded_context(workspace.path());
         let duplicate = ambiguous_context
@@ -1359,12 +1540,18 @@ mod tests {
             ));
         }
         let workspace = tempfile::tempdir().map_err(ResearchError::Io)?;
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let flow = product_data_io
+            .begin_owned_flow("live research provider smoke")
+            .map_err(|error| ResearchError::External(error.to_string()))?;
         for provider in [
             ResearchProvider::Openalex,
             ResearchProvider::Crossref,
             ResearchProvider::EuropePmc,
         ] {
             let result = search_and_ingest(
+                &flow,
+                &[],
                 workspace.path(),
                 ScholarlySearchRequest {
                     provider,
@@ -1380,6 +1567,7 @@ mod tests {
                 )));
             }
         }
+        flow.settle(None);
         Ok(())
     }
 
@@ -1405,7 +1593,13 @@ mod tests {
             }
         };
         let workspace = tempfile::tempdir().map_err(ResearchError::Io)?;
+        let product_data_io = crate::product_data_io::ProductDataIoService::new();
+        let flow = product_data_io
+            .begin_owned_flow("live Zotero smoke")
+            .map_err(|error| ResearchError::External(error.to_string()))?;
         let result = import_zotero(
+            &flow,
+            &[],
             workspace.path(),
             ZoteroSyncRequest {
                 library_kind,
@@ -1421,6 +1615,7 @@ mod tests {
                 "Zotero library returned no importable source records".to_string(),
             ));
         }
+        flow.settle(None);
         Ok(())
     }
 }

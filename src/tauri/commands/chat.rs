@@ -1100,14 +1100,18 @@ async fn append_chat_projection(
     let workspace_id = workspace_id.to_string();
     let conversation_id = conversation_id.to_string();
     let root_turn_id = root_turn_id.to_string();
-    echo_agent_app_core::product_data_io::run("append GUI chat projection", move || {
-        let _workspace_receipt = workspace_receipt;
-        chat_events.append(&workspace_id, Some(&conversation_id), &root_turn_id, event)
-    })
-    .await
-    .map_err(|error| IpcError::Internal(error.to_string()))?
-    .map(|_| ())
-    .map_err(|error| IpcError::Internal(error.to_string()))
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("append GUI chat projection", move || {
+            let _workspace_receipt = workspace_receipt;
+            chat_events.append(&workspace_id, Some(&conversation_id), &root_turn_id, event)
+        })
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?
+        .map(|_| ())
+        .map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[tauri::command]

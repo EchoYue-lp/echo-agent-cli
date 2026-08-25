@@ -4,19 +4,21 @@
 //! channel 不直接构造该 handler。此处 agent 从 `AgentPool::acquire` 取，经
 //! `AgentRuntime::bootstrap` 全套接通
 //! （state_store / store / compressor / MemoryLayerManager / permission_service /
-//! cache_user_id / conversation_id）。会话按平台 conversation 隔离，群聊不会按 sender
-//! 交叉复用上下文。
+//! cache_user_id / conversation_id）。会话身份与 framework `SessionHandler` 一致，按
+//! channel + conversation + sender 隔离；群聊成员不会交叉复用 Agent、TaskRun 或缓存。
 //!
 //! 归属（spec §D1-6）：`AgentPool` 是 EKO 产品概念，handler 放应用层（bin crate），
 //! 不进框架 `channels.rs`。框架复用方可按需使用要求显式 LLM 依赖的
 //! `AgentChannelHandler::from_config` / `from_config_with_client`。
 
 #[cfg(feature = "channels")]
-use std::sync::Arc;
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+};
 
 #[cfg(feature = "channels")]
-use echo_agent_app_core::agent_pool::AgentPool;
-
 #[cfg(feature = "channels")]
 use echo_agent_app_core::foreground_turn::{
     ForegroundTurnControl, ForegroundTurnError, ForegroundTurnSurface,
@@ -26,22 +28,466 @@ use echo_agent_app_core::foreground_turn::{
 use echo_agent_app_core::hitl::{ChannelHumanLoopProvider, ChannelHumanLoopResolution};
 
 #[cfg(feature = "channels")]
+use sha2::{Digest, Sha256};
+
+#[cfg(feature = "channels")]
 enum ChannelRenderEvent {
+    Token(String),
     Driver(echo_agent_app_core::chat_driver::ChatDriverEvent),
+    Journaled(echo_agent_app_core::chat_event_log::ChatEventEnvelope),
+    ToolProjection(echo_agent_app_core::tool_execution_projection::ToolExecutionProjectionUpdate),
     Prompt(String),
     Terminal(echo_agent_app_core::chat_driver::TurnOutcome),
 }
 
 #[cfg(feature = "channels")]
+mod outbound;
+
+#[cfg(feature = "channels")]
+use outbound::{
+    CHANNEL_EVENT_QUEUE_CAPACITY, ChannelOutboundDraft, ChannelSurfaceSink,
+    channel_outbound_chunks, channel_outbound_transport, channel_safe_text,
+    channel_terminal_stream, immediate_channel_response,
+};
+
+#[cfg(feature = "channels")]
+mod tool_render;
+
+#[cfg(feature = "channels")]
+use tool_render::{
+    CHANNEL_TOOL_PROGRESS_CHARS, ChannelExecutionToolCompleted, ChannelExecutionToolOutput,
+    ChannelExecutionToolStarted, ChannelToolAddress, ChannelToolObserveOutcome, ChannelToolOwner,
+    ChannelToolRenderState, ChannelToolTerminal, channel_tool_args_preview,
+    channel_tool_result_message, channel_verified_artifact,
+};
+
+#[cfg(all(feature = "channels", test))]
+use outbound::{
+    CHANNEL_OUTBOUND_TOTAL_MESSAGES, CHANNEL_TOKEN_COALESCE_BYTES, ChannelBufferOutcome,
+    ChannelStreamingSanitizer, channel_outbound_transport_unpaced, channel_rate_deadline,
+    channel_rate_policy,
+};
+
+#[cfg(all(feature = "channels", test))]
+use tool_render::{
+    CHANNEL_ACTIVE_TOOL_LIMIT, CHANNEL_RECENT_TOOL_TERMINALS, CHANNEL_TOOL_OUTPUT_CHARS,
+};
+
+#[cfg(feature = "channels")]
 enum ChannelTaskRunControl {
     Reply(String),
     Resume {
-        run_id: String,
-        root_message_id: String,
-        expected_resume: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+        expected: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
         continuation_enabled: bool,
         runtime: Box<echo_agent_app_core::state::ScopedChatRuntime>,
     },
+}
+
+#[cfg(feature = "channels")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelResumeDispatch {
+    Planned(echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity),
+    Continuation(echo_agent_app_core::tasks::task_runtime::RunTurnBinding),
+}
+
+#[cfg(feature = "channels")]
+fn channel_resume_dispatch(
+    expected: echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity,
+    continuation_enabled: bool,
+    turn_id: &str,
+) -> ChannelResumeDispatch {
+    if continuation_enabled {
+        ChannelResumeDispatch::Continuation(
+            echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume_expected(
+                expected, turn_id,
+            ),
+        )
+    } else {
+        ChannelResumeDispatch::Planned(expected)
+    }
+}
+
+#[cfg(feature = "channels")]
+fn channel_resume_rejects_attachments(is_resume: bool, attachment_count: usize) -> bool {
+    is_resume && attachment_count > 0
+}
+
+#[cfg(feature = "channels")]
+#[derive(Clone)]
+struct ChannelActiveTurn {
+    runtime: echo_agent_app_core::state::ScopedChatRuntime,
+    agent_conversation_id: String,
+    conversation_id: String,
+    turn_id: String,
+}
+
+#[cfg(feature = "channels")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ChannelSurfaceIdentity {
+    channel_id: String,
+    chat_id: String,
+    sender_id: String,
+}
+
+#[cfg(feature = "channels")]
+type ChannelActiveTurnMap =
+    Arc<std::sync::Mutex<HashMap<ChannelSurfaceIdentity, ChannelActiveTurn>>>;
+
+#[cfg(feature = "channels")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ChannelRuntimeOwnerKey {
+    workspace_id: String,
+    workspace_generation: String,
+    runtime_state_id: String,
+}
+
+#[cfg(feature = "channels")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelRetirementPhase {
+    Active,
+    RetirePending,
+    GcPending,
+}
+
+#[cfg(feature = "channels")]
+#[derive(Clone, Debug)]
+struct ChannelRuntimeObligation {
+    key: ChannelRuntimeOwnerKey,
+    product_conversation_id: String,
+    incarnation_id: String,
+    phase: ChannelRetirementPhase,
+}
+
+#[cfg(feature = "channels")]
+type ChannelSessionRetirementGate =
+    Arc<std::sync::Mutex<BTreeMap<ChannelRuntimeOwnerKey, ChannelRuntimeObligation>>>;
+
+#[cfg(feature = "channels")]
+#[derive(Default)]
+struct ChannelSessionLifecycleRecord {
+    current_incarnation_id: Option<String>,
+    pending_ended_incarnation_id: Option<String>,
+    retirement_gate: ChannelSessionRetirementGate,
+}
+
+#[cfg(feature = "channels")]
+#[derive(Default)]
+pub(crate) struct ChannelSessionCoordinator {
+    active_turns: ChannelActiveTurnMap,
+    lifecycle: std::sync::Mutex<HashMap<ChannelSurfaceIdentity, ChannelSessionLifecycleRecord>>,
+}
+
+#[cfg(feature = "channels")]
+impl ChannelSessionCoordinator {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn surface_id(
+        instance: &echo_agent::channels::ChannelSessionInstance,
+    ) -> ChannelSurfaceIdentity {
+        ChannelSurfaceIdentity {
+            channel_id: instance.channel_id().to_string(),
+            chat_id: instance.conversation_id().to_string(),
+            sender_id: instance.sender_id().to_string(),
+        }
+    }
+
+    fn register(
+        &self,
+        instance: &echo_agent::channels::ChannelSessionInstance,
+    ) -> Result<(Option<String>, ChannelSessionRetirementGate), String> {
+        let surface_id = Self::surface_id(instance);
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = lifecycle.entry(surface_id).or_default();
+        let explicit_previous = instance.previous_incarnation_id().map(str::to_string);
+        let pending_previous = record.pending_ended_incarnation_id.clone();
+        let previous = match (explicit_previous, pending_previous) {
+            (Some(explicit), Some(pending)) if explicit != pending => {
+                return Err(format!(
+                    "channel session incarnation conflict: factory replaces {explicit}, callback retained {pending}"
+                ));
+            }
+            (Some(explicit), _) => Some(explicit),
+            (None, pending) => pending,
+        };
+        if let Some(current) = record.current_incarnation_id.as_deref()
+            && previous.as_deref() != Some(current)
+        {
+            return Err(format!(
+                "channel session factory replaced live incarnation {current} without an exact predecessor"
+            ));
+        }
+        record.current_incarnation_id = Some(instance.incarnation_id());
+        record.pending_ended_incarnation_id = None;
+        if let Some(previous) = previous.as_deref() {
+            Self::mark_incarnation_pending(&record.retirement_gate, previous);
+        }
+        Ok((previous, Arc::clone(&record.retirement_gate)))
+    }
+
+    pub(crate) fn record_session_end(&self, info: echo_agent::channels::SessionEndInfo) {
+        let surface_id = ChannelSurfaceIdentity {
+            channel_id: info.channel_id,
+            chat_id: info.chat_id,
+            sender_id: info.sender_id,
+        };
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = lifecycle.entry(surface_id).or_default();
+        if record.current_incarnation_id.as_deref() == Some(info.incarnation_id.as_str()) {
+            record.current_incarnation_id = None;
+            Self::mark_incarnation_pending(&record.retirement_gate, &info.incarnation_id);
+            record.pending_ended_incarnation_id = Some(info.incarnation_id);
+        }
+    }
+
+    fn rotate(
+        &self,
+        surface_id: &ChannelSurfaceIdentity,
+        instance: &echo_agent::channels::ChannelSessionInstance,
+    ) -> Result<echo_agent::channels::ChannelSessionRotation, String> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = lifecycle.entry(surface_id.clone()).or_default();
+        let current_incarnation_id = instance.incarnation_id();
+        if record.current_incarnation_id.as_deref() != Some(current_incarnation_id.as_str()) {
+            return Err(
+                "channel session rotation rejected a stale coordinator authority".to_string(),
+            );
+        }
+        let rotation = instance.rotate();
+        if rotation.previous_incarnation_id() != current_incarnation_id {
+            return Err("framework session incarnation changed during rotation".to_string());
+        }
+        record.current_incarnation_id = Some(rotation.incarnation_id().to_string());
+        record.pending_ended_incarnation_id = None;
+        Ok(rotation)
+    }
+
+    fn mark_incarnation_pending(gate: &ChannelSessionRetirementGate, incarnation_id: &str) {
+        let mut obligations = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        for obligation in obligations.values_mut() {
+            if obligation.incarnation_id == incarnation_id
+                && obligation.phase == ChannelRetirementPhase::Active
+            {
+                obligation.phase = ChannelRetirementPhase::RetirePending;
+            }
+        }
+    }
+}
+
+#[cfg(feature = "channels")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChannelSessionRetirementError {
+    Cancelled,
+    Failed(String),
+}
+
+#[cfg(feature = "channels")]
+impl std::fmt::Display for ChannelSessionRetirementError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("channel session retirement cancelled"),
+            Self::Failed(error) => write!(formatter, "channel session retirement failed: {error}"),
+        }
+    }
+}
+
+#[cfg(feature = "channels")]
+impl std::error::Error for ChannelSessionRetirementError {}
+
+#[cfg(feature = "channels")]
+struct ChannelActiveTurnOwner {
+    active_turns: ChannelActiveTurnMap,
+    surface_id: ChannelSurfaceIdentity,
+    turn_id: String,
+}
+
+#[cfg(feature = "channels")]
+impl ChannelActiveTurnOwner {
+    fn new(
+        active_turns: ChannelActiveTurnMap,
+        surface_id: ChannelSurfaceIdentity,
+        turn_id: String,
+    ) -> Self {
+        Self {
+            active_turns,
+            surface_id,
+            turn_id,
+        }
+    }
+}
+
+#[cfg(feature = "channels")]
+impl Drop for ChannelActiveTurnOwner {
+    fn drop(&mut self) {
+        AppChannelMessageHandler::clear_active_turn(
+            &self.active_turns,
+            &self.surface_id,
+            &self.turn_id,
+        );
+    }
+}
+
+#[cfg(feature = "channels")]
+fn channel_cancel_barrier_complete(
+    foreground_turns: &ForegroundTurnControl,
+    workspace_id: &str,
+    conversation_id: &str,
+    root_turn_id: &str,
+    result: &Result<
+        echo_agent_app_core::foreground_turn::ForegroundTurnSettlement,
+        ForegroundTurnError,
+    >,
+) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(ForegroundTurnError::NoActiveTurn { .. }) => foreground_turns
+            .snapshots_for_workspace(workspace_id)
+            .is_ok_and(|snapshots| {
+                !snapshots.iter().any(|snapshot| {
+                    snapshot.surface == ForegroundTurnSurface::Channel
+                        && snapshot.conversation_id == conversation_id
+                        && channel_snapshot_matches_root(snapshot, root_turn_id)
+                })
+            }),
+        Err(_) => false,
+    }
+}
+
+#[cfg(feature = "channels")]
+async fn channel_cancel_root(
+    foreground_turns: &ForegroundTurnControl,
+    workspace_id: &str,
+    conversation_id: &str,
+    root_turn_id: &str,
+) -> Result<echo_agent_app_core::foreground_turn::ForegroundTurnSettlement, ForegroundTurnError> {
+    foreground_turns
+        .request_root_cancel_scoped(
+            workspace_id,
+            ForegroundTurnSurface::Channel,
+            conversation_id,
+            root_turn_id,
+        )?
+        .wait()
+        .await
+}
+
+#[cfg(feature = "channels")]
+fn channel_snapshot_matches_root(
+    snapshot: &echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot,
+    root_turn_id: &str,
+) -> bool {
+    snapshot.root_turn_id == root_turn_id
+}
+
+#[cfg(feature = "channels")]
+fn channel_snapshot_for_conversation(
+    snapshots: Vec<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>,
+    conversation_id: &str,
+) -> Result<Option<echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot>, String> {
+    let mut matches = snapshots.into_iter().filter(|snapshot| {
+        snapshot.surface == ForegroundTurnSurface::Channel
+            && snapshot.conversation_id == conversation_id
+    });
+    let Some(snapshot) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "multiple channel foreground roots exist for conversation {conversation_id}"
+        ));
+    }
+    Ok(Some(snapshot))
+}
+
+#[cfg(feature = "channels")]
+fn channel_steer_target(
+    snapshot: &echo_agent_app_core::foreground_turn::ForegroundTurnSnapshot,
+) -> &str {
+    &snapshot.active_turn_id
+}
+
+#[cfg(feature = "channels")]
+fn channel_active_generation_matches(active_turn_id: Option<&str>, owner_turn_id: &str) -> bool {
+    active_turn_id.is_some_and(|active_turn_id| active_turn_id == owner_turn_id)
+}
+
+#[cfg(feature = "channels")]
+async fn await_channel_retirement<T, RetireFuture>(
+    cancel: echo_agent::agent::CancellationToken,
+    retire: RetireFuture,
+) -> Result<T, ChannelSessionRetirementError>
+where
+    RetireFuture: std::future::Future<Output = Result<T, String>>,
+{
+    tokio::select! {
+        _ = cancel.cancelled() => Err(ChannelSessionRetirementError::Cancelled),
+        result = retire => result.map_err(ChannelSessionRetirementError::Failed),
+    }
+}
+
+#[cfg(feature = "channels")]
+async fn await_channel_operation<Output, OperationFuture>(
+    cancel: echo_agent::agent::CancellationToken,
+    operation: OperationFuture,
+) -> Option<Output>
+where
+    OperationFuture: std::future::Future<Output = Output>,
+{
+    tokio::select! {
+        biased;
+        result = operation => Some(result),
+        _ = cancel.cancelled() => None,
+    }
+}
+
+#[cfg(feature = "channels")]
+fn channel_retirement_terminal(
+    error: ChannelSessionRetirementError,
+) -> (echo_agent_app_core::chat_driver::TurnOutcome, String) {
+    match error {
+        ChannelSessionRetirementError::Cancelled => (
+            echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+            "Channel session retirement was cancelled; retry the message.".to_string(),
+        ),
+        ChannelSessionRetirementError::Failed(error) => (
+            echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                echo_agent::error::AgentFailure::message(
+                    "channel_session_generation",
+                    error.clone(),
+                ),
+            ),
+            format!("Unable to retire the previous channel session: {error}"),
+        ),
+    }
+}
+
+#[cfg(feature = "channels")]
+fn is_task_run_control_command(command: &str) -> bool {
+    matches!(
+        command,
+        "/subagent-message"
+            | "/subagent-followup"
+            | "/subagent-interrupt"
+            | "/task-goal"
+            | "/task-requirements"
+            | "/task-requirement-skip"
+            | "/task-run"
+            | "/task-status"
+            | "/task-pause"
+            | "/task-resume"
+            | "/task-cancel"
+            | "/task-budget"
+    )
 }
 
 #[cfg(feature = "channels")]
@@ -70,9 +516,7 @@ impl Drop for ChannelStreamDropGuard {
 
 #[cfg(feature = "channels")]
 fn channel_render_event_stream(
-    mut driver_rx: tokio::sync::mpsc::UnboundedReceiver<
-        echo_agent_app_core::chat_driver::ChatDriverEvent,
-    >,
+    mut driver_rx: tokio::sync::mpsc::Receiver<ChannelRenderEvent>,
     mut prompt_rx: tokio::sync::broadcast::Receiver<String>,
     mut terminal_rx: tokio::sync::oneshot::Receiver<echo_agent_app_core::chat_driver::TurnOutcome>,
     stream_drop_guard: ChannelStreamDropGuard,
@@ -88,7 +532,7 @@ fn channel_render_event_stream(
         loop {
             tokio::select! {
                 event = driver_rx.recv(), if driver_open => match event {
-                    Some(event) => yield Ok(ChannelRenderEvent::Driver(event)),
+                    Some(event) => yield Ok(event),
                     None => driver_open = false,
                 },
                 prompt = prompt_rx.recv(), if prompt_open => match prompt {
@@ -126,11 +570,11 @@ fn channel_render_event_stream(
     .boxed()
 }
 
-/// IM channel 消息处理器：持 `AgentPool`，每 `handle` 从 pool 取/复用 per-sender agent。
+/// IM channel 消息处理器：每 `handle` 从 AppState 的 exact scoped runtime 取/复用 per-sender agent。
 ///
 /// TUI/GUI functional parity (AGENTS.md): channels drive chat through the
-/// shared foreground driver. Holds the per-sender `AgentPool` + the
-/// `TaskRuntimeStore` (so `create_complex_task` can build `ChatResources`).
+/// shared foreground driver. TaskRuntime and AgentPool ownership are resolved
+/// from the captured AppState workspace generation.
 /// Whether a complex run is warranted is decided by the agent itself, not
 /// pre-judged here.
 #[cfg(feature = "channels")]
@@ -140,38 +584,399 @@ pub struct AppChannelMessageHandler {
     hitl: Arc<ChannelHumanLoopProvider>,
     foreground_turns: ForegroundTurnControl,
     interaction_mode:
-        tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
+        Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
+    session_instance: echo_agent::channels::ChannelSessionInstance,
+    session_coordinator: Arc<ChannelSessionCoordinator>,
+    initialization_error: Option<String>,
+    incarnation_fault: Arc<std::sync::Mutex<Option<String>>>,
+    active_turns: ChannelActiveTurnMap,
+    pending_retirement: ChannelSessionRetirementGate,
 }
 
 #[cfg(feature = "channels")]
 impl AppChannelMessageHandler {
-    pub fn new(
+    pub(crate) fn new(
         app_state: Arc<echo_agent_app_core::state::AppState>,
-        _pool: Arc<AgentPool>,
-        _store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-        _review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
         webhook_emitter: Arc<echo_agent_app_core::webhook::WebhookEmitter>,
         foreground_turns: ForegroundTurnControl,
+        session_instance: echo_agent::channels::ChannelSessionInstance,
+        session_coordinator: Arc<ChannelSessionCoordinator>,
     ) -> Self {
+        let registration = session_coordinator.register(&session_instance);
+        let (pending_retirement, initialization_error) = match registration {
+            Ok((_previous_incarnation_id, gate)) => (gate, None),
+            Err(error) => (Arc::default(), Some(error)),
+        };
         Self {
             app_state,
             webhook_emitter,
             hitl: Arc::new(ChannelHumanLoopProvider::new()),
             foreground_turns,
-            interaction_mode: tokio::sync::RwLock::new(
+            interaction_mode: Arc::new(tokio::sync::RwLock::new(
                 echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-            ),
+            )),
+            session_instance,
+            active_turns: Arc::clone(&session_coordinator.active_turns),
+            session_coordinator,
+            initialization_error,
+            incarnation_fault: Arc::new(std::sync::Mutex::new(None)),
+            pending_retirement,
         }
     }
 
-    /// Per-conversation pool key.
-    fn conversation_id(channel_id: &str, chat_id: &str) -> String {
-        format!("channel:{channel_id}:{chat_id}")
+    fn active_turn(&self, surface_id: &ChannelSurfaceIdentity) -> Option<ChannelActiveTurn> {
+        self.active_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(surface_id)
+            .cloned()
     }
 
-    /// Per-conversation provider cache identity.
-    fn cache_user_id(channel_id: &str, chat_id: &str) -> String {
-        sanitize_cache_user_id(&format!("im-{channel_id}-{chat_id}"))
+    async fn resolve_active_turn(
+        &self,
+        surface_id: &ChannelSurfaceIdentity,
+        conversation_id: &str,
+        agent_conversation_id: &str,
+    ) -> Result<Option<ChannelActiveTurn>, String> {
+        if let Some(active) = self.active_turn(surface_id) {
+            return Ok(Some(active));
+        }
+        let runtime = self
+            .app_state
+            .current_control_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let snapshot = channel_snapshot_for_conversation(
+            self.foreground_turns
+                .snapshots_for_workspace(runtime.execution_scope().workspace_id())
+                .map_err(|error| error.to_string())?,
+            conversation_id,
+        )?;
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        Ok(Some(ChannelActiveTurn {
+            runtime,
+            agent_conversation_id: agent_conversation_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            turn_id: snapshot.root_turn_id,
+        }))
+    }
+
+    fn publish_active_turn(
+        &self,
+        surface_id: &ChannelSurfaceIdentity,
+        conversation_id: &str,
+        agent_conversation_id: &str,
+        runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+        turn_id: &str,
+    ) -> Result<(), String> {
+        let mut active = self
+            .active_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = active.get(surface_id) {
+            return Err(format!("Turn {} is still running.", existing.turn_id));
+        }
+        active.insert(
+            surface_id.clone(),
+            ChannelActiveTurn {
+                runtime: runtime.clone(),
+                agent_conversation_id: agent_conversation_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                turn_id: turn_id.to_string(),
+            },
+        );
+        Ok(())
+    }
+
+    fn clear_active_turn(
+        active_turns: &std::sync::Mutex<HashMap<ChannelSurfaceIdentity, ChannelActiveTurn>>,
+        surface_id: &ChannelSurfaceIdentity,
+        turn_id: &str,
+    ) {
+        let mut active = active_turns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if channel_active_generation_matches(
+            active.get(surface_id).map(|entry| entry.turn_id.as_str()),
+            turn_id,
+        ) {
+            active.remove(surface_id);
+        }
+    }
+
+    async fn settle_pending_retirement_for_runtime(
+        &self,
+        runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+        conversation_id: &str,
+        agent_conversation_id: &str,
+        surface_id: &ChannelSurfaceIdentity,
+    ) -> Result<(), String> {
+        let obligations = self.pending_runtime_obligations();
+        if obligations.is_empty() {
+            return Ok(());
+        }
+        if let Some(active) = self.active_turn(surface_id) {
+            let result = channel_cancel_root(
+                &self.foreground_turns,
+                active.runtime.execution_scope().workspace_id(),
+                &active.conversation_id,
+                &active.turn_id,
+            )
+            .await;
+            let barrier_complete = channel_cancel_barrier_complete(
+                &self.foreground_turns,
+                active.runtime.execution_scope().workspace_id(),
+                &active.conversation_id,
+                &active.turn_id,
+                &result,
+            );
+            if !barrier_complete {
+                return Err(match result {
+                    Ok(_) => "previous channel foreground did not reach its barrier".to_string(),
+                    Err(error) => format!(
+                        "unable to settle previous channel foreground before retirement: {error}"
+                    ),
+                });
+            }
+            Self::clear_active_turn(&self.active_turns, surface_id, &active.turn_id);
+        }
+        let retirement_turn_id = uuid::Uuid::new_v4().to_string();
+        let retirement_lease = runtime
+            .begin_turn(
+                &self.foreground_turns,
+                ForegroundTurnSurface::Channel,
+                conversation_id,
+                retirement_turn_id.clone(),
+            )
+            .await
+            .map_err(|error| format!("Unable to admit channel session retirement: {error}"))?;
+        if let Err(message) = self.publish_active_turn(
+            surface_id,
+            conversation_id,
+            agent_conversation_id,
+            runtime,
+            &retirement_turn_id,
+        ) {
+            retirement_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+            return Err(message);
+        }
+        let retirement_owner = ChannelActiveTurnOwner::new(
+            Arc::clone(&self.active_turns),
+            surface_id.clone(),
+            retirement_turn_id,
+        );
+        let retired = await_channel_retirement(retirement_lease.cancellation_token(), async {
+            for obligation in obligations {
+                let runtime = self.runtime_for_obligation(&obligation).await?;
+                let pool = runtime
+                    .pool()
+                    .ok_or_else(|| "The recorded workspace has no AgentPool.".to_string())?;
+                let retirement = pool
+                    .begin_conversation_retirement(&obligation.key.runtime_state_id)
+                    .map_err(|error| error.to_string())?;
+                pool.drain_conversation_retirement(&retirement)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                self.set_runtime_obligation_phase(
+                    &obligation.key,
+                    ChannelRetirementPhase::GcPending,
+                );
+                Self::clear_runtime_incarnation(
+                    &runtime,
+                    &obligation.product_conversation_id,
+                    &obligation.key.runtime_state_id,
+                )
+                .await?;
+                self.consume_runtime_obligation(&obligation.key);
+                drop(retirement);
+            }
+            Ok(())
+        })
+        .await;
+        match retired {
+            Ok(()) => {
+                retirement_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+                drop(retirement_owner);
+                Ok(())
+            }
+            Err(error) => {
+                let (outcome, message) = channel_retirement_terminal(error);
+                retirement_lease.settle(outcome);
+                drop(retirement_owner);
+                Err(message)
+            }
+        }
+    }
+
+    fn record_runtime_owner(
+        &self,
+        runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+        product_conversation_id: &str,
+        runtime_state_id: &str,
+    ) {
+        let workspace = runtime.workspace_io_receipt();
+        let key = ChannelRuntimeOwnerKey {
+            workspace_id: workspace.workspace_id().to_string(),
+            workspace_generation: workspace.host_generation().to_string(),
+            runtime_state_id: runtime_state_id.to_string(),
+        };
+        let obligation = ChannelRuntimeObligation {
+            key: key.clone(),
+            product_conversation_id: product_conversation_id.to_string(),
+            incarnation_id: self.session_instance.incarnation_id(),
+            phase: ChannelRetirementPhase::Active,
+        };
+        let mut obligations = self
+            .pending_retirement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match obligations.get(&key) {
+            Some(existing) if existing.phase != ChannelRetirementPhase::Active => {}
+            _ => {
+                obligations.insert(key, obligation);
+            }
+        }
+    }
+
+    fn pending_runtime_obligations(&self) -> Vec<ChannelRuntimeObligation> {
+        self.pending_retirement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|obligation| obligation.phase != ChannelRetirementPhase::Active)
+            .cloned()
+            .collect()
+    }
+
+    fn set_runtime_obligation_phase(
+        &self,
+        key: &ChannelRuntimeOwnerKey,
+        phase: ChannelRetirementPhase,
+    ) {
+        if let Some(obligation) = self
+            .pending_retirement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_mut(key)
+        {
+            obligation.phase = phase;
+        }
+    }
+
+    fn consume_runtime_obligation(&self, key: &ChannelRuntimeOwnerKey) {
+        self.pending_retirement
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(key);
+    }
+
+    async fn runtime_for_obligation(
+        &self,
+        obligation: &ChannelRuntimeObligation,
+    ) -> Result<echo_agent_app_core::state::ScopedChatRuntime, String> {
+        let runtime = self
+            .app_state
+            .chat_runtime_for_scope(&obligation.key.workspace_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        let receipt = runtime.workspace_io_receipt();
+        if receipt.host_generation() != obligation.key.workspace_generation {
+            return Err(format!(
+                "workspace {} generation changed before channel runtime cleanup",
+                obligation.key.workspace_id
+            ));
+        }
+        Ok(runtime)
+    }
+
+    async fn clear_runtime_incarnation(
+        runtime: &echo_agent_app_core::state::ScopedChatRuntime,
+        conversation_id: &str,
+        runtime_state_id: &str,
+    ) -> Result<bool, String> {
+        Self::clear_runtime_incarnation_stores(
+            runtime.conversation_store(),
+            runtime.runtime_state_store(),
+            conversation_id,
+            runtime_state_id,
+        )
+        .await
+    }
+
+    async fn clear_runtime_incarnation_stores(
+        conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
+        runtime_state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
+        conversation_id: &str,
+        runtime_state_id: &str,
+    ) -> Result<bool, String> {
+        let Some(runtime_state_store) = runtime_state_store else {
+            return Ok(false);
+        };
+        let indexed = runtime_state_store
+            .runtime_state_ids(conversation_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !indexed
+            .iter()
+            .any(|indexed_id| indexed_id == runtime_state_id)
+        {
+            return Ok(false);
+        }
+        let conversation_store = conversation_store.ok_or_else(|| {
+            "ConversationStore is unavailable for exact channel runtime cleanup".to_string()
+        })?;
+        echo_agent::state::clear_persisted_runtime_incarnation(
+            conversation_store.as_ref(),
+            runtime_state_store.as_ref(),
+            conversation_id,
+            runtime_state_id,
+        )
+        .await
+        .map(|receipt| receipt.checkpoint_removed)
+        .map_err(|error| error.to_string())
+    }
+
+    fn session_fingerprint(channel_id: &str, chat_id: &str, sender_id: &str) -> String {
+        let identity = serde_json::json!([channel_id, chat_id, sender_id]).to_string();
+        format!("{:x}", Sha256::digest(identity.as_bytes()))
+    }
+
+    /// Stable sender-scoped product identity for journal, TaskRun, and UI.
+    fn conversation_id(channel_id: &str, chat_id: &str, sender_id: &str) -> String {
+        format!(
+            "channel:sha256:{}",
+            Self::session_fingerprint(channel_id, chat_id, sender_id)
+        )
+    }
+
+    /// Ephemeral AgentPool/checkpoint identity for one model-context incarnation.
+    fn agent_conversation_id(conversation_id: &str, incarnation_id: &str) -> String {
+        let identity = serde_json::json!([conversation_id, incarnation_id]).to_string();
+        format!(
+            "channel-runtime:sha256:{:x}",
+            Sha256::digest(identity.as_bytes())
+        )
+    }
+
+    /// Full control-surface identity matching the framework session boundary.
+    fn active_surface_identity(
+        channel_id: &str,
+        chat_id: &str,
+        sender_id: &str,
+    ) -> ChannelSurfaceIdentity {
+        ChannelSurfaceIdentity {
+            channel_id: channel_id.to_string(),
+            chat_id: chat_id.to_string(),
+            sender_id: sender_id.to_string(),
+        }
+    }
+
+    /// Provider cache identity isolated with the model-context incarnation.
+    fn cache_user_id(conversation_id: &str, incarnation_id: &str) -> String {
+        let identity = serde_json::json!([conversation_id, incarnation_id]).to_string();
+        format!("im-{:x}", Sha256::digest(identity.as_bytes()))
     }
 
     fn generation_receipts(
@@ -351,11 +1156,14 @@ impl AppChannelMessageHandler {
     ) -> Option<ChannelTaskRunControl> {
         let mut parts = message.split_whitespace();
         let command = parts.next()?;
-        let runtime = match self.app_state.current_chat_runtime().await {
+        if !is_task_run_control_command(command) {
+            return None;
+        }
+        let runtime = match self.app_state.current_control_runtime().await {
             Ok(runtime) => runtime,
             Err(error) => {
                 return Some(ChannelTaskRunControl::Reply(format!(
-                    "Workspace runtime is unavailable: {error}"
+                    "Workspace control runtime is unavailable: {error}"
                 )));
             }
         };
@@ -621,9 +1429,7 @@ impl AppChannelMessageHandler {
                     )
                 } else {
                     return Some(ChannelTaskRunControl::Resume {
-                        run_id,
-                        root_message_id: snapshot.run.root_message_id.clone(),
-                        expected_resume:
+                        expected:
                             echo_agent_app_core::tasks::task_runtime::TaskRunResumeIdentity::capture(
                                 &snapshot,
                             ),
@@ -668,20 +1474,17 @@ impl AppChannelMessageHandler {
         Some(ChannelTaskRunControl::Reply(reply))
     }
 
-    async fn control_command_response(&self, message: &str, conv: &str) -> Option<String> {
+    async fn control_command_response(
+        &self,
+        message: &str,
+        conv: &str,
+        agent_conv: &str,
+        cache_id: &str,
+        active_surface_id: &ChannelSurfaceIdentity,
+    ) -> Option<String> {
         let mut parts = message.trim().splitn(2, char::is_whitespace);
         let command = parts.next()?;
         let argument = parts.next().map(str::trim).unwrap_or_default();
-        let scoped_runtime = if matches!(command, "/stop" | "/reset" | "/steer") {
-            match self.app_state.current_chat_runtime().await {
-                Ok(runtime) => Some(runtime),
-                Err(error) => {
-                    return Some(format!("Workspace runtime is unavailable: {error}"));
-                }
-            }
-        } else {
-            None
-        };
         match command {
             "/workflow" => Some(
                 self.app_state
@@ -694,66 +1497,194 @@ impl AppChannelMessageHandler {
             "/compact" | "/compress" => {
                 let keep_messages = if command == "/compress" { 6 } else { 12 };
                 let focus = (!argument.is_empty()).then(|| argument.to_string());
-                Some(
-                    match self
-                        .app_state
-                        .compress_conversation_owned(
-                            echo_agent_app_core::manual_compression::ManualCompressionRequest {
-                                workspace_id: self
-                                    .app_state
-                                    .current_execution_scope()
-                                    .await
-                                    .workspace_id()
-                                    .to_string(),
-                                conversation_id: conv.to_string(),
-                                surface: ForegroundTurnSurface::Channel,
-                                focus,
-                                keep_messages,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(receipt) => format!(
-                            "Context compressed: {} -> {} messages, {} tokens saved.",
-                            receipt.messages_before,
-                            receipt.messages_after,
-                            receipt.tokens_saved()
-                        ),
-                        Err(error) => format!("Context compression failed: {error}"),
-                    },
-                )
+                let runtime = match self.app_state.current_control_runtime().await {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        return Some(format!("Workspace runtime is unavailable: {error}"));
+                    }
+                };
+                if let Err(error) = self
+                    .settle_pending_retirement_for_runtime(
+                        &runtime,
+                        conv,
+                        agent_conv,
+                        active_surface_id,
+                    )
+                    .await
+                {
+                    return Some(error);
+                }
+                let turn_id = format!("channel-compression:{}", uuid::Uuid::new_v4());
+                let lease = match runtime
+                    .begin_turn(
+                        &self.foreground_turns,
+                        ForegroundTurnSurface::Channel,
+                        conv,
+                        turn_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(error) => return Some(format!("Unable to admit compression: {error}")),
+                };
+                if let Err(message) = self.publish_active_turn(
+                    active_surface_id,
+                    conv,
+                    agent_conv,
+                    &runtime,
+                    &turn_id,
+                ) {
+                    lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                    return Some(message);
+                }
+                let active_owner = ChannelActiveTurnOwner::new(
+                    Arc::clone(&self.active_turns),
+                    active_surface_id.clone(),
+                    turn_id.clone(),
+                );
+                let receipts = match Self::generation_receipts(&runtime) {
+                    Ok(receipts) => receipts,
+                    Err(message) => {
+                        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message(
+                                "workspace_generation",
+                                message.clone(),
+                            ),
+                        ));
+                        drop(active_owner);
+                        return Some(message);
+                    }
+                };
+                self.record_runtime_owner(&runtime, conv, agent_conv);
+                let execution = match runtime.agent_for(agent_conv).await {
+                    Ok(execution) => execution,
+                    Err(error) => {
+                        receipts.release_lifo();
+                        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                            echo_agent::error::AgentFailure::message(
+                                "agent_pool",
+                                error.to_string(),
+                            ),
+                        ));
+                        drop(active_owner);
+                        return Some(format!("AgentPool admission failed: {error}"));
+                    }
+                };
+                let agent = execution.agent();
+                configure_channel_agent(&agent, cache_id, Arc::clone(&self.hitl)).await;
+                let workspace_io_receipt = runtime.workspace_io_receipt();
+                let app_state = Arc::clone(&self.app_state);
+                let workspace_id = runtime.execution_scope().workspace_id().to_string();
+                let conversation_id = conv.to_string();
+                let agent_conversation_id = agent_conv.to_string();
+                let compression_turn_id = turn_id.clone();
+                let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+                if let Err(error) =
+                    self.foreground_turns
+                        .supervise(lease, move |lease| async move {
+                            let compression = app_state
+                                .compress_conversation_with_agent(
+                                    &workspace_id,
+                                    &conversation_id,
+                                    &agent_conversation_id,
+                                    &compression_turn_id,
+                                    &agent,
+                                    focus,
+                                    keep_messages,
+                                    workspace_io_receipt,
+                                    Some(lease.cancellation_token()),
+                                )
+                                .await;
+                            drop(execution);
+                            receipts.release_lifo();
+                            let message = match compression {
+                                Err(
+                                    echo_agent_app_core::manual_compression::ManualCompressionError::Cancelled,
+                                ) => {
+                                    lease.settle(
+                                        echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                                    );
+                                    "Context compression was cancelled.".to_string()
+                                }
+                                Ok(receipt) => {
+                                    lease.settle(
+                                        echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                                    );
+                                    format!(
+                                        "Context compressed: {} -> {} messages, {} tokens saved.",
+                                        receipt.messages_before,
+                                        receipt.messages_after,
+                                        receipt.tokens_saved()
+                                    )
+                                }
+                                Err(error) => {
+                                    lease.settle(
+                                        echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                            echo_agent::error::AgentFailure::message(
+                                                error.code(),
+                                                error.to_string(),
+                                            ),
+                                        ),
+                                    );
+                                    format!("Context compression failed: {error}")
+                                }
+                            };
+                            drop(active_owner);
+                            let _delivered = result_tx.send(message);
+                        })
+                {
+                    Self::clear_active_turn(&self.active_turns, active_surface_id, &turn_id);
+                    return Some(format!("Unable to supervise compression: {error}"));
+                }
+                Some(result_rx.await.unwrap_or_else(|_| {
+                    "Compression owner ended without publishing its terminal result.".to_string()
+                }))
             }
             "/stop" => {
-                let runtime = scoped_runtime.as_ref()?;
-                let Some(snapshot) = self.foreground_turns.snapshot_scoped(
-                    runtime.execution_scope().workspace_id(),
-                    ForegroundTurnSurface::Channel,
-                    conv,
-                ) else {
+                let active = match self
+                    .resolve_active_turn(active_surface_id, conv, agent_conv)
+                    .await
+                {
+                    Ok(active) => active,
+                    Err(error) => {
+                        return Some(format!("Unable to inspect the active turn: {error}"));
+                    }
+                };
+                let Some(active) = active else {
                     return Some("No active channel turn to stop.".to_string());
                 };
-                Some(
-                    match self
-                        .foreground_turns
-                        .root_cancel_and_wait_scoped(
-                            runtime.execution_scope().workspace_id(),
-                            ForegroundTurnSurface::Channel,
-                            conv,
-                            &snapshot.root_turn_id,
-                        )
-                        .await
-                    {
-                        Ok(settlement) => format!(
-                            "Turn {} settled as {}.",
-                            settlement.turn_id,
-                            settlement.outcome.status()
-                        ),
-                        Err(ForegroundTurnError::NoActiveTurn { .. }) => {
-                            "The channel turn already settled.".to_string()
-                        }
-                        Err(error) => format!("Unable to stop the active turn: {error}"),
-                    },
+                let workspace_id = active.runtime.execution_scope().workspace_id();
+                let result = channel_cancel_root(
+                    &self.foreground_turns,
+                    workspace_id,
+                    &active.conversation_id,
+                    &active.turn_id,
                 )
+                .await;
+                let barrier_complete = channel_cancel_barrier_complete(
+                    &self.foreground_turns,
+                    workspace_id,
+                    &active.conversation_id,
+                    &active.turn_id,
+                    &result,
+                );
+                if barrier_complete {
+                    Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
+                }
+                Some(match result {
+                    Ok(settlement) => format!(
+                        "Turn {} settled as {}.",
+                        settlement.turn_id,
+                        settlement.outcome.status()
+                    ),
+                    Err(ForegroundTurnError::NoActiveTurn { .. }) if barrier_complete => {
+                        "The channel turn already settled.".to_string()
+                    }
+                    Err(ForegroundTurnError::NoActiveTurn { .. }) => {
+                        "The channel turn is still active; retry /stop.".to_string()
+                    }
+                    Err(error) => format!("Unable to stop the active turn: {error}"),
+                })
             }
             "/cancel" => Some(match self.hitl.reject_front("Cancelled by user").await {
                 ChannelHumanLoopResolution::NoPending => {
@@ -763,25 +1694,65 @@ impl AppChannelMessageHandler {
                 | ChannelHumanLoopResolution::Invalid(message) => message,
             }),
             "/reset" => {
-                let runtime = scoped_runtime.as_ref()?;
-                if let Some(snapshot) = self.foreground_turns.snapshot_scoped(
-                    runtime.execution_scope().workspace_id(),
-                    ForegroundTurnSurface::Channel,
-                    conv,
-                ) && let Err(error) = self
-                    .foreground_turns
-                    .root_cancel_and_wait_scoped(
-                        runtime.execution_scope().workspace_id(),
-                        ForegroundTurnSurface::Channel,
-                        conv,
-                        &snapshot.root_turn_id,
-                    )
+                let active = match self
+                    .resolve_active_turn(active_surface_id, conv, agent_conv)
                     .await
-                    && !matches!(error, ForegroundTurnError::NoActiveTurn { .. })
                 {
-                    return Some(format!(
-                        "Unable to reset before the active turn settles: {error}"
-                    ));
+                    Ok(active) => active,
+                    Err(error) => {
+                        return Some(format!("Unable to inspect the active turn: {error}"));
+                    }
+                };
+                let runtime = match active.as_ref() {
+                    Some(active) => active.runtime.clone(),
+                    None => match self.app_state.current_control_runtime().await {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            return Some(format!("Workspace runtime is unavailable: {error}"));
+                        }
+                    },
+                };
+                self.record_runtime_owner(&runtime, conv, agent_conv);
+                ChannelSessionCoordinator::mark_incarnation_pending(
+                    &self.pending_retirement,
+                    &self.session_instance.incarnation_id(),
+                );
+                let reset_obligations = self.pending_runtime_obligations();
+                if let Some(active) = active.as_ref() {
+                    let result = channel_cancel_root(
+                        &self.foreground_turns,
+                        active.runtime.execution_scope().workspace_id(),
+                        &active.conversation_id,
+                        &active.turn_id,
+                    )
+                    .await;
+                    let barrier_complete = channel_cancel_barrier_complete(
+                        &self.foreground_turns,
+                        active.runtime.execution_scope().workspace_id(),
+                        &active.conversation_id,
+                        &active.turn_id,
+                        &result,
+                    );
+                    if barrier_complete {
+                        Self::clear_active_turn(
+                            &self.active_turns,
+                            active_surface_id,
+                            &active.turn_id,
+                        );
+                    }
+                    if let Err(error) = result
+                        && !matches!(error, ForegroundTurnError::NoActiveTurn { .. })
+                    {
+                        return Some(format!(
+                            "Unable to reset before the active turn settles: {error}"
+                        ));
+                    }
+                    if !barrier_complete {
+                        return Some(
+                            "Unable to reset before the active turn settles; retry /reset."
+                                .to_string(),
+                        );
+                    }
                 }
                 let reset_turn_id = uuid::Uuid::new_v4().to_string();
                 let reset_lease = match runtime
@@ -789,7 +1760,7 @@ impl AppChannelMessageHandler {
                         &self.foreground_turns,
                         ForegroundTurnSurface::Channel,
                         conv,
-                        reset_turn_id,
+                        reset_turn_id.clone(),
                     )
                     .await
                 {
@@ -803,7 +1774,17 @@ impl AppChannelMessageHandler {
                     }
                     Err(error) => return Some(format!("Unable to admit reset: {error}")),
                 };
-                let generation_receipts = match Self::generation_receipts(runtime) {
+                if let Err(message) = self.publish_active_turn(
+                    active_surface_id,
+                    conv,
+                    agent_conv,
+                    &runtime,
+                    &reset_turn_id,
+                ) {
+                    reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                    return Some(message);
+                }
+                let generation_receipts = match Self::generation_receipts(&runtime) {
                     Ok(receipts) => receipts,
                     Err(message) => {
                         reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
@@ -812,54 +1793,143 @@ impl AppChannelMessageHandler {
                                 message.clone(),
                             ),
                         ));
+                        Self::clear_active_turn(
+                            &self.active_turns,
+                            active_surface_id,
+                            &reset_turn_id,
+                        );
                         return Some(message);
                     }
                 };
-                let Some(pool) = runtime.pool() else {
-                    reset_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                        echo_agent::error::AgentFailure::message(
-                            "agent_pool",
-                            "AgentPool is unavailable",
-                        ),
-                    ));
-                    generation_receipts.release_lifo();
-                    return Some("AgentPool is unavailable".to_string());
-                };
                 let hitl = Arc::clone(&self.hitl);
-                let conv_owned = conv.to_string();
+                let session_instance = self.session_instance.clone();
+                let session_coordinator = Arc::clone(&self.session_coordinator);
+                let incarnation_fault = Arc::clone(&self.incarnation_fault);
+                let interaction_mode = Arc::clone(&self.interaction_mode);
+                let pending_retirement = Arc::clone(&self.pending_retirement);
+                let active_turns = Arc::clone(&self.active_turns);
+                let reset_turn_id_for_owner = reset_turn_id.clone();
+                let active_surface_id_for_owner = active_surface_id.clone();
+                let active_owner = ChannelActiveTurnOwner::new(
+                    Arc::clone(&active_turns),
+                    active_surface_id_for_owner.clone(),
+                    reset_turn_id_for_owner.clone(),
+                );
+                let app_state = Arc::clone(&self.app_state);
                 let (result_tx, result_rx) = tokio::sync::oneshot::channel();
                 if let Err(error) =
                     self.foreground_turns
                         .supervise(reset_lease, move |reset_lease| async move {
+                            let _active_owner = active_owner;
                             hitl.reject_all("Conversation reset by user").await;
-                            let retirement = match pool.lease_existing(&conv_owned).await {
-                                Ok(Some(execution)) => {
-                                    pool.retire_execution(&conv_owned, execution).await
-                                }
-                                Ok(None) => Ok(false),
-                                Err(error) => Err(error),
-                            };
+                            let retirement_obligations = reset_obligations.clone();
+                            let retirement_gate = Arc::clone(&pending_retirement);
+                            let retirement = await_channel_retirement(
+                                reset_lease.cancellation_token(),
+                                async move {
+                                    let mut retirement_holds =
+                                        Vec::with_capacity(retirement_obligations.len());
+                                    for obligation in &retirement_obligations {
+                                        let runtime = app_state
+                                            .chat_runtime_for_scope(
+                                                &obligation.key.workspace_id,
+                                            )
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                        let workspace = runtime.workspace_io_receipt();
+                                        if workspace.host_generation()
+                                            != obligation.key.workspace_generation
+                                        {
+                                            return Err(format!(
+                                                "workspace {} generation changed before reset cleanup",
+                                                obligation.key.workspace_id
+                                            ));
+                                        }
+                                        let pool = runtime.pool().ok_or_else(|| {
+                                            "The recorded workspace has no AgentPool.".to_string()
+                                        })?;
+                                        let retirement = pool
+                                            .begin_conversation_retirement(
+                                                &obligation.key.runtime_state_id,
+                                            )
+                                            .map_err(|error| error.to_string())?;
+                                        pool.drain_conversation_retirement(&retirement)
+                                            .await
+                                            .map_err(|error| error.to_string())?;
+                                        if let Some(recorded) = retirement_gate
+                                            .lock()
+                                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                            .get_mut(&obligation.key)
+                                        {
+                                            recorded.phase = ChannelRetirementPhase::GcPending;
+                                        }
+                                        Self::clear_runtime_incarnation(
+                                            &runtime,
+                                            &obligation.product_conversation_id,
+                                            &obligation.key.runtime_state_id,
+                                        )
+                                        .await?;
+                                        retirement_holds.push((pool, retirement));
+                                    }
+                                    Ok(retirement_holds)
+                                },
+                            )
+                            .await;
                             let (outcome, message) = match retirement {
-                                Ok(_) => (
-                                    echo_agent_app_core::chat_driver::TurnOutcome::Completed,
-                                    "Conversation reset after exact foreground settlement."
-                                        .to_string(),
-                                ),
-                                Err(error) => (
-                                    echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                                        echo_agent::error::AgentFailure::message(
-                                            "channel_reset",
-                                            error.to_string(),
+                                Ok(retirement_holds) => {
+                                    match session_coordinator.rotate(
+                                        &active_surface_id_for_owner,
+                                        &session_instance,
+                                    ) {
+                                        Ok(_) => {
+                                            {
+                                                let mut pending = pending_retirement
+                                                    .lock()
+                                                    .unwrap_or_else(|poisoned| {
+                                                        poisoned.into_inner()
+                                                    });
+                                                for obligation in &reset_obligations {
+                                                    pending.remove(&obligation.key);
+                                                }
+                                            }
+                                            drop(retirement_holds);
+                                            reset_channel_interaction_mode(&interaction_mode).await;
+                                            (
+                                                echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                                                "Conversation reset with a clean model context; product history remains available."
+                                                    .to_string(),
+                                            )
+                                        }
+                                        Err(error) => (
+                                            {
+                                                *incarnation_fault
+                                                    .lock()
+                                                    .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                                                    Some(error.clone());
+                                                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                                    echo_agent::error::AgentFailure::message(
+                                                        "channel_session_incarnation",
+                                                        error.clone(),
+                                                    ),
+                                                )
+                                            },
+                                            format!("Conversation reset failed closed after coordinator rejection: {error}"),
                                         ),
-                                    ),
-                                    format!("Unable to retire the conversation agent: {error}"),
-                                ),
+                                    }
+                                }
+                                Err(error) => channel_retirement_terminal(error),
                             };
                             generation_receipts.release_lifo();
                             reset_lease.settle(outcome);
+                            Self::clear_active_turn(
+                                &active_turns,
+                                &active_surface_id_for_owner,
+                                &reset_turn_id_for_owner,
+                            );
                             let _delivered = result_tx.send(message);
                         })
                 {
+                    Self::clear_active_turn(&self.active_turns, active_surface_id, &reset_turn_id);
                     return Some(format!("Unable to supervise reset settlement: {error}"));
                 }
                 Some(result_rx.await.unwrap_or_else(|_| {
@@ -870,18 +1940,44 @@ impl AppChannelMessageHandler {
                 if argument.is_empty() {
                     return Some("Usage: /steer <additional instruction>".to_string());
                 }
-                let runtime = scoped_runtime.as_ref()?;
-                let Some(snapshot) = self.foreground_turns.snapshot_scoped(
-                    runtime.execution_scope().workspace_id(),
-                    ForegroundTurnSurface::Channel,
-                    conv,
-                ) else {
+                let active = match self
+                    .resolve_active_turn(active_surface_id, conv, agent_conv)
+                    .await
+                {
+                    Ok(active) => active,
+                    Err(error) => {
+                        return Some(format!("Unable to inspect the active turn: {error}"));
+                    }
+                };
+                let Some(active) = active else {
                     return Some("No active channel turn to steer.".to_string());
                 };
-                let Some(pool) = runtime.pool() else {
+                let snapshots = match self
+                    .foreground_turns
+                    .snapshots_for_workspace(active.runtime.execution_scope().workspace_id())
+                {
+                    Ok(snapshots) => snapshots,
+                    Err(error) => {
+                        return Some(format!(
+                            "Unable to inspect the active channel turn: {error}"
+                        ));
+                    }
+                };
+                let Some(snapshot) = snapshots.into_iter().find(|snapshot| {
+                    snapshot.surface == ForegroundTurnSurface::Channel
+                        && snapshot.conversation_id == active.conversation_id
+                }) else {
+                    Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
+                    return Some("No active channel turn to steer.".to_string());
+                };
+                if !channel_snapshot_matches_root(&snapshot, &active.turn_id) {
+                    Self::clear_active_turn(&self.active_turns, active_surface_id, &active.turn_id);
+                    return Some("The recorded channel turn already settled.".to_string());
+                }
+                let Some(pool) = active.runtime.pool() else {
                     return Some("The active workspace has no AgentPool.".to_string());
                 };
-                let execution = match pool.lease_existing(conv).await {
+                let execution = match pool.lease_existing(&active.agent_conversation_id).await {
                     Ok(Some(execution)) => execution,
                     Ok(None) => {
                         return Some("The active channel turn has no attached agent.".to_string());
@@ -893,9 +1989,10 @@ impl AppChannelMessageHandler {
                     }
                 };
                 let agent = execution.agent();
+                let active_agent_turn_id = channel_steer_target(&snapshot).to_string();
                 let response = match agent
                     .steer_input(
-                        Some(&snapshot.active_turn_id),
+                        Some(&active_agent_turn_id),
                         echo_agent::prelude::Message::user(argument.to_string()),
                     )
                     .await
@@ -905,6 +2002,11 @@ impl AppChannelMessageHandler {
                         "The active turn is not currently steerable; try again shortly.".to_string()
                     }
                     Err(echo_agent::agent::TurnSteerError::NoActiveTurn) => {
+                        Self::clear_active_turn(
+                            &self.active_turns,
+                            active_surface_id,
+                            &active.turn_id,
+                        );
                         "The channel turn already settled.".to_string()
                     }
                     Err(error) => format!("Unable to steer the active turn: {error}"),
@@ -923,23 +2025,6 @@ impl Drop for AppChannelMessageHandler {
         self.hitl
             .close_now("Channel session ended before the request settled");
     }
-}
-
-#[cfg(feature = "channels")]
-fn immediate_channel_response<'a>(
-    msg: &echo_agent::channels::InboundMessage,
-    message: impl Into<String>,
-) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
-{
-    use futures::StreamExt;
-
-    let outbound = echo_agent::channels::OutboundMessage::new(
-        &msg.channel_id,
-        msg.reply_target(),
-        msg.chat_type,
-        message,
-    );
-    futures::stream::once(async move { Ok(outbound) }).boxed()
 }
 
 #[cfg(feature = "channels")]
@@ -1072,73 +2157,6 @@ fn parse_developer_command(message: &str) -> Result<Option<(String, Vec<String>)
 }
 
 #[cfg(feature = "channels")]
-fn channel_terminal_stream(
-    message: &echo_agent::channels::InboundMessage,
-    initial: String,
-    mut events: tokio::sync::broadcast::Receiver<echo_agent_app_core::terminal::TerminalEvent>,
-    terminal_id: String,
-) -> futures::stream::BoxStream<
-    'static,
-    echo_agent::error::Result<echo_agent::channels::OutboundMessage>,
-> {
-    use futures::StreamExt;
-
-    let channel_id = message.channel_id.clone();
-    let reply_target = message.reply_target().to_string();
-    let chat_type = message.chat_type;
-    async_stream::stream! {
-        yield Ok(echo_agent::channels::OutboundMessage::new(
-            &channel_id,
-            &reply_target,
-            chat_type,
-            initial,
-        ));
-        loop {
-            match events.recv().await {
-                Ok(echo_agent_app_core::terminal::TerminalEvent::Output { id, bytes })
-                    if id == terminal_id =>
-                {
-                    let stripped = strip_ansi_escapes::strip(bytes);
-                    let text = String::from_utf8_lossy(&stripped).into_owned();
-                    if !text.is_empty() {
-                        yield Ok(echo_agent::channels::OutboundMessage::new(
-                            &channel_id,
-                            &reply_target,
-                            chat_type,
-                            text,
-                        ));
-                    }
-                }
-                Ok(echo_agent_app_core::terminal::TerminalEvent::Exited { id, reason })
-                    if id == terminal_id =>
-                {
-                    yield Ok(echo_agent::channels::OutboundMessage::new(
-                        &channel_id,
-                        &reply_target,
-                        chat_type,
-                        format!("Terminal '{terminal_id}' exited: {reason:?}"),
-                    ));
-                    break;
-                }
-                Ok(_) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    yield Ok(echo_agent::channels::OutboundMessage::new(
-                        &channel_id,
-                        &reply_target,
-                        chat_type,
-                        format!(
-                            "Terminal '{terminal_id}' output lagged by {skipped} event(s); subsequent output remains live."
-                        ),
-                    ));
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    }
-    .boxed()
-}
-
-#[cfg(feature = "channels")]
 #[async_trait::async_trait]
 impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     async fn handle(
@@ -1159,8 +2177,12 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             }
             reply.push_str(&message.text);
         }
+        let bounded = channel_outbound_chunks(&channel_id, &ChannelOutboundDraft::ordinary(reply))
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         Ok(echo_agent::channels::OutboundMessage::new(
-            channel_id, to, chat_type, reply,
+            channel_id, to, chat_type, bounded,
         ))
     }
 
@@ -1173,6 +2195,32 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             echo_agent::error::Result<echo_agent::channels::OutboundMessage>,
         >,
     > {
+        if let Some(error) = self.initialization_error.as_ref() {
+            return Ok(immediate_channel_response(
+                &msg,
+                format!("Channel session initialization failed: {error}"),
+            ));
+        }
+        if let Some(error) = self
+            .incarnation_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            return Ok(immediate_channel_response(
+                &msg,
+                format!("Channel session is quarantined: {error}"),
+            ));
+        }
+        if self.session_instance.channel_id() != msg.channel_id
+            || self.session_instance.conversation_id() != msg.conversation_id()
+            || self.session_instance.sender_id() != msg.sender_id
+        {
+            return Ok(immediate_channel_response(
+                &msg,
+                "Channel session identity changed after framework routing.",
+            ));
+        }
         let developer_command = match parse_developer_command(&msg.text) {
             Ok(command) => command,
             Err(error) => return Ok(immediate_channel_response(&msg, error)),
@@ -1202,8 +2250,12 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 )),
             };
         }
-        let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id());
-        let cache_id = Self::cache_user_id(&msg.channel_id, msg.conversation_id());
+        let conv = Self::conversation_id(&msg.channel_id, msg.conversation_id(), &msg.sender_id);
+        let incarnation_id = self.session_instance.incarnation_id();
+        let agent_conv = Self::agent_conversation_id(&conv, &incarnation_id);
+        let active_surface_id =
+            Self::active_surface_identity(&msg.channel_id, msg.conversation_id(), &msg.sender_id);
+        let cache_id = Self::cache_user_id(&conv, &incarnation_id);
         if let Some(message) = self.agent_router_command_response(&msg.text, &conv).await {
             return Ok(immediate_channel_response(&msg, message));
         }
@@ -1214,51 +2266,196 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     return Ok(immediate_channel_response(&msg, message));
                 }
                 ChannelTaskRunControl::Resume {
-                    run_id,
-                    root_message_id,
-                    expected_resume,
+                    expected,
                     continuation_enabled,
                     runtime,
                 } => {
-                    resume_task_run = Some((
-                        run_id,
-                        root_message_id,
-                        expected_resume,
-                        continuation_enabled,
-                        runtime,
-                    ));
+                    resume_task_run = Some((expected, continuation_enabled, runtime));
                 }
             }
         }
         // Product control commands always outrank HITL parsing. `/stop` owns
         // turn cancellation; `/cancel` rejects only the queue front.
-        if let Some(message) = self.control_command_response(&msg.text, &conv).await {
+        if let Some(message) = self
+            .control_command_response(&msg.text, &conv, &agent_conv, &cache_id, &active_surface_id)
+            .await
+        {
             return Ok(immediate_channel_response(&msg, message));
         }
         if msg.text.split_whitespace().next() == Some("/extract") {
-            let workspace_id = self
-                .app_state
-                .current_execution_scope()
-                .await
-                .workspace_id()
-                .to_string();
+            use echo_agent_app_core::structured_extraction::PreparedStructuredExtractionCommand;
+
             let command = msg
                 .text
                 .trim()
                 .strip_prefix("/extract")
                 .map(str::trim)
                 .unwrap_or_default();
-            let message = self
+            let prepared = match self
                 .app_state
-                .execute_structured_extraction_command_for_scope(
-                    &workspace_id,
-                    &conv,
-                    ForegroundTurnSurface::Channel,
-                    command,
-                )
-                .await
-                .unwrap_or_else(|error| format!("Structured extraction command failed: {error}"));
-            return Ok(immediate_channel_response(&msg, message));
+                .history
+                .structured_extraction
+                .parse_command(command)
+            {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Structured extraction command failed: {error}"),
+                    ));
+                }
+            };
+            match prepared {
+                PreparedStructuredExtractionCommand::Examples => {
+                    let value = serde_json::to_value(
+                        self.app_state.history.structured_extraction.examples(),
+                    )
+                    .and_then(|value| serde_json::to_string_pretty(&value));
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        value.unwrap_or_else(|error| {
+                            format!("Structured extraction serialization failed: {error}")
+                        }),
+                    ));
+                }
+                PreparedStructuredExtractionCommand::Validate(schema) => {
+                    let value = serde_json::to_value(
+                        self.app_state
+                            .history
+                            .structured_extraction
+                            .validate_schema(&schema),
+                    )
+                    .and_then(|value| serde_json::to_string_pretty(&value));
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        value.unwrap_or_else(|error| {
+                            format!("Structured extraction serialization failed: {error}")
+                        }),
+                    ));
+                }
+                PreparedStructuredExtractionCommand::Extract(request) => {
+                    let runtime = match self.app_state.current_control_runtime().await {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            return Ok(immediate_channel_response(
+                                &msg,
+                                format!("Workspace runtime is unavailable: {error}"),
+                            ));
+                        }
+                    };
+                    if let Err(error) = self
+                        .settle_pending_retirement_for_runtime(
+                            &runtime,
+                            &conv,
+                            &agent_conv,
+                            &active_surface_id,
+                        )
+                        .await
+                    {
+                        return Ok(immediate_channel_response(&msg, error));
+                    }
+                    let turn_id = format!("channel-extraction:{}", uuid::Uuid::new_v4());
+                    let lease = match runtime
+                        .begin_turn(
+                            &self.foreground_turns,
+                            ForegroundTurnSurface::Channel,
+                            &conv,
+                            turn_id.clone(),
+                        )
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(error) => {
+                            return Ok(immediate_channel_response(
+                                &msg,
+                                format!("Unable to admit structured extraction: {error}"),
+                            ));
+                        }
+                    };
+                    if let Err(message) = self.publish_active_turn(
+                        &active_surface_id,
+                        &conv,
+                        &agent_conv,
+                        &runtime,
+                        &turn_id,
+                    ) {
+                        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                        return Ok(immediate_channel_response(&msg, message));
+                    }
+                    let active_owner = ChannelActiveTurnOwner::new(
+                        Arc::clone(&self.active_turns),
+                        active_surface_id.clone(),
+                        turn_id,
+                    );
+                    let receipts = match Self::generation_receipts(&runtime) {
+                        Ok(receipts) => receipts,
+                        Err(message) => {
+                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message(
+                                    "workspace_generation",
+                                    message.clone(),
+                                ),
+                            ));
+                            drop(active_owner);
+                            return Ok(immediate_channel_response(&msg, message));
+                        }
+                    };
+                    self.record_runtime_owner(&runtime, &conv, &agent_conv);
+                    let execution = match runtime.agent_for(&agent_conv).await {
+                        Ok(execution) => execution,
+                        Err(error) => {
+                            receipts.release_lifo();
+                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message(
+                                    "agent_pool",
+                                    error.to_string(),
+                                ),
+                            ));
+                            drop(active_owner);
+                            return Ok(immediate_channel_response(
+                                &msg,
+                                format!("AgentPool admission failed: {error}"),
+                            ));
+                        }
+                    };
+                    let agent = execution.agent();
+                    configure_channel_agent(&agent, &cache_id, Arc::clone(&self.hitl)).await;
+                    let cancel = lease.cancellation_token();
+                    let extraction = await_channel_operation(
+                        cancel,
+                        self.app_state
+                            .history
+                            .structured_extraction
+                            .extract(&agent, request),
+                    )
+                    .await;
+                    drop(execution);
+                    receipts.release_lifo();
+                    let message = match extraction {
+                        None => {
+                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                            "Structured extraction was cancelled.".to_string()
+                        }
+                        Some(Ok(outcome)) => {
+                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Completed);
+                            serde_json::to_string_pretty(&outcome).unwrap_or_else(|error| {
+                                format!("Structured extraction serialization failed: {error}")
+                            })
+                        }
+                        Some(Err(error)) => {
+                            lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message(
+                                    error.code(),
+                                    error.to_string(),
+                                ),
+                            ));
+                            format!("Structured extraction failed: {error}")
+                        }
+                    };
+                    drop(active_owner);
+                    return Ok(immediate_channel_response(&msg, message));
+                }
+            }
         }
         if self.hitl.has_pending().await {
             match self.hitl.resolve_message(&msg.text).await {
@@ -1276,7 +2473,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 .begin_scoped_chat_turn_owned(
                     ForegroundTurnSurface::Channel,
                     &conv,
-                    command_id,
+                    command_id.clone(),
                 )
                 .await
             {
@@ -1309,13 +2506,33 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         // TaskRuntime -> pool order as chat. They do not mutate the agent when
         // any admission step fails.
         if is_agent_management_command(&msg.text) {
+            let retirement_runtime = match self.app_state.current_control_runtime().await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Workspace runtime is unavailable: {error}"),
+                    ));
+                }
+            };
+            if let Err(error) = self
+                .settle_pending_retirement_for_runtime(
+                    &retirement_runtime,
+                    &conv,
+                    &agent_conv,
+                    &active_surface_id,
+                )
+                .await
+            {
+                return Ok(immediate_channel_response(&msg, error));
+            }
             let command_id = uuid::Uuid::new_v4().to_string();
             let (runtime, lease) = match self
                 .app_state
                 .begin_scoped_chat_turn_owned(
                     ForegroundTurnSurface::Channel,
                     &conv,
-                    command_id,
+                    command_id.clone(),
                 )
                 .await
             {
@@ -1337,6 +2554,21 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     ));
                 }
             };
+            if let Err(message) = self.publish_active_turn(
+                &active_surface_id,
+                &conv,
+                &agent_conv,
+                &runtime,
+                &command_id,
+            ) {
+                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+                return Ok(immediate_channel_response(&msg, message));
+            }
+            let _active_owner = ChannelActiveTurnOwner::new(
+                Arc::clone(&self.active_turns),
+                active_surface_id.clone(),
+                command_id,
+            );
             let generation_receipts = match Self::generation_receipts(&runtime) {
                 Ok(receipts) => receipts,
                 Err(message) => {
@@ -1349,7 +2581,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     return Ok(immediate_channel_response(&msg, message));
                 }
             };
-            let pool_execution = match runtime.agent_for(&conv).await {
+            self.record_runtime_owner(&runtime, &conv, &agent_conv);
+            let pool_execution = match runtime.agent_for(&agent_conv).await {
                 Ok(execution) => execution,
                 Err(error) => {
                     generation_receipts.release_lifo();
@@ -1384,15 +2617,38 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             return Ok(immediate_channel_response(&msg, message));
         }
 
-        if resume_task_run.is_some() && !msg.attachments.is_empty() {
+        if channel_resume_rejects_attachments(resume_task_run.is_some(), msg.attachments.len()) {
             return Ok(immediate_channel_response(
                 &msg,
                 "TaskRun resume does not accept new attachments; send them in a separate turn.",
             ));
         }
+        let retirement_runtime = match resume_task_run.as_ref() {
+            Some((_, _, runtime)) => runtime.as_ref().clone(),
+            None => match self.app_state.current_control_runtime().await {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    return Ok(immediate_channel_response(
+                        &msg,
+                        format!("Workspace runtime is unavailable: {error}"),
+                    ));
+                }
+            },
+        };
+        if let Err(error) = self
+            .settle_pending_retirement_for_runtime(
+                &retirement_runtime,
+                &conv,
+                &agent_conv,
+                &active_surface_id,
+            )
+            .await
+        {
+            return Ok(immediate_channel_response(&msg, error));
+        }
         let turn_id = uuid::Uuid::new_v4().to_string();
         let admission = match resume_task_run.as_ref() {
-            Some((_, _, _, _, runtime)) => runtime
+            Some((_, _, runtime)) => runtime
                 .begin_turn(
                     &self.foreground_turns,
                     ForegroundTurnSurface::Channel,
@@ -1433,72 +2689,17 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 ));
             }
         };
-        let stream_cancel = foreground_lease.cancellation_token();
-        let text = resume_task_run.as_ref().map_or_else(
-            || msg.text.clone(),
-            |(run_id, _, _, _, _)| {
-                format!(
-                    "Resume the existing TaskRun {run_id} toward its unchanged Goal. Reload the authoritative TaskRuntime projection and continue the next useful work."
-                )
-            },
-        );
-        // Persist IM attachments into the same durable reference contract as
-        // GUI/TUI so TaskRuntime subagents can reconstruct the same message.
-        let attachment_refs = match stage_channel_attachments(&msg.attachments) {
-            Ok(attachments) => attachments,
-            Err(error) => {
-                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("attachment_staging", error.clone()),
-                ));
-                return Ok(immediate_channel_response(
-                    &msg,
-                    format!("附件保存失败，未发送本条消息：{error}"),
-                ));
-            }
-        };
-        // Channels have no workspace root; long pastes spill to the global
-        // user-input artifact dir (~/.eko/artifacts/user-input/).
-        let spill_dir = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(None);
-        let interaction_mode = if resume_task_run.is_some() {
-            echo_agent_app_core::tasks::task_runtime::InteractionMode::Task
-        } else {
-            *self.interaction_mode.read().await
-        };
-        let runtime_authored = resume_task_run.is_some();
-        let turn = match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
-            echo_agent_app_core::prepared_turn::UserTurnInput {
-                text: &text,
-                attachments: &attachment_refs,
-                spill_dir: &spill_dir,
-                conversation_id: Some(&conv),
-                turn_id: Some(&turn_id),
-            },
+        if let Err(message) = self.publish_active_turn(
+            &active_surface_id,
+            &conv,
+            &agent_conv,
+            &scoped_runtime,
+            &turn_id,
         ) {
-            Ok(turn) if runtime_authored => turn.runtime_authored(),
-            Ok(turn) => turn,
-            Err(error) => {
-                tracing::warn!(%error, conv = %conv, "channel user-turn preparation failed");
-                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("prepared_turn", error.to_string()),
-                ));
-                let cleanup = echo_agent_app_core::attachments::discard_staged_attachment_refs(
-                    &attachment_refs,
-                )
-                .err();
-                let suffix = cleanup
-                    .map(|cleanup| format!("；临时附件清理也失败：{cleanup}"))
-                    .unwrap_or_default();
-                return Ok(immediate_channel_response(
-                    &msg,
-                    format!("无法安全保存这条消息，请检查本地磁盘后重试：{error}{suffix}"),
-                ));
-            }
-        };
-
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-            echo_agent_app_core::chat_driver::ChatDriverEvent,
-        >();
-        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
+            foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+            return Ok(immediate_channel_response(&msg, message));
+        }
+        self.record_runtime_owner(&scoped_runtime, &conv, &agent_conv);
         let Some(pool) = scoped_runtime.pool() else {
             foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                 echo_agent::error::AgentFailure::message(
@@ -1506,44 +2707,142 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                     "The active workspace has no AgentPool",
                 ),
             ));
+            Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
             return Ok(immediate_channel_response(
                 &msg,
                 "The active workspace has no AgentPool.",
             ));
         };
+        if let Some((expected, _, _)) = resume_task_run.as_ref() {
+            let validation = match scoped_runtime.task_runtime() {
+                Some(store) => {
+                    let expected_identity = expected.clone();
+                    let run_id = expected.run_id.clone();
+                    Self::task_runtime_io(store, "validate channel TaskRun resume", move |store| {
+                        let snapshot = store.get_run_state(&run_id)?.ok_or_else(|| {
+                            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                                format!("TaskRun '{run_id}' no longer exists"),
+                            )
+                        })?;
+                        expected_identity.validate_resumable(&snapshot).map_err(|error| {
+                            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(error)
+                        })
+                    })
+                    .await
+                }
+                None => Err("TaskRuntime store is unavailable".to_string()),
+            }
+            .and_then(|()| {
+                if expected.workspace_id != scoped_runtime.execution_scope().workspace_id() {
+                    Err(format!(
+                        "TaskRun '{}' was queued for workspace '{}', but admitted workspace is '{}'",
+                        expected.run_id,
+                        expected.workspace_id,
+                        scoped_runtime.execution_scope().workspace_id()
+                    ))
+                } else if expected.conversation_id != conv {
+                    Err(format!(
+                        "TaskRun '{}' was queued for conversation '{}', but channel conversation is '{}'",
+                        expected.run_id, expected.conversation_id, conv
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(detail) = validation {
+                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
+                ));
+                Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
+                return Ok(immediate_channel_response(&msg, detail));
+            }
+        }
+        let stream_cancel = foreground_lease.cancellation_token();
+        let text = resume_task_run.as_ref().map_or_else(
+            || msg.text.clone(),
+            |(expected, _, _)| {
+                format!(
+                    "Resume the existing TaskRun {} toward its unchanged Goal. Reload the authoritative TaskRuntime projection and continue the next useful work.",
+                    expected.run_id
+                )
+            },
+        );
+        let execution_root = scoped_runtime.execution_scope().root().to_path_buf();
+        let workspace_io_receipt = scoped_runtime.workspace_io_receipt();
+        // Persist IM attachments into the same durable reference contract as
+        // GUI/TUI under the exact immutable execution scope captured at turn
+        // admission. PreparedUserTurn then promotes these staging files into
+        // conversation/turn-scoped resources shared by main and Subagents.
+        let interaction_mode = if resume_task_run.is_some() {
+            echo_agent_app_core::tasks::task_runtime::InteractionMode::Task
+        } else {
+            *self.interaction_mode.read().await
+        };
+        let runtime_authored = resume_task_run.is_some();
+        let prepared_attachments = msg.attachments.clone();
+        let prepared_conversation_id = conv.clone();
+        let prepared_turn_id = turn_id.clone();
+        let prepared_workspace_receipt = workspace_io_receipt.clone();
+
+        let (tx, rx) =
+            tokio::sync::mpsc::channel::<ChannelRenderEvent>(CHANNEL_EVENT_QUEUE_CAPACITY);
+        let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let store = scoped_runtime.task_runtime();
         let execution_scope = scoped_runtime.execution_scope().clone();
-        let workspace_io_receipt = scoped_runtime.workspace_io_receipt();
         let app_state = self.app_state.clone();
+        let turn_preparation_flow = match self
+            .app_state
+            .session
+            .product_data_io
+            .begin_owned_flow("prepare channel user turn")
+        {
+            Ok(flow) => flow,
+            Err(error) => {
+                let detail = error.to_string();
+                foreground_lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "product_data_admission",
+                        detail.clone(),
+                    ),
+                ));
+                Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
+                return Ok(immediate_channel_response(&msg, detail));
+            }
+        };
         let webhook_emitter = self.webhook_emitter.clone();
         let review_integration = scoped_runtime.review_integration();
         let hitl = Arc::clone(&self.hitl);
         let prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
-        let planned_resume = resume_task_run.as_ref().and_then(
-            |(_, _, expected_resume, continuation_enabled, _)| {
-                (!continuation_enabled).then(|| expected_resume.clone())
-            },
+        let agent_conv_owned = agent_conv.clone();
+        let resume_dispatch = resume_task_run.map(|(expected_resume, continuation_enabled, _)| {
+            channel_resume_dispatch(expected_resume, continuation_enabled, &turn_id)
+        });
+        let (planned_resume, explicit_binding) = match resume_dispatch {
+            Some(ChannelResumeDispatch::Planned(expected)) => (Some(expected), None),
+            Some(ChannelResumeDispatch::Continuation(binding)) => (None, Some(binding)),
+            None => (None, None),
+        };
+        let renderer_cancel = stream_cancel.clone();
+        let active_turns = Arc::clone(&self.active_turns);
+        let active_surface_id_for_owner = active_surface_id.clone();
+        let active_turn_id = turn_id.clone();
+        let active_owner = ChannelActiveTurnOwner::new(
+            Arc::clone(&active_turns),
+            active_surface_id_for_owner.clone(),
+            active_turn_id.clone(),
         );
-        let explicit_binding =
-            resume_task_run.and_then(|(_, _, expected_resume, continuation_enabled, _)| {
-                continuation_enabled.then(|| {
-                    echo_agent_app_core::tasks::task_runtime::RunTurnBinding::resume_expected(
-                        expected_resume,
-                        turn_id.clone(),
-                    )
-                })
-            });
+        let driver_turn_id = turn_id.clone();
         let supervision =
             self.foreground_turns
                 .supervise(foreground_lease, move |foreground_lease| async move {
-                    use echo_agent_app_core::chat_driver::ChannelChatSink;
+                    let _active_owner = active_owner;
                     use echo_agent_app_core::foreground_turn::{
                         drive_foreground_pooled_chat, drive_foreground_pooled_chat_turn,
                     };
 
                     let renderer: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
-                        std::sync::Arc::new(ChannelChatSink::new(tx));
+                        std::sync::Arc::new(ChannelSurfaceSink::new(tx, renderer_cancel));
                     let sink = echo_agent_app_core::chat_event_log::bind_surface_chat_sink(
                         echo_agent_app_core::chat_event_log::ChatSurface::Channel,
                         renderer,
@@ -1551,8 +2850,37 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         app_state.storage.tool_executions.clone(),
                         execution_scope.workspace_id().to_string(),
                         Some(conv_owned.clone()),
-                        turn_id.clone(),
+                        driver_turn_id.clone(),
                     );
+                    let turn = match prepare_channel_turn(
+                        ChannelTurnPreparation {
+                            attachments: prepared_attachments,
+                            execution_root,
+                            text,
+                            conversation_id: prepared_conversation_id,
+                            turn_id: prepared_turn_id,
+                            runtime_authored,
+                            workspace_io_receipt: prepared_workspace_receipt,
+                        },
+                        &turn_preparation_flow,
+                    )
+                    .await
+                    {
+                        Ok(turn) => {
+                            turn_preparation_flow.settle(None);
+                            turn
+                        }
+                        Err(error) => {
+                            turn_preparation_flow.settle(Some(error.clone()));
+                            tracing::warn!(%error, "channel user-turn preparation failed");
+                            let outcome = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                                echo_agent::error::AgentFailure::message("prepared_turn", error),
+                            );
+                            foreground_lease.settle(outcome.clone());
+                            let _delivered = terminal_tx.send(outcome);
+                            return;
+                        }
+                    };
                     let res =
                         std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
                             execution_scope,
@@ -1562,7 +2890,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                             sink,
                             webhook_emitter: Some(webhook_emitter),
                             conv_id: Some(conv_owned.clone()),
-                            root_message_id: turn_id,
+                            root_message_id: driver_turn_id,
                             attachments: turn.inline_attachment_refs(),
                             cancel: foreground_lease.cancellation_token(),
                             interaction_mode,
@@ -1578,7 +2906,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                         Ok(())
                     };
                     let outcome = if let Some(expected) = planned_resume {
-                        let execution = match pool.acquire(&conv_owned).await {
+                        let execution = match pool.acquire(&agent_conv_owned).await {
                             Ok(execution) => execution,
                             Err(error) => {
                                 let outcome = echo_agent_app_core::chat_driver::TurnOutcome::Failed(
@@ -1662,7 +2990,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                 drive_foreground_pooled_chat_turn(
                                     foreground_lease,
                                     pool,
-                                    conv_owned,
+                                    agent_conv_owned,
                                     configure,
                                     &turn,
                                     res,
@@ -1674,7 +3002,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                                 drive_foreground_pooled_chat(
                                     foreground_lease,
                                     pool,
-                                    conv_owned,
+                                    agent_conv_owned,
                                     configure,
                                     &turn,
                                     res,
@@ -1683,9 +3011,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                             }
                         }
                     };
+                    Self::clear_active_turn(
+                        &active_turns,
+                        &active_surface_id_for_owner,
+                        &active_turn_id,
+                    );
                     let _delivered = terminal_tx.send(outcome);
                 });
         if let Err(error) = supervision {
+            Self::clear_active_turn(&self.active_turns, &active_surface_id, &turn_id);
             return Ok(immediate_channel_response(
                 &msg,
                 format!("Unable to supervise the channel turn: {error}"),
@@ -1702,7 +3036,14 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         let channel_id = msg.channel_id.clone();
         let to = msg.reply_target().to_string();
         let chat_type = msg.chat_type;
-        Ok(aggregate_by_sentence(event_stream, channel_id, to, chat_type).await)
+        Ok(aggregate_by_sentence_with_repository(
+            event_stream,
+            channel_id,
+            to,
+            chat_type,
+            self.app_state.storage.tool_executions.clone(),
+        )
+        .await)
     }
 
     async fn reply(
@@ -1760,6 +3101,13 @@ async fn parse_channel_mode_command(
     };
     *mode.write().await = next;
     Some(format!("Interaction mode set to {}.", next.as_str()))
+}
+
+#[cfg(feature = "channels")]
+async fn reset_channel_interaction_mode(
+    mode: &tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
+) {
+    *mode.write().await = echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto;
 }
 
 #[cfg(feature = "channels")]
@@ -1853,23 +3201,6 @@ async fn channel_skills_response(
     crate::cli::cmd_impls::skills::execute_skill_update_command(agent, &args).await
 }
 
-/// 将任意字符串清理为 DeepSeek `user_id` 合法形式 `[a-zA-Z0-9\-_]+`，最长 512 字符。
-///
-/// UTF-8 安全：用 `chars()` 迭代，禁止字节截断（中文/emoji → 替换为 `-`）。
-/// 参考 AGENTS.md Rust 硬性约束 §1。
-fn sanitize_cache_user_id(raw: &str) -> String {
-    raw.chars()
-        .take(512)
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
-}
-
 #[cfg(feature = "channels")]
 fn channel_attachment_data(
     index: usize,
@@ -1913,11 +3244,12 @@ fn channel_attachment_data(
 #[cfg(feature = "channels")]
 fn stage_channel_attachments(
     attachments: &[echo_agent::channels::MessageAttachment],
+    execution_root: &Path,
 ) -> Result<Vec<echo_agent_app_core::attachments::AttachmentRef>, String> {
     let mut staged = Vec::with_capacity(attachments.len());
     for (index, attachment) in attachments.iter().enumerate() {
         let data = channel_attachment_data(index, attachment);
-        match echo_agent_app_core::attachments::stage_attachment_data(&data, None) {
+        match echo_agent_app_core::attachments::stage_attachment_data(&data, Some(execution_root)) {
             Ok(reference) => staged.push(reference),
             Err(error) => {
                 let cleanup =
@@ -1932,6 +3264,67 @@ fn stage_channel_attachments(
     Ok(staged)
 }
 
+/// Persist channel attachments and construct the canonical turn on the bounded
+/// product-data I/O pool. The exact workspace receipt remains owned by the
+/// blocking closure, while the foreground supervisor owns this future after
+/// admission, so surface cancellation cannot detach a half-written turn.
+#[cfg(feature = "channels")]
+struct ChannelTurnPreparation {
+    attachments: Vec<echo_agent::channels::MessageAttachment>,
+    execution_root: std::path::PathBuf,
+    text: String,
+    conversation_id: String,
+    turn_id: String,
+    runtime_authored: bool,
+    workspace_io_receipt: echo_agent_app_core::state::ScopedWorkspaceIoReceipt,
+}
+
+#[cfg(feature = "channels")]
+async fn prepare_channel_turn(
+    preparation: ChannelTurnPreparation,
+    flow: &echo_agent_app_core::product_data_io::ProductDataIoFlow,
+) -> Result<echo_agent_app_core::prepared_turn::PreparedUserTurn, String> {
+    flow.run("prepare channel user turn", move || {
+        let ChannelTurnPreparation {
+            attachments,
+            execution_root,
+            text,
+            conversation_id,
+            turn_id,
+            runtime_authored,
+            workspace_io_receipt,
+        } = preparation;
+        let _workspace_io_receipt = workspace_io_receipt;
+        let attachment_refs = stage_channel_attachments(&attachments, &execution_root)?;
+        let spill_dir =
+            echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(&execution_root));
+        match echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+            echo_agent_app_core::prepared_turn::UserTurnInput {
+                text: &text,
+                attachments: &attachment_refs,
+                spill_dir: &spill_dir,
+                conversation_id: Some(&conversation_id),
+                turn_id: Some(&turn_id),
+            },
+        ) {
+            Ok(turn) if runtime_authored => Ok(turn.runtime_authored()),
+            Ok(turn) => Ok(turn),
+            Err(error) => {
+                let cleanup = echo_agent_app_core::attachments::discard_staged_attachment_refs(
+                    &attachment_refs,
+                )
+                .err();
+                let suffix = cleanup
+                    .map(|cleanup| format!("; staged attachment cleanup failed: {cleanup}"))
+                    .unwrap_or_default();
+                Err(format!("{error}{suffix}"))
+            }
+        }
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
 #[cfg(feature = "channels")]
 const FLUSH_THRESHOLD: usize = 80;
 
@@ -1942,50 +3335,123 @@ fn is_sentence_end(c: char) -> bool {
     matches!(c, '。' | '．' | '！' | '？' | '…' | '.' | '!' | '?')
 }
 
-/// 把共享 `ChatDriverEvent` 流按句/段落聚合成逐段 `OutboundMessage` 流。
+/// 把共享 `ChatDriverEvent` 流投影为有界的内部文本 drafts。
 ///
 /// flush 条件(满足任一):
 /// 1. buf 含换行 → flush 到最后一个换行(含),保留换行后的剩余。
 /// 2. buf 以句末标点结尾 → flush 全 buf。
 /// 3. buf.chars().count() >= FLUSH_THRESHOLD → flush 全 buf。
 ///
-/// Agent terminal events flush buffered text; the application-owned terminal
-/// receipt then renders an explicit cancelled/failed outcome and closes.
+/// These sentence/newline boundaries do not directly release transport
+/// messages. Dynamic continuation drafts are buffered up to the 252 KiB
+/// ordinary-turn cap, canonically redacted once at an atomic/terminal/end
+/// boundary, and only then UTF-8 chunked/rate-limited by `outbound`. Overflow
+/// fails closed to a fixed omission notice. Agent terminal receipts remain in
+/// their separately reserved slot and close the projection last.
 ///
 /// 生命周期:返回流借用 'a(随 `events`),由 `try_stream!` 自然处理(宏生成的
 /// future 持有 `events` 的借用)。UTF-8 安全:全用 chars() 判长和拆分
 /// (AGENTS.md §1);无 unwrap/expect(§2)。
-#[cfg(feature = "channels")]
+#[cfg(all(feature = "channels", test))]
 async fn aggregate_by_sentence<'a>(
-    mut events: futures::stream::BoxStream<'a, echo_agent::error::Result<ChannelRenderEvent>>,
+    events: futures::stream::BoxStream<'a, echo_agent::error::Result<ChannelRenderEvent>>,
     channel_id: String,
     to: String,
     chat_type: echo_agent::channels::ChatType,
 ) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
 {
+    let repository = Arc::new(
+        echo_agent_app_core::tool_execution::ToolExecutionRepository::without_initialization(
+            std::env::temp_dir().join(format!("eko-channel-render-test-{}", uuid::Uuid::new_v4())),
+        ),
+    );
+    aggregate_by_sentence_with_repository(events, channel_id, to, chat_type, repository).await
+}
+
+#[cfg(feature = "channels")]
+async fn aggregate_by_sentence_with_repository<'a>(
+    mut events: futures::stream::BoxStream<'a, echo_agent::error::Result<ChannelRenderEvent>>,
+    channel_id: String,
+    to: String,
+    chat_type: echo_agent::channels::ChatType,
+    tool_executions: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
+) -> futures::stream::BoxStream<'a, echo_agent::error::Result<echo_agent::channels::OutboundMessage>>
+{
     use echo_agent::agent::AgentEvent;
-    use echo_agent::channels::OutboundMessage;
     use echo_agent_app_core::chat_driver::ChatDriverEvent;
     use futures::StreamExt;
 
     let s = async_stream::try_stream! {
         let mut buf = String::new();
+        let mut tool_state = ChannelToolRenderState::default();
+        let mut tool_capacity_reported = false;
+        let mut tool_identity_conflict_reported = false;
         // flush 全 buf(若非空)的统一动作,被多个终态/flush 分支共用。
         macro_rules! flush_all {
             () => {
                 if !buf.is_empty() {
-                    yield OutboundMessage::new(&channel_id, &to, chat_type, &buf);
-                    buf.clear();
+                    yield ChannelOutboundDraft::stream(std::mem::take(&mut buf));
                 }
             };
         }
         while let Some(ev) = events.next().await {
-            match ev? {
+            let event = match ev? {
+                ChannelRenderEvent::Journaled(envelope) => {
+                    ChannelRenderEvent::Driver(envelope.payload)
+                }
+                event => event,
+            };
+            match event {
+                ChannelRenderEvent::ToolProjection(update) => {
+                    match tool_state.observe(update) {
+                        ChannelToolObserveOutcome::Accepted
+                        | ChannelToolObserveOutcome::Duplicate => {}
+                        ChannelToolObserveOutcome::Capacity if !tool_capacity_reported => {
+                            tool_capacity_reported = true;
+                            flush_all!();
+                            yield ChannelOutboundDraft::ordinary(
+                                "[tool] live detail capacity reached; canonical events remain available in the durable trace.",
+                            );
+                        }
+                        ChannelToolObserveOutcome::IdentityConflict
+                            if !tool_identity_conflict_reported =>
+                        {
+                            tool_identity_conflict_reported = true;
+                            flush_all!();
+                            yield ChannelOutboundDraft::ordinary(
+                                "[tool] canonical identity conflict; channel detail and artifact references were withheld.",
+                            );
+                        }
+                        ChannelToolObserveOutcome::Capacity
+                        | ChannelToolObserveOutcome::IdentityConflict => {}
+                    }
+                }
                 ChannelRenderEvent::Prompt(prompt) => {
                     flush_all!();
-                    yield OutboundMessage::new(&channel_id, &to, chat_type, &prompt);
+                    yield ChannelOutboundDraft::ordinary(prompt);
                 }
-                ChannelRenderEvent::Driver(ChatDriverEvent::Agent(envelope)) => match envelope.payload {
+                ChannelRenderEvent::Token(t) => {
+                    buf.push_str(&t);
+                    if let Some(trailing_chars) = buf.chars().rev().position(|ch| ch == '\n') {
+                        let cut = buf.chars().count().saturating_sub(trailing_chars);
+                        let chunk: String = buf.chars().take(cut).collect();
+                        buf = buf.chars().skip(cut).collect();
+                        yield ChannelOutboundDraft::stream(chunk);
+                    } else if buf.chars().last().map(is_sentence_end).unwrap_or(false)
+                        || buf.chars().count() >= FLUSH_THRESHOLD
+                    {
+                        flush_all!();
+                    }
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::Agent(envelope)) => {
+                let fallback_message_id = envelope
+                    .message_id
+                    .as_ref()
+                    .map(|message_id| message_id.as_str())
+                    .unwrap_or_else(|| envelope.turn_id.as_str())
+                    .to_string();
+                let chat_owner = ChannelToolOwner::Chat(fallback_message_id.clone());
+                match envelope.payload {
                 AgentEvent::Token(t) => {
                     buf.push_str(&t);
                     // 1. 换行 flush(到最后一个 \n 含)。反向字符偏移表示换行后
@@ -1994,7 +3460,7 @@ async fn aggregate_by_sentence<'a>(
                         let cut = buf.chars().count().saturating_sub(trailing_chars);
                         let chunk: String = buf.chars().take(cut).collect();
                         buf = buf.chars().skip(cut).collect();
-                        yield OutboundMessage::new(&channel_id, &to, chat_type, &chunk);
+                        yield ChannelOutboundDraft::stream(chunk);
                     }
                     // 2/3. 句末标点 或 阈值(chars().count() 非字节)→ flush 全 buf
                     else if buf.chars().last().map(is_sentence_end).unwrap_or(false)
@@ -2003,32 +3469,129 @@ async fn aggregate_by_sentence<'a>(
                         flush_all!();
                     }
                 }
+                AgentEvent::ToolCall { call_id, invocation } => {
+                    flush_all!();
+                    let address = tool_state.chat_address(&call_id, &fallback_message_id);
+                    let args_preview = channel_tool_args_preview(&invocation.args);
+                    let detail = tool_state
+                        .detail_ref(&address)
+                        .map(|detail_ref| {
+                            format!(
+                                " [detail {}]",
+                                channel_safe_text(detail_ref, CHANNEL_TOOL_PROGRESS_CHARS)
+                            )
+                        })
+                        .unwrap_or_default();
+                    yield ChannelOutboundDraft::ordinary(
+                        format!(
+                            "[tool:{}] started {}: {}{}",
+                            channel_safe_text(&call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                            channel_safe_text(&invocation.name, CHANNEL_TOOL_PROGRESS_CHARS),
+                            args_preview,
+                            detail
+                        )
+                    );
+                }
+                AgentEvent::ToolStream {
+                    call_id,
+                    name,
+                    event: echo_agent::tools::ToolStreamEvent::Progress { message, percent },
+                } => {
+                    let address = tool_state.chat_address(&call_id, &fallback_message_id);
+                    if let Some(preview) = tool_state.progress_preview(&address, &message) {
+                        flush_all!();
+                        let percent = percent
+                            .map(|percent| format!(" {percent}%"))
+                            .unwrap_or_default();
+                        yield ChannelOutboundDraft::ordinary(
+                            format!(
+                                "[tool:{}] progress {}{}: {}",
+                                channel_safe_text(&call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                channel_safe_text(&name, CHANNEL_TOOL_PROGRESS_CHARS),
+                                percent,
+                                preview
+                            )
+                        );
+                    }
+                }
+                AgentEvent::ToolStream {
+                    call_id,
+                    name,
+                    event: echo_agent::tools::ToolStreamEvent::Output { channel, chunk },
+                } => {
+                    let address = tool_state.chat_address(&call_id, &fallback_message_id);
+                    if let Some(preview) = tool_state.output_preview(&address, &chunk) {
+                        flush_all!();
+                        let channel = match channel {
+                            echo_agent::tools::ToolOutputChannel::Stdout => "stdout",
+                            echo_agent::tools::ToolOutputChannel::Stderr => "stderr",
+                            echo_agent::tools::ToolOutputChannel::Log => "log",
+                        };
+                        yield ChannelOutboundDraft::ordinary(
+                            format!(
+                                "[tool:{}] {channel} {}: {}",
+                                channel_safe_text(&call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                channel_safe_text(&name, CHANNEL_TOOL_PROGRESS_CHARS),
+                                preview
+                            )
+                        );
+                    }
+                }
+                AgentEvent::ToolStream {
+                    call_id,
+                    name,
+                    event: echo_agent::tools::ToolStreamEvent::Complete(result),
+                }
+                | AgentEvent::ToolResult {
+                    call_id,
+                    name,
+                    result,
+                } => {
+                    flush_all!();
+                    let address = tool_state.chat_address(&call_id, &fallback_message_id);
+                    match tool_state.finish(&address) {
+                        ChannelToolTerminal::Duplicate => {}
+                        ChannelToolTerminal::IdentityConflict => {
+                            yield ChannelOutboundDraft::ordinary(format!(
+                                "[tool:{}] result withheld because canonical tool identity conflicted; inspect the durable trace.",
+                                channel_safe_text(&call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                            ));
+                        }
+                        ChannelToolTerminal::Render(entry) => {
+                            let artifact = channel_verified_artifact(
+                                Arc::clone(&tool_executions),
+                                entry.as_deref().map(|entry| &entry.summary),
+                            )
+                            .await;
+                            yield ChannelOutboundDraft::ordinary(channel_tool_result_message(
+                                entry.as_deref(),
+                                artifact.as_ref(),
+                                &call_id,
+                                &name,
+                                &result,
+                            ));
+                        }
+                    }
+                }
                 AgentEvent::FinalAnswer(_) => {
                     flush_all!();
+                    tool_state.finish_owner(&chat_owner);
                 }
                 AgentEvent::Cancelled => {
                     flush_all!();
+                    tool_state.finish_owner(&chat_owner);
                 }
                 AgentEvent::Error { .. } => {
                     flush_all!();
+                    tool_state.finish_owner(&chat_owner);
                 }
                 AgentEvent::BudgetDecision { decision, reason, .. } => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[budget] {decision:?}: {reason}"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[budget] {decision:?}: {reason}"));
                 }
                 AgentEvent::GuardTriggered { guard, blocked } => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[guard] {guard} (blocked={blocked})"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[guard] {guard} (blocked={blocked})"));
                 }
                 AgentEvent::MemoryRecalled { count } => {
                     tracing::debug!(count, "channel agent recalled memory");
@@ -2036,43 +3599,146 @@ async fn aggregate_by_sentence<'a>(
                 AgentEvent::Chart { spec } => {
                     flush_all!();
                     let preview: String = spec.to_string().chars().take(500).collect();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[chart] {preview}"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[chart] {preview}"));
                 }
                 AgentEvent::SafetyNotice { action, reason, risk, permission } => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[safety] {action}: {reason} (risk={risk}, permission={permission})"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[safety] {action}: {reason} (risk={risk}, permission={permission})"));
                 }
                 AgentEvent::ParameterError { tool, parameter, expected, got } => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[parameter] {tool}.{parameter}: expected {expected}, got {got}"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[parameter] {tool}.{parameter}: expected {expected}, got {got}"));
                 }
                 _ => {}
-                },
+                }
+                }
                 ChannelRenderEvent::Driver(ChatDriverEvent::Execution(event)) => {
-                    if event.event.is_attention_event() {
+                    let mut handled_tool_event = false;
+                    if event.scope
+                        == echo_agent_app_core::tasks::task_runtime::executor::ExecEventScope::Subagent
+                        && let Some(subagent_run_id) = event.subagent_run_id.as_deref()
+                    {
+                        let owner = ChannelToolOwner::Subagent(subagent_run_id.to_string());
+                        match event.event {
+                            echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::ToolStarted => {
+                                handled_tool_event = true;
+                                if let Ok(payload) = serde_json::from_value::<ChannelExecutionToolStarted>(event.payload.clone()) {
+                                    flush_all!();
+                                    let address = ChannelToolAddress::subagent(
+                                        &event.workspace_id,
+                                        &event.conversation_id,
+                                        &event.run_id,
+                                        subagent_run_id,
+                                        &payload.call_id,
+                                    );
+                                    let detail = tool_state.detail_ref(&address).map(|detail_ref| {
+                                        format!(" [detail {}]", channel_safe_text(detail_ref, CHANNEL_TOOL_PROGRESS_CHARS))
+                                    }).unwrap_or_default();
+                                    yield ChannelOutboundDraft::ordinary(format!(
+                                        "[subagent:{} tool:{}] started {}: {}{}",
+                                        channel_safe_text(subagent_run_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                        channel_safe_text(&payload.call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                        channel_safe_text(&payload.invocation.name, CHANNEL_TOOL_PROGRESS_CHARS),
+                                        channel_tool_args_preview(&payload.invocation.args),
+                                        detail,
+                                    ));
+                                }
+                            }
+                            echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::ToolOutput => {
+                                handled_tool_event = true;
+                                if let Ok(payload) = serde_json::from_value::<ChannelExecutionToolOutput>(event.payload.clone()) {
+                                    let address = ChannelToolAddress::subagent(
+                                        &event.workspace_id,
+                                        &event.conversation_id,
+                                        &event.run_id,
+                                        subagent_run_id,
+                                        &payload.call_id,
+                                    );
+                                    let projected = match (payload.channel, payload.chunk, payload.message) {
+                                        (Some(channel), Some(chunk), None) => tool_state
+                                            .output_preview(&address, &chunk)
+                                            .map(|preview| format!(
+                                                "[subagent:{} tool:{}] {} {}: {}",
+                                                channel_safe_text(subagent_run_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                channel_safe_text(&payload.call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                channel_safe_text(&channel, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                channel_safe_text(&payload.name, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                preview,
+                                            )),
+                                        (None, None, Some(message)) => tool_state
+                                            .progress_preview(&address, &message)
+                                            .map(|preview| {
+                                                let percent = payload.percent.map(|percent| format!(" {percent}%")).unwrap_or_default();
+                                                format!(
+                                                    "[subagent:{} tool:{}] progress {}{}: {}",
+                                                    channel_safe_text(subagent_run_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                    channel_safe_text(&payload.call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                    channel_safe_text(&payload.name, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                    percent,
+                                                    preview,
+                                                )
+                                            }),
+                                        _ => None,
+                                    };
+                                    if let Some(projected) = projected {
+                                        flush_all!();
+                                        yield ChannelOutboundDraft::ordinary(projected);
+                                    }
+                                }
+                            }
+                            echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::ToolCompleted => {
+                                handled_tool_event = true;
+                                if let Ok(payload) = serde_json::from_value::<ChannelExecutionToolCompleted>(event.payload.clone()) {
+                                    flush_all!();
+                                    let address = ChannelToolAddress::subagent(
+                                        &event.workspace_id,
+                                        &event.conversation_id,
+                                        &event.run_id,
+                                        subagent_run_id,
+                                        &payload.call_id,
+                                    );
+                                    match tool_state.finish(&address) {
+                                        ChannelToolTerminal::Duplicate => {}
+                                        ChannelToolTerminal::IdentityConflict => {
+                                            yield ChannelOutboundDraft::ordinary(format!(
+                                                "[subagent:{} tool:{}] result withheld because canonical tool identity conflicted; inspect the durable trace.",
+                                                channel_safe_text(subagent_run_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                channel_safe_text(&payload.call_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                            ));
+                                        }
+                                        ChannelToolTerminal::Render(entry) => {
+                                            let artifact = channel_verified_artifact(
+                                                Arc::clone(&tool_executions),
+                                                entry.as_deref().map(|entry| &entry.summary),
+                                            ).await;
+                                            yield ChannelOutboundDraft::ordinary(format!(
+                                                "[subagent:{}] {}",
+                                                channel_safe_text(subagent_run_id, CHANNEL_TOOL_PROGRESS_CHARS),
+                                                channel_tool_result_message(
+                                                    entry.as_deref(),
+                                                    artifact.as_ref(),
+                                                    &payload.call_id,
+                                                    &payload.name,
+                                                    &payload.result,
+                                                )
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::Cancelled
+                            | echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::TimedOut
+                            | echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::Completed
+                            | echo_agent_app_core::tasks::task_runtime::RuntimeEventKind::Failed => {
+                                tool_state.finish_owner(&owner);
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !handled_tool_event && event.event.is_attention_event() {
                         flush_all!();
                         let detail: String = event.payload.to_string().chars().take(500).collect();
-                        yield OutboundMessage::new(
-                            &channel_id,
-                            &to,
-                            chat_type,
-                            format!("[task:{}] {}: {detail}", event.run_id, event.event),
-                        );
+                        yield ChannelOutboundDraft::ordinary(format!("[task:{}] {}: {detail}", event.run_id, event.event));
                     }
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::TurnStatus { .. })
@@ -2080,41 +3746,21 @@ async fn aggregate_by_sentence<'a>(
                 | ChannelRenderEvent::Driver(ChatDriverEvent::TurnConfiguration { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::Interrupt { run_id, goal, new_message }) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[paused:{run_id}] {goal}; new instruction: {new_message}"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[paused:{run_id}] {goal}; new instruction: {new_message}"));
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::InputQueued { input_id, .. }) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[queued:{input_id}]"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[queued:{input_id}]"));
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::InputRemoved { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::InputReordered { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::CommandCellStarted { cell }) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[cell:{}] started: {}", cell.cell_id, cell.name),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[cell:{}] started: {}", cell.cell_id, cell.name));
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::CommandCellSettled { cell }) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[cell:{}] settled: {}", cell.cell_id, cell.phase),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[cell:{}] settled: {}", cell.cell_id, cell.phase));
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultReady { result }) => {
                     flush_all!();
@@ -2122,12 +3768,7 @@ async fn aggregate_by_sentence<'a>(
                     let message = echo_agent_app_core::tasks::task_runtime::project_awaiter_surface_event(&event)
                         .map(|projection| projection.display_message())
                         .unwrap_or_else(|| "Awaiter result is unavailable".to_string());
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        message,
-                    );
+                    yield ChannelOutboundDraft::ordinary(message);
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultAcknowledged { .. }) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::ApprovalRequest {
@@ -2137,21 +3778,11 @@ async fn aggregate_by_sentence<'a>(
                     ..
                 }) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[approval:{request_id}] {tool_name}: {prompt}"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[approval:{request_id}] {tool_name}: {prompt}"));
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::InputRequest { request_id, prompt }) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[input:{request_id}] {prompt}"),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[input:{request_id}] {prompt}"));
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::SelectionRequest {
                     request_id,
@@ -2160,12 +3791,7 @@ async fn aggregate_by_sentence<'a>(
                     ..
                 }) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[selection:{request_id}] {prompt} ({})", options.join(", ")),
-                    );
+                    yield ChannelOutboundDraft::ordinary(format!("[selection:{request_id}] {prompt} ({})", options.join(", ")));
                 }
                 ChannelRenderEvent::Driver(ChatDriverEvent::ContextCompressed {
                     before_count,
@@ -2175,14 +3801,11 @@ async fn aggregate_by_sentence<'a>(
                 }) => {
                     flush_all!();
                     let saved = before_tokens.saturating_sub(after_tokens);
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
+                    yield ChannelOutboundDraft::ordinary(
                         format!(
                             "[context] compressed {before_count}->{after_count} messages, \
                              {before_tokens}->{after_tokens} tokens ({saved} saved)"
-                        ),
+                        )
                     );
                 }
                 ChannelRenderEvent::Terminal(
@@ -2195,35 +3818,161 @@ async fn aggregate_by_sentence<'a>(
                     echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
                 ) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        "[cancelled] The channel turn was cancelled.",
-                    );
+                    yield ChannelOutboundDraft::terminal("[cancelled] The channel turn was cancelled.");
                     break;
                 }
                 ChannelRenderEvent::Terminal(
                     echo_agent_app_core::chat_driver::TurnOutcome::Failed(failure),
                 ) => {
                     flush_all!();
-                    yield OutboundMessage::new(
-                        &channel_id,
-                        &to,
-                        chat_type,
-                        format!("[failed:{}] {}", failure.code, failure.message),
-                    );
+                    yield ChannelOutboundDraft::terminal(format!("[failed:{}] {}", failure.code, failure.message));
                     break;
                 }
+                ChannelRenderEvent::Journaled(_) => {}
             }
         }
     };
-    s.boxed()
+    channel_outbound_transport(s.boxed(), channel_id, to, chat_type)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_cache_user_id;
+    #[cfg(feature = "channels")]
+    struct SessionIdentityProbe;
+
+    #[cfg(feature = "channels")]
+    #[async_trait::async_trait]
+    impl echo_agent::channels::MessageHandler for SessionIdentityProbe {
+        async fn handle(
+            &self,
+            message: echo_agent::channels::InboundMessage,
+        ) -> echo_agent::error::Result<echo_agent::channels::OutboundMessage> {
+            Ok(echo_agent::channels::OutboundMessage::new(
+                &message.channel_id,
+                message.reply_target(),
+                message.chat_type,
+                "ok",
+            ))
+        }
+
+        async fn reply(
+            &self,
+            _message: echo_agent::channels::OutboundMessage,
+        ) -> echo_agent::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    struct ChannelTestSink;
+
+    #[cfg(feature = "channels")]
+    impl echo_agent_app_core::chat_driver::ChatSink for ChannelTestSink {
+        fn on_event(&self, _event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
+            true
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    fn channel_test_agent(
+        delay: std::time::Duration,
+    ) -> Result<echo_agent::agent::AgentHandle, String> {
+        let llm = std::sync::Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("channel-scope-test")
+                .with_response("done")
+                .with_delay(delay),
+        );
+        echo_agent::agent::ReactAgentBuilder::new()
+            .model("channel-scope-test")
+            .llm_client(llm)
+            .build()
+            .map(echo_agent::agent::AgentHandle::new)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(feature = "channels")]
+    struct ChannelCancellationBarrierLlmClient {
+        started: std::sync::atomic::AtomicBool,
+        started_notify: tokio::sync::Notify,
+    }
+
+    #[cfg(feature = "channels")]
+    impl ChannelCancellationBarrierLlmClient {
+        fn new() -> Self {
+            Self {
+                started: std::sync::atomic::AtomicBool::new(false),
+                started_notify: tokio::sync::Notify::new(),
+            }
+        }
+
+        async fn wait_started(&self) {
+            if self.started.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            self.started_notify.notified().await;
+        }
+
+        async fn wait_for_cancel(
+            &self,
+            request: &echo_agent::llm::ChatRequest,
+        ) -> echo_agent::error::Result<()> {
+            self.started
+                .store(true, std::sync::atomic::Ordering::Release);
+            self.started_notify.notify_waiters();
+            request
+                .cancel_token
+                .clone()
+                .unwrap_or_default()
+                .cancelled()
+                .await;
+            Err(echo_agent::error::ReactError::Agent(Box::new(
+                echo_agent::error::AgentError::Cancelled(
+                    "channel cancellation barrier observed root cancel".to_string(),
+                ),
+            )))
+        }
+    }
+
+    #[cfg(feature = "channels")]
+    impl echo_agent::llm::LlmClient for ChannelCancellationBarrierLlmClient {
+        fn chat(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> futures::future::BoxFuture<'_, echo_agent::error::Result<echo_agent::llm::ChatResponse>>
+        {
+            Box::pin(async move {
+                self.wait_for_cancel(&request).await?;
+                Err(echo_agent::error::ReactError::Other(
+                    "channel cancellation barrier returned unexpectedly".to_string(),
+                ))
+            })
+        }
+
+        fn chat_stream(
+            &self,
+            request: echo_agent::llm::ChatRequest,
+        ) -> futures::future::BoxFuture<
+            '_,
+            echo_agent::error::Result<
+                futures::stream::BoxStream<
+                    'static,
+                    echo_agent::error::Result<echo_agent::llm::ChatChunk>,
+                >,
+            >,
+        > {
+            Box::pin(async move {
+                self.wait_for_cancel(&request).await?;
+                Err(echo_agent::error::ReactError::Other(
+                    "channel cancellation barrier returned unexpectedly".to_string(),
+                ))
+            })
+        }
+
+        fn model_name(&self) -> &str {
+            "channel-cancellation-barrier"
+        }
+    }
 
     #[cfg(feature = "channels")]
     #[test]
@@ -2233,53 +3982,868 @@ mod tests {
         assert!(super::parse_channel_budget("0", "time").is_err());
     }
 
+    #[cfg(feature = "channels")]
     #[test]
-    fn ascii_passthrough() {
-        assert_eq!(
-            sanitize_cache_user_id("im-qqbot-user_123"),
-            "im-qqbot-user_123"
+    fn resume_dispatch_separates_planned_and_continuation_authorities() -> Result<(), String> {
+        use echo_agent_app_core::tasks::task_runtime::{RunTurnOrigin, TaskRunResumeIdentity};
+
+        let identity = TaskRunResumeIdentity {
+            run_id: "run-a".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            conversation_id: "conversation-a".to_string(),
+            root_message_id: "root-a".to_string(),
+            created_at: chrono::Utc::now(),
+            goal_revision: 3,
+            journal_sequence: 11,
+            continuation_enabled: true,
+        };
+        assert!(matches!(
+            super::channel_resume_dispatch(identity.clone(), false, "surface-turn"),
+            super::ChannelResumeDispatch::Planned(ref planned) if planned == &identity
+        ));
+        let continuation = super::channel_resume_dispatch(identity.clone(), true, "surface-turn");
+        let super::ChannelResumeDispatch::Continuation(binding) = continuation else {
+            return Err("continuation-enabled resume selected planned execution".to_string());
+        };
+        assert_eq!(binding.run_id.as_deref(), Some("run-a"));
+        assert_eq!(binding.turn_id, "surface-turn");
+        assert_eq!(binding.root_message_id, "root-a");
+        assert_eq!(binding.origin, RunTurnOrigin::Resume);
+        assert_eq!(binding.expected_resume.as_ref(), Some(&identity));
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn resume_rejects_new_attachments_before_admission() {
+        assert!(!super::channel_resume_rejects_attachments(false, 0));
+        assert!(!super::channel_resume_rejects_attachments(false, 2));
+        assert!(!super::channel_resume_rejects_attachments(true, 0));
+        assert!(super::channel_resume_rejects_attachments(true, 1));
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn completed_channel_operation_wins_simultaneous_cancel_safe_point() {
+        let cancel = echo_agent::agent::CancellationToken::new();
+        cancel.cancel();
+        let outcome = super::await_channel_operation(cancel, async { "committed" }).await;
+        assert_eq!(outcome, Some("committed"));
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn successful_reset_restores_only_the_sender_mode_to_auto() {
+        use echo_agent_app_core::tasks::task_runtime::InteractionMode;
+
+        let alice = tokio::sync::RwLock::new(InteractionMode::Task);
+        let bob = tokio::sync::RwLock::new(InteractionMode::Chat);
+        let failed_reset = tokio::sync::RwLock::new(InteractionMode::Task);
+        super::reset_channel_interaction_mode(&alice).await;
+
+        assert_eq!(*alice.read().await, InteractionMode::Auto);
+        assert_eq!(*bob.read().await, InteractionMode::Chat);
+        assert_eq!(*failed_reset.read().await, InteractionMode::Task);
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn reset_gc_removes_only_the_exact_sender_incarnation() -> Result<(), String> {
+        use echo_agent::memory::{ConversationStore, FileConversationStore, NewConversation};
+        use echo_agent::state::{AgentCheckpoint, FileRuntimeStateStore, RuntimeStateStore};
+
+        let temp =
+            std::env::temp_dir().join(format!("eko-channel-reset-gc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp).map_err(|error| error.to_string())?;
+        let conversations: std::sync::Arc<dyn ConversationStore> = std::sync::Arc::new(
+            FileConversationStore::new(temp.join("conversations"))
+                .map_err(|error| error.to_string())?,
         );
-    }
-
-    #[test]
-    fn chinese_replaced_with_dash() {
-        // 输入 8 字符: i m - 飞 书 - 张 三
-        // 字面 `-` 保留,4 个中文各替换为 `-` → im + 6 个 `-`
-        assert_eq!(sanitize_cache_user_id("im-飞书-张三"), "im------");
-    }
-
-    #[test]
-    fn emoji_and_specials_replaced() {
-        assert_eq!(sanitize_cache_user_id("a@b.c🦀d"), "a-b-c-d");
-    }
-
-    #[test]
-    fn truncated_to_512_chars() {
-        let raw: String = "x".repeat(600);
-        let out = sanitize_cache_user_id(&raw);
-        assert_eq!(out.chars().count(), 512);
-        assert!(out.chars().all(|c| c == 'x'));
-    }
-
-    #[test]
-    fn empty_input_yields_empty() {
-        assert_eq!(sanitize_cache_user_id(""), "");
-    }
-
-    #[test]
-    fn conversation_id_format() {
-        assert_eq!(
-            super::AppChannelMessageHandler::conversation_id("qqbot", "user_123"),
-            "channel:qqbot:user_123"
+        let runtime_state: std::sync::Arc<dyn RuntimeStateStore> = std::sync::Arc::new(
+            FileRuntimeStateStore::new(temp.join("runtime")).map_err(|error| error.to_string())?,
         );
+        let product_id = "channel-product-alice";
+        let retired_id = "channel-runtime-alice-a";
+        let retained_id = "channel-runtime-alice-b";
+        let other_product_id = "channel-product-bob";
+        let other_runtime_id = "channel-runtime-bob-a";
+        for conversation_id in [
+            product_id,
+            retired_id,
+            retained_id,
+            other_product_id,
+            other_runtime_id,
+        ] {
+            conversations
+                .create_conversation(NewConversation {
+                    conversation_id: conversation_id.to_string(),
+                    user_id: "default".to_string(),
+                    agent_type: None,
+                    title: None,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        for (scope_id, runtime_id) in [
+            (product_id, retired_id),
+            (product_id, retained_id),
+            (other_product_id, other_runtime_id),
+        ] {
+            let mut checkpoint = AgentCheckpoint::new(runtime_id);
+            checkpoint.messages_json = "[]".to_string();
+            runtime_state
+                .save_checkpoint_for_scope(scope_id, &checkpoint)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+
+        assert!(
+            super::AppChannelMessageHandler::clear_runtime_incarnation_stores(
+                Some(conversations.clone()),
+                Some(runtime_state.clone()),
+                product_id,
+                retired_id,
+            )
+            .await?
+        );
+        assert!(
+            conversations
+                .get_conversation(product_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+        assert!(
+            conversations
+                .get_conversation(retired_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            runtime_state
+                .get_checkpoint(retired_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_none()
+        );
+        assert!(
+            runtime_state
+                .get_checkpoint(retained_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+        assert!(
+            runtime_state
+                .get_checkpoint(other_runtime_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some()
+        );
+        let _cleanup = std::fs::remove_dir_all(temp);
+        Ok(())
     }
 
+    #[cfg(feature = "channels")]
     #[test]
-    fn cache_user_id_format() {
+    fn session_retirement_marks_every_exact_workspace_owner_for_the_incarnation() {
+        let gate = std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new()));
+        let obligation = |workspace_id: &str,
+                          workspace_generation: &str,
+                          runtime_state_id: &str,
+                          incarnation_id: &str| {
+            let key = super::ChannelRuntimeOwnerKey {
+                workspace_id: workspace_id.to_string(),
+                workspace_generation: workspace_generation.to_string(),
+                runtime_state_id: runtime_state_id.to_string(),
+            };
+            (
+                key.clone(),
+                super::ChannelRuntimeObligation {
+                    key,
+                    product_conversation_id: "stable-product".to_string(),
+                    incarnation_id: incarnation_id.to_string(),
+                    phase: super::ChannelRetirementPhase::Active,
+                },
+            )
+        };
+        {
+            let mut obligations = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            obligations.extend([
+                obligation("workspace-a", "generation-a", "agent-runtime", "inc-a"),
+                obligation("workspace-b", "generation-b", "agent-runtime", "inc-a"),
+                obligation("workspace-c", "generation-c", "agent-runtime", "inc-b"),
+            ]);
+        }
+
+        super::ChannelSessionCoordinator::mark_incarnation_pending(&gate, "inc-a");
+
+        let obligations = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let pending = obligations
+            .values()
+            .filter(|obligation| obligation.phase == super::ChannelRetirementPhase::RetirePending)
+            .map(|obligation| {
+                (
+                    obligation.key.workspace_id.as_str(),
+                    obligation.key.workspace_generation.as_str(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            super::AppChannelMessageHandler::cache_user_id("qqbot", "user_123"),
-            "im-qqbot-user_123"
+            pending,
+            std::collections::BTreeSet::from([
+                ("workspace-a", "generation-a"),
+                ("workspace-b", "generation-b"),
+            ])
         );
+        assert!(obligations.values().any(|obligation| {
+            obligation.incarnation_id == "inc-b"
+                && obligation.phase == super::ChannelRetirementPhase::Active
+        }));
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn handler_gc_failure_and_cancel_keep_the_exact_obligation_for_retry()
+    -> Result<(), String> {
+        let key = super::ChannelRuntimeOwnerKey {
+            workspace_id: "workspace-a".to_string(),
+            workspace_generation: "generation-a".to_string(),
+            runtime_state_id: "runtime-a".to_string(),
+        };
+        let gate =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::from([(
+                key.clone(),
+                super::ChannelRuntimeObligation {
+                    key: key.clone(),
+                    product_conversation_id: "product-a".to_string(),
+                    incarnation_id: "incarnation-a".to_string(),
+                    phase: super::ChannelRetirementPhase::RetirePending,
+                },
+            )])));
+
+        let failed =
+            super::await_channel_retirement(echo_agent::agent::CancellationToken::new(), async {
+                Err::<(), _>("injected GC failure".to_string())
+            })
+            .await;
+        assert!(matches!(
+            failed,
+            Err(super::ChannelSessionRetirementError::Failed(_))
+        ));
+        assert!(
+            gate.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&key)
+        );
+
+        let cancel = echo_agent::agent::CancellationToken::new();
+        cancel.cancel();
+        let cancelled = super::await_channel_retirement(cancel, async {
+            futures::future::pending::<Result<(), String>>().await
+        })
+        .await;
+        assert_eq!(
+            cancelled,
+            Err(super::ChannelSessionRetirementError::Cancelled)
+        );
+        let mut obligations = gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let retained = obligations
+            .get_mut(&key)
+            .ok_or_else(|| "cancelled GC consumed the exact obligation".to_string())?;
+        retained.phase = super::ChannelRetirementPhase::GcPending;
+        obligations.remove(&key);
+        assert!(obligations.is_empty());
+        Ok::<(), String>(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn product_identity_is_stable_while_agent_and_cache_follow_incarnation() {
+        let alice =
+            super::AppChannelMessageHandler::conversation_id("qqbot", "shared-group", "alice");
+        let alice_again =
+            super::AppChannelMessageHandler::conversation_id("qqbot", "shared-group", "alice");
+        let bob = super::AppChannelMessageHandler::conversation_id("qqbot", "shared-group", "bob");
+        let other_chat =
+            super::AppChannelMessageHandler::conversation_id("qqbot", "other", "alice");
+        let other_channel =
+            super::AppChannelMessageHandler::conversation_id("feishu", "shared-group", "alice");
+        assert_eq!(alice, alice_again);
+        assert!(alice.starts_with("channel:sha256:"));
+        assert_ne!(alice, bob);
+        assert_ne!(alice, other_chat);
+        assert_ne!(alice, other_channel);
+
+        let alice_agent_a =
+            super::AppChannelMessageHandler::agent_conversation_id(&alice, "incarnation-a");
+        let alice_agent_b =
+            super::AppChannelMessageHandler::agent_conversation_id(&alice, "incarnation-b");
+        let bob_agent =
+            super::AppChannelMessageHandler::agent_conversation_id(&bob, "incarnation-a");
+        assert!(alice_agent_a.starts_with("channel-runtime:sha256:"));
+        assert_ne!(alice_agent_a, alice_agent_b);
+        assert_ne!(alice_agent_a, bob_agent);
+
+        let alice_cache_a = super::AppChannelMessageHandler::cache_user_id(&alice, "incarnation-a");
+        let alice_cache_b = super::AppChannelMessageHandler::cache_user_id(&alice, "incarnation-b");
+        assert!(alice_cache_a.starts_with("im-"));
+        assert_ne!(alice_cache_a, alice_cache_b);
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn active_surface_identity_is_typed_and_delimiter_safe() {
+        let left =
+            super::AppChannelMessageHandler::active_surface_identity("qq", "a:sender:b", "c");
+        let right =
+            super::AppChannelMessageHandler::active_surface_identity("qq", "a", "b:sender:c");
+        assert_ne!(left, right);
+        let identities = std::collections::HashSet::from([left, right]);
+        assert_eq!(identities.len(), 2);
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn late_framework_end_callback_cannot_clear_registered_replacement() -> Result<(), String>
+    {
+        use echo_agent::channels::{
+            ChatType, InboundMessage, MessageHandler, SessionConfig, SessionHandler,
+        };
+
+        let coordinator = std::sync::Arc::new(super::ChannelSessionCoordinator::new());
+        let factory_coordinator = std::sync::Arc::clone(&coordinator);
+        let end_coordinator = std::sync::Arc::clone(&coordinator);
+        let instances = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let factory_instances = std::sync::Arc::clone(&instances);
+        let handler = SessionHandler::new(
+            SessionConfig::default(),
+            move |instance: &echo_agent::channels::ChannelSessionInstance| {
+                let registration = factory_coordinator.register(instance);
+                match factory_instances.lock() {
+                    Ok(mut instances) => instances.push((instance.clone(), registration)),
+                    Err(poisoned) => poisoned.into_inner().push((instance.clone(), registration)),
+                }
+                Box::new(SessionIdentityProbe) as Box<dyn MessageHandler>
+            },
+        )
+        .with_on_session_end(move |info| end_coordinator.record_session_end(info));
+        let message = |text: &str, id: &str| {
+            InboundMessage::new(
+                "channel",
+                "sender",
+                "conversation",
+                ChatType::Direct,
+                text,
+                id,
+            )
+        };
+
+        handler
+            .handle(message("first", "m1"))
+            .await
+            .map_err(|error| error.to_string())?;
+        handler
+            .handle(message("reset chat", "m2"))
+            .await
+            .map_err(|error| error.to_string())?;
+        let captured = match instances.lock() {
+            Ok(instances) => instances.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if captured.len() != 2 || captured.iter().any(|(_, result)| result.is_err()) {
+            return Err("framework replacement did not register both incarnations".to_string());
+        }
+        let replacement = captured
+            .get(1)
+            .map(|(instance, _)| instance.clone())
+            .ok_or_else(|| "replacement instance is missing".to_string())?;
+        let surface_id = super::ChannelSessionCoordinator::surface_id(&replacement);
+        let lifecycle = coordinator
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let record = lifecycle
+            .get(&surface_id)
+            .ok_or_else(|| "replacement lifecycle record is missing".to_string())?;
+        if record.current_incarnation_id.as_deref() != Some(replacement.incarnation_id().as_str())
+            || record.pending_ended_incarnation_id.is_some()
+        {
+            return Err("late end callback cleared the replacement incarnation".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn stale_coordinator_rejects_rotation_without_changing_framework_instance()
+    -> Result<(), String> {
+        use echo_agent::channels::{ChatType, InboundMessage, MessageHandler, SessionHandler};
+
+        let instance_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let factory_slot = std::sync::Arc::clone(&instance_slot);
+        let handler = SessionHandler::with_defaults(
+            move |instance: &echo_agent::channels::ChannelSessionInstance| {
+                match factory_slot.lock() {
+                    Ok(mut slot) => *slot = Some(instance.clone()),
+                    Err(poisoned) => *poisoned.into_inner() = Some(instance.clone()),
+                }
+                Box::new(SessionIdentityProbe) as Box<dyn MessageHandler>
+            },
+        );
+        handler
+            .handle(InboundMessage::new(
+                "channel",
+                "sender",
+                "conversation",
+                ChatType::Direct,
+                "first",
+                "m1",
+            ))
+            .await
+            .map_err(|error| error.to_string())?;
+        let instance = match instance_slot.lock() {
+            Ok(slot) => slot.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+        .ok_or_else(|| "framework instance is missing".to_string())?;
+        let coordinator = super::ChannelSessionCoordinator::new();
+        coordinator.register(&instance)?;
+        let surface_id = super::ChannelSessionCoordinator::surface_id(&instance);
+        {
+            let mut lifecycle = coordinator
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let record = lifecycle.entry(surface_id.clone()).or_default();
+            record.current_incarnation_id = Some("stale-incarnation".to_string());
+        }
+        let before = instance.incarnation_id();
+        if coordinator.rotate(&surface_id, &instance).is_ok() || instance.incarnation_id() != before
+        {
+            return Err("stale coordinator mutated the framework incarnation".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn task_dispatcher_does_not_intercept_pinned_foreground_controls() {
+        assert!(super::is_task_run_control_command("/task-resume"));
+        assert!(super::is_task_run_control_command("/subagent-message"));
+        assert!(!super::is_task_run_control_command("/stop"));
+        assert!(!super::is_task_run_control_command("/reset"));
+        assert!(!super::is_task_run_control_command("/steer"));
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn cancellation_barrier_preserves_pin_while_root_snapshot_is_valid() -> Result<(), String> {
+        use echo_agent_app_core::foreground_turn::{
+            ForegroundTurnControl, ForegroundTurnError, ForegroundTurnSettlement,
+            ForegroundTurnSurface,
+        };
+
+        let control = ForegroundTurnControl::default();
+        let settled = Ok(ForegroundTurnSettlement {
+            workspace_id: "workspace-a".to_string(),
+            surface: ForegroundTurnSurface::Channel,
+            conversation_id: "conversation-a".to_string(),
+            turn_id: "root-turn".to_string(),
+            outcome: echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+        });
+        assert!(super::channel_cancel_barrier_complete(
+            &control,
+            "workspace-a",
+            "conversation-a",
+            "root-turn",
+            &settled,
+        ));
+        let no_active = Err(ForegroundTurnError::NoActiveTurn {
+            surface: ForegroundTurnSurface::Channel,
+            conversation_id: "conversation-a".to_string(),
+        });
+        assert!(super::channel_cancel_barrier_complete(
+            &control,
+            "workspace-a",
+            "conversation-a",
+            "root-turn",
+            &no_active,
+        ));
+
+        let lease = control
+            .begin_scoped(
+                "workspace-a",
+                ForegroundTurnSurface::Channel,
+                "conversation-a",
+                "root-turn",
+            )
+            .map_err(|error| error.to_string())?;
+        assert!(!super::channel_cancel_barrier_complete(
+            &control,
+            "workspace-a",
+            "conversation-a",
+            "root-turn",
+            &no_active,
+        ));
+        assert!(super::channel_cancel_barrier_complete(
+            &control,
+            "workspace-a",
+            "conversation-a",
+            "stale-root",
+            &no_active,
+        ));
+        assert!(!super::channel_cancel_barrier_complete(
+            &control,
+            "workspace-a",
+            "conversation-a",
+            "root-turn",
+            &Err(ForegroundTurnError::StateUnavailable),
+        ));
+        drop(lease);
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn retirement_foreground_root_remains_stoppable_until_settlement() -> Result<(), String> {
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+
+        let control = std::sync::Arc::new(ForegroundTurnControl::default());
+        let lease = control
+            .begin_scoped(
+                "workspace-b",
+                ForegroundTurnSurface::Channel,
+                "stable-product",
+                "retirement-root",
+            )
+            .map_err(|error| error.to_string())?;
+        let cancel = lease.cancellation_token();
+        let cancel_control = std::sync::Arc::clone(&control);
+        let stop = tokio::spawn(async move {
+            super::channel_cancel_root(
+                cancel_control.as_ref(),
+                "workspace-b",
+                "stable-product",
+                "retirement-root",
+            )
+            .await
+        });
+        cancel.cancelled().await;
+        assert!(
+            control
+                .snapshot_scoped(
+                    "workspace-b",
+                    ForegroundTurnSurface::Channel,
+                    "stable-product",
+                )
+                .is_some()
+        );
+        lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Cancelled);
+        stop.await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(
+            control
+                .snapshot_scoped(
+                    "workspace-b",
+                    ForegroundTurnSurface::Channel,
+                    "stable-product",
+                )
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn continuation_uses_stable_root_for_control_and_current_turn_for_steer() {
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnSnapshot, ForegroundTurnSurface};
+
+        let snapshot = ForegroundTurnSnapshot {
+            workspace_id: "workspace-a".to_string(),
+            surface: ForegroundTurnSurface::Channel,
+            conversation_id: "conversation-a".to_string(),
+            root_turn_id: "root-turn".to_string(),
+            active_turn_id: "continuation-turn".to_string(),
+            cancellation_requested: false,
+        };
+        assert!(super::channel_snapshot_matches_root(&snapshot, "root-turn"));
+        assert!(!super::channel_snapshot_matches_root(
+            &snapshot,
+            "continuation-turn"
+        ));
+        assert_eq!(super::channel_steer_target(&snapshot), "continuation-turn");
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn framework_owned_channel_root_is_resolved_without_local_pin() -> Result<(), String> {
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnSnapshot, ForegroundTurnSurface};
+
+        let unrelated = ForegroundTurnSnapshot {
+            workspace_id: "workspace-a".to_string(),
+            surface: ForegroundTurnSurface::Gui,
+            conversation_id: "sender-conversation".to_string(),
+            root_turn_id: "gui-root".to_string(),
+            active_turn_id: "gui-root".to_string(),
+            cancellation_requested: false,
+        };
+        let extraction = ForegroundTurnSnapshot {
+            workspace_id: "workspace-a".to_string(),
+            surface: ForegroundTurnSurface::Channel,
+            conversation_id: "sender-conversation".to_string(),
+            root_turn_id: "extract-root".to_string(),
+            active_turn_id: "extract-root".to_string(),
+            cancellation_requested: false,
+        };
+        let resolved = super::channel_snapshot_for_conversation(
+            vec![unrelated, extraction],
+            "sender-conversation",
+        )?
+        .ok_or_else(|| "framework-owned channel root was not resolved".to_string())?;
+        assert_eq!(resolved.root_turn_id, "extract-root");
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn old_supervisor_cannot_clear_new_active_generation() {
+        assert!(super::channel_active_generation_matches(
+            Some("turn-2"),
+            "turn-2"
+        ));
+        assert!(!super::channel_active_generation_matches(
+            Some("turn-2"),
+            "turn-1"
+        ));
+        assert!(!super::channel_active_generation_matches(None, "turn-1"));
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn foreground_continuation_steers_current_turn_and_root_cancel_settles()
+    -> Result<(), String> {
+        use echo_agent_app_core::chat_driver::TurnOutcome;
+        use echo_agent_app_core::foreground_turn::{ForegroundTurnControl, ForegroundTurnSurface};
+        use echo_agent_app_core::tasks::task_runtime::{
+            InteractionMode, RunTurnBinding, RunTurnOrigin, TaskRuntimeStore, TurnVisibility,
+        };
+
+        let temporary =
+            std::env::temp_dir().join(format!("eko-channel-foreground-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temporary).map_err(|error| error.to_string())?;
+        let store = std::sync::Arc::new(
+            TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?,
+        );
+        let workspace_id = store.active_workspace_id();
+        let foreground_turns = ForegroundTurnControl::default();
+        let lease = foreground_turns
+            .begin_scoped(
+                &workspace_id,
+                ForegroundTurnSurface::Channel,
+                "conversation-a",
+                "root-turn",
+            )
+            .map_err(|error| error.to_string())?;
+        let cancel = lease.cancellation_token();
+        let llm = std::sync::Arc::new(ChannelCancellationBarrierLlmClient::new());
+        let agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("channel-cancellation-barrier")
+            .llm_client(llm.clone())
+            .build()
+            .map(echo_agent::agent::AgentHandle::new)
+            .map_err(|error| error.to_string())?;
+        let agent_for_steer = agent.clone();
+        let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+            echo_agent_app_core::prepared_turn::UserTurnInput {
+                text: "continue",
+                attachments: &[],
+                spill_dir: &temporary,
+                conversation_id: Some("conversation-a"),
+                turn_id: Some("root-turn"),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let resources = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+            execution_scope: echo_agent_app_core::workspace::WorkspaceExecutionScope::workspace(
+                &echo_agent_app_core::workspace::WorkspaceId::from_raw(workspace_id.clone()),
+                &temporary,
+            ),
+            workspace_io_receipt: None,
+            pool: None,
+            store: Some(store),
+            sink: std::sync::Arc::new(ChannelTestSink),
+            webhook_emitter: None,
+            conv_id: Some("conversation-a".to_string()),
+            root_message_id: "root-turn".to_string(),
+            attachments: Vec::new(),
+            cancel,
+            interaction_mode: InteractionMode::Chat,
+            review_integration: None,
+            layer_manager: None,
+            memory_generation: None,
+            human_loop_provider: None,
+        });
+        let binding = RunTurnBinding {
+            run_id: None,
+            turn_id: "continuation-turn".to_string(),
+            root_message_id: "root-turn".to_string(),
+            origin: RunTurnOrigin::Continuation,
+            transcript_visibility: TurnVisibility::Visible,
+            expected_resume: None,
+        };
+        let driver = tokio::spawn(async move {
+            echo_agent_app_core::foreground_turn::drive_foreground_chat_turn(
+                lease, &agent, &turn, resources, binding,
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), llm.wait_started())
+            .await
+            .map_err(|_| "channel model request did not reach cancellation barrier".to_string())?;
+        let snapshot_wait = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(snapshot) = foreground_turns.snapshot_scoped(
+                    &workspace_id,
+                    ForegroundTurnSurface::Channel,
+                    "conversation-a",
+                ) && snapshot.active_turn_id == "continuation-turn"
+                {
+                    return snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let snapshot = match snapshot_wait {
+            Ok(snapshot) => snapshot,
+            Err(_) if driver.is_finished() => {
+                let outcome = driver.await.map_err(|error| error.to_string())?;
+                return Err(format!(
+                    "channel driver ended before publishing continuation identity: {outcome:?}"
+                ));
+            }
+            Err(_) => {
+                let observed = foreground_turns.snapshot_scoped(
+                    &workspace_id,
+                    ForegroundTurnSurface::Channel,
+                    "conversation-a",
+                );
+                return Err(format!(
+                    "continuation turn identity was not published; observed={observed:?}"
+                ));
+            }
+        };
+        assert!(super::channel_snapshot_matches_root(&snapshot, "root-turn"));
+        let steer_target = super::channel_steer_target(&snapshot).to_string();
+        let steered_turn = agent_for_steer
+            .steer_input(
+                Some(&steer_target),
+                echo_agent::prelude::Message::user("steer continuation".to_string()),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(steered_turn, "continuation-turn");
+
+        let settlement = super::channel_cancel_root(
+            &foreground_turns,
+            &workspace_id,
+            "conversation-a",
+            "root-turn",
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert_eq!(settlement.turn_id, "root-turn");
+        if !matches!(settlement.outcome, TurnOutcome::Cancelled) {
+            return Err(format!(
+                "channel root cancellation settled with {:?}",
+                settlement.outcome
+            ));
+        }
+        let _driver_outcome = tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .map_err(|_| "cancelled channel driver did not settle".to_string())?
+            .map_err(|error| error.to_string())?;
+        let _cleanup = std::fs::remove_dir_all(&temporary);
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn dropped_old_owner_keeps_replacement_in_real_active_map() -> Result<(), String> {
+        let temporary =
+            std::env::temp_dir().join(format!("eko-channel-owner-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temporary).map_err(|error| error.to_string())?;
+        let agent = channel_test_agent(std::time::Duration::ZERO)?;
+        let mcp_runtime = std::sync::Arc::new(
+            echo_agent_app_core::mcp_config_runtime::McpConfigRuntime::from_snapshot(
+                temporary.join("mcp.json"),
+                echo_agent::mcp::McpConfigFile::default(),
+            ),
+        );
+        let state = echo_agent_app_core::state::AppState::from_shared(
+            agent,
+            None,
+            std::sync::Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            mcp_runtime,
+            echo_agent_app_core::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        let runtime = state
+            .current_control_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let active_turns: super::ChannelActiveTurnMap =
+            std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let surface =
+            super::AppChannelMessageHandler::active_surface_identity("qq", "chat-a", "sender-a");
+        {
+            let mut active = active_turns
+                .lock()
+                .map_err(|_| "active turn map lock poisoned".to_string())?;
+            active.insert(
+                surface.clone(),
+                super::ChannelActiveTurn {
+                    runtime: runtime.clone(),
+                    agent_conversation_id: "agent-conversation-a".to_string(),
+                    conversation_id: "conversation-a".to_string(),
+                    turn_id: "turn-1".to_string(),
+                },
+            );
+        }
+        let old_owner = super::ChannelActiveTurnOwner::new(
+            std::sync::Arc::clone(&active_turns),
+            surface.clone(),
+            "turn-1".to_string(),
+        );
+        {
+            let mut active = active_turns
+                .lock()
+                .map_err(|_| "active turn map lock poisoned".to_string())?;
+            active.insert(
+                surface.clone(),
+                super::ChannelActiveTurn {
+                    runtime,
+                    agent_conversation_id: "agent-conversation-a".to_string(),
+                    conversation_id: "conversation-a".to_string(),
+                    turn_id: "turn-2".to_string(),
+                },
+            );
+        }
+        drop(old_owner);
+        let retained_turn = active_turns
+            .lock()
+            .map_err(|_| "active turn map lock poisoned".to_string())?
+            .get(&surface)
+            .map(|active| active.turn_id.clone());
+        assert_eq!(retained_turn.as_deref(), Some("turn-2"));
+        let _cleanup = std::fs::remove_dir_all(&temporary);
+        Ok(())
     }
 
     #[cfg(feature = "channels")]
@@ -2308,6 +4872,36 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn tasks_immediate_response_redacts_and_bounds_multi_megabyte_text() -> Result<(), String>
+    {
+        use echo_agent::channels::{ChatType, InboundMessage};
+        use futures::StreamExt;
+
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        let message = InboundMessage::new(
+            "qq",
+            "user",
+            "conversation",
+            ChatType::Direct,
+            "/tasks",
+            "message-1",
+        );
+        let huge = format!("Task list token={secret}\n{}", "任务🙂".repeat(500_000));
+        let mut stream = super::immediate_channel_response(&message, huge);
+        let mut texts = Vec::new();
+        while let Some(item) = stream.next().await {
+            texts.push(item.map_err(|error| error.to_string())?.text);
+        }
+        let joined = texts.join("\n");
+        assert!(!joined.contains(secret));
+        assert!(joined.contains("[REDACTED]"));
+        assert!(texts.iter().all(|text| text.len() <= 1_800));
+        assert!(texts.len() <= super::CHANNEL_OUTBOUND_TOTAL_MESSAGES);
+        Ok(())
+    }
+
     #[cfg(all(feature = "channels", unix))]
     #[tokio::test]
     async fn terminal_stream_keeps_fast_output_from_pre_dispatch_subscription() -> Result<(), String>
@@ -2318,10 +4912,16 @@ mod tests {
         let terminal = echo_agent_app_core::terminal::TerminalService::new();
         let receiver = terminal.subscribe();
         terminal
-            .create("channel-fast".to_string(), None, 24, 80)
+            .create_with_shell_for_test(
+                "channel-fast".to_string(),
+                None,
+                24,
+                80,
+                "/bin/sh".to_string(),
+            )
             .await?;
         terminal
-            .write("channel-fast", b"printf channel-fast-output; exit\r")
+            .write("channel-fast", b"printf channel-fast-output; exit\n")
             .await?;
         let message = InboundMessage::new(
             "qq",
@@ -2337,7 +4937,7 @@ mod tests {
             receiver,
             "channel-fast".to_string(),
         );
-        let texts = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let texts = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             let mut texts = Vec::new();
             while let Some(message) = stream.next().await {
                 let message = message.map_err(|error| error.to_string())?;
@@ -2356,7 +4956,166 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("channel-fast-output"))
         );
-        assert!(texts.iter().any(|text| text.contains("exited:")));
+        if !texts.iter().any(|text| text.contains("exited:")) {
+            return Err(format!(
+                "channel terminal stream ended without exit receipt: {texts:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn terminal_stream_preserves_utf8_split_at_every_byte() -> Result<(), String> {
+        use echo_agent::channels::{ChatType, InboundMessage};
+        use echo_agent_app_core::terminal::{TerminalEvent, TerminalExitReason};
+        use futures::StreamExt;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(32);
+        let expected = "中文🙂";
+        for byte in expected.as_bytes() {
+            sender
+                .send(TerminalEvent::Output {
+                    id: "utf8-terminal".to_string(),
+                    bytes: vec![*byte],
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        sender
+            .send(TerminalEvent::Exited {
+                id: "utf8-terminal".to_string(),
+                reason: TerminalExitReason::ProcessExited,
+            })
+            .map_err(|error| error.to_string())?;
+        let message = InboundMessage::new(
+            "qq",
+            "user",
+            "conversation",
+            ChatType::Direct,
+            "/terminal create utf8-terminal",
+            "message-1",
+        );
+        let mut stream = super::channel_terminal_stream(
+            &message,
+            "created".to_string(),
+            receiver,
+            "utf8-terminal".to_string(),
+        );
+        let mut joined = String::new();
+        while let Some(item) = stream.next().await {
+            joined.push_str(&item.map_err(|error| error.to_string())?.text);
+        }
+        assert!(joined.contains(expected));
+        assert!(!joined.contains('\u{fffd}'));
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
+    #[tokio::test]
+    async fn terminal_stream_strips_split_csi_and_osc_at_every_byte() -> Result<(), String> {
+        use echo_agent::channels::{ChatType, InboundMessage};
+        use echo_agent_app_core::terminal::{TerminalEvent, TerminalExitReason};
+        use futures::StreamExt;
+
+        let (sender, receiver) = tokio::sync::broadcast::channel(32);
+        let encoded = b"\x1b[31m\xe4\xb8\xad\xf0\x9f\x99\x82\x1b[0m|\x1b]x\x07\xe6\x96\x87";
+        for byte in encoded {
+            sender
+                .send(TerminalEvent::Output {
+                    id: "ansi-terminal".to_string(),
+                    bytes: vec![*byte],
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        sender
+            .send(TerminalEvent::Exited {
+                id: "ansi-terminal".to_string(),
+                reason: TerminalExitReason::ProcessExited,
+            })
+            .map_err(|error| error.to_string())?;
+        let message = InboundMessage::new(
+            "qq",
+            "user",
+            "conversation",
+            ChatType::Direct,
+            "/terminal create ansi-terminal",
+            "message-1",
+        );
+        let mut stream = super::channel_terminal_stream(
+            &message,
+            "created".to_string(),
+            receiver,
+            "ansi-terminal".to_string(),
+        );
+        let mut joined = String::new();
+        while let Some(item) = stream.next().await {
+            joined.push_str(&item.map_err(|error| error.to_string())?.text);
+        }
+        assert!(joined.contains("中🙂|文"));
+        assert!(!joined.contains('\u{1b}'));
+        assert!(!joined.contains("31m"));
+        assert!(!joined.contains("]x"));
+        Ok(())
+    }
+
+    #[cfg(all(feature = "channels", unix))]
+    #[tokio::test]
+    async fn terminal_stream_detaches_secret_multi_megabyte_process_at_budget() -> Result<(), String>
+    {
+        use echo_agent::channels::{ChatType, InboundMessage};
+        use futures::StreamExt;
+
+        let secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        let terminal = echo_agent_app_core::terminal::TerminalService::new();
+        let receiver = terminal.subscribe();
+        terminal
+            .create("channel-budget".to_string(), None, 24, 80)
+            .await?;
+        terminal
+            .write(
+                "channel-budget",
+                format!(
+                    "printf 'Bearer {secret} '; head -c 2000000 /dev/zero | tr '\\000' x; sleep 30\r"
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let message = InboundMessage::new(
+            "qq",
+            "user",
+            "conversation",
+            ChatType::Direct,
+            "/terminal create channel-budget",
+            "message-1",
+        );
+        let mut stream = super::channel_terminal_stream(
+            &message,
+            "created".to_string(),
+            receiver,
+            "channel-budget".to_string(),
+        );
+        let texts = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut texts = Vec::new();
+            while let Some(item) = stream.next().await {
+                texts.push(item.map_err(|error| error.to_string())?.text);
+            }
+            Ok::<_, String>(texts)
+        })
+        .await
+        .map_err(|_| "budgeted channel terminal did not settle".to_string())??;
+        let joined = texts.join("\n");
+        assert!(!joined.contains(secret));
+        assert!(joined.contains("[REDACTED]"));
+        assert!(
+            joined.contains("forwarding detached") || joined.contains("exited:"),
+            "terminal had no reserved settlement: {joined}"
+        );
+        if joined.contains("forwarding detached") {
+            assert!(terminal.contains("channel-budget"));
+        }
+        assert!(texts.iter().all(|text| text.len() <= 1_800));
+        assert!(texts.len() <= super::CHANNEL_OUTBOUND_TOTAL_MESSAGES);
+        let _closed = terminal.close("channel-budget").await?;
         Ok(())
     }
 
@@ -2389,13 +5148,66 @@ mod tests {
     }
 
     #[cfg(feature = "channels")]
+    #[test]
+    fn bounded_surface_sink_cancels_when_consumer_does_not_poll() {
+        use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink};
+
+        let (tx, rx) = tokio::sync::mpsc::channel(super::CHANNEL_EVENT_QUEUE_CAPACITY);
+        let cancellation = echo_agent::agent::CancellationToken::new();
+        let sink = super::ChannelSurfaceSink::new(tx, cancellation.clone());
+        for index in 0..super::CHANNEL_EVENT_QUEUE_CAPACITY {
+            assert!(sink.on_event(ChatDriverEvent::TurnStatus {
+                status: format!("running-{index}"),
+            }));
+        }
+        assert!(!sink.on_event(ChatDriverEvent::TurnStatus {
+            status: "queue-full".to_string(),
+        }));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(rx.len(), super::CHANNEL_EVENT_QUEUE_CAPACITY);
+    }
+
+    #[cfg(feature = "channels")]
+    #[test]
+    fn large_token_is_utf8_chunked_and_cancels_at_bounded_queue() -> Result<(), String> {
+        use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
+        use echo_agent_app_core::chat_driver::{ChatDriverEvent, ChatSink};
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(super::CHANNEL_EVENT_QUEUE_CAPACITY);
+        let cancellation = echo_agent::agent::CancellationToken::new();
+        let sink = super::ChannelSurfaceSink::new(tx, cancellation.clone());
+        let identity = EventIdentity::new("channel-large-token", "turn-1")
+            .map_err(|error| error.to_string())?;
+        let envelope = EventEnvelope::new(
+            &identity,
+            1,
+            None,
+            AgentEvent::Token("中文🙂".repeat(25_000)),
+        )
+        .map_err(|error| error.to_string())?;
+        assert!(!sink.on_event(ChatDriverEvent::Agent(Box::new(envelope))));
+        assert!(cancellation.is_cancelled());
+        assert_eq!(rx.len(), super::CHANNEL_EVENT_QUEUE_CAPACITY);
+        while let Ok(event) = rx.try_recv() {
+            let super::ChannelRenderEvent::Token(token) = event else {
+                return Err("large token queued a non-token event".to_string());
+            };
+            assert!(token.len() <= super::CHANNEL_TOKEN_COALESCE_BYTES);
+            assert!(token.is_char_boundary(token.len()));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "channels")]
     #[tokio::test]
     async fn terminal_drains_accepted_final_answer_before_publication() -> Result<(), String> {
         use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
         use echo_agent_app_core::chat_driver::{ChatDriverEvent, TurnOutcome};
         use futures::StreamExt;
 
-        let (driver_tx, driver_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Fill the only ordinary data slot; terminal still arrives through its
+        // independent oneshot receipt and cannot be displaced by this event.
+        let (driver_tx, driver_rx) = tokio::sync::mpsc::channel(1);
         let identity = EventIdentity::new("channel-driver", "channel-conversation")
             .map_err(|error| error.to_string())?;
         let final_answer = EventEnvelope::new(
@@ -2406,7 +5218,9 @@ mod tests {
         )
         .map_err(|error| error.to_string())?;
         driver_tx
-            .send(ChatDriverEvent::Agent(Box::new(final_answer)))
+            .try_send(super::ChannelRenderEvent::Driver(ChatDriverEvent::Agent(
+                Box::new(final_answer),
+            )))
             .map_err(|_| "channel driver receiver closed".to_string())?;
         let (_prompt_tx, prompt_rx) = tokio::sync::broadcast::channel::<String>(1);
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
@@ -2459,7 +5273,7 @@ mod tests {
         use echo_agent_app_core::chat_driver::TurnOutcome;
         use futures::StreamExt;
 
-        let (driver_tx, driver_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (driver_tx, driver_rx) = tokio::sync::mpsc::channel(4);
         let (prompt_tx, prompt_rx) = tokio::sync::broadcast::channel::<String>(2);
         let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel();
         let cancellation = echo_agent::agent::CancellationToken::new();
@@ -2505,8 +5319,74 @@ mod tests {
     // ── channel attachment transport tests ──────────────────────────────
     #[cfg(feature = "channels")]
     mod multimodal {
-        use super::super::channel_attachment_data;
+        use super::super::{
+            ChannelTurnPreparation, channel_attachment_data, prepare_channel_turn,
+            stage_channel_attachments,
+        };
         use echo_agent::channels::{AttachmentKind, MessageAttachment};
+        use std::path::{Path, PathBuf};
+
+        struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new(label: &str) -> Result<Self, String> {
+                let path = std::env::temp_dir()
+                    .join(format!("eko-channel-{label}-{}", uuid::Uuid::new_v4()));
+                std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+                Ok(Self(path))
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _cleanup = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        fn prepare_scoped_attachment(
+            root: &Path,
+            conversation_id: &str,
+            turn_id: &str,
+        ) -> Result<(PathBuf, PathBuf), String> {
+            let attachment =
+                MessageAttachment::new(AttachmentKind::File, b"workspace note".to_vec())
+                    .with_filename("notes.txt");
+            let staged = stage_channel_attachments(&[attachment], root)?;
+            let staged_path = staged
+                .first()
+                .map(|attachment| attachment.path.clone())
+                .ok_or_else(|| "channel attachment was not staged".to_string())?;
+            let spill_dir =
+                echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(root));
+            let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+                echo_agent_app_core::prepared_turn::UserTurnInput {
+                    text: "inspect the attachment",
+                    attachments: &staged,
+                    spill_dir: &spill_dir,
+                    conversation_id: Some(conversation_id),
+                    turn_id: Some(turn_id),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+            let main_refs = turn.inline_attachment_refs();
+            let subagent_refs = turn.inline_attachment_refs();
+            let main_path = main_refs
+                .first()
+                .map(|attachment| attachment.path.clone())
+                .ok_or_else(|| "main Agent attachment ref is missing".to_string())?;
+            let subagent_path = subagent_refs
+                .first()
+                .map(|attachment| attachment.path.clone())
+                .ok_or_else(|| "Subagent attachment ref is missing".to_string())?;
+            if main_path != subagent_path {
+                return Err("main Agent and Subagent received different artifact refs".to_string());
+            }
+            Ok((staged_path, main_path))
+        }
 
         #[test]
         fn image_attachment_keeps_name_and_image_mime() {
@@ -2527,16 +5407,183 @@ mod tests {
             assert_eq!(data.mime_type, "text/plain");
             assert_eq!(data.size, 3);
         }
+
+        #[tokio::test]
+        async fn bounded_prepare_retires_staging_into_exact_turn_scope() -> Result<(), String> {
+            let temporary = TestDirectory::new("bounded-prepare")?;
+            let workspace = temporary.path().join("workspace");
+            let attachment =
+                MessageAttachment::new(AttachmentKind::File, b"workspace note".to_vec())
+                    .with_filename("notes.txt");
+            let product_data_io = echo_agent_app_core::product_data_io::ProductDataIoService::new();
+            let flow = product_data_io
+                .begin_owned_flow("prepare channel user turn fixture")
+                .map_err(|error| error.to_string())?;
+            let turn = prepare_channel_turn(
+                ChannelTurnPreparation {
+                    attachments: vec![attachment],
+                    execution_root: workspace.clone(),
+                    text: "inspect the attachment".to_string(),
+                    conversation_id: "conversation-a".to_string(),
+                    turn_id: "turn-a".to_string(),
+                    runtime_authored: false,
+                    workspace_io_receipt:
+                        echo_agent_app_core::state::ScopedWorkspaceIoReceipt::global_for_test(
+                            workspace.clone(),
+                        ),
+                },
+                &flow,
+            )
+            .await?;
+            flow.settle(None);
+            let resource = turn
+                .resources
+                .first()
+                .ok_or_else(|| "prepared attachment resource is missing".to_string())?;
+            assert!(
+                resource.path.starts_with(
+                    workspace
+                        .join(".eko/artifacts/user-input")
+                        .join("conversation-a")
+                        .join("turn-a")
+                )
+            );
+            let uploads = workspace.join(".eko/uploads");
+            let staging_is_empty = match std::fs::read_dir(&uploads) {
+                Ok(mut entries) => entries.next().is_none(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => return Err(error.to_string()),
+            };
+            assert!(staging_is_empty);
+            Ok(())
+        }
+
+        #[test]
+        fn attachments_follow_exact_workspace_and_conversation_scope() -> Result<(), String> {
+            let temporary = TestDirectory::new("attachments")?;
+            let workspace_a = temporary.path().join("workspace-a");
+            let workspace_b = temporary.path().join("workspace-b");
+            let (staged_a1, scoped_a1) =
+                prepare_scoped_attachment(&workspace_a, "conversation-a", "turn-1")?;
+            let (staged_a2, scoped_a2) =
+                prepare_scoped_attachment(&workspace_a, "conversation-b", "turn-1")?;
+            let (staged_b1, scoped_b1) =
+                prepare_scoped_attachment(&workspace_b, "conversation-a", "turn-1")?;
+
+            assert!(staged_a1.starts_with(workspace_a.join(".eko/uploads")));
+            assert!(staged_a2.starts_with(workspace_a.join(".eko/uploads")));
+            assert!(staged_b1.starts_with(workspace_b.join(".eko/uploads")));
+            assert!(!staged_a1.exists(), "prepared turn retires staging file");
+            assert!(!staged_a2.exists(), "prepared turn retires staging file");
+            assert!(!staged_b1.exists(), "prepared turn retires staging file");
+
+            let spill_a = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+                &workspace_a,
+            ));
+            let spill_b = echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(
+                &workspace_b,
+            ));
+            assert!(scoped_a1.starts_with(spill_a.join("conversation-a").join("turn-1")));
+            assert!(scoped_a2.starts_with(spill_a.join("conversation-b").join("turn-1")));
+            assert!(scoped_b1.starts_with(spill_b.join("conversation-a").join("turn-1")));
+            assert_ne!(scoped_a1, scoped_a2);
+            assert_ne!(scoped_a1, scoped_b1);
+            Ok(())
+        }
+
+        #[test]
+        fn long_text_spill_isolated_across_workspace_and_conversation() -> Result<(), String> {
+            let temporary = TestDirectory::new("long-text")?;
+            let workspace_a = temporary.path().join("workspace-a");
+            let workspace_b = temporary.path().join("workspace-b");
+            let long_text = "中文🙂tool-output\n".repeat(3_000);
+
+            let prepare = |root: &Path, conversation_id: &str| -> Result<PathBuf, String> {
+                let spill_dir =
+                    echo_agent_app_core::prepared_turn::resolve_user_input_spill_dir(Some(root));
+                let turn = echo_agent_app_core::prepared_turn::PreparedUserTurn::build(
+                    echo_agent_app_core::prepared_turn::UserTurnInput {
+                        text: &long_text,
+                        attachments: &[],
+                        spill_dir: &spill_dir,
+                        conversation_id: Some(conversation_id),
+                        turn_id: Some("turn-1"),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                turn.resources
+                    .first()
+                    .map(|resource| resource.path.clone())
+                    .ok_or_else(|| "long channel text did not spill".to_string())
+            };
+
+            let a1 = prepare(&workspace_a, "conversation-a")?;
+            let a2 = prepare(&workspace_a, "conversation-b")?;
+            let b1 = prepare(&workspace_b, "conversation-a")?;
+            assert!(
+                a1.starts_with(workspace_a.join(".eko/artifacts/user-input/conversation-a/turn-1"))
+            );
+            assert!(
+                a2.starts_with(workspace_a.join(".eko/artifacts/user-input/conversation-b/turn-1"))
+            );
+            assert!(
+                b1.starts_with(workspace_b.join(".eko/artifacts/user-input/conversation-a/turn-1"))
+            );
+            assert_ne!(a1, a2);
+            assert_ne!(a1, b1);
+            Ok(())
+        }
     }
 
     // ── aggregate_by_sentence 测试(需 channels feature)──────────────────────
     #[cfg(feature = "channels")]
     mod aggregate {
-        use super::super::{ChannelRenderEvent, FLUSH_THRESHOLD, aggregate_by_sentence};
-        use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity};
+        use super::super::{
+            CHANNEL_TOOL_OUTPUT_CHARS, ChannelBufferOutcome, ChannelOutboundDraft,
+            ChannelRenderEvent, ChannelStreamingSanitizer, ChannelToolAddress,
+            ChannelToolObserveOutcome, ChannelToolRenderState, ChannelToolTerminal,
+            FLUSH_THRESHOLD, aggregate_by_sentence, channel_outbound_transport,
+            channel_outbound_transport_unpaced, channel_rate_deadline, channel_rate_policy,
+            channel_tool_args_preview,
+        };
+        use echo_agent::agent::{AgentEvent, EventEnvelope, EventIdentity, ToolInvocation};
         use echo_agent::channels::{ChatType, OutboundMessage};
         use echo_agent::error::Result;
+        use echo_agent::tools::{
+            ToolFailureCategory, ToolOutputChannel, ToolResult, ToolStreamEvent,
+        };
+        use echo_agent_app_core::tool_execution::{
+            ToolExecutionOwner, ToolExecutionStatus, ToolExecutionSummary,
+        };
+        use echo_agent_app_core::tool_execution_projection::{
+            ToolExecutionProjectionKind, ToolExecutionProjectionUpdate,
+        };
         use futures::stream::{BoxStream, StreamExt};
+        use std::path::{Path, PathBuf};
+
+        struct TestDirectory(PathBuf);
+
+        impl TestDirectory {
+            fn new(label: &str) -> std::result::Result<Self, String> {
+                let path = std::env::temp_dir().join(format!(
+                    "eko-channel-render-{label}-{}",
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::create_dir_all(&path).map_err(|error| error.to_string())?;
+                Ok(Self(path))
+            }
+
+            fn path(&self) -> &Path {
+                &self.0
+            }
+        }
+
+        impl Drop for TestDirectory {
+            fn drop(&mut self) {
+                let _cleanup = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         fn events_to_stream(
             events: Vec<Result<AgentEvent>>,
         ) -> BoxStream<'static, Result<ChannelRenderEvent>> {
@@ -2557,6 +5604,51 @@ mod tests {
                 })
             }))
             .boxed()
+        }
+
+        fn agent_render_event(sequence: u64, payload: AgentEvent) -> Result<ChannelRenderEvent> {
+            let identity = EventIdentity::new("channel-tool-stream", "channel-tool-turn")?;
+            EventEnvelope::new(&identity, sequence, None, payload).map(|envelope| {
+                ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(Box::new(envelope)),
+                )
+            })
+        }
+
+        fn projection_event(
+            call_id: &str,
+            name: &str,
+            args_preview: &str,
+            status: ToolExecutionStatus,
+            kind: ToolExecutionProjectionKind,
+        ) -> ChannelRenderEvent {
+            ChannelRenderEvent::ToolProjection(ToolExecutionProjectionUpdate {
+                kind,
+                agent: "echo-assistant".to_string(),
+                summary: ToolExecutionSummary {
+                    id: format!("tool-{call_id}"),
+                    call_id: call_id.to_string(),
+                    owner: ToolExecutionOwner::Chat {
+                        message_id: "message-1".to_string(),
+                    },
+                    workspace_id: "workspace-a".to_string(),
+                    conversation_id: Some("conversation-a".to_string()),
+                    run_id: None,
+                    name: name.to_string(),
+                    args_preview: args_preview.to_string(),
+                    status,
+                    started_at: 1,
+                    finished_at: (status != ToolExecutionStatus::Running).then_some(2),
+                    duration_ms: (status != ToolExecutionStatus::Running).then_some(1),
+                    detail_ref: format!("chat/message-1/{call_id}"),
+                },
+            })
+        }
+
+        fn render_events_to_stream(
+            events: Vec<Result<ChannelRenderEvent>>,
+        ) -> BoxStream<'static, Result<ChannelRenderEvent>> {
+            futures::stream::iter(events).boxed()
         }
 
         async fn collect_texts(s: BoxStream<'_, Result<OutboundMessage>>) -> Vec<String> {
@@ -2582,7 +5674,7 @@ mod tests {
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let texts = collect_texts(out).await;
-            assert_eq!(texts, vec!["ab\n".to_string(), "c".to_string()]);
+            assert_eq!(texts.concat(), "ab\nc");
         }
 
         #[tokio::test]
@@ -2595,7 +5687,7 @@ mod tests {
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let texts = collect_texts(out).await;
-            assert_eq!(texts, vec!["你好。".to_string(), "再见".to_string()]);
+            assert_eq!(texts.concat(), "你好。再见");
         }
 
         #[tokio::test]
@@ -2689,6 +5781,1217 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn tool_lifecycle_is_ordered_redacted_and_bounded() -> std::result::Result<(), String>
+        {
+            let secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+            let args = serde_json::json!({
+                "path": "src/main.rs",
+                "token": secret,
+                "query": "中文🙂".repeat(120)
+            });
+            let invocation = ToolInvocation {
+                requested_name: "grep".to_string(),
+                requested_args: args.clone(),
+                name: "grep".to_string(),
+                args: args.clone(),
+                rewrites: Vec::new(),
+            };
+            let args_preview = channel_tool_args_preview(&args);
+            let success = ToolResult::success("成功🙂".repeat(300))
+                .with_truncated(true)
+                .with_meta("artifact_path", "/tmp/channel-tool-full.log")
+                .with_meta("artifact_bytes", "8192");
+            let complete_failure = ToolResult::failure(
+                ToolFailureCategory::Timeout,
+                "token=secretvalue123456，请重试🙂",
+            );
+            let terminal_failure = ToolResult::failure(
+                ToolFailureCategory::InvalidArguments,
+                "password=secretvalue123456，参数错误🙂",
+            );
+
+            let events = render_events_to_stream(vec![
+                Ok(projection_event(
+                    "call-1",
+                    "grep",
+                    &args_preview,
+                    ToolExecutionStatus::Running,
+                    ToolExecutionProjectionKind::Started,
+                )),
+                agent_render_event(
+                    1,
+                    AgentEvent::ToolCall {
+                        call_id: "call-1".to_string(),
+                        invocation,
+                    },
+                ),
+                agent_render_event(
+                    2,
+                    AgentEvent::ToolStream {
+                        call_id: "call-1".to_string(),
+                        name: "grep".to_string(),
+                        event: ToolStreamEvent::Progress {
+                            message: format!("正在搜索🙂 Bearer {secret}"),
+                            percent: Some(25),
+                        },
+                    },
+                ),
+                agent_render_event(
+                    3,
+                    AgentEvent::ToolStream {
+                        call_id: "call-1".to_string(),
+                        name: "grep".to_string(),
+                        event: ToolStreamEvent::Output {
+                            channel: ToolOutputChannel::Stdout,
+                            chunk: "stdout🙂".to_string(),
+                        },
+                    },
+                ),
+                agent_render_event(
+                    4,
+                    AgentEvent::ToolStream {
+                        call_id: "call-1".to_string(),
+                        name: "grep".to_string(),
+                        event: ToolStreamEvent::Output {
+                            channel: ToolOutputChannel::Stderr,
+                            chunk: "stderr🙂".to_string(),
+                        },
+                    },
+                ),
+                agent_render_event(
+                    5,
+                    AgentEvent::ToolStream {
+                        call_id: "call-1".to_string(),
+                        name: "grep".to_string(),
+                        event: ToolStreamEvent::Output {
+                            channel: ToolOutputChannel::Log,
+                            chunk: "日志🙂".to_string(),
+                        },
+                    },
+                ),
+                agent_render_event(
+                    6,
+                    AgentEvent::ToolStream {
+                        call_id: "call-1".to_string(),
+                        name: "grep".to_string(),
+                        event: ToolStreamEvent::Output {
+                            channel: ToolOutputChannel::Stdout,
+                            chunk: "长输出🙂".repeat(CHANNEL_TOOL_OUTPUT_CHARS),
+                        },
+                    },
+                ),
+                Ok(projection_event(
+                    "call-1",
+                    "grep",
+                    &args_preview,
+                    ToolExecutionStatus::Succeeded,
+                    ToolExecutionProjectionKind::Finished,
+                )),
+                agent_render_event(
+                    7,
+                    AgentEvent::ToolResult {
+                        call_id: "call-1".to_string(),
+                        name: "grep".to_string(),
+                        result: success,
+                    },
+                ),
+                Ok(projection_event(
+                    "call-2",
+                    "shell",
+                    "{\"command\":\"false\"}",
+                    ToolExecutionStatus::Running,
+                    ToolExecutionProjectionKind::Started,
+                )),
+                agent_render_event(
+                    8,
+                    AgentEvent::ToolCall {
+                        call_id: "call-2".to_string(),
+                        invocation: ToolInvocation {
+                            requested_name: "shell".to_string(),
+                            requested_args: serde_json::json!({"command": "false"}),
+                            name: "shell".to_string(),
+                            args: serde_json::json!({"command": "false"}),
+                            rewrites: Vec::new(),
+                        },
+                    },
+                ),
+                agent_render_event(
+                    9,
+                    AgentEvent::ToolStream {
+                        call_id: "call-2".to_string(),
+                        name: "shell".to_string(),
+                        event: ToolStreamEvent::Complete(complete_failure),
+                    },
+                ),
+                Ok(projection_event(
+                    "call-2",
+                    "shell",
+                    "{\"command\":\"false\"}",
+                    ToolExecutionStatus::TimedOut,
+                    ToolExecutionProjectionKind::Finished,
+                )),
+                agent_render_event(
+                    10,
+                    AgentEvent::ToolResult {
+                        call_id: "call-2".to_string(),
+                        name: "shell".to_string(),
+                        result: ToolResult::failure(
+                            ToolFailureCategory::Timeout,
+                            "token=secretvalue123456，请重试🙂",
+                        ),
+                    },
+                ),
+                Ok(projection_event(
+                    "call-3",
+                    "read_file",
+                    "{\"path\":\"missing\"}",
+                    ToolExecutionStatus::Running,
+                    ToolExecutionProjectionKind::Started,
+                )),
+                agent_render_event(
+                    10,
+                    AgentEvent::ToolCall {
+                        call_id: "call-3".to_string(),
+                        invocation: ToolInvocation {
+                            requested_name: "read_file".to_string(),
+                            requested_args: serde_json::json!({"path": "missing"}),
+                            name: "read_file".to_string(),
+                            args: serde_json::json!({"path": "missing"}),
+                            rewrites: Vec::new(),
+                        },
+                    },
+                ),
+                Ok(projection_event(
+                    "call-3",
+                    "read_file",
+                    "{\"path\":\"missing\"}",
+                    ToolExecutionStatus::Failed,
+                    ToolExecutionProjectionKind::Finished,
+                )),
+                agent_render_event(
+                    11,
+                    AgentEvent::ToolResult {
+                        call_id: "call-3".to_string(),
+                        name: "read_file".to_string(),
+                        result: terminal_failure,
+                    },
+                ),
+                agent_render_event(12, AgentEvent::Cancelled),
+                Ok(ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Cancelled,
+                )),
+            ]);
+            let output =
+                aggregate_by_sentence(events, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(output).await;
+            let joined = texts.join("\n");
+
+            assert!(!joined.contains(secret));
+            assert!(!joined.contains("secretvalue123456"));
+            assert!(joined.contains("[REDACTED]"));
+            assert!(joined.contains("started grep"));
+            assert!(joined.contains("progress grep 25%"));
+            assert!(joined.contains("stdout grep"));
+            assert!(joined.contains("stderr grep"));
+            assert!(joined.contains("log grep"));
+            assert!(joined.contains("output available in detail chat/message-1/call-1"));
+            assert!(joined.contains("result grep"));
+            assert!(joined.contains("truncated"));
+            assert!(!joined.contains("artifact /tmp/channel-tool-full.log"));
+            assert!(joined.contains("detail chat/message-1/call-1"));
+            assert!(joined.contains("error shell [timeout -> verify_then_retry]"));
+            assert_eq!(
+                joined
+                    .matches("error shell [timeout -> verify_then_retry]")
+                    .count(),
+                1
+            );
+            assert!(joined.contains("error read_file [invalid_arguments -> correct_arguments]"));
+            assert!(texts.iter().all(|text| {
+                text.chars().count() <= CHANNEL_TOOL_OUTPUT_CHARS.saturating_add(400)
+            }));
+
+            let started = texts
+                .iter()
+                .position(|text| text.contains("started grep"))
+                .ok_or_else(|| "started event is missing".to_string())?;
+            let progress = texts
+                .iter()
+                .position(|text| text.contains("progress grep"))
+                .ok_or_else(|| "progress event is missing".to_string())?;
+            let result = texts
+                .iter()
+                .position(|text| text.contains("result grep"))
+                .ok_or_else(|| "result event is missing".to_string())?;
+            let terminal = texts
+                .iter()
+                .position(|text| text.starts_with("[cancelled]"))
+                .ok_or_else(|| "terminal event is missing".to_string())?;
+            assert!(started < progress);
+            assert!(progress < result);
+            assert!(result < terminal);
+            assert_eq!(terminal, texts.len().saturating_sub(1));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn only_registered_verified_artifact_is_rendered() -> std::result::Result<(), String>
+        {
+            let temporary = TestDirectory::new("verified-artifact")?;
+            let artifact_config = echo_agent::tools::artifact::ToolOutputArtifactConfig::new(
+                temporary.path().join("artifacts"),
+                "conversation_or_30d",
+            )
+            .threshold_bytes(1);
+            let mut writer = echo_agent::tools::artifact::ToolOutputArtifactWriter::new(
+                artifact_config.clone(),
+                echo_agent::tools::artifact::ToolOutputArtifactIdentity {
+                    conversation_id: Some("conversation-a".to_string()),
+                    run_id: Some("turn-a".to_string()),
+                    call_id: "call-artifact".to_string(),
+                    tool_name: "shell".to_string(),
+                },
+            );
+            writer
+                .push_raw("complete artifact output")
+                .map_err(|error| error.to_string())?;
+            let artifact = writer
+                .finish()
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "artifact writer did not spill".to_string())?;
+            let result = ToolResult::success("bounded preview").with_metadata({
+                let mut metadata = std::collections::HashMap::new();
+                artifact.extend_metadata(&mut metadata);
+                metadata
+            });
+            let repository = std::sync::Arc::new(
+                echo_agent_app_core::tool_execution::ToolExecutionRepository::open(
+                    temporary.path().join("tool-details"),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            repository.register_artifact_config(artifact_config);
+            let owner = ToolExecutionOwner::Chat {
+                message_id: "message-1".to_string(),
+            };
+            let invocation = ToolInvocation {
+                requested_name: "shell".to_string(),
+                requested_args: serde_json::json!({"command": "echo ok"}),
+                name: "shell".to_string(),
+                args: serde_json::json!({"command": "echo ok"}),
+                rewrites: Vec::new(),
+            };
+            let started = repository
+                .project_start(
+                    "workspace-a",
+                    owner,
+                    Some("conversation-a"),
+                    None,
+                    "call-artifact",
+                    &invocation,
+                )
+                .map_err(|error| error.to_string())?
+                .summary;
+            let finished = repository
+                .project_finish("workspace-a", &started.owner, "call-artifact", &result)
+                .map_err(|error| error.to_string())?
+                .summary;
+            let verified = repository
+                .verified_artifact_reference("workspace-a", &finished.detail_ref)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "registered artifact was not recovered from detail".to_string())?;
+            assert_eq!(verified, artifact);
+            let events = render_events_to_stream(vec![
+                Ok(ChannelRenderEvent::ToolProjection(
+                    ToolExecutionProjectionUpdate {
+                        kind: ToolExecutionProjectionKind::Started,
+                        agent: "echo-assistant".to_string(),
+                        summary: started,
+                    },
+                )),
+                agent_render_event(
+                    1,
+                    AgentEvent::ToolCall {
+                        call_id: "call-artifact".to_string(),
+                        invocation,
+                    },
+                ),
+                Ok(ChannelRenderEvent::ToolProjection(
+                    ToolExecutionProjectionUpdate {
+                        kind: ToolExecutionProjectionKind::Finished,
+                        agent: "echo-assistant".to_string(),
+                        summary: finished,
+                    },
+                )),
+                agent_render_event(
+                    2,
+                    AgentEvent::ToolResult {
+                        call_id: "call-artifact".to_string(),
+                        name: "shell".to_string(),
+                        result,
+                    },
+                ),
+                Ok(ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                )),
+            ]);
+            let output = super::super::aggregate_by_sentence_with_repository(
+                events,
+                "qq".to_string(),
+                "u1".to_string(),
+                ChatType::Direct,
+                repository,
+            )
+            .await;
+            let joined = collect_texts(output).await.join("\n");
+            assert!(
+                joined.contains(&artifact.path.to_string_lossy().to_string()),
+                "verified artifact was omitted: {joined}"
+            );
+            assert!(joined.contains(&artifact.sha256));
+            assert!(joined.contains("retention conversation_or_30d"));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn main_and_subagent_same_call_id_render_independently()
+        -> std::result::Result<(), String> {
+            use echo_agent_app_core::tasks::task_runtime::RuntimeEventKind;
+            use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
+
+            let invocation = ToolInvocation {
+                requested_name: "read_file".to_string(),
+                requested_args: serde_json::json!({"path": "shared.txt"}),
+                name: "read_file".to_string(),
+                args: serde_json::json!({"path": "shared.txt"}),
+                rewrites: Vec::new(),
+            };
+            let subagent_summary = |status| ToolExecutionSummary {
+                id: "tool-subagent-shared".to_string(),
+                call_id: "shared-call".to_string(),
+                owner: ToolExecutionOwner::Subagent {
+                    subagent_run_id: "subagent-1".to_string(),
+                },
+                workspace_id: "workspace-a".to_string(),
+                conversation_id: Some("conversation-a".to_string()),
+                run_id: Some("run-1".to_string()),
+                name: "read_file".to_string(),
+                args_preview: "{\"path\":\"shared.txt\"}".to_string(),
+                status,
+                started_at: 1,
+                finished_at: (status != ToolExecutionStatus::Running).then_some(2),
+                duration_ms: (status != ToolExecutionStatus::Running).then_some(1),
+                detail_ref: "subagent/subagent-1/shared-call".to_string(),
+            };
+            let events = render_events_to_stream(vec![
+                Ok(projection_event(
+                    "shared-call",
+                    "read_file",
+                    "{\"path\":\"shared.txt\"}",
+                    ToolExecutionStatus::Running,
+                    ToolExecutionProjectionKind::Started,
+                )),
+                Ok(ChannelRenderEvent::ToolProjection(
+                    ToolExecutionProjectionUpdate {
+                        kind: ToolExecutionProjectionKind::Started,
+                        agent: "reviewer".to_string(),
+                        summary: subagent_summary(ToolExecutionStatus::Running),
+                    },
+                )),
+                agent_render_event(
+                    1,
+                    AgentEvent::ToolCall {
+                        call_id: "shared-call".to_string(),
+                        invocation: invocation.clone(),
+                    },
+                ),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::Execution(
+                        ExecEvent::subagent(
+                            "workspace-a",
+                            "conversation-a",
+                            "run-1",
+                            "task-1",
+                            "subagent-1",
+                            RuntimeEventKind::ToolStarted,
+                            serde_json::json!({
+                                "call_id": "shared-call",
+                                "invocation": invocation,
+                            }),
+                        )
+                        .with_agent("reviewer"),
+                    ),
+                )),
+                agent_render_event(
+                    2,
+                    AgentEvent::ToolStream {
+                        call_id: "shared-call".to_string(),
+                        name: "read_file".to_string(),
+                        event: ToolStreamEvent::Output {
+                            channel: ToolOutputChannel::Stdout,
+                            chunk: "{\"password\":\"main-supersecret".to_string(),
+                        },
+                    },
+                ),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::Execution(
+                        ExecEvent::subagent(
+                            "workspace-a",
+                            "conversation-a",
+                            "run-1",
+                            "task-1",
+                            "subagent-1",
+                            RuntimeEventKind::ToolOutput,
+                            serde_json::json!({
+                                "call_id": "shared-call",
+                                "name": "read_file",
+                                "channel": "stdout",
+                                "chunk": "{\"password\":\"subagent-supersecret",
+                            }),
+                        )
+                        .with_agent("reviewer"),
+                    ),
+                )),
+                Ok(projection_event(
+                    "shared-call",
+                    "read_file",
+                    "{\"path\":\"shared.txt\"}",
+                    ToolExecutionStatus::Succeeded,
+                    ToolExecutionProjectionKind::Finished,
+                )),
+                agent_render_event(
+                    3,
+                    AgentEvent::ToolResult {
+                        call_id: "shared-call".to_string(),
+                        name: "read_file".to_string(),
+                        result: ToolResult::success("main-result"),
+                    },
+                ),
+                Ok(ChannelRenderEvent::ToolProjection(
+                    ToolExecutionProjectionUpdate {
+                        kind: ToolExecutionProjectionKind::Finished,
+                        agent: "reviewer".to_string(),
+                        summary: subagent_summary(ToolExecutionStatus::Succeeded),
+                    },
+                )),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::Execution(
+                        ExecEvent::subagent(
+                            "workspace-a",
+                            "conversation-a",
+                            "run-1",
+                            "task-1",
+                            "subagent-1",
+                            RuntimeEventKind::ToolCompleted,
+                            serde_json::json!({
+                                "call_id": "shared-call",
+                                "name": "read_file",
+                                "result": ToolResult::success("subagent-result"),
+                            }),
+                        )
+                        .with_agent("reviewer"),
+                    ),
+                )),
+                Ok(ChannelRenderEvent::Terminal(
+                    echo_agent_app_core::chat_driver::TurnOutcome::Completed,
+                )),
+            ]);
+            let joined = collect_texts(
+                aggregate_by_sentence(events, "qq".to_string(), "u1".to_string(), ChatType::Direct)
+                    .await,
+            )
+            .await
+            .join("\n");
+            assert!(joined.contains("[tool:shared-call] started read_file"));
+            assert!(joined.contains("[subagent:subagent-1 tool:shared-call] started read_file"));
+            assert!(!joined.contains("main-supersecret"));
+            assert!(!joined.contains("subagent-supersecret"));
+            assert!(joined.contains("output available in detail"));
+            assert!(joined.contains("main-result"));
+            assert!(joined.contains("subagent-result"));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn every_outbound_surface_is_redacted_chunked_and_terminal_reserved()
+        -> std::result::Result<(), String> {
+            use echo_agent_app_core::tasks::task_runtime::RuntimeEventKind;
+            use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
+
+            let secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+            let sensitive = format!("Bearer {secret}");
+            let mut events = vec![
+                Ok(ChannelRenderEvent::Prompt(format!("prompt {sensitive}"))),
+                Ok(ChannelRenderEvent::Token(format!(
+                    "huge token {sensitive} {}",
+                    "中文🙂".repeat(5_000)
+                ))),
+                agent_render_event(
+                    1,
+                    AgentEvent::BudgetDecision {
+                        decision: serde_json::from_value(serde_json::json!("wind_down"))
+                            .map_err(|error| error.to_string())?,
+                        reason: format!("budget {sensitive}"),
+                        iteration: 1,
+                        reported_model_tokens: 1,
+                        usage_complete: true,
+                    },
+                ),
+                agent_render_event(
+                    2,
+                    AgentEvent::GuardTriggered {
+                        guard: format!("guard {sensitive}"),
+                        blocked: true,
+                    },
+                ),
+                agent_render_event(
+                    3,
+                    AgentEvent::SafetyNotice {
+                        action: format!("action {sensitive}"),
+                        reason: format!("reason {sensitive}"),
+                        risk: format!("risk {sensitive}"),
+                        permission: format!("permission {sensitive}"),
+                    },
+                ),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::Execution(ExecEvent::run(
+                        "workspace-a",
+                        "conversation-a",
+                        "run-a",
+                        RuntimeEventKind::RunFailed,
+                        serde_json::json!({"token": secret}),
+                    )),
+                )),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::Interrupt {
+                        run_id: format!("run-{sensitive}"),
+                        goal: format!("goal {sensitive}"),
+                        new_message: format!("message {sensitive}"),
+                    },
+                )),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::ApprovalRequest {
+                        request_id: format!("approval-{sensitive}"),
+                        tool_name: format!("tool-{sensitive}"),
+                        args: serde_json::json!({"token": secret}),
+                        prompt: format!("approve {sensitive}"),
+                    },
+                )),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::InputRequest {
+                        request_id: format!("input-{sensitive}"),
+                        prompt: format!("input {sensitive}"),
+                    },
+                )),
+                Ok(ChannelRenderEvent::Driver(
+                    echo_agent_app_core::chat_driver::ChatDriverEvent::SelectionRequest {
+                        request_id: format!("selection-{sensitive}"),
+                        prompt: format!("select {sensitive}"),
+                        options: vec![format!("option {sensitive}")],
+                        task_id: None,
+                        context: None,
+                        phase: None,
+                    },
+                )),
+            ];
+            for index in 0..5 {
+                events.push(Ok(ChannelRenderEvent::Prompt(format!(
+                    "rate-{index} {sensitive}"
+                ))));
+            }
+            events.push(Ok(ChannelRenderEvent::Terminal(
+                echo_agent_app_core::chat_driver::TurnOutcome::Failed(
+                    echo_agent::error::AgentFailure::message(
+                        "terminal_failure",
+                        format!("terminal {sensitive}"),
+                    ),
+                ),
+            )));
+
+            let output = aggregate_by_sentence(
+                render_events_to_stream(events),
+                "qq".into(),
+                "u1".into(),
+                ChatType::Direct,
+            )
+            .await;
+            let texts = collect_texts(output).await;
+            let joined = texts.join("\n");
+            assert!(!joined.contains(secret));
+            assert!(joined.contains("[REDACTED]"));
+            assert!(texts.iter().all(|text| text.len() <= 1_800));
+            assert!(texts.len() <= super::super::CHANNEL_OUTBOUND_TOTAL_MESSAGES);
+            let terminal = texts
+                .last()
+                .ok_or_else(|| "terminal output is missing".to_string())?;
+            assert!(terminal.starts_with("[failed:terminal_failure]"));
+            assert!(terminal.contains("[REDACTED]"));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn outbound_total_budget_preserves_reserved_terminal_without_real_wait()
+        -> std::result::Result<(), String> {
+            let mut drafts = (0..300)
+                .map(|index| Ok(ChannelOutboundDraft::ordinary(format!("message-{index}"))))
+                .collect::<Vec<_>>();
+            drafts.push(Ok(ChannelOutboundDraft::terminal("terminal")));
+            let texts = collect_texts(channel_outbound_transport_unpaced(
+                futures::stream::iter(drafts).boxed(),
+                "qq".to_string(),
+                "u1".to_string(),
+                ChatType::Direct,
+            ))
+            .await;
+            assert!(texts.len() <= super::super::CHANNEL_OUTBOUND_TOTAL_MESSAGES);
+            assert_eq!(texts.last().map(String::as_str), Some("terminal"));
+            assert!(texts.iter().any(|text| text.contains("additional output")));
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn streaming_redaction_covers_cross_draft_boundaries()
+        -> std::result::Result<(), String> {
+            let drafts = futures::stream::iter(vec![
+                Ok(ChannelOutboundDraft::stream("gh")),
+                Ok(ChannelOutboundDraft::stream(
+                    "p_abcdefghijklmnopqrstuvwxyz1234567890 ",
+                )),
+                Ok(ChannelOutboundDraft::stream("Bearer cross")),
+                Ok(ChannelOutboundDraft::stream("boundarytoken ")),
+                Ok(ChannelOutboundDraft::stream("password=secret")),
+                Ok(ChannelOutboundDraft::stream("value123456 ")),
+                Ok(ChannelOutboundDraft::terminal("\nterminal done")),
+            ])
+            .boxed();
+            let texts = collect_texts(channel_outbound_transport(
+                drafts,
+                "qq".to_string(),
+                "u1".to_string(),
+                ChatType::Direct,
+            ))
+            .await;
+            let joined = texts.join("\n");
+            assert!(!joined.contains("ghp_abcdefghijklmnopqrstuvwxyz1234567890"));
+            assert!(!joined.contains("crossboundarytoken"));
+            assert!(!joined.contains("secretvalue123456"));
+            assert!(joined.matches("[REDACTED]").count() >= 3);
+            assert!(
+                texts
+                    .last()
+                    .is_some_and(|text| text.contains("terminal done"))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn streaming_redaction_covers_every_canonical_pattern_at_every_split()
+        -> std::result::Result<(), String> {
+            let secrets = [
+                "AKIA1234567890ABCDEF",
+                "ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+                "github_pat_abcdefghijklmnopqrstuv",
+                "sk-ant-abcdefghijklmnopqrst",
+                "sk-abcdefghijklmnopqrst",
+                "eyJabcdefghij.abcdefghijk.abcdefghijkl",
+                "xoxb-abcdefghij",
+                "hf_abcdefghijklmnopqrstuvwxyz12345678",
+                "AIza1234567890abcdefghijklmnopqrstuvwxy",
+                "glpat-abcdefghijklmnopqrstuvwxyz",
+                "Bearer abcdefghijklmnopqrstuvwxyz",
+                "password=secretvalue123456",
+                "{\"password\"\n: \"secretvalue123456\"}",
+                "postgresql://user:secret_password@localhost/db",
+                "-----BEGIN OPENSSH PRIVATE KEY-----",
+            ];
+            for secret in secrets {
+                let character_count = secret.chars().count();
+                for split in 1..character_count {
+                    let first = secret.chars().take(split).collect::<String>();
+                    let second = secret.chars().skip(split).collect::<String>();
+                    let mut sanitizer = ChannelStreamingSanitizer::default();
+                    assert_eq!(sanitizer.push(&first), ChannelBufferOutcome::Buffered);
+                    assert_eq!(
+                        sanitizer.push(&format!("{second} ")),
+                        ChannelBufferOutcome::Buffered
+                    );
+                    let rendered = sanitizer.finish().unwrap_or_default();
+                    if rendered.contains(secret) || !rendered.contains("[REDACTED") {
+                        return Err(format!(
+                            "secret pattern escaped at split {split}: {secret} -> {rendered}"
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn streaming_redaction_holds_long_unclosed_json_secret_until_escaped_close()
+        -> std::result::Result<(), String> {
+            let secret_fragment = "秘密🙂A".repeat(700);
+            let drafts = [
+                "{\"password\"\n: \"".to_string(),
+                secret_fragment.clone(),
+                "escaped\\\"quote".to_string(),
+                "\",\"visible\":true}".to_string(),
+            ];
+            let mut sanitizer = ChannelStreamingSanitizer::default();
+            for draft in drafts {
+                assert_eq!(sanitizer.push(&draft), ChannelBufferOutcome::Buffered);
+            }
+            let rendered = sanitizer.finish().unwrap_or_default();
+            assert!(!rendered.contains("秘密"));
+            assert!(!rendered.contains("escaped"));
+            assert!(!rendered.contains("quote"));
+            assert_eq!(rendered.matches("[REDACTED]").count(), 1);
+            assert!(rendered.contains("\"visible\":true"));
+            Ok(())
+        }
+
+        #[test]
+        fn buffered_redaction_covers_long_db_jwt_and_nested_json_candidates()
+        -> std::result::Result<(), String> {
+            let db_password = "A".repeat(5_000);
+            let jwt_segment = "B".repeat(5_000);
+            let nested_secret = "秘密🙂".repeat(1_500);
+            let candidates = [
+                (
+                    format!("postgresql://user:{db_password}"),
+                    "@localhost/db ".to_string(),
+                    db_password,
+                ),
+                (
+                    format!("eyJ{jwt_segment}"),
+                    ".abcdefghijk.abcdefghijkl ".to_string(),
+                    jwt_segment,
+                ),
+                (
+                    "{\"password\":{\"nested\":[\"".to_string(),
+                    format!("{nested_secret}\",\"other\"]}},\"after\":\"ok\"}}"),
+                    nested_secret,
+                ),
+            ];
+            for (first, second, secret) in candidates {
+                let mut sanitizer = ChannelStreamingSanitizer::default();
+                assert_eq!(sanitizer.push(&first), ChannelBufferOutcome::Buffered);
+                assert_eq!(sanitizer.push(&second), ChannelBufferOutcome::Buffered);
+                let rendered = sanitizer.finish().unwrap_or_default();
+                assert!(!rendered.contains(&secret));
+                assert!(rendered.contains("[REDACTED]"));
+            }
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn buffered_safe_content_preserves_100k_before_transport_cap()
+        -> std::result::Result<(), String> {
+            let safe = "safe-中文🙂\n".repeat(7_000);
+            assert!(safe.len() > 100_000);
+            let mut buffer = ChannelStreamingSanitizer::default();
+            assert_eq!(buffer.push(&safe), ChannelBufferOutcome::Buffered);
+            assert_eq!(buffer.finish().as_deref(), Some(safe.as_str()));
+            let mut drafts = Vec::new();
+            let mut chunk = String::new();
+            for character in safe.chars() {
+                if !chunk.is_empty() && chunk.len().saturating_add(character.len_utf8()) > 4_000 {
+                    drafts.push(Ok(ChannelOutboundDraft::stream(std::mem::take(&mut chunk))));
+                }
+                chunk.push(character);
+            }
+            if !chunk.is_empty() {
+                drafts.push(Ok(ChannelOutboundDraft::stream(chunk)));
+            }
+            drafts.push(Ok(ChannelOutboundDraft::terminal("terminal")));
+            let texts = collect_texts(channel_outbound_transport_unpaced(
+                futures::stream::iter(drafts).boxed(),
+                "qq".to_string(),
+                "u1".to_string(),
+                ChatType::Direct,
+            ))
+            .await;
+            let terminal = texts.last().cloned().unwrap_or_default();
+            let recovered = texts
+                .iter()
+                .take(texts.len().saturating_sub(1))
+                .cloned()
+                .collect::<String>();
+            assert_eq!(recovered, safe);
+            assert_eq!(terminal, "terminal");
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn buffered_overflow_and_literal_marker_are_typed_not_inferred()
+        -> std::result::Result<(), String> {
+            let drafts = futures::stream::iter(vec![
+                Ok(ChannelOutboundDraft::stream("literal [REDACTED]foo")),
+                Ok(ChannelOutboundDraft::stream("visible123 ")),
+                Ok(ChannelOutboundDraft::terminal("terminal")),
+            ])
+            .boxed();
+            let literal = collect_texts(channel_outbound_transport_unpaced(
+                drafts,
+                "qq".to_string(),
+                "u1".to_string(),
+                ChatType::Direct,
+            ))
+            .await
+            .join("");
+            assert!(literal.contains("literal [REDACTED]foovisible123 "));
+
+            let overflow = futures::stream::iter(vec![
+                Ok(ChannelOutboundDraft::stream("x".repeat(260 * 1024))),
+                Ok(ChannelOutboundDraft::terminal("terminal")),
+            ])
+            .boxed();
+            let texts = collect_texts(channel_outbound_transport_unpaced(
+                overflow,
+                "qq".to_string(),
+                "u1".to_string(),
+                ChatType::Direct,
+            ))
+            .await;
+            assert!(texts.iter().any(|text| text.contains("retention limit")));
+            assert_eq!(texts.last().map(String::as_str), Some("terminal"));
+            assert!(!texts.join("").contains(&"x".repeat(128)));
+            Ok(())
+        }
+
+        #[test]
+        fn outbound_rate_fake_clock_allows_burst_then_paces_sustained_messages() {
+            let policy = channel_rate_policy("qq");
+            let started = tokio::time::Instant::now();
+            let mut remaining_burst = policy.burst;
+            let mut next_sustained = started + policy.sustained_interval;
+            for _ in 0..4 {
+                assert_eq!(
+                    channel_rate_deadline(
+                        &mut remaining_burst,
+                        &mut next_sustained,
+                        started,
+                        policy,
+                    ),
+                    None
+                );
+            }
+            assert_eq!(
+                channel_rate_deadline(&mut remaining_burst, &mut next_sustained, started, policy,),
+                Some(started + std::time::Duration::from_millis(250))
+            );
+            assert_eq!(
+                channel_rate_deadline(
+                    &mut remaining_burst,
+                    &mut next_sustained,
+                    started + std::time::Duration::from_millis(250),
+                    policy,
+                ),
+                Some(started + std::time::Duration::from_millis(500))
+            );
+        }
+
+        #[test]
+        fn channel_preserves_canonical_cli_tui_tool_fields() -> std::result::Result<(), String> {
+            let args = serde_json::json!({"path": "src/lib.rs", "offset": 12});
+            let preview = channel_tool_args_preview(&args);
+            let mut state = ChannelToolRenderState::default();
+            let update = match projection_event(
+                "call-shared",
+                "read_file",
+                &preview,
+                ToolExecutionStatus::Running,
+                ToolExecutionProjectionKind::Started,
+            ) {
+                ChannelRenderEvent::ToolProjection(update) => update,
+                _ => return Err("fixture did not produce a tool projection".to_string()),
+            };
+            assert_eq!(state.observe(update), ChannelToolObserveOutcome::Accepted);
+            let entry = state
+                .entries
+                .get("tool-call-shared")
+                .ok_or_else(|| "channel tool state did not preserve call id".to_string())?;
+
+            // CLI and TUI consume these exact canonical AgentEvent/product
+            // fields too; only their presentation differs from channel text.
+            assert_eq!(entry.summary.call_id, "call-shared");
+            assert_eq!(entry.summary.name, "read_file");
+            assert_eq!(entry.summary.args_preview, preview);
+            assert_eq!(entry.summary.status, ToolExecutionStatus::Running);
+            assert_eq!(entry.summary.detail_ref, "chat/message-1/call-shared");
+            Ok(())
+        }
+
+        #[test]
+        fn active_tools_are_bounded_and_owner_qualified() -> std::result::Result<(), String> {
+            let mut literal_state = ChannelToolRenderState::default();
+            let literal = match projection_event(
+                "literal-marker",
+                "shell",
+                "{}",
+                ToolExecutionStatus::Running,
+                ToolExecutionProjectionKind::Started,
+            ) {
+                ChannelRenderEvent::ToolProjection(update) => update,
+                _ => return Err("fixture did not produce literal marker projection".to_string()),
+            };
+            let literal_address = ChannelToolAddress::from_summary(&literal.summary);
+            assert_eq!(
+                literal_state.observe(literal),
+                ChannelToolObserveOutcome::Accepted
+            );
+            let fixed = literal_state
+                .output_preview(&literal_address, "ok...[TRUNCATED]")
+                .ok_or_else(|| "fixed output notice is missing".to_string())?;
+            assert!(!fixed.contains("ok...[TRUNCATED]"));
+            assert!(fixed.contains("output available in detail"));
+            let later = literal_state
+                .output_preview(&literal_address, "later")
+                .ok_or_else(|| "second fixed output notice is missing".to_string())?;
+            assert!(!later.contains("later"));
+
+            let mut state = ChannelToolRenderState::default();
+            for index in 0..super::super::CHANNEL_ACTIVE_TOOL_LIMIT {
+                let update = match projection_event(
+                    &format!("call-{index}"),
+                    "read_file",
+                    "{}",
+                    ToolExecutionStatus::Running,
+                    ToolExecutionProjectionKind::Started,
+                ) {
+                    ChannelRenderEvent::ToolProjection(update) => update,
+                    _ => return Err("fixture did not produce a tool projection".to_string()),
+                };
+                assert_eq!(state.observe(update), ChannelToolObserveOutcome::Accepted);
+            }
+            let overflow = match projection_event(
+                "overflow",
+                "read_file",
+                "{}",
+                ToolExecutionStatus::Running,
+                ToolExecutionProjectionKind::Started,
+            ) {
+                ChannelRenderEvent::ToolProjection(update) => update,
+                _ => return Err("fixture did not produce overflow projection".to_string()),
+            };
+            assert_eq!(state.observe(overflow), ChannelToolObserveOutcome::Capacity);
+            assert_eq!(state.entries.len(), super::super::CHANNEL_ACTIVE_TOOL_LIMIT);
+
+            let main = ChannelToolAddress::chat(
+                "workspace-a",
+                Some("conversation-a"),
+                None,
+                "message-1",
+                "call-0",
+            );
+            let subagent_summary = ToolExecutionSummary {
+                id: "tool-subagent-collision".to_string(),
+                call_id: "call-0".to_string(),
+                owner: ToolExecutionOwner::Subagent {
+                    subagent_run_id: "subagent-1".to_string(),
+                },
+                workspace_id: "workspace-a".to_string(),
+                conversation_id: Some("conversation-a".to_string()),
+                run_id: Some("run-1".to_string()),
+                name: "read_file".to_string(),
+                args_preview: "{}".to_string(),
+                status: ToolExecutionStatus::Running,
+                started_at: 1,
+                finished_at: None,
+                duration_ms: None,
+                detail_ref: "subagent/subagent-1/call-0".to_string(),
+            };
+            let _removed = state.finish(&main);
+            assert_eq!(
+                state.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "reviewer".to_string(),
+                    summary: subagent_summary,
+                }),
+                ChannelToolObserveOutcome::Accepted
+            );
+            let subagent = ChannelToolAddress::subagent(
+                "workspace-a",
+                "conversation-a",
+                "run-1",
+                "subagent-1",
+                "call-0",
+            );
+            assert!(state.entry(&subagent).is_some());
+            assert!(state.entry(&main).is_none());
+            let _removed = state.finish(&subagent);
+            assert!(state.entry(&subagent).is_none());
+            assert!(state.recent_terminals.len() <= super::super::CHANNEL_RECENT_TOOL_TERMINALS);
+
+            let mut collisions = ChannelToolRenderState::default();
+            let first = match projection_event(
+                "collision",
+                "read_file",
+                "{}",
+                ToolExecutionStatus::Running,
+                ToolExecutionProjectionKind::Started,
+            ) {
+                ChannelRenderEvent::ToolProjection(update) => update,
+                _ => return Err("fixture did not produce first collision projection".to_string()),
+            };
+            let original_summary = first.summary.clone();
+            let original_address = ChannelToolAddress::from_summary(&original_summary);
+            assert_eq!(
+                collisions.observe(first),
+                ChannelToolObserveOutcome::Accepted
+            );
+
+            let independent = ToolExecutionSummary {
+                id: "independent-canonical-id".to_string(),
+                call_id: "independent".to_string(),
+                detail_ref: "chat/message-1/independent".to_string(),
+                ..original_summary.clone()
+            };
+            let independent_address = ChannelToolAddress::from_summary(&independent);
+            assert_eq!(
+                collisions.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "echo-assistant".to_string(),
+                    summary: independent,
+                }),
+                ChannelToolObserveOutcome::Accepted
+            );
+
+            let mut same_address_other_id = original_summary.clone();
+            same_address_other_id.id = "other-canonical-id".to_string();
+            assert_eq!(
+                collisions.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "echo-assistant".to_string(),
+                    summary: same_address_other_id,
+                }),
+                ChannelToolObserveOutcome::IdentityConflict
+            );
+            assert!(collisions.entry(&original_address).is_none());
+            assert!(collisions.detail_ref(&original_address).is_none());
+            assert!(matches!(
+                collisions.finish(&original_address),
+                ChannelToolTerminal::IdentityConflict
+            ));
+            assert!(collisions.entry(&independent_address).is_some());
+            assert!(matches!(
+                collisions.finish(&independent_address),
+                ChannelToolTerminal::Render(Some(_))
+            ));
+
+            let mut canonical_collision = ChannelToolRenderState::default();
+            let first = ToolExecutionProjectionUpdate {
+                kind: ToolExecutionProjectionKind::Started,
+                agent: "echo-assistant".to_string(),
+                summary: original_summary.clone(),
+            };
+            assert_eq!(
+                canonical_collision.observe(first),
+                ChannelToolObserveOutcome::Accepted
+            );
+            let mut same_id_other_address = original_summary.clone();
+            same_id_other_address.workspace_id = "workspace-b".to_string();
+            same_id_other_address.detail_ref = "workspace-b/collision".to_string();
+            let other_address = ChannelToolAddress::from_summary(&same_id_other_address);
+            assert_eq!(
+                canonical_collision.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Finished,
+                    agent: "echo-assistant".to_string(),
+                    summary: same_id_other_address,
+                }),
+                ChannelToolObserveOutcome::IdentityConflict
+            );
+            assert!(canonical_collision.entry(&original_address).is_none());
+            assert!(canonical_collision.entry(&other_address).is_none());
+            assert!(matches!(
+                canonical_collision.finish(&other_address),
+                ChannelToolTerminal::IdentityConflict
+            ));
+
+            let mut terminal_canonical_collision = ChannelToolRenderState::default();
+            assert_eq!(
+                terminal_canonical_collision.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "echo-assistant".to_string(),
+                    summary: original_summary.clone(),
+                }),
+                ChannelToolObserveOutcome::Accepted
+            );
+            assert!(matches!(
+                terminal_canonical_collision.finish(&original_address),
+                ChannelToolTerminal::Render(Some(_))
+            ));
+            let mut terminal_same_id_other_address = original_summary.clone();
+            terminal_same_id_other_address.workspace_id = "workspace-after-terminal".to_string();
+            terminal_same_id_other_address.detail_ref =
+                "workspace-after-terminal/collision".to_string();
+            let terminal_other_address =
+                ChannelToolAddress::from_summary(&terminal_same_id_other_address);
+            assert_eq!(
+                terminal_canonical_collision.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "echo-assistant".to_string(),
+                    summary: terminal_same_id_other_address,
+                }),
+                ChannelToolObserveOutcome::IdentityConflict
+            );
+            assert!(
+                terminal_canonical_collision
+                    .entry(&original_address)
+                    .is_none()
+            );
+            assert!(
+                terminal_canonical_collision
+                    .entry(&terminal_other_address)
+                    .is_none()
+            );
+            assert!(matches!(
+                terminal_canonical_collision.finish(&terminal_other_address),
+                ChannelToolTerminal::IdentityConflict
+            ));
+
+            let mut replay = ChannelToolRenderState::default();
+            assert_eq!(
+                replay.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "echo-assistant".to_string(),
+                    summary: original_summary.clone(),
+                }),
+                ChannelToolObserveOutcome::Accepted
+            );
+            assert!(matches!(
+                replay.finish(&original_address),
+                ChannelToolTerminal::Render(Some(_))
+            ));
+            assert_eq!(
+                replay.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "echo-assistant".to_string(),
+                    summary: original_summary.clone(),
+                }),
+                ChannelToolObserveOutcome::Duplicate
+            );
+            assert!(matches!(
+                replay.finish(&original_address),
+                ChannelToolTerminal::Duplicate
+            ));
+            let mut replayed_different_id = original_summary;
+            replayed_different_id.id = "replayed-different-id".to_string();
+            assert_eq!(
+                replay.observe(ToolExecutionProjectionUpdate {
+                    kind: ToolExecutionProjectionKind::Started,
+                    agent: "echo-assistant".to_string(),
+                    summary: replayed_different_id,
+                }),
+                ChannelToolObserveOutcome::IdentityConflict
+            );
+            assert!(matches!(
+                replay.finish(&original_address),
+                ChannelToolTerminal::IdentityConflict
+            ));
+            Ok(())
+        }
+
+        #[tokio::test]
         async fn multibyte_no_panic() {
             // 中文 + emoji 不 panic,按 FinalAnswer flush
             let evs = events_to_stream(vec![
@@ -2710,7 +7013,7 @@ mod tests {
             ]);
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let texts = collect_texts(out).await;
-            assert_eq!(texts, vec!["第一句！".to_string(), "第二句？".to_string()]);
+            assert_eq!(texts.concat(), "第一句！第二句？");
         }
     }
 }

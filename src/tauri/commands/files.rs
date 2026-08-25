@@ -95,12 +95,16 @@ pub async fn list_files(
 ) -> Result<Vec<FileEntry>, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    echo_agent_app_core::product_data_io::run("list workspace files", move || {
-        let base = control.project_root();
-        list_workspace_files(&base, path.as_deref())
-    })
-    .await
-    .map_err(super::product_data::blocking_error)?
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("list workspace files", move || {
+            let base = control.project_root();
+            list_workspace_files(&base, path.as_deref())
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 fn list_workspace_files(
@@ -167,12 +171,16 @@ pub async fn read_file(
 ) -> Result<FileContent, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    echo_agent_app_core::product_data_io::run("read workspace file", move || {
-        let base = control.project_root();
-        read_workspace_file(&base, control.workspace_id(), &control.generation(), path)
-    })
-    .await
-    .map_err(super::product_data::blocking_error)?
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("read workspace file", move || {
+            let base = control.project_root();
+            read_workspace_file(&base, control.workspace_id(), &control.generation(), path)
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 #[tauri::command]
@@ -186,19 +194,23 @@ pub async fn write_file(
 ) -> Result<FileContent, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    echo_agent_app_core::product_data_io::run("write workspace file", move || {
-        let base = control.project_root();
-        write_workspace_file(
-            &base,
-            control.workspace_id(),
-            &control.generation(),
-            path,
-            content,
-            expected_revision,
-        )
-    })
-    .await
-    .map_err(super::product_data::blocking_error)?
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("write workspace file", move || {
+            let base = control.project_root();
+            write_workspace_file(
+                &base,
+                control.workspace_id(),
+                &control.generation(),
+                path,
+                content,
+                expected_revision,
+            )
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 fn write_workspace_file(
@@ -243,25 +255,29 @@ pub async fn workspace_changes(
 ) -> Result<Vec<WorkspaceChange>, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    echo_agent_app_core::product_data_io::run("load workspace changes", move || {
-        let base = control.project_root();
-        let output = std::process::Command::new("git")
-            .args(["status", "--porcelain=v1", "--untracked-files=all"])
-            .current_dir(base)
-            .output()
-            .map_err(|error| IpcError::Internal(error.to_string()))?;
-        if !output.status.success() {
-            return Err(IpcError::Internal(format!(
-                "git status failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Ok(parse_workspace_changes(&String::from_utf8_lossy(
-            &output.stdout,
-        )))
-    })
-    .await
-    .map_err(super::product_data::blocking_error)?
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("load workspace changes", move || {
+            let base = control.project_root();
+            let output = std::process::Command::new("git")
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .current_dir(base)
+                .output()
+                .map_err(|error| IpcError::Internal(error.to_string()))?;
+            if !output.status.success() {
+                return Err(IpcError::Internal(format!(
+                    "git status failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+            Ok(parse_workspace_changes(&String::from_utf8_lossy(
+                &output.stdout,
+            )))
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 fn parse_workspace_changes(text: &str) -> Vec<WorkspaceChange> {
@@ -313,12 +329,16 @@ pub async fn diff_file(
 
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    echo_agent_app_core::product_data_io::run("diff workspace file", move || {
-        let base = control.project_root();
-        diff_workspace_file(base, path, ref_str)
-    })
-    .await
-    .map_err(super::product_data::blocking_error)?
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("diff workspace file", move || {
+            let base = control.project_root();
+            diff_workspace_file(base, path, ref_str)
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 fn diff_workspace_file(
@@ -456,12 +476,16 @@ pub async fn file_tree(
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
     let max_depth = depth.unwrap_or(3);
-    echo_agent_app_core::product_data_io::run("build workspace file tree", move || {
-        let base = control.project_root();
-        build_tree(&base, &base, 0, max_depth)
-    })
-    .await
-    .map_err(super::product_data::blocking_error)
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("build workspace file tree", move || {
+            let base = control.project_root();
+            build_tree(&base, &base, 0, max_depth)
+        })
+        .await
+        .map_err(super::product_data::blocking_error)
 }
 
 #[tauri::command]
@@ -473,12 +497,16 @@ pub async fn browse_directories(
 ) -> Result<BrowseResult, IpcError> {
     let control =
         super::product_data::scoped_control(&state, &workspace_id, &workspace_generation).await?;
-    echo_agent_app_core::product_data_io::run("browse host directories", move || {
-        let _control = control;
-        browse_host_directories(path)
-    })
-    .await
-    .map_err(super::product_data::blocking_error)?
+    state
+        .app_state
+        .session
+        .product_data_io
+        .run("browse host directories", move || {
+            let _control = control;
+            browse_host_directories(path)
+        })
+        .await
+        .map_err(super::product_data::blocking_error)?
 }
 
 fn browse_host_directories(path: Option<String>) -> Result<BrowseResult, IpcError> {
