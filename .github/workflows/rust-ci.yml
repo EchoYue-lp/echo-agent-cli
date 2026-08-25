@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           repository: EchoYue-lp/echo-agent
-          ref: 34e592e23e3f5c2fa1b562473ce50b6360e8075b
+          ref: c6379aad32213ae7e806318d4fd8a28499274c39
           path: echo-agent
       - name: Prepare sibling path dependency
         run: ln -s "$GITHUB_WORKSPACE/echo-agent" "$GITHUB_WORKSPACE/../echo-agent"
