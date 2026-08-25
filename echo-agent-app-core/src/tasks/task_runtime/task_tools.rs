@@ -1173,7 +1173,13 @@ impl CheckRunStatusTool {
             Some(s) => s,
             None => return Ok(ToolResult::error("no TaskRuntimeStore available")),
         };
-        match store.get_run(&run_id) {
+        let lookup_run_id = run_id.clone();
+        match super::executor::TaskRuntimeBlockingAdapter::new(store)
+            .run_store("check TaskRun status tool", move |store| {
+                store.get_run(&lookup_run_id)
+            })
+            .await
+        {
             Ok(Some(run)) => Ok(ToolResult::success(
                 serde_json::json!({"status": format!("{:?}", run.status), "goal": run.goal})
                     .to_string(),
@@ -1230,7 +1236,13 @@ impl CancelRunTool {
             Some(s) => s,
             None => return Ok(ToolResult::error("no TaskRuntimeStore available")),
         };
-        match store.request_cancel(&run_id) {
+        let cancel_run_id = run_id.clone();
+        match super::executor::TaskRuntimeBlockingAdapter::new(store)
+            .run_store("cancel TaskRun tool", move |store| {
+                store.request_cancel(&cancel_run_id)
+            })
+            .await
+        {
             Ok(cancelled) => Ok(ToolResult::success(
                 serde_json::json!({"run_id": run_id, "cancelled": cancelled}).to_string(),
             )),

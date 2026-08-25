@@ -113,6 +113,17 @@ pub enum InteractionMode {
     Auto,
 }
 
+/// Typed IPC request for changing the application-wide interaction mode.
+///
+/// Keeping the request beside [`InteractionMode`] makes the Rust and generated
+/// TypeScript wire contract evolve together instead of translating through a
+/// numeric UI-only representation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "InteractionModeRequest")]
+pub struct InteractionModeRequest {
+    pub mode: InteractionMode,
+}
+
 impl InteractionMode {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -161,6 +172,56 @@ impl InteractionMode {
             }
         }
     }
+}
+
+/// Result of a run-level pause or cancellation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskRunControlReceipt")]
+pub struct TaskRunControlReceipt {
+    /// `true` when this request changed or signalled the run. `false` means
+    /// the addressed run was already terminal or otherwise required no action.
+    pub success: bool,
+    pub run_id: String,
+}
+
+/// Which canonical resume path accepted a TaskRun.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "TaskRunResumeKind")]
+pub enum TaskRunResumeKind {
+    Resumed,
+    ContinuationResumed,
+}
+
+/// Typed result of resuming a TaskRun.
+///
+/// `turn_id` is present when the resume launches a foreground continuation
+/// turn. Planned DAG resumes have no foreground turn identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskRunResumeReceipt")]
+pub struct TaskRunResumeReceipt {
+    pub kind: TaskRunResumeKind,
+    pub run_id: String,
+    pub turn_id: Option<String>,
+}
+
+/// Which canonical retry path accepted a task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "TaskRetryKind")]
+pub enum TaskRetryKind {
+    RetryScheduled,
+    RecoveryRetryRecorded,
+}
+
+/// Typed result of retrying one exact task attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskRetryReceipt")]
+pub struct TaskRetryReceipt {
+    pub kind: TaskRetryKind,
+    pub run_id: String,
+    pub task_id: String,
+    pub next_attempt: Option<u32>,
 }
 
 // ── Attended mode ───────────────────────────────────────────────────────
@@ -908,6 +969,7 @@ pub struct TaskRunResumeIdentity {
     pub created_at: DateTime<Utc>,
     pub goal_revision: u64,
     pub journal_sequence: u64,
+    pub continuation_enabled: bool,
 }
 
 impl TaskRunResumeIdentity {
@@ -921,22 +983,52 @@ impl TaskRunResumeIdentity {
             created_at: run.created_at,
             goal_revision: run.goal_revision,
             journal_sequence: snapshot.journal_sequence,
+            continuation_enabled: snapshot
+                .continuation
+                .as_ref()
+                .is_some_and(|continuation| continuation.enabled),
         }
     }
 
     pub fn validate_resumable(&self, snapshot: &RunStateSnapshot) -> Result<(), String> {
         let run = &snapshot.run;
-        if run.run_id != self.run_id
-            || run.workspace_id != self.workspace_id
-            || run.conversation_id != self.conversation_id
-            || run.root_message_id != self.root_message_id
-            || run.created_at != self.created_at
-            || run.goal_revision != self.goal_revision
-            || snapshot.journal_sequence != self.journal_sequence
+        let mut changed = Vec::new();
+        if run.run_id != self.run_id {
+            changed.push("run_id");
+        }
+        if run.workspace_id != self.workspace_id {
+            changed.push("workspace_id");
+        }
+        if run.conversation_id != self.conversation_id {
+            changed.push("conversation_id");
+        }
+        if run.root_message_id != self.root_message_id {
+            changed.push("root_message_id");
+        }
+        if run.created_at != self.created_at {
+            changed.push("created_at");
+        }
+        if run.goal_revision != self.goal_revision {
+            changed.push("goal_revision");
+        }
+        if snapshot.journal_sequence != self.journal_sequence {
+            changed.push("journal_sequence");
+        }
+        if snapshot
+            .continuation
+            .as_ref()
+            .is_some_and(|continuation| continuation.enabled)
+            != self.continuation_enabled
         {
+            changed.push("continuation_enabled");
+        }
+        if !changed.is_empty() {
             return Err(format!(
-                "TaskRun '{}' identity changed after resume was queued",
-                self.run_id
+                "TaskRun '{}' identity changed after resume was queued (fields: {}; journal sequence expected {}, current {})",
+                self.run_id,
+                changed.join(","),
+                self.journal_sequence,
+                snapshot.journal_sequence,
             ));
         }
         if run.status != TaskRunStatus::Paused {
@@ -2915,6 +3007,65 @@ mod tests {
         assert!(auto.contains("task_list"));
         assert_ne!(chat, task);
         assert_ne!(task, auto);
+    }
+
+    #[test]
+    fn task_runtime_ipc_receipts_preserve_typed_wire_fields() -> Result<(), String> {
+        let request = InteractionModeRequest {
+            mode: InteractionMode::Task,
+        };
+        let request_json = serde_json::to_value(request).map_err(|error| error.to_string())?;
+        assert_eq!(request_json, serde_json::json!({ "mode": "task" }));
+
+        let planned = TaskRunResumeReceipt {
+            kind: TaskRunResumeKind::Resumed,
+            run_id: "run-planned".to_string(),
+            turn_id: None,
+        };
+        let planned_json = serde_json::to_value(&planned).map_err(|error| error.to_string())?;
+        assert_eq!(
+            planned_json.get("kind").and_then(serde_json::Value::as_str),
+            Some("resumed")
+        );
+        assert!(
+            planned_json
+                .get("turn_id")
+                .is_some_and(serde_json::Value::is_null)
+        );
+
+        let continuation = TaskRunResumeReceipt {
+            kind: TaskRunResumeKind::ContinuationResumed,
+            run_id: "run-continuation".to_string(),
+            turn_id: Some("turn-1".to_string()),
+        };
+        let encoded = serde_json::to_string(&continuation).map_err(|error| error.to_string())?;
+        let decoded: TaskRunResumeReceipt =
+            serde_json::from_str(&encoded).map_err(|error| error.to_string())?;
+        assert_eq!(decoded, continuation);
+        assert_eq!(decoded.turn_id.as_deref(), Some("turn-1"));
+
+        let control = TaskRunControlReceipt {
+            success: false,
+            run_id: "already-terminal".to_string(),
+        };
+        assert!(!control.success);
+        let retry = TaskRetryReceipt {
+            kind: TaskRetryKind::RecoveryRetryRecorded,
+            run_id: "retry-run".to_string(),
+            task_id: "task-1".to_string(),
+            next_attempt: None,
+        };
+        let retry_json = serde_json::to_value(retry).map_err(|error| error.to_string())?;
+        assert_eq!(
+            retry_json.get("kind").and_then(serde_json::Value::as_str),
+            Some("recovery_retry_recorded")
+        );
+        assert!(
+            retry_json
+                .get("next_attempt")
+                .is_some_and(serde_json::Value::is_null)
+        );
+        Ok(())
     }
 
     #[test]

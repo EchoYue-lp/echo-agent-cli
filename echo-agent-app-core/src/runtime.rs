@@ -340,14 +340,21 @@ impl ApplicationLifecycleOwner {
             {
                 receipt.record("TaskRun driver admission", error);
             }
+            if let Some(store) = self.task_runtime_store.as_ref()
+                && let Err(error) = store.begin_operation_shutdown()
+            {
+                receipt.record("TaskRuntime operation admission", error);
+            }
             if let Some(pool) = self.pool.as_ref() {
                 pool.begin_shutdown();
             }
             if let Some(integration) = self.review_integration.as_ref() {
                 integration.begin_background_review_shutdown();
             }
-            if let Some(runtime) = self.command_cell_runtime.as_ref() {
-                runtime.begin_shutdown();
+            if let Some(runtime) = self.command_cell_runtime.as_ref()
+                && let Err(error) = runtime.begin_shutdown()
+            {
+                receipt.record("command cells", error);
             }
         }
         for owner in &mut self.external_owners {
@@ -454,6 +461,9 @@ impl ApplicationLifecycleOwner {
         if let Some(store) = self.task_runtime_store.as_ref() {
             if let Err(error) = store.shutdown_run_drivers().await {
                 receipt.record("TaskRun drivers", error);
+            }
+            if let Err(error) = store.shutdown_operations().await {
+                receipt.record("TaskRuntime operations", error);
             }
             if let Err(error) = store.shutdown_hook_events().await {
                 receipt.record("task hook dispatcher", error);
@@ -1439,6 +1449,66 @@ mod tests {
             });
         assert!(receipt.is_clean(), "unexpected receipt: {receipt}");
         assert!(settled.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn application_shutdown_joins_blocking_operation_after_caller_abort() -> Result<(), String>
+    {
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            adapter
+                .run_owned("application shutdown barrier", move || {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(|error| {
+                            crate::tasks::task_runtime::StoreError::InvalidPlan(error.to_string())
+                        })?;
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx
+            .await
+            .map_err(|_| "blocking operation did not enter".to_string())?;
+        caller.abort();
+        let _ = caller.await;
+
+        let mut owner = ApplicationLifecycleOwner::new(tokio_util::sync::CancellationToken::new());
+        owner.bind_task_runtime(store.clone());
+        let receipt = owner.begin_shutdown(ApplicationLifecycleReason::Shutdown, None);
+        let rejected = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+            .run_owned("late application operation", || Ok(()))
+            .await;
+        if !rejected.is_err_and(|error| error.to_string().contains("admission is closed")) {
+            return Err("application phase one did not close TaskRuntime operations".to_string());
+        }
+        let settlement = owner.start_join(receipt);
+        let waiter = tokio::spawn(settlement.wait());
+        tokio::task::yield_now().await;
+        if waiter.is_finished() {
+            return Err("application shutdown crossed an active TaskRuntime operation".to_string());
+        }
+        release_tx
+            .send(())
+            .map_err(|error| format!("failed to release blocking operation: {error}"))?;
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .map_err(|_| "application settlement timed out".to_string())?
+            .map_err(|error| format!("application settlement failed to join: {error}"))?;
+        if !receipt.is_clean() {
+            return Err(format!("unexpected lifecycle receipt: {receipt}"));
+        }
+        if store.active_operation_count() != 0 {
+            return Err("TaskRuntime operation supervisor remained active".to_string());
+        }
+        Ok(())
     }
 
     fn make_test_classifier() -> KeywordClassifier {

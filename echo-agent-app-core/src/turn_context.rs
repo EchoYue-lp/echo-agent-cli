@@ -186,6 +186,7 @@ impl PreModelContextProjector for EkoContextProjector {
             ) {
                 (Some((service, scope)), Some(conversation_id), Some(turn_id)) => service
                     .project_pending_awaiter_results(scope.workspace_id(), conversation_id, turn_id)
+                    .await
                     .map_err(echo_agent::error::ReactError::Other)?,
                 _ => None,
             };

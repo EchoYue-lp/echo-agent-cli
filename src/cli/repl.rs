@@ -2018,50 +2018,28 @@ async fn prepare_repl_turn_start(
         .await
         .map_err(ReplTurnStartError::from_conversation_admission)?;
     let resume_is_continuation = if let Some(resume) = input.task_run_resume.as_ref() {
-        let snapshot = match scoped_runtime
-            .task_runtime()
-            .ok_or_else(|| "TaskRuntime store is unavailable".to_string())
-            .and_then(|store| {
-                store
-                    .get_run_state(&resume.run_id)
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| format!("TaskRun '{}' no longer exists", resume.run_id))
-            }) {
-            Ok(snapshot) => snapshot,
-            Err(detail) => {
-                lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
-                    echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
-                ));
-                return Err(ReplTurnStartError::Permanent(detail));
-            }
+        let validation = if resume.workspace_id != scoped_runtime.execution_scope().workspace_id() {
+            Err(format!(
+                "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
+                resume.run_id,
+                resume.workspace_id,
+                scoped_runtime.execution_scope().workspace_id()
+            ))
+        } else if resume.conversation_id != conversation_id {
+            Err(format!(
+                "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
+                resume.run_id, resume.conversation_id, conversation_id
+            ))
+        } else {
+            Ok(())
         };
-        let validation = resume.validate_resumable(&snapshot).and_then(|()| {
-            if resume.workspace_id != scoped_runtime.execution_scope().workspace_id() {
-                Err(format!(
-                    "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
-                    resume.run_id,
-                    resume.workspace_id,
-                    scoped_runtime.execution_scope().workspace_id()
-                ))
-            } else if resume.conversation_id != conversation_id {
-                Err(format!(
-                    "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
-                    resume.run_id, resume.conversation_id, conversation_id
-                ))
-            } else {
-                Ok(())
-            }
-        });
         if let Err(detail) = validation {
             lease.settle(echo_agent_app_core::chat_driver::TurnOutcome::Failed(
                 echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
             ));
             return Err(ReplTurnStartError::Permanent(detail));
         }
-        snapshot
-            .continuation
-            .as_ref()
-            .is_some_and(|continuation| continuation.enabled)
+        resume.continuation_enabled
     } else {
         false
     };
@@ -2494,6 +2472,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 goal_revision: 1,
                 journal_sequence: 7,
+                continuation_enabled: false,
             },
         );
         queue.enqueue(stale_resume);

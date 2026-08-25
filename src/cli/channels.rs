@@ -194,7 +194,7 @@ impl AppChannelMessageHandler {
         Ok(receipts)
     }
 
-    fn current_task_run(
+    async fn current_task_run(
         store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
         conv: &str,
         requested_run_id: Option<&str>,
@@ -206,24 +206,56 @@ impl AppChannelMessageHandler {
         String,
     > {
         let store = store.ok_or_else(|| "TaskRuntime store is unavailable".to_string())?;
-        let run = match requested_run_id.filter(|run_id| !run_id.trim().is_empty()) {
-            Some(run_id) => store.get_run(run_id).map_err(|error| error.to_string())?,
-            None => store
-                .latest_run_for_conversation(conv)
-                .map_err(|error| error.to_string())?,
-        }
-        .ok_or_else(|| "No TaskRun was found for this conversation.".to_string())?;
-        if run.conversation_id != conv {
-            return Err(format!(
-                "TaskRun {} belongs to another conversation.",
-                run.run_id
-            ));
-        }
-        let snapshot = store
-            .get_run_state(&run.run_id)
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| format!("TaskRun {} has no event projection.", run.run_id))?;
+        let requested_run_id = requested_run_id
+            .filter(|run_id| !run_id.trim().is_empty())
+            .map(str::to_string);
+        let conversation_id = conv.to_string();
+        let snapshot = Self::task_runtime_io(store.clone(), "load channel TaskRun", move |store| {
+            let run = match requested_run_id {
+                Some(run_id) => store.get_run(&run_id)?,
+                None => store.latest_run_for_conversation(&conversation_id)?,
+            }
+            .ok_or_else(|| {
+                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                    "No TaskRun was found for this conversation.".to_string(),
+                )
+            })?;
+            if run.conversation_id != conversation_id {
+                return Err(
+                    echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                        "TaskRun {} belongs to another conversation.",
+                        run.run_id
+                    )),
+                );
+            }
+            store.get_run_state(&run.run_id)?.ok_or_else(|| {
+                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                    "TaskRun {} has no event projection.",
+                    run.run_id
+                ))
+            })
+        })
+        .await?;
         Ok((store, snapshot))
+    }
+
+    async fn task_runtime_io<T, F>(
+        store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+        operation: &'static str,
+        function: F,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+            ) -> Result<T, echo_agent_app_core::tasks::task_runtime::StoreError>
+            + Send
+            + 'static,
+    {
+        echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+            .run_store(operation, function)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn agent_router_command_response(
@@ -351,7 +383,9 @@ impl AppChannelMessageHandler {
                 task_runtime.clone(),
                 conv,
                 Some(&parsed.identity.run_id),
-            ) {
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
             };
@@ -374,11 +408,13 @@ impl AppChannelMessageHandler {
                     let Some(instruction) = parsed.instruction.as_deref() else {
                         return Some(ChannelTaskRunControl::Reply(format!("Usage: {usage}")));
                     };
-                    service.queue_guidance(
-                        parsed.identity,
-                        instruction,
-                        echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Channel,
-                    )
+                    service
+                        .queue_guidance_async(
+                            parsed.identity,
+                            instruction.to_string(),
+                            echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Channel,
+                        )
+                        .await
                 }
                 "/subagent-interrupt" => {
                     service
@@ -415,17 +451,28 @@ impl AppChannelMessageHandler {
                 task_runtime.clone(),
                 conv,
                 parsed.requested_run_id.as_deref(),
-            ) {
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
             };
-            let reply = match store.update_run_goal(
-                &snapshot.run.run_id,
-                parsed.expected_goal_revision,
-                &parsed.new_goal,
-                &parsed.reason,
-                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Channel,
-            ) {
+            let run_id = snapshot.run.run_id;
+            let reply = match Self::task_runtime_io(
+                store,
+                "update channel TaskRun Goal",
+                move |store| {
+                    store.update_run_goal(
+                        &run_id,
+                        parsed.expected_goal_revision,
+                        &parsed.new_goal,
+                        &parsed.reason,
+                        echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Channel,
+                    )
+                },
+            )
+            .await
+            {
                 Ok(run) => format!(
                     "TaskRun {} Goal updated to revision {}; update its task graph before resuming.",
                     run.run_id, run.goal_revision
@@ -437,14 +484,20 @@ impl AppChannelMessageHandler {
         if command == "/task-requirements" {
             let requested_run_id = parts.next();
             let (store, snapshot) =
-                match Self::current_task_run(task_runtime.clone(), conv, requested_run_id) {
+                match Self::current_task_run(task_runtime.clone(), conv, requested_run_id).await {
                     Ok(value) => value,
                     Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
                 };
-            let reply = match store.completion_gate_report(&snapshot.run.run_id) {
-                Ok(report) => format_channel_completion_gate(&report),
-                Err(error) => format!("Unable to read completion gate: {error}"),
-            };
+            let run_id = snapshot.run.run_id;
+            let reply =
+                match Self::task_runtime_io(store, "load channel completion gate", move |store| {
+                    store.completion_gate_report(&run_id)
+                })
+                .await
+                {
+                    Ok(report) => format_channel_completion_gate(&report),
+                    Err(error) => format!("Unable to read completion gate: {error}"),
+                };
             return Some(ChannelTaskRunControl::Reply(reply));
         }
         if command == "/task-requirement-skip" {
@@ -457,20 +510,28 @@ impl AppChannelMessageHandler {
                 task_runtime.clone(),
                 conv,
                 parsed.requested_run_id.as_deref(),
-            ) {
+            )
+            .await
+            {
                 Ok(value) => value,
                 Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
             };
-            let reply = match store.skip_goal_requirement(
-                &snapshot.run.run_id,
-                parsed.expected_goal_revision,
-                &parsed.requirement_id,
-                &parsed.reason,
-                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Channel,
-            ) {
-                Ok(report) => format_channel_completion_gate(&report),
-                Err(error) => format!("Unable to confirm requirement Skip: {error}"),
-            };
+            let run_id = snapshot.run.run_id;
+            let reply =
+                match Self::task_runtime_io(store, "skip channel Goal requirement", move |store| {
+                    store.skip_goal_requirement(
+                        &run_id,
+                        parsed.expected_goal_revision,
+                        &parsed.requirement_id,
+                        &parsed.reason,
+                        echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Channel,
+                    )
+                })
+                .await
+                {
+                    Ok(report) => format_channel_completion_gate(&report),
+                    Err(error) => format!("Unable to confirm requirement Skip: {error}"),
+                };
             return Some(ChannelTaskRunControl::Reply(reply));
         }
         let (action, budget_values, requested_run_id) = match command {
@@ -518,23 +579,38 @@ impl AppChannelMessageHandler {
             }
             _ => return None,
         };
-        let (store, snapshot) = match Self::current_task_run(task_runtime, conv, requested_run_id) {
-            Ok(value) => value,
-            Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
-        };
+        let (store, snapshot) =
+            match Self::current_task_run(task_runtime, conv, requested_run_id).await {
+                Ok(value) => value,
+                Err(error) => return Some(ChannelTaskRunControl::Reply(error)),
+            };
         let run_id = snapshot.run.run_id.clone();
         let reply = match action {
             "status" => format_channel_task_run_status(&snapshot),
-            "pause" => match store.request_pause(&run_id) {
-                Ok(true) => format!("TaskRun {run_id} paused."),
-                Ok(false) => format!("TaskRun {run_id} is not actively pausable."),
-                Err(error) => format!("Unable to pause TaskRun {run_id}: {error}"),
-            },
-            "cancel" => match store.request_cancel(&run_id) {
-                Ok(true) => format!("TaskRun {run_id} cancelled."),
-                Ok(false) => format!("TaskRun {run_id} is already terminal."),
-                Err(error) => format!("Unable to cancel TaskRun {run_id}: {error}"),
-            },
+            "pause" => {
+                let owned_run_id = run_id.clone();
+                match Self::task_runtime_io(store.clone(), "pause channel TaskRun", move |store| {
+                    store.request_pause(&owned_run_id)
+                })
+                .await
+                {
+                    Ok(true) => format!("TaskRun {run_id} paused."),
+                    Ok(false) => format!("TaskRun {run_id} is not actively pausable."),
+                    Err(error) => format!("Unable to pause TaskRun {run_id}: {error}"),
+                }
+            }
+            "cancel" => {
+                let owned_run_id = run_id.clone();
+                match Self::task_runtime_io(store.clone(), "cancel channel TaskRun", move |store| {
+                    store.request_cancel(&owned_run_id)
+                })
+                .await
+                {
+                    Ok(true) => format!("TaskRun {run_id} cancelled."),
+                    Ok(false) => format!("TaskRun {run_id} is already terminal."),
+                    Err(error) => format!("Unable to cancel TaskRun {run_id}: {error}"),
+                }
+            }
             "resume" => {
                 if snapshot.run.status
                     != echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused
@@ -568,11 +644,21 @@ impl AppChannelMessageHandler {
                 let budgets = parse_channel_budget(token_value, "token").and_then(|tokens| {
                     parse_channel_budget(time_value, "time").map(|time| (tokens, time))
                 });
-                match budgets.and_then(|(tokens, time)| {
-                    store
-                        .update_run_continuation_budgets(&run_id, tokens, time)
-                        .map_err(|error| error.to_string())
-                }) {
+                let result = match budgets {
+                    Ok((tokens, time)) => {
+                        let owned_run_id = run_id.clone();
+                        Self::task_runtime_io(
+                            store,
+                            "update channel TaskRun budgets",
+                            move |store| {
+                                store.update_run_continuation_budgets(&owned_run_id, tokens, time)
+                            },
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                };
+                match result {
                     Ok(_) => format!("TaskRun {run_id} budgets updated."),
                     Err(error) => format!("Unable to update TaskRun {run_id} budgets: {error}"),
                 }

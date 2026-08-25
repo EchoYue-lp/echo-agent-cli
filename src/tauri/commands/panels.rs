@@ -1859,6 +1859,39 @@ struct ScopedWorktreeControl {
     store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
 }
 
+async fn run_taskruntime_worktree_operation<T, E, F>(
+    store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    operation: &'static str,
+    function: F,
+) -> Result<T, IpcError>
+where
+    T: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce(Option<&echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>) -> Result<T, E>
+        + Send
+        + 'static,
+{
+    match store {
+        Some(store) => {
+            let operation_store = store.clone();
+            echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+                .run_owned(operation, move || {
+                    function(Some(operation_store.as_ref())).map_err(|error| {
+                        echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                            error.to_string(),
+                        )
+                    })
+                })
+                .await
+                .map_err(|error| IpcError::Internal(error.to_string()))
+        }
+        None => tokio::task::spawn_blocking(move || function(None))
+            .await
+            .map_err(|error| IpcError::Internal(format!("Failed to join {operation}: {error}")))?
+            .map_err(|error| IpcError::Internal(error.to_string())),
+    }
+}
+
 async fn worktree_control_for_workspace(
     state: &TauriState,
     workspace_id: &str,
@@ -2168,15 +2201,13 @@ pub async fn list_unattended_worktrees(
     let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
     let store = control.store.clone();
 
-    let unattended = tokio::task::spawn_blocking(move || {
-        echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
-            &repo_root,
-            store.as_deref(),
-        )
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree listing: {error}")))?
-    .map_err(|error| IpcError::Internal(format!("Failed to list unattended worktrees: {error}")))?;
+    let unattended =
+        run_taskruntime_worktree_operation(store, "list unattended worktrees", move |store| {
+            echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
+                &repo_root, store,
+            )
+        })
+        .await?;
     drop(control);
 
     let result: Vec<serde_json::Value> = unattended
@@ -2211,29 +2242,39 @@ pub async fn merge_unattended_worktree(
     let control = worktree_control_for_workspace(&state, &workspace_id).await?;
     let repo_root = git_repo_root_async(control.repo_root.clone()).await?;
     let store = control.store.clone();
-    if store
-        .as_ref()
-        .and_then(|store| store.get_run(&run_id).ok().flatten())
-        .is_none_or(|run| run.workspace_id != workspace_id)
-    {
-        return Err(IpcError::Validation(format!(
-            "TaskRun '{run_id}' does not belong to workspace '{workspace_id}'"
-        )));
+    if let Some(store) = store.as_ref() {
+        let lookup_run_id = run_id.clone();
+        let run = echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(
+            store.clone(),
+        )
+        .run_store("validate unattended worktree TaskRun", move |store| {
+            store.get_run(&lookup_run_id)
+        })
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+        if run.is_none_or(|run| run.workspace_id != workspace_id) {
+            return Err(IpcError::Validation(format!(
+                "TaskRun '{run_id}' does not belong to workspace '{workspace_id}'"
+            )));
+        }
+    } else {
+        return Err(IpcError::Validation(
+            "TaskRuntime store is unavailable for unattended worktree merge".to_string(),
+        ));
     }
     let merge_lock =
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
     let run_id_for_merge = run_id.clone();
-    let outcome = tokio::task::spawn_blocking(move || {
-        echo_agent_app_core::tasks::task_runtime::worktree::merge_unattended_worktree(
-            &repo_root,
-            &run_id_for_merge,
-            store.as_deref(),
-        )
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree merge: {error}")))?
-    .map_err(|error| IpcError::Internal(format!("Failed to merge unattended worktree: {error}")))?;
+    let outcome =
+        run_taskruntime_worktree_operation(store, "merge unattended worktree", move |store| {
+            echo_agent_app_core::tasks::task_runtime::worktree::merge_unattended_worktree(
+                &repo_root,
+                &run_id_for_merge,
+                store,
+            )
+        })
+        .await?;
     drop(control);
 
     Ok(json!({
@@ -2260,18 +2301,14 @@ pub async fn discard_unattended_worktree(
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
     let run_id_for_discard = run_id.clone();
-    tokio::task::spawn_blocking(move || {
+    run_taskruntime_worktree_operation(store, "discard unattended worktree", move |store| {
         echo_agent_app_core::tasks::task_runtime::worktree::discard_unattended_worktree(
             &repo_root,
             &run_id_for_discard,
-            store.as_deref(),
+            store,
         )
     })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree discard: {error}")))?
-    .map_err(|error| {
-        IpcError::Internal(format!("Failed to discard unattended worktree: {error}"))
-    })?;
+    .await?;
     drop(control);
 
     Ok(json!({"success": true, "discarded": run_id}))
@@ -2288,17 +2325,13 @@ pub async fn cleanup_unattended_worktrees(
     let merge_lock =
         echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
     let _merge_guard = merge_lock.lock().await;
-    let result = tokio::task::spawn_blocking(move || {
-        echo_agent_app_core::tasks::task_runtime::worktree::cleanup_unattended_worktrees(
-            &repo_root,
-            store.as_deref(),
-        )
-    })
-    .await
-    .map_err(|error| IpcError::Internal(format!("Failed to join worktree cleanup: {error}")))?
-    .map_err(|error| {
-        IpcError::Internal(format!("Failed to clean unattended worktrees: {error}"))
-    })?;
+    let result =
+        run_taskruntime_worktree_operation(store, "clean unattended worktrees", move |store| {
+            echo_agent_app_core::tasks::task_runtime::worktree::cleanup_unattended_worktrees(
+                &repo_root, store,
+            )
+        })
+        .await?;
     drop(control);
 
     Ok(json!({

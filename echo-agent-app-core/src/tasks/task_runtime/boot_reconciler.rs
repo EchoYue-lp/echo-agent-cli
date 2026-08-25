@@ -3,7 +3,8 @@ use std::sync::{Arc, Weak};
 use tokio::sync::OnceCell;
 
 use super::{
-    BootAutoResumeDecision, BootAutoResumeOutcome, TaskRun, TaskRunStatus, TaskRuntimeStore,
+    BootAutoResumeDecision, BootAutoResumeOutcome, TaskRun, TaskRunStatus,
+    TaskRuntimeBlockingAdapter, TaskRuntimeStore,
 };
 
 #[derive(Debug, Clone)]
@@ -42,8 +43,11 @@ impl TaskRunBootReconciler {
                 let store = self.store.upgrade().ok_or_else(|| {
                     "TaskRuntimeStore was released before boot recovery".to_string()
                 })?;
-                store
-                    .recover_incomplete()
+                TaskRuntimeBlockingAdapter::new(store)
+                    .run_store("recover incomplete TaskRuns", |store| {
+                        store.recover_incomplete()
+                    })
+                    .await
                     .map_err(|error| error.to_string())
             })
             .await
@@ -56,8 +60,11 @@ impl TaskRunBootReconciler {
             .store
             .upgrade()
             .ok_or_else(|| "TaskRuntimeStore was released before candidate listing".to_string())?;
-        store
-            .list_runs_in(&[TaskRunStatus::Paused])
+        TaskRuntimeBlockingAdapter::new(store)
+            .run_store("list boot-resumable TaskRuns", |store| {
+                store.list_runs_in(&[TaskRunStatus::Paused])
+            })
+            .await
             .map_err(|error| error.to_string())
     }
 
@@ -72,8 +79,12 @@ impl TaskRunBootReconciler {
             .store
             .upgrade()
             .ok_or_else(|| "TaskRuntimeStore was released before boot admission".to_string())?;
-        store
-            .boot_auto_resume_decision(run_id, launcher_ready, interactive_owner_ready)
+        let run_id = run_id.to_string();
+        TaskRuntimeBlockingAdapter::new(store)
+            .run_store("evaluate TaskRun boot resume", move |store| {
+                store.boot_auto_resume_decision(&run_id, launcher_ready, interactive_owner_ready)
+            })
+            .await
             .map_err(|error| error.to_string())
     }
 
@@ -107,8 +118,16 @@ impl TaskRunBootReconciler {
             }
             BootAutoResumeDecision::Ready { .. } => {}
         }
-        match store
-            .resume_task_run_after_boot(run_id, launcher_ready, interactive_owner_ready)
+        let owned_run_id = run_id.to_string();
+        match TaskRuntimeBlockingAdapter::new(store)
+            .run_store("resume TaskRun after boot", move |store| {
+                store.resume_task_run_after_boot(
+                    &owned_run_id,
+                    launcher_ready,
+                    interactive_owner_ready,
+                )
+            })
+            .await
             .map_err(|error| error.to_string())?
         {
             BootAutoResumeOutcome::Resumed(run) => Ok(TaskRunBootOutcome::Resumed(run)),

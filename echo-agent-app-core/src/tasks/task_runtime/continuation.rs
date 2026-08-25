@@ -318,6 +318,7 @@ impl TaskContinuationRuntime {
                             "continuation dispatch terminated unexpectedly",
                         ),
                     )
+                    .await
                 } else {
                     continuation_failure(
                         "continuation_panic",
@@ -366,7 +367,7 @@ impl TaskContinuationRuntime {
                 .map(|entry| entry.launcher.clone())
             else {
                 store.wait_for_run_driver_idle(&run_id).await;
-                let terminal = stopped_terminal_for_run(&store, &run_id, terminal);
+                let terminal = stopped_terminal_for_run(&store, &run_id, terminal).await;
                 self.finish_dispatch(
                     &run_id,
                     dispatch_generation,
@@ -383,7 +384,7 @@ impl TaskContinuationRuntime {
                 .map(crate::foreground_turn::ForegroundTurnProgress::cancellation_token)
                 .unwrap_or_else(CancellationToken::new);
             if turn_cancel.is_cancelled() {
-                let _cancelled = store.request_cancel(&run_id);
+                request_continuation_cancel(&store, &run_id).await;
                 store.wait_for_run_driver_idle(&run_id).await;
                 drop(launcher);
                 self.finish_dispatch(
@@ -398,7 +399,7 @@ impl TaskContinuationRuntime {
             }
             if dispatch_cancel.is_cancelled() {
                 store.wait_for_run_driver_idle(&run_id).await;
-                let terminal = stopped_terminal_for_run(&store, &run_id, terminal);
+                let terminal = stopped_terminal_for_run(&store, &run_id, terminal).await;
                 drop(launcher);
                 self.finish_dispatch(
                     &run_id,
@@ -424,7 +425,7 @@ impl TaskContinuationRuntime {
             }
             tokio::select! {
                 _ = turn_cancel.cancelled() => {
-                    let _cancelled = store.request_cancel(&run_id);
+                    request_continuation_cancel(&store, &run_id).await;
                     store.wait_for_run_driver_idle(&run_id).await;
                     drop(launcher);
                     self.finish_dispatch(
@@ -439,7 +440,7 @@ impl TaskContinuationRuntime {
                 }
                 _ = dispatch_cancel.cancelled() => {
                     store.wait_for_run_driver_idle(&run_id).await;
-                    let terminal = stopped_terminal_for_run(&store, &run_id, terminal);
+                    let terminal = stopped_terminal_for_run(&store, &run_id, terminal).await;
                     drop(launcher);
                     self.finish_dispatch(
                         &run_id,
@@ -478,7 +479,7 @@ impl TaskContinuationRuntime {
                 );
                 return;
             }
-            match continuation_eligibility(&store, &run_id) {
+            match continuation_eligibility(&store, &run_id).await {
                 ContinuationEligibility::Ready => {}
                 ContinuationEligibility::RetryAt(deadline) => {
                     let delay = (deadline - chrono::Utc::now()).to_std().unwrap_or_default();
@@ -487,7 +488,7 @@ impl TaskContinuationRuntime {
                         .await
                     {
                         RetryWaitOutcome::RootCancelled => {
-                            let _cancelled = store.request_cancel(&run_id);
+                            request_continuation_cancel(&store, &run_id).await;
                             drop(launcher);
                             self.finish_dispatch(
                                 &run_id,
@@ -501,7 +502,8 @@ impl TaskContinuationRuntime {
                         }
                         RetryWaitOutcome::DispatchCancelled => {
                             store.wait_for_run_driver_idle(&run_id).await;
-                            let terminal = stopped_terminal_for_run(&store, &run_id, terminal);
+                            let terminal =
+                                stopped_terminal_for_run(&store, &run_id, terminal).await;
                             drop(launcher);
                             self.finish_dispatch(
                                 &run_id,
@@ -542,7 +544,7 @@ impl TaskContinuationRuntime {
                     return;
                 }
                 ContinuationEligibility::Stop => {
-                    let terminal = stopped_terminal_for_run(&store, &run_id, terminal);
+                    let terminal = stopped_terminal_for_run(&store, &run_id, terminal).await;
                     drop(launcher);
                     self.finish_dispatch(
                         &run_id,
@@ -579,7 +581,7 @@ impl TaskContinuationRuntime {
                     tracing::warn!(run_id, %error, "long-horizon continuation turn failed");
                     let terminal = if dispatch_cancel.is_cancelled() {
                         store.wait_for_run_driver_idle(&run_id).await;
-                        stopped_terminal_for_run(&store, &run_id, terminal)
+                        stopped_terminal_for_run(&store, &run_id, terminal).await
                     } else {
                         continuation_failure("continuation_driver", error)
                     };
@@ -931,12 +933,18 @@ fn continuation_failure(code: &str, message: impl Into<String>) -> crate::chat_d
     crate::chat_driver::TurnOutcome::Failed(echo_agent::error::AgentFailure::message(code, message))
 }
 
-fn stopped_terminal_for_run(
-    store: &TaskRuntimeStore,
+async fn stopped_terminal_for_run(
+    store: &Arc<TaskRuntimeStore>,
     run_id: &str,
     previous: crate::chat_driver::TurnOutcome,
 ) -> crate::chat_driver::TurnOutcome {
-    match store.get_run(run_id) {
+    let lookup_run_id = run_id.to_string();
+    let run = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store("load stopped continuation TaskRun", move |store| {
+            store.get_run(&lookup_run_id)
+        })
+        .await;
+    match run {
         Ok(Some(run)) => match run.status {
             TaskRunStatus::Cancelled => crate::chat_driver::TurnOutcome::Cancelled,
             TaskRunStatus::Failed => continuation_failure(
@@ -1020,8 +1028,17 @@ enum ContinuationEligibility {
     Stop,
 }
 
-fn continuation_eligibility(store: &TaskRuntimeStore, run_id: &str) -> ContinuationEligibility {
-    let Ok(Some(snapshot)) = store.get_run_state(run_id) else {
+async fn continuation_eligibility(
+    store: &Arc<TaskRuntimeStore>,
+    run_id: &str,
+) -> ContinuationEligibility {
+    let lookup_run_id = run_id.to_string();
+    let Ok(Some(snapshot)) = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store("load continuation eligibility", move |store| {
+            store.get_run_state(&lookup_run_id)
+        })
+        .await
+    else {
         return ContinuationEligibility::Stop;
     };
     if snapshot.run.status != TaskRunStatus::Running {
@@ -1054,6 +1071,18 @@ fn continuation_eligibility(store: &TaskRuntimeStore, run_id: &str) -> Continuat
         return ContinuationEligibility::Stop;
     }
     ContinuationEligibility::Ready
+}
+
+async fn request_continuation_cancel(store: &Arc<TaskRuntimeStore>, run_id: &str) {
+    let run_id = run_id.to_string();
+    if let Err(error) = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store("cancel continuation TaskRun", move |store| {
+            store.request_cancel(&run_id)
+        })
+        .await
+    {
+        tracing::warn!(%error, "failed to persist continuation cancellation");
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1094,7 +1123,7 @@ pub(crate) async fn await_owned_continue(
 
     let outcome = loop {
         let notified = wake.notified();
-        match continuation_eligibility(store, run_id) {
+        match continuation_eligibility(store, run_id).await {
             ContinuationEligibility::Ready => break OwnedContinueOutcome::Ready,
             ContinuationEligibility::Stop => break OwnedContinueOutcome::Stop,
             ContinuationEligibility::Deferred => {

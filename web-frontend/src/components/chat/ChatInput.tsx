@@ -19,7 +19,7 @@ import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useChatStore, cacheHitRate } from '../../stores/chatStore';
 import type { Attachment } from '../../types/api';
-import type { ConfiguredModel } from '../../generated';
+import type { ConfiguredModel, InteractionMode } from '../../generated';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import { isKnownThinkingLevel, thinkingLevelOptions } from './thinkingLevels';
@@ -33,9 +33,9 @@ import {
 
 const THINKING_STORAGE_KEY = 'echo_thinking_level';
 const INTERACTION_MODES = [
-  { id: 1, label: 'Chat', description: '直接对话' },
-  { id: 2, label: 'Task', description: '计划并执行复杂任务' },
-  { id: 0, label: 'Auto', description: '由 Agent 选择执行路径' },
+  { id: 'chat', label: 'Chat', description: '直接对话' },
+  { id: 'task', label: 'Task', description: '计划并执行复杂任务' },
+  { id: 'auto', label: 'Auto', description: '由 Agent 选择执行路径' },
 ] as const;
 function loadThinkingLevel(): string {
   try {
@@ -333,8 +333,10 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const [thinkingLevel, setThinkingLevel] = useState<string>(loadThinkingLevel);
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
   const [switchingThinking, setSwitchingThinking] = useState(false);
-  const [interactionMode, setInteractionMode] = useState<number>(0);
-  const [switchingInteractionMode, setSwitchingInteractionMode] = useState<number | null>(null);
+  const [interactionMode, setInteractionMode] = useState<InteractionMode>('auto');
+  const [switchingInteractionMode, setSwitchingInteractionMode] = useState<InteractionMode | null>(
+    null
+  );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
@@ -381,7 +383,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const loadInteractionMode = useCallback(async () => {
     try {
       const mode = await taskRuntimeApi.getInteractionMode();
-      setInteractionMode(INTERACTION_MODES.some((m) => m.id === mode) ? mode : 0);
+      setInteractionMode(INTERACTION_MODES.some((m) => m.id === mode) ? mode : 'auto');
     } catch (e) {
       console.error('[ChatInput] Failed to load interaction mode:', e);
     }
@@ -459,7 +461,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   );
 
   const switchInteractionMode = useCallback(
-    async (mode: number) => {
+    async (mode: InteractionMode) => {
       if (mode === interactionMode || switchingInteractionMode !== null) return;
       setSwitchingInteractionMode(mode);
       try {

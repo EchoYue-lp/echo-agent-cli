@@ -446,22 +446,35 @@ pub async fn send_chat_message(
     // run, do NOT start a new one. Instead, emit an InterruptPrompt event
     // so the GUI can ask the user what to do (resume / edit-and-resume /
     // abandon).
-    if let Some(ref conv_id) = conversation_id
-        && let Some(store) = scoped_runtime.task_runtime()
-        && let Ok(Some(existing)) = store.find_in_progress_run_by_conversation(conv_id)
+    let in_progress_run = if let (Some(conv_id), Some(store)) =
+        (conversation_id.as_ref(), scoped_runtime.task_runtime())
+    {
+        let conv_id = conv_id.clone();
+        echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+            .run_store("load GUI in-progress TaskRun", move |store| {
+                store.find_in_progress_run_by_conversation(&conv_id)
+            })
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    if let Some(existing) = in_progress_run
         && matches!(
             existing.status,
             echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Running
                 | echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused
         )
     {
+        let conv_id = existing.conversation_id.clone();
         let queued = state
             .app_state
             .storage
             .chat_events
             .enqueue_chat_input(
                 &workspace_id,
-                conv_id,
+                &conv_id,
                 &message_key,
                 message.clone(),
                 saved_attachments.clone(),
@@ -1070,6 +1083,33 @@ fn request_chat_cancel(
     }
 }
 
+async fn append_chat_projection(
+    state: &TauriState,
+    workspace_id: &str,
+    conversation_id: &str,
+    root_turn_id: &str,
+    event: ChatDriverEvent,
+) -> Result<(), IpcError> {
+    let runtime = state
+        .app_state
+        .chat_runtime_for_scope(workspace_id)
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    let workspace_receipt = runtime.workspace_io_receipt();
+    let chat_events = state.app_state.storage.chat_events.clone();
+    let workspace_id = workspace_id.to_string();
+    let conversation_id = conversation_id.to_string();
+    let root_turn_id = root_turn_id.to_string();
+    echo_agent_app_core::product_data_io::run("append GUI chat projection", move || {
+        let _workspace_receipt = workspace_receipt;
+        chat_events.append(&workspace_id, Some(&conversation_id), &root_turn_id, event)
+    })
+    .await
+    .map_err(|error| IpcError::Internal(error.to_string()))?
+    .map(|_| ())
+    .map_err(|error| IpcError::Internal(error.to_string()))
+}
+
 #[tauri::command]
 pub async fn cancel_chat(
     state: tauri::State<'_, TauriState>,
@@ -1098,14 +1138,16 @@ pub async fn cancel_chat(
         &expected_root_turn_id,
     )?
     else {
-        let _ = state.app_state.storage.chat_events.append(
+        append_chat_projection(
+            &state,
             &workspace_id,
-            Some(&conversation_id),
+            &conversation_id,
             &expected_root_turn_id,
             ChatDriverEvent::TurnStatus {
                 status: "cancelled".to_string(),
             },
-        );
+        )
+        .await?;
         return Ok(serde_json::json!({
             "success": true,
             "turn_id": expected_root_turn_id,
@@ -1159,14 +1201,14 @@ fn validate_hitl_response_scope(
     }
 }
 
-fn settle_orphaned_hitl_projection(
+async fn settle_orphaned_hitl_projection(
     state: &TauriState,
     workspace_id: &str,
     conversation_id: &str,
     root_turn_id: Option<&str>,
-) {
+) -> Result<(), IpcError> {
     let Some(root_turn_id) = root_turn_id.filter(|value| !value.trim().is_empty()) else {
-        return;
+        return Ok(());
     };
     if let Ok(snapshots) = state
         .app_state
@@ -1190,14 +1232,16 @@ fn settle_orphaned_hitl_projection(
                 );
         }
     }
-    let _ = state.app_state.storage.chat_events.append(
+    append_chat_projection(
+        state,
         workspace_id,
-        Some(conversation_id),
+        conversation_id,
         root_turn_id,
         ChatDriverEvent::TurnStatus {
             status: "failed".to_string(),
         },
-    );
+    )
+    .await
 }
 
 // Tauri exposes these fields as individual IPC arguments; grouping them would
@@ -1227,7 +1271,8 @@ pub async fn send_approval_response(
             &workspace_id,
             &conversation_id,
             expected_root_turn_id.as_deref(),
-        );
+        )
+        .await?;
         return Err(error);
     }
     let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
@@ -1244,7 +1289,8 @@ pub async fn send_approval_response(
             &workspace_id,
             &conversation_id,
             expected_root_turn_id.as_deref(),
-        );
+        )
+        .await?;
         Err(IpcError::NotFound(format!(
             "Approval request '{}' not found or expired",
             request_id
@@ -1275,7 +1321,8 @@ pub async fn send_input_response(
             &workspace_id,
             &conversation_id,
             expected_root_turn_id.as_deref(),
-        );
+        )
+        .await?;
         return Err(error);
     }
     let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
@@ -1288,7 +1335,8 @@ pub async fn send_input_response(
             &workspace_id,
             &conversation_id,
             expected_root_turn_id.as_deref(),
-        );
+        )
+        .await?;
         Err(IpcError::NotFound(format!(
             "Input request '{}' not found or expired",
             request_id
@@ -1322,7 +1370,8 @@ pub async fn send_selection_response(
             &workspace_id,
             &conversation_id,
             expected_root_turn_id.as_deref(),
-        );
+        )
+        .await?;
         return Err(error);
     }
     let req = lock_std(&PENDING_RESPONSES, "pending GUI HITL responses").remove(&request_id);
@@ -1338,7 +1387,8 @@ pub async fn send_selection_response(
             &workspace_id,
             &conversation_id,
             expected_root_turn_id.as_deref(),
-        );
+        )
+        .await?;
         Err(IpcError::NotFound(format!(
             "Selection request '{}' not found or expired",
             request_id

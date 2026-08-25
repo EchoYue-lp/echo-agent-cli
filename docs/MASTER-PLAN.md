@@ -91,6 +91,12 @@ state、运行边界索引、10k/100k 性能门、真实 Agent/Awaiter/surface �
 
 ## 下一步
 
+TaskRuntime async surface 已统一复用进程共享的 bounded `TaskRuntimeBlockingAdapter`，并以
+ts-rs typed receipts 替代 GUI mutation 的 `serde_json::Value`/numeric interaction mode。
+下一阶段仍需独立完成两项 persistence 收口：一是 journal 已提交但 projection refresh 降级时
+返回统一 typed committed outcome；二是把 Todo/Artifact/Completion 当前视图改为 checkpoint
+增量索引，并让 10k/100k release gate 覆盖真实 GUI snapshot，而不只测 warm run state。
+
 Long-horizon 的 LH6 代码修复已完成：18 行故障矩阵、可取消 artifact finalize、Started projection
 crash window、Awaiter Provider failure durable result、EKO permission-owned shell policy、跨 workspace
 Agent execution governor、四 surface real-provider harness 与 truthful ledger 都已进入生产/测试路径。

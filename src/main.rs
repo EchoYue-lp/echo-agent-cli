@@ -423,6 +423,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
     // CLI-only, channel-only, and combined mode share one application service
     // bootstrap. Surface composition below only owns input/output lifetimes.
+    #[cfg_attr(not(feature = "channels"), allow(unused_mut))]
     let mut headless_services = match cli::start_headless_services(
         agent_handle.clone(),
         runtime.hitl_dispatcher.clone(),

@@ -77,11 +77,38 @@ identity 包含已 fold 的 journal sequence，因此 pause ABA、附件或 cont
 旧操作失效。CAS 未提交时只拒绝 driver registration，不得把当前 run 改写为
 Failed/Cancelled；append 结果不确定时必须重开 journal 并对账。
 
-RuntimeTaskService executor 和共享 planned-resume adapter 的异步文件 I/O 通过进程共享、
-固定上限的 `TaskRuntimeBlockingAdapter` 进入 `spawn_blocking`。Drop 只释放内存
-registration；终态文件写入由可 await 的 driver/supervisor 路径负责。
-其余 chat admission 和 surface query/mutation 仍由 `taskruntime-blocking-surfaces` 迭代迁移，
-在完成前不得宣称整个 app-core 已无 blocking file I/O。
+RuntimeTaskService executor 和共享 planned-resume adapter 的异步文件 I/O 通过固定上限的
+`TaskRuntimeBlockingAdapter` 进入 `spawn_blocking`。进程 semaphore 只限制并发；每个 store 的
+operation supervisor 持有 blocking handle、RunDriver、CommandCell observer、多阶段 Subagent
+command 和 turn projector，调用方只等待 receipt。caller future Drop 不会 detach operation；
+Application phase one 关闭 global/workspace 新 admission，已接受 owner 通过 nested capability
+完成 terminal settlement，phase two 再限时 join 并把失败写入 lifecycle receipt。reservation 与
+admission seal 在同一锁内线性化；CommandCell 在 framework prepare 前、RunDriver 在 owner 发布前
+预留 operation，因此 join 返回后不能出现 late accepted operation。phase one 还启动 framework
+command manager shutdown，先取消长命令再 join；terminal repair 有上限，耗尽形成 typed
+projection debt，observer join 有总 deadline。active operation 同时阻止 workspace eviction。
+Workspace 通过 idle proof 后先提交 Closing，再执行不可逆 shutdown；host 原子 claim 并启动唯一
+state-owned shared settlement。eviction caller drop 不会取消 owner 或丢失已消费的 debt。
+cleanup degraded 的 generation 留在 registry 中保持 sealed，后续 control/open 与二次 eviction
+不能重新开放它或吞掉原始 debt。framework command shutdown 是可重复 await 的 shared result，
+并发 caller 不会覆盖 owner。
+
+ChatEventLog 的 async safe point 通过 bounded product-data adapter，并让 blocking closure 捕获
+exact workspace I/O receipt。manual compression、GUI cancel 和 HITL orphan projection 在 caller
+drop 后仍持有 generation；workspace delete 不能先删文件再被迟到 append 复活。
+
+排队 resume 的 identity 冻结 continuation route。TUI/CLI 不在 surface 读取 run snapshot 或严格
+预判 journal sequence；真正判定统一由 store 原子 resume transaction 完成。identity 后只有
+`execution_path` diagnostic Note 的 suffix 可以继续，其它状态、附件或 continuation 变化仍拒绝。
+
+chat preparation/projection、background submit/control/query、boot reconciler、revision adapter、
+Subagent control、GUI/TUI/CLI/channel TaskRuntime surface 和 unattended worktree control 都复用
+该边界。已接受的复合文件 mutation 把 driver registration 随 closure 一起持有，因此 caller
+drop 不会提前释放 workspace generation。
+
+Tauri mutation 使用 ts-rs 生成的 `TaskRunControlReceipt`、`TaskRunResumeReceipt`、
+`TaskRetryReceipt` 和 `InteractionModeRequest`。Continuation resume 的 `turn_id` 是正式 wire
+字段；interaction mode 使用字符串 enum，不再由前端手写数字协议。
 
 ## 取舍与影响
 
@@ -103,8 +130,11 @@ registration；终态文件写入由可 await 的 driver/supervisor 路径负责
   的候选结果直接丢弃。
 - Subagent durable recovery 使用 revision、attempt、physical execution id 和 TaskStarted
   线性化边界；合法的 restart handoff 可复用，迟到旧 release 不可越过新 claim。
-- Surface 层的 blocking 调用将在 `taskruntime-blocking-surfaces` 迭代中接入同一 adapter；
-  该工作需在 scoped-control/channel 分支合入后执行，避免并行 worktree 交叉修改。
+- Async surface 不再直接执行 TaskRuntime file I/O；source inventory 固定所有 production
+  surface、boot、Subagent、projector 与 lifecycle/workspace owner 都必须经过同一 adapter 和
+  store operation supervisor。
+- Projection refresh 的 committed/degraded typed outcome 和 Todo/Artifact/Completion 的增量索引
+  仍是后续 persistence 迭代，不能用本次 async cutover 宣称 10k/100k 全查询面已完成。
 
 ## 业界依据
 

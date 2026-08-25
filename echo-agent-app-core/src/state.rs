@@ -3830,14 +3830,28 @@ impl AppState {
         {
             failures.push(format!("TaskRun drivers: {error}"));
         }
+        if let Some(store) = self.tasks.runtime.as_ref()
+            && let Err(error) = store.begin_operation_shutdown()
+        {
+            failures.push(format!("TaskRuntime operations: {error}"));
+        }
+        if let Err(error) = self
+            .workspace
+            .runtimes
+            .begin_task_runtime_operation_shutdown()
+        {
+            failures.push(format!("workspace TaskRuntime operations: {error}"));
+        }
         if let Some(pool) = self.connection.pool.as_ref() {
             pool.begin_shutdown();
         }
         if let Some(integration) = self.review_integration.as_ref() {
             integration.begin_background_review_shutdown();
         }
-        if let Some(runtime) = self.command_cell_runtime.as_ref() {
-            runtime.begin_shutdown();
+        if let Some(runtime) = self.command_cell_runtime.as_ref()
+            && let Err(error) = runtime.begin_shutdown()
+        {
+            failures.push(format!("command cells: {error}"));
         }
         if let Err(error) = self.close_agent_delivery_admission() {
             failures.push(format!("Agent deliveries: {error}"));
@@ -4426,6 +4440,7 @@ impl AppState {
                 active_pool_executions = activity.active_pool_executions,
                 active_run_drivers = activity.active_run_drivers,
                 active_run_driver_receipts = activity.active_run_driver_receipts,
+                active_task_runtime_operations = activity.active_task_runtime_operations,
                 active_controls = activity.active_controls,
                 idle = activity.is_idle(),
                 "workspace runtime activity before shutdown"

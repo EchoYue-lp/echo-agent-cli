@@ -5,17 +5,35 @@
 //! reachability assertion for the corrected authority.
 
 const APP_COMMAND_CELLS: &str = include_str!("command_cells.rs");
+const APP_CONTINUATION: &str = include_str!("continuation.rs");
+const APP_COMPACT_CONTEXT: &str = include_str!("compact_context.rs");
+const APP_TASK_TOOLS: &str = include_str!("task_tools.rs");
+const APP_CONVERSATION_DELETION: &str = include_str!("../../conversation_deletion.rs");
 const APP_AGENT_POOL: &str = include_str!("../../agent_pool.rs");
 const APP_CHAT_DRIVER: &str = include_str!("../../chat_driver.rs");
+const APP_TURN_CONTEXT: &str = include_str!("../../turn_context.rs");
+const APP_MANUAL_COMPRESSION: &str = include_str!("../../manual_compression.rs");
+const APP_RUNTIME: &str = include_str!("../../runtime.rs");
+const APP_WORKSPACE_RUNTIME: &str = include_str!("../../workspace/runtime.rs");
 const APP_EXECUTOR: &str = include_str!("executor.rs");
+const APP_BOOT_RECONCILER: &str = include_str!("boot_reconciler.rs");
 const APP_FILE_STORE: &str = include_str!("file_store.rs");
 const APP_COMPLETION_GATE: &str = include_str!("completion_gate.rs");
 const APP_INFRA: &str = include_str!("../../infra.rs");
 const APP_STATE: &str = include_str!("../../state.rs");
+const APP_TASK_SERVICE: &str = include_str!("../service.rs");
 const APP_STORE: &str = include_str!("store.rs");
 const APP_SUBAGENT_CONTROL: &str = include_str!("subagent_control.rs");
+const APP_REVISION_ADAPTER: &str = include_str!("revisioned_adapter.rs");
 const APP_TYPES: &str = include_str!("types.rs");
 const APP_TAURI: &str = include_str!("../../../../src/tauri/mod.rs");
+const APP_TAURI_TASK_RUNTIME: &str = include_str!("../../../../src/tauri/commands/task_runtime.rs");
+const APP_TAURI_TASKS: &str = include_str!("../../../../src/tauri/commands/tasks.rs");
+const APP_TAURI_CHAT: &str = include_str!("../../../../src/tauri/commands/chat.rs");
+const APP_TUI_EVENTS: &str = include_str!("../../../../src/tui/events.rs");
+const APP_CLI_TASKS: &str = include_str!("../../../../src/cli/cmd_impls/tasks_ext.rs");
+const APP_CLI_REPL: &str = include_str!("../../../../src/cli/repl.rs");
+const APP_CHANNELS: &str = include_str!("../../../../src/cli/channels.rs");
 const FRAMEWORK_CELL_CONTRACT: &str =
     include_str!("../../../../../echo-agent/echo-core/src/tools/cell.rs");
 const FRAMEWORK_CELL_RUNTIME: &str =
@@ -40,6 +58,12 @@ fn require_absent(source: &str, needle: &str, failure: &str) -> Result<(), Strin
     } else {
         Ok(())
     }
+}
+
+fn before_test_module(source: &str) -> &str {
+    source
+        .split_once("\n#[cfg(test)]\nmod tests {")
+        .map_or(source, |(production, _)| production)
 }
 
 fn ordered(source: &str, first: &str, second: &str, failure: &str) -> Result<(), String> {
@@ -135,7 +159,7 @@ fn lh_f03_tauri_excludes_awaiter_and_formal_subagents_from_generic_projection() 
 }
 
 #[test]
-fn lh_f04_terminal_projection_keeps_an_owned_repair_loop() -> Result<(), String> {
+fn lh_f04_terminal_projection_keeps_bounded_owned_repair_debt() -> Result<(), String> {
     require_absent(
         APP_COMMAND_CELLS,
         "for attempt in 1..=3_u8",
@@ -143,8 +167,18 @@ fn lh_f04_terminal_projection_keeps_an_owned_repair_loop() -> Result<(), String>
     )?;
     require(
         APP_COMMAND_CELLS,
-        "delay = delay.saturating_mul(2).min(Duration::from_secs(30))",
+        "const MAX_PROJECTION_REPAIR_ATTEMPTS: u64 = 8",
+        "LH-F04 repair regressed: bounded repair budget is missing",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        "delay = delay.saturating_mul(2).min(Duration::from_secs(1))",
         "LH-F04 repair regressed: capped-backoff repair is missing",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        "record_lifecycle_debt(",
+        "LH-F04 repair regressed: exhausted terminal repair is not lifecycle debt",
     )?;
     ordered(
         APP_COMMAND_CELLS,
@@ -221,15 +255,12 @@ fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
         .split("// The compile-time test that proves the transaction invariant:")
         .next()
         .ok_or_else(|| "store production section missing".to_string())?;
-    let production_control = APP_SUBAGENT_CONTROL
-        .split("#[cfg(test)]")
-        .next()
-        .ok_or_else(|| "Subagent control production section missing".to_string())?;
-    let production_completion = APP_COMPLETION_GATE
-        .split("#[cfg(test)]")
-        .next()
-        .ok_or_else(|| "completion production section missing".to_string())?;
+    let production_control = before_test_module(APP_SUBAGENT_CONTROL);
+    let production_completion = before_test_module(APP_COMPLETION_GATE);
     let scans = production_store.matches("list_events(run_id, 0)").count()
+        + production_store
+            .matches("i64::try_from(expected.journal_sequence).unwrap_or(i64::MAX)")
+            .count()
         + production_control
             .matches("list_events(&target.run_id, 0)")
             .count()
@@ -239,9 +270,9 @@ fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
         + production_completion
             .matches("list_events(run_id, 0)")
             .count();
-    if scans != 7 {
+    if scans != 8 {
         return Err(format!(
-            "LH5 full-scan allowlist changed without review: expected 7, found {scans}"
+            "LH5 full-scan allowlist changed without review: expected 8, found {scans}"
         ));
     }
     let comments = production_store.matches("Audit allowlist:").count()
@@ -253,6 +284,314 @@ fn lh5_full_scan_allowlist_is_explicit_and_bounded() -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[test]
+fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Result<(), String> {
+    let chat_preparation = between(
+        APP_CHAT_DRIVER,
+        "async fn prepare_chat_execution",
+        "async fn drive_prepared_chat",
+        "chat preparation boundary could not be isolated",
+    )?;
+    require(
+        chat_preparation,
+        "run_owned(\"prepare and claim chat TaskRun\"",
+        "chat preparation bypasses the bounded TaskRuntime adapter",
+    )?;
+
+    let background_submit = between(
+        APP_TASK_SERVICE,
+        "async fn submit_prompt_run",
+        "pub async fn submit_dag",
+        "background submit boundary could not be isolated",
+    )?;
+    require(
+        background_submit,
+        "run_owned(\"prepare background TaskRun\"",
+        "background submit bypasses the bounded TaskRuntime adapter",
+    )?;
+    require(
+        APP_TASK_SERVICE,
+        "run_store(\"cancel background TaskRun\"",
+        "background cancellation runs file I/O on a Tokio async executor thread",
+    )?;
+    require(
+        APP_TASK_SERVICE,
+        "run_store(\"load pending background TaskRuns\"",
+        "background recovery discovery runs file I/O on a Tokio async executor thread",
+    )?;
+    let dependency_poll = between(
+        APP_TASK_SERVICE,
+        "async fn wait_for_dependencies",
+        "fn transition_to_running",
+        "background dependency boundary could not be isolated",
+    )?;
+    require(
+        dependency_poll,
+        "run_store(\"poll background dependencies\"",
+        "background dependency polling runs file I/O on a Tokio async executor thread",
+    )?;
+
+    require(
+        APP_REVISION_ADAPTER,
+        "blocking: TaskRuntimeBlockingAdapter",
+        "revision adapter lost its bounded file-I/O owner",
+    )?;
+    for (source, operation) in [
+        (APP_TASK_SERVICE, "prepare background TaskRun DAG"),
+        (APP_TASK_SERVICE, "pause background TaskRun"),
+        (APP_TASK_SERVICE, "load background recovery blockers"),
+        (APP_TASK_SERVICE, "resolve background recovery task"),
+        (APP_TASK_SERVICE, "list background TaskRuns"),
+        (APP_TASK_SERVICE, "load background TaskRun progress"),
+        (APP_BOOT_RECONCILER, "recover incomplete TaskRuns"),
+        (APP_BOOT_RECONCILER, "list boot-resumable TaskRuns"),
+        (APP_BOOT_RECONCILER, "evaluate TaskRun boot resume"),
+        (APP_BOOT_RECONCILER, "resume TaskRun after boot"),
+        (APP_TUI_EVENTS, "resolve TUI TaskRun"),
+        (APP_TUI_EVENTS, "refresh TUI TaskRuntime projection"),
+        (APP_TUI_EVENTS, "resolve TUI recovery task"),
+        (APP_TUI_EVENTS, "list TUI unattended worktrees"),
+        (APP_CLI_TASKS, "load CLI TaskRun control"),
+        (APP_CLI_TASKS, "update CLI TaskRun Goal"),
+        (APP_CHANNELS, "load channel TaskRun"),
+        (APP_CHANNELS, "update channel TaskRun Goal"),
+        (APP_CHAT_DRIVER, "observe chat execution path"),
+        (APP_CHAT_DRIVER, "resolve previous continuation driver"),
+        (APP_CHAT_DRIVER, "project EKO turn TaskRuntime event"),
+        (APP_SUBAGENT_CONTROL, "deliver live Subagent guidance"),
+        (APP_SUBAGENT_CONTROL, "interrupt exact Subagent attempt"),
+        (APP_COMMAND_CELLS, "record command-cell start"),
+        (APP_COMMAND_CELLS, "record command-cell terminal"),
+        (APP_COMMAND_CELLS, "observe command-cell terminal"),
+        (
+            APP_COMMAND_CELLS,
+            "observe ordinary-chat command-cell terminal",
+        ),
+        (APP_COMMAND_CELLS, "load Awaiter TaskRun cell"),
+        (APP_COMMAND_CELLS, "load Awaiter ordinary-chat cell"),
+        (APP_COMMAND_CELLS, "persist ordinary-chat command cell"),
+        (APP_CONTINUATION, "load continuation eligibility"),
+        (APP_CONTINUATION, "cancel continuation TaskRun"),
+        (APP_COMPACT_CONTEXT, "project TaskRuntime model context"),
+        (APP_TASK_TOOLS, "check TaskRun status tool"),
+        (APP_TASK_TOOLS, "cancel TaskRun tool"),
+        (APP_CONVERSATION_DELETION, "cancel conversation TaskRuns"),
+        (APP_CONVERSATION_DELETION, "remove conversation TaskRuns"),
+        (APP_STORE, "drive registered TaskRun"),
+        (APP_TURN_CONTEXT, "project_pending_awaiter_results"),
+    ] {
+        require(
+            source,
+            operation,
+            &format!("TaskRuntime async production inventory lost operation '{operation}'"),
+        )?;
+    }
+    require(
+        APP_EXECUTOR,
+        "pub async fn run_async_owned",
+        "TaskRuntime multi-stage operation ownership is missing",
+    )?;
+    require_absent(
+        APP_EXECUTOR,
+        "fn register_accepted",
+        "TaskRuntime settlement reservation can bypass sealed admission",
+    )?;
+    require(
+        APP_RUNTIME,
+        "store.shutdown_operations().await",
+        "application lifecycle does not join TaskRuntime operations",
+    )?;
+    require(
+        APP_STATE,
+        "begin_task_runtime_operation_shutdown",
+        "application phase one does not close workspace TaskRuntime operation admission",
+    )?;
+    require(
+        APP_WORKSPACE_RUNTIME,
+        "active_task_runtime_operations",
+        "workspace teardown does not treat TaskRuntime operations as busy",
+    )?;
+    require(
+        APP_WORKSPACE_RUNTIME,
+        "shutdown_settlement: std::sync::Mutex<Option<WorkspaceShutdownSettlement>>",
+        "workspace shutdown does not retain one state-owned shared settlement",
+    )?;
+    require(
+        APP_WORKSPACE_RUNTIME,
+        "runtime.spawn(settlement.clone())",
+        "workspace shutdown settlement is still driven only by the eviction caller",
+    )?;
+    ordered(
+        APP_WORKSPACE_RUNTIME,
+        "closing.commit();",
+        "host.shutdown_runtime().await?;",
+        "workspace eviction can reopen a generation after irreversible shutdown starts",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        ".boxed()\n            .shared()",
+        "command-cell shutdown callers do not share one stable framework settlement",
+    )?;
+    require_absent(
+        APP_COMMAND_CELLS,
+        "Mutex<Option<tokio::task::JoinHandle<Result<(), String>>>>",
+        "command-cell shutdown can overwrite and detach a framework JoinHandle",
+    )?;
+    require_absent(
+        APP_CHAT_DRIVER,
+        "receiver.blocking_recv()",
+        "per-turn projector still retains a blocking thread for its full lifetime",
+    )?;
+    let awaiter_publish = between(
+        APP_COMMAND_CELLS,
+        "async fn publish_awaiter_result",
+        "fn acknowledge_awaiter_result_sync",
+        "Awaiter Ready publication boundary could not be isolated",
+    )?;
+    require(
+        awaiter_publish,
+        "product_data_io::run(\"persist Awaiter Ready fact\"",
+        "Awaiter Ready fact bypasses bounded product-data I/O",
+    )?;
+    require_absent(
+        awaiter_publish,
+        "self.chat_events.append(",
+        "Awaiter Ready fact directly appends on a Tokio executor thread",
+    )?;
+    let tui_dispatch = between(
+        APP_TUI_EVENTS,
+        "async fn dispatch_turn",
+        "fn run_turn_binding_for_queued_turn",
+        "TUI turn-dispatch boundary could not be isolated",
+    )?;
+    require_absent(
+        tui_dispatch,
+        "validate_resumable(",
+        "TUI resume surface pre-validates a stale journal sequence before store authority",
+    )?;
+    require_absent(
+        tui_dispatch,
+        "get_run_state(",
+        "TUI resume surface performs a non-authoritative TaskRuntime read",
+    )?;
+    let cli_prepare = between(
+        APP_CLI_REPL,
+        "async fn prepare_repl_turn_start",
+        "fn spawn_prepared_repl_turn",
+        "CLI REPL turn-preparation boundary could not be isolated",
+    )?;
+    require_absent(
+        cli_prepare,
+        "validate_resumable(",
+        "CLI resume surface pre-validates a stale journal sequence before store authority",
+    )?;
+    require_absent(
+        cli_prepare,
+        "get_run_state(",
+        "CLI resume surface performs synchronous TaskRuntime file I/O",
+    )?;
+    let tauri_cancel = between(
+        APP_TAURI_CHAT,
+        "pub async fn cancel_chat",
+        "fn validate_hitl_response_scope",
+        "Tauri cancel boundary could not be isolated",
+    )?;
+    require(
+        tauri_cancel,
+        "append_chat_projection(",
+        "Tauri cancel orphan projection bypasses bounded product-data I/O",
+    )?;
+    let tauri_orphan = between(
+        APP_TAURI_CHAT,
+        "async fn settle_orphaned_hitl_projection",
+        "pub async fn send_approval_response",
+        "Tauri HITL orphan boundary could not be isolated",
+    )?;
+    require(
+        tauri_orphan,
+        "append_chat_projection(",
+        "Tauri HITL orphan projection bypasses bounded product-data I/O",
+    )?;
+    let tauri_append = between(
+        APP_TAURI_CHAT,
+        "async fn append_chat_projection",
+        "pub async fn cancel_chat",
+        "Tauri chat-projection boundary could not be isolated",
+    )?;
+    require(
+        tauri_append,
+        "product_data_io::run(\"append GUI chat projection\"",
+        "Tauri chat projection bypasses bounded product-data I/O",
+    )?;
+    require(
+        tauri_append,
+        "workspace_io_receipt()",
+        "Tauri chat projection does not retain workspace generation ownership",
+    )?;
+    let manual_compression = between(
+        APP_MANUAL_COMPRESSION,
+        "pub async fn compress_conversation_owned",
+        "#[cfg(test)]",
+        "manual-compression production boundary could not be isolated",
+    )?;
+    require(
+        manual_compression,
+        "product_data_io::run(",
+        "manual compression safe point bypasses bounded product-data I/O",
+    )?;
+    require(
+        manual_compression,
+        "persist manual compression safe point",
+        "manual compression safe-point operation is missing",
+    )?;
+    require(
+        manual_compression,
+        "workspace_io_receipt()",
+        "manual compression safe point does not retain workspace generation ownership",
+    )?;
+    require_absent(
+        manual_compression,
+        "self.storage.chat_events.append(",
+        "manual compression directly appends on a Tokio executor thread",
+    )?;
+    require(
+        APP_TAURI_TASKS,
+        "service.list_unified(None).await",
+        "Tauri background-task projection bypasses its async service boundary",
+    )?;
+    require(
+        APP_REVISION_ADAPTER,
+        "run_store(\"commit revisioned task graph\"",
+        "revision compare-and-commit bypasses the bounded adapter",
+    )?;
+    require(
+        APP_TAURI_TASK_RUNTIME,
+        "async fn task_runtime_io",
+        "Tauri TaskRuntime commands lost their shared async I/O boundary",
+    )?;
+    let tauri_io_boundaries = APP_TAURI_TASK_RUNTIME
+        .split("#[cfg(test)]")
+        .next()
+        .ok_or_else(|| "Tauri TaskRuntime production section missing".to_string())?
+        .matches("task_runtime_io(")
+        .count();
+    if tauri_io_boundaries != 23 {
+        return Err(format!(
+            "Tauri TaskRuntime blocking-boundary inventory changed without review: expected 23, found {tauri_io_boundaries}"
+        ));
+    }
+    require_absent(
+        APP_TAURI_TASK_RUNTIME,
+        "Result<serde_json::Value, IpcError>",
+        "TaskRuntime mutation IPC regressed to an untyped JSON receipt",
+    )?;
+    require_absent(
+        APP_TAURI_TASK_RUNTIME,
+        "Result<u8, IpcError>",
+        "TaskRuntime interaction-mode IPC regressed to a numeric contract",
+    )
 }
 
 #[test]

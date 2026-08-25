@@ -22,6 +22,25 @@ struct ScopedTaskControl {
     snapshot: echo_agent_app_core::tasks::task_runtime::RunStateSnapshot,
 }
 
+async fn task_runtime_io<T, F>(
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    operation: &'static str,
+    function: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+        ) -> Result<T, echo_agent_app_core::tasks::task_runtime::StoreError>
+        + Send
+        + 'static,
+{
+    echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+        .run_store(operation, function)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn current_task_run(
     ctx: &CommandContext,
     requested_run_id: Option<&str>,
@@ -52,13 +71,30 @@ async fn current_task_run(
         .ok_or_else(|| {
             format!("workspace '{workspace_id}' conversation identity is unavailable")
         })?;
-    let run = match requested_run_id.filter(|run_id| !run_id.trim().is_empty()) {
-        Some(run_id) => store.get_run(run_id).map_err(|error| error.to_string())?,
-        None => store
-            .latest_run_for_conversation(&conversation_id)
-            .map_err(|error| error.to_string())?,
-    }
-    .ok_or_else(|| "no TaskRun was found for this conversation".to_string())?;
+    let requested_run_id = requested_run_id
+        .filter(|run_id| !run_id.trim().is_empty())
+        .map(str::to_string);
+    let lookup_conversation_id = conversation_id.clone();
+    let (run, snapshot) =
+        task_runtime_io(store.clone(), "load CLI TaskRun control", move |store| {
+            let run = match requested_run_id {
+                Some(run_id) => store.get_run(&run_id)?,
+                None => store.latest_run_for_conversation(&lookup_conversation_id)?,
+            }
+            .ok_or_else(|| {
+                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                    "no TaskRun was found for this conversation".to_string(),
+                )
+            })?;
+            let snapshot = store.get_run_state(&run.run_id)?.ok_or_else(|| {
+                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(format!(
+                    "TaskRun {} has no event projection",
+                    run.run_id
+                ))
+            })?;
+            Ok((run, snapshot))
+        })
+        .await?;
     if run.workspace_id != workspace_id {
         return Err(format!(
             "TaskRun {} belongs to workspace '{}', not current workspace '{}'",
@@ -71,10 +107,6 @@ async fn current_task_run(
             run.run_id
         ));
     }
-    let snapshot = store
-        .get_run_state(&run.run_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("TaskRun {} has no event projection", run.run_id))?;
     Ok(ScopedTaskControl {
         _runtime: runtime,
         store,
@@ -165,19 +197,33 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     };
     match action {
         "status" => print_task_run_status(&snapshot),
-        "pause" => match store.request_pause(&snapshot.run.run_id) {
-            Ok(true) => println!("\n  TaskRun {} paused.", snapshot.run.run_id),
-            Ok(false) => println!(
-                "\n  TaskRun {} is not actively pausable.",
-                snapshot.run.run_id
-            ),
-            Err(error) => println!("\n  Unable to pause TaskRun: {error}"),
-        },
-        "cancel" => match store.request_cancel(&snapshot.run.run_id) {
-            Ok(true) => println!("\n  TaskRun {} cancelled.", snapshot.run.run_id),
-            Ok(false) => println!("\n  TaskRun {} is already terminal.", snapshot.run.run_id),
-            Err(error) => println!("\n  Unable to cancel TaskRun: {error}"),
-        },
+        "pause" => {
+            let run_id = snapshot.run.run_id.clone();
+            match task_runtime_io(store.clone(), "pause CLI TaskRun", move |store| {
+                store.request_pause(&run_id)
+            })
+            .await
+            {
+                Ok(true) => println!("\n  TaskRun {} paused.", snapshot.run.run_id),
+                Ok(false) => println!(
+                    "\n  TaskRun {} is not actively pausable.",
+                    snapshot.run.run_id
+                ),
+                Err(error) => println!("\n  Unable to pause TaskRun: {error}"),
+            }
+        }
+        "cancel" => {
+            let run_id = snapshot.run.run_id.clone();
+            match task_runtime_io(store.clone(), "cancel CLI TaskRun", move |store| {
+                store.request_cancel(&run_id)
+            })
+            .await
+            {
+                Ok(true) => println!("\n  TaskRun {} cancelled.", snapshot.run.run_id),
+                Ok(false) => println!("\n  TaskRun {} is already terminal.", snapshot.run.run_id),
+                Err(error) => println!("\n  Unable to cancel TaskRun: {error}"),
+            }
+        }
         "resume" => {
             if snapshot.run.status
                 != echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused
@@ -213,11 +259,17 @@ async fn cmd_task_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             };
             let budgets = parse_budget(token_value, "token")
                 .and_then(|tokens| parse_budget(time_value, "time").map(|time| (tokens, time)));
-            match budgets.and_then(|(tokens, time)| {
-                store
-                    .update_run_continuation_budgets(&snapshot.run.run_id, tokens, time)
-                    .map_err(|error| error.to_string())
-            }) {
+            let result = match budgets {
+                Ok((tokens, time)) => {
+                    let run_id = snapshot.run.run_id.clone();
+                    task_runtime_io(store.clone(), "update CLI TaskRun budgets", move |store| {
+                        store.update_run_continuation_budgets(&run_id, tokens, time)
+                    })
+                    .await
+                }
+                Err(error) => Err(error),
+            };
+            match result {
                 Ok(updated) => {
                     println!("\n  TaskRun {} budgets updated.", snapshot.run.run_id);
                     let mut updated_snapshot = snapshot;
@@ -259,13 +311,18 @@ async fn cmd_task_goal(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
     };
-    match store.update_run_goal(
-        &snapshot.run.run_id,
-        parsed.expected_goal_revision,
-        &parsed.new_goal,
-        &parsed.reason,
-        echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
-    ) {
+    let run_id = snapshot.run.run_id.clone();
+    match task_runtime_io(store, "update CLI TaskRun Goal", move |store| {
+        store.update_run_goal(
+            &run_id,
+            parsed.expected_goal_revision,
+            &parsed.new_goal,
+            &parsed.reason,
+            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
+        )
+    })
+    .await
+    {
         Ok(run) => println!(
             "\n  TaskRun {} Goal updated to revision {}; submit task_update before resuming.",
             run.run_id, run.goal_revision
@@ -316,7 +373,12 @@ async fn cmd_task_requirements(ctx: &CommandContext, args: &[&str]) -> CommandOu
             return CommandOutcome::Continue;
         }
     };
-    match store.completion_gate_report(&snapshot.run.run_id) {
+    let run_id = snapshot.run.run_id;
+    match task_runtime_io(store, "load CLI completion gate", move |store| {
+        store.completion_gate_report(&run_id)
+    })
+    .await
+    {
         Ok(report) => print_completion_gate(&report),
         Err(error) => println!("\n  Unable to read completion gate: {error}"),
     }
@@ -342,13 +404,18 @@ async fn cmd_task_requirement_skip(ctx: &CommandContext, args: &[&str]) -> Comma
             return CommandOutcome::Continue;
         }
     };
-    match store.skip_goal_requirement(
-        &snapshot.run.run_id,
-        parsed.expected_goal_revision,
-        &parsed.requirement_id,
-        &parsed.reason,
-        echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
-    ) {
+    let run_id = snapshot.run.run_id;
+    match task_runtime_io(store, "skip CLI Goal requirement", move |store| {
+        store.skip_goal_requirement(
+            &run_id,
+            parsed.expected_goal_revision,
+            &parsed.requirement_id,
+            &parsed.reason,
+            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Cli,
+        )
+    })
+    .await
+    {
         Ok(report) => print_completion_gate(&report),
         Err(error) => println!("\n  Unable to confirm requirement Skip: {error}"),
     }
@@ -431,11 +498,13 @@ async fn cmd_subagent_control(
                 println!("\n  Usage: {usage}");
                 return CommandOutcome::Continue;
             };
-            service.queue_guidance(
-                parsed.identity,
-                instruction,
-                echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
-            )
+            service
+                .queue_guidance_async(
+                    parsed.identity,
+                    instruction.to_string(),
+                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Cli,
+                )
+                .await
         }
         SubagentControlAction::Interrupt => {
             service

@@ -15,7 +15,8 @@ use echo_agent::tools::cell::{
     CommandCellRegistry, CommandCellRequest, CommandCellSnapshot,
 };
 use echo_agent::tools::{Tool, ToolContext, ToolParameters, ToolResult};
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
@@ -32,6 +33,9 @@ const OBSERVER_YIELD_MS: u64 = 30_000;
 const OUTPUT_EXCERPT_CHARS: usize = 1_000;
 const MAX_ACTIVE_AWAITERS: usize = 64;
 const SETTLED_AWAITER_RETENTION: usize = 256;
+const MAX_PROJECTION_REPAIR_ATTEMPTS: u64 = 8;
+const OBSERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+type FrameworkShutdownSettlement = Shared<BoxFuture<'static, Result<(), String>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RunCellScope {
@@ -212,6 +216,7 @@ pub struct CommandCellRuntimeService {
         >,
     >,
     foreground_turns: RwLock<Option<crate::foreground_turn::ForegroundTurnControl>>,
+    framework_shutdown: Mutex<Option<FrameworkShutdownSettlement>>,
 }
 
 impl CommandCellRuntimeService {
@@ -237,6 +242,7 @@ impl CommandCellRuntimeService {
             awaiters: Mutex::new(AwaiterRuntimeState::default()),
             awaiter_agents: RwLock::new(HashMap::new()),
             foreground_turns: RwLock::new(None),
+            framework_shutdown: Mutex::new(None),
         }))
     }
 
@@ -438,14 +444,13 @@ impl CommandCellRuntimeService {
             .remove(cell_id);
     }
 
-    fn append_chat_cell_fact(
-        &self,
+    fn append_chat_cell_fact_sync(
+        chat_events: &crate::chat_event_log::ChatEventLog,
         scope: &ChatCellScope,
         cell: &BackgroundCellState,
         settled: bool,
     ) -> Result<(), String> {
-        let replay = self
-            .chat_events
+        let replay = chat_events
             .replay(
                 &scope.workspace_id,
                 Some(&scope.conversation_id),
@@ -472,7 +477,7 @@ impl CommandCellRuntimeService {
                 cell: Box::new(cell.clone()),
             }
         };
-        match self.chat_events.append(
+        match chat_events.append(
             &scope.workspace_id,
             Some(&scope.conversation_id),
             &scope.root_turn_id,
@@ -480,8 +485,7 @@ impl CommandCellRuntimeService {
         ) {
             Ok(_) => Ok(()),
             Err(append_error) => {
-                let repaired = self
-                    .chat_events
+                let repaired = chat_events
                     .replay(
                         &scope.workspace_id,
                         Some(&scope.conversation_id),
@@ -503,7 +507,23 @@ impl CommandCellRuntimeService {
         }
     }
 
-    fn cell_state_for_watch(
+    async fn append_chat_cell_fact(
+        &self,
+        scope: &ChatCellScope,
+        cell: &BackgroundCellState,
+        settled: bool,
+    ) -> Result<(), String> {
+        let chat_events = self.chat_events.clone();
+        let scope = scope.clone();
+        let cell = cell.clone();
+        crate::product_data_io::run("persist ordinary-chat command cell", move || {
+            Self::append_chat_cell_fact_sync(&chat_events, &scope, &cell, settled)
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    async fn cell_state_for_watch(
         &self,
         key: &AwaiterWatchKey,
     ) -> Result<BackgroundCellState, CommandCellError> {
@@ -513,34 +533,47 @@ impl CommandCellRuntimeService {
                     message: "Awaiter requires the exact TaskRuntimeStore".to_string(),
                 }
             })?;
-            return store
-                .list_background_cells(run_id)
+            let run_id = run_id.to_string();
+            let cell_id = key.cell_id.clone();
+            return super::executor::TaskRuntimeBlockingAdapter::new(store)
+                .run_store("load Awaiter TaskRun cell", move |store| {
+                    store
+                        .list_background_cells(&run_id)
+                        .map(|cells| cells.into_iter().find(|cell| cell.cell_id == cell_id))
+                })
+                .await
                 .map_err(|error| CommandCellError::Runtime {
                     message: error.to_string(),
                 })?
-                .into_iter()
-                .find(|cell| cell.cell_id == key.cell_id)
                 .ok_or_else(|| CommandCellError::Validation {
                     message: "cell does not belong to the exact TaskRun scope".to_string(),
                 });
         }
-        let replay = self
-            .chat_events
-            .replay(
+        let chat_events = self.chat_events.clone();
+        let key = key.clone();
+        crate::product_data_io::run("load Awaiter ordinary-chat cell", move || {
+            let replay = chat_events.replay(
                 &key.workspace_id,
                 Some(&key.conversation_id),
                 &key.root_turn_id,
                 0,
+            )?;
+            Ok::<Option<BackgroundCellState>, crate::chat_event_log::ChatEventLogError>(
+                find_chat_cell_fact(&replay.events, &key.cell_id, false)
+                    .or_else(|| find_chat_cell_fact(&replay.events, &key.cell_id, true))
+                    .cloned(),
             )
-            .map_err(|error| CommandCellError::Runtime {
-                message: error.to_string(),
-            })?;
-        find_chat_cell_fact(&replay.events, &key.cell_id, false)
-            .or_else(|| find_chat_cell_fact(&replay.events, &key.cell_id, true))
-            .cloned()
-            .ok_or_else(|| CommandCellError::Validation {
-                message: "cell does not belong to the exact ordinary Chat scope".to_string(),
-            })
+        })
+        .await
+        .map_err(|error| CommandCellError::Runtime {
+            message: error.to_string(),
+        })?
+        .map_err(|error| CommandCellError::Runtime {
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| CommandCellError::Validation {
+            message: "cell does not belong to the exact ordinary Chat scope".to_string(),
+        })
     }
 
     fn owns_active_cell(&self, key: &AwaiterWatchKey) -> bool {
@@ -611,7 +644,7 @@ impl CommandCellRuntimeService {
                 ),
             });
         }
-        let base_cell = self.cell_state_for_watch(&key)?;
+        let base_cell = self.cell_state_for_watch(&key).await?;
         let observation = registry.observe(cell_id)?;
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|error| CommandCellError::Runtime {
@@ -785,14 +818,17 @@ impl CommandCellRuntimeService {
                 {
                     Ok(Some(cell)) => {
                         let (awaiter_status, awaiter_summary) = awaiter_summary(join_result);
-                        service
+                        if let Err(error) = service
                             .publish_awaiter_result(AwaiterResult {
                                 receipt: settled_receipt,
                                 cell,
                                 awaiter_status,
                                 awaiter_summary,
                             })
-                            .await;
+                            .await
+                        {
+                            tracing::error!(%error, "Awaiter result publication remained degraded");
+                        }
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -919,32 +955,47 @@ impl CommandCellRuntimeService {
         Ok(receipt)
     }
 
-    async fn publish_awaiter_result(self: &Arc<Self>, result: AwaiterResult) {
+    async fn publish_awaiter_result(self: &Arc<Self>, result: AwaiterResult) -> Result<(), String> {
         let mut delay = Duration::from_millis(50);
+        let mut attempt = 0_u64;
         loop {
-            match self.chat_events.append(
-                &result.receipt.workspace_id,
-                Some(&result.receipt.conversation_id),
-                &result.receipt.root_turn_id,
-                crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
-                    result: Box::new(result.clone()),
-                },
-            ) {
-                Ok(_) => break,
+            attempt = attempt.saturating_add(1);
+            let chat_events = self.chat_events.clone();
+            let append_result = result.clone();
+            let persisted = crate::product_data_io::run("persist Awaiter Ready fact", move || {
+                chat_events.append(
+                    &append_result.receipt.workspace_id,
+                    Some(&append_result.receipt.conversation_id),
+                    &append_result.receipt.root_turn_id,
+                    crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+                        result: Box::new(append_result.clone()),
+                    },
+                )
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
+            match persisted {
+                Ok(()) => {
+                    self.clear_projection_degraded(&result.receipt.execution_id);
+                    break;
+                }
                 Err(error) => {
+                    self.mark_projection_degraded(&result.receipt.execution_id, error.clone());
                     tracing::warn!(
                         execution_id = result.receipt.execution_id,
+                        attempt,
                         %error,
                         "retrying Awaiter Ready persistence"
                     );
-                    if self.shutdown.is_cancelled() {
-                        return;
+                    if attempt >= MAX_PROJECTION_REPAIR_ATTEMPTS {
+                        return Err(format!(
+                            "Awaiter '{}' Ready persistence exhausted its repair budget: {error}",
+                            result.receipt.execution_id
+                        ));
                     }
-                    tokio::select! {
-                        _ = self.shutdown.cancelled() => return,
-                        _ = tokio::time::sleep(delay) => {}
-                    }
-                    delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(1));
                 }
             }
         }
@@ -983,11 +1034,17 @@ impl CommandCellRuntimeService {
             )
             .await
         {
-            self.acknowledge_awaiter_result(&result, acknowledged_turn_id);
+            self.acknowledge_awaiter_result(&result, acknowledged_turn_id)
+                .await;
         }
+        Ok(())
     }
 
-    fn acknowledge_awaiter_result(&self, result: &AwaiterResult, acknowledged_turn_id: String) {
+    fn acknowledge_awaiter_result_sync(
+        chat_events: &crate::chat_event_log::ChatEventLog,
+        result: &AwaiterResult,
+        acknowledged_turn_id: String,
+    ) {
         let acknowledgement = AwaiterResultAcknowledgement {
             execution_id: result.receipt.execution_id.clone(),
             attempt: result.receipt.attempt,
@@ -995,7 +1052,7 @@ impl CommandCellRuntimeService {
             cell_id: result.receipt.cell_id.clone(),
             acknowledged_turn_id,
         };
-        if let Err(error) = self.chat_events.append(
+        if let Err(error) = chat_events.append(
             &result.receipt.workspace_id,
             Some(&result.receipt.conversation_id),
             &result.receipt.root_turn_id,
@@ -1009,27 +1066,50 @@ impl CommandCellRuntimeService {
         }
     }
 
-    pub(crate) fn project_pending_awaiter_results(
+    async fn acknowledge_awaiter_result(
+        &self,
+        result: &AwaiterResult,
+        acknowledged_turn_id: String,
+    ) {
+        let chat_events = self.chat_events.clone();
+        let result = result.clone();
+        if let Err(error) = crate::product_data_io::run("acknowledge Awaiter result", move || {
+            Self::acknowledge_awaiter_result_sync(&chat_events, &result, acknowledged_turn_id);
+        })
+        .await
+        {
+            tracing::warn!(%error, "Awaiter acknowledgement task failed");
+        }
+    }
+
+    pub(crate) async fn project_pending_awaiter_results(
         &self,
         workspace_id: &str,
         conversation_id: &str,
         turn_id: &str,
     ) -> Result<Option<String>, String> {
-        let pending = self
-            .chat_events
-            .pending_awaiter_results_for_conversation(workspace_id, conversation_id)
-            .map_err(|error| error.to_string())?;
-        if pending.is_empty() {
-            return Ok(None);
-        }
-        let mut rendered = String::from("[pending_awaiter_results]\n");
-        for result in &pending {
-            rendered.push_str(&render_awaiter_handoff(result));
-            rendered.push('\n');
-            self.acknowledge_awaiter_result(result, turn_id.to_string());
-        }
-        rendered.push_str("[/pending_awaiter_results]");
-        Ok(Some(rendered))
+        let chat_events = self.chat_events.clone();
+        let workspace_id = workspace_id.to_string();
+        let conversation_id = conversation_id.to_string();
+        let turn_id = turn_id.to_string();
+        crate::product_data_io::run("project pending Awaiter results", move || {
+            let pending = chat_events
+                .pending_awaiter_results_for_conversation(&workspace_id, &conversation_id)
+                .map_err(|error| error.to_string())?;
+            if pending.is_empty() {
+                return Ok(None);
+            }
+            let mut rendered = String::from("[pending_awaiter_results]\n");
+            for result in &pending {
+                rendered.push_str(&render_awaiter_handoff(result));
+                rendered.push('\n');
+                Self::acknowledge_awaiter_result_sync(&chat_events, result, turn_id.clone());
+            }
+            rendered.push_str("[/pending_awaiter_results]");
+            Ok(Some(rendered))
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     pub(crate) fn stop_run(&self, workspace_id: &str, run_id: &str) -> usize {
@@ -1049,9 +1129,27 @@ impl CommandCellRuntimeService {
             .count()
     }
 
-    pub fn begin_shutdown(&self) {
+    pub fn begin_shutdown(&self) -> Result<(), String> {
         self.shutdown.cancel();
         self.observers.close();
+        let active_cells = {
+            let run_cells = self
+                .run_cells
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            let chat_cells = self
+                .chat_cells
+                .read()
+                .unwrap_or_else(|error| error.into_inner());
+            run_cells
+                .values()
+                .chain(chat_cells.values())
+                .flat_map(|cells| cells.iter().cloned())
+                .collect::<HashSet<_>>()
+        };
+        for cell_id in active_cells {
+            let _ = self.inner.stop(&cell_id);
+        }
         let active_awaiters = self
             .awaiters
             .lock()
@@ -1066,17 +1164,77 @@ impl CommandCellRuntimeService {
                 handle.cancel();
             }
         }
+        let mut owner = self
+            .framework_shutdown
+            .lock()
+            .map_err(|_| "command-cell framework shutdown owner lock is poisoned".to_string())?;
+        if owner.is_none() {
+            let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+                format!("Tokio runtime is unavailable during command-cell shutdown: {error}")
+            })?;
+            let inner = self.inner.clone();
+            let shutdown = async move {
+                match std::panic::AssertUnwindSafe(inner.shutdown())
+                    .catch_unwind()
+                    .await
+                {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("command-cell framework shutdown panicked".to_string()),
+                }
+            }
+            .boxed()
+            .shared();
+            drop(runtime.spawn(shutdown.clone()));
+            *owner = Some(shutdown);
+        }
+        Ok(())
     }
 
     pub async fn shutdown(&self) -> Result<(), String> {
-        self.begin_shutdown();
-        let shutdown_result = self
-            .inner
-            .shutdown()
-            .await
-            .map_err(|error| error.to_string());
-        self.observers.wait().await;
-        shutdown_result
+        let mut failures = Vec::new();
+        if let Err(error) = self.begin_shutdown() {
+            failures.push(error);
+        }
+        let owned_shutdown = self
+            .framework_shutdown
+            .lock()
+            .map_err(|_| "command-cell framework shutdown owner lock is poisoned".to_string())?
+            .clone();
+        let settlement = tokio::time::timeout(OBSERVER_SHUTDOWN_TIMEOUT, async {
+            let shutdown_result = match owned_shutdown {
+                Some(shutdown) => shutdown.await,
+                None => Err("command-cell framework shutdown owner is unavailable".to_string()),
+            };
+            self.observers.wait().await;
+            shutdown_result
+        })
+        .await;
+        match settlement {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => failures.push(error),
+            Err(_) => failures.push(format!(
+                "command-cell framework and observer shutdown did not settle within {} seconds",
+                OBSERVER_SHUTDOWN_TIMEOUT.as_secs()
+            )),
+        }
+        let degraded = self
+            .projection_degraded
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .values()
+            .map(|diagnostic| format!("{}: {}", diagnostic.cell_id, diagnostic.message))
+            .collect::<Vec<_>>();
+        if !degraded.is_empty() {
+            failures.push(format!(
+                "command-cell projection debt remained at shutdown: {}",
+                degraded.join("; ")
+            ));
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 }
 
@@ -1096,10 +1254,8 @@ impl ScopedCommandCellRegistry {
         name: String,
         call_id: Option<String>,
         shell_permit: Option<OwnedSemaphorePermit>,
+        operation_reservation: super::executor::TaskRuntimeSettlementReservation,
     ) -> Result<(), CommandCellError> {
-        if self.service.shutdown.is_cancelled() {
-            return Err(CommandCellError::Shutdown);
-        }
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|error| CommandCellError::Runtime {
                 message: format!("Tokio runtime is unavailable: {error}"),
@@ -1107,13 +1263,18 @@ impl ScopedCommandCellRegistry {
         let service = self.service.clone();
         let registry = service.inner.clone();
         let observers = service.observers.clone();
-        drop(observers.spawn_on(
+        let operation_store = store.clone();
+        let operation_adapter = super::executor::TaskRuntimeBlockingAdapter::new(store);
+        let debt_adapter = operation_adapter.clone();
+        let operation = operation_adapter.spawn_reserved_settlement(
+            "observe command-cell terminal",
+            operation_reservation,
             async move {
                 let _observation = observation;
                 let _shell_permit = shell_permit;
-                observe_terminal_cell(
+                let persisted = observe_terminal_cell(
                     registry,
-                    store,
+                    operation_store,
                     scope.run_id.clone(),
                     cell_id.clone(),
                     name,
@@ -1122,6 +1283,28 @@ impl ScopedCommandCellRegistry {
                 )
                 .await;
                 service.forget(&scope, &cell_id);
+                if persisted {
+                    Ok(())
+                } else {
+                    let error = super::store::StoreError::InvalidPlan(format!(
+                        "command-cell '{cell_id}' terminal persistence exhausted its repair budget"
+                    ));
+                    debt_adapter.record_lifecycle_debt("observe command-cell terminal", &error);
+                    Err(error)
+                }
+            },
+        );
+        drop(observers.spawn_on(
+            async move {
+                match operation.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "command-cell observer ownership failed");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "command-cell observer receipt was lost");
+                    }
+                }
             },
             &runtime,
         ));
@@ -1134,10 +1317,8 @@ impl ScopedCommandCellRegistry {
         scope: ChatCellScope,
         started: BackgroundCellState,
         shell_permit: Option<OwnedSemaphorePermit>,
+        operation_reservation: super::executor::TaskRuntimeSettlementReservation,
     ) -> Result<(), CommandCellError> {
-        if self.service.shutdown.is_cancelled() {
-            return Err(CommandCellError::Shutdown);
-        }
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|error| CommandCellError::Runtime {
                 message: format!("Tokio runtime is unavailable: {error}"),
@@ -1145,13 +1326,53 @@ impl ScopedCommandCellRegistry {
         let service = self.service.clone();
         let registry = service.inner.clone();
         let observers = service.observers.clone();
+        let store = service
+            .store_for_workspace(&scope.workspace_id)
+            .ok_or_else(|| CommandCellError::Validation {
+                message: "ordinary Chat cell requires the scoped TaskRuntimeStore".to_string(),
+            })?;
+        let operation_adapter = super::executor::TaskRuntimeBlockingAdapter::new(store);
+        let debt_adapter = operation_adapter.clone();
+        let operation = operation_adapter.spawn_reserved_settlement(
+                "observe ordinary-chat command-cell terminal",
+                operation_reservation,
+                async move {
+                    let _observation = observation;
+                    let _shell_permit = shell_permit;
+                    let cell_id = started.cell_id.clone();
+                    let persisted = observe_chat_terminal_cell(
+                        registry,
+                        service.clone(),
+                        scope.clone(),
+                        started,
+                    )
+                    .await;
+                    service.forget_chat(&scope, &cell_id);
+                    if persisted {
+                        Ok(())
+                    } else {
+                        let error = super::store::StoreError::InvalidPlan(format!(
+                            "ordinary-chat command-cell '{cell_id}' terminal persistence exhausted its repair budget"
+                        ));
+                        debt_adapter.record_lifecycle_debt(
+                            "observe ordinary-chat command-cell terminal",
+                            &error,
+                        );
+                        Err(error)
+                    }
+                },
+            );
         drop(observers.spawn_on(
             async move {
-                let _observation = observation;
-                let _shell_permit = shell_permit;
-                let cell_id = started.cell_id.clone();
-                observe_chat_terminal_cell(registry, service.clone(), scope.clone(), started).await;
-                service.forget_chat(&scope, &cell_id);
+                match operation.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::error!(%error, "ordinary-chat command-cell observer failed");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "ordinary-chat command-cell receipt was lost");
+                    }
+                }
             },
             &runtime,
         ));
@@ -1179,6 +1400,18 @@ impl ScopedCommandCellRegistry {
                 .ok_or_else(|| CommandCellError::Validation {
                     message: "ordinary Chat cell requires root message identity".to_string(),
                 })?;
+        let operation_store = self
+            .service
+            .store_for_workspace(self.execution_scope.workspace_id())
+            .ok_or_else(|| CommandCellError::Validation {
+                message: "ordinary Chat cell requires the scoped TaskRuntimeStore".to_string(),
+            })?;
+        let operation_adapter = super::executor::TaskRuntimeBlockingAdapter::new(operation_store);
+        let operation_reservation = operation_adapter
+            .reserve_settlement("observe ordinary-chat command-cell terminal")
+            .map_err(|error| CommandCellError::Runtime {
+                message: error.to_string(),
+            })?;
         let reservation = self.service.inner.prepare_launch(request).await?;
         let receipt = reservation.receipt().clone();
         let cell_id = receipt.cell_id.clone();
@@ -1209,7 +1442,11 @@ impl ScopedCommandCellRegistry {
             started_at: receipt.accepted_at,
             finished_at: None,
         };
-        if let Err(error) = self.service.append_chat_cell_fact(&scope, &started, false) {
+        if let Err(error) = self
+            .service
+            .append_chat_cell_fact(&scope, &started, false)
+            .await
+        {
             let _ = self
                 .service
                 .inner
@@ -1237,16 +1474,28 @@ impl ScopedCommandCellRegistry {
                     reservation,
                     format!("process shell admission failed: {error}"),
                 );
-                self.spawn_chat_observer(observation, scope, started, None)?;
+                self.spawn_chat_observer(observation, scope, started, None, operation_reservation)?;
                 return Err(error);
             }
         };
         let start_result = self.service.inner.start_prepared(reservation).await;
         if let Err(error) = start_result {
-            self.spawn_chat_observer(observation, scope, started, Some(shell_permit))?;
+            self.spawn_chat_observer(
+                observation,
+                scope,
+                started,
+                Some(shell_permit),
+                operation_reservation,
+            )?;
             return Err(error);
         }
-        self.spawn_chat_observer(observation, scope, started, Some(shell_permit))?;
+        self.spawn_chat_observer(
+            observation,
+            scope,
+            started,
+            Some(shell_permit),
+            operation_reservation,
+        )?;
         Ok(receipt)
     }
 }
@@ -1431,8 +1680,12 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 .ok_or_else(|| CommandCellError::Validation {
                     message: "run-owned cell requires the scoped TaskRuntimeStore".to_string(),
                 })?;
-            let run = store
-                .get_run(&run_id)
+            let lookup_run_id = run_id.clone();
+            let run = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+                .run_store("load command-cell TaskRun", move |store| {
+                    store.get_run(&lookup_run_id)
+                })
+                .await
                 .map_err(|error| CommandCellError::Runtime {
                     message: error.to_string(),
                 })?
@@ -1454,6 +1707,12 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 });
             }
 
+            let operation_adapter = super::executor::TaskRuntimeBlockingAdapter::new(store.clone());
+            let operation_reservation = operation_adapter
+                .reserve_settlement("observe command-cell terminal")
+                .map_err(|error| CommandCellError::Runtime {
+                    message: error.to_string(),
+                })?;
             let reservation = self.service.inner.prepare_launch(request).await?;
             let receipt = reservation.receipt().clone();
             let cell_id = receipt.cell_id.clone();
@@ -1462,15 +1721,26 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 workspace_id: run.workspace_id.clone(),
                 run_id: run_id.clone(),
             };
-            let start_commit = store.record_background_cell_started(
-                &run_id,
-                &cell_id,
-                &name,
-                &command_hash,
-                owner.turn_id.as_deref(),
-                owner.execution_id.as_deref(),
-                owner.call_id.as_deref(),
-            );
+            let start_run_id = run_id.clone();
+            let start_cell_id = cell_id.clone();
+            let start_name = name.clone();
+            let start_command_hash = command_hash.clone();
+            let start_turn_id = owner.turn_id.clone();
+            let start_execution_id = owner.execution_id.clone();
+            let start_call_id = owner.call_id.clone();
+            let start_commit = super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+                .run_store("record command-cell start", move |store| {
+                    store.record_background_cell_started(
+                        &start_run_id,
+                        &start_cell_id,
+                        &start_name,
+                        &start_command_hash,
+                        start_turn_id.as_deref(),
+                        start_execution_id.as_deref(),
+                        start_call_id.as_deref(),
+                    )
+                })
+                .await;
             match start_commit {
                 Ok(super::store::BackgroundCellStartCommit::Durable) => {
                     self.service.track(&scope, &cell_id, receipt.deadline);
@@ -1491,6 +1761,7 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                         name,
                         owner.call_id,
                         None,
+                        operation_reservation,
                     )?;
                     return Err(CommandCellError::Runtime {
                         message: format!("cell start committed but projection degraded: {detail}"),
@@ -1532,6 +1803,7 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                         name,
                         owner.call_id,
                         None,
+                        operation_reservation,
                     )?;
                     return Err(error);
                 }
@@ -1546,6 +1818,7 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                     name,
                     owner.call_id,
                     Some(shell_permit),
+                    operation_reservation,
                 )?;
                 return Err(error);
             }
@@ -1557,6 +1830,7 @@ impl CommandCellRegistry for ScopedCommandCellRegistry {
                 name,
                 owner.call_id,
                 Some(shell_permit),
+                operation_reservation,
             )?;
 
             Ok(receipt)
@@ -1714,7 +1988,7 @@ async fn observe_terminal_cell(
     name: String,
     call_id: Option<String>,
     service: Arc<CommandCellRuntimeService>,
-) {
+) -> bool {
     let mut cursor = 0_u64;
     let mut excerpt = String::new();
     loop {
@@ -1742,10 +2016,7 @@ async fn observe_terminal_cell(
                     &service,
                 )
                 .await;
-                if persisted {
-                    super::continuation::wake_after_cell_terminal(&store, &run_id);
-                }
-                return;
+                return persisted;
             }
         };
         push_tail(&mut excerpt, &delta.new_output, OUTPUT_EXCERPT_CHARS);
@@ -1783,10 +2054,7 @@ async fn observe_terminal_cell(
             &service,
         )
         .await;
-        if persisted {
-            super::continuation::wake_after_cell_terminal(&store, &run_id);
-        }
-        return;
+        return persisted;
     }
 }
 
@@ -1795,7 +2063,7 @@ async fn observe_chat_terminal_cell(
     service: Arc<CommandCellRuntimeService>,
     scope: ChatCellScope,
     mut cell: BackgroundCellState,
-) {
+) -> bool {
     let mut cursor = 0_u64;
     let mut excerpt = String::new();
     loop {
@@ -1809,8 +2077,7 @@ async fn observe_chat_terminal_cell(
                 cell.terminal_cause = Some(BackgroundCellTerminalCause::ObserverFailed);
                 cell.terminal_message = Some(error.to_string());
                 cell.finished_at = Some(chrono::Utc::now());
-                persist_chat_terminal_with_retry(&service, &scope, &cell).await;
-                return;
+                return persist_chat_terminal_with_retry(&service, &scope, &cell).await;
             }
         };
         push_tail(&mut excerpt, &delta.new_output, OUTPUT_EXCERPT_CHARS);
@@ -1837,8 +2104,7 @@ async fn observe_chat_terminal_cell(
             .output_artifact
             .map(|artifact| artifact.sha256);
         cell.finished_at = Some(chrono::Utc::now());
-        persist_chat_terminal_with_retry(&service, &scope, &cell).await;
-        return;
+        return persist_chat_terminal_with_retry(&service, &scope, &cell).await;
     }
 }
 
@@ -1846,15 +2112,15 @@ async fn persist_chat_terminal_with_retry(
     service: &CommandCellRuntimeService,
     scope: &ChatCellScope,
     cell: &BackgroundCellState,
-) {
+) -> bool {
     let mut delay = Duration::from_millis(50);
     let mut attempt = 0_u64;
     loop {
         attempt = attempt.saturating_add(1);
-        match service.append_chat_cell_fact(scope, cell, true) {
+        match service.append_chat_cell_fact(scope, cell, true).await {
             Ok(()) => {
                 service.clear_projection_degraded(&cell.cell_id);
-                return;
+                return true;
             }
             Err(error) => {
                 service.mark_projection_degraded(&cell.cell_id, error.clone());
@@ -1867,14 +2133,11 @@ async fn persist_chat_terminal_with_retry(
                     %error,
                     "retrying ordinary-chat command-cell terminal persistence"
                 );
-                if service.shutdown.is_cancelled() {
-                    return;
+                if attempt >= MAX_PROJECTION_REPAIR_ATTEMPTS {
+                    return false;
                 }
-                tokio::select! {
-                    _ = service.shutdown.cancelled() => return,
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(Duration::from_secs(1));
             }
         }
     }
@@ -1900,33 +2163,59 @@ async fn persist_terminal_with_retry(
     call_id: Option<&str>,
     service: &CommandCellRuntimeService,
 ) -> bool {
+    let run_id = run_id.to_string();
+    let cell_id = cell_id.to_string();
+    let name = name.to_string();
+    let terminal_message = terminal_message.map(str::to_string);
+    let artifact_message = artifact_message.map(str::to_string);
+    let output_excerpt = output_excerpt.map(str::to_string);
+    let artifact_path = artifact_path.map(str::to_string);
+    let artifact_sha256 = artifact_sha256.map(str::to_string);
+    let call_id = call_id.map(str::to_string);
+    let blocking = super::executor::TaskRuntimeBlockingAdapter::new(store.clone());
     let mut delay = Duration::from_millis(50);
     let mut attempt = 0_u64;
     loop {
         attempt = attempt.saturating_add(1);
-        match store.record_background_cell_finished(
-            run_id,
-            cell_id,
-            name,
-            phase,
-            terminal_cause,
-            terminal_message,
-            exit_code,
-            artifact_status,
-            artifact_message,
-            total_output_bytes,
-            output_truncated,
-            output_excerpt,
-            artifact_path,
-            artifact_sha256,
-            call_id,
-        ) {
+        let operation_run_id = run_id.clone();
+        let operation_cell_id = cell_id.clone();
+        let operation_name = name.clone();
+        let operation_terminal_message = terminal_message.clone();
+        let operation_artifact_message = artifact_message.clone();
+        let operation_output_excerpt = output_excerpt.clone();
+        let operation_artifact_path = artifact_path.clone();
+        let operation_artifact_sha256 = artifact_sha256.clone();
+        let operation_call_id = call_id.clone();
+        match blocking
+            .run_store("record command-cell terminal", move |store| {
+                store.record_background_cell_finished(
+                    &operation_run_id,
+                    &operation_cell_id,
+                    &operation_name,
+                    phase,
+                    terminal_cause,
+                    operation_terminal_message.as_deref(),
+                    exit_code,
+                    artifact_status,
+                    operation_artifact_message.as_deref(),
+                    total_output_bytes,
+                    output_truncated,
+                    operation_output_excerpt.as_deref(),
+                    operation_artifact_path.as_deref(),
+                    operation_artifact_sha256.as_deref(),
+                    operation_call_id.as_deref(),
+                )?;
+                super::continuation::wake_after_cell_terminal(&store, &operation_run_id);
+                Ok(())
+            })
+            .await
+        {
             Ok(()) => {
-                service.clear_projection_degraded(cell_id);
+                service.clear_projection_degraded(&cell_id);
                 return true;
             }
             Err(error) => {
-                service.mark_projection_degraded(cell_id, error.to_string());
+                service.mark_projection_degraded(&cell_id, error.to_string());
                 tracing::warn!(
                     run_id,
                     cell_id,
@@ -1934,14 +2223,11 @@ async fn persist_terminal_with_retry(
                     %error,
                     "retrying terminal command-cell event persistence"
                 );
-                if service.shutdown.is_cancelled() {
+                if attempt >= MAX_PROJECTION_REPAIR_ATTEMPTS {
                     return false;
                 }
-                tokio::select! {
-                    _ = service.shutdown.cancelled() => return false,
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                delay = delay.saturating_mul(2).min(Duration::from_secs(30));
+                tokio::time::sleep(delay).await;
+                delay = delay.saturating_mul(2).min(Duration::from_secs(1));
             }
         }
     }
@@ -2054,6 +2340,7 @@ mod tests {
             awaiters: Mutex::new(AwaiterRuntimeState::default()),
             awaiter_agents: RwLock::new(HashMap::new()),
             foreground_turns: RwLock::new(None),
+            framework_shutdown: Mutex::new(None),
         }))
     }
 
@@ -2103,8 +2390,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn awaiter_ready_is_idempotent_and_acknowledgement_clears_pending() -> Result<(), String> {
+    #[tokio::test]
+    async fn awaiter_ready_is_idempotent_and_acknowledgement_clears_pending() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = test_service(temp.path())?;
         let result = awaiter_result("awaiter-execution", "cell-ready");
@@ -2130,7 +2418,9 @@ mod tests {
             Some(BackgroundCellPhase::Succeeded)
         );
 
-        service.acknowledge_awaiter_result(&result, "next-turn".to_string());
+        service
+            .acknowledge_awaiter_result(&result, "next-turn".to_string())
+            .await;
         let pending = service
             .chat_events
             .pending_awaiter_results("global", "conversation", "root-message")
@@ -2220,8 +2510,9 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn next_turn_projection_delivers_and_acknowledges_pending_results() -> Result<(), String> {
+    #[tokio::test]
+    async fn next_turn_projection_delivers_and_acknowledges_pending_results() -> Result<(), String>
+    {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = test_service(temp.path())?;
         let result = awaiter_result("awaiter-next-turn", "cell-next-turn");
@@ -2238,7 +2529,8 @@ mod tests {
             .map_err(|error| error.to_string())?;
 
         let projection = service
-            .project_pending_awaiter_results("global", "conversation", "next-turn")?
+            .project_pending_awaiter_results("global", "conversation", "next-turn")
+            .await?
             .ok_or_else(|| "pending Awaiter result was not projected".to_string())?;
         assert!(projection.contains("awaiter-next-turn"));
         assert!(projection.contains("\"phase\":\"succeeded\""));
@@ -2254,9 +2546,13 @@ mod tests {
     async fn exact_awaiter_interrupt_does_not_stop_its_cell() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = test_service(temp.path())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
         let registry = service.scoped(
             crate::workspace::WorkspaceExecutionScope::global(temp.path()),
-            None,
+            Some(store.clone()),
         );
         let cell_id = registry
             .launch(CommandCellRequest {
@@ -2336,7 +2632,11 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = test_service(temp.path())?;
         let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
-        let registry = service.scoped(scope.clone(), None);
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
         let cell_id = registry
             .launch(CommandCellRequest {
                 command: "sleep 1; printf owned-awaiter-result".to_string(),
@@ -2439,7 +2739,11 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = test_service(temp.path())?;
         let scope = crate::workspace::WorkspaceExecutionScope::global(temp.path());
-        let registry = service.scoped(scope.clone(), None);
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
         let cell_id = registry
             .launch(CommandCellRequest {
                 command: "sleep 0.2; printf cell-still-succeeded".to_string(),
@@ -2538,7 +2842,7 @@ mod tests {
         );
         let cell_id = registry
             .launch(CommandCellRequest {
-                command: "echo projected-cell-result".to_string(),
+                command: "sleep 0.2; echo projected-cell-result".to_string(),
                 owner: CommandCellOwner {
                     conversation_id: Some("conversation".to_string()),
                     run_id: Some("cell-run".to_string()),
@@ -2552,6 +2856,18 @@ mod tests {
             .await
             .map(|receipt| receipt.cell_id)
             .map_err(|error| error.to_string())?;
+        if store.active_operation_count() == 0 {
+            return Err(
+                "command-cell observer did not retain TaskRuntime operation ownership".to_string(),
+            );
+        }
+        store.begin_operation_shutdown()?;
+        let rejected = super::super::executor::TaskRuntimeBlockingAdapter::new(store.clone())
+            .run_owned("late command-cell operation", || Ok(()))
+            .await;
+        if !rejected.is_err_and(|error| error.to_string().contains("admission is closed")) {
+            return Err("command-cell phase-one fixture accepted a late operation".to_string());
+        }
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -2589,6 +2905,7 @@ mod tests {
             .ok_or_else(|| "cell result missing from recovery capsule".to_string())?;
         assert!(capsule.contains("projected-cell-result"));
         assert!(capsule.contains(&cell_id));
+        store.shutdown_operations().await?;
         Ok(())
     }
 
@@ -2654,9 +2971,13 @@ mod tests {
     -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let service = test_service(temp.path())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
         let registry = service.scoped(
             crate::workspace::WorkspaceExecutionScope::global(temp.path()),
-            None,
+            Some(store.clone()),
         );
         let cell_id = registry
             .launch(CommandCellRequest {
@@ -2708,6 +3029,76 @@ mod tests {
             .replay("global", Some("conversation-b"), "root-message-a", 0)
             .map_err(|error| error.to_string())?;
         assert!(wrong_conversation.events.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn phase_one_cancels_long_cell_before_operation_join() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(temp.path().join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(
+            crate::workspace::WorkspaceExecutionScope::global(temp.path()),
+            Some(store.clone()),
+        );
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "sleep 30".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+
+        store.begin_operation_shutdown()?;
+        service.begin_shutdown()?;
+        tokio::time::timeout(Duration::from_secs(5), store.shutdown_operations())
+            .await
+            .map_err(|_| "operation join waited for the uncancelled long command".to_string())??;
+        tokio::time::timeout(Duration::from_secs(5), service.shutdown())
+            .await
+            .map_err(|_| "command-cell shutdown exceeded its total deadline".to_string())??;
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        let terminal = find_chat_cell_fact(&replay.events, &cell_id, true).ok_or_else(|| {
+            "phase-one cancellation did not persist terminal cell truth".to_string()
+        })?;
+        assert!(!terminal.is_active());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_callers_share_one_stable_framework_settlement()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let first = service.clone();
+        let second = service.clone();
+        let (first_begin, second_begin) = tokio::join!(
+            tokio::spawn(async move { first.begin_shutdown() }),
+            tokio::spawn(async move { second.begin_shutdown() }),
+        );
+        first_begin
+            .map_err(|error| format!("first shutdown broadcast failed to join: {error}"))??;
+        second_begin
+            .map_err(|error| format!("second shutdown broadcast failed to join: {error}"))??;
+
+        let first = service.clone();
+        let second = service.clone();
+        let (first_settlement, second_settlement) =
+            tokio::join!(first.shutdown(), second.shutdown());
+        assert_eq!(first_settlement, second_settlement);
+        assert!(first_settlement.is_ok());
         Ok(())
     }
 

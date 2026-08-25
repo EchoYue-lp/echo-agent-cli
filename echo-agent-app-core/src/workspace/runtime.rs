@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use echo_agent::memory::{ConversationStore, FileConversationStore, FileStore, Store};
 use echo_agent::state::{FileRuntimeStateStore, RuntimeStateStore};
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use tokio::sync::{Mutex, OnceCell, RwLock};
 
 use super::layout::WorkspaceLayout;
@@ -17,6 +19,8 @@ use crate::agent_pool::{AgentPool, WorkspaceAgentPoolResources};
 use crate::conversation_deletion::ConversationDeletionService;
 use crate::evolution::ReviewIntegration;
 use crate::tasks::task_runtime::TaskRuntimeStore;
+
+type WorkspaceShutdownSettlement = Shared<BoxFuture<'static, Result<(), String>>>;
 
 /// One coherently prepared set of workspace-scoped runtime resources.
 ///
@@ -43,6 +47,11 @@ pub(crate) struct WorkspaceRuntimeHost {
     task_runtime: OnceCell<Arc<TaskRuntimeStore>>,
     execution: OnceCell<Arc<WorkspaceExecutionRuntime>>,
     control_lifecycle: std::sync::Mutex<WorkspaceControlLifecycle>,
+    operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
+    operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_settlement: std::sync::Mutex<Option<WorkspaceShutdownSettlement>>,
+    #[cfg(test)]
+    shutdown_after_operations_barrier: std::sync::Mutex<Option<WorkspaceControlAcquireTestBarrier>>,
 }
 
 #[derive(Default)]
@@ -109,6 +118,7 @@ pub(crate) struct WorkspaceRuntimeActivity {
     pub active_pool_executions: usize,
     pub active_run_drivers: usize,
     pub active_run_driver_receipts: usize,
+    pub active_task_runtime_operations: usize,
     pub active_controls: usize,
 }
 
@@ -117,6 +127,7 @@ impl WorkspaceRuntimeActivity {
         self.active_pool_executions == 0
             && self.active_run_drivers == 0
             && self.active_run_driver_receipts == 0
+            && self.active_task_runtime_operations == 0
             && self.active_controls == 0
     }
 }
@@ -130,6 +141,8 @@ impl WorkspaceRuntimeActivity {
 #[derive(Default)]
 pub(crate) struct WorkspaceRuntimeRegistry {
     hosts: Mutex<HashMap<WorkspaceId, Arc<WorkspaceRuntimeHost>>>,
+    operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
+    operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(test)]
     control_acquire_barrier: std::sync::Mutex<Option<WorkspaceControlAcquireTestBarrier>>,
     #[cfg(test)]
@@ -240,7 +253,11 @@ impl WorkspaceRuntimeResources {
 }
 
 impl WorkspaceRuntimeHost {
-    async fn open(workspace: Workspace) -> anyhow::Result<Arc<Self>> {
+    async fn open_with_operation_stores(
+        workspace: Workspace,
+        operation_stores: Arc<std::sync::Mutex<Vec<std::sync::Weak<TaskRuntimeStore>>>>,
+        operation_admission_open: Arc<std::sync::atomic::AtomicBool>,
+    ) -> anyhow::Result<Arc<Self>> {
         let resources = WorkspaceRuntimeResources::prepare(workspace).await?;
         let workspace = resources.workspace().clone();
         Ok(Arc::new(Self {
@@ -249,6 +266,11 @@ impl WorkspaceRuntimeHost {
             task_runtime: OnceCell::new(),
             execution: OnceCell::new(),
             control_lifecycle: std::sync::Mutex::new(WorkspaceControlLifecycle::default()),
+            operation_stores,
+            operation_admission_open,
+            shutdown_settlement: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            shutdown_after_operations_barrier: std::sync::Mutex::new(None),
         }))
     }
 
@@ -303,6 +325,17 @@ impl WorkspaceRuntimeHost {
             .map_err(|_| anyhow::anyhow!("workspace control lifecycle lock is poisoned"))
     }
 
+    fn ensure_open(&self) -> anyhow::Result<()> {
+        let lifecycle = self
+            .control_lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace control lifecycle lock is poisoned"))?;
+        if lifecycle.closing {
+            anyhow::bail!("workspace '{}' runtime is closing", self.id());
+        }
+        Ok(())
+    }
+
     fn begin_closing(self: &Arc<Self>) -> anyhow::Result<WorkspaceClosingGuard> {
         let mut lifecycle = self
             .control_lifecycle
@@ -329,16 +362,60 @@ impl WorkspaceRuntimeHost {
         lifecycle.closing = false;
     }
 
+    #[cfg(test)]
+    fn park_shutdown_after_operations(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::oneshot::Receiver<()>,
+            tokio::sync::oneshot::Sender<()>,
+        ),
+        String,
+    > {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut barrier = self
+            .shutdown_after_operations_barrier
+            .lock()
+            .map_err(|_| "workspace shutdown test barrier is poisoned".to_string())?;
+        if barrier.is_some() {
+            return Err("workspace shutdown test barrier is already installed".to_string());
+        }
+        *barrier = Some(WorkspaceControlAcquireTestBarrier {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        Ok((entered_rx, release_tx))
+    }
+
     /// Open the host's TaskRuntime authority without constructing AgentPool,
     /// plugin, MCP, or review generations.
     pub(crate) async fn task_runtime(&self) -> anyhow::Result<Arc<TaskRuntimeStore>> {
         let store = self
             .task_runtime
             .get_or_try_init(|| async {
+                if !self
+                    .operation_admission_open
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    anyhow::bail!("workspace TaskRuntime operation admission is closed");
+                }
                 let store = Arc::new(TaskRuntimeStore::open_for_workspace(
                     self.resources.tasks_dir(),
                     self.id().to_string(),
                 )?);
+                self.operation_stores
+                    .lock()
+                    .map_err(|_| {
+                        anyhow::anyhow!("workspace TaskRuntime operation registry lock is poisoned")
+                    })?
+                    .push(Arc::downgrade(&store));
+                if !self
+                    .operation_admission_open
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    anyhow::bail!("workspace TaskRuntime operation admission closed during open");
+                }
                 crate::tasks::task_runtime::TaskRunBootReconciler::for_store(&store)
                     .recover_once()
                     .await
@@ -421,6 +498,78 @@ impl WorkspaceRuntimeHost {
         *self.workspace.write().await = workspace;
         Ok(())
     }
+
+    async fn shutdown_runtime_uncached(&self) -> anyhow::Result<()> {
+        if let Some(runtime) = self.execution.get() {
+            return runtime.shutdown().await;
+        }
+        let Some(store) = self.task_runtime.get() else {
+            return Ok(());
+        };
+        let mut errors = Vec::new();
+        if let Err(error) = store.shutdown_run_drivers().await {
+            errors.push(format!("TaskRun drivers: {error}"));
+        }
+        if let Err(error) = store.shutdown_operations().await {
+            errors.push(format!("TaskRuntime operations: {error}"));
+        }
+        #[cfg(test)]
+        {
+            let barrier = self
+                .shutdown_after_operations_barrier
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workspace shutdown test barrier is poisoned"))?
+                .take();
+            if let Some(barrier) = barrier {
+                let _ = barrier.entered.send(());
+                barrier.release.await.map_err(|_| {
+                    anyhow::anyhow!("workspace shutdown test barrier release was dropped")
+                })?;
+            }
+        }
+        if let Err(error) = store.shutdown_hook_events().await {
+            errors.push(format!("task hooks: {error}"));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow::anyhow!(errors.join("; ")))
+        }
+    }
+
+    async fn shutdown_runtime(self: &Arc<Self>) -> anyhow::Result<()> {
+        let settlement = {
+            let mut owner = self
+                .shutdown_settlement
+                .lock()
+                .map_err(|_| anyhow::anyhow!("workspace shutdown owner lock is poisoned"))?;
+            if let Some(settlement) = owner.as_ref() {
+                settlement.clone()
+            } else {
+                let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+                    anyhow::anyhow!(
+                        "Tokio runtime is unavailable during workspace shutdown: {error}"
+                    )
+                })?;
+                let host = Arc::clone(self);
+                let settlement = async move {
+                    match std::panic::AssertUnwindSafe(host.shutdown_runtime_uncached())
+                        .catch_unwind()
+                        .await
+                    {
+                        Ok(result) => result.map_err(|error| error.to_string()),
+                        Err(_) => Err("workspace runtime shutdown panicked".to_string()),
+                    }
+                }
+                .boxed()
+                .shared();
+                drop(runtime.spawn(settlement.clone()));
+                *owner = Some(settlement.clone());
+                settlement
+            }
+        };
+        settlement.await.map_err(anyhow::Error::msg)
+    }
 }
 
 impl WorkspaceExecutionRuntime {
@@ -471,6 +620,7 @@ impl WorkspaceExecutionRuntime {
                 .task_runtime
                 .active_run_driver_receipt_count()
                 .map_err(anyhow::Error::msg)?,
+            active_task_runtime_operations: self.task_runtime.active_operation_count(),
             active_controls,
         })
     }
@@ -479,6 +629,9 @@ impl WorkspaceExecutionRuntime {
         let mut errors = Vec::new();
         if let Err(error) = self.task_runtime.shutdown_run_drivers().await {
             errors.push(format!("TaskRun drivers: {error}"));
+        }
+        if let Err(error) = self.task_runtime.shutdown_operations().await {
+            errors.push(format!("TaskRuntime operations: {error}"));
         }
         if let Err(error) = self.review_integration.shutdown_background_reviews().await {
             errors.push(format!("memory review: {error}"));
@@ -504,7 +657,15 @@ impl WorkspaceExecutionRuntime {
 
 impl WorkspaceRuntimeRegistry {
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            hosts: Mutex::new(HashMap::new()),
+            operation_stores: Arc::new(std::sync::Mutex::new(Vec::new())),
+            operation_admission_open: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            #[cfg(test)]
+            control_acquire_barrier: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            close_barrier: std::sync::Mutex::new(None),
+        }
     }
 
     /// Return the one loaded host for a workspace, opening it on first use.
@@ -515,11 +676,17 @@ impl WorkspaceRuntimeRegistry {
         let workspace_id = workspace.id.clone();
         let mut hosts = self.hosts.lock().await;
         if let Some(host) = hosts.get(&workspace_id) {
+            host.ensure_open()?;
             host.refresh_workspace(workspace).await?;
             return Ok(Arc::clone(host));
         }
 
-        let host = WorkspaceRuntimeHost::open(workspace).await?;
+        let host = WorkspaceRuntimeHost::open_with_operation_stores(
+            workspace,
+            Arc::clone(&self.operation_stores),
+            Arc::clone(&self.operation_admission_open),
+        )
+        .await?;
         hosts.insert(workspace_id, Arc::clone(&host));
         Ok(host)
     }
@@ -534,11 +701,17 @@ impl WorkspaceRuntimeRegistry {
         let mut hosts = self.hosts.lock().await;
         let host = match hosts.get(&workspace_id) {
             Some(host) => {
+                host.ensure_open()?;
                 host.refresh_workspace(workspace).await?;
                 Arc::clone(host)
             }
             None => {
-                let host = WorkspaceRuntimeHost::open(workspace).await?;
+                let host = WorkspaceRuntimeHost::open_with_operation_stores(
+                    workspace,
+                    Arc::clone(&self.operation_stores),
+                    Arc::clone(&self.operation_admission_open),
+                )
+                .await?;
                 hosts.insert(workspace_id, Arc::clone(&host));
                 host
             }
@@ -574,6 +747,33 @@ impl WorkspaceRuntimeRegistry {
             }
         }
         host.acquire_control_lease()
+    }
+
+    pub(crate) fn begin_task_runtime_operation_shutdown(&self) -> Result<(), String> {
+        self.operation_admission_open
+            .store(false, std::sync::atomic::Ordering::Release);
+        let mut stores = self
+            .operation_stores
+            .lock()
+            .map_err(|_| "workspace TaskRuntime operation registry lock is poisoned".to_string())?;
+        let mut failures = Vec::new();
+        stores.retain(|store| {
+            let Some(store) = store.upgrade() else {
+                return false;
+            };
+            if let Err(error) = store.begin_operation_shutdown() {
+                failures.push(format!(
+                    "workspace {}: {error}",
+                    store.active_workspace_id()
+                ));
+            }
+            true
+        });
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        }
     }
 
     #[cfg(test)]
@@ -659,6 +859,11 @@ impl WorkspaceRuntimeRegistry {
                     active_pool_executions: 0,
                     active_run_drivers: 0,
                     active_run_driver_receipts: 0,
+                    active_task_runtime_operations: host
+                        .task_runtime
+                        .get()
+                        .map(|store| store.active_operation_count())
+                        .unwrap_or(0),
                     active_controls: host.active_control_count()?,
                 }),
             }
@@ -701,6 +906,11 @@ impl WorkspaceRuntimeRegistry {
                 active_pool_executions: 0,
                 active_run_drivers: 0,
                 active_run_driver_receipts: 0,
+                active_task_runtime_operations: host
+                    .task_runtime
+                    .get()
+                    .map(|store| store.active_operation_count())
+                    .unwrap_or(0),
                 active_controls,
             }),
         };
@@ -710,19 +920,18 @@ impl WorkspaceRuntimeRegistry {
         };
         if !activity.is_idle() {
             anyhow::bail!(
-                "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {}, controls: {})",
+                "workspace '{}' is busy (pool executions: {}, run drivers: {}, driver receipts: {}, TaskRuntime operations: {}, controls: {})",
                 workspace_id,
                 activity.active_pool_executions,
                 activity.active_run_drivers,
                 activity.active_run_driver_receipts,
+                activity.active_task_runtime_operations,
                 activity.active_controls
             );
         }
-        if let Some(runtime) = host.execution.get() {
-            runtime.shutdown().await?;
-        }
-        hosts.remove(workspace_id);
         closing.commit();
+        host.shutdown_runtime().await?;
+        hosts.remove(workspace_id);
         Ok(true)
     }
 
@@ -736,9 +945,7 @@ impl WorkspaceRuntimeRegistry {
             .collect::<Vec<_>>();
         let mut errors = Vec::new();
         for host in hosts {
-            if let Some(runtime) = host.execution.get()
-                && let Err(error) = runtime.shutdown().await
-            {
+            if let Err(error) = host.shutdown_runtime().await {
                 errors.push(format!("workspace {}: {error}", host.id()));
             }
         }
@@ -843,7 +1050,9 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let root = temp.path().join("lazy-runtime");
         std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-        let host = WorkspaceRuntimeHost::open(workspace("lazy", root))
+        let registry = WorkspaceRuntimeRegistry::new();
+        let host = registry
+            .get_or_open(workspace("lazy", root))
             .await
             .map_err(|error| error.to_string())?;
 
@@ -858,6 +1067,72 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert!(host.execution.get().is_none());
         assert_eq!(first.active_workspace_id(), "lazy");
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn caller_abort_keeps_workspace_busy_until_taskruntime_operation_settles()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("operation-barrier");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let registry = WorkspaceRuntimeRegistry::new();
+        let host = registry
+            .get_or_open(workspace("operation-barrier", root))
+            .await
+            .map_err(|error| error.to_string())?;
+        let workspace_id = host.id().clone();
+        let store = host
+            .task_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone());
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            adapter
+                .run_owned("workspace teardown barrier", move || {
+                    let _ = entered_tx.send(());
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(|error| {
+                            crate::tasks::task_runtime::StoreError::InvalidPlan(error.to_string())
+                        })?;
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx
+            .await
+            .map_err(|_| "TaskRuntime operation did not enter".to_string())?;
+        caller.abort();
+        let _ = caller.await;
+
+        let error = registry
+            .shutdown_and_evict_if_idle(&workspace_id)
+            .await
+            .err()
+            .ok_or_else(|| "workspace teardown crossed an active operation".to_string())?;
+        if !error.to_string().contains("TaskRuntime operations: 1") {
+            return Err(format!("unexpected workspace busy receipt: {error}"));
+        }
+        release_tx
+            .send(())
+            .map_err(|error| format!("failed to release TaskRuntime operation: {error}"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while store.active_operation_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "TaskRuntime operation did not settle".to_string())?;
+        if !registry
+            .shutdown_and_evict_if_idle(&workspace_id)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Err("settled workspace host was not evicted".to_string());
+        }
         Ok(())
     }
 
@@ -1055,6 +1330,107 @@ mod tests {
                 .map_err(|error| error.to_string())?
         );
         assert_eq!(registry.host_count().await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn degraded_workspace_shutdown_stays_sealed_and_replays_its_debt() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("degraded-eviction");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let registry = WorkspaceRuntimeRegistry::new();
+        let workspace = workspace("degraded", root);
+        let host = registry
+            .get_or_open(workspace.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = host
+            .task_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store);
+        let debt = crate::tasks::task_runtime::StoreError::InvalidPlan(
+            "terminal projection debt".to_string(),
+        );
+        adapter.record_lifecycle_debt("degraded workspace fixture", &debt);
+
+        let first = registry
+            .shutdown_and_evict_if_idle(&workspace.id)
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .ok_or_else(|| "degraded workspace shutdown unexpectedly succeeded".to_string())?;
+        assert!(first.contains("terminal projection debt"));
+        assert_eq!(registry.host_count().await, 1);
+        assert!(registry.get_or_open(workspace.clone()).await.is_err());
+
+        let replay = host
+            .shutdown_runtime()
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .ok_or_else(|| "cached degraded settlement was lost".to_string())?;
+        assert!(replay.contains("terminal projection debt"));
+        assert!(
+            registry
+                .shutdown_and_evict_if_idle(&workspace.id)
+                .await
+                .is_err()
+        );
+        assert_eq!(registry.host_count().await, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn eviction_caller_drop_cannot_cancel_or_erase_shutdown_debt() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("caller-drop-eviction");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let registry = Arc::new(WorkspaceRuntimeRegistry::new());
+        let workspace = workspace("caller-drop", root);
+        let host = registry
+            .get_or_open(workspace.clone())
+            .await
+            .map_err(|error| error.to_string())?;
+        let store = host
+            .task_runtime()
+            .await
+            .map_err(|error| error.to_string())?;
+        let adapter = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store);
+        let debt = crate::tasks::task_runtime::StoreError::InvalidPlan(
+            "caller-drop terminal debt".to_string(),
+        );
+        adapter.record_lifecycle_debt("caller-drop workspace fixture", &debt);
+        let (entered, release) = host.park_shutdown_after_operations()?;
+
+        let eviction_registry = registry.clone();
+        let workspace_id = workspace.id.clone();
+        let eviction = tokio::spawn(async move {
+            eviction_registry
+                .shutdown_and_evict_if_idle(&workspace_id)
+                .await
+        });
+        entered.await.map_err(|_| {
+            "workspace shutdown never reached its post-operation barrier".to_string()
+        })?;
+        eviction.abort();
+        let eviction_result = eviction.await;
+        if !eviction_result.is_err_and(|error| error.is_cancelled()) {
+            return Err("workspace eviction caller was not cancelled".to_string());
+        }
+        release
+            .send(())
+            .map_err(|_| "failed to release workspace shutdown owner".to_string())?;
+
+        let replay = host
+            .shutdown_runtime()
+            .await
+            .err()
+            .map(|error| error.to_string())
+            .ok_or_else(|| "caller-drop shutdown debt was lost".to_string())?;
+        assert!(replay.contains("caller-drop terminal debt"));
+        assert!(registry.get_or_open(workspace.clone()).await.is_err());
+        assert_eq!(registry.host_count().await, 1);
         Ok(())
     }
 

@@ -5,24 +5,25 @@
 
 ## 文档导航
 
-| 文档                                                                         | 内容                                                 |
-| ---------------------------------------------------------------------------- | ---------------------------------------------------- |
-| [快速入门](./getting-started.md)                                             | 环境准备、TUI/GUI/JSONL 启动与首次配置               |
-| [功能总览](./features.md)                                                    | 已接入真实主路径的产品能力与代码依据                 |
-| [架构说明](./architecture.md)                                                | 框架/应用边界、运行时所有权、数据流和文件布局        |
-| [持久化概念](./persistence.md)                                               | Store、Journal、Checkpoint、Trace 与权威关系         |
-| [配置指南](./configuration.md)                                               | 模型、MCP、Hooks、Browser、Channel 与环境变量        |
-| [Provider 架构](./architecture/providers.md)                                 | 动态 Provider、模型协议和思考能力解析                |
-| [RuntimeTaskService 决策](./architecture/runtime-task-service.md)            | Task DAG 权威、EKO adapter、journal 与 blocking 边界 |
-| [Foreground continuation ADR](./adr/0005-foreground-continuation-owner.md)   | 多 RunTurn 单一 owner、steer/cancel 与 settlement    |
-| [TaskRuntime Agent Turn ADR](./adr/0007-taskruntime-agent-turn-authority.md) | AgentTurnDriver、typed terminal 与 RunTurn 原子权威  |
-| [Agent 协同 ADR](./adr/0001-agent-collaboration.md)                          | Codex 协同机制与 EKO 功能设计                        |
-| [Codex 工具目录 ADR](./adr/0002-codex-tool-capability-catalog.md)            | Codex 工具能力与 EKO 参考设计                        |
-| [Claude Code 能力目录](./adr/0003-claude-code-capability-catalog.md)         | Claude Code 工具、子智能体和 Skills 快照             |
-| [应用生命周期 ADR](./adr/0004-application-lifecycle-supervisor.md)           | GUI/headless admission、取消、join 与 rollback       |
-| [Scoped product-data I/O](./adr/0006-scoped-product-data-io.md)              | 文件、研究和分析的 workspace authority 与阻塞边界    |
-| [Skill 同步](./skill-sync.md)                                                | 内置/用户 Skill、启用状态与上游同步                  |
-| [项目状态](./MASTER-PLAN.md)                                                 | 当前权威路径、活跃工作与下一步                       |
+| 文档                                                                                  | 内容                                                 |
+| ------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| [快速入门](./getting-started.md)                                                      | 环境准备、TUI/GUI/JSONL 启动与首次配置               |
+| [功能总览](./features.md)                                                             | 已接入真实主路径的产品能力与代码依据                 |
+| [架构说明](./architecture.md)                                                         | 框架/应用边界、运行时所有权、数据流和文件布局        |
+| [持久化概念](./persistence.md)                                                        | Store、Journal、Checkpoint、Trace 与权威关系         |
+| [配置指南](./configuration.md)                                                        | 模型、MCP、Hooks、Browser、Channel 与环境变量        |
+| [Provider 架构](./architecture/providers.md)                                          | 动态 Provider、模型协议和思考能力解析                |
+| [RuntimeTaskService 决策](./architecture/runtime-task-service.md)                     | Task DAG 权威、EKO adapter、journal 与 blocking 边界 |
+| [Foreground continuation ADR](./adr/0005-foreground-continuation-owner.md)            | 多 RunTurn 单一 owner、steer/cancel 与 settlement    |
+| [TaskRuntime Agent Turn ADR](./adr/0007-taskruntime-agent-turn-authority.md)          | AgentTurnDriver、typed terminal 与 RunTurn 原子权威  |
+| [TaskRuntime Async Boundary ADR](./adr/0009-taskruntime-async-io-and-ipc-boundary.md) | bounded file I/O、caller drop 与 typed IPC           |
+| [Agent 协同 ADR](./adr/0001-agent-collaboration.md)                                   | Codex 协同机制与 EKO 功能设计                        |
+| [Codex 工具目录 ADR](./adr/0002-codex-tool-capability-catalog.md)                     | Codex 工具能力与 EKO 参考设计                        |
+| [Claude Code 能力目录](./adr/0003-claude-code-capability-catalog.md)                  | Claude Code 工具、子智能体和 Skills 快照             |
+| [应用生命周期 ADR](./adr/0004-application-lifecycle-supervisor.md)                    | GUI/headless admission、取消、join 与 rollback       |
+| [Scoped product-data I/O](./adr/0006-scoped-product-data-io.md)                       | 文件、研究和分析的 workspace authority 与阻塞边界    |
+| [Skill 同步](./skill-sync.md)                                                         | 内置/用户 Skill、启用状态与上游同步                  |
+| [项目状态](./MASTER-PLAN.md)                                                          | 当前权威路径、活跃工作与下一步                       |
 
 仓库根 [README](../README.md) 负责产品介绍、构建命令和常用交互；本文档集不再
 复制完整的 slash command 或历史里程碑清单。

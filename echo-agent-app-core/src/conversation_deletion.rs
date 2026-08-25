@@ -372,8 +372,12 @@ impl ConversationDeletionService {
         }
         if let Some(store) = task_runtime {
             quiesce_task_runs(&store, &conversation_id).await?;
-            store
-                .remove_conversation(&conversation_id)
+            let remove_id = conversation_id.clone();
+            crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+                .run_store("remove conversation TaskRuns", move |store| {
+                    store.remove_conversation(&remove_id)
+                })
+                .await
                 .map_err(|error| ConversationDeletionError::TaskRuntime(error.to_string()))?;
         }
         self.complete_step(&tombstone_path, &mut tombstone, DeletionStep::TaskRuntime)?;
@@ -684,14 +688,17 @@ async fn quiesce_task_runs(
     store: &Arc<TaskRuntimeStore>,
     conversation_id: &str,
 ) -> Result<(), ConversationDeletionError> {
-    let runs = store
-        .list_runs_for_conversation(conversation_id)
+    let conversation_id = conversation_id.to_string();
+    let runs = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store("cancel conversation TaskRuns", move |store| {
+            let runs = store.list_runs_for_conversation(&conversation_id)?;
+            for run in &runs {
+                store.request_cancel(&run.run_id)?;
+            }
+            Ok(runs)
+        })
+        .await
         .map_err(|error| ConversationDeletionError::TaskRuntime(error.to_string()))?;
-    for run in &runs {
-        store
-            .request_cancel(&run.run_id)
-            .map_err(|error| ConversationDeletionError::TaskRuntime(error.to_string()))?;
-    }
     for run in &runs {
         store.wait_for_run_driver_idle(&run.run_id).await;
     }

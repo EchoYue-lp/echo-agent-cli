@@ -8,8 +8,8 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 
 use echo_agent_app_core::state::ScopedChatRuntime;
-use echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore;
 use echo_agent_app_core::tasks::task_runtime::types::*;
+use echo_agent_app_core::tasks::task_runtime::{TaskRuntimeBlockingAdapter, TaskRuntimeStore};
 use std::sync::Arc;
 
 // ── Exact workspace runtime resolution ───────────────────────────────────
@@ -57,28 +57,53 @@ fn validate_run_workspace(run: &TaskRun, workspace_id: &str) -> Result<(), IpcEr
     Ok(())
 }
 
-fn get_scoped_run(
-    store: &TaskRuntimeStore,
+async fn task_runtime_io<T, F>(
+    store: &Arc<TaskRuntimeStore>,
+    operation: &'static str,
+    function: F,
+) -> Result<T, IpcError>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            Arc<TaskRuntimeStore>,
+        ) -> Result<T, echo_agent_app_core::tasks::task_runtime::StoreError>
+        + Send
+        + 'static,
+{
+    TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store(operation, function)
+        .await
+        .map_err(internal)
+}
+
+async fn get_scoped_run(
+    store: &Arc<TaskRuntimeStore>,
     workspace_id: &str,
     run_id: &str,
 ) -> Result<Option<TaskRun>, IpcError> {
-    let run = store.get_run(run_id).map_err(internal)?;
+    let run_id = run_id.to_string();
+    let run = task_runtime_io(store, "load scoped TaskRun", move |store| {
+        store.get_run(&run_id)
+    })
+    .await?;
     if let Some(run) = run.as_ref() {
         validate_run_workspace(run, workspace_id)?;
     }
     Ok(run)
 }
 
-fn require_scoped_run(
-    store: &TaskRuntimeStore,
+async fn require_scoped_run(
+    store: &Arc<TaskRuntimeStore>,
     workspace_id: &str,
     run_id: &str,
 ) -> Result<TaskRun, IpcError> {
-    get_scoped_run(store, workspace_id, run_id)?.ok_or_else(|| {
-        IpcError::NotFound(format!(
-            "TaskRun '{run_id}' was not found in workspace '{workspace_id}'"
-        ))
-    })
+    get_scoped_run(store, workspace_id, run_id)
+        .await?
+        .ok_or_else(|| {
+            IpcError::NotFound(format!(
+                "TaskRun '{run_id}' was not found in workspace '{workspace_id}'"
+            ))
+        })
 }
 
 async fn task_runtime_for_run(
@@ -87,7 +112,7 @@ async fn task_runtime_for_run(
     run_id: &str,
 ) -> Result<(ScopedChatRuntime, Arc<TaskRuntimeStore>, TaskRun), IpcError> {
     let (runtime, store) = task_runtime_for_workspace(state, workspace_id).await?;
-    let run = require_scoped_run(&store, workspace_id, run_id)?;
+    let run = require_scoped_run(&store, workspace_id, run_id).await?;
     Ok((runtime, store, run))
 }
 
@@ -101,7 +126,7 @@ pub async fn get_task_run(
     run_id: String,
 ) -> Result<Option<TaskRun>, IpcError> {
     let (_runtime, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
-    get_scoped_run(&store, &workspace_id, &run_id)
+    get_scoped_run(&store, &workspace_id, &run_id).await
 }
 
 /// The one Requirement/Evidence completion report shared by every surface.
@@ -112,7 +137,10 @@ pub async fn get_task_completion_gate(
     run_id: String,
 ) -> Result<CompletionGateReport, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.completion_gate_report(&run_id).map_err(internal)
+    task_runtime_io(&store, "load TaskRun completion gate", move |store| {
+        store.completion_gate_report(&run_id)
+    })
+    .await
 }
 
 /// Confirm a Skip for one exact current-Goal requirement from the GUI.
@@ -126,15 +154,16 @@ pub async fn skip_task_goal_requirement(
     reason: String,
 ) -> Result<CompletionGateReport, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store
-        .skip_goal_requirement(
+    task_runtime_io(&store, "skip TaskRun requirement", move |store| {
+        store.skip_goal_requirement(
             &run_id,
             expected_goal_revision,
             &requirement_id,
             &reason,
             RunGoalActorSource::Gui,
         )
-        .map_err(internal)
+    })
+    .await
 }
 
 /// Event-folded long-horizon control state for the existing TaskRun.
@@ -145,10 +174,12 @@ pub async fn get_task_continuation(
     run_id: String,
 ) -> Result<Option<RunContinuationState>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store
-        .get_run_state(&run_id)
-        .map(|snapshot| snapshot.and_then(|state| state.continuation))
-        .map_err(internal)
+    task_runtime_io(&store, "load TaskRun continuation", move |store| {
+        store
+            .get_run_state(&run_id)
+            .map(|snapshot| snapshot.and_then(|state| state.continuation))
+    })
+    .await
 }
 
 /// Update finite-turn budgets for an existing long-horizon TaskRun. Restart
@@ -163,9 +194,10 @@ pub async fn configure_task_continuation(
     time_budget_seconds: Option<u64>,
 ) -> Result<RunContinuationState, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store
-        .update_run_continuation_budgets(&run_id, token_budget, time_budget_seconds)
-        .map_err(internal)
+    task_runtime_io(&store, "configure TaskRun continuation", move |store| {
+        store.update_run_continuation_budgets(&run_id, token_budget, time_budget_seconds)
+    })
+    .await
 }
 
 /// Update the authoritative Goal only from an explicit GUI action. The store
@@ -180,15 +212,16 @@ pub async fn update_task_run_goal(
     reason: String,
 ) -> Result<TaskRun, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store
-        .update_run_goal(
+    task_runtime_io(&store, "update TaskRun goal", move |store| {
+        store.update_run_goal(
             &run_id,
             expected_goal_revision,
             &new_goal,
             &reason,
             RunGoalActorSource::Gui,
         )
-        .map_err(internal)
+    })
+    .await
 }
 
 /// Send guidance through the safe point of one exact active Subagent attempt.
@@ -218,7 +251,8 @@ pub async fn queue_task_subagent_guidance(
     let (_runtime, store, _run) =
         task_runtime_for_run(&state, &workspace_id, &identity.run_id).await?;
     echo_agent_app_core::tasks::task_runtime::SubagentControlService::new(store)
-        .queue_guidance(identity, &instruction, SubagentControlActorSource::Gui)
+        .queue_guidance_async(identity, instruction, SubagentControlActorSource::Gui)
+        .await
         .map_err(internal)
 }
 
@@ -245,7 +279,10 @@ pub async fn list_task_background_cells(
     run_id: String,
 ) -> Result<Vec<BackgroundCellState>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.list_background_cells(&run_id).map_err(internal)
+    task_runtime_io(&store, "list TaskRun background cells", move |store| {
+        store.list_background_cells(&run_id)
+    })
+    .await
 }
 
 /// Latest run for a conversation — binds a chat thread to its runtime run.
@@ -256,9 +293,11 @@ pub async fn latest_task_run_for_conversation(
     conversation_id: String,
 ) -> Result<Option<TaskRun>, IpcError> {
     let (_runtime, store) = task_runtime_for_workspace(&state, &workspace_id).await?;
-    let run = store
-        .latest_run_for_conversation(&conversation_id)
-        .map_err(internal)?;
+    let lookup_conversation_id = conversation_id.clone();
+    let run = task_runtime_io(&store, "load latest conversation TaskRun", move |store| {
+        store.latest_run_for_conversation(&lookup_conversation_id)
+    })
+    .await?;
     if let Some(run) = run.as_ref() {
         validate_run_workspace(run, &workspace_id)?;
         if run.conversation_id != conversation_id {
@@ -298,7 +337,10 @@ pub async fn list_task_runs(
     } else {
         parsed
     };
-    let runs = store.list_runs_in(&query).map_err(internal)?;
+    let runs = task_runtime_io(&store, "list TaskRuns", move |store| {
+        store.list_runs_in(&query)
+    })
+    .await?;
     for run in &runs {
         validate_run_workspace(run, &workspace_id)?;
     }
@@ -313,7 +355,10 @@ pub async fn get_task_plan(
     run_id: String,
 ) -> Result<Option<TaskPlan>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.get_plan(&run_id).map_err(internal)
+    task_runtime_io(&store, "load TaskRun plan", move |store| {
+        store.get_plan(&run_id)
+    })
+    .await
 }
 
 /// Todo projection for a run — what the right-rail Todo panel renders from.
@@ -324,7 +369,10 @@ pub async fn list_task_todos(
     run_id: String,
 ) -> Result<Vec<TodoItem>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.list_todos(&run_id).map_err(internal)
+    task_runtime_io(&store, "list TaskRun todos", move |store| {
+        store.list_todos(&run_id)
+    })
+    .await
 }
 
 /// Events since `since_seq` (polling-style incremental event feed).
@@ -343,7 +391,10 @@ pub async fn list_task_events(
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.list_events(&run_id, since).map_err(internal)
+    task_runtime_io(&store, "list TaskRun events", move |store| {
+        store.list_events(&run_id, since)
+    })
+    .await
 }
 
 /// Artifacts produced by a run (files, reports, charts, traces).
@@ -354,7 +405,10 @@ pub async fn list_task_artifacts(
     run_id: String,
 ) -> Result<Vec<Artifact>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.list_artifacts(&run_id).map_err(internal)
+    task_runtime_io(&store, "list TaskRun artifacts", move |store| {
+        store.list_artifacts(&run_id)
+    })
+    .await
 }
 
 /// Reviews recorded against a task within a run (scoped to run_id + task_id
@@ -367,7 +421,10 @@ pub async fn list_task_reviews(
     task_id: String,
 ) -> Result<Vec<ReviewResult>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.list_reviews(&run_id, &task_id).map_err(internal)
+    task_runtime_io(&store, "list TaskRun reviews", move |store| {
+        store.list_reviews(&run_id, &task_id)
+    })
+    .await
 }
 
 /// The execution summary a subagent produced for a task — used by the Summary
@@ -380,7 +437,10 @@ pub async fn get_task_summary(
     task_id: String,
 ) -> Result<Option<TaskExecutionSummary>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.get_summary(&run_id, &task_id).map_err(internal)
+    task_runtime_io(&store, "load TaskRun summary", move |store| {
+        store.get_summary(&run_id, &task_id)
+    })
+    .await
 }
 
 /// Recovery barriers created when a mutating subagent/tool was interrupted
@@ -392,7 +452,10 @@ pub async fn list_recovery_blockers(
     run_id: String,
 ) -> Result<Vec<RecoveryBlocker>, IpcError> {
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store.list_recovery_blockers(&run_id).map_err(internal)
+    task_runtime_io(&store, "list TaskRun recovery blockers", move |store| {
+        store.list_recovery_blockers(&run_id)
+    })
+    .await
 }
 
 /// Resolve an indeterminate side effect after the user inspected the
@@ -415,9 +478,10 @@ pub async fn resolve_recovery_task(
         }
     };
     let (_runtime, store, _run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    store
-        .resolve_recovery_task(&run_id, &task_id, decision)
-        .map_err(internal)
+    task_runtime_io(&store, "resolve TaskRun recovery", move |store| {
+        store.resolve_recovery_task(&run_id, &task_id, decision)
+    })
+    .await
 }
 
 // ── Error mapping ────────────────────────────────────────────────────────
@@ -432,25 +496,29 @@ fn internal<E: std::fmt::Display>(e: E) -> IpcError {
 #[tauri::command]
 pub async fn set_interaction_mode(
     state: tauri::State<'_, TauriState>,
-    mode: u8,
-) -> Result<u8, IpcError> {
+    request: InteractionModeRequest,
+) -> Result<InteractionMode, IpcError> {
     state
         .app_state
         .tasks
         .interaction_mode
-        .store(mode, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(mode, "interaction mode set");
-    Ok(mode)
+        .store(request.mode.as_u8(), std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(mode = request.mode.as_str(), "interaction mode set");
+    Ok(request.mode)
 }
 
 /// Get the current interaction mode.
 #[tauri::command]
-pub async fn get_interaction_mode(state: tauri::State<'_, TauriState>) -> Result<u8, IpcError> {
-    Ok(state
-        .app_state
-        .tasks
-        .interaction_mode
-        .load(std::sync::atomic::Ordering::Relaxed))
+pub async fn get_interaction_mode(
+    state: tauri::State<'_, TauriState>,
+) -> Result<InteractionMode, IpcError> {
+    Ok(InteractionMode::from_u8(
+        state
+            .app_state
+            .tasks
+            .interaction_mode
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ))
 }
 
 /// Resume a paused run. Transitions `Paused → Running` and re-launches the
@@ -462,9 +530,13 @@ pub async fn resume_task_run(
     app: tauri::AppHandle,
     workspace_id: String,
     run_id: String,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<TaskRunResumeReceipt, IpcError> {
     let (runtime, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    let run_state = store.get_run_state(&run_id).map_err(internal)?;
+    let state_run_id = run_id.clone();
+    let run_state = task_runtime_io(&store, "load TaskRun resume state", move |store| {
+        store.get_run_state(&state_run_id)
+    })
+    .await?;
     if run_state
         .as_ref()
         .and_then(|snapshot| snapshot.continuation.as_ref())
@@ -560,10 +632,11 @@ pub async fn resume_task_run(
     });
     tracing::info!(run_id = %run_id, "task run resumed -> Running");
 
-    Ok(serde_json::json!({
-        "kind": "resumed",
-        "run_id": run_id,
-    }))
+    Ok(TaskRunResumeReceipt {
+        kind: TaskRunResumeKind::Resumed,
+        run_id,
+        turn_id: None,
+    })
 }
 
 async fn resume_continuation_run(
@@ -573,7 +646,7 @@ async fn resume_continuation_run(
     store: Arc<TaskRuntimeStore>,
     run_id: String,
     run_state: Option<RunStateSnapshot>,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<TaskRunResumeReceipt, IpcError> {
     let snapshot =
         run_state.ok_or_else(|| IpcError::Validation("TaskRun not found".to_string()))?;
     if snapshot.run.status != TaskRunStatus::Paused {
@@ -602,7 +675,11 @@ async fn resume_continuation_run(
             ));
         }
     }
-    let blockers = store.list_recovery_blockers(&run_id).map_err(internal)?;
+    let blocker_run_id = run_id.clone();
+    let blockers = task_runtime_io(&store, "load TaskRun resume blockers", move |store| {
+        store.list_recovery_blockers(&blocker_run_id)
+    })
+    .await?;
     if !blockers.is_empty() {
         return Err(IpcError::Validation(format!(
             "run {run_id} has unresolved recovery blockers"
@@ -613,12 +690,12 @@ async fn resume_continuation_run(
     // its exact driver. Do not mutate Paused -> Running until that old claim
     // has closed, otherwise an immediate resume can lose to its own old turn.
     store.wait_for_run_driver_idle(&run_id).await;
-    let snapshot = store
-        .get_run_state(&run_id)
-        .map_err(internal)?
-        .ok_or_else(|| {
-            IpcError::Validation("TaskRun not found after driver settlement".to_string())
-        })?;
+    let settled_run_id = run_id.clone();
+    let snapshot = task_runtime_io(&store, "reload settled TaskRun resume", move |store| {
+        store.get_run_state(&settled_run_id)
+    })
+    .await?
+    .ok_or_else(|| IpcError::Validation("TaskRun not found after driver settlement".to_string()))?;
     validate_run_workspace(&snapshot.run, runtime.execution_scope().workspace_id())?;
     if snapshot.run.status != TaskRunStatus::Paused {
         return Err(IpcError::Validation(format!(
@@ -710,8 +787,12 @@ async fn resume_continuation_run(
         if let Err(error) = outcome.as_ref() {
             tracing::warn!(%error, run_id = %spawned_run_id, "long-horizon GUI resume failed");
         }
-        let terminal_status = status_store
-            .get_run(&spawned_run_id)
+        let terminal_run_id = spawned_run_id.clone();
+        let terminal_status = TaskRuntimeBlockingAdapter::new(status_store)
+            .run_store("load resumed TaskRun terminal", move |store| {
+                store.get_run(&terminal_run_id)
+            })
+            .await
             .ok()
             .flatten()
             .map(|run| run.status.as_str().to_string())
@@ -728,11 +809,11 @@ async fn resume_continuation_run(
         );
     });
 
-    Ok(serde_json::json!({
-        "kind": "continuation_resumed",
-        "run_id": run_id,
-        "turn_id": turn_id,
-    }))
+    Ok(TaskRunResumeReceipt {
+        kind: TaskRunResumeKind::ContinuationResumed,
+        run_id,
+        turn_id: Some(turn_id),
+    })
 }
 
 /// Explicitly retry a Blocked (or Failed) task in a Paused (or Failed) run.
@@ -753,7 +834,7 @@ pub async fn retry_blocked_task(
     workspace_id: String,
     run_id: String,
     task_id: String,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<TaskRetryReceipt, IpcError> {
     let (runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     let pool_execution = runtime
         .agent_for(&run.conversation_id)
@@ -783,6 +864,7 @@ pub async fn retry_blocked_task(
         task_id.clone(),
         Some(runtime.workspace_io_invocation()),
     )
+    .await
     .map_err(|error| match error {
         echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(message) => {
             IpcError::Validation(message)
@@ -792,22 +874,22 @@ pub async fn retry_blocked_task(
     let (kind, next_attempt) = match preparation {
         echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Acceptance {
             next_attempt,
-        } => ("retry_scheduled", Some(next_attempt)),
+        } => (TaskRetryKind::RetryScheduled, Some(next_attempt)),
         echo_agent_app_core::tasks::task_runtime::TaskRetryPreparation::Recovery => {
-            ("recovery_retry_recorded", None)
+            (TaskRetryKind::RecoveryRetryRecorded, None)
         }
     };
     tracing::info!(run_id = %run_id, task_id = %task_id, ?preparation, "task retry prepared atomically");
-    Ok(serde_json::json!({
-        "kind": kind,
-        "run_id": run_id,
-        "task_id": task_id,
-        "next_attempt": next_attempt,
-    }))
+    Ok(TaskRetryReceipt {
+        kind,
+        run_id,
+        task_id,
+        next_attempt,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
-fn spawn_tauri_task_retry(
+async fn spawn_tauri_task_retry(
     store: Arc<TaskRuntimeStore>,
     primary_agent: echo_agent_app_core::agent_handle::AgentHandle,
     pool_execution: Option<echo_agent_app_core::agent_pool::AgentPoolExecutionLease>,
@@ -824,7 +906,8 @@ fn spawn_tauri_task_retry(
     let driver_store = store.clone();
     let driver_run_id = run_id.clone();
     let supervisor_cancel = cancel.clone();
-    let (preparation, result_waiter) = store.spawn_supervised_task_retry(
+    let (preparation, result_waiter) = store
+        .spawn_supervised_task_retry_async(
         run_id,
         task_id,
         supervisor_cancel,
@@ -886,7 +969,8 @@ fn spawn_tauri_task_retry(
             }
             Ok(())
         },
-    )?;
+        )
+        .await?;
     drop(result_waiter);
     Ok(preparation)
 }
@@ -911,7 +995,7 @@ pub async fn update_tasks(
     )
     .await;
     echo_agent_app_core::tasks::task_runtime::apply_eko_task_update(
-        &service, &store, &run_id, request,
+        &service, store, &run_id, request,
     )
     .await
     .map_err(|error| match error {
@@ -935,18 +1019,22 @@ pub async fn cancel_task_run(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
     run_id: String,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<TaskRunControlReceipt, IpcError> {
     let (_runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     let message_key = Some(run.root_message_id);
-    let cancelled = store.request_cancel(&run_id).map_err(internal)?;
+    let cancel_run_id = run_id.clone();
+    let cancelled = task_runtime_io(&store, "cancel TaskRun", move |store| {
+        store.request_cancel(&cancel_run_id)
+    })
+    .await?;
     if cancelled {
         super::chat::cancel_pending_hitl(message_key.as_deref(), "task run cancelled").await;
         store.wait_for_run_driver_idle(&run_id).await;
     }
-    Ok(serde_json::json!({
-        "success": cancelled,
-        "run_id": run_id,
-    }))
+    Ok(TaskRunControlReceipt {
+        success: cancelled,
+        run_id,
+    })
 }
 
 /// Pause a running TaskRun through the same cancellation token that owns its
@@ -956,17 +1044,21 @@ pub async fn pause_task_run(
     state: tauri::State<'_, TauriState>,
     workspace_id: String,
     run_id: String,
-) -> Result<serde_json::Value, IpcError> {
+) -> Result<TaskRunControlReceipt, IpcError> {
     let (_runtime, store, run) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
     let message_key = Some(run.root_message_id);
-    let paused = store.request_pause(&run_id).map_err(internal)?;
+    let pause_run_id = run_id.clone();
+    let paused = task_runtime_io(&store, "pause TaskRun", move |store| {
+        store.request_pause(&pause_run_id)
+    })
+    .await?;
     if paused {
         super::chat::cancel_pending_hitl(message_key.as_deref(), "task run paused").await;
     }
-    Ok(serde_json::json!({
-        "success": paused,
-        "run_id": run_id,
-    }))
+    Ok(TaskRunControlReceipt {
+        success: paused,
+        run_id,
+    })
 }
 
 /// Render the human-readable progress ledger derived from canonical run files.
@@ -979,12 +1071,15 @@ pub async fn get_progress_ledger(
     run_id: String,
 ) -> Result<String, IpcError> {
     let (runtime, store, _) = task_runtime_for_run(&state, &workspace_id, &run_id).await?;
-    echo_agent_app_core::tasks::task_runtime::write_progress(
-        &store,
-        &run_id,
-        Some(runtime.execution_scope().root()),
-    )
-    .map_err(internal)
+    let workspace_root = runtime.execution_scope().root().to_path_buf();
+    task_runtime_io(&store, "write TaskRun progress ledger", move |store| {
+        echo_agent_app_core::tasks::task_runtime::write_progress(
+            &store,
+            &run_id,
+            Some(&workspace_root),
+        )
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -996,9 +1091,9 @@ mod tests {
     use futures::future::BoxFuture;
     use futures::stream::{self, BoxStream};
 
-    #[test]
-    fn task_runtime_scope_validation_fails_closed() -> Result<(), String> {
-        let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+    #[tokio::test]
+    async fn task_runtime_scope_validation_fails_closed() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         validate_store_workspace(&store, "test").map_err(|error| error.to_string())?;
 
         let store_error = validate_store_workspace(&store, "workspace-b")
@@ -1023,11 +1118,13 @@ mod tests {
             )
             .map_err(|error| error.to_string())?;
         let run = get_scoped_run(&store, "workspace-a", "scope-run")
+            .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "workspace A run is missing".to_string())?;
         assert_eq!(run.workspace_id, "workspace-a");
 
         let run_error = get_scoped_run(&store, "workspace-b", "scope-run")
+            .await
             .err()
             .ok_or_else(|| "cross-workspace run validation unexpectedly succeeded".to_string())?;
         if !matches!(run_error, IpcError::Validation(_)) {
@@ -1219,6 +1316,7 @@ mod tests {
                 "retry-task".to_string(),
                 None,
             )
+            .await
             .map_err(|error| error.to_string())?;
             assert_eq!(preparation, expected);
             store
@@ -1251,31 +1349,23 @@ mod tests {
             "gui-closed".to_string(),
             "retry-task".to_string(),
             None,
-        );
+        )
+        .await;
         assert!(result.is_err());
         assert_eq!(before, snapshot(&store, "gui-closed")?);
         Ok(())
     }
 
-    #[test]
-    fn gui_retry_registration_infrastructure_failure_does_not_mutate_runtime() -> Result<(), String>
-    {
+    #[tokio::test]
+    async fn gui_retry_registration_infrastructure_failure_does_not_mutate_runtime()
+    -> Result<(), String> {
         let store = Arc::new(
             echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
                 .map_err(|error| error.to_string())?,
         );
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?;
-        runtime.block_on(prepare_retry_run(
-            store.clone(),
-            "gui-registration",
-            "retry-task",
-            false,
-        ))?;
-        drop(runtime);
+        prepare_retry_run(store.clone(), "gui-registration", "retry-task", false).await?;
         let before = snapshot(&store, "gui-registration")?;
+        store.fail_next_run_driver_registration_for_test();
         let error = spawn_tauri_task_retry(
             store.clone(),
             test_agent()?,
@@ -1287,12 +1377,13 @@ mod tests {
             "retry-task".to_string(),
             None,
         )
+        .await
         .err()
         .ok_or_else(|| "GUI retry registration unexpectedly succeeded".to_string())?;
         assert!(
             error
                 .to_string()
-                .contains("requires an active Tokio runtime")
+                .contains("injected TaskRun driver registration failure")
         );
         assert_eq!(before, snapshot(&store, "gui-registration")?);
         Ok(())

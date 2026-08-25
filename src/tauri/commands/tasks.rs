@@ -47,14 +47,13 @@ pub async fn list_tasks(state: tauri::State<'_, TauriState>) -> Result<Vec<TaskI
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
     // Background-task APIs are compatibility projections over TaskRun files.
-    let tasks = service.list_unified(None);
-    Ok(tasks
-        .into_iter()
-        .map(|task| {
-            let progress = service.get_progress(&task.id);
-            task_to_info(task, progress)
-        })
-        .collect())
+    let tasks = service.list_unified(None).await;
+    let mut projected = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let progress = service.get_progress(&task.id).await;
+        projected.push(task_to_info(task, progress));
+    }
+    Ok(projected)
 }
 
 #[tauri::command]
@@ -148,8 +147,9 @@ pub async fn get_task(
 
     let task = service
         .get_unified(&id)
+        .await
         .ok_or_else(|| IpcError::NotFound(format!("Task '{}' not found", id)))?;
-    let progress = service.get_progress(&id);
+    let progress = service.get_progress(&id).await;
     Ok(task_to_info(task, progress))
 }
 
@@ -233,7 +233,7 @@ pub async fn get_task_dag(state: tauri::State<'_, TauriState>) -> Result<TaskDag
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    let tasks = service.list_unified(None);
+    let tasks = service.list_unified(None).await;
     let mut mermaid_lines = vec!["graph TD".to_string()];
     for task in &tasks {
         mermaid_lines.push(format!(

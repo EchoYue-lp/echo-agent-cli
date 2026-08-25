@@ -922,16 +922,21 @@ pub fn build_tauri_app(
                                 if let Some(run_id) = run_id.as_deref() {
                                     payload.insert("run_id".into(), run_id.into());
                                     if let Some(store) = task_runtime_store.as_ref()
-                                        && let Ok(Some(run)) = store.get_run(run_id)
                                     {
-                                        payload.insert(
-                                            "conversation_id".into(),
-                                            run.conversation_id.into(),
-                                        );
-                                        payload.insert(
-                                            "message_id".into(),
-                                            run.root_message_id.into(),
-                                        );
+                                        let lookup_run_id = run_id.to_string();
+                                        if let Ok(Some(run)) = echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+                                            .run_store("project Tauri TaskRun identity", move |store| store.get_run(&lookup_run_id))
+                                            .await
+                                        {
+                                            payload.insert(
+                                                "conversation_id".into(),
+                                                run.conversation_id.into(),
+                                            );
+                                            payload.insert(
+                                                "message_id".into(),
+                                                run.root_message_id.into(),
+                                            );
+                                        }
                                     }
                                 } else {
                                     payload.insert("run_id".into(), String::new().into());

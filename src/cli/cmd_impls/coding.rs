@@ -62,7 +62,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("");
     match sub {
         "list" | "" => {
-            let tasks = service.list_unified(None);
+            let tasks = service.list_unified(None).await;
             if tasks.is_empty() {
                 println!("No background tasks.");
             } else {
@@ -87,7 +87,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /tasks status <id>");
                 return CommandOutcome::Continue;
             }
-            match service.get_unified(id) {
+            match service.get_unified(id).await {
                 Some(task) => {
                     println!("\nTask: {}", task.id);
                     println!("  Description: {}", task.description);
@@ -104,7 +104,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         println!("  Type: {}", kind);
                     }
                     // Show real-time progress from cache
-                    if let Some(p) = service.get_progress(id) {
+                    if let Some(p) = service.get_progress(id).await {
                         println!("  Live Progress: {:.1}%", p.percentage);
                         println!("  Phase: {}", p.current_phase);
                         if let Some(ref msg) = p.message {
@@ -114,7 +114,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                             println!("  ETA: {}s", eta);
                         }
                     }
-                    match service.recovery_blockers(id) {
+                    match service.recovery_blockers(id).await {
                         Ok(blockers) if !blockers.is_empty() => {
                             println!("  Recovery blockers:");
                             for blocker in blockers {
@@ -148,7 +148,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /tasks pause <id>");
                 return CommandOutcome::Continue;
             }
-            match service.pause(id) {
+            match service.pause(id).await {
                 Ok(true) => println!("Task paused: {id}"),
                 Ok(false) => println!("Failed to pause task (not running): {id}"),
                 Err(error) => println!("Failed to pause task: {error}"),
@@ -171,7 +171,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /tasks recovery <id>");
                 return CommandOutcome::Continue;
             }
-            match service.recovery_blockers(id) {
+            match service.recovery_blockers(id).await {
                 Ok(blockers) if blockers.is_empty() => println!("No recovery blockers: {id}"),
                 Ok(blockers) => {
                     println!("Recovery blockers for {id}:");
@@ -193,7 +193,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 return CommandOutcome::Continue;
             }
             if sub == "retry" {
-                match service.retry_blocked_task(id, task_id) {
+                match service.retry_blocked_task(id, task_id).await {
                     Ok(TaskRetryPreparation::Acceptance { next_attempt }) => {
                         println!("Task {task_id} retried as attempt {next_attempt} on run {id}.");
                     }
@@ -203,7 +203,10 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     Err(error) => println!("Failed to retry task: {error}"),
                 }
             } else {
-                match service.resolve_recovery_task(id, task_id, RecoveryDecision::Skip) {
+                match service
+                    .resolve_recovery_task(id, task_id, RecoveryDecision::Skip)
+                    .await
+                {
                     Ok(()) => println!("Recovery decision recorded: {id}/{task_id} -> skip"),
                     Err(error) => println!("Failed to resolve recovery task: {error}"),
                 }
@@ -234,7 +237,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
         "dag" => {
-            let tasks = service.list_unified(None);
+            let tasks = service.list_unified(None).await;
             if tasks.is_empty() {
                 println!("No tasks to visualize.");
             } else {

@@ -52,6 +52,8 @@ pub enum ManualCompressionError {
     Compression(String),
     #[error("context was compressed but its journal safe point failed: {0}")]
     Journal(#[from] ChatEventLogError),
+    #[error("manual compression journal I/O failed: {0}")]
+    JournalIo(String),
 }
 
 impl AppState {
@@ -141,14 +143,33 @@ impl AppState {
             before_tokens: stats.before_tokens,
             after_tokens: stats.after_tokens,
         };
-        let envelope = match self.storage.chat_events.append(
-            &workspace_id,
-            Some(&conversation_id),
-            &turn_id,
-            event,
-        ) {
-            Ok(envelope) => envelope,
+        let chat_events = self.storage.chat_events.clone();
+        let workspace_receipt = runtime.workspace_io_receipt();
+        let append_workspace_id = workspace_id.clone();
+        let append_conversation_id = conversation_id.clone();
+        let append_turn_id = turn_id.clone();
+        let appended =
+            crate::product_data_io::run("persist manual compression safe point", move || {
+                let _workspace_receipt = workspace_receipt;
+                chat_events.append(
+                    &append_workspace_id,
+                    Some(&append_conversation_id),
+                    &append_turn_id,
+                    event,
+                )
+            })
+            .await
+            .map_err(|error| ManualCompressionError::JournalIo(error.to_string()));
+        let envelope = match appended {
+            Ok(Ok(envelope)) => envelope,
             Err(error) => {
+                lease.settle(TurnOutcome::Failed(AgentFailure::message(
+                    "chat_event_log",
+                    error.to_string(),
+                )));
+                return Err(error);
+            }
+            Ok(Err(error)) => {
                 lease.settle(TurnOutcome::Failed(AgentFailure::message(
                     "chat_event_log",
                     error.to_string(),

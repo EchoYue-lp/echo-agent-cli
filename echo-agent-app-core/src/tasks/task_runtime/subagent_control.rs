@@ -58,11 +58,68 @@ impl Drop for SubagentControlTargetGuard {
 #[derive(Clone)]
 pub struct SubagentControlService {
     store: Arc<TaskRuntimeStore>,
+    blocking: super::executor::TaskRuntimeBlockingAdapter,
+    #[cfg(test)]
+    command_test_barrier: Option<Arc<SubagentControlTestBarrier>>,
+    #[cfg(test)]
+    settlement_failures: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+struct SubagentControlTestBarrier {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl SubagentControlService {
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
-        Self { store }
+        Self {
+            blocking: super::executor::TaskRuntimeBlockingAdapter::new(store.clone()),
+            store,
+            #[cfg(test)]
+            command_test_barrier: None,
+            #[cfg(test)]
+            settlement_failures: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_command_test_barrier(mut self, barrier: Arc<SubagentControlTestBarrier>) -> Self {
+        self.command_test_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    async fn wait_at_command_test_barrier(&self) {
+        if let Some(barrier) = self.command_test_barrier.as_ref() {
+            barrier.entered.notify_one();
+            barrier.release.notified().await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn wait_at_command_test_barrier(&self) {}
+
+    #[cfg(test)]
+    fn fail_next_settlements(&self, count: usize) {
+        self.settlement_failures
+            .store(count, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn consume_settlement_failure(&self) -> bool {
+        self.settlement_failures
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+    }
+
+    #[cfg(not(test))]
+    fn consume_settlement_failure(&self) -> bool {
+        false
     }
 
     /// Persist guidance for exactly one not-yet-started attempt. The task
@@ -95,6 +152,22 @@ impl SubagentControlService {
         })
     }
 
+    /// Async-surface wrapper for queued guidance. The synchronous method stays
+    /// available to blocking adapters and tests; GUI/channel callers use this
+    /// bounded path so journal I/O never runs on a Tokio async executor thread.
+    pub async fn queue_guidance_async(
+        &self,
+        identity: SubagentControlIdentity,
+        instruction: String,
+        actor_source: SubagentControlActorSource,
+    ) -> Result<SubagentControlReceipt, StoreError> {
+        self.blocking
+            .run_store("queue Subagent guidance", move |store| {
+                Self::new(store).queue_guidance(identity, &instruction, actor_source)
+            })
+            .await
+    }
+
     /// Deliver one message to the existing safe point of an exact active
     /// attempt. The durable queued boundary is written before framework IO.
     pub async fn send_message(
@@ -104,96 +177,166 @@ impl SubagentControlService {
         actor_source: SubagentControlActorSource,
     ) -> Result<SubagentControlReceipt, StoreError> {
         validate_instruction(instruction)?;
+        let service = self.clone();
+        let instruction = instruction.to_string();
+        self.blocking
+            .run_async_owned("deliver live Subagent guidance", async move {
+                service
+                    .send_message_owned(identity, instruction, actor_source)
+                    .await
+            })
+            .await
+    }
+
+    async fn send_message_owned(
+        &self,
+        identity: SubagentControlIdentity,
+        instruction: String,
+        actor_source: SubagentControlActorSource,
+    ) -> Result<SubagentControlReceipt, StoreError> {
+        validate_instruction(&instruction)?;
         let command_run_id = identity.run_id.clone();
-        let begin = self.store.with_run_lock(&command_run_id, || {
-            if let Some(receipt) = existing_receipt(&self.store, &identity)? {
-                return Ok(ControlBegin::Existing(receipt));
-            }
-            validate_plan_target(&self.store, &identity)?;
-            match exact_active_target(&self.store, &identity) {
-                Ok(target) => {
-                    append_guidance_event(
-                        &self.store,
-                        &identity,
-                        RuntimeEventKind::SubagentGuidanceQueued,
-                        SubagentGuidanceKind::LiveMessage,
-                        actor_source,
-                        Some(instruction),
-                        serde_json::json!({}),
-                    )?;
-                    Ok(ControlBegin::New(target))
-                }
-                Err(error) => {
-                    let detail = error.to_string();
-                    self.store.shadow.append_event_batch(
-                        &identity.run_id,
-                        vec![
-                            guidance_event(
-                                &identity,
+        let begin_identity = identity.clone();
+        let owned_instruction = instruction.clone();
+        let begin = self
+            .blocking
+            .run_store("begin live Subagent guidance", move |store| {
+                store.with_run_lock(&command_run_id, || {
+                    if let Some(receipt) = existing_receipt(&store, &begin_identity)? {
+                        return Ok(ControlBegin::Existing(receipt));
+                    }
+                    validate_plan_target(&store, &begin_identity)?;
+                    match exact_active_target(&store, &begin_identity) {
+                        Ok(target) => {
+                            append_guidance_event(
+                                &store,
+                                &begin_identity,
                                 RuntimeEventKind::SubagentGuidanceQueued,
                                 SubagentGuidanceKind::LiveMessage,
                                 actor_source,
-                                Some(instruction),
+                                Some(&owned_instruction),
                                 serde_json::json!({}),
-                            ),
-                            guidance_event(
-                                &identity,
+                            )?;
+                            Ok(ControlBegin::New(target))
+                        }
+                        Err(error) => {
+                            let detail = error.to_string();
+                            store.shadow.append_event_batch(
+                                &begin_identity.run_id,
+                                vec![
+                                    guidance_event(
+                                        &begin_identity,
+                                        RuntimeEventKind::SubagentGuidanceQueued,
+                                        SubagentGuidanceKind::LiveMessage,
+                                        actor_source,
+                                        Some(&owned_instruction),
+                                        serde_json::json!({}),
+                                    ),
+                                    guidance_event(
+                                        &begin_identity,
+                                        RuntimeEventKind::SubagentGuidanceRejected,
+                                        SubagentGuidanceKind::LiveMessage,
+                                        actor_source,
+                                        None,
+                                        serde_json::json!({ "reason": detail }),
+                                    ),
+                                ],
+                            )?;
+                            Ok(ControlBegin::Existing(rejected_receipt(
+                                begin_identity.clone(),
+                                detail,
+                            )))
+                        }
+                    }
+                })
+            })
+            .await?;
+        let ControlBegin::New(target) = begin else {
+            return begin.into_receipt();
+        };
+        self.wait_at_command_test_barrier().await;
+
+        let delivery_executor = target.executor.clone();
+        let delivery_execution_id = identity.execution_id.clone();
+        let delivery_attempt = identity.attempt;
+        let delivery_instruction = instruction.clone();
+        let delivery = match tokio::spawn(async move {
+            delivery_executor
+                .send_message(
+                    &delivery_execution_id,
+                    delivery_attempt,
+                    &delivery_instruction,
+                )
+                .await
+                .map(|receipt| receipt.turn_id)
+                .map_err(|error| error.to_string())
+        })
+        .await
+        {
+            Ok(delivery) => delivery,
+            Err(error) => Err(format!("framework Subagent guidance panicked: {error}")),
+        };
+        let run_id = identity.run_id.clone();
+        let settlement_identity = identity.clone();
+        let mut delay = std::time::Duration::from_millis(25);
+        loop {
+            if self.consume_settlement_failure() {
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(1));
+                continue;
+            }
+            let operation_run_id = run_id.clone();
+            let operation_identity = settlement_identity.clone();
+            let operation_delivery = delivery.clone();
+            match self
+                .blocking
+                .run_store("settle live Subagent guidance", move |store| {
+                    store.with_run_lock(&operation_run_id, || match operation_delivery {
+                        Ok(turn_id) => {
+                            append_guidance_event(
+                                &store,
+                                &operation_identity,
+                                RuntimeEventKind::SubagentGuidanceDelivered,
+                                SubagentGuidanceKind::LiveMessage,
+                                actor_source,
+                                None,
+                                serde_json::json!({ "framework_turn_id": turn_id }),
+                            )?;
+                            Ok(SubagentControlReceipt {
+                                identity: operation_identity,
+                                status: SubagentControlStatus::Delivered,
+                                detail: None,
+                                framework_turn_id: Some(turn_id),
+                            })
+                        }
+                        Err(detail) => {
+                            append_guidance_event(
+                                &store,
+                                &operation_identity,
                                 RuntimeEventKind::SubagentGuidanceRejected,
                                 SubagentGuidanceKind::LiveMessage,
                                 actor_source,
                                 None,
                                 serde_json::json!({ "reason": detail }),
-                            ),
-                        ],
-                    )?;
-                    Ok(ControlBegin::Existing(rejected_receipt(
-                        identity.clone(),
-                        detail,
-                    )))
+                            )?;
+                            Ok(rejected_receipt(operation_identity, detail))
+                        }
+                    })
+                })
+                .await
+            {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) => {
+                    tracing::warn!(%error, command_id = %identity.command_id, "retrying live Subagent guidance settlement");
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(1));
                 }
             }
-        })?;
-        let ControlBegin::New(target) = begin else {
-            return begin.into_receipt();
-        };
-
-        let delivery = target
-            .executor
-            .send_message(&identity.execution_id, identity.attempt, instruction)
-            .await;
-        let run_id = identity.run_id.clone();
-        self.store.with_run_lock(&run_id, || match delivery {
-            Ok(delivery) => {
-                append_guidance_event(
-                    &self.store,
-                    &identity,
-                    RuntimeEventKind::SubagentGuidanceDelivered,
-                    SubagentGuidanceKind::LiveMessage,
-                    actor_source,
-                    None,
-                    serde_json::json!({ "framework_turn_id": delivery.turn_id }),
-                )?;
-                Ok(SubagentControlReceipt {
-                    identity,
-                    status: SubagentControlStatus::Delivered,
-                    detail: None,
-                    framework_turn_id: Some(delivery.turn_id),
-                })
-            }
-            Err(error) => {
-                let detail = error.to_string();
-                append_guidance_event(
-                    &self.store,
-                    &identity,
-                    RuntimeEventKind::SubagentGuidanceRejected,
-                    SubagentGuidanceKind::LiveMessage,
-                    actor_source,
-                    None,
-                    serde_json::json!({ "reason": detail }),
-                )?;
-                Ok(rejected_receipt(identity, detail))
-            }
-        })
+        }
     }
 
     /// Interrupt one exact active attempt without pausing or cancelling its
@@ -203,105 +346,165 @@ impl SubagentControlService {
         identity: SubagentControlIdentity,
         actor_source: SubagentControlActorSource,
     ) -> Result<SubagentControlReceipt, StoreError> {
+        let service = self.clone();
+        self.blocking
+            .run_async_owned("interrupt exact Subagent attempt", async move {
+                service
+                    .interrupt_subagent_owned(identity, actor_source)
+                    .await
+            })
+            .await
+    }
+
+    async fn interrupt_subagent_owned(
+        &self,
+        identity: SubagentControlIdentity,
+        actor_source: SubagentControlActorSource,
+    ) -> Result<SubagentControlReceipt, StoreError> {
         let command_run_id = identity.run_id.clone();
-        let begin = self.store.with_run_lock(&command_run_id, || {
-            if let Some(receipt) = existing_receipt(&self.store, &identity)? {
-                return Ok(ControlBegin::Existing(receipt));
-            }
-            validate_plan_target(&self.store, &identity)?;
-            match exact_active_target(&self.store, &identity) {
-                Ok(target) => {
-                    append_interrupt_event(
-                        &self.store,
-                        &identity,
-                        RuntimeEventKind::SubagentInterruptRequested,
-                        actor_source,
-                        serde_json::json!({}),
-                    )?;
-                    Ok(ControlBegin::New(target))
-                }
-                Err(error) => {
-                    let detail = error.to_string();
-                    self.store.shadow.append_event_batch(
-                        &identity.run_id,
-                        vec![
-                            interrupt_event(
-                                &identity,
+        let begin_identity = identity.clone();
+        let begin = self
+            .blocking
+            .run_store("begin Subagent interrupt", move |store| {
+                store.with_run_lock(&command_run_id, || {
+                    if let Some(receipt) = existing_receipt(&store, &begin_identity)? {
+                        return Ok(ControlBegin::Existing(receipt));
+                    }
+                    validate_plan_target(&store, &begin_identity)?;
+                    match exact_active_target(&store, &begin_identity) {
+                        Ok(target) => {
+                            append_interrupt_event(
+                                &store,
+                                &begin_identity,
                                 RuntimeEventKind::SubagentInterruptRequested,
                                 actor_source,
                                 serde_json::json!({}),
-                            ),
-                            interrupt_event(
-                                &identity,
-                                RuntimeEventKind::SubagentInterruptSettled,
-                                actor_source,
-                                serde_json::json!({ "accepted": false, "reason": detail }),
-                            ),
-                        ],
-                    )?;
-                    Ok(ControlBegin::Existing(rejected_receipt(
-                        identity.clone(),
-                        detail,
-                    )))
-                }
-            }
-        })?;
+                            )?;
+                            Ok(ControlBegin::New(target))
+                        }
+                        Err(error) => {
+                            let detail = error.to_string();
+                            store.shadow.append_event_batch(
+                                &begin_identity.run_id,
+                                vec![
+                                    interrupt_event(
+                                        &begin_identity,
+                                        RuntimeEventKind::SubagentInterruptRequested,
+                                        actor_source,
+                                        serde_json::json!({}),
+                                    ),
+                                    interrupt_event(
+                                        &begin_identity,
+                                        RuntimeEventKind::SubagentInterruptSettled,
+                                        actor_source,
+                                        serde_json::json!({ "accepted": false, "reason": detail }),
+                                    ),
+                                ],
+                            )?;
+                            Ok(ControlBegin::Existing(rejected_receipt(
+                                begin_identity.clone(),
+                                detail,
+                            )))
+                        }
+                    }
+                })
+            })
+            .await?;
         let ControlBegin::New(target) = begin else {
             return begin.into_receipt();
         };
+        self.wait_at_command_test_barrier().await;
 
-        let outcome = target
-            .executor
-            .interrupt_subagent(&identity.execution_id, identity.attempt)
-            .await;
-        let run_id = identity.run_id.clone();
-        self.store.with_run_lock(&run_id, || {
-            let (status, detail, payload) = match outcome {
-                Ok(outcome) => {
-                    let terminal_status = outcome
-                        .terminal_status
-                        .map(|status| status.as_str().to_string());
-                    let detail = terminal_status.clone().or_else(|| {
-                        Some(format!(
-                            "previous_status={}",
-                            phase_name(outcome.previous_status)
-                        ))
-                    });
-                    (
-                        SubagentControlStatus::Settled,
-                        detail,
-                        serde_json::json!({
-                            "accepted": true,
-                            "requested": outcome.requested,
-                            "settled": outcome.settled,
-                            "previous_status": phase_name(outcome.previous_status),
-                            "terminal_status": terminal_status,
-                        }),
-                    )
-                }
-                Err(error) => {
-                    let detail = error.to_string();
-                    (
-                        SubagentControlStatus::Rejected,
-                        Some(detail.clone()),
-                        serde_json::json!({ "accepted": false, "reason": detail }),
-                    )
-                }
-            };
-            append_interrupt_event(
-                &self.store,
-                &identity,
-                RuntimeEventKind::SubagentInterruptSettled,
-                actor_source,
-                payload,
-            )?;
-            Ok(SubagentControlReceipt {
-                identity,
-                status,
-                detail,
-                framework_turn_id: None,
-            })
+        let interrupt_executor = target.executor.clone();
+        let interrupt_execution_id = identity.execution_id.clone();
+        let interrupt_attempt = identity.attempt;
+        let outcome = match tokio::spawn(async move {
+            interrupt_executor
+                .interrupt_subagent(&interrupt_execution_id, interrupt_attempt)
+                .await
+                .map_err(|error| error.to_string())
         })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => Err(format!("framework Subagent interrupt panicked: {error}")),
+        };
+        let (status, detail, payload) = match outcome {
+            Ok(outcome) => {
+                let terminal_status = outcome
+                    .terminal_status
+                    .map(|status| status.as_str().to_string());
+                let detail = terminal_status.clone().or_else(|| {
+                    Some(format!(
+                        "previous_status={}",
+                        phase_name(outcome.previous_status)
+                    ))
+                });
+                (
+                    SubagentControlStatus::Settled,
+                    detail,
+                    serde_json::json!({
+                        "accepted": true,
+                        "requested": outcome.requested,
+                        "settled": outcome.settled,
+                        "previous_status": phase_name(outcome.previous_status),
+                        "terminal_status": terminal_status,
+                    }),
+                )
+            }
+            Err(detail) => (
+                SubagentControlStatus::Rejected,
+                Some(detail.clone()),
+                serde_json::json!({ "accepted": false, "reason": detail }),
+            ),
+        };
+        let run_id = identity.run_id.clone();
+        let settlement_identity = identity.clone();
+        let mut delay = std::time::Duration::from_millis(25);
+        loop {
+            if self.consume_settlement_failure() {
+                tokio::time::sleep(delay).await;
+                delay = delay
+                    .saturating_mul(2)
+                    .min(std::time::Duration::from_secs(1));
+                continue;
+            }
+            let operation_run_id = run_id.clone();
+            let operation_identity = settlement_identity.clone();
+            let operation_status = status;
+            let operation_detail = detail.clone();
+            let operation_payload = payload.clone();
+            match self
+                .blocking
+                .run_store("settle Subagent interrupt", move |store| {
+                    store.with_run_lock(&operation_run_id, || {
+                        append_interrupt_event(
+                            &store,
+                            &operation_identity,
+                            RuntimeEventKind::SubagentInterruptSettled,
+                            actor_source,
+                            operation_payload,
+                        )?;
+                        Ok(SubagentControlReceipt {
+                            identity: operation_identity,
+                            status: operation_status,
+                            detail: operation_detail,
+                            framework_turn_id: None,
+                        })
+                    })
+                })
+                .await
+            {
+                Ok(receipt) => return Ok(receipt),
+                Err(error) => {
+                    tracing::warn!(%error, command_id = %identity.command_id, "retrying Subagent interrupt settlement");
+                    tokio::time::sleep(delay).await;
+                    delay = delay
+                        .saturating_mul(2)
+                        .min(std::time::Duration::from_secs(1));
+                }
+            }
+        }
     }
 }
 
@@ -1143,7 +1346,11 @@ mod tests {
         registry
             .register(
                 SubagentDefinition::new("slow", "Slow Subagent"),
-                Box::new(MockAgent::new("slow").with_delay_ms(30_000)),
+                Box::new(
+                    MockAgent::new("slow")
+                        .with_response("must be cancelled before completion")
+                        .with_delay_ms(30_000),
+                ),
             )
             .await;
         let executor = Arc::new(SubagentExecutor::new(
@@ -1197,13 +1404,18 @@ mod tests {
             command_id: "interrupt-1".to_string(),
         };
         let service = SubagentControlService::new(store.clone());
+        service.fail_next_settlements(2);
         let receipt = service
             .interrupt_subagent(identity.clone(), SubagentControlActorSource::Gui)
             .await
             .map_err(|error| error.to_string())?;
         assert_eq!(receipt.status, SubagentControlStatus::Settled);
-        let result = handle.join().await.map_err(|error| error.to_string())?;
-        assert_eq!(result.outcome.status, SubagentStatus::Cancelled);
+        match handle.join().await {
+            Ok(result) => assert_eq!(result.outcome.status, SubagentStatus::Cancelled),
+            Err(echo_agent::error::ReactError::Agent(error))
+                if matches!(*error, echo_agent::error::AgentError::Cancelled(_)) => {}
+            Err(error) => return Err(format!("interrupted Subagent did not settle: {error}")),
+        }
 
         let replay = service
             .interrupt_subagent(identity, SubagentControlActorSource::Gui)
@@ -1227,6 +1439,141 @@ mod tests {
                 .count(),
             1
         );
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn caller_abort_cannot_leave_interrupt_requested_without_settlement() -> Result<(), String>
+    {
+        use echo_agent::agent::CancellationToken;
+        use echo_agent::agent::subagent::{
+            DispatchRequest, ExecutionMode as FrameworkExecutionMode, SubagentDefinition,
+            SubagentStatus,
+        };
+        use echo_agent::testing::MockAgent;
+
+        let store = store_with_plan("run-abort-interrupt", &["task-1"])?;
+        let registry = Arc::new(echo_agent::agent::subagent::SubagentRegistry::new());
+        registry
+            .register(
+                SubagentDefinition::new("slow", "Slow Subagent"),
+                Box::new(
+                    MockAgent::new("slow")
+                        .with_response("must be interrupted")
+                        .with_delay_ms(30_000),
+                ),
+            )
+            .await;
+        let executor = Arc::new(SubagentExecutor::new(
+            registry,
+            echo_agent::agent::subagent::SubagentExecutorConfig::default(),
+        ));
+        let execution_id = "run-abort-interrupt:task-1:1:1:claim-1";
+        let (_, framework_identity) =
+            attempt_identity("run-abort-interrupt", "task-1", execution_id, 1, 1)
+                .map_err(|error| error.to_string())?;
+        let _route = store
+            .record_controlled_subagent_assigned(
+                "run-abort-interrupt",
+                "task-1",
+                execution_id,
+                "slow",
+                "Slow Subagent",
+                1,
+                1,
+                true,
+                false,
+                executor.clone(),
+            )
+            .map_err(|error| error.to_string())?;
+        let handle = executor
+            .dispatch_background_attempt(
+                DispatchRequest {
+                    agent_name: "slow".to_string(),
+                    task: "wait".to_string(),
+                    mode_override: Some(FrameworkExecutionMode::Sync),
+                    cancel: CancellationToken::new(),
+                    parent_agent: "parent".to_string(),
+                    parent_context: None,
+                    delegation_policy: DispatchRequest::policy_from_depth(0),
+                    runtime_context: None,
+                    message: None,
+                    prompt_payload: None,
+                    constraints: Vec::new(),
+                    background: false,
+                },
+                framework_identity,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let identity = SubagentControlIdentity {
+            run_id: "run-abort-interrupt".to_string(),
+            task_id: "task-1".to_string(),
+            execution_id: execution_id.to_string(),
+            plan_revision: 1,
+            attempt: 1,
+            command_id: "interrupt-aborted-caller".to_string(),
+        };
+        let barrier = Arc::new(SubagentControlTestBarrier {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let service =
+            SubagentControlService::new(store.clone()).with_command_test_barrier(barrier.clone());
+        let caller_service = service.clone();
+        let caller = tokio::spawn(async move {
+            caller_service
+                .interrupt_subagent(identity, SubagentControlActorSource::Gui)
+                .await
+        });
+        barrier.entered.notified().await;
+        caller.abort();
+        let _ = caller.await;
+        let before_release = store
+            .list_events("run-abort-interrupt", 0)
+            .map_err(|error| error.to_string())?;
+        if !before_release
+            .iter()
+            .any(|event| event.event_type == RuntimeEventKind::SubagentInterruptRequested)
+            || before_release
+                .iter()
+                .any(|event| event.event_type == RuntimeEventKind::SubagentInterruptSettled)
+        {
+            return Err("interrupt did not pause at the durable requested boundary".to_string());
+        }
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.shutdown_operations().await });
+        tokio::task::yield_now().await;
+        if shutdown.is_finished() {
+            return Err("operation shutdown crossed an unsettled interrupt".to_string());
+        }
+        barrier.release.notify_one();
+        shutdown
+            .await
+            .map_err(|error| format!("operation shutdown failed to join: {error}"))??;
+        match handle.join().await {
+            Ok(result) if result.outcome.status == SubagentStatus::Cancelled => {}
+            Ok(result) => {
+                return Err(format!(
+                    "unexpected interrupted status: {:?}",
+                    result.outcome.status
+                ));
+            }
+            Err(echo_agent::error::ReactError::Agent(error))
+                if matches!(*error, echo_agent::error::AgentError::Cancelled(_)) => {}
+            Err(error) => return Err(format!("interrupted Subagent did not settle: {error}")),
+        }
+        let settled = store
+            .list_events("run-abort-interrupt", 0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter(|event| event.event_type == RuntimeEventKind::SubagentInterruptSettled)
+            .count();
+        if settled != 1 {
+            return Err(format!(
+                "expected one interrupt settlement, found {settled}"
+            ));
+        }
         Ok(())
     }
 }

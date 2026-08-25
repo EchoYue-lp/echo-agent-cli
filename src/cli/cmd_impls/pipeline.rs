@@ -239,7 +239,7 @@ async fn pipeline_data(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
 async fn pipeline_list(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
     if let Some(ref service) = ctx.task_service {
-        let tasks = service.list_unified(None);
+        let tasks = service.list_unified(None).await;
         let pipeline_tasks: Vec<_> = tasks
             .iter()
             .filter(|t| {

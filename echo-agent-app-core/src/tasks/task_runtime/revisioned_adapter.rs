@@ -11,6 +11,7 @@ use echo_agent::tasks::{
 };
 use echo_agent::tools::ToolContext;
 
+use super::executor::TaskRuntimeBlockingAdapter;
 use super::profiles::default_subagent_for;
 use super::store::{InitialRunTriggerMetadata, StoreError, TaskRuntimeStore};
 use super::task_tools::{TaskCapabilityCatalog, current_run_id, formal_run_id_for_turn};
@@ -38,7 +39,7 @@ type PendingDirectCompletions = Arc<Mutex<HashMap<String, PendingDirectCompletio
 /// File persistence adapter. It deliberately has no patch or validation
 /// logic; those remain authoritative in the framework service.
 pub struct EkoRevisionedTaskStore {
-    store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     pending_initial_runs: PendingInitialRuns,
     pending_direct_completions: PendingDirectCompletions,
 }
@@ -46,7 +47,7 @@ pub struct EkoRevisionedTaskStore {
 impl EkoRevisionedTaskStore {
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
         Self {
-            store,
+            blocking: TaskRuntimeBlockingAdapter::new(store),
             pending_initial_runs: Arc::new(Mutex::new(HashMap::new())),
             pending_direct_completions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -57,7 +58,7 @@ impl EkoRevisionedTaskStore {
         pending_initial_runs: PendingInitialRuns,
     ) -> Self {
         Self {
-            store,
+            blocking: TaskRuntimeBlockingAdapter::new(store),
             pending_initial_runs,
             pending_direct_completions: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -68,7 +69,7 @@ impl EkoRevisionedTaskStore {
         pending_direct_completions: PendingDirectCompletions,
     ) -> Self {
         Self {
-            store,
+            blocking: TaskRuntimeBlockingAdapter::new(store),
             pending_initial_runs: Arc::new(Mutex::new(HashMap::new())),
             pending_direct_completions,
         }
@@ -81,8 +82,12 @@ impl RevisionedTaskStore for EkoRevisionedTaskStore {
         &self,
         scope_id: &str,
     ) -> Result<Option<RevisionedTaskGraph>, RevisionedTaskStoreError> {
-        self.store
-            .load_revisioned_task_graph(scope_id)
+        let scope_id = scope_id.to_string();
+        self.blocking
+            .run_store("load revisioned task graph", move |store| {
+                store.load_revisioned_task_graph(&scope_id)
+            })
+            .await
             .map_err(store_error)
     }
 
@@ -103,29 +108,33 @@ impl RevisionedTaskStore for EkoRevisionedTaskStore {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(scope_id)
             .cloned();
-        let committed = match (pending, pending_direct) {
-            (Some(pending), None) => self
-                .store
-                .compare_and_publish_initial_revisioned_task_graph(
-                    &pending.run,
-                    &pending.trigger,
-                    pending.continuation,
-                    commit,
-                ),
-            (None, Some(completion)) => self.store.compare_and_commit_direct_completion(
-                scope_id,
-                commit,
-                &completion.summary,
-                &completion.task_summary,
-            ),
-            (None, None) => self
-                .store
-                .compare_and_commit_revisioned_task_graph(scope_id, commit),
-            (Some(_), Some(_)) => Err(StoreError::InvalidPlan(format!(
-                "TaskRun {scope_id} cannot be both an initial publication and direct completion"
-            ))),
-        }
-        .map_err(store_error)?;
+        let owned_scope_id = scope_id.to_string();
+        let committed = self
+            .blocking
+            .run_store("commit revisioned task graph", move |store| {
+                match (pending, pending_direct) {
+                    (Some(pending), None) => store
+                        .compare_and_publish_initial_revisioned_task_graph(
+                            &pending.run,
+                            &pending.trigger,
+                            pending.continuation,
+                            commit,
+                        ),
+                    (None, Some(completion)) => store.compare_and_commit_direct_completion(
+                        &owned_scope_id,
+                        commit,
+                        &completion.summary,
+                        &completion.task_summary,
+                    ),
+                    (None, None) => store
+                        .compare_and_commit_revisioned_task_graph(&owned_scope_id, commit),
+                    (Some(_), Some(_)) => Err(StoreError::InvalidPlan(format!(
+                        "TaskRun {owned_scope_id} cannot be both an initial publication and direct completion"
+                    ))),
+                }
+            })
+            .await
+            .map_err(store_error)?;
         self.pending_initial_runs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -166,7 +175,7 @@ fn store_error(error: StoreError) -> RevisionedTaskStoreError {
 /// EKO product policy: run bootstrap, domain defaults, capability validation,
 /// and extension round trips. It cannot alter generic task fields.
 pub struct EkoTaskToolPolicy {
-    store: Arc<TaskRuntimeStore>,
+    blocking: TaskRuntimeBlockingAdapter,
     capabilities: Arc<TaskCapabilityCatalog>,
     pending_initial_runs: PendingInitialRuns,
 }
@@ -178,13 +187,13 @@ impl EkoTaskToolPolicy {
         pending_initial_runs: PendingInitialRuns,
     ) -> Self {
         Self {
-            store,
+            blocking: TaskRuntimeBlockingAdapter::new(store),
             capabilities,
             pending_initial_runs,
         }
     }
 
-    fn run(&self, scope_id: &str) -> Result<super::types::TaskRun, TaskPolicyError> {
+    async fn run(&self, scope_id: &str) -> Result<super::types::TaskRun, TaskPolicyError> {
         if let Some(pending) = self
             .pending_initial_runs
             .lock()
@@ -194,8 +203,13 @@ impl EkoTaskToolPolicy {
         {
             return Ok(pending.run);
         }
-        self.store
-            .get_run(scope_id)
+        let scope_id = scope_id.to_string();
+        let lookup_scope_id = scope_id.clone();
+        self.blocking
+            .run_store("load task policy run", move |store| {
+                store.get_run(&lookup_scope_id)
+            })
+            .await
             .map_err(|error| TaskPolicyError::Backend {
                 message: format!("Failed to read task run domain: {error}"),
             })?
@@ -294,15 +308,6 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         input: &TaskCreateInput,
         context: &ToolContext,
     ) -> Result<(), TaskPolicyError> {
-        match self.store.get_run(scope_id) {
-            Ok(Some(_)) => return Ok(()),
-            Ok(None) => {}
-            Err(error) => {
-                return Err(TaskPolicyError::Backend {
-                    message: format!("Failed to inspect task run before creating task: {error}"),
-                });
-            }
-        }
         let first = input
             .tasks
             .first()
@@ -334,20 +339,35 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
             .map(|resources| resources.attachments.clone())
             .unwrap_or_default();
         let goal = task_goal(&first.title, &first.description);
-        let mut run = self
-            .store
-            .prepare_run_for_active_workspace(
-                scope_id,
-                &conversation_id,
-                &root_message_id,
-                DomainProfile::General,
-                &goal,
-                "agent_task_plan",
-                AttendedMode::Attended,
-            )
+        let owned_scope_id = scope_id.to_string();
+        let owned_conversation_id = conversation_id.clone();
+        let owned_root_message_id = root_message_id.clone();
+        let owned_goal = goal.clone();
+        let prepared = self
+            .blocking
+            .run_store("prepare task policy scope", move |store| {
+                if store.get_run(&owned_scope_id)?.is_some() {
+                    return Ok(None);
+                }
+                store
+                    .prepare_run_for_active_workspace(
+                        &owned_scope_id,
+                        &owned_conversation_id,
+                        &owned_root_message_id,
+                        DomainProfile::General,
+                        &owned_goal,
+                        "agent_task_plan",
+                        AttendedMode::Attended,
+                    )
+                    .map(Some)
+            })
+            .await
             .map_err(|error| TaskPolicyError::Backend {
                 message: format!("Failed to prepare task run before creating task: {error}"),
             })?;
+        let Some(mut run) = prepared else {
+            return Ok(());
+        };
         run.attachments = attachments;
         self.pending_initial_runs
             .lock()
@@ -381,7 +401,7 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         draft: &TaskDraft,
         position: usize,
     ) -> Result<PreparedTaskPolicy, TaskPolicyError> {
-        let run = self.run(scope_id)?;
+        let run = self.run(scope_id).await?;
         let kind = draft
             .extension
             .get("kind")
@@ -454,7 +474,7 @@ impl TaskToolPolicy for EkoTaskToolPolicy {
         scope_id: &str,
         input: &TaskCreateInput,
     ) -> Result<TaskGraphContext, TaskPolicyError> {
-        let run = self.run(scope_id)?;
+        let run = self.run(scope_id).await?;
         let metadata = serde_json::to_value(EkoPlanMetadata {
             plan_id: format!("plan_{}", uuid::Uuid::new_v4().as_simple()),
             domain_profile: run.domain_profile,
@@ -555,7 +575,7 @@ pub fn build_eko_task_revision_service(
 /// existing EKO projection expected by GUI/TUI callers.
 pub async fn apply_eko_task_update(
     service: &TaskRevisionService,
-    store: &TaskRuntimeStore,
+    store: Arc<TaskRuntimeStore>,
     run_id: &str,
     request: TaskUpdateRequest,
 ) -> Result<super::types::TaskPlan, TaskRevisionError> {
@@ -563,8 +583,12 @@ pub async fn apply_eko_task_update(
         .to_task_plan_patch()
         .map_err(|message| TaskRevisionError::InvalidInput { message })?;
     service.apply_patch(run_id, patch).await?;
-    store
-        .get_plan(run_id)
+    let owned_run_id = run_id.to_string();
+    TaskRuntimeBlockingAdapter::new(store)
+        .run_store("load committed task update", move |store| {
+            store.get_plan(&owned_run_id)
+        })
+        .await
         .map_err(|error| TaskRevisionError::Backend {
             message: error.to_string(),
         })?
@@ -580,8 +604,12 @@ pub async fn commit_eko_task_plan(
     store: Arc<TaskRuntimeStore>,
     plan: super::types::TaskPlan,
 ) -> Result<super::types::TaskPlan, TaskRevisionError> {
-    let run = store
-        .get_run(&plan.run_id)
+    let plan_run_id = plan.run_id.clone();
+    let run = TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store("load task plan run", move |store| {
+            store.get_run(&plan_run_id)
+        })
+        .await
         .map_err(|error| TaskRevisionError::Backend {
             message: error.to_string(),
         })?
@@ -596,7 +624,7 @@ pub async fn commit_eko_task_plan(
     service
         .create_prepared(&run_id, context, tasks, "initial complete plan".to_string())
         .await?;
-    load_committed_plan(&store, run_id)
+    load_committed_plan(store, run_id).await
 }
 
 /// Framework-validate a fixed direct-answer graph, then atomically persist the
@@ -607,8 +635,12 @@ pub(crate) async fn commit_eko_direct_completion(
     summary: TaskExecutionSummary,
     task_summary: String,
 ) -> Result<super::types::TaskPlan, TaskRevisionError> {
-    let run = store
-        .get_run(&plan.run_id)
+    let plan_run_id = plan.run_id.clone();
+    let run = TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store("load direct completion run", move |store| {
+            store.get_run(&plan_run_id)
+        })
+        .await
         .map_err(|error| TaskRevisionError::Backend {
             message: error.to_string(),
         })?
@@ -638,7 +670,7 @@ pub(crate) async fn commit_eko_direct_completion(
     service
         .create_prepared(&run_id, context, tasks, "initial complete plan".to_string())
         .await?;
-    load_committed_plan(&store, run_id)
+    load_committed_plan(store, run_id).await
 }
 
 /// Publish a prepared TaskRun and its first framework-validated graph as one
@@ -685,7 +717,7 @@ pub(crate) async fn publish_eko_task_plan(
             .remove(&run_id);
     }
     create_result?;
-    load_committed_plan(&store, run_id)
+    load_committed_plan(store, run_id).await
 }
 
 fn plan_graph_input(
@@ -725,16 +757,22 @@ fn plan_graph_input(
     Ok((run_id, context, tasks))
 }
 
-fn load_committed_plan(
-    store: &TaskRuntimeStore,
+async fn load_committed_plan(
+    store: Arc<TaskRuntimeStore>,
     run_id: String,
 ) -> Result<super::types::TaskPlan, TaskRevisionError> {
-    store
-        .get_plan(&run_id)
+    let missing_scope = run_id.clone();
+    TaskRuntimeBlockingAdapter::new(store)
+        .run_store("load committed task plan", move |store| {
+            store.get_plan(&run_id)
+        })
+        .await
         .map_err(|error| TaskRevisionError::Backend {
             message: error.to_string(),
         })?
-        .ok_or(TaskRevisionError::GraphNotFound { scope_id: run_id })
+        .ok_or(TaskRevisionError::GraphNotFound {
+            scope_id: missing_scope,
+        })
 }
 
 #[cfg(test)]

@@ -15,8 +15,8 @@ use super::background::BackgroundTaskKind;
 use super::task_runtime::{
     AttendedMode, DomainProfile, ExecuteTaskTool, ExecutionMode, MemoryPolicy, PlanTask,
     RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRetryPreparation, TaskRun, TaskRunBootOutcome,
-    TaskRunBootReconciler, TaskRunStatus, TaskRuntimeBlockingAdapter, TaskRuntimeStore, TodoStatus,
-    UnattendedWriteMode,
+    TaskRunBootReconciler, TaskRunStatus, TaskRuntimeBlockingAdapter, TaskRuntimeStore, TodoItem,
+    TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 #[cfg(test)]
@@ -267,7 +267,7 @@ impl BackgroundTaskService {
         let generation_lease = self
             .task_runtime_store
             .lease_active_workspace_generation()?;
-        let mut registration = self
+        let registration = self
             .task_runtime_store
             .register_run_driver::<()>(admission, generation_lease)?;
         let conversation_id = format!("background:{}:{}", request.source, uuid::Uuid::new_v4());
@@ -276,37 +276,56 @@ impl BackgroundTaskService {
         } else {
             request.description
         };
-        registration.mark_preparation_started();
-        let preparation = self
-            .task_runtime_store
-            .create_run_for_active_workspace(
-                &run_id,
-                &conversation_id,
-                "",
-                request.domain_profile,
-                goal,
-                request.task_kind,
-                AttendedMode::Unattended,
-            )
-            .and_then(|_| {
-                self.task_runtime_store
-                    .configure_run_continuation(&run_id, true, true, None, None)
-                    .map(|_| ())
+        let preparation_run_id = run_id.clone();
+        let preparation_conversation_id = conversation_id.clone();
+        let preparation_goal = goal.to_string();
+        let preparation_kind = request.task_kind.to_string();
+        let preparation_source = request.source.to_string();
+        let preparation_prompt = request.prompt.to_string();
+        let preparation_dependencies = request.dependencies.clone();
+        let preparation_domain_profile = request.domain_profile;
+        let preparation_priority = request.priority;
+        let preparation_store = self.task_runtime_store.clone();
+        let registration = TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_owned("prepare background TaskRun", move || {
+                let mut registration = registration;
+                registration.mark_preparation_started();
+                if let Err(error) = preparation_store.create_run_for_active_workspace(
+                    &preparation_run_id,
+                    &preparation_conversation_id,
+                    "",
+                    preparation_domain_profile,
+                    &preparation_goal,
+                    &preparation_kind,
+                    AttendedMode::Unattended,
+                ) {
+                    registration.fail_preparation(error.to_string());
+                    return Err(error);
+                }
+                if let Err(error) = preparation_store.configure_run_continuation(
+                    &preparation_run_id,
+                    true,
+                    true,
+                    None,
+                    None,
+                ) {
+                    registration.fail_preparation(error.to_string());
+                    return Err(error);
+                }
+                if let Err(error) = preparation_store.record_trigger_metadata(
+                    &preparation_run_id,
+                    &preparation_source,
+                    &preparation_kind,
+                    &preparation_prompt,
+                    preparation_priority,
+                    &preparation_dependencies,
+                ) {
+                    registration.fail_preparation(error.to_string());
+                    return Err(error);
+                }
+                Ok(registration)
             })
-            .and_then(|_| {
-                self.task_runtime_store.record_trigger_metadata(
-                    &run_id,
-                    request.source,
-                    request.task_kind,
-                    request.prompt,
-                    request.priority,
-                    &request.dependencies,
-                )
-            });
-        if let Err(error) = preparation {
-            registration.fail_preparation(error.to_string());
-            return Err(error.into());
-        }
+            .await?;
         self.start_run_driver(
             run_id.clone(),
             request.prompt.to_string(),
@@ -332,7 +351,7 @@ impl BackgroundTaskService {
         let generation_lease = self
             .task_runtime_store
             .lease_active_workspace_generation()?;
-        let mut registration = self
+        let registration = self
             .task_runtime_store
             .register_run_driver::<()>(admission, generation_lease)?;
         let conversation_id = format!("background:{source_id}:{}", uuid::Uuid::new_v4());
@@ -342,22 +361,32 @@ impl BackgroundTaskService {
             description
         };
         let task_kind = format!("bg:kind:{source_kind}_composite");
-        registration.mark_preparation_started();
-        let run = match self.task_runtime_store.prepare_run_for_active_workspace(
-            &run_id,
-            &conversation_id,
-            "",
-            DomainProfile::General,
-            goal,
-            &task_kind,
-            AttendedMode::Unattended,
-        ) {
-            Ok(run) => run,
-            Err(error) => {
-                registration.reject(error.to_string());
-                return Err(error.into());
-            }
-        };
+        let preparation_store = self.task_runtime_store.clone();
+        let preparation_run_id = run_id.clone();
+        let preparation_conversation_id = conversation_id.clone();
+        let preparation_goal = goal.to_string();
+        let preparation_kind = task_kind.clone();
+        let (registration, run) = TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_owned("prepare background TaskRun DAG", move || {
+                let mut registration = registration;
+                registration.mark_preparation_started();
+                match preparation_store.prepare_run_for_active_workspace(
+                    &preparation_run_id,
+                    &preparation_conversation_id,
+                    "",
+                    DomainProfile::General,
+                    &preparation_goal,
+                    &preparation_kind,
+                    AttendedMode::Unattended,
+                ) {
+                    Ok(run) => Ok((registration, run)),
+                    Err(error) => {
+                        registration.reject(error.to_string());
+                        Err(error)
+                    }
+                }
+            })
+            .await?;
         if let Err(error) = super::task_runtime::revisioned_adapter::publish_eko_task_plan(
             self.task_runtime_store.clone(),
             run,
@@ -427,14 +456,22 @@ impl BackgroundTaskService {
     }
 
     pub async fn cancel(&self, id: &str) -> bool {
-        self.task_runtime_store
-            .request_cancel(id)
+        let run_id = id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("cancel background TaskRun", move |store| {
+                store.request_cancel(&run_id)
+            })
+            .await
             .is_ok_and(|cancelled| cancelled)
     }
 
-    pub fn pause(&self, id: &str) -> anyhow::Result<bool> {
-        self.task_runtime_store
-            .request_pause(id)
+    pub async fn pause(&self, id: &str) -> anyhow::Result<bool> {
+        let run_id = id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("pause background TaskRun", move |store| {
+                store.request_pause(&run_id)
+            })
+            .await
             .map_err(Into::into)
     }
 
@@ -505,27 +542,36 @@ impl BackgroundTaskService {
         Ok(())
     }
 
-    pub fn recovery_blockers(&self, id: &str) -> anyhow::Result<Vec<RecoveryBlocker>> {
-        self.task_runtime_store
-            .list_recovery_blockers(id)
+    pub async fn recovery_blockers(&self, id: &str) -> anyhow::Result<Vec<RecoveryBlocker>> {
+        let run_id = id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("load background recovery blockers", move |store| {
+                store.list_recovery_blockers(&run_id)
+            })
+            .await
             .map_err(Into::into)
     }
 
-    pub fn resolve_recovery_task(
+    pub async fn resolve_recovery_task(
         &self,
         id: &str,
         task_id: &str,
         decision: RecoveryDecision,
     ) -> anyhow::Result<()> {
-        self.task_runtime_store
-            .resolve_recovery_task(id, task_id, decision)
+        let run_id = id.to_string();
+        let task_id = task_id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("resolve background recovery task", move |store| {
+                store.resolve_recovery_task(&run_id, &task_id, decision)
+            })
+            .await
             .map_err(Into::into)
     }
 
     /// Atomically retry a Blocked/Failed task on a Paused/Failed run. Mirrors
     /// the Tauri `retry_blocked_task` command and the GUI retry button so
     /// CLI/TUI users get the same acceptance-retry semantics.
-    pub fn retry_blocked_task(
+    pub async fn retry_blocked_task(
         &self,
         run_id: &str,
         task_id: &str,
@@ -540,58 +586,74 @@ impl BackgroundTaskService {
         let driver_store = store.clone();
         let driver_run_id = run_id.to_string();
         let driver_cancel = cancel.clone();
-        let (preparation, result_waiter) = store.spawn_supervised_task_retry(
-            run_id.to_string(),
-            task_id.to_string(),
-            cancel,
-            move || {
-                let run = preflight_store.get_run(&preflight_run_id)?.ok_or_else(|| {
-                    super::task_runtime::StoreError::RunNotFound(preflight_run_id.clone())
-                })?;
-                if !run.conversation_id.starts_with("background:") {
-                    return Err(super::task_runtime::StoreError::InvalidPlan(format!(
-                        "task run is not owned by the background service: {preflight_run_id}"
-                    )));
-                }
-                let metadata = trigger_metadata(&preflight_store, &preflight_run_id);
-                Ok((metadata.prompt.unwrap_or(run.goal), metadata.dependencies))
-            },
-            move |(prompt, dependencies), receipt_owner| {
-                drive_background_run(
-                    driver_store,
-                    agent_provider,
-                    review_integration,
-                    run_semaphore,
-                    driver_run_id,
-                    prompt,
-                    dependencies,
-                    driver_cancel,
-                    receipt_owner,
-                )
-            },
-        )?;
+        let (preparation, result_waiter) = store
+            .spawn_supervised_task_retry_async(
+                run_id.to_string(),
+                task_id.to_string(),
+                cancel,
+                move || {
+                    let run = preflight_store.get_run(&preflight_run_id)?.ok_or_else(|| {
+                        super::task_runtime::StoreError::RunNotFound(preflight_run_id.clone())
+                    })?;
+                    if !run.conversation_id.starts_with("background:") {
+                        return Err(super::task_runtime::StoreError::InvalidPlan(format!(
+                            "task run is not owned by the background service: {preflight_run_id}"
+                        )));
+                    }
+                    let metadata = trigger_metadata(&preflight_store, &preflight_run_id);
+                    Ok((metadata.prompt.unwrap_or(run.goal), metadata.dependencies))
+                },
+                move |(prompt, dependencies), receipt_owner| {
+                    drive_background_run(
+                        driver_store,
+                        agent_provider,
+                        review_integration,
+                        run_semaphore,
+                        driver_run_id,
+                        prompt,
+                        dependencies,
+                        driver_cancel,
+                        receipt_owner,
+                    )
+                },
+            )
+            .await?;
         drop(result_waiter);
         Ok(preparation)
     }
 
-    pub fn list_unified(&self, status_filter: Option<&str>) -> Vec<UnifiedTaskInfo> {
-        let Ok(runs) = self.task_runtime_store.list_runs_in(&all_run_statuses()) else {
-            return Vec::new();
-        };
-        runs.into_iter()
-            .filter(|run| run.conversation_id.starts_with("background:"))
-            .map(|run| run_to_unified(&self.task_runtime_store, &run))
-            .filter(|task| status_filter.is_none_or(|status| task.status == status))
-            .collect()
+    pub async fn list_unified(&self, status_filter: Option<&str>) -> Vec<UnifiedTaskInfo> {
+        let status_filter = status_filter.map(str::to_string);
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("list background TaskRuns", move |store| {
+                store.list_runs_in(&all_run_statuses()).map(|runs| {
+                    runs.into_iter()
+                        .filter(|run| run.conversation_id.starts_with("background:"))
+                        .map(|run| run_to_unified(&store, &run))
+                        .filter(|task| {
+                            status_filter
+                                .as_deref()
+                                .is_none_or(|status| task.status == status)
+                        })
+                        .collect()
+                })
+            })
+            .await
+            .unwrap_or_default()
     }
 
-    pub fn get_unified(&self, id: &str) -> Option<UnifiedTaskInfo> {
-        self.task_runtime_store
-            .get_run(id)
+    pub async fn get_unified(&self, id: &str) -> Option<UnifiedTaskInfo> {
+        let run_id = id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("load background TaskRun", move |store| {
+                store.get_run(&run_id).map(|run| {
+                    run.filter(|run| run.conversation_id.starts_with("background:"))
+                        .map(|run| run_to_unified(&store, &run))
+                })
+            })
+            .await
             .ok()
             .flatten()
-            .filter(|run| run.conversation_id.starts_with("background:"))
-            .map(|run| run_to_unified(&self.task_runtime_store, &run))
     }
 
     pub async fn resume_pending(&self) -> anyhow::Result<usize> {
@@ -599,15 +661,24 @@ impl BackgroundTaskService {
             .recover_once()
             .await
             .map_err(anyhow::Error::msg)?;
-        let mut runs = self
-            .task_runtime_store
-            .list_runs_in(&[TaskRunStatus::Pending, TaskRunStatus::Paused])?;
-        runs.sort_by_key(|run| run.status == TaskRunStatus::Paused);
+        let mut runs = TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("load pending background TaskRuns", move |store| {
+                store
+                    .list_runs_in(&[TaskRunStatus::Pending, TaskRunStatus::Paused])
+                    .map(|runs| {
+                        runs.into_iter()
+                            .filter(|run| run.conversation_id.starts_with("background:"))
+                            .map(|run| {
+                                let metadata = trigger_metadata(&store, &run.run_id);
+                                (run, metadata)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+            })
+            .await?;
+        runs.sort_by_key(|(run, _)| run.status == TaskRunStatus::Paused);
         let mut resumed = 0usize;
-        for run in runs
-            .into_iter()
-            .filter(|run| run.conversation_id.starts_with("background:"))
-        {
+        for (run, metadata) in runs {
             let cancel = self.cancel.child_token();
             let admission = self
                 .task_runtime_store
@@ -618,7 +689,6 @@ impl BackgroundTaskService {
             let mut registration = self
                 .task_runtime_store
                 .register_run_driver::<()>(admission, generation_lease)?;
-            let metadata = trigger_metadata(&self.task_runtime_store, &run.run_id);
             let prompt = metadata.prompt.unwrap_or(run.goal);
             registration.mark_preparation_started();
             if run.status == TaskRunStatus::Paused {
@@ -672,45 +742,58 @@ impl BackgroundTaskService {
         });
     }
 
-    pub fn get_progress(&self, run_id: &str) -> Option<TaskProgress> {
-        let run = self.task_runtime_store.get_run(run_id).ok().flatten()?;
-        let todos = self.task_runtime_store.list_todos(run_id).ok()?;
-        let total = todos.len();
-        let completed = todos
-            .iter()
-            .filter(|todo| {
-                matches!(
-                    todo.status,
-                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-                )
+    pub async fn get_progress(&self, run_id: &str) -> Option<TaskProgress> {
+        let run_id = run_id.to_string();
+        TaskRuntimeBlockingAdapter::new(self.task_runtime_store.clone())
+            .run_store("load background TaskRun progress", move |store| {
+                let Some(run) = store.get_run(&run_id)? else {
+                    return Ok(None);
+                };
+                let todos = store.list_todos(&run_id)?;
+                Ok(Some(task_progress(&run_id, run, todos)))
             })
-            .count();
-        let percentage = if total == 0 {
-            if run.status == TaskRunStatus::Completed {
-                100.0
-            } else {
-                0.0
-            }
-        } else {
-            (completed as f64 / total as f64) * 100.0
-        };
-        Some(TaskProgress {
-            task_id: run_id.to_string(),
-            percentage,
-            current_phase: run_status_string(run.status).to_string(),
-            phase_index: completed.min(total),
-            total_phases: total,
-            message: todos
-                .iter()
-                .find(|todo| todo.status == TodoStatus::Running)
-                .map(|todo| todo.title.clone()),
-            eta_secs: None,
-            updated_at: run.updated_at,
-        })
+            .await
+            .ok()
+            .flatten()
     }
 
     pub fn config(&self) -> &BackgroundTaskServiceConfig {
         &self.config
+    }
+}
+
+fn task_progress(run_id: &str, run: TaskRun, todos: Vec<TodoItem>) -> TaskProgress {
+    let total = todos.len();
+    let completed = todos
+        .iter()
+        .filter(|todo| {
+            matches!(
+                todo.status,
+                TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+            )
+        })
+        .count();
+    let percentage = if total == 0 {
+        if run.status == TaskRunStatus::Completed {
+            100.0
+        } else {
+            0.0
+        }
+    } else {
+        (completed as f64 / total as f64) * 100.0
+    };
+    TaskProgress {
+        task_id: run_id.to_string(),
+        percentage,
+        current_phase: run_status_string(run.status).to_string(),
+        phase_index: completed.min(total),
+        total_phases: total,
+        message: todos
+            .iter()
+            .find(|todo| todo.status == TodoStatus::Running)
+            .map(|todo| todo.title.clone()),
+        eta_secs: None,
+        updated_at: run.updated_at,
     }
 }
 
@@ -726,34 +809,87 @@ async fn drive_background_run(
     cancel: CancellationToken,
     mut receipt_owner: super::task_runtime::store::RunDriverReceiptOwner,
 ) -> Result<(), String> {
-    if let Err(error) = wait_for_dependencies(&store, &dependencies, &cancel).await {
-        finish_pre_execution_failure(&store, &run_id, &error, cancel.is_cancelled())?;
+    let blocking = TaskRuntimeBlockingAdapter::new(store.clone());
+    if let Err(error) = wait_for_dependencies(&blocking, &dependencies, &cancel).await {
+        let failure_run_id = run_id.clone();
+        let failure_store = store.clone();
+        let failure = error.clone();
+        let cancelled = cancel.is_cancelled();
+        blocking
+            .run_owned("settle background dependency failure", move || {
+                finish_pre_execution_failure(&failure_store, &failure_run_id, &failure, cancelled)
+                    .map_err(super::task_runtime::StoreError::InvalidPlan)
+            })
+            .await
+            .map_err(|settlement| settlement.to_string())?;
         if cancel.is_cancelled() {
             return Ok(());
         }
         return Err(error);
     }
     if cancel.is_cancelled() {
-        finish_pre_execution_failure(&store, &run_id, "run cancelled", true)?;
+        let failure_run_id = run_id.clone();
+        let failure_store = store.clone();
+        blocking
+            .run_owned("settle cancelled background run", move || {
+                finish_pre_execution_failure(&failure_store, &failure_run_id, "run cancelled", true)
+                    .map_err(super::task_runtime::StoreError::InvalidPlan)
+            })
+            .await
+            .map_err(|settlement| settlement.to_string())?;
         return Ok(());
     }
     let _run_permit = tokio::select! {
         _ = cancel.cancelled() => {
-            finish_pre_execution_failure(&store, &run_id, "run cancelled", true)?;
+            let failure_run_id = run_id.clone();
+            let failure_store = store.clone();
+            blocking
+                .run_owned("settle cancelled background admission", move || {
+                    finish_pre_execution_failure(&failure_store, &failure_run_id, "run cancelled", true)
+                        .map_err(super::task_runtime::StoreError::InvalidPlan)
+                })
+                .await
+                .map_err(|settlement| settlement.to_string())?;
             return Ok(());
         }
         permit = run_semaphore.acquire_owned() => match permit {
             Ok(permit) => permit,
             Err(error) => {
                 let message = format!("background concurrency closed: {error}");
-                finish_pre_execution_failure(&store, &run_id, &message, false)?;
+                let failure_run_id = run_id.clone();
+                let failure_store = store.clone();
+                let failure = message.clone();
+                blocking
+                    .run_owned("settle background admission failure", move || {
+                        finish_pre_execution_failure(&failure_store, &failure_run_id, &failure, false)
+                            .map_err(super::task_runtime::StoreError::InvalidPlan)
+                    })
+                    .await
+                    .map_err(|settlement| settlement.to_string())?;
                 return Err(message);
             }
         }
     };
-    if let Err(error) = transition_to_running(&store, &run_id) {
-        finish_pre_execution_failure(&store, &run_id, &error, false)?;
-        return Err(error);
+    let transition_run_id = run_id.clone();
+    let transition = blocking
+        .run_store("start background TaskRun", move |store| {
+            transition_to_running(&store, &transition_run_id)
+                .map_err(super::task_runtime::StoreError::InvalidPlan)
+        })
+        .await;
+    if let Err(error) = transition {
+        let message = error.to_string();
+        let failure_run_id = run_id.clone();
+        let failure_store = store.clone();
+        let failure = message.clone();
+        blocking
+            .run_owned("settle background start failure", move || {
+                finish_pre_execution_failure(&failure_store, &failure_run_id, &failure, false)
+                    .map_err(super::task_runtime::StoreError::InvalidPlan)
+            })
+            .await
+            .map_err(|settlement| settlement.to_string())?;
+        return Err(message);
     }
     let memory_generation = review_integration
         .as_ref()
@@ -772,7 +908,16 @@ async fn drive_background_run(
         Ok(lease) => lease,
         Err(error) => {
             let message = format!("acquire agent: {error}");
-            finish_running_failure(&store, &run_id, &message)?;
+            let failure_run_id = run_id.clone();
+            let failure_store = store.clone();
+            let failure = message.clone();
+            blocking
+                .run_owned("settle background agent acquisition", move || {
+                    finish_running_failure(&failure_store, &failure_run_id, &failure)
+                        .map_err(super::task_runtime::StoreError::InvalidPlan)
+                })
+                .await
+                .map_err(|settlement| settlement.to_string())?;
             return Err(message);
         }
     };
@@ -785,8 +930,15 @@ async fn drive_background_run(
             .await;
     }
     let reviewer_llm = agent.read(|agent| agent.llm_client().cloned()).await;
-    let result = match store.get_plan(&run_id) {
-        Ok(Some(_)) => super::task_runtime::execute_run(
+    let plan_run_id = run_id.clone();
+    let has_plan = blocking
+        .run_store("load background TaskRun plan", move |store| {
+            store.get_plan(&plan_run_id).map(|plan| plan.is_some())
+        })
+        .await
+        .map_err(|error| format!("read plan before background execution: {error}"))?;
+    let result = if has_plan {
+        super::task_runtime::execute_run(
             store.clone(),
             Some(agent),
             reviewer_llm,
@@ -800,29 +952,34 @@ async fn drive_background_run(
             None,
         )
         .await
-        .map(|_| run_id.clone()),
-        Ok(None) => {
-            register_task_execute(&agent, store.clone()).await;
-            super::task_runtime::drive_unattended_run(
-                store.clone(),
-                agent,
-                &run_id,
-                "background",
-                &run_id,
-                &prompt,
-                cancel,
-                UnattendedWriteMode::default(),
-                None,
-            )
-            .await
-        }
-        Err(error) => Err(super::task_runtime::ExecError::Other(format!(
-            "read plan before background execution: {error}"
-        ))),
+        .map(|_| run_id.clone())
+    } else {
+        register_task_execute(&agent, store.clone()).await;
+        super::task_runtime::drive_unattended_run(
+            store.clone(),
+            agent,
+            &run_id,
+            "background",
+            &run_id,
+            &prompt,
+            cancel,
+            UnattendedWriteMode::default(),
+            None,
+        )
+        .await
     };
     if let Err(error) = result {
         let message = error.to_string();
-        finish_running_failure(&store, &run_id, &message)?;
+        let failure_run_id = run_id.clone();
+        let failure_store = store;
+        let failure = message.clone();
+        blocking
+            .run_owned("settle background execution failure", move || {
+                finish_running_failure(&failure_store, &failure_run_id, &failure)
+                    .map_err(super::task_runtime::StoreError::InvalidPlan)
+            })
+            .await
+            .map_err(|settlement| settlement.to_string())?;
         return Err(message);
     }
     Ok(())
@@ -934,7 +1091,7 @@ fn all_run_statuses() -> [TaskRunStatus; 6] {
 }
 
 async fn wait_for_dependencies(
-    store: &TaskRuntimeStore,
+    blocking: &TaskRuntimeBlockingAdapter,
     dependencies: &[String],
     cancel: &CancellationToken,
 ) -> Result<(), String> {
@@ -942,25 +1099,31 @@ async fn wait_for_dependencies(
         if cancel.is_cancelled() {
             return Err("run cancelled while waiting for dependencies".to_string());
         }
-        let mut waiting = false;
-        for dependency in dependencies {
-            let run = store
-                .get_run(dependency)
-                .map_err(|error| format!("read dependency {dependency}: {error}"))?
-                .ok_or_else(|| format!("dependency run not found: {dependency}"))?;
-            match run.status {
-                TaskRunStatus::Completed => {}
-                TaskRunStatus::Failed | TaskRunStatus::Cancelled => {
-                    return Err(format!(
-                        "dependency {dependency} ended {}",
-                        run.status.as_str()
-                    ));
+        let dependencies = dependencies.to_vec();
+        let waiting = blocking
+            .run_store("poll background dependencies", move |store| {
+                let mut waiting = false;
+                for dependency in dependencies {
+                    let run = store.get_run(&dependency)?.ok_or_else(|| {
+                        super::task_runtime::StoreError::RunNotFound(dependency.clone())
+                    })?;
+                    match run.status {
+                        TaskRunStatus::Completed => {}
+                        TaskRunStatus::Failed | TaskRunStatus::Cancelled => {
+                            return Err(super::task_runtime::StoreError::InvalidPlan(format!(
+                                "dependency {dependency} ended {}",
+                                run.status.as_str()
+                            )));
+                        }
+                        TaskRunStatus::Pending | TaskRunStatus::Running | TaskRunStatus::Paused => {
+                            waiting = true;
+                        }
+                    }
                 }
-                TaskRunStatus::Pending | TaskRunStatus::Running | TaskRunStatus::Paused => {
-                    waiting = true;
-                }
-            }
-        }
+                Ok(waiting)
+            })
+            .await
+            .map_err(|error| format!("read background dependencies: {error}"))?;
         if !waiting {
             return Ok(());
         }
@@ -1399,6 +1562,7 @@ mod tests {
         .map_err(|error| error.to_string())?;
         let preparation = service
             .retry_blocked_task("retry-run", "retry-task")
+            .await
             .map_err(|error| error.to_string())?;
         assert_eq!(
             preparation,
@@ -1427,6 +1591,7 @@ mod tests {
 
         let preparation = service
             .retry_blocked_task("recovery-run", "recovery-task")
+            .await
             .map_err(|error| error.to_string())?;
         assert_eq!(preparation, TaskRetryPreparation::Recovery);
         assert!(
@@ -1489,7 +1654,11 @@ mod tests {
                 store.fail_next_run_driver_registration_for_test();
             }
 
-            if service.retry_blocked_task(&run_id, "retry-task").is_ok() {
+            if service
+                .retry_blocked_task(&run_id, "retry-task")
+                .await
+                .is_ok()
+            {
                 return Err(format!("{failure} retry unexpectedly succeeded"));
             }
             assert_eq!(before, retry_snapshot(&store, &run_id)?);

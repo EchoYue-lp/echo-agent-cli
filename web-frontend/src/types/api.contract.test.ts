@@ -4,6 +4,10 @@ import type {
   RuntimeEventKind,
   RunContinuationState,
   StreamingEvent,
+  InteractionModeRequest,
+  TaskRetryReceipt,
+  TaskRunControlReceipt,
+  TaskRunResumeReceipt,
   ToolInfo,
   WorkspaceTransitionReceipt,
 } from '../generated';
@@ -125,6 +129,30 @@ const serializedWorkspaceTransition = {
   ],
 } satisfies WorkspaceTransitionReceipt;
 
+const taskRuntimeMutationContracts = {
+  mode: { mode: 'task' } satisfies InteractionModeRequest,
+  control: {
+    success: false,
+    run_id: 'already-terminal',
+  } satisfies TaskRunControlReceipt,
+  plannedResume: {
+    kind: 'resumed',
+    run_id: 'run-planned',
+    turn_id: null,
+  } satisfies TaskRunResumeReceipt,
+  continuationResume: {
+    kind: 'continuation_resumed',
+    run_id: 'run-continuation',
+    turn_id: 'turn-1',
+  } satisfies TaskRunResumeReceipt,
+  retry: {
+    kind: 'recovery_retry_recorded',
+    run_id: 'retry-run',
+    task_id: 'task-1',
+    next_attempt: null,
+  } satisfies TaskRetryReceipt,
+};
+
 describe('Rust serialization contracts', () => {
   it('consumes the generated ToolInfo wire fields', () => {
     expect(serializedToolInfo.parameters).toHaveProperty('properties.path');
@@ -158,5 +186,13 @@ describe('Rust serialization contracts', () => {
     expect(serializedWorkspaceTransition.status).toBe('degraded');
     expect(serializedWorkspaceTransition.degraded_subsystems[0]?.stale_roots).toEqual([]);
     expectTypeOf(serializedWorkspaceTransition).toMatchTypeOf<WorkspaceTransitionReceipt>();
+  });
+
+  it('keeps TaskRuntime mutation receipts and interaction mode generated', () => {
+    expect(taskRuntimeMutationContracts.mode.mode).toBe('task');
+    expect(taskRuntimeMutationContracts.control.success).toBe(false);
+    expect(taskRuntimeMutationContracts.plannedResume.turn_id).toBeNull();
+    expect(taskRuntimeMutationContracts.continuationResume.turn_id).toBe('turn-1');
+    expect(taskRuntimeMutationContracts.retry.kind).toBe('recovery_retry_recorded');
   });
 });

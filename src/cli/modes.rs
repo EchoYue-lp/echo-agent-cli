@@ -723,7 +723,7 @@ pub async fn run_channels_mode(args: ChannelsModeArgs) -> Result<()> {
         let foreground_turns = foreground_turns.clone();
         Arc::new(SessionHandler::new(
             session_config,
-            move || -> Box<dyn MessageHandler> {
+            move |_instance: &echo_agent::channels::ChannelSessionInstance| -> Box<dyn MessageHandler> {
                 Box::new(AppChannelMessageHandler::new(
                     app_state.clone(),
                     pool.clone(),
@@ -888,11 +888,14 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let factory_calls = Arc::clone(&calls);
-        let handler = SessionHandler::new(channel_session_config(30), move || {
-            Box::new(ResetProbe {
-                calls: Arc::clone(&factory_calls),
-            }) as Box<dyn MessageHandler>
-        });
+        let handler = SessionHandler::new(
+            channel_session_config(30),
+            move |_instance: &echo_agent::channels::ChannelSessionInstance| {
+                Box::new(ResetProbe {
+                    calls: Arc::clone(&factory_calls),
+                }) as Box<dyn MessageHandler>
+            },
+        );
         let mut stream = handler
             .handle_stream(InboundMessage::new(
                 "test-channel",

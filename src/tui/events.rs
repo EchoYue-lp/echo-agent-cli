@@ -1599,33 +1599,22 @@ async fn dispatch_turn(
         };
     if let Some(resume) = turn.run_resume.as_ref() {
         let identity = &resume.identity;
-        let validation = scoped_runtime
-            .task_runtime()
-            .ok_or_else(|| "TaskRuntime store is unavailable".to_string())
-            .and_then(|store| {
-                store
-                    .get_run_state(&identity.run_id)
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| format!("TaskRun '{}' no longer exists", identity.run_id))
-            })
-            .and_then(|snapshot| identity.validate_resumable(&snapshot))
-            .and_then(|()| {
-                if identity.workspace_id != scoped_runtime.execution_scope().workspace_id() {
-                    Err(format!(
-                        "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
-                        identity.run_id,
-                        identity.workspace_id,
-                        scoped_runtime.execution_scope().workspace_id()
-                    ))
-                } else if identity.conversation_id != conversation_id {
-                    Err(format!(
-                        "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
-                        identity.run_id, identity.conversation_id, conversation_id
-                    ))
-                } else {
-                    Ok(())
-                }
-            });
+        let validation = if identity.workspace_id != scoped_runtime.execution_scope().workspace_id()
+        {
+            Err(format!(
+                "TaskRun '{}' was queued for workspace '{}', but current workspace is '{}'",
+                identity.run_id,
+                identity.workspace_id,
+                scoped_runtime.execution_scope().workspace_id()
+            ))
+        } else if identity.conversation_id != conversation_id {
+            Err(format!(
+                "TaskRun '{}' was queued for conversation '{}', but current conversation is '{}'",
+                identity.run_id, identity.conversation_id, conversation_id
+            ))
+        } else {
+            Ok(())
+        };
         if let Err(detail) = validation {
             lease.settle(TurnOutcome::Failed(
                 echo_agent::error::AgentFailure::message("task_run_resume", detail.clone()),
@@ -2949,25 +2938,40 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
 
     match subcommand {
         "list" | "ls" => {
-            let result = tokio::task::spawn_blocking(move || {
-                list_unattended_worktrees(&repo_root, Some(store.as_ref()))
-            })
-            .await;
+            let operation_store = store.clone();
+            let result =
+                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+                    .run_owned("list TUI unattended worktrees", move || {
+                        list_unattended_worktrees(&repo_root, Some(operation_store.as_ref()))
+                            .map_err(|error| {
+                                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                                    error.to_string(),
+                                )
+                            })
+                    })
+                    .await;
             match result {
-                Ok(Ok(worktrees)) => format_unattended_worktrees(&worktrees),
-                Ok(Err(error)) => format!("Failed to list retained worktrees: {error}"),
-                Err(error) => format!("Failed to join worktree listing: {error}"),
+                Ok(worktrees) => format_unattended_worktrees(&worktrees),
+                Err(error) => format!("Failed to list retained worktrees: {error}"),
             }
         }
         "cleanup" | "clean" => {
             let lock = repo_merge_lock(&repo_root);
             let _guard = lock.lock().await;
-            let result = tokio::task::spawn_blocking(move || {
-                cleanup_unattended_worktrees(&repo_root, Some(store.as_ref()))
-            })
-            .await;
+            let operation_store = store.clone();
+            let result =
+                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+                    .run_owned("clean TUI unattended worktrees", move || {
+                        cleanup_unattended_worktrees(&repo_root, Some(operation_store.as_ref()))
+                            .map_err(|error| {
+                                echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                                    error.to_string(),
+                                )
+                            })
+                    })
+                    .await;
             match result {
-                Ok(Ok(result)) => format!(
+                Ok(result) => format!(
                     "Worktree cleanup: removed={}, unlocked={}, kept={}, errors={}{}",
                     result.removed.len(),
                     result.unlocked.len(),
@@ -2979,8 +2983,7 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
                         format!("\n{}", result.errors.join("\n"))
                     }
                 ),
-                Ok(Err(error)) => format!("Failed to clean retained worktrees: {error}"),
-                Err(error) => format!("Failed to join worktree cleanup: {error}"),
+                Err(error) => format!("Failed to clean retained worktrees: {error}"),
             }
         }
         "merge" | "integrate" => {
@@ -2990,12 +2993,24 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let lock = repo_merge_lock(&repo_root);
             let _guard = lock.lock().await;
             let run_id_for_merge = run_id.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                merge_unattended_worktree(&repo_root, &run_id_for_merge, Some(store.as_ref()))
-            })
-            .await;
+            let operation_store = store.clone();
+            let result =
+                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+                    .run_owned("merge TUI unattended worktree", move || {
+                        merge_unattended_worktree(
+                            &repo_root,
+                            &run_id_for_merge,
+                            Some(operation_store.as_ref()),
+                        )
+                        .map_err(|error| {
+                            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                                error.to_string(),
+                            )
+                        })
+                    })
+                    .await;
             match result {
-                Ok(Ok(outcome)) => {
+                Ok(outcome) => {
                     let files = if outcome.changed_files.is_empty() {
                         "none".to_string()
                     } else {
@@ -3010,8 +3025,7 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
                         outcome.status.as_str()
                     )
                 }
-                Ok(Err(error)) => format!("Failed to merge retained worktree: {error}"),
-                Err(error) => format!("Failed to join worktree merge: {error}"),
+                Err(error) => format!("Failed to merge retained worktree: {error}"),
             }
         }
         "discard" | "remove" | "rm" => {
@@ -3021,14 +3035,25 @@ async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
             let lock = repo_merge_lock(&repo_root);
             let _guard = lock.lock().await;
             let run_id_for_discard = run_id.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                discard_unattended_worktree(&repo_root, &run_id_for_discard, Some(store.as_ref()))
-            })
-            .await;
+            let operation_store = store.clone();
+            let result =
+                echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+                    .run_owned("discard TUI unattended worktree", move || {
+                        discard_unattended_worktree(
+                            &repo_root,
+                            &run_id_for_discard,
+                            Some(operation_store.as_ref()),
+                        )
+                        .map_err(|error| {
+                            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(
+                                error.to_string(),
+                            )
+                        })
+                    })
+                    .await;
             match result {
-                Ok(Ok(())) => format!("Discarded retained worktree for run {run_id}."),
-                Ok(Err(error)) => format!("Failed to discard retained worktree: {error}"),
-                Err(error) => format!("Failed to join worktree discard: {error}"),
+                Ok(()) => format!("Discarded retained worktree for run {run_id}."),
+                Err(error) => format!("Failed to discard retained worktree: {error}"),
             }
         }
         _ => "Usage: /worktrees [list|cleanup|merge <run-id>|discard <run-id>]".to_string(),
@@ -3259,10 +3284,29 @@ async fn current_tui_runtime_conversation_id(
         })
 }
 
+async fn tui_task_runtime_io<T, F>(
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    operation: &'static str,
+    function: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(
+            Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+        ) -> Result<T, echo_agent_app_core::tasks::task_runtime::StoreError>
+        + Send
+        + 'static,
+{
+    echo_agent_app_core::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+        .run_store(operation, function)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 async fn resolve_tui_task_run(
     app: &TuiApp,
     runtime: &echo_agent_app_core::state::ScopedChatRuntime,
-    store: &echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore,
+    store: &Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     requested_run_id: Option<&str>,
 ) -> Result<echo_agent_app_core::tasks::task_runtime::TaskRun, String> {
     let workspace_id = runtime.execution_scope().workspace_id();
@@ -3277,10 +3321,12 @@ async fn resolve_tui_task_run(
             .map(|view| view.run_id.clone())
             .ok_or_else(|| "No active task run. Supply a run id explicitly.".to_string())?,
     };
-    let run = store
-        .get_run(&run_id)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| format!("TaskRun {run_id} was not found"))?;
+    let lookup_run_id = run_id.clone();
+    let run = tui_task_runtime_io(store.clone(), "resolve TUI TaskRun", move |store| {
+        store.get_run(&lookup_run_id)
+    })
+    .await?
+    .ok_or_else(|| format!("TaskRun {run_id} was not found"))?;
     validate_tui_task_run_scope(&run, workspace_id, &conversation_id, implicit_view)?;
     Ok(run)
 }
@@ -5519,24 +5565,39 @@ async fn handle_slash_command(
             };
             let run_id = run.run_id.clone();
             let result = match action {
-                SlashCommand::TaskCancel => store
-                    .request_cancel(&run_id)
-                    .map_err(|error| error.to_string())
+                SlashCommand::TaskCancel => {
+                    let owned_run_id = run_id.clone();
+                    tui_task_runtime_io(store.clone(), "cancel TUI TaskRun", move |store| {
+                        store.request_cancel(&owned_run_id)
+                    })
+                    .await
                     .and_then(|cancelled| {
                         cancelled
                             .then_some("cancelled")
                             .ok_or_else(|| "run is not cancellable".to_string())
-                    }),
-                SlashCommand::TaskPause => store
-                    .request_pause(&run_id)
-                    .map_err(|error| error.to_string())
+                    })
+                }
+                SlashCommand::TaskPause => {
+                    let owned_run_id = run_id.clone();
+                    tui_task_runtime_io(store.clone(), "pause TUI TaskRun", move |store| {
+                        store.request_pause(&owned_run_id)
+                    })
+                    .await
                     .and_then(|paused| {
                         paused
                             .then_some("paused")
                             .ok_or_else(|| "run is not actively pausable".to_string())
-                    }),
+                    })
+                }
                 SlashCommand::TaskResume => {
-                    let resume_state = match store.get_run_state(&run_id) {
+                    let owned_run_id = run_id.clone();
+                    let resume_state = match tui_task_runtime_io(
+                        store.clone(),
+                        "load TUI TaskRun resume state",
+                        move |store| store.get_run_state(&owned_run_id),
+                    )
+                    .await
+                    {
                         Ok(Some(state)) => state,
                         Ok(None) => {
                             return push_system_message(app, "TaskRun not found".to_string());
@@ -5638,14 +5699,24 @@ async fn handle_slash_command(
             };
             let requested_run_id = values.next();
             let result = match resolve_tui_task_run(app, &runtime, &store, requested_run_id).await {
-                Ok(run) => parse_tui_budget(token_value, "token").and_then(|tokens| {
-                    parse_tui_budget(time_value, "time").and_then(|time| {
-                        store
-                            .update_run_continuation_budgets(&run.run_id, tokens, time)
-                            .map(|_| run.run_id)
-                            .map_err(|error| error.to_string())
-                    })
-                }),
+                Ok(run) => match parse_tui_budget(token_value, "token").and_then(|tokens| {
+                    parse_tui_budget(time_value, "time").map(|time| (tokens, time))
+                }) {
+                    Ok((tokens, time)) => {
+                        let run_id = run.run_id;
+                        let owned_run_id = run_id.clone();
+                        tui_task_runtime_io(
+                            store.clone(),
+                            "update TUI TaskRun budgets",
+                            move |store| {
+                                store.update_run_continuation_budgets(&owned_run_id, tokens, time)
+                            },
+                        )
+                        .await
+                        .map(|_| run_id)
+                    }
+                    Err(error) => Err(error),
+                },
                 Err(error) => Err(error),
             };
             app.messages.push(ChatMessage {
@@ -5675,15 +5746,23 @@ async fn handle_slash_command(
                 )
                 .await
                 {
-                    Ok(run) => store
-                        .update_run_goal(
-                            &run.run_id,
-                            parsed.expected_goal_revision,
-                            &parsed.new_goal,
-                            &parsed.reason,
-                            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                    Ok(run) => {
+                        let run_id = run.run_id;
+                        tui_task_runtime_io(
+                            store.clone(),
+                            "update TUI TaskRun Goal",
+                            move |store| {
+                                store.update_run_goal(
+                                &run_id,
+                                parsed.expected_goal_revision,
+                                &parsed.new_goal,
+                                &parsed.reason,
+                                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                            )
+                            },
                         )
-                        .map_err(|error| error.to_string()),
+                        .await
+                    }
                     Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
@@ -5710,9 +5789,13 @@ async fn handle_slash_command(
             };
             let requested_run_id = args.split_whitespace().next();
             let result = match resolve_tui_task_run(app, &runtime, &store, requested_run_id).await {
-                Ok(run) => store
-                    .completion_gate_report(&run.run_id)
-                    .map_err(|error| error.to_string()),
+                Ok(run) => {
+                    let run_id = run.run_id;
+                    tui_task_runtime_io(store.clone(), "load TUI completion gate", move |store| {
+                        store.completion_gate_report(&run_id)
+                    })
+                    .await
+                }
                 Err(error) => Err(error),
             };
             app.messages.push(ChatMessage {
@@ -5741,15 +5824,23 @@ async fn handle_slash_command(
                 )
                 .await
                 {
-                    Ok(run) => store
-                        .skip_goal_requirement(
-                            &run.run_id,
-                            parsed.expected_goal_revision,
-                            &parsed.requirement_id,
-                            &parsed.reason,
-                            echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                    Ok(run) => {
+                        let run_id = run.run_id;
+                        tui_task_runtime_io(
+                            store.clone(),
+                            "skip TUI Goal requirement",
+                            move |store| {
+                                store.skip_goal_requirement(
+                                &run_id,
+                                parsed.expected_goal_revision,
+                                &parsed.requirement_id,
+                                &parsed.reason,
+                                echo_agent_app_core::tasks::task_runtime::RunGoalActorSource::Tui,
+                            )
+                            },
                         )
-                        .map_err(|error| error.to_string()),
+                        .await
+                    }
                     Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
@@ -5831,11 +5922,13 @@ async fn handle_slash_command(
                                 });
                                 return;
                             };
-                            service.queue_guidance(
-                                parsed.identity,
-                                instruction,
-                                echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
-                            )
+                            service
+                                .queue_guidance_async(
+                                    parsed.identity,
+                                    instruction.to_string(),
+                                    echo_agent_app_core::tasks::task_runtime::SubagentControlActorSource::Tui,
+                                )
+                                .await
                         }
                         SlashCommand::SubagentInterrupt => {
                             service
@@ -5887,7 +5980,14 @@ async fn handle_slash_command(
                 }
             };
             let run_id = run.run_id;
-            let content = match store.list_recovery_blockers(&run_id) {
+            let owned_run_id = run_id.clone();
+            let content = match tui_task_runtime_io(
+                store,
+                "load TUI recovery blockers",
+                move |store| store.list_recovery_blockers(&owned_run_id),
+            )
+            .await
+            {
                 Ok(blockers) if blockers.is_empty() => {
                     format!("Task run {run_id} has no recovery blockers.")
                 }
@@ -5963,14 +6063,17 @@ async fn handle_slash_command(
                 .await
                 .map_err(|error| error.to_string())
             } else {
-                store
-                    .resolve_recovery_task(
-                        &run_id,
-                        task_id,
+                let owned_run_id = run_id.clone();
+                let owned_task_id = task_id.to_string();
+                tui_task_runtime_io(store.clone(), "resolve TUI recovery task", move |store| {
+                    store.resolve_recovery_task(
+                        &owned_run_id,
+                        &owned_task_id,
                         echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Skip,
                     )
-                    .map(|()| format!("Recovery decision recorded for {run_id}/{task_id}: skip."))
-                    .map_err(|e| e.to_string())
+                })
+                .await
+                .map(|()| format!("Recovery decision recorded for {run_id}/{task_id}: skip."))
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -6260,11 +6363,12 @@ async fn start_tui_task_retry_driver(
     let cancel = echo_agent::agent::CancellationToken::new();
     let preparation_store = store.clone();
     let preparation_run_id = run_id.clone();
-    let (preparation, _) = store.spawn_supervised_task_retry(
-        run_id,
-        task_id,
-        cancel.clone(),
-        move || {
+    let (preparation, _) = store
+        .spawn_supervised_task_retry_async(
+            run_id,
+            task_id,
+            cancel.clone(),
+            move || {
             let memory_generation = review_integration
                 .as_ref()
                 .map(|integration| integration.lease_generation())
@@ -6284,8 +6388,8 @@ async fn start_tui_task_retry_driver(
                     ))
                 })?;
             Ok((memory_generation, layer_manager))
-        },
-        move |(memory_generation, layer_manager), mut receipt_owner| async move {
+            },
+            move |(memory_generation, layer_manager), mut receipt_owner| async move {
             let _pool_execution = pool_execution;
             if let Some(generation) = memory_generation.as_ref() {
                 receipt_owner.retain(generation.clone());
@@ -6311,8 +6415,9 @@ async fn start_tui_task_retry_driver(
                 return Err(error.to_string());
             }
             Ok(())
-        },
-    )?;
+            },
+        )
+        .await?;
     Ok(preparation)
 }
 
@@ -6544,19 +6649,43 @@ async fn refresh_task_runtime_view(app: &mut TuiApp) {
         app.task_runtime_view = None;
         return;
     };
-    let run = match store.latest_run_for_conversation(&conversation_id) {
-        Ok(run) => run,
-        Err(e) => {
-            tracing::warn!(error = %e, "TUI failed to refresh TaskRuntime run");
+    let lookup_conversation_id = conversation_id.clone();
+    let projection =
+        tui_task_runtime_io(store, "refresh TUI TaskRuntime projection", move |store| {
+            let Some(run) = store.latest_run_for_conversation(&lookup_conversation_id)? else {
+                return Ok(None);
+            };
+            let plan = store.get_plan(&run.run_id)?;
+            let continuation = store
+                .get_run_state(&run.run_id)?
+                .and_then(|state| state.continuation);
+            let active_cell_count = store
+                .list_background_cells(&run.run_id)?
+                .iter()
+                .filter(|cell| cell.is_active())
+                .count();
+            let completion = store.completion_gate_report(&run.run_id)?;
+            Ok(Some((
+                run,
+                plan,
+                continuation,
+                active_cell_count,
+                completion,
+            )))
+        })
+        .await;
+    let Some((run, plan, continuation, active_cell_count, completion)) = (match projection {
+        Ok(projection) => projection,
+        Err(error) => {
+            tracing::warn!(%error, "TUI failed to refresh TaskRuntime projection");
             return;
         }
-    };
-    let Some(run) = run else {
+    }) else {
         app.task_runtime_view = None;
         return;
     };
-    let tasks = match store.get_plan(&run.run_id) {
-        Ok(Some(plan)) => plan
+    let tasks = match plan {
+        Some(plan) => plan
             .tasks
             .into_iter()
             .map(|task| TaskRuntimeTaskView {
@@ -6565,36 +6694,18 @@ async fn refresh_task_runtime_view(app: &mut TuiApp) {
                 agent_role: task.agent_role,
             })
             .collect(),
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            tracing::warn!(error = %e, run_id = %run.run_id, "TUI failed to refresh TaskRuntime plan");
-            Vec::new()
-        }
+        None => Vec::new(),
     };
-    let continuation = store
-        .get_run_state(&run.run_id)
-        .ok()
-        .flatten()
-        .and_then(|state| state.continuation);
-    let active_cell_count = store
-        .list_background_cells(&run.run_id)
-        .map(|cells| cells.iter().filter(|cell| cell.is_active()).count())
-        .unwrap_or(0);
-    let completion = store.completion_gate_report(&run.run_id).ok();
-    let completion_ready = completion.as_ref().is_some_and(|report| report.ready);
+    let completion_ready = completion.ready;
     let requirements = completion
-        .map(|report| {
-            report
-                .requirements
-                .into_iter()
-                .map(|item| TaskRuntimeRequirementView {
-                    requirement_id: item.requirement.requirement_id,
-                    title: item.requirement.title,
-                    status: item.status.as_str().to_string(),
-                })
-                .collect()
+        .requirements
+        .into_iter()
+        .map(|item| TaskRuntimeRequirementView {
+            requirement_id: item.requirement.requirement_id,
+            title: item.requirement.title,
+            status: item.status.as_str().to_string(),
         })
-        .unwrap_or_default();
+        .collect();
     app.task_runtime_view = Some(TaskRuntimeView {
         workspace_id: runtime.execution_scope().workspace_id().to_string(),
         conversation_id,
@@ -7549,6 +7660,7 @@ mod tests {
                     created_at: chrono::Utc::now(),
                     goal_revision: 1,
                     journal_sequence: 7,
+                    continuation_enabled: true,
                 },
                 is_continuation: true,
             }),

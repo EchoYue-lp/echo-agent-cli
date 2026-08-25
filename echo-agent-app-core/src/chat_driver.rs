@@ -396,7 +396,7 @@ pub async fn drive_chat_turn(
     binding: Option<RunTurnBinding>,
 ) -> Result<ChatTurnOutcome, String> {
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
-    match prepare_chat_execution(turn, res, binding)? {
+    match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => {
             drive_prepared_chat(agent.clone(), turn, *prepared, None).await
         }
@@ -442,7 +442,7 @@ where
 {
     let binding = binding.into();
     wait_for_previous_continuation_driver(&res, binding.as_ref()).await?;
-    let prepared = match prepare_chat_execution(turn, res, binding)? {
+    let prepared = match prepare_chat_execution(turn, res, binding).await? {
         ChatExecutionPreparation::Ready(prepared) => prepared,
         ChatExecutionPreparation::Settled(outcome) => return Ok(outcome),
     };
@@ -504,26 +504,28 @@ async fn wait_for_previous_continuation_driver(
             crate::tasks::task_runtime::InteractionMode::Task
                 | crate::tasks::task_runtime::InteractionMode::Auto
         ) {
-        resources
-            .conv_id
-            .as_deref()
-            .map(|conversation_id| {
-                store
-                    .find_in_progress_run_by_conversation(conversation_id)
-                    .map_err(|error| error.to_string())
-            })
-            .transpose()?
-            .flatten()
-            .filter(|run| run.status == TaskRunStatus::Paused)
-            .and_then(|run| {
-                store
-                    .get_run_state(&run.run_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|state| state.continuation)
-                    .is_some_and(|continuation| continuation.enabled)
-                    .then_some(run.run_id)
-            })
+        match resources.conv_id.as_ref() {
+            Some(conversation_id) => {
+                let conversation_id = conversation_id.clone();
+                crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+                    .run_store("resolve previous continuation driver", move |store| {
+                        let Some(run) = store
+                            .find_in_progress_run_by_conversation(&conversation_id)?
+                            .filter(|run| run.status == TaskRunStatus::Paused)
+                        else {
+                            return Ok(None);
+                        };
+                        let enabled = store
+                            .get_run_state(&run.run_id)?
+                            .and_then(|state| state.continuation)
+                            .is_some_and(|continuation| continuation.enabled);
+                        Ok(enabled.then_some(run.run_id))
+                    })
+                    .await
+                    .map_err(|error| error.to_string())?
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -597,7 +599,7 @@ impl PreparedChatExecution {
     }
 }
 
-fn prepare_chat_execution(
+async fn prepare_chat_execution(
     turn: &crate::prepared_turn::PreparedUserTurn,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
     binding: Option<RunTurnBinding>,
@@ -637,22 +639,38 @@ fn prepare_chat_execution(
             | crate::tasks::task_runtime::InteractionMode::Auto
     ) && binding.run_id.is_none()
         && let (Some(store), Some(conversation_id)) = (res.store.as_ref(), res.conv_id.as_deref())
-        && let Some(existing) = store
-            .find_in_progress_run_by_conversation(conversation_id)
-            .map_err(|error| error.to_string())?
-        && existing.status == crate::tasks::task_runtime::TaskRunStatus::Paused
-        && let Some(existing_snapshot) = store
-            .get_run_state(&existing.run_id)
-            .map_err(|error| error.to_string())?
-        && existing_snapshot
-            .continuation
-            .as_ref()
-            .is_some_and(|continuation| continuation.enabled)
     {
-        binding.run_id = Some(existing.run_id.clone());
-        binding.root_message_id = existing.root_message_id.clone();
-        binding.origin = RunTurnOrigin::Resume;
-        binding.expected_resume = Some(TaskRunResumeIdentity::capture(&existing_snapshot));
+        let conversation_id = conversation_id.to_string();
+        let candidate = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+            .run_store("resolve chat TaskRun resume", move |store| {
+                let Some(existing) =
+                    store.find_in_progress_run_by_conversation(&conversation_id)?
+                else {
+                    return Ok(None);
+                };
+                if existing.status != crate::tasks::task_runtime::TaskRunStatus::Paused {
+                    return Ok(None);
+                }
+                let Some(snapshot) = store.get_run_state(&existing.run_id)? else {
+                    return Ok(None);
+                };
+                if !snapshot
+                    .continuation
+                    .as_ref()
+                    .is_some_and(|continuation| continuation.enabled)
+                {
+                    return Ok(None);
+                }
+                Ok(Some((existing, snapshot)))
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some((existing, existing_snapshot)) = candidate {
+            binding.run_id = Some(existing.run_id.clone());
+            binding.root_message_id = existing.root_message_id.clone();
+            binding.origin = RunTurnOrigin::Resume;
+            binding.expected_resume = Some(TaskRunResumeIdentity::capture(&existing_snapshot));
+        }
     }
     if binding.turn_id.trim().is_empty() || binding.root_message_id.trim().is_empty() {
         return Err("RunTurn binding requires non-empty turn and root message ids".to_string());
@@ -765,77 +783,100 @@ fn prepare_chat_execution(
     let interaction_mode = res.interaction_mode;
     let store = res.store.clone();
     if drives_task_run {
-        if let Some(registration) = task_driver_registration.as_mut() {
-            registration.mark_preparation_started();
-        }
+        let registration = task_driver_registration.take().ok_or_else(|| {
+            "TaskRun-bound turn lost its driver registration during preparation".to_string()
+        })?;
         // The raw prepared instruction is the goal. For spilled long text it is
         // the reference block, which is a better task goal than the full paste.
         // Dynamic mode policy stays in the per-turn context projection.
-        if binding.expected_resume.is_none() {
-            if let Err(error) = ensure_task_mode_run(
-                store.as_ref(),
-                &formal_run_id,
-                res.conv_id.as_deref(),
-                &binding.root_message_id,
-                &turn.instruction,
-                &res.attachments,
-                Some(&trace_sink),
-            ) {
+        let task_store = store.as_ref().ok_or_else(|| {
+            "TaskRun-bound turn lost its TaskRuntimeStore during preparation".to_string()
+        })?;
+        let owned_run_id = formal_run_id.clone();
+        let owned_conversation_id = res.conv_id.clone();
+        let owned_root_message_id = binding.root_message_id.clone();
+        let owned_instruction = turn.instruction.clone();
+        let owned_attachments = res.attachments.clone();
+        let expected_resume = binding.expected_resume.clone();
+        let origin = binding.origin;
+        let visibility = binding.transcript_visibility;
+        let owned_turn_id = turn_id.clone();
+        let owned_trace_sink = trace_sink.clone();
+        let owned_store = task_store.clone();
+        let claim = crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(task_store.clone())
+            .run_owned("prepare and claim chat TaskRun", move || {
+                let mut registration = registration;
+                registration.mark_preparation_started();
+                if expected_resume.is_none() {
+                    if let Err(error) = ensure_task_mode_run(
+                        &owned_store,
+                        &owned_run_id,
+                        owned_conversation_id.as_deref(),
+                        &owned_root_message_id,
+                        &owned_instruction,
+                        &owned_attachments,
+                        Some(&owned_trace_sink),
+                    ) {
+                        registration.fail_preparation(error.to_string());
+                        return Err(error);
+                    }
+                    let continuation = match owned_store.get_run_state(&owned_run_id) {
+                        Ok(state) => state.and_then(|state| state.continuation),
+                        Err(error) => {
+                            registration.fail_preparation(error.to_string());
+                            return Err(error);
+                        }
+                    };
+                    if continuation.is_none()
+                        && let Err(error) = owned_store.configure_run_continuation(
+                            &owned_run_id,
+                            true,
+                            false,
+                            None,
+                            None,
+                        )
+                    {
+                        registration.fail_preparation(error.to_string());
+                        return Err(error);
+                    }
+                }
+                let claim = if let Some(expected) = expected_resume.as_ref() {
+                    owned_store.resume_and_claim_run_turn_expected(
+                        expected,
+                        &owned_turn_id,
+                        origin,
+                        visibility,
+                    )
+                } else if origin == RunTurnOrigin::Resume {
+                    Err(crate::tasks::task_runtime::StoreError::InvalidPlan(
+                        "resume RunTurn requires an exact queued TaskRun identity".to_string(),
+                    ))
+                } else {
+                    owned_store.claim_run_turn(&owned_run_id, &owned_turn_id, origin, visibility)
+                };
+                Ok((registration, claim.map_err(|error| error.to_string())))
+            })
+            .await;
+        let claim = match claim {
+            Ok((registration, Ok(claim))) => {
+                task_driver_registration = Some(registration);
+                claim
+            }
+            Ok((registration, Err(message))) => {
+                registration.reject(message.clone());
+                return Err(message);
+            }
+            Err(error) => {
+                return Err(error.to_string());
+            }
+        };
+        match claim {
+            crate::tasks::task_runtime::store::RunTurnClaimOutcome::Started(_) => {}
+            crate::tasks::task_runtime::store::RunTurnClaimOutcome::NotSubmitted(reason) => {
                 if let Some(registration) = task_driver_registration.take() {
-                    registration.fail_preparation(error.clone());
+                    registration.reject(format!("RunTurn was not submitted: {reason:?}"));
                 }
-                return Err(error);
-            }
-            let continuation = store
-                .as_ref()
-                .and_then(|store| store.get_run_state(&formal_run_id).ok().flatten())
-                .and_then(|state| state.continuation);
-            if continuation.is_none()
-                && let Some(store) = store.as_ref()
-            {
-                store
-                    .configure_run_continuation(&formal_run_id, true, false, None, None)
-                    .map_err(|error| error.to_string())?;
-            }
-        }
-        if let Some(store) = store.as_ref() {
-            let claim = if let Some(expected) = binding.expected_resume.as_ref() {
-                store.resume_and_claim_run_turn_expected(
-                    expected,
-                    &turn_id,
-                    binding.origin,
-                    binding.transcript_visibility,
-                )
-            } else if binding.origin == RunTurnOrigin::Resume {
-                Err(crate::tasks::task_runtime::StoreError::InvalidPlan(
-                    "resume RunTurn requires an exact queued TaskRun identity".to_string(),
-                ))
-            } else {
-                store.claim_run_turn(
-                    &formal_run_id,
-                    &turn_id,
-                    binding.origin,
-                    binding.transcript_visibility,
-                )
-            };
-            let claim = match claim {
-                Ok(claim) => claim,
-                Err(error) => {
-                    let message = error.to_string();
-                    if let Some(registration) = task_driver_registration.take() {
-                        registration.reject(message.clone());
-                    }
-                    return Err(message);
-                }
-            };
-            match claim {
-                crate::tasks::task_runtime::store::RunTurnClaimOutcome::Started(_) => {}
-                crate::tasks::task_runtime::store::RunTurnClaimOutcome::NotSubmitted(reason) => {
-                    if let Some(registration) = task_driver_registration.take() {
-                        registration.reject(format!("RunTurn was not submitted: {reason:?}"));
-                    }
-                    return Err(format!("RunTurn was not submitted: {reason:?}"));
-                }
+                return Err(format!("RunTurn was not submitted: {reason:?}"));
             }
         }
     }
@@ -1010,7 +1051,8 @@ async fn drive_prepared_chat(
         &prepared.formal_run_id,
         &prepared.turn_id,
         requested_mode,
-    );
+    )
+    .await;
     let _ = prepared.sink.on_event(ChatDriverEvent::ExecutionPath {
         requested_mode: requested_mode.to_string(),
         observed_path: observed_path.to_string(),
@@ -1099,37 +1141,30 @@ fn resolve_turn_memory_generation(
 }
 
 fn ensure_task_mode_run(
-    store: Option<&std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    store: &crate::tasks::task_runtime::TaskRuntimeStore,
     run_id: &str,
     conversation_id: Option<&str>,
     turn_id: &str,
     goal: &str,
     attachments: &[crate::attachments::AttachmentRef],
     trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
-) -> Result<(), String> {
+) -> Result<(), crate::tasks::task_runtime::StoreError> {
     use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
 
-    let store = store.ok_or_else(|| "Task mode requires TaskRuntimeStore".to_string())?;
-    let run = store
-        .create_run_for_active_workspace(
-            run_id,
-            conversation_id.unwrap_or("message:task"),
-            turn_id,
-            DomainProfile::General,
-            goal,
-            "agent_task_plan",
-            AttendedMode::Attended,
-        )
-        .map_err(|error| error.to_string())?;
+    let run = store.create_run_for_active_workspace(
+        run_id,
+        conversation_id.unwrap_or("message:task"),
+        turn_id,
+        DomainProfile::General,
+        goal,
+        "agent_task_plan",
+        AttendedMode::Attended,
+    )?;
     if !attachments.is_empty() {
-        store
-            .set_run_attachments(run_id, attachments)
-            .map_err(|error| error.to_string())?;
+        store.set_run_attachments(run_id, attachments)?;
     }
     if run.status == TaskRunStatus::Pending {
-        store
-            .transition_run(run_id, TaskRunStatus::Running)
-            .map_err(|error| error.to_string())?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
         if let Some(trace_sink) = trace_sink {
             trace_sink(ExecEvent::run(
                 run.workspace_id.clone(),
@@ -1170,7 +1205,7 @@ async fn finalize_run_turn(
     .await
 }
 
-fn observe_execution_path(
+async fn observe_execution_path(
     store: Option<&std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     formal_run_id: &str,
     turn_id: &str,
@@ -1181,41 +1216,47 @@ fn observe_execution_path(
     let Some(store) = store else {
         return "direct";
     };
-    if let Ok(Some(run)) = store.get_run(formal_run_id) {
-        let observed = if run.route == "agent_autonomous" {
-            "detached_background"
-        } else {
-            "formal_plan"
-        };
-        let _ = store.record_execution_path(&run.run_id, requested_mode, observed);
-        return observed;
-    }
-    let statuses = [
-        TaskRunStatus::Pending,
-        TaskRunStatus::Running,
-        TaskRunStatus::Paused,
-        TaskRunStatus::Cancelled,
-        TaskRunStatus::Failed,
-        TaskRunStatus::Completed,
-    ];
-    let Ok(runs) = store.list_runs_in(&statuses) else {
-        return "direct";
-    };
-    let matching: Vec<_> = runs
-        .into_iter()
-        .filter(|run| run.root_message_id == turn_id)
-        .collect();
-    let observed = if matching.iter().any(|run| run.run_id == formal_run_id) {
-        "formal_plan"
-    } else if matching.iter().any(|run| run.route == "agent_autonomous") {
-        "detached_background"
-    } else {
-        "direct"
-    };
-    for run in matching {
-        let _ = store.record_execution_path(&run.run_id, requested_mode, observed);
-    }
-    observed
+    let formal_run_id = formal_run_id.to_string();
+    let turn_id = turn_id.to_string();
+    let requested_mode = requested_mode.to_string();
+    crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+        .run_store("observe chat execution path", move |store| {
+            if let Some(run) = store.get_run(&formal_run_id)? {
+                let observed = if run.route == "agent_autonomous" {
+                    "detached_background"
+                } else {
+                    "formal_plan"
+                };
+                store.record_execution_path(&run.run_id, &requested_mode, observed)?;
+                return Ok(observed);
+            }
+            let statuses = [
+                TaskRunStatus::Pending,
+                TaskRunStatus::Running,
+                TaskRunStatus::Paused,
+                TaskRunStatus::Cancelled,
+                TaskRunStatus::Failed,
+                TaskRunStatus::Completed,
+            ];
+            let matching = store
+                .list_runs_in(&statuses)?
+                .into_iter()
+                .filter(|run| run.root_message_id == turn_id)
+                .collect::<Vec<_>>();
+            let observed = if matching.iter().any(|run| run.run_id == formal_run_id) {
+                "formal_plan"
+            } else if matching.iter().any(|run| run.route == "agent_autonomous") {
+                "detached_background"
+            } else {
+                "direct"
+            };
+            for run in matching {
+                store.record_execution_path(&run.run_id, &requested_mode, observed)?;
+            }
+            Ok(observed)
+        })
+        .await
+        .unwrap_or("direct")
 }
 
 struct ChatTurnModelScope {
@@ -1265,8 +1306,10 @@ impl EkoTurnEventSink {
         }));
         let (sender, mut receiver) = tokio::sync::mpsc::channel(64);
         let projector_state = std::sync::Arc::clone(&state);
-        let projector_task = tokio::task::spawn_blocking(move || {
-            while let Some(request) = receiver.blocking_recv() {
+        let projector_store = runtime_store.clone();
+        let owner_store = runtime_store;
+        let projector = async move {
+            while let Some(request) = receiver.recv().await {
                 match request {
                     EkoTurnProjectionRequest::Event {
                         event,
@@ -1276,10 +1319,11 @@ impl EkoTurnEventSink {
                             &sink,
                             &projector_state,
                             active_run_id.as_deref(),
-                            runtime_store.as_deref(),
+                            projector_store.as_ref(),
                             &turn_id,
                             *event,
-                        );
+                        )
+                        .await;
                         let _ = acknowledgement.send(result);
                     }
                     #[cfg(test)]
@@ -1289,7 +1333,28 @@ impl EkoTurnEventSink {
                     }
                 }
             }
-        });
+            Ok::<(), crate::tasks::task_runtime::StoreError>(())
+        };
+        let failure_state = std::sync::Arc::clone(&state);
+        let projector_task = if let Some(store) = owner_store {
+            tokio::spawn(async move {
+                if let Err(error) =
+                    crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store)
+                        .run_async_owned("drive EKO turn projector", projector)
+                        .await
+                    && let Ok(mut state) = failure_state.lock()
+                {
+                    state.downstream_failure = Some(echo_agent::error::AgentFailure::message(
+                        "sink_projector_failed",
+                        error.to_string(),
+                    ));
+                }
+            })
+        } else {
+            tokio::spawn(async move {
+                let _ = projector.await;
+            })
+        };
         Self {
             state,
             sender,
@@ -1372,74 +1437,83 @@ impl EventSink for EkoTurnEventSink {
     }
 }
 
-fn project_eko_turn_event(
+async fn project_eko_turn_event(
     sink: &std::sync::Arc<dyn ChatSink>,
     state: &std::sync::Arc<std::sync::Mutex<EkoTurnEventSinkState>>,
     active_run_id: Option<&str>,
-    runtime_store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+    runtime_store: Option<&std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
     turn_id: &str,
     event: EventEnvelope,
 ) -> echo_agent::error::Result<SinkControl> {
-    let mut state = state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(run_id) = active_run_id {
-        match &event.payload {
+    let reveal_completed = if let (Some(run_id), Some(store)) = (active_run_id, runtime_store) {
+        let usage = match &event.payload {
             AgentEvent::LlmUsage {
                 prompt_tokens,
                 completion_tokens,
                 usage_reported: true,
                 ..
-            } => {
-                if let Some(store) = runtime_store {
-                    let input_tokens = u64::try_from(*prompt_tokens).unwrap_or(u64::MAX);
-                    let output_tokens = u64::try_from(*completion_tokens).unwrap_or(u64::MAX);
-                    match store.account_run_turn_usage(
-                        run_id,
-                        turn_id,
-                        event.event_id.as_str(),
+            } => Some((
+                u64::try_from(*prompt_tokens).unwrap_or(u64::MAX),
+                u64::try_from(*completion_tokens).unwrap_or(u64::MAX),
+            )),
+            _ => None,
+        };
+        let compaction = matches!(&event.payload, AgentEvent::ContextCompressed { .. });
+        let reveal = matches!(
+            &event.payload,
+            AgentEvent::ToolResult { name, .. } if name == "task_execute"
+        ) || matches!(&event.payload, AgentEvent::FinalAnswer(_));
+        let run_id = run_id.to_string();
+        let diagnostic_run_id = run_id.clone();
+        let turn_id = turn_id.to_string();
+        let event_id = event.event_id.clone();
+        match crate::tasks::task_runtime::TaskRuntimeBlockingAdapter::new(store.clone())
+            .run_store("project EKO turn TaskRuntime event", move |store| {
+                if let Some((input_tokens, output_tokens)) = usage
+                    && store.account_run_turn_usage(
+                        &run_id,
+                        &turn_id,
+                        event_id.as_str(),
                         input_tokens,
                         output_tokens,
-                    ) {
-                        Ok(true) => {
-                            if let Err(error) = store.request_pause_with_reason(
-                                run_id,
-                                crate::tasks::task_runtime::RunPauseReason::TokenBudget,
-                                Some(
-                                    "the configured token budget was reached at a provider usage boundary",
-                                ),
-                            ) {
-                                tracing::warn!(
-                                    %error,
-                                    run_id,
-                                    "failed to pause a token-budget-exhausted run"
-                                );
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(error) => tracing::warn!(
-                            %error,
-                            run_id,
-                            "failed to account RunTurn usage"
-                        ),
-                    }
-                }
-            }
-            AgentEvent::ContextCompressed { .. } => {
-                if let Some(store) = runtime_store
-                    && let Err(error) =
-                        store.record_run_turn_compaction(run_id, turn_id, event.event_id.as_str())
+                    )?
                 {
-                    tracing::warn!(
-                        %error,
-                        run_id,
-                        "failed to persist RunTurn compaction"
-                    );
+                    store.request_pause_with_reason(
+                        &run_id,
+                        crate::tasks::task_runtime::RunPauseReason::TokenBudget,
+                        Some(
+                            "the configured token budget was reached at a provider usage boundary",
+                        ),
+                    )?;
                 }
+                if compaction {
+                    store.record_run_turn_compaction(&run_id, &turn_id, event_id.as_str())?;
+                }
+                if reveal {
+                    return store.get_run(&run_id).map(|run| {
+                        run.is_some_and(|run| {
+                            run.status == crate::tasks::task_runtime::TaskRunStatus::Completed
+                        })
+                    });
+                }
+                Ok(false)
+            })
+            .await
+        {
+            Ok(reveal) => reveal,
+            Err(error) => {
+                tracing::warn!(%error, active_run_id = diagnostic_run_id, "failed to project EKO turn TaskRuntime event");
+                false
             }
-            _ => {}
         }
-    }
+    } else {
+        false
+    };
+
+    let mut state = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.expose_internal_synthesis |= reveal_completed;
 
     let observer = state.webhook_observer.as_mut().ok_or_else(|| {
         echo_agent::error::ReactError::Other("EKO turn sink was already finalized".to_string())
@@ -1451,16 +1525,10 @@ fn project_eko_turn_event(
             AgentEvent::ToolResult { name, .. } if name == "task_execute"
         )
     {
-        state.expose_internal_synthesis = active_run_id
-            .zip(runtime_store)
-            .and_then(|(run_id, store)| store.get_run(run_id).ok().flatten())
-            .is_some_and(|run| run.status == crate::tasks::task_runtime::TaskRunStatus::Completed);
+        state.expose_internal_synthesis = reveal_completed;
     }
     if !state.expose_internal_synthesis && matches!(&event.payload, AgentEvent::FinalAnswer(_)) {
-        state.expose_internal_synthesis = active_run_id
-            .zip(runtime_store)
-            .and_then(|(run_id, store)| store.get_run(run_id).ok().flatten())
-            .is_some_and(|run| run.status == crate::tasks::task_runtime::TaskRunStatus::Completed);
+        state.expose_internal_synthesis = reveal_completed;
     }
     let suppress_internal_transcript = !state.expose_internal_synthesis
         && matches!(
@@ -1579,6 +1647,10 @@ async fn drive_chat_inner(
         .map_err(|error| error.to_string())?;
         let invocation = echo_agent::agent::AgentInvocationContext {
             history: None,
+            // Product conversation remains the legacy runtime-state identity.
+            // Channel session incarnations override these fields at their adapter.
+            runtime_state_id: None,
+            transcript_generation_id: None,
             runtime: Some(echo_agent::tools::ExternalRunContext {
                 conversation_id,
                 // A real pre-created Task-mode run is value-carried across
@@ -3561,6 +3633,9 @@ mod tests {
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "paused TaskRun state disappeared".to_string())?,
         );
+        store
+            .record_execution_path("existing-goal", "task", "formal_plan")
+            .map_err(|error| error.to_string())?;
         let sink = Arc::new(MockChatSink::default());
         let resources = Arc::new(crate::chat_resources::ChatResources {
             execution_scope: test_execution_scope(),
@@ -3793,7 +3868,8 @@ mod tests {
             &make_turn("resume replacement"),
             resources.clone(),
             Some(conflicting_binding),
-        );
+        )
+        .await;
         let conflict_error = match conflict {
             Ok(_) => return Err("conflicting expected resume unexpectedly prepared".to_string()),
             Err(error) => error,
@@ -3818,7 +3894,8 @@ mod tests {
                 stale_expected,
                 "stale-turn",
             )),
-        );
+        )
+        .await;
         let error = match result {
             Ok(_) => return Err("stale expected resume unexpectedly prepared".to_string()),
             Err(error) => error,

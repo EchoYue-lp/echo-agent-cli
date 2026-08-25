@@ -82,7 +82,7 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
 分析使用 `execution_scope.root` 作为 EKO data root；文件浏览器使用 control 解析后的
 `project_root`，因此 linked project 不会改变 EKO 自有数据位置。
 
-同步文件 I/O 统一进入 app-core 的有界 `ProductDataIo` adapter，不占用 Tokio worker。
+同步文件 I/O 统一进入 app-core 的有界 `ProductDataIo` adapter，不占用 Tokio async executor thread。
 分析运行由 app-owned supervisor 持有 exact workspace receipt；`run` admission 不阻塞
 CLI/TUI/channel event loop，`wait/cancel` 使用同一 receipt 完成 framework draining 与 join。
 cleanup 失败时 owner 不释放，因此任何 surface 的删除都会一致地返回 busy。
@@ -129,12 +129,21 @@ TaskRun -> PlanTask -> SubagentRun
 `task_execute`、文件投影、workspace policy、review、worktree 和 surface 控制。
 
 `TaskRuntimeStore` 以 `events.jsonl` 为权威事件账本，run/plan/todo/result/checkpoint 是
-可恢复投影。claim、revision、attempt 和 Subagent result 都带稳定 identity；执行前必须
-通过 claim，旧 attempt 不得覆盖新 revision。
+可恢复投影。claim、revision、attempt 和 Subagent result 都带稳定 identity。所有 async 文件
+操作必须通过 store-owned operation supervisor 进入 bounded async/blocking 边界；Application
+shutdown 与 workspace eviction 都会等待已接受 operation，不由 surface caller future 决定其
+寿命。operation admission seal 与 reservation 注册线性化，command manager 在 phase one 先关闭
+admission并取消进程，terminal projection repair 有界且以 typed debt 报告。执行前必须通过
+claim，旧 attempt 不得覆盖新 revision。TUI/CLI resume surface 不预判 journal sequence，统一由
+store 原子 resume authority 处理 diagnostic suffix 与 ABA。
+Workspace shutdown 越过 idle proof 后保持 Closing，唯一 settlement 被缓存；degraded generation
+不会重新开放。所有异步 ChatEvent safe point 都通过 bounded adapter，并把 exact workspace I/O
+receipt 捕获进 blocking closure，保证 caller drop 与 workspace delete 的顺序。
 
 production DAG 只通过 framework `RuntimeTaskService` 驱动；EKO adapter 只提供产品 policy、
 类型转换与 file-journal transaction。完整决策见
-[RuntimeTaskService 适配决策](./architecture/runtime-task-service.md)。
+[RuntimeTaskService 适配决策](./architecture/runtime-task-service.md)和
+[TaskRuntime async I/O 与 typed IPC ADR](./adr/0009-taskruntime-async-io-and-ipc-boundary.md)。
 
 Store、Journal、Checkpoint、Trace 的产品边界和完整权威矩阵见
 [EKO 持久化概念](./persistence.md)。

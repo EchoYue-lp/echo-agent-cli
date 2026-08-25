@@ -2210,15 +2210,142 @@ struct EkoRuntimeDagController<W: TaskDispatcher> {
 #[derive(Clone)]
 pub struct TaskRuntimeBlockingAdapter {
     store: Arc<TaskRuntimeStore>,
+    supervisor: Arc<TaskRuntimeOperationSupervisor>,
 }
 
 const PROCESS_TASK_RUNTIME_FILE_IO_LIMIT: usize = 8;
 static PROCESS_TASK_RUNTIME_FILE_IO: std::sync::LazyLock<Arc<Semaphore>> =
     std::sync::LazyLock::new(|| Arc::new(Semaphore::new(PROCESS_TASK_RUNTIME_FILE_IO_LIMIT)));
+tokio::task_local! {
+    static CURRENT_TASK_RUNTIME_OPERATION_SUPERVISOR: usize;
+}
+
+#[derive(Default)]
+struct TaskRuntimeOperationState {
+    accepting: bool,
+    active: usize,
+    orphan_failures: Vec<String>,
+}
+
+/// Store-owned authority for every accepted async or blocking TaskRuntime
+/// operation. Callers only await receipts; dropping a caller never owns or
+/// aborts the operation itself.
+pub(crate) struct TaskRuntimeOperationSupervisor {
+    state: std::sync::Mutex<TaskRuntimeOperationState>,
+    idle: tokio::sync::Notify,
+}
+
+struct TaskRuntimeOperationReceipt {
+    supervisor: Arc<TaskRuntimeOperationSupervisor>,
+}
+
+pub(crate) struct TaskRuntimeSettlementReservation {
+    receipt: TaskRuntimeOperationReceipt,
+}
+
+impl Drop for TaskRuntimeOperationReceipt {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.supervisor.state.lock() {
+            state.active = state.active.saturating_sub(1);
+            if state.active == 0 {
+                self.supervisor.idle.notify_waiters();
+            }
+        }
+    }
+}
+
+impl TaskRuntimeOperationSupervisor {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: std::sync::Mutex::new(TaskRuntimeOperationState {
+                accepting: true,
+                ..TaskRuntimeOperationState::default()
+            }),
+            idle: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn is_nested_operation(self: &Arc<Self>) -> bool {
+        let identity = Arc::as_ptr(self) as usize;
+        CURRENT_TASK_RUNTIME_OPERATION_SUPERVISOR
+            .try_with(|id| *id == identity)
+            .unwrap_or(false)
+    }
+
+    fn register(
+        self: &Arc<Self>,
+        operation: &'static str,
+    ) -> Result<TaskRuntimeOperationReceipt, StoreError> {
+        let nested = self.is_nested_operation();
+        let mut state = self.state.lock().map_err(|_| StoreError::LockPoisoned)?;
+        if !state.accepting && !nested {
+            return Err(StoreError::InvalidPlan(format!(
+                "TaskRuntime operation admission is closed during {operation}"
+            )));
+        }
+        state.active = state.active.checked_add(1).ok_or_else(|| {
+            StoreError::InvalidPlan("TaskRuntime operation capacity exhausted".to_string())
+        })?;
+        drop(state);
+        Ok(TaskRuntimeOperationReceipt {
+            supervisor: Arc::clone(self),
+        })
+    }
+
+    pub(crate) fn begin_shutdown(&self) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "TaskRuntime operation supervisor lock is poisoned".to_string())?;
+        state.accepting = false;
+        Ok(())
+    }
+
+    pub(crate) fn active_count(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.active)
+            .unwrap_or(usize::MAX)
+    }
+
+    pub(crate) async fn join(&self) -> Result<(), String> {
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let failures = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| "TaskRuntime operation supervisor lock is poisoned".to_string())?;
+                if state.active == 0 {
+                    Some(std::mem::take(&mut state.orphan_failures))
+                } else {
+                    None
+                }
+            };
+            if let Some(failures) = failures {
+                return if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(failures.join("; "))
+                };
+            }
+            notified.await;
+        }
+    }
+
+    fn record_orphan_failure(&self, operation: &'static str, error: &StoreError) {
+        if let Ok(mut state) = self.state.lock() {
+            state.orphan_failures.push(format!("{operation}: {error}"));
+        }
+    }
+}
 
 impl TaskRuntimeBlockingAdapter {
     pub fn new(store: Arc<TaskRuntimeStore>) -> Self {
-        Self { store }
+        let supervisor = store.operation_supervisor();
+        Self { store, supervisor }
     }
 
     pub async fn run<T, F>(
@@ -2230,27 +2357,7 @@ impl TaskRuntimeBlockingAdapter {
         T: Send + 'static,
         F: FnOnce(Arc<TaskRuntimeStore>) -> Result<T, StoreError> + Send + 'static,
     {
-        let permit = PROCESS_TASK_RUNTIME_FILE_IO
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|error| {
-                echo_agent::error::ReactError::Other(format!(
-                    "TaskRuntime blocking adapter closed during {operation}: {error}"
-                ))
-            })?;
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            function(store)
-        })
-        .await
-        .map_err(|error| {
-            echo_agent::error::ReactError::Other(format!(
-                "TaskRuntime blocking operation {operation} failed to join: {error}"
-            ))
-        })?
-        .map_err(|error| {
+        self.run_store(operation, function).await.map_err(|error| {
             echo_agent::error::ReactError::Other(format!(
                 "TaskRuntime blocking operation {operation} failed: {error}"
             ))
@@ -2288,16 +2395,111 @@ impl TaskRuntimeBlockingAdapter {
                     "TaskRuntime blocking adapter closed during {operation}: {error}"
                 ))
             })?;
-        tokio::task::spawn_blocking(move || {
+        let receipt = self.supervisor.register(operation)?;
+        let supervisor = Arc::clone(&self.supervisor);
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let execution = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             function()
-        })
-        .await
-        .map_err(|error| {
+        });
+        tokio::spawn(async move {
+            let _receipt = receipt;
+            let result = match execution.await {
+                Ok(result) => result,
+                Err(error) => Err(StoreError::InvalidPlan(format!(
+                    "TaskRuntime blocking operation {operation} failed to join: {error}"
+                ))),
+            };
+            if let Err(orphaned) = sender.send(result)
+                && let Err(error) = orphaned
+            {
+                supervisor.record_orphan_failure(operation, &error);
+            }
+        });
+        receiver.await.map_err(|_| {
             StoreError::InvalidPlan(format!(
-                "TaskRuntime blocking operation {operation} failed to join: {error}"
+                "TaskRuntime blocking operation {operation} ended without a receipt"
             ))
         })?
+    }
+
+    /// Run a multi-stage async command under store ownership. Nested blocking
+    /// settlements retain admission after phase-one shutdown so an accepted
+    /// command can always publish its terminal fact.
+    pub async fn run_async_owned<T, F>(
+        &self,
+        operation: &'static str,
+        future: F,
+    ) -> Result<T, StoreError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
+    {
+        let receipt = self.supervisor.register(operation)?;
+        let receiver = self.spawn_async_with_receipt(operation, receipt, future);
+        receiver.await.map_err(|_| {
+            StoreError::InvalidPlan(format!(
+                "TaskRuntime async operation {operation} ended without a receipt"
+            ))
+        })?
+    }
+
+    pub(crate) fn reserve_settlement(
+        &self,
+        operation: &'static str,
+    ) -> Result<TaskRuntimeSettlementReservation, StoreError> {
+        self.supervisor
+            .register(operation)
+            .map(|receipt| TaskRuntimeSettlementReservation { receipt })
+    }
+
+    pub(crate) fn record_lifecycle_debt(&self, operation: &'static str, error: &StoreError) {
+        self.supervisor.record_orphan_failure(operation, error);
+    }
+
+    pub(crate) fn spawn_reserved_settlement<T, F>(
+        &self,
+        operation: &'static str,
+        reservation: TaskRuntimeSettlementReservation,
+        future: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, StoreError>>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
+    {
+        self.spawn_async_with_receipt(operation, reservation.receipt, future)
+    }
+
+    fn spawn_async_with_receipt<T, F>(
+        &self,
+        operation: &'static str,
+        receipt: TaskRuntimeOperationReceipt,
+        future: F,
+    ) -> tokio::sync::oneshot::Receiver<Result<T, StoreError>>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, StoreError>> + Send + 'static,
+    {
+        let supervisor = Arc::clone(&self.supervisor);
+        let supervisor_id = Arc::as_ptr(&self.supervisor) as usize;
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let execution =
+            tokio::spawn(CURRENT_TASK_RUNTIME_OPERATION_SUPERVISOR.scope(supervisor_id, future));
+        tokio::spawn(async move {
+            let _receipt = receipt;
+            let result = match execution.await {
+                Ok(result) => result,
+                Err(error) => Err(StoreError::InvalidPlan(format!(
+                    "TaskRuntime async operation {operation} failed to join: {error}"
+                ))),
+            };
+            if let Err(orphaned) = sender.send(result)
+                && let Err(error) = orphaned
+            {
+                supervisor.record_orphan_failure(operation, &error);
+            }
+        });
+        receiver
     }
 }
 
@@ -4740,6 +4942,8 @@ async fn run_main_agent_task(
                 );
                 let invocation = echo_agent::agent::AgentInvocationContext {
                     history: None,
+                    runtime_state_id: None,
+                    transcript_generation_id: None,
                     runtime: Some(echo_agent::tools::ExternalRunContext {
                         conversation_id: Some(run_record.conversation_id.clone()),
                         run_id: Some(run_id.clone()),
@@ -5064,6 +5268,8 @@ async fn drive_owned_agent_turn(
             disabled_tools.extend(mutating_tools.iter().cloned());
             let invocation = echo_agent::agent::AgentInvocationContext {
                 history: None,
+                runtime_state_id: None,
+                transcript_generation_id: None,
                 runtime: Some(echo_agent::tools::ExternalRunContext {
                     conversation_id: Some(conversation_id),
                     run_id: Some(run_id.clone()),
@@ -7049,6 +7255,90 @@ Read the runtime path and found one missing branch.
             .await
             .map_err(|error| format!("blocking adapter task failed to join: {error}"))?
             .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn accepted_blocking_operation_finishes_after_caller_drop() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let adapter = TaskRuntimeBlockingAdapter::new(store.clone());
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_in_operation = completed.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            adapter
+                .run_owned("caller drop contract", move || {
+                    let _ignored = entered_tx.send(());
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(2))
+                        .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+                    completed_in_operation.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx
+            .await
+            .map_err(|_| "blocking operation never started".to_string())?;
+        caller.abort();
+        let caller_result = caller.await;
+        if !caller_result.is_err_and(|error| error.is_cancelled()) {
+            return Err("blocking caller was not cancelled".to_string());
+        }
+        let shutdown_store = store.clone();
+        let shutdown = tokio::spawn(async move { shutdown_store.shutdown_operations().await });
+        tokio::task::yield_now().await;
+        if shutdown.is_finished() {
+            return Err("operation shutdown ignored the accepted blocking task".to_string());
+        }
+        release_tx
+            .send(())
+            .map_err(|error| format!("failed to release detached operation: {error}"))?;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !completed.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "accepted blocking operation stopped with its caller".to_string())?;
+        shutdown
+            .await
+            .map_err(|error| format!("operation shutdown failed to join: {error}"))??;
+        if store.active_operation_count() != 0 {
+            return Err("operation supervisor did not return to idle".to_string());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sealed_operation_admission_cannot_revive_after_join() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let adapter = TaskRuntimeBlockingAdapter::new(store.clone());
+        let parked_adapter = adapter.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let parked = tokio::spawn(async move {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+            parked_adapter.reserve_settlement("parked settlement after seal")
+        });
+        entered_rx
+            .await
+            .map_err(|_| "parked settlement never reached its admission barrier".to_string())?;
+        store.shutdown_operations().await?;
+        release_tx
+            .send(())
+            .map_err(|_| "failed to release parked settlement".to_string())?;
+        let result = parked
+            .await
+            .map_err(|error| format!("parked settlement task failed to join: {error}"))?;
+        if !result.is_err_and(|error| error.to_string().contains("admission is closed")) {
+            return Err("sealed TaskRuntime admission accepted a post-join settlement".to_string());
+        }
+        if store.active_operation_count() != 0 {
+            return Err("post-join settlement revived TaskRuntime operation activity".to_string());
+        }
         Ok(())
     }
 

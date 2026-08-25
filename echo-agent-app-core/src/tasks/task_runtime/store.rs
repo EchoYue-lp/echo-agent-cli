@@ -511,7 +511,7 @@ pub struct TaskRuntimeStore {
     #[cfg(test)]
     run_driver_registration_test_barrier:
         std::sync::Mutex<Option<RunDriverRegistrationTestBarrier>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     fail_next_run_driver_registration: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_recovery_commit: std::sync::atomic::AtomicBool,
@@ -537,6 +537,7 @@ pub struct TaskRuntimeStore {
     /// "读事件 → 校验 → 追加 → 重建投影"事务, 必须按 run 串行化。
     /// Different runs keep independent locks.
     plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
+    operation_supervisor: std::sync::Arc<super::executor::TaskRuntimeOperationSupervisor>,
 }
 
 struct ShadowGeneration {
@@ -1288,7 +1289,7 @@ impl TaskRuntimeStore {
             run_driver_admission_test_barrier: std::sync::Mutex::new(None),
             #[cfg(test)]
             run_driver_registration_test_barrier: std::sync::Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             fail_next_run_driver_registration: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_next_recovery_commit: std::sync::atomic::AtomicBool::new(false),
@@ -1310,7 +1311,32 @@ impl TaskRuntimeStore {
             }),
             hook_event_dispatcher: std::sync::Mutex::new(None),
             plan_locks: dashmap::DashMap::new(),
+            operation_supervisor: super::executor::TaskRuntimeOperationSupervisor::new(),
         }
+    }
+
+    pub(crate) fn operation_supervisor(
+        &self,
+    ) -> std::sync::Arc<super::executor::TaskRuntimeOperationSupervisor> {
+        std::sync::Arc::clone(&self.operation_supervisor)
+    }
+
+    pub fn active_operation_count(&self) -> usize {
+        self.operation_supervisor.active_count()
+    }
+
+    pub fn begin_operation_shutdown(&self) -> Result<(), String> {
+        self.operation_supervisor.begin_shutdown()
+    }
+
+    pub async fn shutdown_operations(&self) -> Result<(), String> {
+        self.begin_operation_shutdown()?;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.operation_supervisor.join(),
+        )
+        .await
+        .map_err(|_| "TaskRuntime operation shutdown timed out after 30 seconds".to_string())?
     }
 
     /// In-memory store for tests / fallback. The file shadow is backed by a
@@ -1748,8 +1774,9 @@ impl TaskRuntimeStore {
         Ok((registered_rx, release_tx))
     }
 
-    #[cfg(test)]
-    pub(crate) fn fail_next_run_driver_registration_for_test(&self) {
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_next_run_driver_registration_for_test(&self) {
         self.fail_next_run_driver_registration
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
@@ -2032,7 +2059,7 @@ impl TaskRuntimeStore {
     where
         T: Send + 'static,
     {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if self
             .fail_next_run_driver_registration
             .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -2096,6 +2123,10 @@ impl TaskRuntimeStore {
             driver_token,
             execution_context_id: execution_context_id.clone(),
         };
+        let operation_adapter =
+            super::executor::TaskRuntimeBlockingAdapter::new(std::sync::Arc::clone(self));
+        let operation_reservation =
+            operation_adapter.reserve_settlement("drive registered TaskRun")?;
         admission.active = false;
         supervisor.pending_admissions = supervisor.pending_admissions.saturating_sub(1);
         let reservations_idle = supervisor.pending_admissions == 0;
@@ -2112,7 +2143,11 @@ impl TaskRuntimeStore {
                 run_id: run_id.clone(),
             },
         );
-        supervisor.driver_settlements.spawn_on(async move {
+        let operation_driver_token = driver_token;
+        let driver_operation = operation_adapter.spawn_reserved_settlement(
+            "drive registered TaskRun",
+            operation_reservation,
+            async move {
             let mut generation_lease = Some(generation_lease);
             let _cancellation_registration = cancellation_registration;
             let start = start_receiver.await;
@@ -2138,11 +2173,17 @@ impl TaskRuntimeStore {
                     false,
                 ),
             };
-            if should_settle {
-                let settlement = match &result {
-                    Ok(_) => settlement_store.confirm_run_settled(&run_id, run_required),
-                    Err(error) => {
-                        match settlement_store.get_run(&run_id) {
+            let operation_store = settlement_store.clone();
+            let operation_run_id = run_id.clone();
+            let (settled_result, release_receipts) =
+                super::executor::TaskRuntimeBlockingAdapter::new(settlement_store.clone())
+                    .run_owned("settle registered TaskRun", move || {
+                let mut release_receipts = !should_settle;
+                if should_settle {
+                    let settlement = match &result {
+                        Ok(_) => operation_store
+                            .confirm_run_settled(&operation_run_id, run_required),
+                        Err(error) => match operation_store.get_run(&operation_run_id) {
                             Ok(None) if !run_required => Ok(()),
                             Ok(Some(run)) if run.status == TaskRunStatus::Paused => Ok(()),
                             Ok(_) => {
@@ -2151,58 +2192,58 @@ impl TaskRuntimeStore {
                                 } else {
                                     TaskRunStatus::Failed
                                 };
-                                settlement_store
+                                operation_store
                                     .finalize_run_with_lease(
                                         &mut generation_lease,
                                         Some(driver_token),
-                                        &run_id,
+                                        &operation_run_id,
                                         target,
                                         Some(error),
                                     )
                                     .map(|_| ())
                             }
                             Err(read_error) => Err(read_error),
-                        }
-                    }
-                };
-                if let Err(settlement_error) = settlement {
-                    let original = result.as_ref().err().cloned().unwrap_or_else(|| {
-                        "TaskRun driver returned before durable settlement".to_string()
-                    });
-                    if generation_lease.is_some() {
-                        match settlement_store.finalize_run_with_lease(
-                            &mut generation_lease,
-                            Some(driver_token),
-                            &run_id,
-                            TaskRunStatus::Failed,
-                            Some(&original),
-                        ) {
-                            Ok(_) => {
-                                settlement_store
-                                    .release_run_driver_receipts(driver_token)
-                                    .await;
-                                result = Err(format!(
-                                    "{original}; recovered non-terminal driver result after: {settlement_error}"
-                                ));
+                        },
+                    };
+                    if let Err(settlement_error) = settlement {
+                        let original = result.as_ref().err().cloned().unwrap_or_else(|| {
+                            "TaskRun driver returned before durable settlement".to_string()
+                        });
+                        if generation_lease.is_some() {
+                            match operation_store.finalize_run_with_lease(
+                                &mut generation_lease,
+                                Some(driver_token),
+                                &operation_run_id,
+                                TaskRunStatus::Failed,
+                                Some(&original),
+                            ) {
+                                Ok(_) => {
+                                    release_receipts = true;
+                                    result = Err(format!(
+                                        "{original}; recovered non-terminal driver result after: {settlement_error}"
+                                    ));
+                                }
+                                Err(recovery_error) => {
+                                    let combined = format!(
+                                        "{original}; terminal settlement failed: {settlement_error}; fallback terminal settlement failed: {recovery_error}"
+                                    );
+                                    result = Err(combined);
+                                }
                             }
-                            Err(recovery_error) => {
-                                let combined = format!(
-                                    "{original}; terminal settlement failed: {settlement_error}; fallback terminal settlement failed: {recovery_error}"
-                                );
-                                result = Err(combined);
-                            }
+                        } else {
+                            let combined =
+                                format!("{original}; terminal settlement failed: {settlement_error}");
+                            result = Err(combined);
                         }
                     } else {
-                        let combined =
-                            format!("{original}; terminal settlement failed: {settlement_error}");
-                        result = Err(combined);
+                        release_receipts = true;
                     }
-                } else {
-                    settlement_store
-                        .release_run_driver_receipts(driver_token)
-                        .await;
                 }
-            } else {
+                Ok((result, release_receipts))
+            })
+            .await?;
+            result = settled_result;
+            if release_receipts {
                 settlement_store
                     .release_run_driver_receipts(driver_token)
                     .await;
@@ -2225,8 +2266,22 @@ impl TaskRuntimeStore {
             // with the exact generation and execution receipts. Shutdown and
             // workspace transition retry that canonical debt and report only
             // if it remains unsettled.
-            (driver_token, Ok(()))
-        }, &runtime_handle);
+            Ok((driver_token, Ok(())))
+            },
+        );
+        supervisor.driver_settlements.spawn_on(
+            async move {
+                match driver_operation.await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => (operation_driver_token, Err(error.to_string())),
+                    Err(error) => (
+                        operation_driver_token,
+                        Err(format!("TaskRun operation receipt was lost: {error}")),
+                    ),
+                }
+            },
+            &runtime_handle,
+        );
         drop(supervisor);
         if reservations_idle {
             self.run_driver_admission_idle.notify_one();
@@ -2324,7 +2379,7 @@ impl TaskRuntimeStore {
         Context: Send + 'static,
         F: std::future::Future<Output = Result<T, String>> + Send + 'static,
         Factory: FnOnce(RunDriverReceiptOwner) -> F,
-        Preflight: FnOnce() -> Result<Context, StoreError>,
+        Preflight: FnOnce() -> Result<Context, StoreError> + Send + 'static,
         Prepare: FnOnce(Context) -> Result<(Prepared, Factory), StoreError>,
     {
         let admission = self.reserve_run_driver_admission(run_id, cancel)?;
@@ -2387,7 +2442,7 @@ impl TaskRuntimeStore {
         Context: Send + 'static,
         F: std::future::Future<Output = Result<(), String>> + Send + 'static,
         Factory: FnOnce(Context, RunDriverReceiptOwner) -> F,
-        Preflight: FnOnce() -> Result<Context, StoreError>,
+        Preflight: FnOnce() -> Result<Context, StoreError> + Send + 'static,
     {
         let admission = self.reserve_run_driver_admission(run_id.clone(), cancel)?;
         let generation_lease = self.lease_active_workspace_generation()?;
@@ -2414,6 +2469,79 @@ impl TaskRuntimeStore {
                 return Err(error);
             }
         };
+        let waiter = match preparation {
+            TaskRetryPreparation::Acceptance { .. } => {
+                registration.start(move |owner| factory(context, owner))
+            }
+            TaskRetryPreparation::Recovery => registration.start(|_| async { Ok(()) }),
+        };
+        Ok((preparation, waiter))
+    }
+
+    /// Async-surface variant of [`Self::spawn_supervised_task_retry`]. Driver
+    /// admission remains on the Tokio runtime, while the journal-backed retry
+    /// preparation runs through the process-wide bounded blocking adapter.
+    ///
+    /// The registration is owned by the blocking closure once file I/O starts.
+    /// Dropping the caller therefore cannot release the workspace generation
+    /// while the accepted non-interruptible journal mutation is still running.
+    pub async fn spawn_supervised_task_retry_async<Context, F, Factory, Preflight>(
+        self: &std::sync::Arc<Self>,
+        run_id: String,
+        task_id: String,
+        cancel: echo_agent::agent::CancellationToken,
+        preflight: Preflight,
+        factory: Factory,
+    ) -> Result<
+        (
+            TaskRetryPreparation,
+            tokio::sync::oneshot::Receiver<Result<(), String>>,
+        ),
+        StoreError,
+    >
+    where
+        Context: Send + 'static,
+        F: std::future::Future<Output = Result<(), String>> + Send + 'static,
+        Factory: FnOnce(Context, RunDriverReceiptOwner) -> F,
+        Preflight: FnOnce() -> Result<Context, StoreError> + Send + 'static,
+    {
+        let admission = self.reserve_run_driver_admission(run_id.clone(), cancel)?;
+        let generation_lease = self.lease_active_workspace_generation()?;
+        let registration = self.register_run_driver::<()>(admission, generation_lease)?;
+        let operation_store = std::sync::Arc::clone(self);
+        let (registration, preparation, context) =
+            super::executor::TaskRuntimeBlockingAdapter::new(std::sync::Arc::clone(self))
+                .run_owned("prepare supervised task retry", move || {
+                    let mut registration = registration;
+                    let context = match preflight() {
+                        Ok(context) => context,
+                        Err(error) => {
+                            registration.reject(error.to_string());
+                            return Err(error);
+                        }
+                    };
+                    registration.mark_preparation_started();
+                    let has_recovery_blocker = match operation_store.list_recovery_blockers(&run_id)
+                    {
+                        Ok(blockers) => blockers.iter().any(|blocker| blocker.task_id == task_id),
+                        Err(error) => {
+                            registration.fail_preparation(error.to_string());
+                            return Err(error);
+                        }
+                    };
+                    match operation_store.prepare_task_retry(
+                        &run_id,
+                        &task_id,
+                        has_recovery_blocker,
+                    ) {
+                        Ok(preparation) => Ok((registration, preparation, context)),
+                        Err(error) => {
+                            registration.fail_preparation(error.to_string());
+                            Err(error)
+                        }
+                    }
+                })
+                .await?;
         let waiter = match preparation {
             TaskRetryPreparation::Acceptance { .. } => {
                 registration.start(move |owner| factory(context, owner))
@@ -3320,10 +3448,41 @@ impl TaskRuntimeStore {
             .get_run_state(run_id)?
             .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
         let run = snapshot.run.clone();
-        if let Some(expected) = expected {
-            expected
-                .validate_resumable(&snapshot)
-                .map_err(StoreError::InvalidPlan)?;
+        if let Some(expected) = expected
+            && let Err(error) = expected.validate_resumable(&snapshot)
+        {
+            // Audit allowlist: exact resume inspects only its post-capture
+            // suffix. Execution-path Notes are diagnostic and can be
+            // published just after driver idle; every other fact remains
+            // identity-changing and is rejected.
+            let suffix = self.list_events(
+                run_id,
+                i64::try_from(expected.journal_sequence).unwrap_or(i64::MAX),
+            )?;
+            let diagnostic_only = !suffix.is_empty()
+                && suffix.iter().all(|event| {
+                    event.event_type == RuntimeEventKind::Note
+                        && event
+                            .payload
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("execution_path")
+                });
+            if diagnostic_only {
+                let mut semantic_snapshot = snapshot.clone();
+                semantic_snapshot.journal_sequence = expected.journal_sequence;
+                expected
+                    .validate_resumable(&semantic_snapshot)
+                    .map_err(StoreError::InvalidPlan)?;
+            } else {
+                let latest = suffix
+                    .last()
+                    .map(|event| format!("{} at sequence {}", event.event_type.as_str(), event.seq))
+                    .unwrap_or_else(|| "unavailable".to_string());
+                return Err(StoreError::InvalidPlan(format!(
+                    "{error}; latest event after queued identity: {latest}"
+                )));
+            }
         }
         let plan = self
             .get_plan(run_id)?
@@ -9966,6 +10125,32 @@ mod tests {
                 .status,
             TaskRunStatus::Running
         );
+        Ok(())
+    }
+
+    #[test]
+    fn expected_resume_allows_only_execution_path_diagnostic_suffix() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.configure_run_continuation("r1", true, false, None, None)?;
+        store.request_pause("r1")?;
+        let expected = TaskRunResumeIdentity::capture(
+            &store
+                .get_run_state("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?,
+        );
+        store.record_execution_path("r1", "task", "formal_plan")?;
+
+        assert!(matches!(
+            store.resume_and_claim_run_turn_expected(
+                &expected,
+                "diagnostic-race-resume",
+                RunTurnOrigin::Resume,
+                TurnVisibility::Visible,
+            )?,
+            RunTurnClaimOutcome::Started(ref turn)
+                if turn.turn_id == "diagnostic-race-resume"
+        ));
         Ok(())
     }
 

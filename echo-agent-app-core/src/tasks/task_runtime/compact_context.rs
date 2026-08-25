@@ -146,20 +146,29 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
                 .map(super::task_tools::formal_run_id_for_turn);
             let run_id = context.run_id.as_deref().or(derived_run_id.as_deref());
             let store = run_id.and_then(|run_id| self.registry.store(run_id));
+            let (goal, recovery) = match (run_id, store) {
+                (Some(run_id), Some(store)) => {
+                    let run_id = run_id.to_string();
+                    super::executor::TaskRuntimeBlockingAdapter::new(store)
+                        .run_store("project TaskRuntime model context", move |store| {
+                            Ok((
+                                build_runtime_goal_contract(&store, &run_id),
+                                build_runtime_recovery_capsule(&store, &run_id),
+                            ))
+                        })
+                        .await
+                        .unwrap_or((None, None))
+                }
+                _ => (None, None),
+            };
             Ok(vec![
                 ContextProjection {
                     marker: RUNTIME_GOAL_MARKER.to_string(),
-                    message: run_id
-                        .zip(store.as_deref())
-                        .and_then(|(run_id, store)| build_runtime_goal_contract(store, run_id))
-                        .map(Message::user),
+                    message: goal.map(Message::user),
                 },
                 ContextProjection {
                     marker: RUNTIME_RECOVERY_MARKER.to_string(),
-                    message: run_id
-                        .zip(store.as_deref())
-                        .and_then(|(run_id, store)| build_runtime_recovery_capsule(store, run_id))
-                        .map(Message::user),
+                    message: recovery.map(Message::user),
                 },
             ])
         })

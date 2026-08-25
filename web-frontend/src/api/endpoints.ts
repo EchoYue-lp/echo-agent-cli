@@ -54,6 +54,11 @@ import type {
   SubagentControlIdentity,
   SubagentControlReceipt,
   CompletionGateReport,
+  InteractionMode,
+  InteractionModeRequest,
+  TaskRetryReceipt,
+  TaskRunControlReceipt,
+  TaskRunResumeReceipt,
   WorkspaceTransitionReceipt,
   StoredWorkflow,
   WorkflowExecution,
@@ -795,31 +800,28 @@ export const taskRuntimeApi = {
 
   cancelRun: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; run_id: string }>('cancel_task_run', {
+      ? apiInvoke<TaskRunControlReceipt>('cancel_task_run', {
           workspaceId,
           runId,
         })
-      : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/cancel`),
+      : post<TaskRunControlReceipt>(`/task_runtime/runs/${runId}/cancel`),
   pauseRun: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; run_id: string }>('pause_task_run', {
+      ? apiInvoke<TaskRunControlReceipt>('pause_task_run', {
           workspaceId,
           runId,
         })
-      : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/pause`),
+      : post<TaskRunControlReceipt>(`/task_runtime/runs/${runId}/pause`),
 
   // ── Dynamic task operations ──────────────────────────────────────────
   resumeRun: (workspaceId: string, runId: string) =>
     isTauri()
-      ? apiInvoke<{ kind: string; run_id: string }>('resume_task_run', { workspaceId, runId })
-      : post(`/task_runtime/runs/${runId}/resume`),
+      ? apiInvoke<TaskRunResumeReceipt>('resume_task_run', { workspaceId, runId })
+      : post<TaskRunResumeReceipt>(`/task_runtime/runs/${runId}/resume`),
   retryBlockedTask: (workspaceId: string, runId: string, taskId: string) =>
     isTauri()
-      ? apiInvoke<{ kind: string; run_id: string; task_id: string; next_attempt: number | null }>(
-          'retry_blocked_task',
-          { workspaceId, runId, taskId }
-        )
-      : post(`/task_runtime/runs/${runId}/tasks/${taskId}/retry`),
+      ? apiInvoke<TaskRetryReceipt>('retry_blocked_task', { workspaceId, runId, taskId })
+      : post<TaskRetryReceipt>(`/task_runtime/runs/${runId}/tasks/${taskId}/retry`),
   resolveRecoveryTask: (workspaceId: string, runId: string, taskId: string, decision: 'skip') =>
     isTauri()
       ? apiInvoke<void>('resolve_recovery_task', { workspaceId, runId, taskId, decision })
@@ -830,14 +832,18 @@ export const taskRuntimeApi = {
       : post<TaskPlan>(`/task_runtime/runs/${runId}/tasks/update`, request),
 
   // ── Interaction mode ─────────────────────────────────────────────────
-  setInteractionMode: (mode: number) =>
+  setInteractionMode: (mode: InteractionMode) =>
     isTauri()
-      ? apiInvoke<number>('set_interaction_mode', { mode })
-      : post<number>('/task_runtime/interaction_mode', { mode }),
+      ? apiInvoke<InteractionMode>('set_interaction_mode', {
+          request: { mode } satisfies InteractionModeRequest,
+        })
+      : post<InteractionMode>('/task_runtime/interaction_mode', {
+          mode,
+        } satisfies InteractionModeRequest),
   getInteractionMode: () =>
     isTauri()
-      ? apiInvoke<number>('get_interaction_mode')
-      : get<number>('/task_runtime/interaction_mode'),
+      ? apiInvoke<InteractionMode>('get_interaction_mode')
+      : get<InteractionMode>('/task_runtime/interaction_mode'),
 };
 
 // ── Durable run diagnostics API ──────────────────────────────────────
