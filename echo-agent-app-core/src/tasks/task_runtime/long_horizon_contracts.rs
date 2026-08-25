@@ -10,6 +10,7 @@ const APP_COMPACT_CONTEXT: &str = include_str!("compact_context.rs");
 const APP_TASK_TOOLS: &str = include_str!("task_tools.rs");
 const APP_CONVERSATION_DELETION: &str = include_str!("../../conversation_deletion.rs");
 const APP_AGENT_POOL: &str = include_str!("../../agent_pool.rs");
+const APP_AGENT_ROUTER: &str = include_str!("../../agent_router.rs");
 const APP_CHAT_DRIVER: &str = include_str!("../../chat_driver.rs");
 const APP_TURN_CONTEXT: &str = include_str!("../../turn_context.rs");
 const APP_MANUAL_COMPRESSION: &str = include_str!("../../manual_compression.rs");
@@ -111,20 +112,59 @@ fn lh_f01_boot_resume_accepts_normal_conversation_runs() -> Result<(), String> {
         "/// 启动后台任务服务",
         "LH-F01 app-core boot reconciler could not be isolated",
     )?;
-    require_absent(
+    require(
         reconciler,
-        "starts_with(\"background:\")",
-        "LH-F01 repair regressed: app boot resume is restricted to background conversations",
+        "run.conversation_id.starts_with(\"background:\")",
+        "LH-F01 repair regressed: global background launcher ownership is not separated",
     )?;
     require(
         APP_STATE,
         "reconcile_task_runs_at_boot",
         "LH-F01 repair regressed: app-core boot reconciler is not wired",
     )?;
+    require_absent(
+        reconciler,
+        "transition.write().await",
+        "LH-F01 boot recovery holds workspace transition admission across recovery",
+    )?;
     require(
         include_str!("boot_reconciler.rs"),
         "pub struct TaskRunBootReconciler",
         "LH-F01 repair regressed: store-scoped boot owner is missing",
+    )
+}
+
+#[test]
+fn boot_and_inbox_authorities_remain_cancellation_safe_and_bounded() -> Result<(), String> {
+    require(
+        include_str!("boot_reconciler.rs"),
+        "tokio::sync::watch::channel(None)",
+        "boot recovery no longer owns a cancellation-safe singleflight receipt",
+    )?;
+    require(
+        APP_AGENT_ROUTER,
+        "CheckpointedReducer<SegmentedFileEventJournal<AgentInboxEvent>",
+        "AgentRouter no longer uses the framework checkpointed journal authority",
+    )?;
+    require(
+        APP_AGENT_ROUTER,
+        "AgentDeliveryStatus::InjectionStarted",
+        "Agent delivery lost its pre-side-effect durable boundary",
+    )?;
+    require_absent(
+        APP_AGENT_ROUTER,
+        "fn read_events(",
+        "AgentRouter regressed to full journal replay per operation",
+    )?;
+    require(
+        APP_WORKSPACE_RUNTIME,
+        "run(\"prepare workspace runtime file stores\"",
+        "workspace file resource preparation returned to a Tokio executor thread",
+    )?;
+    require(
+        APP_COMMAND_CELLS,
+        "AwaiterResultDeliveryStarted",
+        "Awaiter lost its no-duplicate delivery boundary",
     )
 }
 
@@ -407,10 +447,10 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
         (APP_TASK_SERVICE, "resolve background recovery task"),
         (APP_TASK_SERVICE, "list background TaskRuns"),
         (APP_TASK_SERVICE, "load background TaskRun progress"),
-        (APP_BOOT_RECONCILER, "recover incomplete TaskRuns"),
-        (APP_BOOT_RECONCILER, "list boot-resumable TaskRuns"),
-        (APP_BOOT_RECONCILER, "evaluate TaskRun boot resume"),
-        (APP_BOOT_RECONCILER, "resume TaskRun after boot"),
+        (APP_BOOT_RECONCILER, "recover TaskRuntime at boot"),
+        (APP_BOOT_RECONCILER, "list boot recovery candidates"),
+        (APP_BOOT_RECONCILER, "decide boot auto-resume admission"),
+        (APP_BOOT_RECONCILER, "commit boot auto-resume admission"),
         (APP_TUI_EVENTS, "resolve TUI TaskRun"),
         (APP_TUI_EVENTS, "refresh TUI TaskRuntime projection"),
         (APP_TUI_EVENTS, "resolve TUI recovery task"),
@@ -509,7 +549,7 @@ fn task_runtime_async_boundaries_keep_file_io_behind_the_bounded_adapter() -> Re
     let awaiter_publish = between(
         APP_COMMAND_CELLS,
         "async fn publish_awaiter_result",
-        "fn acknowledge_awaiter_result_sync",
+        "async fn persist_awaiter_delivery_fact",
         "Awaiter Ready publication boundary could not be isolated",
     )?;
     require(

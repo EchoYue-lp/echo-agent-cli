@@ -2596,6 +2596,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 cell.cell_id, cell.phase
             )),
             ChatDriverEvent::AwaiterResultReady { .. }
+            | ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
             | ChatDriverEvent::AwaiterResultAcknowledged { .. } => {
                 AgentEvent::Notice("Awaiter projection unavailable".to_string())
             }

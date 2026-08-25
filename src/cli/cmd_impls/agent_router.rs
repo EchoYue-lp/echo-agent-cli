@@ -232,6 +232,7 @@ fn format_delivery_records(records: Vec<AgentDeliveryRecord>, message_id: Option
             let status = match record.status {
                 AgentDeliveryStatus::Queued => "queued",
                 AgentDeliveryStatus::Claimed => "claimed",
+                AgentDeliveryStatus::InjectionStarted => "injection_started",
                 AgentDeliveryStatus::Injected => "injected",
                 AgentDeliveryStatus::Delivered => "delivered",
                 AgentDeliveryStatus::Failed => "failed",

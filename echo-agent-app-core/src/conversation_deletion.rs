@@ -47,6 +47,8 @@ pub enum ConversationDeletionError {
     ConversationStore(String),
     #[error("conversation agent cleanup failed: {0}")]
     AgentPool(String),
+    #[error("conversation Agent inbox cleanup failed: {0}")]
+    AgentRouter(String),
     #[error("task-runtime cleanup failed: {0}")]
     TaskRuntime(String),
     #[error("tool-execution cleanup failed: {0}")]
@@ -91,9 +93,26 @@ pub struct ConversationDeletionReceipt {
     pub cleanup_pending: bool,
 }
 
+#[derive(Clone)]
+pub(crate) struct ConversationDeletionRecoveryContext {
+    pub workspace_id: String,
+    pub conversation_store: Arc<dyn ConversationStore>,
+    pub runtime_state: Option<Arc<dyn RuntimeStateStore>>,
+    pub agent_pool: Option<Arc<crate::agent_pool::AgentPool>>,
+    pub task_runtime: Option<Arc<TaskRuntimeStore>>,
+    pub tool_executions: Arc<ToolExecutionRepository>,
+    pub chat_events: Arc<ChatEventLog>,
+    pub foreground_turns: ForegroundTurnControl,
+    pub artifact_config: Option<ToolOutputArtifactConfig>,
+    pub workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
+    pub agent_router: Arc<crate::agent_router::AgentRouter>,
+    pub agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 enum DeletionStep {
+    AgentRouter,
     TaskRuntime,
     ToolExecutions,
     ChatEvents,
@@ -165,6 +184,11 @@ struct ConversationLockRegistration<'a> {
 enum DeletionIo<'a> {
     Service(&'a crate::product_data_io::ProductDataIoService),
     Flow(&'a crate::product_data_io::ProductDataIoFlow),
+}
+
+struct ConversationAgentRetirementGuards {
+    _delivery: crate::agent_router::AgentDeliveryRetirementGuard,
+    _router: crate::agent_router::AgentRouterRetirementGuard,
 }
 
 impl Drop for ConversationLockRegistration<'_> {
@@ -365,12 +389,9 @@ impl ConversationDeletionService {
             .map_err(ConversationDeletionError::Foreground)
     }
 
-    pub async fn recover_committed_deletions(
+    pub(crate) async fn recover_committed_deletions(
         &self,
-        conversation_store: Arc<dyn ConversationStore>,
-        runtime_state: Option<Arc<dyn RuntimeStateStore>>,
-        agent_pool: Option<Arc<crate::agent_pool::AgentPool>>,
-        workspace_io_receipt: Option<crate::state::ScopedWorkspaceIoReceipt>,
+        context: ConversationDeletionRecoveryContext,
     ) -> Result<Vec<ConversationDeletionReceipt>, ConversationDeletionError> {
         let flow = self
             .product_data_io
@@ -380,13 +401,7 @@ impl ConversationDeletionService {
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let result = service
-                .recover_committed_deletions_owned(
-                    &flow,
-                    conversation_store,
-                    runtime_state,
-                    agent_pool,
-                    workspace_io_receipt,
-                )
+                .recover_committed_deletions_owned(&flow, context)
                 .await;
             let durable_failure = result
                 .as_ref()
@@ -412,15 +427,12 @@ impl ConversationDeletionService {
     async fn recover_committed_deletions_owned(
         &self,
         flow: &crate::product_data_io::ProductDataIoFlow,
-        conversation_store: Arc<dyn ConversationStore>,
-        runtime_state: Option<Arc<dyn RuntimeStateStore>>,
-        agent_pool: Option<Arc<crate::agent_pool::AgentPool>>,
-        workspace_io_receipt: Option<crate::state::ScopedWorkspaceIoReceipt>,
+        context: ConversationDeletionRecoveryContext,
     ) -> Result<Vec<ConversationDeletionReceipt>, ConversationDeletionError> {
         let discovered = self
             .run_io(
                 DeletionIo::Flow(flow),
-                workspace_io_receipt.clone(),
+                Some(context.workspace_io_receipt.clone()),
                 "discover conversation deletion tombstones",
                 |service| service.discover_tombstones_sync(),
             )
@@ -439,15 +451,45 @@ impl ConversationDeletionService {
                 }
                 continue;
             }
+            if !authority_commit_started(&discovered) {
+                let conversation_id = discovered.conversation_id;
+                match self
+                    .delete_owned(
+                        flow,
+                        context.workspace_id.clone(),
+                        conversation_id,
+                        Some(context.conversation_store.clone()),
+                        context.agent_pool.clone(),
+                        context.task_runtime.clone(),
+                        context.tool_executions.clone(),
+                        context.chat_events.clone(),
+                        context.runtime_state.clone(),
+                        context.foreground_turns.clone(),
+                        context.agent_router.clone(),
+                        context.agent_deliveries.clone(),
+                        context.artifact_config.clone(),
+                        context.workspace_io_receipt.clone(),
+                    )
+                    .await
+                {
+                    Ok(receipt) => recovered.push(receipt),
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error);
+                        }
+                    }
+                }
+                continue;
+            }
             let conversation_id = discovered.conversation_id;
             let registration = self.lock_registration(&conversation_id);
             let _identity_lock = registration.lock.lock().await;
             let load_path = path.clone();
             let load_conversation_id = conversation_id.clone();
-            let tombstone = match self
+            let mut tombstone = match self
                 .run_io(
                     DeletionIo::Flow(flow),
-                    workspace_io_receipt.clone(),
+                    Some(context.workspace_io_receipt.clone()),
                     "load conversation deletion tombstone",
                     move |service| service.load_tombstone(&load_path, &load_conversation_id),
                 )
@@ -462,12 +504,41 @@ impl ConversationDeletionService {
                     continue;
                 }
             };
-            if !authority_commit_started(&tombstone) {
+            let _router_retirement = match retire_agent_inbox(
+                &context.workspace_id,
+                &conversation_id,
+                &context.agent_router,
+                &context.agent_deliveries,
+            )
+            .await
+            {
+                Ok(retirement) => retirement,
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                    continue;
+                }
+            };
+            if !tombstone.completed.contains(&DeletionStep::AgentRouter)
+                && let Err(error) = self
+                    .complete_step_io(
+                        DeletionIo::Flow(flow),
+                        Some(context.workspace_io_receipt.clone()),
+                        &path,
+                        &mut tombstone,
+                        DeletionStep::AgentRouter,
+                    )
+                    .await
+            {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
                 continue;
             }
             let _retirement_receipts = match begin_runtime_lineage_retirements(
-                agent_pool.as_ref(),
-                runtime_state.as_ref(),
+                context.agent_pool.as_ref(),
+                context.runtime_state.as_ref(),
                 &conversation_id,
             )
             .await
@@ -485,10 +556,10 @@ impl ConversationDeletionService {
                     &path,
                     &conversation_id,
                     tombstone,
-                    conversation_store.as_ref(),
-                    runtime_state.as_deref(),
+                    context.conversation_store.as_ref(),
+                    context.runtime_state.as_deref(),
                     DeletionIo::Flow(flow),
-                    workspace_io_receipt.clone(),
+                    Some(context.workspace_io_receipt.clone()),
                 )
                 .await
             {
@@ -504,24 +575,6 @@ impl ConversationDeletionService {
             Some(error) => Err(error),
             None => Ok(recovered),
         }
-    }
-
-    pub(crate) async fn recover_committed_deletions_in_flow(
-        &self,
-        flow: &crate::product_data_io::ProductDataIoFlow,
-        conversation_store: Arc<dyn ConversationStore>,
-        runtime_state: Option<Arc<dyn RuntimeStateStore>>,
-        agent_pool: Option<Arc<crate::agent_pool::AgentPool>>,
-        workspace_io_receipt: Option<crate::state::ScopedWorkspaceIoReceipt>,
-    ) -> Result<Vec<ConversationDeletionReceipt>, ConversationDeletionError> {
-        self.recover_committed_deletions_owned(
-            flow,
-            conversation_store,
-            runtime_state,
-            agent_pool,
-            workspace_io_receipt,
-        )
-        .await
     }
 
     async fn write_conversation(
@@ -556,6 +609,8 @@ impl ConversationDeletionService {
         chat_events: Arc<ChatEventLog>,
         runtime_state: Option<Arc<dyn RuntimeStateStore>>,
         foreground_turns: &ForegroundTurnControl,
+        agent_router: Arc<crate::agent_router::AgentRouter>,
+        agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
         artifact_config: Option<ToolOutputArtifactConfig>,
         workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
     ) -> Result<ConversationDeletionReceipt, ConversationDeletionError> {
@@ -581,6 +636,8 @@ impl ConversationDeletionService {
                     chat_events,
                     runtime_state,
                     foreground_turns,
+                    agent_router,
+                    agent_deliveries,
                     artifact_config,
                     workspace_io_receipt,
                 )
@@ -619,6 +676,8 @@ impl ConversationDeletionService {
         chat_events: Arc<ChatEventLog>,
         runtime_state: Option<Arc<dyn RuntimeStateStore>>,
         foreground_turns: ForegroundTurnControl,
+        agent_router: Arc<crate::agent_router::AgentRouter>,
+        agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
         artifact_config: Option<ToolOutputArtifactConfig>,
         workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt,
     ) -> Result<ConversationDeletionReceipt, ConversationDeletionError> {
@@ -666,6 +725,24 @@ impl ConversationDeletionService {
                 (tombstone, false)
             }
         };
+
+        let _router_retirement = retire_agent_inbox(
+            &workspace_id,
+            &conversation_id,
+            &agent_router,
+            &agent_deliveries,
+        )
+        .await?;
+        if !tombstone.completed.contains(&DeletionStep::AgentRouter) {
+            self.complete_step_io(
+                DeletionIo::Flow(flow),
+                Some(workspace_io_receipt.clone()),
+                &tombstone_path,
+                &mut tombstone,
+                DeletionStep::AgentRouter,
+            )
+            .await?;
+        }
 
         if authority_commit_started(&tombstone) {
             let store = conversation_store
@@ -1193,6 +1270,33 @@ fn validated_id(conversation_id: &str) -> Result<&str, ConversationDeletionError
     }
 }
 
+async fn retire_agent_inbox(
+    workspace_id: &str,
+    conversation_id: &str,
+    router: &Arc<crate::agent_router::AgentRouter>,
+    deliveries: &Arc<crate::agent_router::AgentDeliverySupervisor>,
+) -> Result<ConversationAgentRetirementGuards, ConversationDeletionError> {
+    let target = crate::agent_router::AgentAddress::new(
+        crate::workspace::WorkspaceId::from_raw(workspace_id.to_string()),
+        conversation_id.to_string(),
+    );
+    let router = router
+        .begin_target_retirement(target.clone())
+        .map_err(|error| ConversationDeletionError::AgentRouter(error.to_string()))?;
+    let delivery = deliveries
+        .retire_target(target.clone())
+        .await
+        .map_err(|error| ConversationDeletionError::AgentRouter(error.to_string()))?;
+    router
+        .purge()
+        .await
+        .map_err(|error| ConversationDeletionError::AgentRouter(error.to_string()))?;
+    Ok(ConversationAgentRetirementGuards {
+        _delivery: delivery,
+        _router: router,
+    })
+}
+
 async fn begin_runtime_lineage_retirements(
     pool: Option<&Arc<crate::agent_pool::AgentPool>>,
     runtime_state: Option<&Arc<dyn RuntimeStateStore>>,
@@ -1310,6 +1414,46 @@ mod tests {
         Ok(Arc::new(FileConversationStore::new(root)?))
     }
 
+    fn router_context(
+        root: &Path,
+    ) -> (
+        Arc<crate::agent_router::AgentRouter>,
+        Arc<crate::agent_router::AgentDeliverySupervisor>,
+    ) {
+        (
+            Arc::new(crate::agent_router::AgentRouter::new(
+                root.join("agent-router"),
+            )),
+            Arc::new(crate::agent_router::AgentDeliverySupervisor::default()),
+        )
+    }
+
+    fn recovery_context(
+        root: &Path,
+        conversation_store: Arc<dyn ConversationStore>,
+        runtime_state: Option<Arc<dyn RuntimeStateStore>>,
+        agent_router: Arc<crate::agent_router::AgentRouter>,
+        agent_deliveries: Arc<crate::agent_router::AgentDeliverySupervisor>,
+    ) -> Result<ConversationDeletionRecoveryContext, Box<dyn Error>> {
+        Ok(ConversationDeletionRecoveryContext {
+            workspace_id: "global".to_string(),
+            conversation_store,
+            runtime_state,
+            agent_pool: None,
+            task_runtime: None,
+            tool_executions: Arc::new(ToolExecutionRepository::open(root.join("tools"))?),
+            chat_events: Arc::new(ChatEventLog::open(
+                root.join("chat-events"),
+                ChatEventRetention::default(),
+            )?),
+            foreground_turns: ForegroundTurnControl::default(),
+            artifact_config: None,
+            workspace_io_receipt: crate::state::ScopedWorkspaceIoReceipt::global_for_test(root),
+            agent_router,
+            agent_deliveries,
+        })
+    }
+
     #[test]
     fn tombstone_durability_barrier_failures_are_retryable() -> Result<(), Box<dyn Error>> {
         let temp = tempfile::tempdir()?;
@@ -1353,6 +1497,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn precommit_tombstone_resumes_instead_of_permanently_blocking_admission()
+    -> Result<(), Box<dyn Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = file_store(&temp.path().join("state"))?;
+        let service = ConversationDeletionService::new(temp.path().join("deletions"));
+        let id = "precommit-resume";
+        store.create_conversation(conversation(id)).await?;
+        let path = service.tombstone_path(id);
+        let mut tombstone = DeletionTombstone::new(id);
+        tombstone.completed.insert(DeletionStep::AgentRouter);
+        service.persist_tombstone(&path, &tombstone)?;
+        let (router, deliveries) = router_context(temp.path());
+        let target = crate::agent_router::AgentAddress::new(
+            crate::workspace::WorkspaceId::from_raw("global".to_string()),
+            id,
+        );
+        router
+            .enqueue(crate::agent_router::AgentMessage::user_text(
+                None,
+                target.clone(),
+                "partial deletion",
+            ))
+            .await?;
+        drop(router.retire_target(target.clone()).await?);
+
+        let receipts = service
+            .recover_committed_deletions(recovery_context(
+                temp.path(),
+                store.clone(),
+                None,
+                router.clone(),
+                deliveries,
+            )?)
+            .await?;
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts.first().is_some_and(|receipt| receipt.resumed));
+        assert!(store.get_conversation(id).await?.is_none());
+        assert!(!path.exists());
+        assert!(router.records(&target).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn commit_started_with_missing_authority_recovers_cleanup_only()
     -> Result<(), Box<dyn Error>> {
         let temp = tempfile::tempdir()?;
@@ -1365,9 +1552,16 @@ mod tests {
             .completed
             .insert(DeletionStep::ConversationCommitStarted);
         service.persist_tombstone(&path, &tombstone)?;
+        let (router, deliveries) = router_context(temp.path());
 
         let receipts = service
-            .recover_committed_deletions(store.clone(), None, None, None)
+            .recover_committed_deletions(recovery_context(
+                temp.path(),
+                store.clone(),
+                None,
+                router,
+                deliveries,
+            )?)
             .await?;
         let receipt = receipts.first().ok_or_else(|| {
             std::io::Error::other("committed deletion did not produce a recovery receipt")
@@ -1393,9 +1587,16 @@ mod tests {
             .completed
             .insert(DeletionStep::ConversationCommitStarted);
         service.persist_tombstone(&path, &tombstone)?;
+        let (router, deliveries) = router_context(temp.path());
 
         let error = service
-            .recover_committed_deletions(store.clone(), None, None, None)
+            .recover_committed_deletions(recovery_context(
+                temp.path(),
+                store.clone(),
+                None,
+                router,
+                deliveries,
+            )?)
             .await
             .err()
             .ok_or_else(|| std::io::Error::other("ambiguous authority was accepted"))?;
@@ -1432,9 +1633,16 @@ mod tests {
             .completed
             .insert(DeletionStep::ConversationCommitStarted);
         service.persist_tombstone(&path, &tombstone)?;
+        let (router, deliveries) = router_context(temp.path());
 
         let receipts = service
-            .recover_committed_deletions(store.clone(), Some(runtime_state.clone()), None, None)
+            .recover_committed_deletions(recovery_context(
+                temp.path(),
+                store.clone(),
+                Some(runtime_state.clone()),
+                router,
+                deliveries,
+            )?)
             .await?;
         assert_eq!(receipts.len(), 1);
         assert!(store.get_conversation(id).await?.is_none());
@@ -1460,6 +1668,7 @@ mod tests {
         let id = "active-conversation";
         store.create_conversation(conversation(id)).await?;
         let lease = turns.begin(ForegroundTurnSurface::Gui, id, "active-turn")?;
+        let (router, deliveries) = router_context(temp.path());
 
         let error = service
             .delete(
@@ -1472,6 +1681,8 @@ mod tests {
                 events,
                 None,
                 &turns,
+                router,
+                deliveries,
                 None,
                 crate::state::ScopedWorkspaceIoReceipt::global_for_test(temp.path()),
             )
@@ -1503,6 +1714,7 @@ mod tests {
         let turns = ForegroundTurnControl::default();
         let id = "delete-complete";
         store.create_conversation(conversation(id)).await?;
+        let (router, deliveries) = router_context(temp.path());
 
         let receipt = service
             .delete(
@@ -1515,6 +1727,8 @@ mod tests {
                 events,
                 None,
                 &turns,
+                router,
+                deliveries,
                 None,
                 crate::state::ScopedWorkspaceIoReceipt::global_for_test(temp.path()),
             )
@@ -1546,6 +1760,7 @@ mod tests {
         let id = "delete-reopen-retry";
         store.create_conversation(conversation(id)).await?;
         first.fail_next_io(DeletionIoFault::RemoveFileBarrier);
+        let (router, deliveries) = router_context(temp.path());
         let first_receipt = first
             .delete(
                 "global",
@@ -1557,6 +1772,8 @@ mod tests {
                 events.clone(),
                 None,
                 &turns,
+                router,
+                deliveries,
                 None,
                 crate::state::ScopedWorkspaceIoReceipt::global_for_test(temp.path()),
             )
@@ -1572,6 +1789,7 @@ mod tests {
             temp.path().join("deletions"),
             crate::product_data_io::ProductDataIoService::new(),
         );
+        let (router, deliveries) = router_context(temp.path());
         let reopened_receipt = reopened
             .delete(
                 "global",
@@ -1583,6 +1801,8 @@ mod tests {
                 events,
                 None,
                 &turns,
+                router,
+                deliveries,
                 None,
                 crate::state::ScopedWorkspaceIoReceipt::global_for_test(temp.path()),
             )
@@ -1647,6 +1867,7 @@ mod tests {
         let delete_tools = tools.clone();
         let delete_events = events.clone();
         let delete_turns = turns.clone();
+        let (delete_router, delete_deliveries) = router_context(temp.path());
         let workspace_receipt =
             crate::state::ScopedWorkspaceIoReceipt::global_for_test(temp.path());
         let deletion = tokio::spawn(async move {
@@ -1661,6 +1882,8 @@ mod tests {
                     delete_events,
                     Some(delete_runtime_state),
                     delete_turns.as_ref(),
+                    delete_router,
+                    delete_deliveries,
                     None,
                     workspace_receipt,
                 )
@@ -1813,6 +2036,18 @@ mod tests {
             .ok_or_else(|| std::io::Error::other("user-input fixture has no parent"))?;
         fs::create_dir_all(user_input_parent)?;
         fs::write(&user_input, b"durable user input")?;
+        let (router, deliveries) = router_context(temp.path());
+        let inbox_target = crate::agent_router::AgentAddress::new(
+            crate::workspace::WorkspaceId::from_raw("global".to_string()),
+            id,
+        );
+        router
+            .enqueue(crate::agent_router::AgentMessage::user_text(
+                None,
+                inbox_target.clone(),
+                "delete this inbox",
+            ))
+            .await?;
 
         let receipt = service
             .delete(
@@ -1825,6 +2060,8 @@ mod tests {
                 events.clone(),
                 Some(runtime_state.clone()),
                 &turns,
+                router.clone(),
+                deliveries,
                 Some(artifact_config),
                 crate::state::ScopedWorkspaceIoReceipt::global_for_test(temp.path()),
             )
@@ -1847,6 +2084,7 @@ mod tests {
             assert!(pool.lease_existing(runtime_id).await?.is_none());
         }
         assert!(runtime_state.runtime_state_ids(id).await?.is_empty());
+        assert!(router.records(&inbox_target).await?.is_empty());
         assert!(!tool_artifact.path.exists());
         assert!(!user_input.exists());
         assert!(!service.tombstone_path(id).exists());

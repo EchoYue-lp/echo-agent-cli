@@ -3770,7 +3770,10 @@ async fn aggregate_by_sentence_with_repository<'a>(
                         .unwrap_or_else(|| "Awaiter result is unavailable".to_string());
                     yield ChannelOutboundDraft::ordinary(message);
                 }
-                ChannelRenderEvent::Driver(ChatDriverEvent::AwaiterResultAcknowledged { .. }) => {}
+                ChannelRenderEvent::Driver(
+                    ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
+                    | ChatDriverEvent::AwaiterResultAcknowledged { .. },
+                ) => {}
                 ChannelRenderEvent::Driver(ChatDriverEvent::ApprovalRequest {
                     request_id,
                     tool_name,

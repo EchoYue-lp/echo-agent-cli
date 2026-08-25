@@ -82,6 +82,7 @@ describe('AgentMessageDialog', () => {
         status: 'queued',
         accepted_at: '2026-08-21T00:00:00Z',
         duplicate: false,
+        durability: { status: 'confirmed' },
       },
     });
     mocks.createGroup.mockResolvedValue({

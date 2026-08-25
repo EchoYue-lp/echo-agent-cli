@@ -102,12 +102,20 @@ pub struct AwaiterResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AwaiterDeliveryOutcome {
+    Drained,
+    OutcomeUnknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AwaiterResultAcknowledgement {
     pub execution_id: String,
     pub attempt: u32,
     pub watch_generation: u64,
     pub cell_id: String,
     pub acknowledged_turn_id: String,
+    pub outcome: AwaiterDeliveryOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -125,6 +133,7 @@ pub enum AwaiterSurfaceProjection {
         execution_id: String,
         cell_id: String,
         acknowledged_turn_id: String,
+        outcome: AwaiterDeliveryOutcome,
     },
 }
 
@@ -140,8 +149,16 @@ impl AwaiterSurfaceProjection {
             Self::Acknowledged {
                 execution_id,
                 acknowledged_turn_id,
+                outcome,
                 ..
-            } => format!("Awaiter {execution_id} delivered to turn {acknowledged_turn_id}"),
+            } => match outcome {
+                AwaiterDeliveryOutcome::Drained => {
+                    format!("Awaiter {execution_id} delivered to turn {acknowledged_turn_id}")
+                }
+                AwaiterDeliveryOutcome::OutcomeUnknown => format!(
+                    "Awaiter {execution_id} delivery to turn {acknowledged_turn_id} is indeterminate"
+                ),
+            },
         }
     }
 }
@@ -165,6 +182,7 @@ pub fn project_awaiter_surface_event(
                 execution_id: acknowledgement.execution_id.clone(),
                 cell_id: acknowledgement.cell_id.clone(),
                 acknowledged_turn_id: acknowledgement.acknowledged_turn_id.clone(),
+                outcome: acknowledgement.outcome.clone(),
             })
         }
         _ => None,
@@ -183,6 +201,24 @@ struct AwaiterRuntimeState {
     active: HashMap<AwaiterWatchKey, ActiveAwaiterWatch>,
     latest: HashMap<AwaiterWatchKey, AwaiterWatchReceipt>,
     settled_order: VecDeque<(AwaiterWatchKey, u64)>,
+}
+
+#[derive(Default)]
+struct AwaiterRecoveryState {
+    completed: bool,
+    running: Option<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
+}
+
+#[cfg(test)]
+struct AwaiterRecoveryTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct AwaiterStartedTestBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -218,6 +254,13 @@ pub struct CommandCellRuntimeService {
     >,
     foreground_turns: RwLock<Option<crate::foreground_turn::ForegroundTurnControl>>,
     framework_shutdown: Mutex<Option<FrameworkShutdownSettlement>>,
+    awaiter_recovery: tokio::sync::Mutex<AwaiterRecoveryState>,
+    #[cfg(test)]
+    awaiter_recovery_barrier: Mutex<Option<AwaiterRecoveryTestBarrier>>,
+    #[cfg(test)]
+    awaiter_recovery_failures: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    awaiter_started_barrier: Mutex<Option<AwaiterStartedTestBarrier>>,
 }
 
 impl CommandCellRuntimeService {
@@ -230,7 +273,7 @@ impl CommandCellRuntimeService {
         let product_data_flow = product_data_io
             .begin_owned_flow("command-cell product-data projection")
             .map_err(|error| error.to_string())?;
-        Ok(Arc::new(Self {
+        let service = Arc::new(Self {
             inner: Arc::new(BackgroundCommandManager::new_with_sandbox(
                 BackgroundCommandManagerConfig::default(),
                 executor,
@@ -249,7 +292,142 @@ impl CommandCellRuntimeService {
             awaiter_agents: RwLock::new(HashMap::new()),
             foreground_turns: RwLock::new(None),
             framework_shutdown: Mutex::new(None),
-        }))
+            awaiter_recovery: tokio::sync::Mutex::new(AwaiterRecoveryState::default()),
+            #[cfg(test)]
+            awaiter_recovery_barrier: Mutex::new(None),
+            #[cfg(test)]
+            awaiter_recovery_failures: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            awaiter_started_barrier: Mutex::new(None),
+        });
+        service.spawn_started_awaiter_recovery();
+        Ok(service)
+    }
+
+    fn spawn_started_awaiter_recovery(self: &Arc<Self>) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let service = Arc::clone(self);
+        let observers = self.observers.clone();
+        drop(observers.spawn_on(
+            async move {
+                if let Err(error) = service.ensure_awaiter_recovery().await {
+                    tracing::warn!(%error, "Awaiter DeliveryStarted recovery remains pending");
+                }
+            },
+            &runtime,
+        ));
+    }
+
+    async fn ensure_awaiter_recovery(self: &Arc<Self>) -> Result<(), String> {
+        let mut receipt = {
+            let mut recovery = self.awaiter_recovery.lock().await;
+            if recovery.completed {
+                return Ok(());
+            }
+            match recovery.running.as_ref() {
+                Some(running) => running.clone(),
+                None => {
+                    if self.shutdown.is_cancelled() {
+                        return Err(
+                            "Awaiter boot recovery is unavailable during shutdown".to_string()
+                        );
+                    }
+                    let (settled, receipt) = tokio::sync::watch::channel(None);
+                    recovery.running = Some(receipt.clone());
+                    let owner = Arc::downgrade(self);
+                    let chat_events = self.chat_events.clone();
+                    let observers = self.observers.clone();
+                    drop(observers.spawn(async move {
+                        #[cfg(test)]
+                        if let Some(owner) = owner.upgrade() {
+                            let barrier = owner
+                                .awaiter_recovery_barrier
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .take();
+                            if let Some(barrier) = barrier {
+                                let _ = barrier.entered.send(());
+                                let _ = barrier.release.await;
+                            }
+                        }
+                        #[cfg(test)]
+                        let injected_failure = owner.upgrade().is_some_and(|owner| {
+                            owner
+                                .awaiter_recovery_failures
+                                .fetch_update(
+                                    std::sync::atomic::Ordering::AcqRel,
+                                    std::sync::atomic::Ordering::Acquire,
+                                    |remaining| remaining.checked_sub(1),
+                                )
+                                .is_ok()
+                        });
+                        #[cfg(not(test))]
+                        let injected_failure = false;
+                        let result = if injected_failure {
+                            Err("injected Awaiter boot recovery failure".to_string())
+                        } else {
+                            chat_events
+                                .settle_all_started_awaiter_deliveries_async()
+                                .await
+                                .map(|_| ())
+                                .map_err(|error| error.to_string())
+                        };
+                        if let Some(owner) = owner.upgrade() {
+                            let mut recovery = owner.awaiter_recovery.lock().await;
+                            recovery.completed = result.is_ok();
+                            recovery.running = None;
+                            match &result {
+                                Ok(()) => owner.clear_projection_degraded("awaiter-recovery"),
+                                Err(error) => owner
+                                    .mark_projection_degraded("awaiter-recovery", error.clone()),
+                            }
+                        }
+                        let _ = settled.send(Some(result));
+                    }));
+                    receipt
+                }
+            }
+        };
+        loop {
+            if let Some(result) = receipt.borrow().clone() {
+                return result;
+            }
+            receipt.changed().await.map_err(|_| {
+                "Awaiter boot recovery owner closed without a typed receipt".to_string()
+            })?;
+        }
+    }
+
+    #[cfg(test)]
+    async fn reset_awaiter_recovery_for_test(&self, barrier: Option<AwaiterRecoveryTestBarrier>) {
+        let mut recovery = self.awaiter_recovery.lock().await;
+        recovery.completed = false;
+        recovery.running = None;
+        *self
+            .awaiter_recovery_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = barrier;
+    }
+
+    #[cfg(test)]
+    fn fail_next_awaiter_recovery_for_test(&self) {
+        self.awaiter_recovery_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    #[cfg(test)]
+    async fn wait_after_awaiter_started_for_test(&self) {
+        let barrier = self
+            .awaiter_started_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.entered.send(());
+            let _ = barrier.release.await;
+        }
     }
 
     pub fn chat_events(&self) -> Arc<crate::chat_event_log::ChatEventLog> {
@@ -822,6 +1000,7 @@ impl CommandCellRuntimeService {
                 drop(permit);
                 let settled_receipt =
                     service.mark_awaiter_joined(&key, &receipt_for_task, &join_result);
+                let settled_execution_id = settled_receipt.execution_id.clone();
                 match observe_awaiter_cell_truth(registry, base_cell, true, &service.shutdown).await
                 {
                     Ok(Some(cell)) => {
@@ -835,13 +1014,15 @@ impl CommandCellRuntimeService {
                             })
                             .await
                         {
+                            service.mark_projection_degraded(&settled_execution_id, error.clone());
                             tracing::error!(%error, "Awaiter result publication remained degraded");
                         }
                     }
                     Ok(None) => {}
                     Err(error) => {
+                        service.mark_projection_degraded(&settled_execution_id, error.clone());
                         tracing::warn!(
-                            execution_id = settled_receipt.execution_id,
+                            execution_id = settled_execution_id,
                             %error,
                             "Awaiter joined but runtime cell truth could not be observed"
                         );
@@ -964,6 +1145,7 @@ impl CommandCellRuntimeService {
     }
 
     async fn publish_awaiter_result(self: &Arc<Self>, result: AwaiterResult) -> Result<(), String> {
+        self.ensure_awaiter_recovery().await?;
         let mut delay = Duration::from_millis(50);
         let mut attempt = 0_u64;
         loop {
@@ -1037,92 +1219,173 @@ impl CommandCellRuntimeService {
                 &result.receipt.workspace_id,
                 &result.receipt.conversation_id,
             ),
-        ) && let Ok(acknowledged_turn_id) = agent
-            .steer_input(
-                Some(&snapshot.active_turn_id),
-                echo_agent::llm::types::Message::user(instruction),
-            )
-            .await
-        {
-            self.acknowledge_awaiter_result(&result, acknowledged_turn_id)
-                .await;
+        ) {
+            let mut acknowledgement = AwaiterResultAcknowledgement {
+                execution_id: result.receipt.execution_id.clone(),
+                attempt: result.receipt.attempt,
+                watch_generation: result.receipt.watch_generation,
+                cell_id: result.receipt.cell_id.clone(),
+                acknowledged_turn_id: snapshot.active_turn_id.clone(),
+                outcome: AwaiterDeliveryOutcome::OutcomeUnknown,
+            };
+            self.persist_awaiter_delivery_fact(&result, "DeliveryStarted", || {
+                crate::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+                    acknowledgement: acknowledgement.clone(),
+                }
+            })
+            .await?;
+            #[cfg(test)]
+            self.wait_after_awaiter_started_for_test().await;
+            let mut steer = match agent
+                .steer_input_tracked(
+                    Some(&snapshot.active_turn_id),
+                    echo_agent::llm::types::Message::user(instruction),
+                )
+                .await
+            {
+                Ok(steer) => steer,
+                Err(_) => {
+                    self.persist_awaiter_delivery_fact(&result, "Acknowledged", || {
+                        crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+                            acknowledgement: acknowledgement.clone(),
+                        }
+                    })
+                    .await?;
+                    return Ok(());
+                }
+            };
+            let state = tokio::select! {
+                _ = self.shutdown.cancelled() => None,
+                state = steer.wait_for_drained() => Some(state),
+            };
+            if state.is_some_and(|state| state.was_drained()) {
+                acknowledgement.acknowledged_turn_id = steer.turn_id().to_string();
+                acknowledgement.outcome = AwaiterDeliveryOutcome::Drained;
+            }
+            self.persist_awaiter_delivery_fact(&result, "Acknowledged", || {
+                crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+                    acknowledgement: acknowledgement.clone(),
+                }
+            })
+            .await?;
         }
         Ok(())
     }
 
-    fn acknowledge_awaiter_result_sync(
-        chat_events: &crate::chat_event_log::ChatEventLog,
-        result: &AwaiterResult,
-        acknowledged_turn_id: String,
-    ) {
-        let acknowledgement = AwaiterResultAcknowledgement {
-            execution_id: result.receipt.execution_id.clone(),
-            attempt: result.receipt.attempt,
-            watch_generation: result.receipt.watch_generation,
-            cell_id: result.receipt.cell_id.clone(),
-            acknowledged_turn_id,
-        };
-        if let Err(error) = chat_events.append(
-            &result.receipt.workspace_id,
-            Some(&result.receipt.conversation_id),
-            &result.receipt.root_turn_id,
-            crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement },
-        ) {
-            tracing::warn!(
-                execution_id = result.receipt.execution_id,
-                %error,
-                "Awaiter handoff was accepted but acknowledgement persistence failed"
-            );
-        }
-    }
-
-    async fn acknowledge_awaiter_result(
+    async fn persist_awaiter_delivery_fact<F>(
         &self,
         result: &AwaiterResult,
-        acknowledged_turn_id: String,
-    ) {
-        let chat_events = self.chat_events.clone();
-        let result = result.clone();
-        if let Err(error) = self
-            .product_data_flow
-            .run("acknowledge Awaiter result", move || {
-                Self::acknowledge_awaiter_result_sync(&chat_events, &result, acknowledged_turn_id);
-            })
-            .await
-        {
-            tracing::warn!(%error, "Awaiter acknowledgement task failed");
+        fact: &'static str,
+        event: F,
+    ) -> Result<(), String>
+    where
+        F: Fn() -> crate::chat_driver::ChatDriverEvent,
+    {
+        let mut delay = Duration::from_millis(50);
+        for attempt in 1..=MAX_PROJECTION_REPAIR_ATTEMPTS {
+            let chat_events = self.chat_events.clone();
+            let workspace_id = result.receipt.workspace_id.clone();
+            let conversation_id = result.receipt.conversation_id.clone();
+            let root_turn_id = result.receipt.root_turn_id.clone();
+            let durable_event = event();
+            let persisted = self
+                .product_data_flow
+                .run("persist Awaiter delivery fact", move || {
+                    chat_events.append(
+                        &workspace_id,
+                        Some(&conversation_id),
+                        &root_turn_id,
+                        durable_event,
+                    )
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result.map(|_| ()).map_err(|error| error.to_string()));
+            match persisted {
+                Ok(()) => {
+                    self.clear_projection_degraded(&result.receipt.execution_id);
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.mark_projection_degraded(&result.receipt.execution_id, error.clone());
+                    tracing::warn!(
+                        execution_id = result.receipt.execution_id,
+                        attempt,
+                        %error,
+                        fact,
+                        "retrying Awaiter delivery fact persistence"
+                    );
+                    if attempt >= MAX_PROJECTION_REPAIR_ATTEMPTS {
+                        return Err(format!(
+                            "Awaiter '{}' {fact} persistence exhausted its repair budget: {error}",
+                            result.receipt.execution_id
+                        ));
+                    }
+                    tokio::select! {
+                        _ = self.shutdown.cancelled() => {
+                            return Err(format!("Awaiter {fact} persistence stopped during shutdown"));
+                        }
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    delay = delay.saturating_mul(2).min(Duration::from_secs(1));
+                }
+            }
         }
+        Err(format!("Awaiter {fact} persistence did not settle"))
     }
 
     pub(crate) async fn project_pending_awaiter_results(
-        &self,
+        self: &Arc<Self>,
         workspace_id: &str,
         conversation_id: &str,
         turn_id: &str,
     ) -> Result<Option<String>, String> {
+        self.ensure_awaiter_recovery().await?;
         let chat_events = self.chat_events.clone();
-        let workspace_id = workspace_id.to_string();
-        let conversation_id = conversation_id.to_string();
-        let turn_id = turn_id.to_string();
-        self.product_data_flow
+        let pending_workspace_id = workspace_id.to_string();
+        let pending_conversation_id = conversation_id.to_string();
+        let pending = self
+            .product_data_flow
             .run("project pending Awaiter results", move || {
-                let pending = chat_events
-                    .pending_awaiter_results_for_conversation(&workspace_id, &conversation_id)
-                    .map_err(|error| error.to_string())?;
-                if pending.is_empty() {
-                    return Ok(None);
-                }
-                let mut rendered = String::from("[pending_awaiter_results]\n");
-                for result in &pending {
-                    rendered.push_str(&render_awaiter_handoff(result));
-                    rendered.push('\n');
-                    Self::acknowledge_awaiter_result_sync(&chat_events, result, turn_id.clone());
-                }
-                rendered.push_str("[/pending_awaiter_results]");
-                Ok(Some(rendered))
+                chat_events
+                    .pending_awaiter_results_for_conversation(
+                        &pending_workspace_id,
+                        &pending_conversation_id,
+                    )
+                    .map_err(|error| error.to_string())
             })
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())??;
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let mut rendered = String::from("[pending_awaiter_results]\n");
+        for result in &pending {
+            rendered.push_str(&render_awaiter_handoff(result));
+            rendered.push('\n');
+            let acknowledgement = AwaiterResultAcknowledgement {
+                execution_id: result.receipt.execution_id.clone(),
+                attempt: result.receipt.attempt,
+                watch_generation: result.receipt.watch_generation,
+                cell_id: result.receipt.cell_id.clone(),
+                acknowledged_turn_id: turn_id.to_string(),
+                outcome: AwaiterDeliveryOutcome::OutcomeUnknown,
+            };
+            self.persist_awaiter_delivery_fact(result, "DeliveryStarted", || {
+                crate::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+                    acknowledgement: acknowledgement.clone(),
+                }
+            })
+            .await?;
+            self.persist_awaiter_delivery_fact(result, "Acknowledged", || {
+                crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+                    acknowledgement: acknowledgement.clone(),
+                }
+            })
+            .await?;
+        }
+        rendered.push_str("[/pending_awaiter_results]");
+        Ok(Some(rendered))
     }
 
     pub(crate) fn stop_run(&self, workspace_id: &str, run_id: &str) -> usize {
@@ -1889,16 +2152,29 @@ async fn observe_awaiter_cell_truth(
 ) -> Result<Option<BackgroundCellState>, String> {
     let mut cursor = 0_u64;
     let mut excerpt = String::new();
+    let mut shutdown_seen = false;
     loop {
-        let yield_ms = if wait_for_terminal {
+        let yield_ms = if shutdown_seen {
+            100
+        } else if wait_for_terminal {
             OBSERVER_YIELD_MS
         } else {
             0
         };
-        let delta = tokio::select! {
-            _ = shutdown.cancelled() => return Err("command-cell runtime is shutting down".to_string()),
-            delta = registry.wait(&cell.cell_id, cursor, yield_ms) => {
-                delta.map_err(|error| error.to_string())?
+        let delta = if shutdown_seen {
+            registry
+                .wait(&cell.cell_id, cursor, yield_ms)
+                .await
+                .map_err(|error| error.to_string())?
+        } else {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    shutdown_seen = true;
+                    continue;
+                }
+                delta = registry.wait(&cell.cell_id, cursor, yield_ms) => {
+                    delta.map_err(|error| error.to_string())?
+                }
             }
         };
         push_tail(&mut excerpt, &delta.new_output, OUTPUT_EXCERPT_CHARS);
@@ -2363,6 +2639,10 @@ mod tests {
             awaiter_agents: RwLock::new(HashMap::new()),
             foreground_turns: RwLock::new(None),
             framework_shutdown: Mutex::new(None),
+            awaiter_recovery: tokio::sync::Mutex::new(AwaiterRecoveryState::default()),
+            awaiter_recovery_barrier: Mutex::new(None),
+            awaiter_recovery_failures: std::sync::atomic::AtomicUsize::new(0),
+            awaiter_started_barrier: Mutex::new(None),
         }))
     }
 
@@ -2412,6 +2692,388 @@ mod tests {
         }
     }
 
+    fn recovery_barrier() -> (
+        AwaiterRecoveryTestBarrier,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            AwaiterRecoveryTestBarrier {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    fn started_barrier() -> (
+        AwaiterStartedTestBarrier,
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        (
+            AwaiterStartedTestBarrier {
+                entered: entered_tx,
+                release: release_rx,
+            },
+            entered_rx,
+            release_tx,
+        )
+    }
+
+    async fn accepted_awaiter_fixture(
+        root: &std::path::Path,
+    ) -> Result<
+        (
+            Arc<CommandCellRuntimeService>,
+            AwaiterWatchReceipt,
+            Arc<TaskRuntimeStore>,
+        ),
+        String,
+    > {
+        let service = test_service(root)?;
+        service.ensure_awaiter_recovery().await?;
+        let scope = crate::workspace::WorkspaceExecutionScope::global(root);
+        let store = Arc::new(
+            TaskRuntimeStore::open_for_workspace(root.join("tasks"), "global")
+                .map_err(|error| error.to_string())?,
+        );
+        let registry = service.scoped(scope.clone(), Some(store.clone()));
+        let cell_id = registry
+            .launch(CommandCellRequest {
+                command: "sleep 30".to_string(),
+                owner: CommandCellOwner {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await
+            .map(|receipt| receipt.cell_id)
+            .map_err(|error| error.to_string())?;
+        let mut parent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("awaiter-shutdown-fixture")
+            .build()
+            .map_err(|error| error.to_string())?;
+        parent.register_subagent_with_definition(
+            echo_agent::agent::subagent::SubagentBuilder::new("awaiter")
+                .description("shutdown fixture")
+                .background()
+                .build(),
+            Box::new(echo_agent::testing::MockAgent::new("awaiter").with_response("joined")),
+        );
+        let receipt = service
+            .watch_cell(
+                registry,
+                parent.subagent_executor().clone(),
+                &scope,
+                &ToolContext {
+                    conversation_id: Some("conversation".to_string()),
+                    message_id: Some("root-message".to_string()),
+                    turn_id: Some("turn".to_string()),
+                    ..ToolContext::default()
+                },
+                &cell_id,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((service, receipt, store))
+    }
+
+    #[tokio::test]
+    async fn boot_recovery_settles_only_the_preexisting_started_awaiter() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        let result = awaiter_result("boot-orphan", "boot-cell");
+        let acknowledgement = AwaiterResultAcknowledgement {
+            execution_id: result.receipt.execution_id.clone(),
+            attempt: result.receipt.attempt,
+            watch_generation: result.receipt.watch_generation,
+            cell_id: result.receipt.cell_id.clone(),
+            acknowledged_turn_id: "orphan-turn".to_string(),
+            outcome: AwaiterDeliveryOutcome::OutcomeUnknown,
+        };
+        service
+            .chat_events
+            .append(
+                "global",
+                Some("conversation"),
+                "root-message",
+                crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+                    result: Box::new(result),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        service
+            .chat_events
+            .append(
+                "global",
+                Some("conversation"),
+                "root-message",
+                crate::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+                    acknowledgement: acknowledgement.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        service.ensure_awaiter_recovery().await?;
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement: ack }
+                if ack == &acknowledgement
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publish_waits_for_boot_recovery_readiness() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        service.ensure_awaiter_recovery().await?;
+        let (barrier, entered, release) = recovery_barrier();
+        service.reset_awaiter_recovery_for_test(Some(barrier)).await;
+        let publisher = service.clone();
+        let publishing = tokio::spawn(async move {
+            publisher
+                .publish_awaiter_result(awaiter_result("blocked-publish", "blocked-cell"))
+                .await
+        });
+        entered
+            .await
+            .map_err(|_| "Awaiter recovery did not reach its barrier".to_string())?;
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(replay.events.is_empty());
+        release
+            .send(())
+            .map_err(|_| "Awaiter recovery release was dropped".to_string())?;
+        publishing.await.map_err(|error| error.to_string())??;
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(replay.events.iter().any(|event| matches!(
+            event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultReady { .. }
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn per_turn_projection_never_acknowledges_a_live_started_delivery() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        service.ensure_awaiter_recovery().await?;
+        let result = awaiter_result("live-started", "live-cell");
+        let mut acknowledgement = AwaiterResultAcknowledgement {
+            execution_id: result.receipt.execution_id.clone(),
+            attempt: result.receipt.attempt,
+            watch_generation: result.receipt.watch_generation,
+            cell_id: result.receipt.cell_id.clone(),
+            acknowledged_turn_id: "live-turn".to_string(),
+            outcome: AwaiterDeliveryOutcome::OutcomeUnknown,
+        };
+        for event in [
+            crate::chat_driver::ChatDriverEvent::AwaiterResultReady {
+                result: Box::new(result),
+            },
+            crate::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+                acknowledgement: acknowledgement.clone(),
+            },
+        ] {
+            service
+                .chat_events
+                .append("global", Some("conversation"), "root-message", event)
+                .map_err(|error| error.to_string())?;
+        }
+        assert!(
+            service
+                .project_pending_awaiter_results("global", "conversation", "another-turn")
+                .await?
+                .is_none()
+        );
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(!replay.events.iter().any(|event| matches!(
+            event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { .. }
+        )));
+
+        acknowledgement.outcome = AwaiterDeliveryOutcome::Drained;
+        service
+            .chat_events
+            .append(
+                "global",
+                Some("conversation"),
+                "root-message",
+                crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
+                    acknowledgement: acknowledgement.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            replay
+                .events
+                .iter()
+                .filter(|event| matches!(
+                    &event.payload,
+                    crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement: ack }
+                        if ack == &acknowledgement
+                ))
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_delivery_started_is_acknowledged_by_the_publish_owner()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        service.ensure_awaiter_recovery().await?;
+        let turns = crate::foreground_turn::ForegroundTurnControl::default();
+        let lease = turns
+            .begin(
+                crate::foreground_turn::ForegroundTurnSurface::Gui,
+                "conversation",
+                "root-message",
+            )
+            .map_err(|error| error.to_string())?;
+        service.bind_foreground_turns(turns);
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("awaiter-shutdown-test")
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        service.bind_agent("global", "conversation", &agent);
+        let (barrier, entered, release) = started_barrier();
+        *service
+            .awaiter_started_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(barrier);
+        let publisher = service.clone();
+        let publishing = tokio::spawn(async move {
+            publisher
+                .publish_awaiter_result(awaiter_result("shutdown-started", "shutdown-cell"))
+                .await
+        });
+        entered
+            .await
+            .map_err(|_| "publish owner did not persist DeliveryStarted".to_string())?;
+        service.begin_shutdown()?;
+        release
+            .send(())
+            .map_err(|_| "publish owner Started barrier was dropped".to_string())?;
+        publishing.await.map_err(|error| error.to_string())??;
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement }
+                if acknowledgement.execution_id == "shutdown-started"
+                    && acknowledgement.outcome == AwaiterDeliveryOutcome::OutcomeUnknown
+        )));
+        lease.settle(crate::chat_driver::TurnOutcome::Cancelled);
+        service.shutdown().await
+    }
+
+    #[tokio::test]
+    async fn accepted_awaiter_drains_framework_terminal_and_persists_ready_during_shutdown()
+    -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (service, receipt, _store) = accepted_awaiter_fixture(temp.path()).await?;
+        service.begin_shutdown()?;
+        service.shutdown().await?;
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultReady { result }
+                if result.receipt.execution_id == receipt.execution_id
+                    && result.cell.phase.is_terminal()
+                    && result.cell.terminal_cause.is_some()
+        )));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accepted_awaiter_publication_failure_becomes_shutdown_debt() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let (service, receipt, _store) = accepted_awaiter_fixture(temp.path()).await?;
+        service.reset_awaiter_recovery_for_test(None).await;
+        service.begin_shutdown()?;
+        let error = service
+            .shutdown()
+            .await
+            .err()
+            .ok_or_else(|| "Awaiter publication debt was silently accepted".to_string())?;
+        assert!(error.contains("command-cell projection debt"));
+        assert!(
+            service
+                .projection_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.cell_id == receipt.execution_id)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovery_failure_retries_and_shutdown_joins_the_owned_recovery() -> Result<(), String>
+    {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let service = test_service(temp.path())?;
+        service.ensure_awaiter_recovery().await?;
+        service.reset_awaiter_recovery_for_test(None).await;
+        service.fail_next_awaiter_recovery_for_test();
+        assert!(service.ensure_awaiter_recovery().await.is_err());
+        service.ensure_awaiter_recovery().await?;
+
+        let (barrier, entered, release) = recovery_barrier();
+        service.reset_awaiter_recovery_for_test(Some(barrier)).await;
+        let recovering_service = service.clone();
+        let recovering =
+            tokio::spawn(async move { recovering_service.ensure_awaiter_recovery().await });
+        entered
+            .await
+            .map_err(|_| "shutdown recovery did not reach its barrier".to_string())?;
+        service.begin_shutdown()?;
+        let shutdown_service = service.clone();
+        let shutdown = tokio::spawn(async move { shutdown_service.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        release
+            .send(())
+            .map_err(|_| "shutdown recovery release was dropped".to_string())?;
+        recovering.await.map_err(|error| error.to_string())??;
+        shutdown.await.map_err(|error| error.to_string())?
+    }
+
     #[tokio::test]
     async fn awaiter_ready_is_idempotent_and_acknowledgement_clears_pending() -> Result<(), String>
     {
@@ -2440,9 +3102,34 @@ mod tests {
             Some(BackgroundCellPhase::Succeeded)
         );
 
+        let acknowledgement = AwaiterResultAcknowledgement {
+            execution_id: result.receipt.execution_id.clone(),
+            attempt: result.receipt.attempt,
+            watch_generation: result.receipt.watch_generation,
+            cell_id: result.receipt.cell_id.clone(),
+            acknowledged_turn_id: "next-turn".to_string(),
+            outcome: AwaiterDeliveryOutcome::Drained,
+        };
         service
-            .acknowledge_awaiter_result(&result, "next-turn".to_string())
-            .await;
+            .chat_events
+            .append(
+                "global",
+                Some("conversation"),
+                "root-message",
+                crate::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+                    acknowledgement: acknowledgement.clone(),
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        service
+            .chat_events
+            .append(
+                "global",
+                Some("conversation"),
+                "root-message",
+                crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement },
+            )
+            .map_err(|error| error.to_string())?;
         let pending = service
             .chat_events
             .pending_awaiter_results("global", "conversation", "root-message")
@@ -2475,6 +3162,7 @@ mod tests {
                 watch_generation: 1,
                 cell_id: result.cell.cell_id,
                 acknowledged_turn_id: "safe-turn".to_string(),
+                outcome: AwaiterDeliveryOutcome::Drained,
             },
         };
         assert_eq!(
@@ -2483,6 +3171,7 @@ mod tests {
                 execution_id: "awaiter-surface".to_string(),
                 cell_id: "cell-surface".to_string(),
                 acknowledged_turn_id: "safe-turn".to_string(),
+                outcome: AwaiterDeliveryOutcome::Drained,
             })
         );
     }
@@ -2561,6 +3250,25 @@ mod tests {
             .pending_awaiter_results_for_conversation("global", "conversation")
             .map_err(|error| error.to_string())?;
         assert!(pending.is_empty());
+        assert!(
+            service
+                .project_pending_awaiter_results("global", "conversation", "later-turn")
+                .await?
+                .is_none()
+        );
+        let replay = service
+            .chat_events
+            .replay("global", Some("conversation"), "root-message", 0)
+            .map_err(|error| error.to_string())?;
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
+        )));
+        assert!(replay.events.iter().any(|event| matches!(
+            &event.payload,
+            crate::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement }
+                if acknowledgement.outcome == AwaiterDeliveryOutcome::OutcomeUnknown
+        )));
         Ok(())
     }
 

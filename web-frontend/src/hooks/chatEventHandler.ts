@@ -30,6 +30,7 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
     payload.source !== 'command_cell_started' &&
     payload.source !== 'command_cell_settled' &&
     payload.source !== 'awaiter_result_ready' &&
+    payload.source !== 'awaiter_result_delivery_started' &&
     payload.source !== 'awaiter_result_acknowledged'
   ) {
     return;
@@ -114,6 +115,7 @@ export function handleChatEventEnvelope(envelope: ChatEventEnvelope, ctx: EventC
       );
       break;
     }
+    case 'awaiter_result_delivery_started':
     case 'awaiter_result_acknowledged':
       break;
     case 'execution':

@@ -361,6 +361,10 @@ export type ChatDriverEvent =
   | { source: 'command_cell_settled'; event: { cell: BackgroundCellState } }
   | { source: 'awaiter_result_ready'; event: { result: AwaiterResult } }
   | {
+      source: 'awaiter_result_delivery_started';
+      event: { acknowledgement: AwaiterResultAcknowledgement };
+    }
+  | {
       source: 'awaiter_result_acknowledged';
       event: { acknowledgement: AwaiterResultAcknowledgement };
     };
@@ -393,6 +397,7 @@ export interface AwaiterResultAcknowledgement {
   watch_generation: number;
   cell_id: string;
   acknowledged_turn_id: string;
+  outcome: 'drained' | 'outcome_unknown';
 }
 
 export interface ChatEventEnvelope {

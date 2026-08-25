@@ -875,6 +875,9 @@ impl echo_agent_app_core::chat_driver::ChatSink for ReplChatSink {
                 ))
             }
             echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultReady { .. }
+            | echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultDeliveryStarted {
+                ..
+            }
             | echo_agent_app_core::chat_driver::ChatDriverEvent::AwaiterResultAcknowledged {
                 ..
             } => true,

@@ -24,6 +24,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 pub const CHAT_EVENT_SCHEMA_VERSION: u16 = 2;
 const REPLAY_BATCH_SIZE: usize = 4096;
 const MAX_CACHED_STREAMS: usize = 128;
+const PROCESS_CHAT_EVENT_IO_LIMIT: usize = 8;
+static PROCESS_CHAT_EVENT_IO: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(PROCESS_CHAT_EVENT_IO_LIMIT)));
 const MAX_REGISTRY_ENTRIES_BEFORE_PRUNE: usize = MAX_CACHED_STREAMS * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,11 +115,25 @@ struct PersistedChatEvent {
 }
 
 type StreamJournal = SegmentedFileEventJournal<PersistedChatEvent>;
+type StartedAwaiterDelivery = (
+    String,
+    Option<String>,
+    String,
+    crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
+);
 
 #[derive(Debug, Default)]
 struct RetentionPins {
     cursor: u64,
     pending_awaiters: HashMap<String, u64>,
+    started_awaiters: HashMap<
+        String,
+        (
+            u64,
+            crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
+        ),
+    >,
+    active_cells: HashMap<String, u64>,
     queued_inputs: HashMap<String, u64>,
     queued_latest: HashMap<String, u64>,
     queue_order: Vec<String>,
@@ -151,6 +168,8 @@ pub struct ChatEventLog {
     stream_access: Mutex<VecDeque<String>>,
     #[cfg(test)]
     deletion_pause: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
+    #[cfg(test)]
+    orphan_recovery_pause: Option<Arc<(std::sync::Barrier, std::sync::Barrier)>>,
 }
 
 impl std::fmt::Debug for ChatEventLog {
@@ -323,6 +342,80 @@ impl crate::chat_driver::ChatSink for JournaledChatSink {
 }
 
 impl ChatEventLog {
+    pub async fn append_async(
+        self: &Arc<Self>,
+        workspace_id: String,
+        conversation_id: Option<String>,
+        root_turn_id: String,
+        event: ChatDriverEvent,
+    ) -> Result<ChatEventEnvelope, ChatEventLogError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.append(
+                &workspace_id,
+                conversation_id.as_deref(),
+                &root_turn_id,
+                event,
+            )
+        })
+        .await
+        .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
+    }
+
+    pub async fn settle_all_started_awaiter_deliveries_async(
+        self: &Arc<Self>,
+    ) -> Result<usize, ChatEventLogError> {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let recoveries = log.all_started_awaiter_deliveries()?;
+            let mut settled = 0_usize;
+            for (workspace_id, conversation_id, root_turn_id, acknowledgement) in recoveries {
+                log.append(
+                    &workspace_id,
+                    conversation_id.as_deref(),
+                    &root_turn_id,
+                    ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement },
+                )?;
+                settled = settled.saturating_add(1);
+            }
+            Ok(settled)
+        })
+        .await
+        .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
+    }
+
+    pub async fn pending_awaiter_results_for_conversation_async(
+        self: &Arc<Self>,
+        workspace_id: String,
+        conversation_id: String,
+    ) -> Result<Vec<crate::tasks::task_runtime::command_cells::AwaiterResult>, ChatEventLogError>
+    {
+        let permit = PROCESS_CHAT_EVENT_IO
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?;
+        let log = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            log.pending_awaiter_results_for_conversation(&workspace_id, &conversation_id)
+        })
+        .await
+        .map_err(|error| ChatEventLogError::Serialization(error.to_string()))?
+    }
+
     pub fn default_root() -> PathBuf {
         crate::data_root::user_data_path("chat-events")
     }
@@ -335,6 +428,8 @@ impl ChatEventLog {
             stream_access: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             deletion_pause: None,
+            #[cfg(test)]
+            orphan_recovery_pause: None,
         }
     }
 
@@ -359,6 +454,8 @@ impl ChatEventLog {
             stream_access: Mutex::new(VecDeque::new()),
             #[cfg(test)]
             deletion_pause: None,
+            #[cfg(test)]
+            orphan_recovery_pause: None,
         })
     }
 
@@ -413,7 +510,7 @@ impl ChatEventLog {
                 .ok_or_else(|| {
                     corrupt(
                         &path,
-                        format!("cached Awaiter fact {fact_key} is missing at {sequence}"),
+                        format!("cached durable fact {fact_key} is missing at {sequence}"),
                     )
                 })?;
             let expected = echo_agent::utils::canonical_json::canonical_json_bytes(&event)
@@ -425,7 +522,7 @@ impl ChatEventLog {
                 envelope_from_record(record, &path, &selected_stream_id)
             } else {
                 Err(ChatEventLogError::InvalidEvent(format!(
-                    "conflicting Awaiter fact for {fact_key}"
+                    "conflicting durable fact for {fact_key}"
                 )))
             };
         }
@@ -517,6 +614,126 @@ impl ChatEventLog {
         Ok(replay)
     }
 
+    /// Close ordinary-Chat command cells whose process owner disappeared.
+    ///
+    /// TaskRun cells are recovered by `TaskRuntimeStore`; this scans only the
+    /// product chat journal so a Chat turn without a formal run still receives
+    /// one durable Interrupted terminal after an application restart.
+    pub fn recover_orphan_command_cells(&self) -> Result<usize, ChatEventLogError> {
+        struct Recovery {
+            workspace_id: String,
+            conversation_id: Option<String>,
+            root_turn_id: String,
+            cell: crate::tasks::task_runtime::types::BackgroundCellState,
+        }
+
+        let mut recoveries = Vec::new();
+        for stream in self.enumerate_streams()? {
+            let Some(cached) = self.stream_journal(&stream.stream_id, false)? else {
+                continue;
+            };
+            let mut guard = lock_cached_stream(&cached);
+            let Some(authority) = guard.as_mut() else {
+                continue;
+            };
+            let active = authority
+                .pins
+                .active_cells
+                .values()
+                .copied()
+                .collect::<Vec<_>>();
+            for sequence in active {
+                let record = authority
+                    .journal
+                    .replay_after(sequence.saturating_sub(1), 1)
+                    .map_err(|error| journal_error(&stream.path, error))?
+                    .into_iter()
+                    .next()
+                    .filter(|record| record.sequence == sequence)
+                    .ok_or_else(|| {
+                        corrupt(
+                            &stream.path,
+                            format!("active command cell is missing at {sequence}"),
+                        )
+                    })?;
+                validate_persisted_record(&record, &stream.path, Some(&stream.stream_id))?;
+                let ChatDriverEvent::CommandCellStarted { cell } = &record.event.payload else {
+                    return Err(corrupt(
+                        &stream.path,
+                        format!("active command cell pin at {sequence} is not a Started fact"),
+                    ));
+                };
+                let mut cell = cell.as_ref().clone();
+                cell.phase = crate::tasks::task_runtime::types::BackgroundCellPhase::Failed;
+                cell.terminal_cause = Some(
+                    crate::tasks::task_runtime::types::BackgroundCellTerminalCause::Interrupted,
+                );
+                cell.terminal_message =
+                    Some("command cell was interrupted by process restart".to_string());
+                cell.exit_code = None;
+                if cell.artifact_status
+                    == crate::tasks::task_runtime::types::BackgroundCellArtifactStatus::Writing
+                {
+                    cell.artifact_status =
+                        crate::tasks::task_runtime::types::BackgroundCellArtifactStatus::Failed;
+                    cell.artifact_message = Some(
+                        "artifact finalization was interrupted by process restart".to_string(),
+                    );
+                }
+                cell.finished_at = Some(Utc::now());
+                recoveries.push(Recovery {
+                    workspace_id: stream.first.workspace_id.clone(),
+                    conversation_id: stream.first.conversation_id.clone(),
+                    root_turn_id: stream.first.root_turn_id.clone(),
+                    cell,
+                });
+            }
+        }
+
+        let mut recovered = 0_usize;
+        #[cfg(test)]
+        if let Some(pause) = &self.orphan_recovery_pause {
+            pause.0.wait();
+            pause.1.wait();
+        }
+        for recovery in recoveries {
+            let cell_id = recovery.cell.cell_id.clone();
+            let appended = self.append(
+                &recovery.workspace_id,
+                recovery.conversation_id.as_deref(),
+                &recovery.root_turn_id,
+                ChatDriverEvent::CommandCellSettled {
+                    cell: Box::new(recovery.cell),
+                },
+            );
+            match appended {
+                Ok(_) => recovered = recovered.saturating_add(1),
+                Err(ChatEventLogError::InvalidEvent(_)) => {
+                    let replay = self.replay(
+                        &recovery.workspace_id,
+                        recovery.conversation_id.as_deref(),
+                        &recovery.root_turn_id,
+                        0,
+                    )?;
+                    let terminal_exists = replay.events.iter().any(|event| {
+                        matches!(
+                            &event.payload,
+                            ChatDriverEvent::CommandCellSettled { cell }
+                                if cell.cell_id == cell_id && !cell.is_active()
+                        )
+                    });
+                    if !terminal_exists {
+                        return Err(ChatEventLogError::InvalidEvent(format!(
+                            "orphan command cell {cell_id} conflicted without a terminal fact"
+                        )));
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(recovered)
+    }
+
     pub fn pending_awaiter_results(
         &self,
         workspace_id: &str,
@@ -584,8 +801,18 @@ impl ChatEventLog {
         conversation_id: &str,
     ) -> Result<Vec<crate::tasks::task_runtime::command_cells::AwaiterResult>, ChatEventLogError>
     {
-        let mut pending =
-            self.pending_awaiter_results(workspace_id, conversation_id, conversation_id)?;
+        let mut pending = Vec::new();
+        for stream in self.enumerate_streams()? {
+            if stream.first.workspace_id == workspace_id
+                && stream.first.conversation_id.as_deref() == Some(conversation_id)
+            {
+                pending.extend(self.pending_awaiter_results(
+                    workspace_id,
+                    conversation_id,
+                    &stream.first.root_turn_id,
+                )?);
+            }
+        }
         pending.sort_by(|left, right| {
             left.receipt
                 .started_at
@@ -593,6 +820,36 @@ impl ChatEventLog {
                 .then_with(|| left.receipt.execution_id.cmp(&right.receipt.execution_id))
         });
         Ok(pending)
+    }
+
+    fn all_started_awaiter_deliveries(
+        &self,
+    ) -> Result<Vec<StartedAwaiterDelivery>, ChatEventLogError> {
+        let mut started = Vec::new();
+        for stream in self.enumerate_streams()? {
+            let Some(cached) = self.stream_journal(&stream.stream_id, false)? else {
+                continue;
+            };
+            let guard = lock_cached_stream(&cached);
+            let Some(authority) = guard.as_ref() else {
+                continue;
+            };
+            started.extend(
+                authority
+                    .pins
+                    .started_awaiters
+                    .values()
+                    .map(|(_, acknowledgement)| {
+                        (
+                            stream.first.workspace_id.clone(),
+                            stream.first.conversation_id.clone(),
+                            stream.first.root_turn_id.clone(),
+                            acknowledgement.clone(),
+                        )
+                    }),
+            );
+        }
+        Ok(started)
     }
 
     pub fn enqueue_chat_input(
@@ -879,6 +1136,15 @@ impl ChatEventLog {
         self
     }
 
+    #[cfg(test)]
+    fn with_orphan_recovery_pause(
+        mut self,
+        pause: Arc<(std::sync::Barrier, std::sync::Barrier)>,
+    ) -> Self {
+        self.orphan_recovery_pause = Some(pause);
+        self
+    }
+
     fn stream_journal(
         &self,
         stream_id: &str,
@@ -1161,6 +1427,18 @@ impl RetentionPins {
             self.awaiter_facts.entry(fact_key).or_insert(sequence);
         }
         match &event.payload {
+            ChatDriverEvent::CommandCellStarted { cell } => {
+                if let std::collections::hash_map::Entry::Vacant(entry) =
+                    self.active_cells.entry(cell.cell_id.clone())
+                {
+                    entry.insert(sequence);
+                    self.earliest = Some(self.earliest.map_or(sequence, |old| old.min(sequence)));
+                }
+            }
+            ChatDriverEvent::CommandCellSettled { cell } => {
+                let removed = self.active_cells.remove(&cell.cell_id);
+                self.refresh_earliest_if_removed(removed);
+            }
             ChatDriverEvent::AwaiterResultReady { result } => {
                 let key = awaiter_receipt_key(&result.receipt);
                 if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -1170,11 +1448,23 @@ impl RetentionPins {
                     self.earliest = Some(self.earliest.map_or(sequence, |old| old.min(sequence)));
                 }
             }
-            ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
-                let removed = self
-                    .pending_awaiters
-                    .remove(&awaiter_ack_key(acknowledgement));
+            ChatDriverEvent::AwaiterResultDeliveryStarted { acknowledgement } => {
+                let key = awaiter_ack_key(acknowledgement);
+                let removed = self.pending_awaiters.remove(&key);
+                self.started_awaiters
+                    .entry(key)
+                    .or_insert_with(|| (sequence, acknowledgement.clone()));
                 self.refresh_earliest_if_removed(removed);
+                self.earliest = Some(self.earliest.map_or(sequence, |old| old.min(sequence)));
+            }
+            ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
+                let key = awaiter_ack_key(acknowledgement);
+                let pending = self.pending_awaiters.remove(&key);
+                let started = self
+                    .started_awaiters
+                    .remove(&key)
+                    .map(|(sequence, _)| sequence);
+                self.refresh_earliest_if_removed(pending.or(started));
             }
             ChatDriverEvent::InputQueued { input_id, .. } => {
                 if let std::collections::hash_map::Entry::Vacant(entry) =
@@ -1221,6 +1511,10 @@ impl RetentionPins {
             .retain(|_, sequence| *sequence >= retained_floor);
         self.pending_awaiters
             .retain(|_, sequence| *sequence >= retained_floor);
+        self.started_awaiters
+            .retain(|_, (sequence, _)| *sequence >= retained_floor);
+        self.active_cells
+            .retain(|_, sequence| *sequence >= retained_floor);
         self.queued_inputs
             .retain(|_, sequence| *sequence >= retained_floor);
         self.queued_latest
@@ -1240,6 +1534,8 @@ impl RetentionPins {
         self.earliest = self
             .pending_awaiters
             .values()
+            .chain(self.started_awaiters.values().map(|(sequence, _)| sequence))
+            .chain(self.active_cells.values())
             .chain(self.queued_inputs.values())
             .copied()
             .min();
@@ -1429,6 +1725,7 @@ fn append_durability(event: &ChatDriverEvent) -> FileDurability {
         | ChatDriverEvent::CommandCellStarted { .. }
         | ChatDriverEvent::CommandCellSettled { .. }
         | ChatDriverEvent::AwaiterResultReady { .. }
+        | ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
         | ChatDriverEvent::AwaiterResultAcknowledged { .. }
         | ChatDriverEvent::InputQueued { .. }
         | ChatDriverEvent::InputRemoved { .. }
@@ -1529,8 +1826,17 @@ fn awaiter_ack_key(
 
 fn awaiter_fact_key(event: &ChatDriverEvent) -> Option<String> {
     match event {
+        ChatDriverEvent::CommandCellStarted { cell } => {
+            Some(format!("cell_started:{}", cell.cell_id))
+        }
+        ChatDriverEvent::CommandCellSettled { cell } => {
+            Some(format!("cell_settled:{}", cell.cell_id))
+        }
         ChatDriverEvent::AwaiterResultReady { result } => {
             Some(format!("ready:{}", awaiter_receipt_key(&result.receipt)))
+        }
+        ChatDriverEvent::AwaiterResultDeliveryStarted { acknowledgement } => {
+            Some(format!("started:{}", awaiter_ack_key(acknowledgement)))
         }
         ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement } => {
             Some(format!("ack:{}", awaiter_ack_key(acknowledgement)))
@@ -1659,7 +1965,8 @@ fn validate_driver_event(event: &ChatDriverEvent) -> Result<(), ChatEventLogErro
                     .to_string(),
             ))
         }
-        ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement }
+        ChatDriverEvent::AwaiterResultDeliveryStarted { acknowledgement }
+        | ChatDriverEvent::AwaiterResultAcknowledged { acknowledgement }
             if acknowledgement.execution_id.trim().is_empty()
                 || acknowledgement.acknowledged_turn_id.trim().is_empty() =>
         {
@@ -1843,6 +2150,144 @@ mod tests {
         }
     }
 
+    fn active_chat_cell(cell_id: &str) -> BackgroundCellState {
+        let mut cell = awaiter_result().cell;
+        cell.cell_id = cell_id.to_string();
+        cell.phase = BackgroundCellPhase::Running;
+        cell.terminal_cause = None;
+        cell.exit_code = None;
+        cell.artifact_status = BackgroundCellArtifactStatus::Writing;
+        cell.finished_at = None;
+        cell
+    }
+
+    #[test]
+    fn boot_recovery_closes_ordinary_chat_orphan_once() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("chat-events");
+        let log = ChatEventLog::open(&root, ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        log.append(
+            "workspace-1",
+            Some("conversation-1"),
+            "turn-1",
+            ChatDriverEvent::CommandCellStarted {
+                cell: Box::new(active_chat_cell("orphan-chat-cell")),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        drop(log);
+
+        let restarted = ChatEventLog::open(&root, ChatEventRetention::default())
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            restarted
+                .recover_orphan_command_cells()
+                .map_err(|error| error.to_string())?,
+            1
+        );
+        assert_eq!(
+            restarted
+                .recover_orphan_command_cells()
+                .map_err(|error| error.to_string())?,
+            0
+        );
+        let replay = restarted
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        let settled = replay
+            .events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                ChatDriverEvent::CommandCellSettled { cell }
+                    if cell.cell_id == "orphan-chat-cell" =>
+                {
+                    Some(cell.as_ref())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(settled.len(), 1);
+        let cell = settled
+            .first()
+            .ok_or_else(|| "recovered Chat cell missing".to_string())?;
+        assert_eq!(cell.phase, BackgroundCellPhase::Failed);
+        assert_eq!(
+            cell.terminal_cause,
+            Some(BackgroundCellTerminalCause::Interrupted)
+        );
+        assert_eq!(cell.artifact_status, BackgroundCellArtifactStatus::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn live_terminal_wins_orphan_recovery_without_duplicate_terminal() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let pause = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
+        let log = Arc::new(
+            ChatEventLog::open(
+                temp.path().join("chat-events"),
+                ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?
+            .with_orphan_recovery_pause(Arc::clone(&pause)),
+        );
+        let started = active_chat_cell("racing-chat-cell");
+        log.append(
+            "workspace-1",
+            Some("conversation-1"),
+            "turn-1",
+            ChatDriverEvent::CommandCellStarted {
+                cell: Box::new(started.clone()),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let recovering = Arc::clone(&log);
+        let recovery = std::thread::spawn(move || recovering.recover_orphan_command_cells());
+        pause.0.wait();
+
+        let mut terminal = started;
+        terminal.phase = BackgroundCellPhase::Succeeded;
+        terminal.terminal_cause = Some(BackgroundCellTerminalCause::Exited);
+        terminal.exit_code = Some(0);
+        terminal.artifact_status = BackgroundCellArtifactStatus::BelowThreshold;
+        terminal.finished_at = Some(Utc::now());
+        log.append(
+            "workspace-1",
+            Some("conversation-1"),
+            "turn-1",
+            ChatDriverEvent::CommandCellSettled {
+                cell: Box::new(terminal),
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        pause.1.wait();
+        assert_eq!(
+            recovery
+                .join()
+                .map_err(|_| "orphan recovery thread panicked".to_string())?
+                .map_err(|error| error.to_string())?,
+            0
+        );
+        let replay = log
+            .replay("workspace-1", Some("conversation-1"), "turn-1", 0)
+            .map_err(|error| error.to_string())?;
+        let terminals = replay
+            .events
+            .iter()
+            .filter_map(|event| match &event.payload {
+                ChatDriverEvent::CommandCellSettled { cell }
+                    if cell.cell_id == "racing-chat-cell" =>
+                {
+                    Some(cell.phase)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminals, vec![BackgroundCellPhase::Succeeded]);
+        Ok(())
+    }
+
     #[test]
     fn rust_wire_model_losslessly_accepts_frontend_fixture() -> Result<(), String> {
         let fixture = include_str!(concat!(
@@ -2009,6 +2454,8 @@ mod tests {
                     watch_generation: result.receipt.watch_generation,
                     cell_id: result.receipt.cell_id,
                     acknowledged_turn_id: "next-turn".to_string(),
+                    outcome:
+                        crate::tasks::task_runtime::command_cells::AwaiterDeliveryOutcome::Drained,
                 },
             },
         )

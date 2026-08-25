@@ -1,10 +1,9 @@
 use std::sync::{Arc, Weak};
 
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 
 use super::{
-    BootAutoResumeDecision, BootAutoResumeOutcome, TaskRun, TaskRunStatus,
-    TaskRuntimeBlockingAdapter, TaskRuntimeStore,
+    BootAutoResumeDecision, BootAutoResumeOutcome, TaskRun, TaskRunStatus, TaskRuntimeStore,
 };
 
 #[derive(Debug, Clone)]
@@ -21,7 +20,21 @@ pub enum TaskRunBootOutcome {
 /// it does not own an Agent, renderer, or second TaskRun executor.
 pub struct TaskRunBootReconciler {
     store: Weak<TaskRuntimeStore>,
-    recovered: OnceCell<Result<usize, String>>,
+    recovered: Mutex<BootRecoveryState>,
+    #[cfg(test)]
+    recovery_barrier: std::sync::Mutex<Option<TestRecoveryBarrier>>,
+}
+
+#[cfg(test)]
+struct TestRecoveryBarrier {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[derive(Default)]
+struct BootRecoveryState {
+    completed: Option<usize>,
+    running: Option<tokio::sync::watch::Receiver<Option<Result<usize, String>>>>,
 }
 
 impl TaskRunBootReconciler {
@@ -31,37 +44,102 @@ impl TaskRunBootReconciler {
             .get_or_init(|| {
                 Arc::new(Self {
                     store: Arc::downgrade(store),
-                    recovered: OnceCell::new(),
+                    recovered: Mutex::new(BootRecoveryState::default()),
+                    #[cfg(test)]
+                    recovery_barrier: std::sync::Mutex::new(None),
                 })
             })
             .clone()
     }
 
-    pub async fn recover_once(&self) -> Result<usize, String> {
-        self.recovered
-            .get_or_init(|| async {
-                let store = self.store.upgrade().ok_or_else(|| {
-                    "TaskRuntimeStore was released before boot recovery".to_string()
-                })?;
-                TaskRuntimeBlockingAdapter::new(store)
-                    .run_store("recover incomplete TaskRuns", |store| {
-                        store.recover_incomplete()
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-            .await
-            .clone()
+    pub async fn recover_once(self: &Arc<Self>) -> Result<usize, String> {
+        let mut receipt = {
+            let mut recovered = self.recovered.lock().await;
+            if let Some(count) = recovered.completed {
+                return Ok(count);
+            }
+            match recovered.running.as_ref() {
+                Some(running) => running.clone(),
+                None => {
+                    let (settled, receipt) = tokio::sync::watch::channel(None);
+                    recovered.running = Some(receipt.clone());
+                    let owner = Arc::downgrade(self);
+                    let store = self.store.clone();
+                    tokio::spawn(async move {
+                        #[cfg(test)]
+                        if let Some(owner) = owner.upgrade() {
+                            let barrier = owner
+                                .recovery_barrier
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .take();
+                            if let Some(barrier) = barrier {
+                                let _ = barrier.entered.send(());
+                                let _ = barrier.release.await;
+                            }
+                        }
+                        let result =
+                            match store.upgrade() {
+                                Some(store) => super::TaskRuntimeBlockingAdapter::new(store)
+                                    .run_store("recover TaskRuntime at boot", |store| {
+                                        store.recover_incomplete()
+                                    })
+                                    .await
+                                    .map_err(|error| error.to_string()),
+                                None => Err("TaskRuntimeStore was released before boot recovery"
+                                    .to_string()),
+                            };
+                        if let Some(owner) = owner.upgrade() {
+                            let mut state = owner.recovered.lock().await;
+                            match &result {
+                                Ok(count) => state.completed = Some(*count),
+                                Err(_) => state.completed = None,
+                            }
+                            state.running = None;
+                        }
+                        let _ = settled.send(Some(result));
+                    });
+                    receipt
+                }
+            }
+        };
+        loop {
+            if let Some(result) = receipt.borrow().clone() {
+                return result;
+            }
+            receipt.changed().await.map_err(|_| {
+                "TaskRuntime boot recovery owner closed without a receipt".to_string()
+            })?;
+        }
     }
 
-    pub async fn paused_candidates(&self) -> Result<Vec<TaskRun>, String> {
+    #[cfg(test)]
+    fn install_recovery_barrier(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .recovery_barrier
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(TestRecoveryBarrier {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+
+    pub async fn paused_candidates(self: &Arc<Self>) -> Result<Vec<TaskRun>, String> {
         self.recover_once().await?;
         let store = self
             .store
             .upgrade()
             .ok_or_else(|| "TaskRuntimeStore was released before candidate listing".to_string())?;
-        TaskRuntimeBlockingAdapter::new(store)
-            .run_store("list boot-resumable TaskRuns", |store| {
+        super::TaskRuntimeBlockingAdapter::new(store)
+            .run_store("list boot recovery candidates", |store| {
                 store.list_runs_in(&[TaskRunStatus::Paused])
             })
             .await
@@ -69,7 +147,7 @@ impl TaskRunBootReconciler {
     }
 
     pub async fn decision(
-        &self,
+        self: &Arc<Self>,
         run_id: &str,
         launcher_ready: bool,
         interactive_owner_ready: bool,
@@ -80,8 +158,8 @@ impl TaskRunBootReconciler {
             .upgrade()
             .ok_or_else(|| "TaskRuntimeStore was released before boot admission".to_string())?;
         let run_id = run_id.to_string();
-        TaskRuntimeBlockingAdapter::new(store)
-            .run_store("evaluate TaskRun boot resume", move |store| {
+        super::TaskRuntimeBlockingAdapter::new(store)
+            .run_store("decide boot auto-resume admission", move |store| {
                 store.boot_auto_resume_decision(&run_id, launcher_ready, interactive_owner_ready)
             })
             .await
@@ -89,7 +167,7 @@ impl TaskRunBootReconciler {
     }
 
     pub async fn resume(
-        &self,
+        self: &Arc<Self>,
         run_id: &str,
         launcher_ready: bool,
         interactive_owner_ready: bool,
@@ -118,18 +196,19 @@ impl TaskRunBootReconciler {
             }
             BootAutoResumeDecision::Ready { .. } => {}
         }
-        let owned_run_id = run_id.to_string();
-        match TaskRuntimeBlockingAdapter::new(store)
-            .run_store("resume TaskRun after boot", move |store| {
+        let run_id = run_id.to_string();
+        let admitted_run_id = run_id.clone();
+        let outcome = super::TaskRuntimeBlockingAdapter::new(store)
+            .run_store("commit boot auto-resume admission", move |store| {
                 store.resume_task_run_after_boot(
-                    &owned_run_id,
+                    &admitted_run_id,
                     launcher_ready,
                     interactive_owner_ready,
                 )
             })
             .await
-            .map_err(|error| error.to_string())?
-        {
+            .map_err(|error| error.to_string())?;
+        match outcome {
             BootAutoResumeOutcome::Resumed(run) => Ok(TaskRunBootOutcome::Resumed(run)),
             BootAutoResumeOutcome::Blocked(blockers) => Ok(TaskRunBootOutcome::Blocked(blockers)),
             BootAutoResumeOutcome::WaitingUntil(_) => Err(format!(
@@ -259,6 +338,57 @@ mod tests {
                 .recover_incomplete()
                 .map_err(|error| error.to_string())?,
             0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transient_recovery_failure_is_not_cached() -> Result<(), String> {
+        let store = recoverable_store(AttendedMode::Unattended)?;
+        store.fail_next_recovery_commit_for_test();
+        let reconciler = TaskRunBootReconciler::for_store(&store);
+
+        let first = reconciler.recover_once().await;
+        assert!(matches!(first, Err(error) if error.contains("injected recovery commit failure")));
+        assert_eq!(reconciler.recover_once().await?, 1);
+        assert_eq!(reconciler.recover_once().await?, 1);
+        assert_eq!(
+            store
+                .get_run("ordinary-run")
+                .map_err(|error| error.to_string())?
+                .map(|run| run.status),
+            Some(TaskRunStatus::Paused)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn caller_abort_does_not_cancel_owned_recovery_singleflight() -> Result<(), String> {
+        let store = recoverable_store(AttendedMode::Unattended)?;
+        let reconciler = TaskRunBootReconciler::for_store(&store);
+        let (entered, release) = reconciler.install_recovery_barrier();
+        let first_owner = Arc::clone(&reconciler);
+        let first = tokio::spawn(async move { first_owner.recover_once().await });
+        entered
+            .await
+            .map_err(|_| "recovery did not reach its owner barrier".to_string())?;
+        first.abort();
+        let second_owner = Arc::clone(&reconciler);
+        let second = tokio::spawn(async move { second_owner.recover_once().await });
+        release
+            .send(())
+            .map_err(|_| "recovery owner dropped its release barrier".to_string())?;
+        assert_eq!(
+            second.await.map_err(|error| error.to_string())??,
+            1,
+            "second caller did not share the owner recovery"
+        );
+        assert_eq!(
+            store
+                .recover_incomplete()
+                .map_err(|error| error.to_string())?,
+            0,
+            "caller abort caused recovery to execute twice"
         );
         Ok(())
     }

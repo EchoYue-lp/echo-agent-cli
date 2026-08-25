@@ -220,24 +220,11 @@ impl WorkspaceRuntimeResources {
             })
             .await
             .map_err(|error| anyhow::anyhow!(error.to_string()))??;
-        let recovery = resources
-            .deletion_service
-            .recover_committed_deletions_in_flow(
-                &flow,
-                resources.conversation_store.clone(),
-                Some(resources.runtime_state_store.clone()),
-                None,
-                None,
-            )
-            .await;
-        if let Err(error) = &recovery {
-            tracing::warn!(
-                workspace = %resources.workspace.id,
-                %error,
-                "workspace conversation deletion recovery remains pending"
-            );
-        }
-        flow.settle(recovery.err().map(|error| error.to_string()));
+        // Aggregate deletion recovery also owns AgentRouter retirement. That
+        // authority belongs to AppState, so boot reconciliation runs it after
+        // the scoped resources have been published instead of finalizing only
+        // the transcript/runtime-state half here.
+        flow.settle(None);
         Ok(resources)
     }
 

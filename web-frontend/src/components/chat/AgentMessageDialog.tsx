@@ -31,6 +31,7 @@ interface AgentMessageDialogProps {
 const statusLabels: Record<AgentDeliveryStatus, string> = {
   queued: '排队中',
   claimed: '处理中',
+  injection_started: '注入已开始',
   injected: '已注入当前任务',
   delivered: '已送达',
   failed: '失败',
@@ -39,7 +40,7 @@ const statusLabels: Record<AgentDeliveryStatus, string> = {
 function StatusIcon({ status }: { status: AgentDeliveryStatus }) {
   if (status === 'delivered') return <Check size={13} aria-hidden="true" />;
   if (status === 'failed') return <XCircle size={13} aria-hidden="true" />;
-  if (status === 'claimed' || status === 'injected')
+  if (status === 'claimed' || status === 'injection_started' || status === 'injected')
     return <LoaderCircle size={13} className="animate-spin" aria-hidden="true" />;
   return <Clock3 size={13} aria-hidden="true" />;
 }
@@ -148,7 +149,9 @@ export function AgentMessageDialog({ isOpen, onClose }: AgentMessageDialogProps)
     if (
       !isOpen ||
       !selected ||
-      !records.some((record) => record.status === 'queued' || record.status === 'claimed')
+      !records.some((record) =>
+        ['queued', 'claimed', 'injection_started', 'injected'].includes(record.status)
+      )
     ) {
       return;
     }
@@ -175,7 +178,13 @@ export function AgentMessageDialog({ isOpen, onClose }: AgentMessageDialogProps)
           : {}),
       });
       setText('');
-      useToastStore.getState().addToast('success', `消息已排队：${response.receipt.message_id}`);
+      if (response.receipt.durability.status === 'degraded') {
+        useToastStore
+          .getState()
+          .addToast('warning', `消息已接收，但磁盘同步仍待恢复：${response.receipt.message_id}`);
+      } else {
+        useToastStore.getState().addToast('success', `消息已排队：${response.receipt.message_id}`);
+      }
       await loadRecords(selected, true);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));

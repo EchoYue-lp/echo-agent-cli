@@ -348,10 +348,8 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         "fixture requires the target turn to still be running when the delivery arrives"
     );
 
-    let source =
-        crate::agent_router::AgentAddress::new(source_workspace.id, "contract-conversation");
     let mut message =
-        crate::agent_router::AgentMessage::user_text(Some(source), target.clone(), "Steer it");
+        crate::agent_router::AgentMessage::user_text(None, target.clone(), "Steer it");
     message.message_id = "contract-live-steer".to_string();
     state.send_agent_message_owned(message).await?;
 
@@ -361,16 +359,20 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         if let Some(record) = records
             .iter()
             .find(|record| record.message_id == "contract-live-steer")
-            && (record.status != crate::agent_router::AgentDeliveryStatus::Queued
-                || record.next_attempt_at.is_some())
         {
-            assert_ne!(
+            if record.status == crate::agent_router::AgentDeliveryStatus::Injected {
+                assert_eq!(record.turn_id.as_deref(), Some("active-target-turn"));
+                break;
+            }
+            if matches!(
                 record.status,
-                crate::agent_router::AgentDeliveryStatus::Delivered,
-                "live steer acceptance must not be a terminal Delivered receipt while the \
-                 target turn is still executing"
-            );
-            break;
+                crate::agent_router::AgentDeliveryStatus::Delivered
+                    | crate::agent_router::AgentDeliveryStatus::Failed
+            ) {
+                anyhow::bail!(
+                    "live steer reached a terminal before the test observed framework drain; record={record:?}"
+                );
+            }
         }
         if active_task.is_finished() {
             anyhow::bail!(
@@ -398,18 +400,128 @@ async fn f08_live_steer_delivery_is_not_terminal_before_target_settlement() -> a
         if let Some(record) = records
             .iter()
             .find(|record| record.message_id == "contract-live-steer")
-            && record.status != crate::agent_router::AgentDeliveryStatus::Delivered
-            && (record.next_attempt_at.is_some() || record.attempt >= 2)
+            && record.status == crate::agent_router::AgentDeliveryStatus::Failed
+            && record.next_attempt_at.is_none()
+            && record.turn_id.as_deref() == Some("active-target-turn")
         {
             return Ok(());
         }
         if tokio::time::Instant::now() >= failure_deadline {
             anyhow::bail!(
-                "cancelled live delivery was not retained for retry; records={records:?}"
+                "cancelled consumed delivery was not closed without replay; records={records:?}"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+}
+
+#[tokio::test]
+async fn typed_live_steer_rejections_defer_but_owner_loss_is_terminal() -> anyhow::Result<()> {
+    let rejections = [
+        echo_agent::agent::TurnSteerError::NoActiveTurn,
+        echo_agent::agent::TurnSteerError::TurnMismatch {
+            expected: "expected-turn".to_string(),
+            actual: "actual-turn".to_string(),
+        },
+        echo_agent::agent::TurnSteerError::NotSteerable {
+            turn_id: "busy-turn".to_string(),
+        },
+    ];
+    for (index, rejection) in rejections.into_iter().enumerate() {
+        assert!(super::is_explicit_live_steer_rejection(&rejection));
+        let temp = tempfile::tempdir()?;
+        let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+        let target = crate::agent_router::AgentAddress::new(
+            crate::workspace::WorkspaceId::from_name("target"),
+            format!("conversation-{index}"),
+        );
+        let mut message =
+            crate::agent_router::AgentMessage::user_text(None, target.clone(), "typed rejection");
+        message.message_id = format!("typed-rejection-{index}");
+        router.enqueue(message).await?;
+        let claim = router
+            .claim_next(&target)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("typed-rejection claim is missing"))?;
+        router.begin_injection(&claim, "candidate-turn").await?;
+        router.defer(&claim, rejection.to_string()).await?;
+        let record = router
+            .records(&target)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("typed-rejection record is missing"))?;
+        assert_eq!(
+            record.status,
+            crate::agent_router::AgentDeliveryStatus::Queued
+        );
+        assert_eq!(record.attempt, 1);
+        assert!(record.turn_id.is_none());
+    }
+
+    let temp = tempfile::tempdir()?;
+    let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    let target = crate::agent_router::AgentAddress::new(
+        crate::workspace::WorkspaceId::from_name("target"),
+        "owner-loss",
+    );
+    let mut message =
+        crate::agent_router::AgentMessage::user_text(None, target.clone(), "owner loss");
+    message.message_id = "owner-loss".to_string();
+    router.enqueue(message).await?;
+    let claim = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("owner-loss claim is missing"))?;
+    router.begin_injection(&claim, "unknown-turn").await?;
+    router
+        .failed(&claim, "owner lost after injection started", false)
+        .await?;
+    let record = router
+        .records(&target)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("owner-loss record is missing"))?;
+    assert_eq!(
+        record.status,
+        crate::agent_router::AgentDeliveryStatus::Failed
+    );
+    assert!(record.next_attempt_at.is_none());
+    assert_eq!(record.turn_id.as_deref(), Some("unknown-turn"));
+    Ok(())
+}
+
+#[test]
+fn live_delivery_requires_one_unambiguous_foreground_snapshot() {
+    let stale = crate::foreground_turn::ForegroundTurnSnapshot {
+        workspace_id: "target".to_string(),
+        surface: crate::foreground_turn::ForegroundTurnSurface::Tui,
+        conversation_id: "conversation".to_string(),
+        root_turn_id: "stale-root".to_string(),
+        active_turn_id: "stale-turn".to_string(),
+        cancellation_requested: false,
+    };
+    let exact = crate::foreground_turn::ForegroundTurnSnapshot {
+        workspace_id: "target".to_string(),
+        surface: crate::foreground_turn::ForegroundTurnSurface::Gui,
+        conversation_id: "conversation".to_string(),
+        root_turn_id: "exact-root".to_string(),
+        active_turn_id: "exact-turn".to_string(),
+        cancellation_requested: false,
+    };
+    let active = vec![stale, exact.clone()];
+    assert!(super::exact_live_delivery_candidate(&active).is_none());
+    assert_eq!(
+        super::exact_live_delivery_candidate(std::slice::from_ref(&exact)),
+        Some(&exact)
+    );
+
+    let mut ambiguous = active;
+    let mut duplicate = exact;
+    duplicate.surface = crate::foreground_turn::ForegroundTurnSurface::Channel;
+    ambiguous.push(duplicate);
+    assert!(super::exact_live_delivery_candidate(&ambiguous).is_none());
 }
 
 #[tokio::test]
@@ -429,6 +541,7 @@ async fn delivery_shutdown_interrupts_pending_live_wait_and_preserves_injected()
         .claim_next(&target)
         .await?
         .ok_or_else(|| anyhow::anyhow!("delivery claim is missing"))?;
+    router.begin_injection(&claim, "live-turn").await?;
     router.injected(&claim, "live-turn").await?;
 
     let shutdown = tokio_util::sync::CancellationToken::new();

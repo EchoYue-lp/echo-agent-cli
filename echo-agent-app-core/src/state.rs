@@ -6,7 +6,7 @@
 
 use chrono::{DateTime, Utc};
 use echo_agent::agent::CancellationToken;
-use echo_agent::memory::{Conversation, ConversationStore, NewConversation, StoredMessage};
+use echo_agent::memory::{Conversation, ConversationStore, NewConversation};
 use echo_agent::prelude::*;
 use echo_agent::state::RuntimeStateStore;
 use futures::future::{BoxFuture, FutureExt, Shared};
@@ -1240,28 +1240,23 @@ fn render_agent_delivery_instruction(message: &crate::agent_router::AgentMessage
     )
 }
 
-fn completed_agent_delivery_answer(
-    transcript: &[StoredMessage],
-    expected_instruction: &str,
-) -> Option<String> {
-    let mut found_delivery = false;
-    let mut answer = None;
-    for message in transcript {
-        if !found_delivery {
-            found_delivery =
-                message.role == "user" && message.content.as_deref() == Some(expected_instruction);
-            continue;
-        }
-        if message.role == "user" {
-            break;
-        }
-        if message.role == "assistant"
-            && let Some(content) = message.content.as_ref()
-        {
-            answer = Some(content.clone());
-        }
-    }
-    answer
+fn is_explicit_live_steer_rejection(error: &echo_agent::agent::TurnSteerError) -> bool {
+    matches!(
+        error,
+        echo_agent::agent::TurnSteerError::NoActiveTurn
+            | echo_agent::agent::TurnSteerError::TurnMismatch { .. }
+            | echo_agent::agent::TurnSteerError::NotSteerable { .. }
+    )
+}
+
+fn exact_live_delivery_candidate(
+    active: &[crate::foreground_turn::ForegroundTurnSnapshot],
+) -> Option<&crate::foreground_turn::ForegroundTurnSnapshot> {
+    let mut candidates = active.iter().filter(|snapshot| {
+        snapshot.surface != crate::foreground_turn::ForegroundTurnSurface::Agent
+    });
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
 }
 
 /// 全局应用状态
@@ -2080,6 +2075,8 @@ impl AppState {
                 self.storage.chat_events.clone(),
                 runtime.runtime_state_store(),
                 &self.session.foreground_turns,
+                Arc::clone(&self.agent_router),
+                Arc::clone(&self.agent_deliveries),
                 artifact_config,
                 runtime.workspace_io_receipt(),
             )
@@ -2102,13 +2099,27 @@ impl AppState {
         let store = runtime
             .conversation_store()
             .ok_or(crate::conversation_deletion::ConversationDeletionError::StoreUnavailable)?;
+        let artifact_config = runtime
+            .primary_agent()
+            .read(|agent| agent.tool_output_artifacts())
+            .await;
         runtime
             .deletions
             .recover_committed_deletions(
-                store,
-                runtime.runtime_state_store(),
-                runtime.pool(),
-                Some(runtime.workspace_io_receipt()),
+                crate::conversation_deletion::ConversationDeletionRecoveryContext {
+                    workspace_id: runtime.execution_scope().workspace_id().to_string(),
+                    conversation_store: store,
+                    runtime_state: runtime.runtime_state_store(),
+                    agent_pool: runtime.pool(),
+                    task_runtime: runtime.task_runtime(),
+                    tool_executions: self.storage.tool_executions.clone(),
+                    chat_events: self.storage.chat_events.clone(),
+                    foreground_turns: self.session.foreground_turns.clone(),
+                    artifact_config,
+                    workspace_io_receipt: runtime.workspace_io_receipt(),
+                    agent_router: Arc::clone(&self.agent_router),
+                    agent_deliveries: Arc::clone(&self.agent_deliveries),
+                },
             )
             .await
     }
@@ -2217,36 +2228,103 @@ impl AppState {
     }
 
     async fn reconcile_task_runs_at_boot(&self) -> TaskRunBootReport {
-        // Bootstrap owns lifecycle write admission before any user surface is
-        // started. Raw host recovery below is therefore not concurrent with
-        // create/delete/control lookup.
-        let _lifecycle = self.workspace.transition.write().await;
         let mut report = TaskRunBootReport::default();
+        let chat_events = Arc::clone(&self.storage.chat_events);
+        match self
+            .session
+            .product_data_io
+            .run("recover ordinary Chat command cells", move || {
+                chat_events.recover_orphan_command_cells()
+            })
+            .await
+        {
+            Ok(Ok(recovered)) if recovered > 0 => {
+                tracing::info!(recovered, "ordinary Chat command cells recovered at boot");
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => report
+                .failed_scopes
+                .push(format!("ordinary Chat command cells: {error}")),
+            Err(error) => report.failed_scopes.push(format!(
+                "ordinary Chat command-cell recovery owner: {error}"
+            )),
+        }
+
+        let global_runtime = self.global_chat_runtime();
+        let global_artifact_config = global_runtime
+            .primary_agent()
+            .read(|agent| agent.tool_output_artifacts())
+            .await;
+        if let Some(conversation_store) = global_runtime.conversation_store()
+            && let Err(error) = global_runtime
+                .deletions
+                .recover_committed_deletions(
+                    crate::conversation_deletion::ConversationDeletionRecoveryContext {
+                        workspace_id: "global".to_string(),
+                        conversation_store,
+                        runtime_state: global_runtime.runtime_state_store(),
+                        agent_pool: global_runtime.pool(),
+                        task_runtime: global_runtime.task_runtime(),
+                        tool_executions: self.storage.tool_executions.clone(),
+                        chat_events: self.storage.chat_events.clone(),
+                        foreground_turns: self.session.foreground_turns.clone(),
+                        artifact_config: global_artifact_config,
+                        workspace_io_receipt: global_runtime.workspace_io_receipt(),
+                        agent_router: Arc::clone(&self.agent_router),
+                        agent_deliveries: Arc::clone(&self.agent_deliveries),
+                    },
+                )
+                .await
+        {
+            report
+                .failed_scopes
+                .push(format!("global conversation deletions: {error}"));
+        }
         if let Some(store) = self.tasks.runtime.clone() {
             self.reconcile_task_run_scope("global", store, &mut report)
                 .await;
         }
-        let workspaces = match self.workspace.registry.list() {
-            Ok(workspaces) => workspaces,
-            Err(error) => {
+        let registry = Arc::clone(&self.workspace.registry);
+        let workspaces = match self
+            .session
+            .product_data_io
+            .run("list workspaces for boot recovery", move || registry.list())
+            .await
+        {
+            Ok(Ok(workspaces)) => workspaces,
+            Ok(Err(error)) => {
                 report
                     .failed_scopes
                     .push(format!("workspace registry: {error}"));
                 return report;
             }
+            Err(error) => {
+                report
+                    .failed_scopes
+                    .push(format!("workspace registry owner: {error}"));
+                return report;
+            }
         };
         for workspace in workspaces {
             let workspace_id = workspace.id.to_string();
-            let store = match self.workspace.runtimes.get_or_open(workspace).await {
-                Ok(host) => match host.task_runtime().await {
-                    Ok(store) => store,
+            let (host, control_lease) =
+                match self.workspace.runtimes.get_or_open_control(workspace).await {
+                    Ok(binding) => binding,
                     Err(error) => {
                         report
                             .failed_scopes
                             .push(format!("workspace {workspace_id}: {error}"));
                         continue;
                     }
+                };
+            let workspace_receipt = ScopedWorkspaceIoReceipt {
+                _lifetime: ScopedRuntimeLifetime::Workspace {
+                    _lease: control_lease,
                 },
+                identity: host.workspace_io_identity(),
+            };
+            let store = match host.task_runtime().await {
+                Ok(store) => store,
                 Err(error) => {
                     report
                         .failed_scopes
@@ -2254,6 +2332,33 @@ impl AppState {
                     continue;
                 }
             };
+            if let Err(error) = host
+                .resources()
+                .deletion_service()
+                .recover_committed_deletions(
+                    crate::conversation_deletion::ConversationDeletionRecoveryContext {
+                        workspace_id: workspace_id.clone(),
+                        conversation_store: host.resources().conversation_store(),
+                        runtime_state: Some(host.resources().runtime_state_store()),
+                        agent_pool: None,
+                        task_runtime: Some(store.clone()),
+                        tool_executions: self.storage.tool_executions.clone(),
+                        chat_events: self.storage.chat_events.clone(),
+                        foreground_turns: self.session.foreground_turns.clone(),
+                        artifact_config: Some(crate::infra::tool_output_artifact_config(Some(
+                            host.root(),
+                        ))),
+                        workspace_io_receipt: workspace_receipt,
+                        agent_router: Arc::clone(&self.agent_router),
+                        agent_deliveries: Arc::clone(&self.agent_deliveries),
+                    },
+                )
+                .await
+            {
+                report.failed_scopes.push(format!(
+                    "workspace {workspace_id} conversation deletions: {error}"
+                ));
+            }
             self.reconcile_task_run_scope(&workspace_id, store, &mut report)
                 .await;
         }
@@ -2286,6 +2391,11 @@ impl AppState {
             }
         };
         for run in candidates {
+            // BackgroundTaskService is the sole launcher owner for global
+            // background runs. AppState owns ordinary continuation recovery.
+            if workspace_id == "global" && run.conversation_id.starts_with("background:") {
+                continue;
+            }
             if run.attended_mode == crate::tasks::task_runtime::AttendedMode::Attended {
                 report.blocked = report.blocked.saturating_add(1);
                 continue;
@@ -2782,10 +2892,9 @@ impl AppState {
         Ok(())
     }
 
-    /// Sole workspace deletion transaction. Lock order is lifecycle write
-    /// admission, focused host, runtime registry/host Closing, projections,
-    /// then metadata registry. Explicit controls hold lifecycle read admission
-    /// through host pin, so no orphan runtime can reopen during deletion.
+    /// Sole workspace deletion transaction. Router and delivery admission close
+    /// before active delivery drain; only then does deletion take lifecycle
+    /// write admission and recheck the complete idle proof.
     pub async fn delete_workspace_owned(
         self: &Arc<Self>,
         workspace_id: &crate::workspace::WorkspaceId,
@@ -2805,9 +2914,17 @@ impl AppState {
         &self,
         workspace_id: &crate::workspace::WorkspaceId,
     ) -> anyhow::Result<()> {
+        let router_retirement = self
+            .agent_router
+            .begin_workspace_retirement(workspace_id.clone())?;
+        let _delivery_retirement = self
+            .agent_deliveries
+            .retire_workspace(workspace_id.clone())
+            .await?;
         let _lifecycle = self.workspace.transition.write().await;
         self.ensure_workspace_idle_for_delete_inner(workspace_id)
             .await?;
+        router_retirement.purge().await?;
         let current = self.workspace.current.read().await.clone();
         if current
             .as_ref()
@@ -3463,6 +3580,17 @@ impl AppState {
                     return;
                 }
             };
+            match self
+                .reconcile_agent_delivery_in_flight(target, &active, &shutdown)
+                .await
+            {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "in-flight Agent delivery reconciliation failed");
+                    return;
+                }
+            }
             let delivered = if active.is_empty() {
                 self.deliver_agent_message_cold(target, &shutdown).await
             } else {
@@ -3472,6 +3600,19 @@ impl AppState {
             match delivered {
                 Ok(true) => {}
                 Ok(false) => {
+                    // A typed steer rejection records Deferred with a bounded
+                    // retry deadline. Re-enter the loop so that deadline, not
+                    // the whole foreground turn settlement, controls the next
+                    // attempt. Paths that did not create a deferred receipt
+                    // still wait for activity to change and cannot busy-loop.
+                    match self.agent_router.next_attempt_at(target).await {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(%error, "Agent delivery retry deadline could not be read");
+                            return;
+                        }
+                    }
                     let next_active = self
                         .session
                         .foreground_turns
@@ -3512,6 +3653,93 @@ impl AppState {
         }
     }
 
+    async fn reconcile_agent_delivery_in_flight(
+        self: &Arc<Self>,
+        target: &crate::agent_router::AgentAddress,
+        active: &[crate::foreground_turn::ForegroundTurnSnapshot],
+        shutdown: &CancellationToken,
+    ) -> Result<bool, AgentMessageSendError> {
+        let Some(in_flight) = self.agent_router.in_flight_claim(target).await? else {
+            return Ok(false);
+        };
+        if in_flight.status == crate::agent_router::AgentDeliveryStatus::InjectionStarted {
+            self.agent_router
+                .failed(
+                    &in_flight.claim,
+                    "Agent delivery injection started before owner loss; mailbox acceptance is unknown and automatic replay is blocked",
+                    false,
+                )
+                .await?;
+            return Ok(true);
+        }
+        let exact = active
+            .iter()
+            .find(|snapshot| snapshot.active_turn_id == in_flight.turn_id);
+        let Some(snapshot) = exact else {
+            self.agent_router
+                .failed(
+                    &in_flight.claim,
+                    "Agent delivery side effect started before owner loss; terminal outcome is indeterminate and automatic replay is blocked",
+                    false,
+                )
+                .await?;
+            return Ok(true);
+        };
+        let waiter = self
+            .session
+            .foreground_turns
+            .settlement_waiter_scoped(
+                target.workspace_id.as_str(),
+                snapshot.surface,
+                &target.conversation_id,
+                &snapshot.root_turn_id,
+            )
+            .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
+        let Some(settlement) = wait_for_live_delivery_or_shutdown(shutdown, waiter.wait()).await
+        else {
+            return Ok(true);
+        };
+        let settlement =
+            settlement.map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
+        match settlement.outcome {
+            crate::chat_driver::TurnOutcome::Completed
+                if !in_flight.claim.message.expects_reply() =>
+            {
+                self.agent_router
+                    .delivered(&in_flight.claim, in_flight.turn_id, None)
+                    .await?;
+            }
+            crate::chat_driver::TurnOutcome::Completed => {
+                self.agent_router
+                    .failed(
+                        &in_flight.claim,
+                        "Agent delivery turn completed after owner loss, but no delivery-owned reply terminal was available",
+                        false,
+                    )
+                    .await?;
+            }
+            crate::chat_driver::TurnOutcome::Cancelled => {
+                self.agent_router
+                    .failed(
+                        &in_flight.claim,
+                        "Agent delivery target turn was cancelled after injection",
+                        false,
+                    )
+                    .await?;
+            }
+            crate::chat_driver::TurnOutcome::Failed(failure) => {
+                self.agent_router
+                    .failed(
+                        &in_flight.claim,
+                        format!("{}: {}", failure.code, failure.message),
+                        false,
+                    )
+                    .await?;
+            }
+        }
+        Ok(true)
+    }
+
     async fn deliver_agent_message_live(
         self: &Arc<Self>,
         target: &crate::agent_router::AgentAddress,
@@ -3534,111 +3762,113 @@ impl AppState {
         let Some(claim) = self.agent_router.claim_next(target).await? else {
             return Ok(true);
         };
+        if claim.message.expects_reply() {
+            self.agent_router
+                .defer(
+                    &claim,
+                    "reply-bearing Agent delivery waits for a delivery-owned cold turn",
+                )
+                .await?;
+            return Ok(false);
+        }
         let agent = execution.agent();
         let instruction = render_agent_delivery_instruction(&claim.message);
-        for snapshot in active {
-            if snapshot.surface == crate::foreground_turn::ForegroundTurnSurface::Agent {
-                continue;
-            }
-            let waiter = match self.session.foreground_turns.settlement_waiter_scoped(
-                target.workspace_id.as_str(),
-                snapshot.surface,
-                &target.conversation_id,
-                &snapshot.root_turn_id,
-            ) {
-                Ok(waiter) => waiter,
-                Err(_) => continue,
-            };
-            let steer = agent
-                .steer_input(
-                    Some(&snapshot.active_turn_id),
-                    echo_agent::llm::types::Message::user(instruction.clone()),
+        let Some(snapshot) = exact_live_delivery_candidate(active) else {
+            self.agent_router
+                .defer(
+                    &claim,
+                    "foreground projection has no unique candidate for the Agent active turn",
                 )
-                .await;
-            match steer {
-                Ok(turn_id) => {
-                    self.agent_router.injected(&claim, turn_id.clone()).await?;
-                    let Some(settlement) =
-                        wait_for_live_delivery_or_shutdown(shutdown, waiter.wait()).await
-                    else {
-                        // Injected is deliberately non-terminal. Shutdown
-                        // leaves the durable claim recoverable instead of
-                        // fabricating Delivered before the target safe point.
-                        return Ok(true);
-                    };
-                    let settlement = settlement
-                        .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
-                    match settlement.outcome {
-                        crate::chat_driver::TurnOutcome::Completed => {
-                            let conversation_store =
-                                runtime.conversation_store().ok_or_else(|| {
-                                    AgentMessageSendError::Conversation(
-                                        "target conversation store is not available".to_string(),
-                                    )
-                                })?;
-                            let transcript = conversation_store
-                                .get_messages(&target.conversation_id)
-                                .await
-                                .map_err(|error| {
-                                    AgentMessageSendError::Conversation(error.to_string())
-                                })?;
-                            let answer = completed_agent_delivery_answer(&transcript, &instruction);
-                            let reply_message_id = self
-                                .queue_agent_delivery_reply(&claim.message, answer)
-                                .await;
-                            if claim.message.expects_reply() && reply_message_id.is_none() {
-                                self.agent_router
-                                    .failed(
-                                        &claim,
-                                        "live Agent delivery completed without a durable correlated reply",
-                                        claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
-                                    )
-                                    .await?;
-                                return Ok(true);
-                            }
-                            self.agent_router
-                                .delivered(&claim, turn_id, reply_message_id)
-                                .await?;
-                        }
-                        crate::chat_driver::TurnOutcome::Cancelled => {
-                            self.agent_router
-                                .failed(
-                                    &claim,
-                                    "live Agent delivery target turn was cancelled",
-                                    claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
-                                )
-                                .await?;
-                        }
-                        crate::chat_driver::TurnOutcome::Failed(failure) => {
-                            self.agent_router
-                                .failed(
-                                    &claim,
-                                    format!("{}: {}", failure.code, failure.message),
-                                    failure.retryable
-                                        && claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
-                                )
-                                .await?;
-                        }
-                    }
-                    return Ok(true);
-                }
-                Err(
-                    echo_agent::agent::TurnSteerError::NoActiveTurn
-                    | echo_agent::agent::TurnSteerError::TurnMismatch { .. }
-                    | echo_agent::agent::TurnSteerError::NotSteerable { .. },
-                ) => {}
-                Err(error) => {
+                .await?;
+            return Ok(false);
+        };
+        let waiter = match self.session.foreground_turns.settlement_waiter_scoped(
+            target.workspace_id.as_str(),
+            snapshot.surface,
+            &target.conversation_id,
+            &snapshot.root_turn_id,
+        ) {
+            Ok(waiter) => waiter,
+            Err(_) => {
+                self.agent_router
+                    .defer(
+                        &claim,
+                        "exact foreground candidate settled before steer admission",
+                    )
+                    .await?;
+                return Ok(false);
+            }
+        };
+        self.agent_router
+            .begin_injection(&claim, snapshot.active_turn_id.clone())
+            .await?;
+        match agent
+            .steer_input_tracked(
+                Some(&snapshot.active_turn_id),
+                echo_agent::llm::types::Message::user(instruction),
+            )
+            .await
+        {
+            Ok(mut receipt) => {
+                let drained = tokio::select! {
+                    _ = shutdown.cancelled() => return Ok(true),
+                    state = receipt.wait_for_drained() => state,
+                };
+                if !drained.was_drained() {
                     self.agent_router
-                        .failed(&claim, error.to_string(), false)
+                        .failed(
+                            &claim,
+                            "live Agent delivery mailbox did not confirm consumption before the target turn settled; automatic replay is blocked",
+                            false,
+                        )
                         .await?;
                     return Ok(true);
                 }
+                let turn_id = receipt.turn_id().to_string();
+                self.agent_router.injected(&claim, turn_id.clone()).await?;
+                let Some(settlement) =
+                    wait_for_live_delivery_or_shutdown(shutdown, waiter.wait()).await
+                else {
+                    return Ok(true);
+                };
+                let settlement = settlement
+                    .map_err(|error| AgentMessageSendError::Workspace(error.to_string()))?;
+                match settlement.outcome {
+                    crate::chat_driver::TurnOutcome::Completed => {
+                        self.agent_router.delivered(&claim, turn_id, None).await?;
+                    }
+                    crate::chat_driver::TurnOutcome::Cancelled => {
+                        self.agent_router
+                            .failed(
+                                &claim,
+                                "live Agent delivery target turn was cancelled",
+                                false,
+                            )
+                            .await?;
+                    }
+                    crate::chat_driver::TurnOutcome::Failed(failure) => {
+                        self.agent_router
+                            .failed(
+                                &claim,
+                                format!("{}: {}", failure.code, failure.message),
+                                false,
+                            )
+                            .await?;
+                    }
+                }
+                Ok(true)
+            }
+            Err(error) if is_explicit_live_steer_rejection(&error) => {
+                self.agent_router.defer(&claim, error.to_string()).await?;
+                Ok(false)
+            }
+            Err(error) => {
+                self.agent_router
+                    .failed(&claim, error.to_string(), false)
+                    .await?;
+                Ok(true)
             }
         }
-        self.agent_router
-            .defer(&claim, "target turn is active but not currently steerable")
-            .await?;
-        Ok(false)
     }
 
     async fn deliver_agent_message_cold(
@@ -3679,36 +3909,6 @@ impl AppState {
             return Ok(false);
         }
         let instruction = render_agent_delivery_instruction(&claim.message);
-        let conversation_store = runtime.conversation_store.as_ref().ok_or_else(|| {
-            AgentMessageSendError::Conversation(
-                "target conversation store is not available".to_string(),
-            )
-        })?;
-        let transcript = conversation_store
-            .get_messages(&target.conversation_id)
-            .await
-            .map_err(|error| AgentMessageSendError::Conversation(error.to_string()))?;
-        if let Some(answer) = completed_agent_delivery_answer(&transcript, &instruction) {
-            let reply_message_id = self
-                .queue_agent_delivery_reply(&claim.message, Some(answer))
-                .await;
-            if claim.message.expects_reply() && reply_message_id.is_none() {
-                self.agent_router
-                    .failed(
-                        &claim,
-                        "completed Agent delivery reply could not be durably queued",
-                        claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
-                    )
-                    .await?;
-                lease.settle(crate::chat_driver::TurnOutcome::Completed);
-                return Ok(true);
-            }
-            self.agent_router
-                .delivered(&claim, root_turn_id, reply_message_id)
-                .await?;
-            lease.settle(crate::chat_driver::TurnOutcome::Completed);
-            return Ok(true);
-        }
         let execution = match runtime.agent_for(&target.conversation_id).await {
             Ok(execution) => execution,
             Err(error) => {
@@ -3773,6 +3973,9 @@ impl AppState {
         });
         let agent = execution.agent();
         let turn_cancel = lease.cancellation_token();
+        self.agent_router
+            .begin_injection(&claim, root_turn_id.clone())
+            .await?;
         let driver = crate::foreground_turn::drive_foreground_chat(lease, &agent, &turn, resources);
         tokio::pin!(driver);
         let outcome = tokio::select! {
@@ -3786,6 +3989,9 @@ impl AppState {
         drop(execution);
         match outcome {
             Ok(crate::chat_driver::TurnOutcome::Completed) => {
+                self.agent_router
+                    .injected(&claim, root_turn_id.clone())
+                    .await?;
                 let reply_message_id = self
                     .queue_agent_delivery_reply(&claim.message, capture.final_answer())
                     .await;
@@ -3794,7 +4000,7 @@ impl AppState {
                         .failed(
                             &claim,
                             "Agent delivery completed without a durable correlated reply",
-                            claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
+                            false,
                         )
                         .await?;
                 } else {
@@ -3804,25 +4010,18 @@ impl AppState {
                 }
             }
             Ok(crate::chat_driver::TurnOutcome::Failed(failure)) => {
-                let retryable = failure.retryable && claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS;
                 let detail = format!("{}: {}", failure.code, failure.message);
-                self.agent_router.failed(&claim, detail, retryable).await?;
+                self.agent_router.failed(&claim, detail, false).await?;
             }
             Ok(crate::chat_driver::TurnOutcome::Cancelled) => {
                 if !shutdown.is_cancelled() {
                     self.agent_router
-                        .failed(
-                            &claim,
-                            "Agent delivery turn was cancelled",
-                            claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS,
-                        )
+                        .failed(&claim, "Agent delivery turn was cancelled", false)
                         .await?;
                 }
             }
             Err(error) => {
-                self.agent_router
-                    .failed(&claim, error, claim.attempt < MAX_AGENT_DELIVERY_ATTEMPTS)
-                    .await?;
+                self.agent_router.failed(&claim, error, false).await?;
             }
         }
         Ok(true)
@@ -6113,7 +6312,7 @@ mod model_mutation_tests {
 mod workspace_transition_tests {
     use super::*;
     use echo_agent::agent::ReactAgentBuilder;
-    use echo_agent::memory::{ConversationStore, FileConversationStore};
+    use echo_agent::memory::{ConversationStore, FileConversationStore, StoredMessage};
     use echo_agent::testing::MockLlmClient;
 
     struct ParkedWorkspaceDeleteHook {
@@ -6332,6 +6531,102 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?;
         assert_eq!(current_root, recreated_root);
         assert_eq!(hook.calls.lock().await.as_slice(), &["same-id".to_string()]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_delete_drains_driver_before_taking_transition_write() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let root = temp.path().join("workspace");
+        std::fs::create_dir_all(&root).map_err(|error| error.to_string())?;
+        let primary = ReactAgentBuilder::new()
+            .llm_client(Arc::new(MockLlmClient::new()))
+            .system_prompt("workspace delete lock order")
+            .build()
+            .map(AgentHandle::new)
+            .map_err(|error| error.to_string())?;
+        let mcp = Arc::new(crate::mcp_config_runtime::McpConfigRuntime::new(
+            temp.path().join("mcp.json"),
+            Default::default(),
+        ));
+        let registry = Arc::new(
+            WorkspaceRegistry::with_base_dir(temp.path().join("registry"))
+                .map_err(|error| error.to_string())?,
+        );
+        let mut state = AppState::from_shared(
+            primary,
+            None,
+            Arc::new(crate::hitl::HitlDispatcher::new()),
+            None,
+            None,
+            Default::default(),
+            mcp,
+            crate::product_data_io::ProductDataIoService::new(),
+        )
+        .map_err(|error| error.to_string())?;
+        state.workspace.registry = registry.clone();
+        state.storage.chat_events = Arc::new(
+            crate::chat_event_log::ChatEventLog::open(
+                temp.path().join("chat-events"),
+                crate::chat_event_log::ChatEventRetention::default(),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.storage.tool_executions = Arc::new(
+            crate::tool_execution::ToolExecutionRepository::open(
+                temp.path().join("tool-executions"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        state.agent_router = Arc::new(crate::agent_router::AgentRouter::new(
+            temp.path().join("agent-router"),
+        ));
+        let state = Arc::new(state);
+        let (workspace, _) = state
+            .create_workspace_owned(
+                "lock-order",
+                crate::workspace::WorkspaceKind::General,
+                Some(root),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let transition_write = state.workspace.transition.write().await;
+        let driver_entered = Arc::new(tokio::sync::Notify::new());
+        let driver_read = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::clone(&driver_entered);
+        let read = Arc::clone(&driver_read);
+        let driver_state = Arc::clone(&state);
+        let target =
+            crate::agent_router::AgentAddress::new(workspace.id.clone(), "delivery-conversation");
+        state
+            .agent_deliveries
+            .supervise(target, Arc::new(|_| {}), move |cycle| async move {
+                entered.notify_one();
+                let _transition_read = driver_state.workspace.transition.read().await;
+                read.notify_one();
+                let _ = cycle.complete();
+            })
+            .map_err(|error| error.to_string())?;
+        driver_entered.notified().await;
+        let delete_state = Arc::clone(&state);
+        let delete_workspace_id = workspace.id.clone();
+        let deleting = tokio::spawn(async move {
+            delete_state
+                .delete_workspace_owned(&delete_workspace_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!deleting.is_finished());
+        drop(transition_write);
+        tokio::time::timeout(std::time::Duration::from_secs(1), driver_read.notified())
+            .await
+            .map_err(|_| "delivery driver never acquired transition read".to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), deleting)
+            .await
+            .map_err(|_| "workspace deletion deadlocked behind delivery drain".to_string())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(registry.open(&workspace.id).is_err());
         Ok(())
     }
 
@@ -6867,6 +7162,12 @@ mod workspace_transition_tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "crash-window claim missing".to_string())?;
         assert_eq!(abandoned_claim.attempt, 1);
+        let actual_turn_id = crash_message.delivery_turn_id();
+        state
+            .agent_router
+            .begin_injection(&abandoned_claim, actual_turn_id.clone())
+            .await
+            .map_err(|error| error.to_string())?;
         let crash_instruction = render_agent_delivery_instruction(&crash_message);
         let created_at = Utc::now().to_rfc3339();
         transcript.push(StoredMessage {
@@ -6883,7 +7184,7 @@ mod workspace_transition_tests {
             id: None,
             conversation_id: target.conversation_id.clone(),
             role: "assistant".to_string(),
-            content: Some("recovered target answer".to_string()),
+            content: Some("unowned adjacent assistant text".to_string()),
             attachments_json: None,
             tool_calls_json: None,
             tool_result_json: None,
@@ -6896,7 +7197,7 @@ mod workspace_transition_tests {
 
         assert!(
             state
-                .deliver_agent_message_cold(&target, &CancellationToken::new())
+                .reconcile_agent_delivery_in_flight(&target, &[], &CancellationToken::new(),)
                 .await
                 .map_err(|error| error.to_string())?
         );
@@ -6910,34 +7211,14 @@ mod workspace_transition_tests {
             .ok_or_else(|| "crash-window delivery record missing".to_string())?;
         assert_eq!(
             recovered_record.status,
-            crate::agent_router::AgentDeliveryStatus::Delivered
+            crate::agent_router::AgentDeliveryStatus::Failed
         );
-        assert_eq!(recovered_record.attempt, 2);
+        assert_eq!(recovered_record.attempt, 1);
         assert_eq!(
             recovered_record.turn_id.as_deref(),
-            Some(crash_message.delivery_turn_id().as_str())
+            Some(actual_turn_id.as_str())
         );
-        let recovery_reply_id = recovered_record
-            .reply_message_id
-            .clone()
-            .ok_or_else(|| "crash-window reply id missing".to_string())?;
-        let duplicate_reply_id = state
-            .queue_agent_delivery_reply(&crash_message, Some("recovered target answer".to_string()))
-            .await
-            .ok_or_else(|| "duplicate reply retry was not accepted".to_string())?;
-        assert_eq!(duplicate_reply_id, recovery_reply_id);
-        let source_records = state
-            .agent_router
-            .records(&source)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            source_records
-                .iter()
-                .filter(|record| record.message_id == recovery_reply_id)
-                .count(),
-            1
-        );
+        assert!(recovered_record.reply_message_id.is_none());
         let recovered_transcript = target_store
             .get_messages(&target.conversation_id)
             .await
@@ -6947,7 +7228,7 @@ mod workspace_transition_tests {
                 .iter()
                 .filter(|stored| {
                     stored.role == "assistant"
-                        && stored.content.as_deref() == Some("recovered target answer")
+                        && stored.content.as_deref() == Some("unowned adjacent assistant text")
                 })
                 .count(),
             1
@@ -7023,7 +7304,7 @@ mod workspace_transition_tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let mut live_message = crate::agent_router::AgentMessage::user_text(
-            Some(source),
+            None,
             target.clone(),
             "Steer the active target turn",
         );

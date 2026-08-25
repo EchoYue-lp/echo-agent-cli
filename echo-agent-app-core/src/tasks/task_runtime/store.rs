@@ -5319,15 +5319,61 @@ impl TaskRuntimeStore {
     /// repairs those files from the event tail without appending a duplicate.
     pub fn recover_incomplete(&self) -> Result<usize, StoreError> {
         let _operation = self.shadow_operation()?;
-        const INTERRUPTED: &[TaskRunStatus] = &[TaskRunStatus::Running];
+        const INTERRUPTED: &[TaskRunStatus] = &[TaskRunStatus::Running, TaskRunStatus::Paused];
         let zombies = self.list_runs_in(INTERRUPTED)?;
         let mut recovered = 0_usize;
         for run in &zombies {
-            if self.recover_interrupted_run(run)? {
+            let changed = match run.status {
+                TaskRunStatus::Running => self.recover_interrupted_run(run)?,
+                TaskRunStatus::Paused => self.recover_paused_orphan_cells(run)?,
+                _ => false,
+            };
+            if changed {
                 recovered = recovered.saturating_add(1);
             }
         }
         Ok(recovered)
+    }
+
+    fn recover_paused_orphan_cells(&self, run: &TaskRun) -> Result<bool, StoreError> {
+        let active = self
+            .list_background_cells(&run.run_id)?
+            .into_iter()
+            .filter(BackgroundCellState::is_active)
+            .collect::<Vec<_>>();
+        if active.is_empty() {
+            return Ok(false);
+        }
+        for cell in active {
+            let artifact_interrupted =
+                cell.artifact_status == BackgroundCellArtifactStatus::Writing;
+            self.record_background_cell_finished(
+                &run.run_id,
+                &cell.cell_id,
+                &cell.name,
+                BackgroundCellPhase::Failed,
+                Some(BackgroundCellTerminalCause::Interrupted),
+                Some("command cell was interrupted by process restart"),
+                None,
+                if artifact_interrupted {
+                    BackgroundCellArtifactStatus::Failed
+                } else {
+                    cell.artifact_status
+                },
+                if artifact_interrupted {
+                    Some("artifact finalization was interrupted by process restart")
+                } else {
+                    cell.artifact_message.as_deref()
+                },
+                cell.total_output_bytes,
+                cell.output_truncated,
+                cell.output_excerpt.as_deref(),
+                cell.artifact_path.as_deref(),
+                cell.artifact_sha256.as_deref(),
+                cell.call_id.as_deref(),
+            )?;
+        }
+        Ok(true)
     }
 
     fn recover_interrupted_run(&self, run: &TaskRun) -> Result<bool, StoreError> {
@@ -11285,6 +11331,49 @@ mod tests {
             .count();
         assert_eq!(recovered_cell_count, 1);
         assert_eq!(store.recover_incomplete()?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_closes_active_cell_owned_by_already_paused_run_once() -> Result<(), StoreError>
+    {
+        let store = fresh();
+        seed_plan(&store);
+        store.record_background_cell_started(
+            "r1",
+            "paused-orphan-cell",
+            "sleep 30",
+            "hash",
+            Some("turn-before-pause"),
+            None,
+            Some("call-before-pause"),
+        )?;
+        store.transition_run("r1", TaskRunStatus::Paused)?;
+
+        assert_eq!(store.recover_incomplete()?, 1);
+        let cells = store.list_background_cells("r1")?;
+        let cell = cells
+            .iter()
+            .find(|cell| cell.cell_id == "paused-orphan-cell")
+            .ok_or_else(|| StoreError::InvalidPlan("paused orphan cell missing".to_string()))?;
+        assert_eq!(cell.phase, BackgroundCellPhase::Failed);
+        assert_eq!(
+            cell.terminal_cause,
+            Some(BackgroundCellTerminalCause::Interrupted)
+        );
+        assert_eq!(store.recover_incomplete()?, 0);
+        assert_eq!(
+            store
+                .list_events("r1", 0)?
+                .into_iter()
+                .filter(|event| {
+                    event.event_type == RuntimeEventKind::BackgroundCellFinished
+                        && json_string(&event.payload, "cell_id").as_deref()
+                            == Some("paused-orphan-cell")
+                })
+                .count(),
+            1
+        );
         Ok(())
     }
 

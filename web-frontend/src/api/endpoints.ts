@@ -1775,7 +1775,18 @@ export interface AgentEndpoint {
   updated_at: string;
 }
 
-export type AgentDeliveryStatus = 'queued' | 'claimed' | 'injected' | 'delivered' | 'failed';
+export type AgentDeliveryStatus =
+  | 'queued'
+  | 'claimed'
+  | 'injection_started'
+  | 'injected'
+  | 'delivered'
+  | 'failed';
+
+export type AgentDeliveryDurability =
+  | { status: 'unconfirmed' }
+  | { status: 'confirmed' }
+  | { status: 'degraded'; error: string };
 
 export interface AgentDeliveryReceipt {
   message_id: string;
@@ -1783,6 +1794,7 @@ export interface AgentDeliveryReceipt {
   status: AgentDeliveryStatus;
   accepted_at: string;
   duplicate: boolean;
+  durability: AgentDeliveryDurability;
 }
 
 export interface AgentDeliveryRecord {

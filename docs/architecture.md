@@ -55,6 +55,19 @@ Browser 和基础 Agent 资源。GUI 通过 `AppState` 持有这些资源；TUI�
 - `WorkflowService` / `StructuredExtractionService`：EKO catalog、显式 runtime address、
   typed outcome 与 surface command adapter；Graph/`extract_json` 执行仍由 framework 拥有。
 
+启动恢复只有两个互斥的产品 owner：AppState 恢复普通 conversation continuation，
+`BackgroundTaskService` 恢复 global background run。TaskRuntime 文件恢复通过同一个 store-scoped
+reconciler 的 owned singleflight 执行并只缓存成功结果；首个 caller 退出不取消恢复。普通 Chat 和
+TaskRun 的 command-cell Started 事实都会在 boot 被闭合为 typed Interrupted terminal。
+
+跨会话 live delivery 与 Awaiter handoff 都使用 framework tracked steer receipt。mailbox acceptance
+不是消费完成。副作用前先写 DeliveryStarted/InjectionStarted，receipt 到达 Drained 后才写
+Acknowledged/Injected；owner loss 没有 typed terminal 时禁止重放。Agent inbox 使用 framework
+segmented journal + checkpointed reducer 作为唯一 sequence/append/projection authority，保留持久化
+FIFO frontier、typed durability 与 prepared-batch reconciliation。Conversation/workspace 删除通过
+retirement guard 清理对应 inbox。完整取舍见
+[ADR 0011](./adr/0011-boot-inbox-recovery-authority.md)。
+
 ### Workspace runtime
 
 `WorkspaceRuntimeRegistry` 是已加载 workspace host 的唯一进程级 owner。每个

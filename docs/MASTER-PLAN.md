@@ -25,6 +25,7 @@ Last updated: 2026-08-25
 | foreground admission/cancel/settlement             | `echo-agent-app-core/src/foreground_turn.rs`   |
 | revisioned TaskRun graph 与文件投影                | `echo-agent-app-core/src/tasks/task_runtime/`  |
 | 跨 address 消息和 groups                           | `echo-agent-app-core/src/agent_router.rs`      |
+| boot recovery 与 unattended admission              | store-scoped reconciler + product owner split  |
 | GUI IPC                                            | `src/tauri/commands/`                          |
 | GUI address/view projection                        | `web-frontend/src/`                            |
 
@@ -71,6 +72,14 @@ CLI `main`；合并前仍须以当时最新 framework/CLI 基线完成最终复�
 FIFO、restore/rebind、orphan terminal repair、delete/evict、AgentRouter settlement/backoff
 以及 process governor 均通过完整自动门禁。M8 的 3x3 smoke 和 36-turn real-provider probe
 均为零失败；10 分钟/2 小时与完整人工 GUI 场景在项目全部研发完成后统一执行。
+
+当前收敛阶段进一步固定：TaskRuntime recovery 只缓存成功结果且文件 I/O 走 bounded blocking；
+AppState 恢复普通 conversation，BackgroundTaskService 独占 global background launcher；普通 Chat
+与 Paused TaskRun 的 orphan command cell 都写入 typed Interrupted terminal。Awaiter/AgentRouter
+在副作用前提交 Started，并只在 framework tracked steer 到达 Drained 后结算；Agent inbox 使用
+framework segmented journal + checkpointed FIFO frontier。删除使用 retirement guard，已开始但
+终态不确定的 attempt 禁止自动重放。见
+[ADR 0011](./adr/0011-boot-inbox-recovery-authority.md)。
 
 ### Long-Horizon Runtime Closure
 

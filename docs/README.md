@@ -18,6 +18,7 @@
 | [TaskRuntime Agent Turn ADR](./adr/0007-taskruntime-agent-turn-authority.md)          | AgentTurnDriver、typed terminal 与 RunTurn 原子权威           |
 | [TaskRuntime 有界查询投影 ADR](./adr/0008-taskruntime-bounded-query-projections.md)   | 热 checkpoint、增量 history segment 与 typed degraded receipt |
 | [TaskRuntime Async Boundary ADR](./adr/0009-taskruntime-async-io-and-ipc-boundary.md) | bounded file I/O、caller drop 与 typed IPC                    |
+| [Boot 与 Agent Inbox ADR](./adr/0011-boot-inbox-recovery-authority.md)                | boot owner、tracked steer、orphan 与 inbox journal            |
 | [Agent 协同 ADR](./adr/0001-agent-collaboration.md)                                   | Codex 协同机制与 EKO 功能设计                                 |
 | [Codex 工具目录 ADR](./adr/0002-codex-tool-capability-catalog.md)                     | Codex 工具能力与 EKO 参考设计                                 |
 | [Claude Code 能力目录](./adr/0003-claude-code-capability-catalog.md)                  | Claude Code 工具、子智能体和 Skills 快照                      |

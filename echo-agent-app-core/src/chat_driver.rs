@@ -107,6 +107,9 @@ pub enum ChatDriverEvent {
     AwaiterResultReady {
         result: Box<crate::tasks::task_runtime::command_cells::AwaiterResult>,
     },
+    AwaiterResultDeliveryStarted {
+        acknowledgement: crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
+    },
     AwaiterResultAcknowledged {
         acknowledgement: crate::tasks::task_runtime::command_cells::AwaiterResultAcknowledgement,
     },
@@ -2230,6 +2233,7 @@ mod tests {
                 | ChatDriverEvent::CommandCellStarted { .. }
                 | ChatDriverEvent::CommandCellSettled { .. }
                 | ChatDriverEvent::AwaiterResultReady { .. }
+                | ChatDriverEvent::AwaiterResultDeliveryStarted { .. }
                 | ChatDriverEvent::AwaiterResultAcknowledged { .. }
                 | ChatDriverEvent::ContextCompressed { .. } => {}
             }
