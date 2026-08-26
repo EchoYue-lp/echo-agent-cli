@@ -145,7 +145,7 @@ Agent execution governor、四 surface real-provider harness 与 truthful ledger
 运行也完成 1,827 cells 且零失败。两小时尝试按研发节奏调整在 26.6 分钟主动停止，状态记录为
 `interrupted_by_policy`。Task 2 EKO Control Plane 与 Surface 已在
 `refactor/eko-control-surface` 完成全自动门禁；当前先完成 framework/CLI/website 的 release
-fix-forward 并冻结新的全绿 child 基线，再启动 characterization lanes。10 分钟/2 小时和完整
+fix-forward 并冻结新的本地门禁通过 child 基线，再启动 characterization lanes。10 分钟/2 小时和完整
 人工 GUI 场景只在项目功能研发全部完成后执行一次 Final Integration Gate。
 
 ## 文档生命周期
