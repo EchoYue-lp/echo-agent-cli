@@ -584,3 +584,442 @@ impl crate::chat_driver::ChatSink for NoopChatSink {
         true
     }
 }
+
+fn f0_router_target() -> crate::agent_router::AgentAddress {
+    crate::agent_router::AgentAddress::new(
+        crate::workspace::WorkspaceId::from_name("f0-router-workspace"),
+        "f0-router-conversation",
+    )
+}
+
+fn f0_router_message(
+    target: &crate::agent_router::AgentAddress,
+    message_id: &str,
+    text: &str,
+) -> crate::agent_router::AgentMessage {
+    let mut message = crate::agent_router::AgentMessage::user_text(None, target.clone(), text);
+    message.message_id = message_id.to_string();
+    message
+}
+
+#[tokio::test]
+async fn f0_live_router_receipt_marks_injected_only_after_real_drain() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    let target = f0_router_target();
+    let message = f0_router_message(&target, "f0-live-drain", "live input");
+
+    let accepted = router.enqueue(message).await?;
+    assert_eq!(
+        accepted.status,
+        crate::agent_router::AgentDeliveryStatus::Queued
+    );
+    let claim = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("live delivery claim is missing"))?;
+    assert_eq!(
+        router
+            .records(&target)
+            .await?
+            .first()
+            .map(|record| record.status),
+        Some(crate::agent_router::AgentDeliveryStatus::Claimed)
+    );
+    router.begin_injection(&claim, "f0-live-turn").await?;
+
+    let (drain_sender, drain_receiver) =
+        tokio::sync::watch::channel(echo_agent::agent::AgentSteerState::Accepted);
+    let mut receipt = echo_agent::agent::AgentSteerReceipt::new(
+        "f0-steer".to_string(),
+        "f0-live-turn".to_string(),
+        drain_receiver,
+    );
+    assert_eq!(
+        receipt.state(),
+        echo_agent::agent::AgentSteerState::Accepted
+    );
+    assert_eq!(
+        router
+            .records(&target)
+            .await?
+            .first()
+            .map(|record| record.status),
+        Some(crate::agent_router::AgentDeliveryStatus::InjectionStarted)
+    );
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            receipt.wait_for_drained()
+        )
+        .await
+        .is_err(),
+        "receipt must remain accepted until the real framework drain signal"
+    );
+
+    drain_sender
+        .send(echo_agent::agent::AgentSteerState::Drained)
+        .map_err(|error| anyhow::anyhow!("failed to publish drain state: {error}"))?;
+    assert_eq!(
+        receipt.wait_for_drained().await,
+        echo_agent::agent::AgentSteerState::Drained
+    );
+    let injected = router.injected(&claim, receipt.turn_id()).await?;
+    assert_eq!(
+        injected.status,
+        crate::agent_router::AgentDeliveryStatus::Injected
+    );
+    assert_eq!(
+        router
+            .records(&target)
+            .await?
+            .first()
+            .map(|record| record.status),
+        Some(crate::agent_router::AgentDeliveryStatus::Injected)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn f0_terminal_before_drain_is_not_injected() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    let target = f0_router_target();
+    let message = f0_router_message(&target, "f0-terminal-before-drain", "cancel me");
+    router.enqueue(message).await?;
+    let claim = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("terminal-before-drain claim is missing"))?;
+    router.begin_injection(&claim, "f0-cancelled-turn").await?;
+
+    let (terminal_sender, terminal_receiver) =
+        tokio::sync::watch::channel(echo_agent::agent::AgentSteerState::Accepted);
+    let mut receipt = echo_agent::agent::AgentSteerReceipt::new(
+        "f0-terminal-steer".to_string(),
+        "f0-cancelled-turn".to_string(),
+        terminal_receiver,
+    );
+    terminal_sender
+        .send(echo_agent::agent::AgentSteerState::TurnSettled {
+            outcome: echo_agent::agent::AgentSteerTurnOutcome::Cancelled,
+            drained: false,
+        })
+        .map_err(|error| anyhow::anyhow!("failed to publish terminal state: {error}"))?;
+    let terminal = receipt.wait_for_drained().await;
+    assert_eq!(
+        terminal,
+        echo_agent::agent::AgentSteerState::TurnSettled {
+            outcome: echo_agent::agent::AgentSteerTurnOutcome::Cancelled,
+            drained: false,
+        }
+    );
+    assert!(!terminal.was_drained());
+
+    let failed = router
+        .failed(&claim, "target turn settled before drain", false)
+        .await?;
+    assert_eq!(
+        failed.status,
+        crate::agent_router::AgentDeliveryStatus::Failed
+    );
+    assert!(router.in_flight_claim(&target).await?.is_none());
+    assert_eq!(
+        router
+            .records(&target)
+            .await?
+            .first()
+            .map(|record| record.status),
+        Some(crate::agent_router::AgentDeliveryStatus::Failed)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn f0_restart_after_drain_before_terminal_preserves_injected_attempt() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let target = f0_router_target();
+    let message = f0_router_message(&target, "f0-restart-after-drain", "recover terminal");
+    let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    router.enqueue(message).await?;
+    let claim = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("restart claim is missing"))?;
+    router.begin_injection(&claim, "f0-restart-turn").await?;
+    let (drain_sender, drain_receiver) =
+        tokio::sync::watch::channel(echo_agent::agent::AgentSteerState::Drained);
+    let mut receipt = echo_agent::agent::AgentSteerReceipt::new(
+        "f0-restart-steer".to_string(),
+        "f0-restart-turn".to_string(),
+        drain_receiver,
+    );
+    assert_eq!(
+        receipt.wait_for_drained().await,
+        echo_agent::agent::AgentSteerState::Drained
+    );
+    router.injected(&claim, receipt.turn_id()).await?;
+    drop(drain_sender);
+    drop(receipt);
+    drop(router);
+
+    let restarted = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    assert!(restarted.claim_next(&target).await?.is_none());
+    let in_flight = restarted
+        .in_flight_claim(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("injected attempt was not recovered"))?;
+    assert_eq!(
+        in_flight.status,
+        crate::agent_router::AgentDeliveryStatus::Injected
+    );
+    assert_eq!(in_flight.claim.attempt_id, claim.attempt_id);
+    assert_eq!(in_flight.claim.attempt, claim.attempt);
+    assert_eq!(in_flight.turn_id, "f0-restart-turn");
+
+    restarted
+        .failed(
+            &in_flight.claim,
+            "terminal outcome unknown after restart",
+            false,
+        )
+        .await?;
+    let record = restarted
+        .records(&target)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("restarted terminal record is missing"))?;
+    assert_eq!(
+        record.status,
+        crate::agent_router::AgentDeliveryStatus::Failed
+    );
+    assert_eq!(record.attempt, 1);
+    assert_eq!(record.turn_id.as_deref(), Some("f0-restart-turn"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn f0_cold_and_live_terminal_records_have_parity() -> anyhow::Result<()> {
+    async fn settle(live: bool) -> anyhow::Result<crate::agent_router::AgentDeliveryRecord> {
+        let temp = tempfile::tempdir()?;
+        let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+        let target = f0_router_target();
+        let message = f0_router_message(
+            &target,
+            if live {
+                "f0-live-parity"
+            } else {
+                "f0-cold-parity"
+            },
+            "terminal parity",
+        );
+        router.enqueue(message).await?;
+        let claim = router
+            .claim_next(&target)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("parity claim is missing"))?;
+        router.begin_injection(&claim, "f0-parity-turn").await?;
+        if live {
+            let (drain_sender, drain_receiver) =
+                tokio::sync::watch::channel(echo_agent::agent::AgentSteerState::Drained);
+            let mut receipt = echo_agent::agent::AgentSteerReceipt::new(
+                "f0-parity-steer".to_string(),
+                "f0-parity-turn".to_string(),
+                drain_receiver,
+            );
+            assert_eq!(
+                receipt.wait_for_drained().await,
+                echo_agent::agent::AgentSteerState::Drained
+            );
+            router.injected(&claim, receipt.turn_id()).await?;
+            drop(drain_sender);
+        } else {
+            router.injected(&claim, "f0-parity-turn").await?;
+        }
+        router.delivered(&claim, "f0-parity-turn", None).await?;
+        let record = router
+            .records(&target)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("parity terminal record is missing"))?;
+        assert!(router.pending(&target).await?.is_empty());
+        assert!(router.in_flight_claim(&target).await?.is_none());
+        Ok(record)
+    }
+
+    let live = settle(true).await?;
+    let cold = settle(false).await?;
+    assert_eq!(
+        live.status,
+        crate::agent_router::AgentDeliveryStatus::Delivered
+    );
+    assert_eq!(
+        cold.status,
+        crate::agent_router::AgentDeliveryStatus::Delivered
+    );
+    assert_eq!(live.attempt, cold.attempt);
+    assert_eq!(live.turn_id, cold.turn_id);
+    assert_eq!(live.reply_message_id, cold.reply_message_id);
+    assert_eq!(live.error, cold.error);
+    assert_eq!(live.next_attempt_at, cold.next_attempt_at);
+    Ok(())
+}
+
+#[tokio::test]
+async fn f0_duplicate_enqueue_returns_current_receipt_at_each_phase() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    let target = f0_router_target();
+    let message = f0_router_message(&target, "f0-duplicate", "idempotent input");
+
+    let first = router.enqueue(message.clone()).await?;
+    assert!(!first.duplicate);
+    assert_eq!(
+        first.status,
+        crate::agent_router::AgentDeliveryStatus::Queued
+    );
+    let duplicate = router.enqueue(message.clone()).await?;
+    assert!(duplicate.duplicate);
+    assert_eq!(
+        duplicate.status,
+        crate::agent_router::AgentDeliveryStatus::Queued
+    );
+
+    let claim = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("duplicate claim is missing"))?;
+    let duplicate = router.enqueue(message.clone()).await?;
+    assert!(duplicate.duplicate);
+    assert_eq!(
+        duplicate.status,
+        crate::agent_router::AgentDeliveryStatus::Claimed
+    );
+
+    router.begin_injection(&claim, "f0-duplicate-turn").await?;
+    let duplicate = router.enqueue(message.clone()).await?;
+    assert!(duplicate.duplicate);
+    assert_eq!(
+        duplicate.status,
+        crate::agent_router::AgentDeliveryStatus::InjectionStarted
+    );
+
+    router.injected(&claim, "f0-duplicate-turn").await?;
+    let duplicate = router.enqueue(message.clone()).await?;
+    assert!(duplicate.duplicate);
+    assert_eq!(
+        duplicate.status,
+        crate::agent_router::AgentDeliveryStatus::Injected
+    );
+
+    router.delivered(&claim, "f0-duplicate-turn", None).await?;
+    let duplicate = router.enqueue(message).await?;
+    assert!(duplicate.duplicate);
+    assert_eq!(
+        duplicate.status,
+        crate::agent_router::AgentDeliveryStatus::Delivered
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn f0_stale_router_attempt_cannot_cross_aba_generation() -> anyhow::Result<()> {
+    let temp = tempfile::tempdir()?;
+    let router = crate::agent_router::AgentRouter::new(temp.path().to_path_buf());
+    let target = f0_router_target();
+    let message = f0_router_message(&target, "f0-aba-attempt", "retry once");
+    router.enqueue(message).await?;
+    let stale = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("stale attempt claim is missing"))?;
+    router.defer(&stale, "first attempt is retryable").await?;
+    let deadline = router
+        .next_attempt_at(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("retry deadline is missing"))?;
+    let delay = deadline
+        .signed_duration_since(chrono::Utc::now())
+        .to_std()
+        .unwrap_or(std::time::Duration::ZERO);
+    if !delay.is_zero() {
+        tokio::time::sleep(delay.saturating_add(std::time::Duration::from_millis(5))).await;
+    }
+    let current = router
+        .claim_next(&target)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("replacement attempt claim is missing"))?;
+    assert_eq!(current.attempt, stale.attempt.saturating_add(1));
+    assert!(matches!(
+        router.begin_injection(&stale, "stale-turn").await,
+        Err(crate::agent_router::AgentRouterError::StaleClaim { .. })
+    ));
+    router.begin_injection(&current, "current-turn").await?;
+    router.injected(&current, "current-turn").await?;
+    router.delivered(&current, "current-turn", None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn f0_idle_text_starts_a_cold_turn() -> anyhow::Result<()> {
+    let (temp, state) = isolated_app_state().await?;
+    let target_workspace = state.workspace.registry.create_at(
+        "f0-cold-target",
+        WorkspaceKind::General,
+        temp.path().join("f0-cold-target"),
+    )?;
+    let host = state
+        .workspace
+        .runtimes
+        .get_or_open(target_workspace.clone())
+        .await?;
+    host.resources()
+        .conversation_store()
+        .ensure_conversation(NewConversation {
+            conversation_id: "f0-cold-conversation".to_string(),
+            user_id: "default".to_string(),
+            agent_type: None,
+            title: Some("F0 cold turn".to_string()),
+        })
+        .await?;
+    let pool = state
+        .connection
+        .pool
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("fixture AgentPool is missing"))?;
+    pool.set_llm_client_override_for_test(Arc::new(
+        MockLlmClient::new().with_responses(["cold turn preflight", "cold turn answer"]),
+    ))
+    .await;
+
+    let target =
+        crate::agent_router::AgentAddress::new(target_workspace.id, "f0-cold-conversation");
+    let message = f0_router_message(&target, "f0-idle-text", "start from idle");
+    state.agent_router.enqueue(message.clone()).await?;
+    assert!(
+        state
+            .deliver_agent_message_cold(&target, &tokio_util::sync::CancellationToken::new())
+            .await?
+    );
+    let record = state
+        .agent_router
+        .records(&target)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("cold delivery record is missing"))?;
+    assert_eq!(
+        record.status,
+        crate::agent_router::AgentDeliveryStatus::Delivered
+    );
+    assert_eq!(record.attempt, 1);
+    assert_eq!(
+        record.turn_id.as_deref(),
+        Some(message.delivery_turn_id().as_str())
+    );
+    assert!(state.agent_router.pending(&target).await?.is_empty());
+    assert!(state.agent_router.in_flight_claim(&target).await?.is_none());
+    Ok(())
+}
