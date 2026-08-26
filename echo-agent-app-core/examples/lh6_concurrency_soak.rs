@@ -12,7 +12,7 @@ use echo_agent_app_core::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::chat_event_log::{ChatEventLog, ChatEventRetention};
 use echo_agent_app_core::tasks::task_runtime::command_cells::CommandCellRuntimeService;
 use echo_agent_app_core::tasks::task_runtime::{
-    ProcessExecutionResourceSnapshot, process_execution_resource_snapshot,
+    ProcessExecutionResourceSnapshot, TaskRuntimeStore, process_execution_resource_snapshot,
 };
 use echo_agent_app_core::workspace::{WorkspaceExecutionScope, WorkspaceId};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,7 @@ struct Address {
     workspace_id: String,
     conversation_id: String,
     registry: Arc<dyn CommandCellRegistry>,
+    _task_runtime: Arc<TaskRuntimeStore>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -139,7 +140,7 @@ async fn main() -> Result<()> {
             .map_err(|error| anyhow!(error.to_string()))?,
     );
     let (mut service, mut product_data_io) = new_service(chat_events.clone())?;
-    let mut addresses = build_addresses(&service);
+    let mut addresses = build_addresses(&service, &args.output_dir).await?;
     let started = std::time::Instant::now();
     let required_active_millis = args.duration_seconds.saturating_mul(1_000);
     let mut ledger = Ledger {
@@ -181,7 +182,7 @@ async fn main() -> Result<()> {
                 .await
                 .map_err(anyhow::Error::msg)?;
             (service, product_data_io) = new_service(chat_events.clone())?;
-            addresses = build_addresses(&service);
+            addresses = build_addresses(&service, &args.output_dir).await?;
             ledger.runtime_restarts = ledger.runtime_restarts.saturating_add(1);
         }
         tokio::time::sleep(Duration::from_millis(750)).await;
@@ -231,21 +232,34 @@ fn new_service(
     Ok((service, product_data_io))
 }
 
-fn build_addresses(service: &Arc<CommandCellRuntimeService>) -> Vec<Address> {
+async fn build_addresses(
+    service: &Arc<CommandCellRuntimeService>,
+    output_dir: &Path,
+) -> Result<Vec<Address>> {
     let mut addresses = Vec::new();
     for workspace in 0..WORKSPACE_COUNT {
         let workspace_id = WorkspaceId::from_name(&format!("lh6-workspace-{workspace}"));
         let scope = WorkspaceExecutionScope::workspace(&workspace_id, ".");
-        let registry = service.scoped(scope, None);
+        let task_runtime = Arc::new(TaskRuntimeStore::new_in_memory()?);
+        task_runtime
+            .rebind_shadow_root(
+                output_dir
+                    .join("task-runtime")
+                    .join(uuid::Uuid::new_v4().to_string()),
+                workspace_id.to_string(),
+            )
+            .await?;
+        let registry = service.scoped(scope, Some(task_runtime.clone()));
         for conversation in 0..CONVERSATIONS_PER_WORKSPACE {
             addresses.push(Address {
                 workspace_id: workspace_id.to_string(),
                 conversation_id: format!("lh6-conversation-{workspace}-{conversation}"),
                 registry: registry.clone(),
+                _task_runtime: task_runtime.clone(),
             });
         }
     }
-    addresses
+    Ok(addresses)
 }
 
 async fn run_cycle(

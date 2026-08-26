@@ -871,7 +871,21 @@ async fn run_cell_wave(
                 ))?
                 .root,
         );
-        let registry = context.runtime.command_cell_runtime.scoped(scope, None);
+        let scoped_runtime = context
+            .services
+            .app_state
+            .chat_runtime_for_scope(&address.workspace_id)
+            .await?;
+        let task_runtime = scoped_runtime.task_runtime().ok_or_else(|| {
+            anyhow!(
+                "workspace '{}' has no scoped TaskRuntimeStore",
+                address.workspace_id
+            )
+        })?;
+        let registry = context
+            .runtime
+            .command_cell_runtime
+            .scoped(scope, Some(task_runtime));
         let root_turn_id = format!("lh6-cell-wave-{}-{index}", ledger.command_cells);
         let receipt = registry
             .launch(CommandCellRequest {
