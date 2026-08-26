@@ -3147,7 +3147,11 @@ mod tests {
             failure_fingerprint: Some("failure-1".to_string()),
             status: TodoStatus::Running,
             status_detail: None,
-            claim: None,
+            claim: Some(echo_agent::tasks::TaskClaim::new(
+                7,
+                2,
+                "spec-hash".to_string(),
+            )),
             sort_order: 10,
         };
 
@@ -3190,6 +3194,157 @@ mod tests {
         assert_eq!(round_trip.acceptance_criteria, task.acceptance_criteria);
         assert_eq!(round_trip.failure_fingerprint, task.failure_fingerprint);
         assert_eq!(round_trip.status, task.status);
+        assert_eq!(round_trip.title, task.title);
+        assert_eq!(round_trip.description, task.description);
+        assert_eq!(round_trip.agent_role, task.agent_role);
+        assert_eq!(round_trip.files, task.files);
+        assert_eq!(round_trip.allowed_tools, task.allowed_tools);
+        assert_eq!(round_trip.retry_count, task.retry_count);
+        assert_eq!(round_trip.max_retries, task.max_retries);
+        assert_eq!(round_trip.status_detail, task.status_detail);
+        assert_eq!(round_trip.claim, task.claim);
+        assert_eq!(round_trip.sort_order, task.sort_order);
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_task_status_restart_round_trip_preserves_framework_and_eko_fields()
+    -> Result<(), String> {
+        let framework_statuses = vec![
+            echo_agent::tasks::TaskStatus::Pending,
+            echo_agent::tasks::TaskStatus::Running,
+            echo_agent::tasks::TaskStatus::Blocked("dependency failed".to_string()),
+            echo_agent::tasks::TaskStatus::Completed,
+            echo_agent::tasks::TaskStatus::Failed("compile failed".to_string()),
+            echo_agent::tasks::TaskStatus::Skipped,
+            echo_agent::tasks::TaskStatus::Cancelled,
+            echo_agent::tasks::TaskStatus::TimedOut {
+                error: "deadline elapsed".to_string(),
+            },
+            echo_agent::tasks::TaskStatus::Retrying {
+                attempt: 3,
+                last_error: "provider unavailable".to_string(),
+            },
+            echo_agent::tasks::TaskStatus::Paused("user paused".to_string()),
+        ];
+        for status in framework_statuses {
+            let encoded = serde_json::to_vec(&status).map_err(|error| error.to_string())?;
+            let restored: echo_agent::tasks::TaskStatus =
+                serde_json::from_slice(&encoded).map_err(|error| error.to_string())?;
+            assert_eq!(restored, status);
+        }
+
+        let statuses = vec![
+            echo_agent::tasks::TaskStatus::Pending,
+            echo_agent::tasks::TaskStatus::Running,
+            echo_agent::tasks::TaskStatus::Blocked("dependency failed".to_string()),
+            echo_agent::tasks::TaskStatus::Completed,
+            echo_agent::tasks::TaskStatus::Failed("compile failed".to_string()),
+            echo_agent::tasks::TaskStatus::Skipped,
+            echo_agent::tasks::TaskStatus::Cancelled,
+            echo_agent::tasks::TaskStatus::TimedOut {
+                error: "deadline elapsed".to_string(),
+            },
+        ];
+
+        for (ordinal, status) in statuses.into_iter().enumerate() {
+            let todo_status = TodoStatus::try_from_task_status(&status)?;
+            let task = PlanTask {
+                id: format!("restart-status-{ordinal}"),
+                title: "Restart status fixture".to_string(),
+                description: "Serialize and restore the canonical task".to_string(),
+                kind: PlanTaskKind::Investigation,
+                agent_role: "explorer".to_string(),
+                domain_profile: DomainProfile::AiCoding,
+                files: vec!["src/runtime.rs".to_string()],
+                allowed_tools: vec!["read_file".to_string()],
+                retry_count: 2,
+                max_retries: 4,
+                failure_fingerprint: Some("fixture-fingerprint".to_string()),
+                status: todo_status,
+                status_detail: task_status_detail(&status),
+                claim: Some(echo_agent::tasks::TaskClaim::new(
+                    3,
+                    2,
+                    format!("fixture-spec-hash-{ordinal}"),
+                )),
+                sort_order: 11,
+                ..PlanTask::default()
+            };
+            let canonical = task.to_task()?;
+            assert_eq!(canonical.execution.status, status);
+
+            // Simulate the file-backed restart boundary: the framework Task
+            // is serialized, dropped, and decoded before the EKO adapter sees
+            // it again.
+            let encoded = serde_json::to_vec(&canonical).map_err(|error| error.to_string())?;
+            let restored: echo_agent::tasks::Task =
+                serde_json::from_slice(&encoded).map_err(|error| error.to_string())?;
+            assert_eq!(restored, canonical);
+
+            let projected = PlanTask::try_from(restored)?;
+            assert_eq!(projected.id, task.id);
+            assert_eq!(projected.title, task.title);
+            assert_eq!(projected.description, task.description);
+            assert_eq!(projected.kind, task.kind);
+            assert_eq!(projected.agent_role, task.agent_role);
+            assert_eq!(projected.domain_profile, task.domain_profile);
+            assert_eq!(projected.files, task.files);
+            assert_eq!(projected.allowed_tools, task.allowed_tools);
+            assert_eq!(projected.retry_count, task.retry_count);
+            assert_eq!(projected.max_retries, task.max_retries);
+            assert_eq!(projected.failure_fingerprint, task.failure_fingerprint);
+            assert_eq!(projected.status, task.status);
+            assert_eq!(projected.status_detail, task.status_detail);
+            assert_eq!(projected.claim, task.claim);
+            assert_eq!(projected.sort_order, task.sort_order);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retrying_and_paused_todo_projection_records_lossy_reverse_conversion() -> Result<(), String>
+    {
+        let retrying = echo_agent::tasks::TaskStatus::Retrying {
+            attempt: 3,
+            last_error: "provider unavailable".to_string(),
+        };
+        assert_eq!(
+            TodoStatus::project_task_status(&retrying),
+            TodoStatus::Running
+        );
+        let retry_error = match TodoStatus::try_from_task_status(&retrying) {
+            Ok(status) => {
+                return Err(format!(
+                    "retrying unexpectedly converted losslessly to {status:?}"
+                ));
+            }
+            Err(error) => error,
+        };
+        assert!(retry_error.contains("no lossless EKO todo projection"));
+        assert_eq!(
+            TodoStatus::Running.to_task_status(Some("provider unavailable")),
+            echo_agent::tasks::TaskStatus::Running
+        );
+
+        let paused = echo_agent::tasks::TaskStatus::Paused("user paused".to_string());
+        assert_eq!(
+            TodoStatus::project_task_status(&paused),
+            TodoStatus::Pending
+        );
+        let paused_error = match TodoStatus::try_from_task_status(&paused) {
+            Ok(status) => {
+                return Err(format!(
+                    "paused unexpectedly converted losslessly to {status:?}"
+                ));
+            }
+            Err(error) => error,
+        };
+        assert!(paused_error.contains("projected as pending"));
+        assert_eq!(
+            TodoStatus::Pending.to_task_status(Some("user paused")),
+            echo_agent::tasks::TaskStatus::Pending
+        );
         Ok(())
     }
 

@@ -9601,6 +9601,374 @@ mod tests {
     }
 
     #[test]
+    fn task_todo_characterization_tracks_dynamic_graph_run_state_todo_and_recovery()
+    -> Result<(), StoreError> {
+        let temp =
+            tempfile::tempdir().map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        let root = temp.path().join("tasks");
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        let run_id = "task-todo-characterization";
+        store.create_run(
+            run_id,
+            "ws",
+            "conversation",
+            "message",
+            DomainProfile::General,
+            "characterize TaskRuntime projections",
+            "task",
+            AttendedMode::Attended,
+        )?;
+
+        let mut upstream = sample_task_body("upstream");
+        upstream.max_retries = 2;
+        let mut dependent = sample_task_body("dependent");
+        dependent.depends_on = vec![upstream.id.clone()];
+        let blocked = sample_task_body("blocked");
+        let timed_out = sample_task_body("timed-out");
+        let skipped = sample_task_body("skipped");
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: "task-todo-characterization-plan".to_string(),
+            run_id: run_id.to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("characterize TaskRuntime projections"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![upstream, dependent, blocked, timed_out, skipped],
+        })?;
+        store.transition_run(run_id, TaskRunStatus::Running)?;
+
+        let assert_graph_and_projections =
+            |store: &TaskRuntimeStore, expected_revision: u64| -> Result<(), StoreError> {
+                let plan = store
+                    .get_plan(run_id)?
+                    .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+                let snapshot = store
+                    .get_run_state(run_id)?
+                    .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+                let runtime = store.load_runtime_plan_snapshot(run_id)?;
+                let todos = store.list_todos(run_id)?;
+                assert_eq!(plan.revision, expected_revision);
+                assert_eq!(runtime.revision, expected_revision);
+                assert_eq!(plan.tasks.len(), snapshot.tasks.len());
+                assert_eq!(plan.tasks.len(), runtime.tasks.len());
+                assert_eq!(plan.tasks.len(), todos.len());
+                for task in &plan.tasks {
+                    if !snapshot.tasks.iter().any(|state| state.task_id == task.id) {
+                        return Err(StoreError::TaskNotFound(format!(
+                            "run-state task {} missing",
+                            task.id
+                        )));
+                    }
+                    if !runtime.tasks.iter().any(|state| state.spec.id == task.id) {
+                        return Err(StoreError::TaskNotFound(format!(
+                            "runtime graph task {} missing",
+                            task.id
+                        )));
+                    }
+                    if !todos.iter().any(|todo| todo.task_id == task.id) {
+                        return Err(StoreError::TaskNotFound(format!(
+                            "Todo projection {} missing",
+                            task.id
+                        )));
+                    }
+                }
+                Ok(())
+            };
+
+        assert_graph_and_projections(&store, 1)?;
+
+        let mut patched = sample_task_body("patched");
+        patched.title = "Inserted during characterization".to_string();
+        let patched_plan = store.apply_task_patch_for_test(
+            run_id,
+            &TaskUpdateRequest {
+                base_revision: 1,
+                reason: "exercise dynamic graph insertion".to_string(),
+                operations: vec![TaskUpdateOperation::Insert {
+                    after_task_id: Some("upstream".to_string()),
+                    task: patched.spec(),
+                }],
+            },
+        )?;
+        assert_eq!(patched_plan.revision, 2);
+        assert_graph_and_projections(&store, 2)?;
+        assert_eq!(
+            store
+                .list_todos(run_id)?
+                .iter()
+                .find(|todo| todo.task_id == "patched")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Pending)
+        );
+
+        store.set_task_status(
+            run_id,
+            "upstream",
+            TodoStatus::Failed,
+            Some("implementer"),
+            Some("upstream failed"),
+        )?;
+        store.set_task_status(
+            run_id,
+            "blocked",
+            TodoStatus::Blocked,
+            Some("reviewer"),
+            Some("awaiting explicit decision"),
+        )?;
+        store.set_task_status(
+            run_id,
+            "timed-out",
+            TodoStatus::TimedOut,
+            Some("reviewer"),
+            Some("deadline elapsed"),
+        )?;
+        let skipped_plan = store.apply_task_patch_for_test(
+            run_id,
+            &TaskUpdateRequest {
+                base_revision: 2,
+                reason: "exercise explicit skip projection".to_string(),
+                operations: vec![TaskUpdateOperation::Skip {
+                    task_id: "skipped".to_string(),
+                }],
+            },
+        )?;
+        assert_eq!(skipped_plan.revision, 3);
+        assert_graph_and_projections(&store, 3)?;
+
+        let runtime = store.load_runtime_plan_snapshot(run_id)?;
+        let runtime_status = |task_id: &str| {
+            runtime
+                .tasks
+                .iter()
+                .find(|task| task.spec.id == task_id)
+                .map(|task| &task.execution.status)
+        };
+        assert!(matches!(
+            runtime_status("upstream"),
+            Some(echo_agent::tasks::TaskStatus::Failed(detail)) if detail == "upstream failed"
+        ));
+        assert_eq!(
+            runtime_status("dependent"),
+            Some(&echo_agent::tasks::TaskStatus::Pending)
+        );
+        assert!(matches!(
+            runtime_status("blocked"),
+            Some(echo_agent::tasks::TaskStatus::Blocked(detail)) if detail == "awaiting explicit decision"
+        ));
+        assert!(matches!(
+            runtime_status("timed-out"),
+            Some(echo_agent::tasks::TaskStatus::TimedOut { error }) if error == "deadline elapsed"
+        ));
+        assert_eq!(
+            runtime_status("skipped"),
+            Some(&echo_agent::tasks::TaskStatus::Skipped)
+        );
+        let todos = store.list_todos(run_id)?;
+        assert_eq!(
+            todos
+                .iter()
+                .find(|todo| todo.task_id == "dependent")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Blocked)
+        );
+        assert_eq!(
+            todos
+                .iter()
+                .find(|todo| todo.task_id == "timed-out")
+                .map(|todo| todo.status),
+            Some(TodoStatus::TimedOut)
+        );
+        assert_eq!(
+            todos
+                .iter()
+                .find(|todo| todo.task_id == "skipped")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Skipped)
+        );
+
+        store.transition_run(run_id, TaskRunStatus::Failed)?;
+        assert_eq!(store.retry_blocked_task(run_id, "upstream")?, 1);
+        assert_graph_and_projections(&store, 3)?;
+        let retried = store.load_runtime_plan_snapshot(run_id)?;
+        let retried_upstream = retried
+            .tasks
+            .iter()
+            .find(|task| task.spec.id == "upstream")
+            .ok_or_else(|| StoreError::TaskNotFound("upstream".to_string()))?;
+        assert_eq!(
+            &retried_upstream.execution.status,
+            &echo_agent::tasks::TaskStatus::Pending
+        );
+        assert_eq!(retried_upstream.execution.retry_count, 1);
+        assert_eq!(
+            store
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?
+                .status,
+            TaskRunStatus::Running
+        );
+        assert_eq!(
+            store
+                .list_todos(run_id)?
+                .iter()
+                .find(|todo| todo.task_id == "dependent")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Pending)
+        );
+
+        assert!(store.request_cancel(run_id)?);
+        let cancelled_runtime = store.load_runtime_plan_snapshot(run_id)?;
+        for task in &cancelled_runtime.tasks {
+            if task.spec.id == "timed-out" || task.spec.id == "skipped" {
+                continue;
+            }
+            assert_eq!(
+                &task.execution.status,
+                &echo_agent::tasks::TaskStatus::Cancelled
+            );
+        }
+        assert_eq!(
+            store
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?
+                .status,
+            TaskRunStatus::Cancelled
+        );
+        let cancelled_todos = store.list_todos(run_id)?;
+        assert_eq!(
+            cancelled_todos
+                .iter()
+                .find(|todo| todo.task_id == "upstream")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Cancelled)
+        );
+        assert_eq!(
+            cancelled_todos
+                .iter()
+                .find(|todo| todo.task_id == "blocked")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Cancelled)
+        );
+        assert_eq!(
+            cancelled_todos
+                .iter()
+                .find(|todo| todo.task_id == "timed-out")
+                .map(|todo| todo.status),
+            Some(TodoStatus::TimedOut)
+        );
+        assert_eq!(
+            cancelled_todos
+                .iter()
+                .find(|todo| todo.task_id == "skipped")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Skipped)
+        );
+
+        let recovery_id = "restart-recovery-characterization";
+        store.create_run(
+            recovery_id,
+            "ws",
+            "conversation",
+            "recovery-message",
+            DomainProfile::General,
+            "characterize restart recovery",
+            "task",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan_for_test(&TaskPlan {
+            plan_id: "restart-recovery-characterization-plan".to_string(),
+            run_id: recovery_id.to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal_revision: 1,
+            goal_sha256: task_goal_sha256("characterize restart recovery"),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![sample_task_body("recovery-task")],
+        })?;
+        store.transition_run(recovery_id, TaskRunStatus::Running)?;
+        store.set_task_status(
+            recovery_id,
+            "recovery-task",
+            TodoStatus::Running,
+            Some("subagent"),
+            Some("interrupted before completion"),
+        )?;
+        drop(store);
+
+        let restarted = TaskRuntimeStore::new_in_memory_with_shadow_root(&root)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        assert_eq!(
+            restarted
+                .get_run(recovery_id)?
+                .ok_or_else(|| StoreError::RunNotFound(recovery_id.to_string()))?
+                .status,
+            TaskRunStatus::Running
+        );
+        assert_eq!(
+            restarted
+                .list_todos(recovery_id)?
+                .iter()
+                .find(|todo| todo.task_id == "recovery-task")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Running)
+        );
+        assert_eq!(restarted.recover_incomplete()?, 1);
+        let recovered_state = restarted
+            .get_run_state(recovery_id)?
+            .ok_or_else(|| StoreError::RunNotFound(recovery_id.to_string()))?;
+        assert_eq!(recovered_state.run.status, TaskRunStatus::Paused);
+        let recovered_task = recovered_state
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "recovery-task")
+            .ok_or_else(|| StoreError::TaskNotFound("recovery-task".to_string()))?;
+        // Current recovery pauses the Run but resets an interrupted task to
+        // Pending so it can be reclaimed explicitly on resume. Todo is the
+        // matching read-only projection of that canonical task status.
+        assert_eq!(
+            recovered_task.status,
+            echo_agent::tasks::TaskStatus::Pending
+        );
+        assert_eq!(
+            restarted
+                .list_todos(recovery_id)?
+                .iter()
+                .find(|todo| todo.task_id == "recovery-task")
+                .map(|todo| todo.status),
+            Some(TodoStatus::Pending)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn list_todos_is_read_only_and_does_not_append_journal() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let events_path = store.active_shadow_root().join("r1").join("events.jsonl");
+        let before_events = std::fs::read(&events_path)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        let before_count = store.list_events("r1", 0)?.len();
+        let first = store.list_todos("r1")?;
+        let second = store.list_todos("r1")?;
+        let first_value = serde_json::to_value(&first)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        let second_value = serde_json::to_value(&second)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        assert_eq!(first_value, second_value);
+        assert_eq!(store.list_events("r1", 0)?.len(), before_count);
+        let after_events = std::fs::read(&events_path)
+            .map_err(|error| StoreError::InvalidPlan(error.to_string()))?;
+        assert_eq!(before_events, after_events);
+        Ok(())
+    }
+
+    #[test]
     fn put_summary_upserts_and_get_summary_reads() {
         let s = fresh();
         seed_plan(&s);
@@ -13361,7 +13729,12 @@ mod tests {
         Ok(())
     }
 
+    /// FINAL performance gate for artifact and per-task review history.
+    ///
+    /// Run explicitly with:
+    /// `cargo test -p echo-agent-app-core artifact_and_per_task_review_history_scale_at_10k_and_100k --lib --release -- --ignored --nocapture`
     #[test]
+    #[ignore = "final 10k/100k performance gate; run explicitly with --release --ignored --nocapture"]
     fn artifact_and_per_task_review_history_scale_at_10k_and_100k() -> Result<(), String> {
         let (_ten_temp, ten_store, ten_run, ten_first, ten_second) =
             seed_history_scale_fixture(10_000)?;
@@ -13544,6 +13917,83 @@ mod tests {
                 .len(),
             100_000
         );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_and_per_task_review_history_characterization_at_2k_and_10k() -> Result<(), String> {
+        let (small_temp, small_store, small_run, _, _) = seed_history_scale_fixture(2_000)?;
+        let (large_temp, large_store, large_run, _, _) = seed_history_scale_fixture(10_000)?;
+
+        for (store, run_id, expected_reviews) in [
+            (&small_store, &small_run, 2_000_usize),
+            (&large_store, &large_run, 10_000_usize),
+        ] {
+            let target_query = time_history_target_queries(store, run_id)?;
+            assert!(
+                target_query <= std::time::Duration::from_millis(250),
+                "targeted history query exceeded daily characterization budget: {target_query:?}"
+            );
+            assert_eq!(
+                store
+                    .list_reviews(run_id, "other-task")
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                expected_reviews
+            );
+            assert_eq!(
+                store
+                    .list_artifacts(run_id)
+                    .map_err(|error| error.to_string())?
+                    .len(),
+                1
+            );
+            let (artifact_path, target_review_path, _) = store
+                .shadow
+                .history_paths_for_test(run_id, "target-task")
+                .map_err(|error| error.to_string())?;
+            assert!(
+                std::fs::metadata(&artifact_path)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    <= 64 * 1024
+            );
+            assert!(
+                std::fs::metadata(&target_review_path)
+                    .map_err(|error| error.to_string())?
+                    .len()
+                    <= 64 * 1024
+            );
+        }
+
+        drop(large_store);
+        let restarted =
+            TaskRuntimeStore::new_in_memory_with_shadow_root(large_temp.path().join("tasks"))
+                .map_err(|error| error.to_string())?;
+        assert_eq!(
+            restarted
+                .list_reviews(&large_run, "other-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            10_000
+        );
+        assert_eq!(
+            restarted
+                .list_reviews(&large_run, "target-task")
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        assert_eq!(
+            restarted
+                .list_artifacts(&large_run)
+                .map_err(|error| error.to_string())?
+                .len(),
+            1
+        );
+        time_history_target_queries(&restarted, &large_run)?;
+        drop(small_store);
+        drop(small_temp);
         Ok(())
     }
 
